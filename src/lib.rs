@@ -13,6 +13,7 @@
 //! references instead of nullable pointers, `-> !` for noreturn).
 
 pub mod api;
+pub mod arglist_defs;
 pub mod ascii_defs;
 pub mod assert_defs;
 pub mod base64;
@@ -45,6 +46,7 @@ pub mod path;
 pub mod pos_defs;
 pub mod profile;
 pub mod sha256;
+pub mod sign_defs;
 pub mod statusline_defs;
 pub mod strings;
 pub mod types_defs;
