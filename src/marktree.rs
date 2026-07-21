@@ -1034,6 +1034,51 @@ pub fn marktree_put_key(b: &mut MarkTree, mut k: MtKey) {
     b.n_keys += 1;
 }
 
+/// `marktree_put`: inserts `key` (unpaired if `end_row < 0`, otherwise
+/// paired with a second, `MT_FLAG_END`-tagged key at `(end_row, end_col)`,
+/// with the pair's spanned nodes marked as intersecting via
+/// `marktree_intersect_pair`). This is the public, paired-mark-aware
+/// entry point that `extmark.c` (not yet translated) uses; `key`'s
+/// caller-supplied flags must not reach outside `MT_FLAG_EXTERNAL_MASK |
+/// MT_FLAG_RIGHT_GRAVITY` (checked, matching the original's `assert`,
+/// which - like other plain C `assert()`s outside the debug-only
+/// `marktree_check*` family - is translated as `debug_assert!`, compiled
+/// out in release builds exactly like the original under `NDEBUG`).
+pub fn marktree_put(b: &mut MarkTree, mut key: MtKey, end_row: i32, end_col: i32, end_right: bool) {
+    debug_assert_eq!(key.flags & !(MT_FLAG_EXTERNAL_MASK | MT_FLAG_RIGHT_GRAVITY), 0);
+    if end_row >= 0 {
+        key.flags |= MT_FLAG_PAIRED;
+    }
+
+    if end_row < 0 {
+        marktree_put_key(b, key);
+        return;
+    }
+
+    // Clone before marktree_put_key consumes `key`: the original C passes
+    // `key` by value, leaving the caller's own copy (here, `key` itself,
+    // since we build `end_key` before moving `key` away) unaffected by the
+    // MT_FLAG_REAL bit marktree_put_key adds to its own internal copy.
+    let mut end_key = key.clone();
+    end_key.flags = (key.flags & !MT_FLAG_RIGHT_GRAVITY)
+        | MT_FLAG_END
+        | if end_right { MT_FLAG_RIGHT_GRAVITY } else { 0 };
+    end_key.pos = MtPos::new(end_row, end_col);
+
+    let key_id = mt_lookup_key(&key);
+    let end_key_id = mt_lookup_key(&end_key);
+
+    marktree_put_key(b, key);
+    marktree_put_key(b, end_key);
+
+    let mut itr = MarkTreeIter::default();
+    let mut end_itr = MarkTreeIter::default();
+    marktree_lookup(b, key_id, Some(&mut itr));
+    marktree_lookup(b, end_key_id, Some(&mut end_itr));
+
+    marktree_intersect_pair(b, key_id, &mut itr, &end_itr, false);
+}
+
 /// `rawkey`: `itr->x->key[itr->i]` (the original's macro).
 ///
 /// # Safety
@@ -1505,10 +1550,100 @@ fn marktree_itr_fix_pos(b: &MarkTree, itr: &mut MarkTreeIter) {
     debug_assert_eq!(x, itr.x);
 }
 
+/// `iat`: the original's `iat` macro (`#define iat(itr, l, q) ((l ==
+/// itr->lvl) ? itr->i + q : itr->s[l].i)`).
+///
+/// Reads iterator `itr`'s child-index at tree level `l`: its *current*
+/// level's index (offset by `q`) if `l == itr.lvl`, or an ancestor
+/// level's recorded index otherwise.
+#[inline]
+fn iat(itr: &MarkTreeIter, l: i32, q: i32) -> i32 {
+    if l == itr.lvl {
+        itr.i + q
+    } else {
+        itr.s[l as usize].i
+    }
+}
+
+/// `marktree_intersect_pair`: marks (or, if `delete`, unmarks) every
+/// internal node strictly between `itr` and `end_itr` as intersecting
+/// `id` - the mechanism that makes "does any pair span this position"
+/// queries O(1) rather than needing to scan every pair.
+///
+/// @param itr mutated
+/// @param end_itr not mutated
+// The `itr.lvl > lvl` and `iat(...) < iat(...)` branches both set `skip =
+// true` - clippy's `if_same_then_else` flags this as suspicious, but it's
+// a faithful match to the original's own `else if (...) { skip = true; }
+// else { if (...) { skip = true; } else { lvl++; } }` structure: two
+// independently-meaningful conditions that happen to trigger the same
+// action, not an accidental copy-paste duplication.
+#[allow(clippy::if_same_then_else)]
+pub fn marktree_intersect_pair(
+    b: &MarkTree,
+    id: u64,
+    itr: &mut MarkTreeIter,
+    end_itr: &MarkTreeIter,
+    delete: bool,
+) {
+    let _ = b; // unused in the original too - kept for public signature parity
+    let mut lvl = 0;
+    let maxlvl = itr.lvl.min(end_itr.lvl);
+    while lvl < maxlvl {
+        if itr.s[lvl as usize].i > end_itr.s[lvl as usize].i {
+            return; // empty range
+        } else if itr.s[lvl as usize].i < end_itr.s[lvl as usize].i {
+            break; // work to do
+        }
+        lvl += 1;
+    }
+    if lvl == maxlvl && iat(itr, lvl, 1) > iat(end_itr, lvl, 0) {
+        return; // empty range
+    }
+
+    while !itr.x.is_null() {
+        let mut skip = false;
+        if itr.x == end_itr.x {
+            // SAFETY: `itr.x` non-null (loop condition).
+            if unsafe { (*itr.x).level } == 0 || itr.i >= end_itr.i {
+                break;
+            } else {
+                skip = true;
+            }
+        } else if itr.lvl > lvl {
+            skip = true;
+        } else if iat(itr, lvl, 1) < iat(end_itr, lvl, 1) {
+            skip = true;
+        } else {
+            lvl += 1;
+        }
+
+        if skip {
+            // SAFETY: `itr.x` non-null.
+            if unsafe { (*itr.x).level } != 0 {
+                // `itr.i + 1` must be computed in `i32` first (matching the
+                // original's `int` arithmetic) before casting to `usize`:
+                // `itr.i` can be `-1` here (see marktree_itr_next_skip's
+                // `preload` branch), and `(itr.i as usize) + 1` would wrap
+                // around instead of correctly yielding `0`.
+                // SAFETY: `itr.x` valid internal node.
+                let x = unsafe { node_child(itr.x, (itr.i + 1) as usize) };
+                // SAFETY: `x` is a valid, live child node.
+                if delete {
+                    unsafe { unintersect_node(&mut (*x).intersect, id, true) };
+                } else {
+                    unsafe { intersect_node(&mut (*x).intersect, id) };
+                }
+            }
+        }
+        marktree_itr_next_skip(itr, skip, true, None, None);
+    }
+}
+
 /// `marktree_put_test`: convenience entry point used by the original's own
-/// unit tests, translated as a thin wrapper matching its shape. Only the
-/// unpaired case (`end_row < 0`) is currently reachable, since
-/// `marktree_put` (needed for `end_row >= 0`) is not yet translated.
+/// unit tests, translated as a thin wrapper matching its shape - now that
+/// `marktree_put` itself is translated, this supports the paired case too
+/// (`end_row >= 0`).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn marktree_put_test(
@@ -1518,6 +1653,9 @@ fn marktree_put_test(
     row: i32,
     col: i32,
     right_gravity: bool,
+    end_row: i32,
+    end_col: i32,
+    end_right: bool,
     meta_inline: bool,
 ) {
     let mut flags = mt_flags(right_gravity, false, false, false);
@@ -1533,7 +1671,7 @@ fn marktree_put_test(
         flags,
         decor_data: crate::decoration_defs::DecorInlineData { hl: DecorHighlightInline::default() },
     };
-    marktree_put_key(b, key);
+    marktree_put(b, key, end_row, end_col, end_right);
 }
 
 /// `marktree_check`: validates every documented invariant of the tree
@@ -1611,7 +1749,12 @@ unsafe fn marktree_check_node(
         let last_child = unsafe { node_child(x, n as usize) };
         let last_meta = unsafe { node_meta(x, n as usize) };
         n_keys += unsafe { marktree_check_node(b, last_child, last, last_right, &last_meta) };
-        // SAFETY: `x` valid; `n >= 1` for an internal node.
+        // An internal node always has n >= 1 (the original assumes this
+        // unguarded too - even the root, if internal, is never left with
+        // n == 0: marktree_put_key's root-growth always immediately
+        // split_node's the new root, which ends with n += 1).
+        debug_assert!(n > 0);
+        // SAFETY: `x` valid; `n > 0` (see above).
         let base = unsafe { (*x).key[n as usize - 1].pos };
         unrelative(base, last);
 
@@ -2072,7 +2215,7 @@ mod tests {
     fn put_key_small_scattered_batch_maintains_invariants() {
         let mut tree = MarkTree::default();
         for (i, &(row, col)) in [(5, 0), (1, 0), (9, 3), (3, 7), (7, 2)].iter().enumerate() {
-            marktree_put_test(&mut tree, 0, i as u32, row, col, false, false);
+            marktree_put_test(&mut tree, 0, i as u32, row, col, false, -1, -1, false, false);
         }
         assert_eq!(tree.n_keys, 5);
         marktree_check(&tree);
@@ -2084,7 +2227,7 @@ mod tests {
         // A leaf holds up to 2*T-1 = 19 keys; 25 forces at least one split.
         let mut tree = MarkTree::default();
         for i in 0..25 {
-            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, false);
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
         }
         assert_eq!(tree.n_keys, 25);
         marktree_check(&tree);
@@ -2095,7 +2238,7 @@ mod tests {
     fn put_key_many_keys_ascending_multiple_levels() {
         let mut tree = MarkTree::default();
         for i in 0..300 {
-            marktree_put_test(&mut tree, 0, i as u32, i, 0, i % 2 == 0, false);
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, i % 2 == 0, -1, -1, false, false);
         }
         assert_eq!(tree.n_keys, 300);
         marktree_check(&tree);
@@ -2106,7 +2249,7 @@ mod tests {
     fn put_key_many_keys_shuffled_order_maintains_invariants() {
         let mut tree = MarkTree::default();
         for (id, row) in shuffled_range(300).into_iter().enumerate() {
-            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, false);
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, -1, -1, false, false);
         }
         assert_eq!(tree.n_keys, 300);
         marktree_check(&tree);
@@ -2120,7 +2263,7 @@ mod tests {
         // break the tie consistently (by flags) without violating the
         // overall ordering invariant that marktree_check enforces.
         for id in 0..10 {
-            marktree_put_test(&mut tree, 0, id, 5, 5, id % 2 == 0, false);
+            marktree_put_test(&mut tree, 0, id, 5, 5, id % 2 == 0, -1, -1, false, false);
         }
         assert_eq!(tree.n_keys, 10);
         marktree_check(&tree);
@@ -2132,7 +2275,7 @@ mod tests {
         let mut tree = MarkTree::default();
         for i in 0..30 {
             // Every third key is marked as carrying inline virtual text.
-            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, i % 3 == 0);
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, i % 3 == 0);
         }
         marktree_check(&tree);
         let expected_inline = (0..30).filter(|i| i % 3 == 0).count() as u32;
@@ -2146,7 +2289,7 @@ mod tests {
         let mut id = 0u32;
         for ns in 0..5 {
             for row in 0..40 {
-                marktree_put_test(&mut tree, ns, id, row, ns as i32, false, false);
+                marktree_put_test(&mut tree, ns, id, row, ns as i32, false, -1, -1, false, false);
                 id += 1;
             }
         }
@@ -2161,7 +2304,7 @@ mod tests {
     fn itr_first_next_visits_all_keys_in_ascending_order() {
         let mut tree = MarkTree::default();
         for (id, &row) in shuffled_range(150).iter().enumerate() {
-            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, false);
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, -1, -1, false, false);
         }
         marktree_check(&tree);
 
@@ -2191,7 +2334,7 @@ mod tests {
     fn itr_last_prev_visits_all_keys_in_descending_order() {
         let mut tree = MarkTree::default();
         for (id, &row) in shuffled_range(150).iter().enumerate() {
-            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, false);
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, -1, -1, false, false);
         }
         marktree_check(&tree);
 
@@ -2221,7 +2364,7 @@ mod tests {
         let mut tree = MarkTree::default();
         // Keys at rows 0, 10, 20, ..., 190 (gaps in between).
         for id in 0..20 {
-            marktree_put_test(&mut tree, 0, id, id as i32 * 10, 0, false, false);
+            marktree_put_test(&mut tree, 0, id, id as i32 * 10, 0, false, -1, -1, false, false);
         }
         marktree_check(&tree);
 
@@ -2254,7 +2397,7 @@ mod tests {
     fn lookup_finds_inserted_keys_by_ns_and_id() {
         let mut tree = MarkTree::default();
         for id in 0..40u32 {
-            marktree_put_test(&mut tree, 3, id, id as i32, id as i32 * 2, id % 2 == 0, false);
+            marktree_put_test(&mut tree, 3, id, id as i32, id as i32 * 2, id % 2 == 0, -1, -1, false, false);
         }
         marktree_check(&tree);
 
@@ -2276,7 +2419,7 @@ mod tests {
     #[test]
     fn lookup_returns_invalid_key_for_unknown_id() {
         let mut tree = MarkTree::default();
-        marktree_put_test(&mut tree, 0, 0, 5, 5, false, false);
+        marktree_put_test(&mut tree, 0, 0, 5, 5, false, -1, -1, false, false);
         marktree_check(&tree);
 
         let mut itr = MarkTreeIter::default();
@@ -2290,7 +2433,7 @@ mod tests {
     #[test]
     fn get_alt_returns_self_for_unpaired_mark() {
         let mut tree = MarkTree::default();
-        marktree_put_test(&mut tree, 0, 7, 3, 3, false, false);
+        marktree_put_test(&mut tree, 0, 7, 3, 3, false, -1, -1, false, false);
         marktree_check(&tree);
 
         let mark = marktree_lookup_ns(&tree, 0, 7, false, None);
@@ -2339,6 +2482,75 @@ mod tests {
         let alt_of_end = marktree_get_alt(&tree, &end_mark, None);
         assert_eq!(alt_of_end.pos, MtPos::new(2, 0));
         assert!(!mt_end(&alt_of_end));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn put_test_paired_mark_creates_start_and_end_keys() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 1, 2, 0, false, 9, 3, true, false);
+        assert_eq!(tree.n_keys, 2);
+        marktree_check(&tree);
+
+        let start = marktree_lookup_ns(&tree, 0, 1, false, None);
+        assert_eq!(start.pos, MtPos::new(2, 0));
+        assert!(mt_paired(&start));
+        assert!(!mt_end(&start));
+
+        let end = marktree_lookup_ns(&tree, 0, 1, true, None);
+        assert_eq!(end.pos, MtPos::new(9, 3));
+        assert!(mt_paired(&end));
+        assert!(mt_end(&end));
+        assert!(mt_right(&end));
+
+        assert_eq!(marktree_get_altpos(&tree, &start, None), MtPos::new(9, 3));
+        assert_eq!(marktree_get_altpos(&tree, &end, None), MtPos::new(2, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn put_test_paired_mark_spanning_many_nodes_maintains_invariants() {
+        // Enough unrelated keys to force multiple levels, then a single
+        // wide pair spanning most of them - exercises marktree_intersect_pair
+        // (via marktree_put) across real internal-node boundaries.
+        let mut tree = MarkTree::default();
+        for i in 0..300 {
+            marktree_put_test(&mut tree, 0, i as u32 + 1, i, 0, false, -1, -1, false, false);
+        }
+        marktree_put_test(&mut tree, 1, 9999, 5, 0, false, 290, 0, false, false);
+        assert_eq!(tree.n_keys, 302);
+        marktree_check(&tree);
+
+        let start = marktree_lookup_ns(&tree, 1, 9999, false, None);
+        let end = marktree_lookup_ns(&tree, 1, 9999, true, None);
+        assert_eq!(start.pos, MtPos::new(5, 0));
+        assert_eq!(end.pos, MtPos::new(290, 0));
+        assert_eq!(marktree_get_altpos(&tree, &start, None), MtPos::new(290, 0));
+
+        // A key strictly between the pair's start/end should find the pair
+        // among its ancestor chain's intersection sets (this is exactly
+        // what marktree_itr_get_overlap/marktree_itr_step_overlap - not yet
+        // translated - would use at query time; here we walk up manually
+        // via itr.x.parent to confirm marktree_intersect_pair actually
+        // marked something).
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 150, 0, &mut itr));
+        let pair_start_id = mt_lookup_key(&start);
+        let mut found = false;
+        let mut x = itr.x;
+        // SAFETY: itr.x and its ancestor chain are valid live nodes in `tree`.
+        unsafe {
+            while !x.is_null() {
+                if intersection_has(&(*x).intersect, pair_start_id) {
+                    found = true;
+                    break;
+                }
+                x = (*x).parent;
+            }
+        }
+        assert!(found, "expected the wide pair to be marked as intersecting somewhere on the ancestor chain of a key between its start and end");
 
         unsafe { marktree_clear(&mut tree) };
     }
