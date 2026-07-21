@@ -92,6 +92,7 @@ pub const SIGN_WIDTH: i32 = 2;
 //   synstate_T -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
 //   Terminal   -> struct terminal,    src/nvim/terminal.h      (phase 14)
 //   win_T      -> struct window_S,    src/nvim/buffer_defs.h   (phase 3/8)
+//   qf_info_T  -> struct qf_info_S,   src/nvim/quickfix.c      (phase 8)
 // MTNode (struct mtnode_s) is no longer a placeholder here: it is now
 // translated for real in `src/nvim/marktree_defs.h` -> `crate::marktree_defs::MtNode`.
 
@@ -117,6 +118,10 @@ pub struct TerminalT {
 }
 /// Placeholder for `win_T` (`struct window_S`) - see `src/nvim/buffer_defs.h` (phase 3/8).
 pub struct WinT {
+    _private: (),
+}
+/// Placeholder for `qf_info_T` (`struct qf_info_S`) - see `src/nvim/quickfix.c` (phase 8).
+pub struct QfInfoT {
     _private: (),
 }
 

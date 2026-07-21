@@ -1,22 +1,25 @@
 //! Translated from `src/nvim/buffer_defs.h` (partial - `buf_T`/`win_T`
 //! themselves (`struct file_buffer`/`struct window_S`, each several
-//! hundred lines and referencing syntax state, memline internals, etc.
+//! hundred lines and referencing memline internals, quickfix state, etc.
 //! not yet translated) are substantial and deliberately deferred to a
 //! dedicated pass rather than rushed).
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
-//! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`).
+//! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`),
+//! `syn_time_T`, `synblock_T`, `BufUpdateCallbacks`, and the
+//! `BUF_HAS_*`/`MAX_MAPHASH` constants.
 //!
-//! Deferred: everything referencing `buf_T`'s actual fields,
-//! `synblock_T`/`syn_time_T` (needs syntax state), `BufUpdateCallbacks`,
-//! `file_buffer`/`window_S` themselves, `tabpage_S`, `frame_S`, and all the
-//! window-layout/diff/match/float-config types further down the original
-//! file.
+//! Deferred: everything referencing `buf_T`'s actual fields (`struct
+//! file_buffer` itself, `ChangedtickDictItem` which needs the eval
+//! engine's `typval_T`), `file_buffer`/`window_S` themselves, `tabpage_S`,
+//! `frame_S`, and all the window-layout/diff/match/float-config types
+//! further down the original file.
 
-use crate::garray_defs::GarrayT;
 use crate::eval::typval_defs::SctxT;
+use crate::garray_defs::GarrayT;
+use crate::hashtab_defs::HashtabT;
 use crate::mark_defs::FmarkT;
-use crate::types_defs::{BufT, OptInt, WinT};
+use crate::types_defs::{BufT, LuaRef, OptInt, ProftimeT, WinT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
 /// `bufref_valid()` (not yet translated) only needs to check `buf` when the
@@ -304,6 +307,164 @@ pub struct WinInfo {
     pub wi_changelistidx: i32,
 }
 
+/// Used for `:syntime`: timing of executing a syntax pattern
+/// (`syn_time_T`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SynTimeT {
+    /// total time used
+    pub total: ProftimeT,
+    /// time of slowest call
+    pub slowest: ProftimeT,
+    /// nr of times used
+    pub count: i32,
+    /// nr of times matched
+    pub match_: i32,
+}
+
+/// These are items normally related to a buffer. But when using
+/// `":ownsyntax"` a window may have its own instance (`synblock_T`).
+///
+/// Pointer fields to not-yet-translated types (`regprog_T`, `synstate_T`)
+/// stay raw pointers, matching this crate's established convention for
+/// opaque forward-declared types (see `types_defs.rs`'s placeholder
+/// list) - they become safely typed once those owning files are
+/// translated (phase 7/8).
+pub struct SynblockT {
+    /// syntax keywords hash table
+    pub b_keywtab: HashtabT,
+    /// idem, ignore case
+    pub b_keywtab_ic: HashtabT,
+    /// true when error occurred in HL
+    pub b_syn_error: bool,
+    /// true when `'redrawtime'` reached
+    pub b_syn_slow: bool,
+    /// ignore case for `:syn` cmds
+    pub b_syn_ic: i32,
+    /// how to compute foldlevel on a line
+    pub b_syn_foldlevel: i32,
+    /// `SYNSPL_*` values
+    pub b_syn_spell: i32,
+    /// table for syntax patterns
+    pub b_syn_patterns: GarrayT,
+    /// table for syntax clusters
+    pub b_syn_clusters: GarrayT,
+    /// `@Spell` cluster ID or 0
+    pub b_spell_cluster_id: i32,
+    /// `@NoSpell` cluster ID or 0
+    pub b_nospell_cluster_id: i32,
+    /// true when there is an item with a `"containedin"` argument
+    pub b_syn_containedin: i32,
+    /// flags about how to sync
+    pub b_syn_sync_flags: i32,
+    /// group to sync on
+    pub b_syn_sync_id: i16,
+    /// minimal sync lines offset
+    pub b_syn_sync_minlines: crate::pos_defs::LinenrT,
+    /// maximal sync lines offset
+    pub b_syn_sync_maxlines: crate::pos_defs::LinenrT,
+    /// offset for multi-line pattern
+    pub b_syn_sync_linebreaks: crate::pos_defs::LinenrT,
+    /// line continuation pattern
+    pub b_syn_linecont_pat: Option<Vec<u8>>,
+    /// line continuation program
+    pub b_syn_linecont_prog: *mut crate::types_defs::RegprogT,
+    pub b_syn_linecont_time: SynTimeT,
+    /// ignore-case flag for `b_syn_linecont_pat`
+    pub b_syn_linecont_ic: i32,
+    /// for `":syntax include"`
+    pub b_syn_topgrp: i32,
+    /// auto-conceal for `:syn` cmds
+    pub b_syn_conceal: i32,
+    /// number of patterns with the `HL_FOLD` flag set
+    pub b_syn_folditems: i32,
+
+    // b_sst_array[] contains the state stack for a number of lines, for
+    // the start of that line (col == 0). This avoids having to recompute
+    // the syntax state too often. It is allocated to hold the state for
+    // all displayed lines, and states for 1 out of about 20 other lines.
+    /// pointer to an array of `synstate_T`
+    pub b_sst_array: *mut crate::types_defs::SynstateT,
+    /// number of entries in `b_sst_array[]`
+    pub b_sst_len: i32,
+    /// pointer to first used entry in `b_sst_array[]` or null
+    pub b_sst_first: *mut crate::types_defs::SynstateT,
+    /// pointer to first free entry in `b_sst_array[]` or null
+    pub b_sst_firstfree: *mut crate::types_defs::SynstateT,
+    /// number of free entries
+    pub b_sst_freecount: i32,
+    /// entries after this lnum need to be checked for validity (`MAXLNUM`
+    /// means no check needed)
+    pub b_sst_check_lnum: crate::pos_defs::LinenrT,
+    /// last display tick
+    pub b_sst_lasttick: DisptickT,
+
+    /// Cache for `in_id_list()`; see `idl_cache_T` in `syntax.c`.
+    pub b_idlist_cache: *mut std::ffi::c_void,
+
+    // for spell checking
+    /// list of pointers to `slang_T`, see `spell.c`
+    pub b_langp: GarrayT,
+    /// flags: is midword char
+    pub b_spell_ismw: [bool; 256],
+    /// multi-byte midword chars
+    pub b_spell_ismw_mb: Option<Vec<u8>>,
+    /// `'spellcapcheck'`
+    pub b_p_spc: Option<Vec<u8>>,
+    /// program for `'spellcapcheck'`
+    pub b_cap_prog: *mut crate::types_defs::RegprogT,
+    /// `'spellfile'`
+    pub b_p_spf: Option<Vec<u8>>,
+    /// `'spelllang'`
+    pub b_p_spl: Option<Vec<u8>>,
+    /// `'spelloptions'`
+    pub b_p_spo: Option<Vec<u8>>,
+    /// `'spelloptions'` flags
+    pub b_p_spo_flags: u32,
+    /// all CJK letters as OK
+    pub b_cjk: i32,
+    /// syntax `'iskeyword'` option
+    pub b_syn_chartab: [u8; 32],
+    /// `'iskeyword'` option
+    pub b_syn_isk: Option<Vec<u8>>,
+}
+
+/// Callbacks registered via `nvim_buf_attach` (`BufUpdateCallbacks`).
+#[derive(Debug, Clone, Copy)]
+pub struct BufUpdateCallbacks {
+    pub on_lines: LuaRef,
+    pub on_bytes: LuaRef,
+    pub on_changedtick: LuaRef,
+    pub on_detach: LuaRef,
+    pub on_reload: LuaRef,
+    pub utf_sizes: bool,
+    pub preview: bool,
+}
+
+impl Default for BufUpdateCallbacks {
+    /// `BUF_UPDATE_CALLBACKS_INIT`
+    fn default() -> Self {
+        // `LUA_NOREF`: represents a missing Lua reference (see `types_defs.rs`'s
+        // doc comment on `LuaRef`), matching the local-const convention
+        // already used for this same constant in `decoration_defs.rs`.
+        const LUA_NOREF: LuaRef = -1;
+        BufUpdateCallbacks {
+            on_lines: LUA_NOREF,
+            on_bytes: LUA_NOREF,
+            on_changedtick: LUA_NOREF,
+            on_detach: LUA_NOREF,
+            on_reload: LUA_NOREF,
+            utf_sizes: false,
+            preview: false,
+        }
+    }
+}
+
+pub const BUF_HAS_QF_ENTRY: i32 = 1;
+pub const BUF_HAS_LL_ENTRY: i32 = 2;
+
+/// Maximum number of maphash blocks we will have (`MAX_MAPHASH`).
+pub const MAX_MAPHASH: i32 = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +519,32 @@ mod tests {
         assert!(!wi.wi_optset);
         assert!(wi.wi_folds.is_empty());
         assert_eq!(wi.wi_opt.wo_arab, 0);
+    }
+
+    #[test]
+    fn syn_time_default_is_zeroed() {
+        let st = SynTimeT::default();
+        assert_eq!(st.total, 0);
+        assert_eq!(st.slowest, 0);
+        assert_eq!(st.count, 0);
+        assert_eq!(st.match_, 0);
+    }
+
+    #[test]
+    fn buf_update_callbacks_default_has_no_refs() {
+        let cb = BufUpdateCallbacks::default();
+        assert_eq!(cb.on_lines, -1);
+        assert_eq!(cb.on_bytes, -1);
+        assert_eq!(cb.on_changedtick, -1);
+        assert_eq!(cb.on_detach, -1);
+        assert_eq!(cb.on_reload, -1);
+        assert!(!cb.utf_sizes);
+        assert!(!cb.preview);
+    }
+
+    #[test]
+    fn buf_has_entry_flags_are_distinct_bits() {
+        assert_ne!(BUF_HAS_QF_ENTRY, BUF_HAS_LL_ENTRY);
+        assert_eq!(BUF_HAS_QF_ENTRY & BUF_HAS_LL_ENTRY, 0);
     }
 }
