@@ -1,7 +1,6 @@
-//! Translated from `src/nvim/buffer_defs.h` (partial - `win_T` itself
-//! (`struct window_S`, several hundred lines referencing quickfix/tag
-//! state etc. not yet translated) is substantial and deliberately
-//! deferred to a dedicated pass rather than rushed).
+//! Translated from `src/nvim/buffer_defs.h` (partial - `tabpage_S`, which
+//! needs `dict_T`'s real fields from the eval engine, is deliberately
+//! deferred rather than rushed).
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
 //! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`),
@@ -10,26 +9,33 @@
 //! `WinKind`, `WinSplit`, `WinStyle`, `AlignTextPos`, `BorderTextType`,
 //! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`, `DB_COUNT`,
 //! `diffblock_S`/`diffline_change_S`/`diffline_S` (-> `DiffT`/
-//! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`, and
-//! now `struct file_buffer` (-> [`BufT`]) itself, including its
-//! buffer-local options block.
+//! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`,
+//! `struct file_buffer` (-> [`BufT`]) itself including its
+//! buffer-local-options block, `FR_LEAF`/`FR_ROW`/`FR_COL` and `struct
+//! frame_S` (-> [`FrameT`]), and now `struct window_S` (-> [`WinT`])
+//! itself.
 //!
 //! Deferred: `match_T`/`llpos_T`/`matchitem_T` (need `regmmatch_T`,
-//! `regexp_defs.h`, phase 7), `window_S` itself, `tabpage_S` (needs
-//! `dict_T`'s real fields, the eval engine), and `frame_S`.
+//! `regexp_defs.h`, phase 7 - `matchitem_T`'s opaque placeholder,
+//! `crate::types_defs::MatchitemT`, is enough for `WinT.w_match_head`'s
+//! pointer field for now), and `tabpage_S` (needs `dict_T`'s real
+//! fields, the eval engine).
 
+use crate::arglist_defs::AlistT;
 use crate::eval::typval_defs::{Callback, ChangedtickDictItem, DictT, ScopeDictDictItem, SctxT, VarnumberT};
 use crate::garray_defs::GarrayT;
+use crate::grid_defs::{GridView, ScreenGrid};
 use crate::hashtab_defs::HashtabT;
-use crate::map::Map;
-use crate::mark_defs::{FmarkT, JUMPLISTSIZE, NMARKS};
+use crate::map::{Map, Set};
+use crate::mark_defs::{FmarkT, JUMPLISTSIZE, NMARKS, TAGSTACKSIZE, XfmarkT};
 use crate::marktree_defs::MarkTree;
 use crate::memline_defs::MemlineT;
 use crate::os::fs_defs::FileID;
 use crate::os::time_defs::Timestamp;
 use crate::pos_defs::{ColnrT, LinenrT, PosT};
 use crate::sign_defs::SIGN_SHOW_MAX;
-use crate::types_defs::{HandleT, LuaRef, MapblockT, OptInt, ProftimeT, TerminalT, WinT};
+use crate::statusline_defs::{StcClicks, StlClickDefinition};
+use crate::types_defs::{HandleT, LuaRef, MapblockT, MatchitemT, OptInt, ProftimeT, QfInfoT, TerminalT};
 use crate::undo_defs::{UHeader, VisualinfoT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
@@ -120,7 +126,7 @@ pub mod b_flags {
 pub type DisptickT = u64;
 
 /// Used to store the information about a `:tag` command (`taggy_T`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TaggyT {
     /// tag name
     pub tagname: Vec<u8>,
@@ -1743,6 +1749,667 @@ impl Default for BufT {
     }
 }
 
+/// leaf frame, contains a window (`FR_LEAF`).
+pub const FR_LEAF: u8 = 0;
+/// frame with a row of windows (`FR_ROW`).
+pub const FR_ROW: u8 = 1;
+/// frame with a column of windows (`FR_COL`).
+pub const FR_COL: u8 = 2;
+
+/// Windows are kept in a tree of frames. Each frame has a column
+/// (`FR_COL`) or row (`FR_ROW`) layout or is a leaf, which has a window
+/// (`struct frame_S`, typedef'd as `frame_T`).
+///
+/// `fr_child`/`fr_win` are mutually exclusive in the original (an inner
+/// frame has children, a leaf frame has a window); kept as two raw
+/// pointer fields, not an enum, to stay a direct field-for-field mirror
+/// of the original since nothing here enforces the invariant in Rust's
+/// type system any more strongly than the original C did.
+pub struct FrameT {
+    /// `FR_LEAF`, `FR_COL` or `FR_ROW`
+    pub fr_layout: u8,
+    pub fr_width: i32,
+    /// new width used in `win_equal_rec()`
+    pub fr_newwidth: i32,
+    pub fr_height: i32,
+    /// new height used in `win_equal_rec()`
+    pub fr_newheight: i32,
+    /// containing frame or `NULL`
+    pub fr_parent: *mut FrameT,
+    /// frame right or below in same parent, `NULL` for last
+    pub fr_next: *mut FrameT,
+    /// frame left or above in same parent, `NULL` for first
+    pub fr_prev: *mut FrameT,
+    /// first contained frame
+    pub fr_child: *mut FrameT,
+    /// window that fills this frame; for a snapshot set to the current
+    /// window
+    pub fr_win: *mut WinT,
+}
+
+impl Default for FrameT {
+    fn default() -> Self {
+        FrameT {
+            fr_layout: FR_LEAF,
+            fr_width: 0,
+            fr_newwidth: 0,
+            fr_height: 0,
+            fr_newheight: 0,
+            fr_parent: std::ptr::null_mut(),
+            fr_next: std::ptr::null_mut(),
+            fr_prev: std::ptr::null_mut(),
+            fr_child: std::ptr::null_mut(),
+            fr_win: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Structure which contains all information that belongs to a window
+/// (`struct window_S`, typedef'd as `win_T`).
+///
+/// All row numbers are relative to the start of the window, except
+/// `w_winrow`.
+///
+/// Kept under the name `WinT` (matching `win_T`, the name used
+/// throughout the rest of the original codebase), replacing the opaque
+/// placeholder that previously lived in `types_defs.rs` - same treatment
+/// as `BufT`/`struct file_buffer` above.
+pub struct WinT {
+    /// unique identifier for the window
+    pub handle: HandleT,
+
+    /// buffer we are a window into (used often; the original keeps it as
+    /// the first struct member for a performance reason that no longer
+    /// applies to a Rust struct, kept here only for field-order fidelity
+    /// with the original).
+    pub w_buffer: *mut BufT,
+
+    /// for `":ownsyntax"`
+    pub w_s: *mut SynblockT,
+
+    pub w_ns_hl: i32,
+    pub w_ns_hl_winhl: i32,
+    pub w_ns_hl_active: i32,
+    pub w_ns_hl_attr: *mut i32,
+
+    pub w_ns_set: Set<u32>,
+
+    /// `'winhighlight'` normal id
+    pub w_hl_id_normal: i32,
+    /// `'winhighlight'` normal final attrs
+    pub w_hl_attr_normal: i32,
+    /// `'winhighlight'` `NormalNC` final attrs
+    pub w_hl_attr_normalnc: i32,
+
+    /// attrs need to be recalculated
+    pub w_hl_needs_update: i32,
+
+    /// link to previous window
+    pub w_prev: *mut WinT,
+    /// link to next window
+    pub w_next: *mut WinT,
+    /// don't let autocommands close the window
+    pub w_locked: i32,
+
+    /// frame containing this window
+    pub w_frame: *mut FrameT,
+
+    /// cursor position in buffer
+    pub w_cursor: PosT,
+
+    /// Column we want to be at. This is used to try to stay in the same
+    /// column for up/down cursor motions.
+    pub w_curswant: ColnrT,
+
+    /// If set, then update `w_curswant` the next time through
+    /// `cursupdate()` to the current virtual column
+    pub w_set_curswant: bool,
+
+    /// Where `'cursorline'` should be drawn, can be different from
+    /// `w_cursor.lnum` for closed folds.
+    pub w_cursorline: LinenrT,
+    /// where last `'cursorline'` was drawn
+    pub w_last_cursorline: LinenrT,
+
+    // The next seven are used to update the visual part.
+    /// last known `Visual.mode`
+    pub w_old_visual_mode: u8,
+    /// last known end of visual part
+    pub w_old_cursor_lnum: LinenrT,
+    /// first column for block visual part
+    pub w_old_cursor_fcol: ColnrT,
+    /// last column for block visual part
+    pub w_old_cursor_lcol: ColnrT,
+    /// last known start of visual part
+    pub w_old_visual_lnum: LinenrT,
+    /// last known start of visual part
+    pub w_old_visual_col: ColnrT,
+    /// last known value of Curswant
+    pub w_old_curswant: ColnrT,
+
+    /// cursor lnum when `'rnu'` was last redrawn
+    pub w_last_cursor_lnum_rnu: LinenrT,
+
+    /// `'listchars'` characters. Defaults set in `set_chars_option()`.
+    pub w_p_lcs_chars: LcsCharsT,
+
+    /// `'fillchars'` characters. Defaults set in `set_chars_option()`.
+    pub w_p_fcs_chars: FcsCharsT,
+
+    // "w_topline", "w_leftcol" and "w_skipcol" specify the offsets for
+    // displaying the buffer.
+    /// buffer line number of the line at the top of the window
+    pub w_topline: LinenrT,
+    /// flag set to true when topline is set, e.g. by `winrestview()`
+    pub w_topline_was_set: bool,
+    /// number of filler lines above `w_topline`
+    pub w_topfill: i32,
+    /// `w_topfill` at last redraw
+    pub w_old_topfill: i32,
+    /// true when filler lines are actually below `w_topline` (at end of
+    /// file)
+    pub w_botfill: bool,
+    /// `w_botfill` at last redraw
+    pub w_old_botfill: bool,
+    /// screen column number of the left most character in the window;
+    /// used when `'wrap'` is off
+    pub w_leftcol: ColnrT,
+    /// starting screen column for the first line in the window; used
+    /// when `'wrap'` is on; does not include `win_col_off()`
+    pub w_skipcol: ColnrT,
+
+    // Six fields that are only used when there is a WinScrolled
+    // autocommand.
+    /// last known value for `w_topline`
+    pub w_last_topline: LinenrT,
+    /// last known value for `w_topfill`
+    pub w_last_topfill: i32,
+    /// last known value for `w_leftcol`
+    pub w_last_leftcol: ColnrT,
+    /// last known value for `w_skipcol`
+    pub w_last_skipcol: ColnrT,
+    /// last known value for `w_width`
+    pub w_last_width: i32,
+    /// last known value for `w_height`
+    pub w_last_height: i32,
+
+    // Layout of the window in the screen. May need to add
+    // "msg_scrolled" to "w_winrow" in rare situations.
+    /// first row of window in screen
+    pub w_winrow: i32,
+    /// number of rows in window, excluding status/command line(s)
+    pub w_height: i32,
+    /// previous winrow used for `'splitkeep'`
+    pub w_prev_winrow: i32,
+    /// previous height used for `'splitkeep'`
+    pub w_prev_height: i32,
+    /// number of status lines (0 or 1)
+    pub w_status_height: i32,
+    /// number of window bars (0 or 1)
+    pub w_winbar_height: i32,
+    /// Leftmost column of window in screen.
+    pub w_wincol: i32,
+    /// Width of window, excluding separation.
+    pub w_width: i32,
+    /// Number of horizontal separator rows (0 or 1)
+    pub w_hsep_height: i32,
+    /// Number of vertical separator columns (0 or 1).
+    pub w_vsep_width: i32,
+    /// backup of cursor pos and topline
+    pub w_save_cursor: PosSaveT,
+    /// if true cursor may be invalid
+    pub w_do_win_fix_cursor: bool,
+
+    /// offset from winrow to the inner window area
+    pub w_winrow_off: i32,
+    /// offset from wincol to the inner window area; this includes float
+    /// border but excludes special columns implemented in `win_line()`
+    /// (i.e. signs, folds, numbers)
+    pub w_wincol_off: i32,
+
+    // Size of the window viewport. This is the area usable to draw
+    // columns and buffer contents.
+    pub w_view_height: i32,
+    pub w_view_width: i32,
+    // External UI request. If non-zero, the inner size will use this.
+    pub w_height_request: i32,
+    pub w_width_request: i32,
+
+    /// top, right, bottom, left
+    pub w_border_adj: [i32; 4],
+    // outer size of window grid, including border
+    pub w_height_outer: i32,
+    pub w_width_outer: i32,
+
+    // === start of cached values ====
+    // Recomputing is minimized by storing the result of computations.
+    // Use functions in screen.c to check if they are valid and to
+    // update. w_valid is a bitfield of flags, which indicate if specific
+    // values are valid or need to be recomputed.
+    pub w_valid: i32,
+    /// last known position of `w_cursor`, used to adjust `w_valid`
+    pub w_valid_cursor: PosT,
+    /// last known `w_leftcol`
+    pub w_valid_leftcol: ColnrT,
+    /// last known `w_skipcol`
+    pub w_valid_skipcol: ColnrT,
+
+    pub w_viewport_invalid: bool,
+    /// topline when the viewport was last updated
+    pub w_viewport_last_topline: LinenrT,
+    /// botline when the viewport was last updated
+    pub w_viewport_last_botline: LinenrT,
+    /// topfill when the viewport was last updated
+    pub w_viewport_last_topfill: LinenrT,
+    /// skipcol when the viewport was last updated
+    pub w_viewport_last_skipcol: LinenrT,
+
+    // w_cline_height is the number of physical lines taken by the
+    // buffer line that the cursor is on. We use this to avoid extra
+    // calls to plines_win().
+    /// current size of cursor line
+    pub w_cline_height: i32,
+    /// cursor line is folded
+    pub w_cline_folded: bool,
+
+    /// starting row of the cursor line
+    pub w_cline_row: i32,
+
+    /// column number of the cursor in the buffer line, as opposed to the
+    /// column number we're at on the screen. This makes a difference on
+    /// lines which span more than one screen line or when `w_leftcol` is
+    /// non-zero
+    pub w_virtcol: ColnrT,
+
+    // w_wrow and w_wcol specify the cursor position in the window. This
+    // is related to positions in the window, not in the display or
+    // buffer, thus w_wrow is relative to w_winrow.
+    /// cursor position in window
+    pub w_wrow: i32,
+    pub w_wcol: i32,
+    /// screen cells concealed before `w_wcol` on the cursor's screen
+    /// line, set by `win_line()`
+    pub w_wcol_conceal_off: i32,
+
+    /// number of the line below the bottom of the window
+    pub w_botline: LinenrT,
+    /// number of ~ rows in window
+    pub w_empty_rows: i32,
+    /// number of filler rows at the end of the window
+    pub w_filler_rows: i32,
+
+    // Info about the lines currently in the window is remembered to
+    // avoid recomputing it every time. The allocated size of w_lines[]
+    // is Rows. Only the w_lines_valid entries are actually valid. When
+    // the display is up-to-date w_lines[0].wl_lnum is equal to w_topline
+    // and w_lines[w_lines_valid - 1].wl_lnum is equal to w_botline.
+    // Between changing text and updating the display w_lines[]
+    // represents what is currently displayed. wl_valid is reset to
+    // indicate this. This is used for efficient redrawing.
+    /// number of valid entries
+    pub w_lines_valid: i32,
+    /// in place of the original's raw `wline_T *w_lines` pointer to a
+    /// heap-allocated array; `w_lines_size` (the *allocated* capacity,
+    /// "Rows"-sized) is dropped as redundant with `Vec::len()` - unlike
+    /// `w_lines_valid` above, which is a distinct *logical validity*
+    /// count (may be less than the allocated/current length) and is
+    /// kept as its own field.
+    pub w_lines: Vec<WlineT>,
+
+    /// array of nested folds
+    pub w_folds: GarrayT,
+    /// when true: some folds are opened/closed manually
+    pub w_fold_manual: bool,
+    /// when true: folding needs to be recomputed
+    pub w_foldinvalid: bool,
+    /// width of `'number'` and `'relativenumber'` column being used
+    pub w_nrwidth: i32,
+    /// width of `'signcolumn'`
+    pub w_scwidth: i32,
+    /// minimum width or `SCL_NO`/`SCL_NUM`
+    pub w_minscwidth: i32,
+    /// maximum width or `SCL_NO`/`SCL_NUM`
+    pub w_maxscwidth: i32,
+    // === end of cached values ===
+    /// type of redraw to be performed on win
+    pub w_redr_type: i32,
+    /// number of window lines to update when `w_redr_type` is
+    /// `UPD_REDRAW_TOP`
+    pub w_upd_rows: i32,
+    /// when != 0: first line needing redraw
+    pub w_redraw_top: LinenrT,
+    /// when != 0: last line needing redraw
+    pub w_redraw_bot: LinenrT,
+    /// if true statusline/winbar must be redrawn
+    pub w_redr_status: bool,
+    /// if true border must be redrawn
+    pub w_redr_border: bool,
+    /// if true `'statuscolumn'` must be redrawn
+    pub w_redr_statuscol: bool,
+    /// when window was last drawn.
+    pub w_display_tick: DisptickT,
+
+    // Remember what is shown in the 'statusline'-format elements.
+    /// cursor position when last redrawn
+    pub w_stl_cursor: PosT,
+    /// virtcol when last redrawn
+    pub w_stl_virtcol: ColnrT,
+    /// topline when last redrawn
+    pub w_stl_topline: LinenrT,
+    /// line count when last redrawn
+    pub w_stl_line_count: LinenrT,
+    /// topfill when last redrawn
+    pub w_stl_topfill: i32,
+    /// true if elements show 0-1 (empty line) (`char` in the original,
+    /// but assigned exactly from a `bool` at every real call site -
+    /// `curwin->w_stl_empty = (char)empty_line;` in `drawscreen.c` -
+    /// verified before choosing `bool` over a `u8`/byte translation).
+    pub w_stl_empty: bool,
+    /// `reg_recording` when last redrawn
+    pub w_stl_recording: i32,
+    /// `get_real_state()` when last redrawn
+    pub w_stl_state: i32,
+    /// `Visual.mode` when last redrawn
+    pub w_stl_visual_mode: i32,
+    /// `Visual.start` when last redrawn
+    pub w_stl_visual_pos: PosT,
+
+    /// alternate file (for # and CTRL-^)
+    pub w_alt_fnum: i32,
+
+    /// pointer to arglist for this window
+    pub w_alist: *mut AlistT,
+    /// current index in argument list (can be out of range!)
+    pub w_arg_idx: i32,
+    /// editing another file than `w_arg_idx`
+    pub w_arg_idx_invalid: bool,
+
+    /// absolute path of local directory or `NULL`
+    pub w_localdir: Option<Vec<u8>>,
+    /// previous directory
+    pub w_prevdir: Option<Vec<u8>>,
+
+    // Options local to a window. They are local because they influence
+    // the layout of the window or depend on the window layout. There
+    // are two values: w_onebuf_opt is local to the buffer currently in
+    // this window, w_allbuf_opt is for all buffers in this window.
+    pub w_onebuf_opt: WinoptT,
+    pub w_allbuf_opt: WinoptT,
+
+    /// array of columns to highlight or `NULL`
+    pub w_p_cc_cols: Option<Vec<i32>>,
+    /// flags for cursorline highlighting
+    pub w_p_culopt_flags: u8,
+
+    /// minimum width for breakindent
+    pub w_briopt_min: i32,
+    /// additional shift for breakindent
+    pub w_briopt_shift: i32,
+    /// sbr in `'briopt'`
+    pub w_briopt_sbr: bool,
+    /// additional indent for lists
+    pub w_briopt_list: i32,
+    /// indent for specific column
+    pub w_briopt_vcol: i32,
+
+    pub w_scbind_pos: i32,
+
+    /// Variable for "w:" dict.
+    pub w_winvar: ScopeDictDictItem,
+    /// Dict with w: variables.
+    pub w_vars: *mut DictT,
+
+    // The w_prev_pcmark field is used to check whether we really did
+    // jump to a new line after setting the w_pcmark. If not, then we
+    // revert to using the previous w_pcmark.
+    /// previous context mark
+    pub w_pcmark: PosT,
+    /// previous `w_pcmark`
+    pub w_prev_pcmark: PosT,
+
+    // The jumplist contains old cursor positions.
+    pub w_jumplist: [XfmarkT; JUMPLISTSIZE as usize],
+    /// number of active entries
+    pub w_jumplistlen: i32,
+    /// current position
+    pub w_jumplistidx: i32,
+
+    /// current position in `b_changelist`
+    pub w_changelistidx: i32,
+
+    /// head of match list
+    pub w_match_head: *mut MatchitemT,
+    /// next match ID
+    pub w_next_match_id: i32,
+
+    // The tagstack grows from 0 upwards:
+    // entry 0: older
+    // entry 1: newer
+    // entry 2: newest
+    /// the tag stack
+    pub w_tagstack: [TaggyT; TAGSTACKSIZE as usize],
+    /// idx just below active entry
+    pub w_tagstackidx: i32,
+    /// number of tags on stack
+    pub w_tagstacklen: i32,
+
+    /// area to draw on, excluding borders and winbar
+    pub w_grid: GridView,
+    /// the grid specific to the window
+    pub w_grid_alloc: ScreenGrid,
+    /// true if window position changed
+    pub w_pos_changed: bool,
+    /// whether the window is floating
+    pub w_floating: bool,
+    /// mutually-exclusive window role
+    pub w_kind: WinKind,
+    pub w_config: WinConfig,
+
+    // w_fraction is the fractional row of the cursor within the window,
+    // from 0 at the top row to FRACTION_MULT at the last row.
+    // w_prev_fraction_row was the actual cursor row when w_fraction was
+    // last calculated.
+    pub w_fraction: i32,
+    pub w_prev_fraction_row: i32,
+
+    /// line count when `ml_nrwidth_width` was computed.
+    pub w_nrwidth_line_count: LinenrT,
+    /// line count when `'statuscolumn'` width was computed.
+    pub w_statuscol_line_count: LinenrT,
+    /// nr of chars to print line count.
+    pub w_nrwidth_width: i32,
+
+    /// Location list for this window
+    pub w_llist: *mut QfInfoT,
+    /// Location list reference used in the location list window. In a
+    /// non-location list window, `w_llist_ref` is `NULL`.
+    pub w_llist_ref: *mut QfInfoT,
+
+    /// Status line click definitions (in place of the original's raw
+    /// `StlClickDefinition *w_status_click_defs` pointer + separate
+    /// `w_status_click_defs_size` - folded into a single `Vec`, dropping
+    /// the now-redundant size field, same as `UEntry.ue_array`/`ue_size`
+    /// in `undo_defs.rs`).
+    pub w_status_click_defs: Vec<StlClickDefinition>,
+    /// Window bar click definitions (same `Vec`-folding as
+    /// `w_status_click_defs` above).
+    pub w_winbar_click_defs: Vec<StlClickDefinition>,
+    /// Map of statuscolumn click definitions, indexed by `v:lnum` and
+    /// `v:virtnum` (`Map(int, StcClicks) w_statuscol_click_defs[1]` in
+    /// the original - the same single-element-array-for-by-value idiom
+    /// as `BufT.b_marktree`/`b_extmark_ns`, translated as a plain
+    /// by-value field).
+    pub w_statuscol_click_defs: Map<i32, StcClicks>,
+}
+
+impl Default for WinT {
+    /// A purely mechanical, structural default, same caveat as
+    /// `BufT`'s: not a translation of `win_alloc()`'s real "freshly
+    /// created window" initial state (which needs e.g. option.c's
+    /// defaults table for `w_onebuf_opt`/`w_allbuf_opt`, phase 4).
+    fn default() -> Self {
+        WinT {
+            handle: 0,
+            w_buffer: std::ptr::null_mut(),
+            w_s: std::ptr::null_mut(),
+            w_ns_hl: 0,
+            w_ns_hl_winhl: 0,
+            w_ns_hl_active: 0,
+            w_ns_hl_attr: std::ptr::null_mut(),
+            w_ns_set: Set::default(),
+            w_hl_id_normal: 0,
+            w_hl_attr_normal: 0,
+            w_hl_attr_normalnc: 0,
+            w_hl_needs_update: 0,
+            w_prev: std::ptr::null_mut(),
+            w_next: std::ptr::null_mut(),
+            w_locked: 0,
+            w_frame: std::ptr::null_mut(),
+            w_cursor: PosT::default(),
+            w_curswant: 0,
+            w_set_curswant: false,
+            w_cursorline: 0,
+            w_last_cursorline: 0,
+            w_old_visual_mode: 0,
+            w_old_cursor_lnum: 0,
+            w_old_cursor_fcol: 0,
+            w_old_cursor_lcol: 0,
+            w_old_visual_lnum: 0,
+            w_old_visual_col: 0,
+            w_old_curswant: 0,
+            w_last_cursor_lnum_rnu: 0,
+            w_p_lcs_chars: LcsCharsT::default(),
+            w_p_fcs_chars: FcsCharsT::default(),
+            w_topline: 0,
+            w_topline_was_set: false,
+            w_topfill: 0,
+            w_old_topfill: 0,
+            w_botfill: false,
+            w_old_botfill: false,
+            w_leftcol: 0,
+            w_skipcol: 0,
+            w_last_topline: 0,
+            w_last_topfill: 0,
+            w_last_leftcol: 0,
+            w_last_skipcol: 0,
+            w_last_width: 0,
+            w_last_height: 0,
+            w_winrow: 0,
+            w_height: 0,
+            w_prev_winrow: 0,
+            w_prev_height: 0,
+            w_status_height: 0,
+            w_winbar_height: 0,
+            w_wincol: 0,
+            w_width: 0,
+            w_hsep_height: 0,
+            w_vsep_width: 0,
+            w_save_cursor: PosSaveT::default(),
+            w_do_win_fix_cursor: false,
+            w_winrow_off: 0,
+            w_wincol_off: 0,
+            w_view_height: 0,
+            w_view_width: 0,
+            w_height_request: 0,
+            w_width_request: 0,
+            w_border_adj: [0; 4],
+            w_height_outer: 0,
+            w_width_outer: 0,
+            w_valid: 0,
+            w_valid_cursor: PosT::default(),
+            w_valid_leftcol: 0,
+            w_valid_skipcol: 0,
+            w_viewport_invalid: false,
+            w_viewport_last_topline: 0,
+            w_viewport_last_botline: 0,
+            w_viewport_last_topfill: 0,
+            w_viewport_last_skipcol: 0,
+            w_cline_height: 0,
+            w_cline_folded: false,
+            w_cline_row: 0,
+            w_virtcol: 0,
+            w_wrow: 0,
+            w_wcol: 0,
+            w_wcol_conceal_off: 0,
+            w_botline: 0,
+            w_empty_rows: 0,
+            w_filler_rows: 0,
+            w_lines_valid: 0,
+            w_lines: Vec::new(),
+            w_folds: GarrayT::default(),
+            w_fold_manual: false,
+            w_foldinvalid: false,
+            w_nrwidth: 0,
+            w_scwidth: 0,
+            w_minscwidth: 0,
+            w_maxscwidth: 0,
+            w_redr_type: 0,
+            w_upd_rows: 0,
+            w_redraw_top: 0,
+            w_redraw_bot: 0,
+            w_redr_status: false,
+            w_redr_border: false,
+            w_redr_statuscol: false,
+            w_display_tick: 0,
+            w_stl_cursor: PosT::default(),
+            w_stl_virtcol: 0,
+            w_stl_topline: 0,
+            w_stl_line_count: 0,
+            w_stl_topfill: 0,
+            w_stl_empty: false,
+            w_stl_recording: 0,
+            w_stl_state: 0,
+            w_stl_visual_mode: 0,
+            w_stl_visual_pos: PosT::default(),
+            w_alt_fnum: 0,
+            w_alist: std::ptr::null_mut(),
+            w_arg_idx: 0,
+            w_arg_idx_invalid: false,
+            w_localdir: None,
+            w_prevdir: None,
+            w_onebuf_opt: WinoptT::default(),
+            w_allbuf_opt: WinoptT::default(),
+            w_p_cc_cols: None,
+            w_p_culopt_flags: 0,
+            w_briopt_min: 0,
+            w_briopt_shift: 0,
+            w_briopt_sbr: false,
+            w_briopt_list: 0,
+            w_briopt_vcol: 0,
+            w_scbind_pos: 0,
+            w_winvar: ScopeDictDictItem::default(),
+            w_vars: std::ptr::null_mut(),
+            w_pcmark: PosT::default(),
+            w_prev_pcmark: PosT::default(),
+            w_jumplist: std::array::from_fn(|_| XfmarkT::default()),
+            w_jumplistlen: 0,
+            w_jumplistidx: 0,
+            w_changelistidx: 0,
+            w_match_head: std::ptr::null_mut(),
+            w_next_match_id: 0,
+            w_tagstack: std::array::from_fn(|_| TaggyT::default()),
+            w_tagstackidx: 0,
+            w_tagstacklen: 0,
+            w_grid: GridView::default(),
+            w_grid_alloc: ScreenGrid::default(),
+            w_pos_changed: false,
+            w_floating: false,
+            w_kind: WinKind::default(),
+            w_config: WinConfig::default(),
+            w_fraction: 0,
+            w_prev_fraction_row: 0,
+            w_nrwidth_line_count: 0,
+            w_statuscol_line_count: 0,
+            w_nrwidth_width: 0,
+            w_llist: std::ptr::null_mut(),
+            w_llist_ref: std::ptr::null_mut(),
+            w_status_click_defs: Vec::new(),
+            w_winbar_click_defs: Vec::new(),
+            w_statuscol_click_defs: Map::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1977,5 +2644,61 @@ mod tests {
         assert_eq!(buf.b_ffu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
         assert_eq!(buf.b_prompt_callback.kind(), crate::eval::typval_defs::CallbackType::None);
         assert!(buf.b_p_cpt_cb.is_empty());
+    }
+
+    #[test]
+    fn frame_default_is_leaf_with_null_pointers() {
+        let f = FrameT::default();
+        assert_eq!(f.fr_layout, FR_LEAF);
+        assert!(f.fr_parent.is_null());
+        assert!(f.fr_next.is_null());
+        assert!(f.fr_prev.is_null());
+        assert!(f.fr_child.is_null());
+        assert!(f.fr_win.is_null());
+    }
+
+    #[test]
+    fn frame_layout_constants_are_distinct() {
+        assert_eq!(FR_LEAF, 0);
+        assert_eq!(FR_ROW, 1);
+        assert_eq!(FR_COL, 2);
+    }
+
+    #[test]
+    fn win_default_has_null_links_and_empty_collections() {
+        let win = WinT::default();
+        assert_eq!(win.handle, 0);
+        assert!(win.w_buffer.is_null());
+        assert!(win.w_s.is_null());
+        assert!(win.w_prev.is_null());
+        assert!(win.w_next.is_null());
+        assert!(win.w_frame.is_null());
+        assert_eq!(win.w_ns_set.len(), 0);
+        assert!(win.w_lines.is_empty());
+        assert_eq!(win.w_lines_valid, 0);
+        assert_eq!(win.w_jumplist.len(), JUMPLISTSIZE as usize);
+        assert_eq!(win.w_tagstack.len(), TAGSTACKSIZE as usize);
+        assert!(win.w_alist.is_null());
+        assert!(win.w_localdir.is_none());
+        assert!(win.w_vars.is_null());
+        assert!(win.w_match_head.is_null());
+        assert!(win.w_llist.is_null());
+        assert!(win.w_llist_ref.is_null());
+        assert!(win.w_status_click_defs.is_empty());
+        assert!(win.w_winbar_click_defs.is_empty());
+        assert_eq!(win.w_statuscol_click_defs.len(), 0);
+        assert_eq!(win.w_kind, WinKind::Normal);
+        assert!(!win.w_floating);
+    }
+
+    #[test]
+    fn win_default_cursor_and_visual_state_is_zeroed() {
+        let win = WinT::default();
+        assert_eq!(win.w_cursor, PosT::default());
+        assert_eq!(win.w_old_visual_mode, 0);
+        assert!(!win.w_set_curswant);
+        assert_eq!(win.w_config.height, 0);
+        assert!(win.w_config.focusable);
+        assert!(win.w_config.mouse);
     }
 }

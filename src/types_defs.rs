@@ -86,25 +86,29 @@ pub const SIGN_WIDTH: i32 = 2;
 // each becomes a real type when its owning file is translated. Kept as
 // opaque placeholder structs until then - never silently faked, just not
 // yet implemented:
-//   Loop       -> struct loop,        src/nvim/event/loop.h    (phase 11)
-//   regprog_T  -> struct regprog,     src/nvim/regexp_defs.h   (phase 7)
-//   synstate_T -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
-//   Terminal   -> struct terminal,    src/nvim/terminal.h      (phase 14)
-//   win_T      -> struct window_S,    src/nvim/buffer_defs.h   (phase 3/8)
-//   qf_info_T  -> struct qf_info_S,   src/nvim/quickfix.c      (phase 8)
-//   mapblock_T -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
-// (mapblock_T/qf_info_T are actually forward-declared in their own headers,
-// not types_defs.h itself, unlike the others above - but this crate keeps
-// all such opaque cross-cutting placeholders here regardless of exactly
-// which original header contains the forward declaration, since Rust has
-// no forward-declaration mechanism of its own to mirror precisely.)
+//   Loop        -> struct loop,        src/nvim/event/loop.h    (phase 11)
+//   regprog_T   -> struct regprog,     src/nvim/regexp_defs.h   (phase 7)
+//   synstate_T  -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
+//   Terminal    -> struct terminal,    src/nvim/terminal.h      (phase 14)
+//   qf_info_T   -> struct qf_info_S,   src/nvim/quickfix.c      (phase 8)
+//   mapblock_T  -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
+//   matchitem_T -> struct matchitem,   src/nvim/buffer_defs.h   (phase 7,
+//                                      needs regmmatch_T)
+// (mapblock_T/qf_info_T/matchitem_T are actually forward-declared in their
+// own headers, not types_defs.h itself, unlike the others above - but this
+// crate keeps all such opaque cross-cutting placeholders here regardless
+// of exactly which original header contains the forward declaration,
+// since Rust has no forward-declaration mechanism of its own to mirror
+// precisely.)
 // MTNode (struct mtnode_s) is no longer a placeholder here: it is now
 // translated for real in `src/nvim/marktree_defs.h` -> `crate::marktree_defs::MtNode`.
-// buf_T (struct file_buffer) is likewise no longer a placeholder: it is
-// now translated for real as `crate::buffer_defs::BufT` (kept under the
-// same name, since `buf_T` - not `FileBuffer` - is the name actually used
-// throughout the rest of the original codebase; matches this crate's
-// "prefer the real typedef name" convention, e.g. `wininfo_S` -> `WinInfo`).
+// buf_T (struct file_buffer) and win_T (struct window_S) are likewise no
+// longer placeholders: they are now translated for real as
+// `crate::buffer_defs::BufT`/`crate::buffer_defs::WinT` (kept under the
+// same names, since `buf_T`/`win_T` - not `FileBuffer`/`Window` - are the
+// names actually used throughout the rest of the original codebase;
+// matches this crate's "prefer the real typedef name" convention, e.g.
+// `wininfo_S` -> `WinInfo`).
 
 /// Placeholder for `Loop` (`struct loop`) - see `src/nvim/event/loop.h` (phase 11).
 pub struct LoopT {
@@ -122,16 +126,18 @@ pub struct SynstateT {
 pub struct TerminalT {
     _private: (),
 }
-/// Placeholder for `win_T` (`struct window_S`) - see `src/nvim/buffer_defs.h` (phase 3/8).
-pub struct WinT {
-    _private: (),
-}
 /// Placeholder for `qf_info_T` (`struct qf_info_S`) - see `src/nvim/quickfix.c` (phase 8).
 pub struct QfInfoT {
     _private: (),
 }
 /// Placeholder for `mapblock_T` (`struct mapblock`) - see `src/nvim/mapping_defs.h` (phase 7).
 pub struct MapblockT {
+    _private: (),
+}
+/// Placeholder for `matchitem_T` (`struct matchitem`) - see
+/// `src/nvim/buffer_defs.h` (phase 7: needs `regmmatch_T`, same blocker as
+/// `match_T`/`llpos_T`, which are deferred for the same reason).
+pub struct MatchitemT {
     _private: (),
 }
 

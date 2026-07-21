@@ -134,6 +134,16 @@ pub struct StcClick {
     pub def: Vec<StlClickDefinition>,
 }
 
+/// A set of `'statuscolumn'` click definitions, indexed by an arbitrary
+/// integer key (`v:lnum`/`v:virtnum`) (`StcClicks`, a `Map(int,
+/// StcClick)` instantiation of the original's per-type `Map(K, V)`
+/// macro - translated directly as a use of this crate's own generic
+/// [`crate::map::Map`], same as every other `Map(K, V)`/`Set(K)`
+/// instantiation elsewhere in this crate, per `map_defs.h`'s own
+/// deferred-as-a-real-file status: only its generic replacement,
+/// `map.rs`, was translated, not a per-type-alias-generating file).
+pub type StcClicks = crate::map::Map<i32, StcClick>;
+
 /// Used for tabline clicks (`StlClickRecord`).
 #[derive(Debug, Clone)]
 pub struct StlClickRecord {
