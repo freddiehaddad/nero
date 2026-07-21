@@ -30,6 +30,7 @@ pub mod iconv_defs;
 pub mod log;
 pub mod macros_defs;
 pub mod map;
+pub mod marktree_defs;
 pub mod math;
 pub mod memory;
 pub mod memory_defs;
