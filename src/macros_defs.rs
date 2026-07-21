@@ -87,12 +87,10 @@ pub fn ascii_isalpha(c: i32) -> bool {
     ascii_isupper(c) || ascii_islower(c)
 }
 
-/// `ASCII_ISALNUM(c)` - depends on `ascii_isdigit()` (`src/nvim/charset.c`,
-/// phase 2). Implemented directly here since ASCII digit-checking needs no
-/// locale/state: matches `ascii_isdigit()`'s definition (`'0'..='9'`).
+/// `ASCII_ISALNUM(c)`
 #[inline]
 pub fn ascii_isalnum(c: i32) -> bool {
-    ascii_isalpha(c) || (b'0' as i32..=b'9' as i32).contains(&c)
+    ascii_isalpha(c) || crate::ascii_defs::ascii_isdigit(c)
 }
 
 /// `RGB_(r, g, b)`
@@ -110,4 +108,42 @@ pub const APPENDBIN: &str = "ab";
 #[inline]
 pub fn empty_pos(a: &PosT) -> bool {
     a.lnum == 0 && a.col == 0 && a.coladd == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_packs_channels() {
+        assert_eq!(rgb_(0xff, 0x00, 0x00), 0x00ff_0000);
+        assert_eq!(rgb_(0x00, 0xff, 0x00), 0x0000_ff00);
+        assert_eq!(rgb_(0x00, 0x00, 0xff), 0x0000_00ff);
+        assert_eq!(rgb_(0x12, 0x34, 0x56), 0x0012_3456);
+    }
+
+    #[test]
+    fn ascii_case_predicates() {
+        assert!(ascii_islower(b'a' as i32));
+        assert!(!ascii_islower(b'A' as i32));
+        assert!(ascii_isupper(b'A' as i32));
+        assert!(ascii_isalpha(b'z' as i32));
+        assert!(ascii_isalnum(b'9' as i32));
+        assert!(ascii_isalnum(b'Z' as i32));
+        assert!(!ascii_isalnum(b'_' as i32));
+    }
+
+    #[test]
+    fn ascii_toupper_tolower() {
+        assert_eq!(toupper_asc(b'a' as i32), b'A' as i32);
+        assert_eq!(toupper_asc(b'A' as i32), b'A' as i32);
+        assert_eq!(tolower_asc(b'A' as i32), b'a' as i32);
+        assert_eq!(tolower_asc(b'a' as i32), b'a' as i32);
+    }
+
+    #[test]
+    fn empty_pos_detects_zero_position() {
+        assert!(empty_pos(&PosT::default()));
+        assert!(!empty_pos(&PosT { lnum: 1, col: 0, coladd: 0 }));
+    }
 }

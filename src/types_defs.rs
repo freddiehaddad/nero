@@ -162,3 +162,24 @@ pub struct MtDamagePair {
 
 /// `StringBuilder`: `kvec_t(char)`, a growable byte buffer.
 pub type StringBuilder = Vec<u8>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tristate_to_bool_matches_macro() {
+        assert!(tristate_to_bool(TriState::True, false));
+        assert!(!tristate_to_bool(TriState::False, true));
+        assert!(tristate_to_bool(TriState::None, true));
+        assert!(!tristate_to_bool(TriState::None, false));
+    }
+
+    #[test]
+    fn tristate_from_int_matches_macro() {
+        assert_eq!(tristate_from_int(0), TriState::False);
+        assert_eq!(tristate_from_int(1), TriState::True);
+        assert_eq!(tristate_from_int(5), TriState::True);
+        assert_eq!(tristate_from_int(-1), TriState::None);
+    }
+}

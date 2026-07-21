@@ -200,3 +200,56 @@ pub fn ascii_isodigit(c: i32) -> bool {
 pub fn ascii_isspace(c: i32) -> bool {
     (9..=13).contains(&c) || c == b' ' as i32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_ord_matches_c_macro() {
+        // CHAR_ORD(x) = x < 'a' ? x - 'A' : x - 'a'
+        assert_eq!(char_ord(b'A'), 0);
+        assert_eq!(char_ord(b'Z'), 25);
+        assert_eq!(char_ord(b'a'), 0);
+        assert_eq!(char_ord(b'z'), 25);
+    }
+
+    #[test]
+    fn rot13_round_trips() {
+        // rot13('n', 'a') applied twice returns the original ('a'-based
+        // alphabet, matching how ROT13 is actually invoked in normal.c).
+        let n = rot13(b'n' as i32, b'a' as i32);
+        assert_eq!(rot13(n, b'a' as i32), b'n' as i32);
+        assert_eq!(rot13(b'a' as i32, b'a' as i32), b'n' as i32);
+    }
+
+    #[test]
+    fn ctrl_chr_matches_known_mappings() {
+        // '?' -> DEL, '@' -> ^@ per the doc comment on CTRL_CHR.
+        assert_eq!(ctrl_chr(b'?' as i32), DEL as i32);
+        assert_eq!(ctrl_chr(b'@' as i32), CTRL_AT as i32);
+        assert_eq!(ctrl_chr(b'A' as i32), CTRL_A as i32);
+    }
+
+    #[test]
+    fn ascii_predicates() {
+        assert!(ascii_iswhite(b' ' as i32));
+        assert!(ascii_iswhite(b'\t' as i32));
+        assert!(!ascii_iswhite(b'x' as i32));
+        assert!(ascii_isdigit(b'5' as i32));
+        assert!(!ascii_isdigit(b'a' as i32));
+        assert!(ascii_isxdigit(b'f' as i32));
+        assert!(ascii_isxdigit(b'F' as i32));
+        assert!(!ascii_isxdigit(b'g' as i32));
+        assert!(ascii_isident(b'_' as i32));
+        assert!(ascii_isident(b'9' as i32));
+        assert!(!ascii_isident(b'-' as i32));
+        assert!(ascii_isbdigit(b'0' as i32));
+        assert!(ascii_isbdigit(b'1' as i32));
+        assert!(!ascii_isbdigit(b'2' as i32));
+        assert!(ascii_isodigit(b'7' as i32));
+        assert!(!ascii_isodigit(b'8' as i32));
+        assert!(ascii_isspace(b'\r' as i32));
+        assert!(ascii_isspace(b' ' as i32));
+    }
+}

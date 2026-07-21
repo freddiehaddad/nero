@@ -12,6 +12,7 @@
 //! definition site instead (e.g. `#[must_use]`, `unsafe fn`, non-null
 //! references instead of nullable pointers, `-> !` for noreturn).
 
+pub mod api;
 pub mod ascii_defs;
 pub mod assert_defs;
 pub mod errors;
