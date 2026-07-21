@@ -3,7 +3,14 @@
 //! umbrella header of its own in the original - each `os/*.c` file includes
 //! exactly the `os/*.h` it needs).
 
+pub mod env;
 pub mod fs_defs;
+// The original `src/nvim/os/os.h` really does live inside the `os/`
+// directory, so this module naturally mirrors it as `os::os` - kept
+// despite the lint since renaming it would break the file-mirroring
+// convention this crate otherwise follows everywhere.
+#[allow(clippy::module_inception)]
+pub mod os;
 pub mod os_defs;
 pub mod time;
 pub mod time_defs;
