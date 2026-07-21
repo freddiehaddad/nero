@@ -29,25 +29,26 @@
 //! `intersect_merge`/`intersect_mov`/`intersect_common`/`intersect_add`/
 //! `intersect_sub`); the pseudo-index helpers (`pseudo_index`/
 //! `pseudo_index_for_id`); the full insert path (`bubble_up`,
-//! `split_node`, `marktree_putp_aux`, `marktree_put_key`); and (as
-//! `#[cfg(test)]`-only, since they exist to validate the above rather than
-//! being needed by any other translated file yet) the original's own
-//! tree-invariant checker `marktree_check`/`marktree_check_node` and its
-//! `marktree_put_test` unit-test helper.
+//! `split_node`, `marktree_putp_aux`, `marktree_put_key`, `marktree_put`);
+//! core iterators (`marktree_itr_get(_ext)`/`first`/`last`/`next(_skip)`/
+//! `prev`/`node_done`/`pos`/`current`, `itr_eq`); id-based lookup
+//! (`marktree_lookup(_ns)`, `marktree_itr_set_node`/`fix_pos`,
+//! `marktree_get_alt(pos)`); `marktree_intersect_pair`; and the full
+//! deletion/rebalancing path (`merge_node`, `pivot_left`/`pivot_right`,
+//! `marktree_del_itr`, `marktree_revise_meta`). Also translated, as
+//! `#[cfg(test)]`-only (since they exist to validate the above rather
+//! than being needed by any other translated file yet): the original's
+//! own tree-invariant checker `marktree_check`/`marktree_check_node`, and
+//! its `marktree_put_test`/`marktree_del_pair_test` unit-test helpers.
 //!
-//! Not yet translated (deferred - the remaining hard parts of the B-tree:
-//! deletion/rebalancing and iteration, each deserving their own dedicated
-//! pass): `marktree_put` (the paired-mark-aware public entry point - needs
-//! `marktree_lookup`/`marktree_intersect_pair`, themselves needing
-//! iterators), `merge_node`, `pivot_left`/`pivot_right`,
-//! `marktree_del_itr`, `marktree_revise_meta`, all `marktree_itr_*`
-//! iterator functions, `marktree_splice` and its helpers
-//! (`check_damage`/`swap_keys`), `marktree_move`/`marktree_move_region`/
-//! `marktree_restore_pair`, the id-based lookup functions
-//! (`marktree_lookup`/`marktree_lookup_ns`/`marktree_get_alt(pos)`),
-//! `marktree_intersect_pair`, `marktree_check_intersections` (needs
-//! iterators), and the debug-only `mt_inspect*`/`marktree_del_pair_test`
-//! functions.
+//! Not yet translated (deferred - each deserving its own dedicated pass):
+//! `marktree_splice` (the text-edit position-update algorithm) and its
+//! helpers (`check_damage`/`swap_keys`); `marktree_move`/
+//! `marktree_move_region`/`marktree_restore_pair`; the filter/overlap
+//! iterator variants (`marktree_itr_get_filter`, `step_out_filter`,
+//! `next_filter`, `check_filter`, `get_overlap`, `step_overlap` - used by
+//! extmark.c's decoration-filtering, not needed before that file); and
+//! the debug-only `mt_inspect*`/`marktree_check_intersections` functions.
 
 // Several helpers here are `static` (private) in the original, matching
 // the non-`pub` visibility kept here. Some have no caller yet since the
@@ -2519,6 +2520,22 @@ fn marktree_put_test(
     marktree_put(b, key, end_row, end_col, end_right);
 }
 
+/// `marktree_del_pair_test`: convenience entry point used by the
+/// original's own unit tests - deletes both sides of a paired mark
+/// identified by `(ns, id)`.
+#[cfg(test)]
+fn marktree_del_pair_test(b: &mut MarkTree, ns: u32, id: u32) {
+    let mut itr = MarkTreeIter::default();
+    marktree_lookup_ns(b, ns, id, false, Some(&mut itr));
+
+    // SAFETY: `itr` was just positioned by the successful lookup above.
+    let other = unsafe { marktree_del_itr(b, &mut itr, false) };
+    assert_ne!(other, 0, "marktree_del_pair_test: mark (ns={ns}, id={id}) must be a paired mark");
+    marktree_lookup(b, other, Some(&mut itr));
+    // SAFETY: `itr` was just positioned by the successful lookup above.
+    unsafe { marktree_del_itr(b, &mut itr, false) };
+}
+
 /// `marktree_check`: validates every documented invariant of the tree
 /// (used by the original's own test suite; translated here to serve the
 /// same role for this crate's tests, rather than inventing new validation
@@ -3635,6 +3652,25 @@ mod tests {
         marktree_check(&tree);
         assert_eq!(tree.n_keys, 30);
         assert_eq!(tree.meta_root[MetaIndex::Inline as usize], 0);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn del_pair_test_removes_both_sides_of_a_pair() {
+        let mut tree = MarkTree::default();
+        for i in 0..30 {
+            marktree_put_test(&mut tree, 0, i as u32 + 100, i, 1, false, -1, -1, false, false);
+        }
+        marktree_put_test(&mut tree, 2, 7, 3, 0, false, 25, 0, false, false);
+        assert_eq!(tree.n_keys, 32);
+        marktree_check(&tree);
+
+        marktree_del_pair_test(&mut tree, 2, 7);
+        assert_eq!(tree.n_keys, 30);
+        marktree_check(&tree);
+        assert_eq!(marktree_lookup_ns(&tree, 2, 7, false, None).pos, MtPos::new(-1, -1));
+        assert_eq!(marktree_lookup_ns(&tree, 2, 7, true, None).pos, MtPos::new(-1, -1));
 
         unsafe { marktree_clear(&mut tree) };
     }
