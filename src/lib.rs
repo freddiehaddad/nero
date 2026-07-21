@@ -18,6 +18,7 @@ pub mod assert_defs;
 pub mod base64;
 pub mod charset;
 pub mod errors;
+pub mod fuzzy;
 pub mod garray;
 pub mod garray_defs;
 pub mod gettext_defs;
