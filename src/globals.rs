@@ -1176,28 +1176,44 @@ impl Default for Globals {
 /// reentrant access patterns the original's C code does have, e.g.
 /// autocmd callbacks touching globals while already inside a global-
 /// touching function).
-pub struct GlobalsCell(UnsafeCell<Globals>);
+///
+/// Generic over `T` so it can back not just [`Globals`] (this file's own
+/// `EXTERN` variables) but any other single-file `EXTERN` global
+/// elsewhere in the codebase - e.g. `mark.h`'s `EXTERN xfmark_T
+/// namedfm[NGLOBALMARKS]` (see `crate::mark`) - without duplicating this
+/// same small amount of unsafe boilerplate at every call site.
+pub struct GlobalCell<T>(UnsafeCell<T>);
 
 // SAFETY: matches the original's own single-threaded-main-loop
-// assumption; every `EXTERN` global in `globals.h` is likewise never
+// assumption; every `EXTERN` global in the original C is likewise never
 // synchronized for multi-threaded access.
-unsafe impl Sync for GlobalsCell {}
-unsafe impl Send for GlobalsCell {}
+unsafe impl<T> Sync for GlobalCell<T> {}
+unsafe impl<T> Send for GlobalCell<T> {}
 
-impl GlobalsCell {
-    /// Returns a mutable reference to the single global editor state.
+impl<T> GlobalCell<T> {
+    /// Wraps `value` for use in a `static` initializer (typically inside
+    /// a [`std::sync::LazyLock::new`] closure, since most `Globals`-like
+    /// values aren't `const`-constructible).
+    pub const fn new(value: T) -> Self {
+        GlobalCell(UnsafeCell::new(value))
+    }
+
+    /// Returns a mutable reference to the single global value.
     ///
     /// # Safety
     /// Caller must not create two overlapping live references from this
     /// method (e.g. holding one across a call that itself calls this
     /// again) - the same non-reentrant-aliasing invariant the original's
     /// single-threaded design already required of every function that
-    /// touches `curwin`/`curbuf`/etc.
+    /// touches the corresponding `EXTERN` global.
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn get_mut(&self) -> &mut Globals {
+    pub unsafe fn get_mut(&self) -> &mut T {
         unsafe { &mut *self.0.get() }
     }
 }
+
+/// [`GlobalCell`] specialized for [`Globals`] itself.
+pub type GlobalsCell = GlobalCell<Globals>;
 
 /// The single, global, mutable editor state instance - the Rust
 /// equivalent of `globals.h`'s `EXTERN` mechanism (every `EXTERN`
@@ -1211,7 +1227,7 @@ impl GlobalsCell {
 /// them `const fn` purely to allow a non-lazy `static` would be a much
 /// larger, riskier cross-cutting change for no behavioral benefit here.
 pub static GLOBALS: std::sync::LazyLock<GlobalsCell> =
-    std::sync::LazyLock::new(|| GlobalsCell(UnsafeCell::new(Globals::default())));
+    std::sync::LazyLock::new(|| GlobalCell::new(Globals::default()));
 
 #[cfg(test)]
 mod tests {
