@@ -38,6 +38,7 @@ pub mod marktree_defs;
 pub mod math;
 pub mod memory;
 pub mod memory_defs;
+pub mod option_defs;
 pub mod os;
 pub mod path;
 pub mod pos_defs;
