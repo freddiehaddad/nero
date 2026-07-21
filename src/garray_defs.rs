@@ -16,7 +16,7 @@
 /// explicit field (capacity *in items*, mirroring the original's field
 /// exactly) even though it is derivable from `ga_data`, for direct
 /// traceability to the C struct's layout.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GarrayT {
     /// current number of items used
     pub ga_len: i32,

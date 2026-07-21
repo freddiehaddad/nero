@@ -1,22 +1,22 @@
-//! Translated from `src/nvim/buffer_defs.h` (partial - a very small,
-//! self-contained subset; `buf_T`/`win_T` themselves (`struct file_buffer`/
-//! `struct window_S`, each several hundred lines and referencing option
-//! state, syntax state, memline internals, etc. not yet translated) are
-//! substantial and deliberately deferred to a dedicated pass rather than
-//! rushed).
+//! Translated from `src/nvim/buffer_defs.h` (partial - `buf_T`/`win_T`
+//! themselves (`struct file_buffer`/`struct window_S`, each several
+//! hundred lines and referencing syntax state, memline internals, etc.
+//! not yet translated) are substantial and deliberately deferred to a
+//! dedicated pass rather than rushed).
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
-//! `disptick_T`, `taggy_T`.
+//! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`).
 //!
-//! Deferred: everything referencing `buf_T`'s actual fields, `winopt_T`
-//! (buffer/window-local options - needs `option_defs.h`), `wininfo_S`,
+//! Deferred: everything referencing `buf_T`'s actual fields,
 //! `synblock_T`/`syn_time_T` (needs syntax state), `BufUpdateCallbacks`,
 //! `file_buffer`/`window_S` themselves, `tabpage_S`, `frame_S`, and all the
 //! window-layout/diff/match/float-config types further down the original
 //! file.
 
+use crate::garray_defs::GarrayT;
+use crate::eval::typval_defs::SctxT;
 use crate::mark_defs::FmarkT;
-use crate::types_defs::BufT;
+use crate::types_defs::{BufT, OptInt, WinT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
 /// `bufref_valid()` (not yet translated) only needs to check `buf` when the
@@ -120,6 +120,190 @@ pub struct TaggyT {
     pub user_data: Option<Vec<u8>>,
 }
 
+/// Structure that contains all options that are local to a window
+/// (`winopt_T`). Used twice in a window: for the current buffer and for
+/// all buffers. Also used in [`WinInfo`].
+///
+/// The original's `#define w_p_arab w_onebuf_opt.wo_arab`-style aliases
+/// (one per field, for use as `win->w_p_arab` once embedded in
+/// `window_S`) are not translated here: they only make sense once
+/// `window_S`/`WinT` itself exists (`buffer_defs.h`'s `struct window_S`,
+/// not yet translated) to embed this struct and give the alias a home.
+#[derive(Debug, Clone, Default)]
+pub struct WinoptT {
+    /// `'arabic'`
+    pub wo_arab: i32,
+    /// `'breakindent'`
+    pub wo_bri: i32,
+    /// `'breakindentopt'`
+    pub wo_briopt: Option<Vec<u8>>,
+    /// `'diff'`
+    pub wo_diff: i32,
+    /// `'foldcolumn'`
+    pub wo_fdc: Option<Vec<u8>>,
+    /// `'eventignorewin'`
+    pub wo_eiw: Option<Vec<u8>>,
+    /// `'fdc'` saved for diff mode
+    pub wo_fdc_save: Option<Vec<u8>>,
+    /// `'foldenable'`
+    pub wo_fen: i32,
+    /// `'foldenable'` saved for diff mode
+    pub wo_fen_save: i32,
+    /// `'foldignore'`
+    pub wo_fdi: Option<Vec<u8>>,
+    /// `'foldlevel'`
+    pub wo_fdl: OptInt,
+    /// `'foldlevel'` state saved for diff mode
+    pub wo_fdl_save: OptInt,
+    /// `'foldmethod'`
+    pub wo_fdm: Option<Vec<u8>>,
+    /// `'fdm'` saved for diff mode
+    pub wo_fdm_save: Option<Vec<u8>>,
+    /// `'foldminlines'`
+    pub wo_fml: OptInt,
+    /// `'foldnestmax'`
+    pub wo_fdn: OptInt,
+    /// `'foldexpr'`
+    pub wo_fde: Option<Vec<u8>>,
+    /// `'foldtext'`
+    pub wo_fdt: Option<Vec<u8>>,
+    /// `'foldmarker'`
+    pub wo_fmr: Option<Vec<u8>>,
+    /// `'linebreak'`
+    pub wo_lbr: i32,
+    /// `'list'`
+    pub wo_list: i32,
+    /// `'number'`
+    pub wo_nu: i32,
+    /// `'relativenumber'`
+    pub wo_rnu: i32,
+    /// `'virtualedit'`
+    pub wo_ve: Option<Vec<u8>>,
+    /// flags for `'virtualedit'`
+    pub wo_ve_flags: u32,
+    /// `'numberwidth'`
+    pub wo_nuw: OptInt,
+    /// `'winfixbuf'`
+    pub wo_wfb: i32,
+    /// `'winfixheight'`
+    pub wo_wfh: i32,
+    /// `'winfixwidth'`
+    pub wo_wfw: i32,
+    /// `'winpinned'`
+    pub wo_wp: i32,
+    /// `'previewwindow'`
+    pub wo_pvw: i32,
+    /// `'lhistory'`
+    pub wo_lhi: OptInt,
+    /// `'rightleft'`
+    pub wo_rl: i32,
+    /// `'rightleftcmd'`
+    pub wo_rlc: Option<Vec<u8>>,
+    /// `'scroll'`
+    pub wo_scr: OptInt,
+    /// `'smoothscroll'`
+    pub wo_sms: i32,
+    /// `'spell'`
+    pub wo_spell: i32,
+    /// `'cursorcolumn'`
+    pub wo_cuc: i32,
+    /// `'cursorline'`
+    pub wo_cul: i32,
+    /// `'cursorlineopt'`
+    pub wo_culopt: Option<Vec<u8>>,
+    /// `'colorcolumn'`
+    pub wo_cc: Option<Vec<u8>>,
+    /// `'showbreak'`
+    pub wo_sbr: Option<Vec<u8>>,
+    /// `'statuscolumn'`
+    pub wo_stc: Option<Vec<u8>>,
+    /// `'statusline'`
+    pub wo_stl: Option<Vec<u8>>,
+    /// `'winbar'`
+    pub wo_wbr: Option<Vec<u8>>,
+    /// `'scrollbind'`
+    pub wo_scb: i32,
+    /// options were saved for starting diff mode
+    pub wo_diff_saved: i32,
+    /// `'scrollbind'` saved for diff mode
+    pub wo_scb_save: i32,
+    /// `'wrap'`
+    pub wo_wrap: i32,
+    /// `'wrap'` state saved for diff mode
+    pub wo_wrap_save: i32,
+    /// `'concealcursor'`
+    pub wo_cocu: Option<Vec<u8>>,
+    /// `'conceallevel'`
+    pub wo_cole: OptInt,
+    /// `'cursorbind'`
+    pub wo_crb: i32,
+    /// `'cursorbind'` state saved for diff mode
+    pub wo_crb_save: i32,
+    /// `'signcolumn'`
+    pub wo_scl: Option<Vec<u8>>,
+    /// `'sidescrolloff'` local value
+    pub wo_siso: OptInt,
+    /// `'scrolloff'` local value
+    pub wo_so: OptInt,
+    /// `'scrolloffpad'` local value
+    pub wo_sop: OptInt,
+    /// `'winhighlight'`
+    pub wo_winhl: Option<Vec<u8>>,
+    /// `'listchars'`
+    pub wo_lcs: Option<Vec<u8>>,
+    /// `'fillchars'`
+    pub wo_fcs: Option<Vec<u8>>,
+    /// `'winblend'`
+    pub wo_winbl: OptInt,
+    /// flags for `'wrap'` (a few options have local flags for
+    /// `kOptFlagInsecure`)
+    pub wo_wrap_flags: u32,
+    /// flags for `'statusline'`
+    pub wo_stl_flags: u32,
+    /// flags for `'winbar'`
+    pub wo_wbr_flags: u32,
+    /// flags for `'foldexpr'`
+    pub wo_fde_flags: u32,
+    /// flags for `'foldtext'`
+    pub wo_fdt_flags: u32,
+    /// SCTXs for window-local options (`sctx_T wo_script_ctx[kWinOptCount]`
+    /// in the original). `kWinOptCount` is a codegen-derived constant (the
+    /// number of window-local options in the master options table,
+    /// `src/gen/*.lua`) that isn't available yet (the "codegen concern"
+    /// flagged and deferred since phase 1) - a growable `Vec` stands in
+    /// for the original's fixed-size array until that's resolved, since
+    /// nothing here depends on it being a fixed size rather than however
+    /// many entries happen to be pushed.
+    pub wo_script_ctx: Vec<SctxT>,
+}
+
+/// Window info stored with a buffer (`struct wininfo_S`, typedef'd as
+/// `WinInfo`).
+///
+/// Two types of info are kept for a buffer which are associated with a
+/// specific window: (1) each window can have a different line number
+/// associated with a buffer; (2) the window-local options for a buffer
+/// work in a similar way. The window-info is kept in a list at
+/// `b_wininfo` (`file_buffer`, not yet translated). It is kept in
+/// most-recently-used order.
+#[derive(Debug, Clone, Default)]
+pub struct WinInfo {
+    /// pointer to window that did set `wi_mark`
+    pub wi_win: *mut WinT,
+    /// last cursor mark in the file
+    pub wi_mark: FmarkT,
+    /// true when `wi_opt` has useful values
+    pub wi_optset: bool,
+    /// local window options
+    pub wi_opt: WinoptT,
+    /// copy of `w_fold_manual`
+    pub wi_fold_manual: bool,
+    /// clone of `w_folds`
+    pub wi_folds: GarrayT,
+    /// copy of `w_changelistidx`
+    pub wi_changelistidx: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +341,22 @@ mod tests {
             assert_eq!(seen & (f as u16), 0, "flag {f:#04x} overlaps a previous one");
             seen |= f as u16;
         }
+    }
+
+    #[test]
+    fn winopt_default_has_no_script_ctx_entries() {
+        let wo = WinoptT::default();
+        assert_eq!(wo.wo_arab, 0);
+        assert!(wo.wo_briopt.is_none());
+        assert!(wo.wo_script_ctx.is_empty());
+    }
+
+    #[test]
+    fn wininfo_default_has_null_window_and_default_opts() {
+        let wi = WinInfo::default();
+        assert!(wi.wi_win.is_null());
+        assert!(!wi.wi_optset);
+        assert!(wi.wi_folds.is_empty());
+        assert_eq!(wi.wi_opt.wo_arab, 0);
     }
 }
