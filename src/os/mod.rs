@@ -4,6 +4,7 @@
 //! exactly the `os/*.h` it needs).
 
 pub mod os_defs;
+pub mod time_defs;
 #[cfg(unix)]
 pub mod unix_defs;
 #[cfg(windows)]

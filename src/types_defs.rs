@@ -128,6 +128,7 @@ pub struct MtNode {
 /// trailing bytes are modeled separately wherever this is actually
 /// allocated/used (translated precisely when a consuming file is reached).
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdditionalData {
     pub nitems: u32,
     pub nbytes: u32,
