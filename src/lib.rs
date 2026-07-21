@@ -30,6 +30,7 @@ pub mod math;
 pub mod memory;
 pub mod memory_defs;
 pub mod os;
+pub mod path;
 pub mod pos_defs;
 pub mod profile;
 pub mod sha256;
