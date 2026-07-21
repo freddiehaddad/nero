@@ -23,6 +23,7 @@ pub mod gettext_defs;
 pub mod hashtab;
 pub mod hashtab_defs;
 pub mod iconv_defs;
+pub mod log;
 pub mod macros_defs;
 pub mod math;
 pub mod memory;
