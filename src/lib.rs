@@ -28,6 +28,7 @@ pub mod fuzzy;
 pub mod garray;
 pub mod garray_defs;
 pub mod gettext_defs;
+pub mod grid_defs;
 pub mod hashtab;
 pub mod hashtab_defs;
 pub mod highlight_defs;

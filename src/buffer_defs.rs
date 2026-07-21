@@ -6,14 +6,17 @@
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
 //! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`),
-//! `syn_time_T`, `synblock_T`, `BufUpdateCallbacks`, and the
-//! `BUF_HAS_*`/`MAX_MAPHASH` constants.
+//! `syn_time_T`, `synblock_T`, `BufUpdateCallbacks`, the
+//! `BUF_HAS_*`/`MAX_MAPHASH` constants, `FloatAnchor`, `FloatRelative`,
+//! `WinKind`, `WinSplit`, `WinStyle`, `AlignTextPos`, `BorderTextType`,
+//! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`.
 //!
 //! Deferred: everything referencing `buf_T`'s actual fields (`struct
 //! file_buffer` itself, `ChangedtickDictItem` which needs the eval
-//! engine's `typval_T`), `file_buffer`/`window_S` themselves, `tabpage_S`,
-//! `frame_S`, and all the window-layout/diff/match/float-config types
-//! further down the original file.
+//! engine's `typval_T`), `match_T`/`llpos_T`/`matchitem_T` (need
+//! `regmmatch_T`, `regexp_defs.h`, phase 7), `file_buffer`/`window_S`
+//! themselves, `tabpage_S`, `frame_S`, `diffblock_S`/`diffline_change_S`/
+//! `diffline_S`, and `wline_T`.
 
 use crate::eval::typval_defs::SctxT;
 use crate::garray_defs::GarrayT;
@@ -465,6 +468,212 @@ pub const BUF_HAS_LL_ENTRY: i32 = 2;
 /// Maximum number of maphash blocks we will have (`MAX_MAPHASH`).
 pub const MAX_MAPHASH: i32 = 256;
 
+/// `FloatAnchor`: kept as a plain `i32` with named bit constants (matches
+/// the original's own `typedef int FloatAnchor;` plus a separate unnamed
+/// `enum` for the bit values, rather than a genuine C enum).
+pub type FloatAnchor = i32;
+pub const K_FLOAT_ANCHOR_EAST: FloatAnchor = 1;
+pub const K_FLOAT_ANCHOR_SOUTH: FloatAnchor = 2;
+
+/// Keep in sync with `float_relative_str[]` in `nvim_win_get_config()`
+/// (`FloatRelative`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FloatRelative {
+    #[default]
+    Editor = 0,
+    Window = 1,
+    Cursor = 2,
+    Mouse = 3,
+    Tabline = 4,
+    Laststatus = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WinKind {
+    #[default]
+    Normal = 0,
+    Info,
+}
+
+/// Keep in sync with `win_split_str[]` in `nvim_win_get_config()`
+/// (`api/win_config.c`) (`WinSplit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WinSplit {
+    #[default]
+    Left = 0,
+    Right = 1,
+    Above = 2,
+    Below = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WinStyle {
+    #[default]
+    Unused = 0,
+    /// Minimal UI: no number column, eob markers, etc.
+    Minimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlignTextPos {
+    #[default]
+    Left = 0,
+    Center = 1,
+    Right = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderTextType {
+    #[default]
+    Title = 0,
+    Footer = 1,
+}
+
+/// See `:help nvim_open_win()` for documentation (`WinConfig`).
+#[derive(Debug, Clone)]
+pub struct WinConfig {
+    pub window: crate::api::private::defs::Window,
+    pub bufpos: crate::pos_defs::LposT,
+    pub height: i32,
+    pub width: i32,
+    pub row: f64,
+    pub col: f64,
+    pub anchor: FloatAnchor,
+    pub relative: FloatRelative,
+    pub external: bool,
+    pub focusable: bool,
+    pub mouse: bool,
+    pub split: WinSplit,
+    pub zindex: i32,
+    pub style: WinStyle,
+    pub border: bool,
+    pub shadow: bool,
+    pub border_chars: [[crate::types_defs::ScharT; crate::types_defs::MAX_SCHAR_SIZE]; 8],
+    pub border_hl_ids: [i32; 8],
+    pub border_attr: [i32; 8],
+    pub title: bool,
+    pub title_pos: AlignTextPos,
+    pub title_chunks: crate::decoration_defs::VirtText,
+    pub title_width: i32,
+    pub footer: bool,
+    pub footer_pos: AlignTextPos,
+    pub footer_chunks: crate::decoration_defs::VirtText,
+    pub footer_width: i32,
+    pub noautocmd: bool,
+    pub fixed: bool,
+    pub hide: bool,
+    pub _cmdline_offset: i32,
+}
+
+impl Default for WinConfig {
+    /// `WIN_CONFIG_INIT`
+    fn default() -> Self {
+        WinConfig {
+            window: 0,
+            bufpos: crate::pos_defs::LposT { lnum: -1, col: 0 },
+            height: 0,
+            width: 0,
+            row: 0.0,
+            col: 0.0,
+            anchor: 0,
+            relative: FloatRelative::Editor,
+            external: false,
+            focusable: true,
+            mouse: true,
+            split: WinSplit::Left,
+            zindex: crate::grid_defs::K_ZINDEX_FLOAT_DEFAULT,
+            style: WinStyle::Unused,
+            border: false,
+            shadow: false,
+            border_chars: [[0; crate::types_defs::MAX_SCHAR_SIZE]; 8],
+            border_hl_ids: [0; 8],
+            border_attr: [0; 8],
+            title: false,
+            title_pos: AlignTextPos::Left,
+            title_chunks: Vec::new(),
+            title_width: 0,
+            footer: false,
+            footer_pos: AlignTextPos::Left,
+            footer_chunks: Vec::new(),
+            footer_width: 0,
+            noautocmd: false,
+            fixed: false,
+            hide: false,
+            _cmdline_offset: i32::MAX,
+        }
+    }
+}
+
+/// Structure to store last cursor position and topline (`pos_save_T`).
+/// Used by `check_lnums()` and `reset_lnums()` (not yet translated).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PosSaveT {
+    /// original topline value
+    pub w_topline_save: i32,
+    /// corrected topline value
+    pub w_topline_corr: i32,
+    /// original cursor position
+    pub w_cursor_save: crate::pos_defs::PosT,
+    /// corrected cursor position
+    pub w_cursor_corr: crate::pos_defs::PosT,
+}
+
+/// Characters from the `'listchars'` option (`lcs_chars_T`).
+#[derive(Debug, Clone, Default)]
+pub struct LcsCharsT {
+    pub eol: crate::types_defs::ScharT,
+    pub ext: crate::types_defs::ScharT,
+    pub prec: crate::types_defs::ScharT,
+    pub nbsp: crate::types_defs::ScharT,
+    pub space: crate::types_defs::ScharT,
+    /// first tab character
+    pub tab1: crate::types_defs::ScharT,
+    /// second tab character
+    pub tab2: crate::types_defs::ScharT,
+    /// third tab character
+    pub tab3: crate::types_defs::ScharT,
+    pub leadtab1: crate::types_defs::ScharT,
+    pub leadtab2: crate::types_defs::ScharT,
+    pub leadtab3: crate::types_defs::ScharT,
+    pub lead: crate::types_defs::ScharT,
+    pub trail: crate::types_defs::ScharT,
+    /// in place of the original's raw `schar_T *multispace` pointer to a
+    /// heap-allocated array (one entry per display column of a multi-space
+    /// run, per `'listchars'`'s `multispace:` sub-option).
+    pub multispace: Option<Vec<crate::types_defs::ScharT>>,
+    pub leadmultispace: Option<Vec<crate::types_defs::ScharT>>,
+    pub conceal: crate::types_defs::ScharT,
+}
+
+/// Characters from the `'fillchars'` option (`fcs_chars_T`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FcsCharsT {
+    pub stl: crate::types_defs::ScharT,
+    pub stlnc: crate::types_defs::ScharT,
+    pub wbr: crate::types_defs::ScharT,
+    pub horiz: crate::types_defs::ScharT,
+    pub horizup: crate::types_defs::ScharT,
+    pub horizdown: crate::types_defs::ScharT,
+    pub vert: crate::types_defs::ScharT,
+    pub vertleft: crate::types_defs::ScharT,
+    pub vertright: crate::types_defs::ScharT,
+    pub verthoriz: crate::types_defs::ScharT,
+    pub fold: crate::types_defs::ScharT,
+    /// when fold is open
+    pub foldopen: crate::types_defs::ScharT,
+    /// when fold is closed
+    pub foldclosed: crate::types_defs::ScharT,
+    /// continuous fold marker
+    pub foldsep: crate::types_defs::ScharT,
+    pub foldinner: crate::types_defs::ScharT,
+    pub diff: crate::types_defs::ScharT,
+    pub msgsep: crate::types_defs::ScharT,
+    pub eob: crate::types_defs::ScharT,
+    pub lastline: crate::types_defs::ScharT,
+    pub trunc: crate::types_defs::ScharT,
+    pub truncrl: crate::types_defs::ScharT,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +755,57 @@ mod tests {
     fn buf_has_entry_flags_are_distinct_bits() {
         assert_ne!(BUF_HAS_QF_ENTRY, BUF_HAS_LL_ENTRY);
         assert_eq!(BUF_HAS_QF_ENTRY & BUF_HAS_LL_ENTRY, 0);
+    }
+
+    #[test]
+    fn win_config_default_matches_win_config_init() {
+        let wc = WinConfig::default();
+        assert_eq!(wc.height, 0);
+        assert_eq!(wc.width, 0);
+        assert_eq!(wc.bufpos.lnum, -1);
+        assert_eq!(wc.bufpos.col, 0);
+        assert_eq!(wc.row, 0.0);
+        assert_eq!(wc.col, 0.0);
+        assert_eq!(wc.relative, FloatRelative::Editor);
+        assert!(!wc.external);
+        assert!(wc.focusable);
+        assert!(wc.mouse);
+        assert_eq!(wc.split, WinSplit::Left);
+        assert_eq!(wc.zindex, crate::grid_defs::K_ZINDEX_FLOAT_DEFAULT);
+        assert_eq!(wc.style, WinStyle::Unused);
+        assert!(!wc.noautocmd);
+        assert!(!wc.hide);
+        assert!(!wc.fixed);
+        assert_eq!(wc._cmdline_offset, i32::MAX);
+    }
+
+    #[test]
+    fn float_relative_default_is_editor() {
+        assert_eq!(FloatRelative::default(), FloatRelative::Editor);
+        assert_eq!(FloatRelative::Laststatus as i32, 5);
+    }
+
+    #[test]
+    fn win_split_discriminants_match_c_enum() {
+        assert_eq!(WinSplit::Left as i32, 0);
+        assert_eq!(WinSplit::Right as i32, 1);
+        assert_eq!(WinSplit::Above as i32, 2);
+        assert_eq!(WinSplit::Below as i32, 3);
+    }
+
+    #[test]
+    fn pos_save_default_is_zeroed() {
+        let ps = PosSaveT::default();
+        assert_eq!(ps.w_topline_save, 0);
+        assert_eq!(ps.w_cursor_save.lnum, 0);
+    }
+
+    #[test]
+    fn lcs_and_fcs_chars_default_have_no_multispace() {
+        let lcs = LcsCharsT::default();
+        assert!(lcs.multispace.is_none());
+        assert!(lcs.leadmultispace.is_none());
+        let fcs = FcsCharsT::default();
+        assert_eq!(fcs.stl, 0);
     }
 }
