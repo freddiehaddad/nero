@@ -50,14 +50,16 @@ pub type MetaFilter<'a> = &'a [u32];
 /// NB: actual marks have `flags > 0`, so `(row, col, 0)` can be used as a
 /// pseudo-key for "space before (row,col)".
 ///
-/// No `Clone`/`Copy` (yet): unlike a standalone [`DecorInlineData`], this
-/// struct *does* have its tag co-located (`flags`, right alongside
-/// `decor_data`), so a safe manual `Clone` reading the `MT_FLAG_DECOR_EXT`
-/// bit is possible in principle - but that flag's exact bit value is
-/// defined in `marktree.c`/`decoration.c` (not yet translated), and
-/// guessing it here risks a real memory-safety bug (reading `ext` when
-/// `hl` is actually stored, or vice versa). Deferred until that context
-/// exists.
+/// Manual `Clone` (no `Copy`, since the `ext` union branch owns a `Box` via
+/// `DecorExt`): unlike a standalone [`DecorInlineData`], this struct's tag
+/// (`flags & MT_FLAG_DECOR_EXT`, see `crate::marktree::MT_FLAG_DECOR_EXT`,
+/// translated from `src/nvim/marktree.h`) *is* co-located right alongside
+/// `decor_data`, so a safe manual `Clone` reading that bit is possible and
+/// implemented below. No `Drop` is implemented: the original's
+/// `marktree_free_node`/`marktree_free_subtree` (`marktree.c`) do not free
+/// `key.decor_data.ext`'s contents either - that is the responsibility of
+/// a higher layer (`decoration.c`, not yet translated) that removes/replaces
+/// a mark's decoration before the key itself is discarded.
 pub struct MtKey {
     pub pos: MtPos,
     pub ns: u32,
@@ -66,6 +68,44 @@ pub struct MtKey {
     /// "ext" tag in `flags` - see [`DecorInlineData`]'s doc comment for why
     /// this stays a raw union rather than a safe enum.
     pub decor_data: DecorInlineData,
+}
+
+impl Clone for MtKey {
+    /// Mirrors the original's plain struct-copy-by-value semantics (C
+    /// copies `MTKey` by value throughout, e.g. `x->key[i] = k;`,
+    /// `memcpy`/`memmove` over `MTKey` arrays). Safe here because we always
+    /// consult `self.flags & MT_FLAG_DECOR_EXT` (the externally co-located
+    /// tag) before reading the corresponding live union field.
+    fn clone(&self) -> Self {
+        // SAFETY: `flags` is this same key's own tag for `decor_data`, so
+        // whichever branch we read below is guaranteed to be the live one.
+        let decor_data = if self.flags & crate::marktree::MT_FLAG_DECOR_EXT != 0 {
+            DecorInlineData { ext: unsafe { self.decor_data.ext.clone() } }
+        } else {
+            DecorInlineData { hl: unsafe { self.decor_data.hl } }
+        };
+        MtKey { pos: self.pos, ns: self.ns, id: self.id, flags: self.flags, decor_data }
+    }
+}
+
+impl Default for MtKey {
+    /// Matches `xcalloc`'s zero-initialization of unused `MTNode.key[]`
+    /// slots (indices `>= x->n`, never read by any tree operation before
+    /// being overwritten - see `marktree_alloc_node`). Uses
+    /// `DecorHighlightInline::default()` (`DECOR_HIGHLIGHT_INLINE_INIT`,
+    /// non-zero bytes) rather than a raw zeroed union: since these slots
+    /// are provably never read as real keys, this is observably equivalent
+    /// to `xcalloc`'s all-zero-bytes while staying within a safe, defined
+    /// union state (never "no variant has been written").
+    fn default() -> Self {
+        MtKey {
+            pos: MtPos::default(),
+            ns: 0,
+            id: 0,
+            flags: 0,
+            decor_data: DecorInlineData { hl: crate::decoration_defs::DecorHighlightInline::default() },
+        }
+    }
 }
 
 pub struct MtPair {
@@ -87,6 +127,7 @@ pub type Intersection = Vec<u64>;
 
 /// Part of the original's `mtnode_s`, only meaningful for inner nodes:
 /// pointers to children plus their meta counts (`mtnode_inner_s`).
+#[derive(Debug, Default)]
 pub struct MtNodeInner {
     pub i_ptr: [*mut MtNode; 2 * MT_BRANCH_FACTOR],
     pub i_meta: [[u32; K_MT_META_COUNT]; 2 * MT_BRANCH_FACTOR],
@@ -143,6 +184,7 @@ impl MarkTreeIter {
 }
 
 /// The marktree itself (`MarkTree`).
+#[derive(Default)]
 pub struct MarkTree {
     pub root: *mut MtNode,
     pub meta_root: [u32; K_MT_META_COUNT],
