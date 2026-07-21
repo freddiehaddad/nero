@@ -92,7 +92,8 @@ pub const SIGN_WIDTH: i32 = 2;
 //   synstate_T -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
 //   Terminal   -> struct terminal,    src/nvim/terminal.h      (phase 14)
 //   win_T      -> struct window_S,    src/nvim/buffer_defs.h   (phase 3/8)
-//   MTNode     -> struct mtnode_s,    src/nvim/marktree_defs.h (phase 3)
+// MTNode (struct mtnode_s) is no longer a placeholder here: it is now
+// translated for real in `src/nvim/marktree_defs.h` -> `crate::marktree_defs::MtNode`.
 
 /// Placeholder for `buf_T` (`struct file_buffer`) - see `src/nvim/buffer_defs.h` (phase 3).
 pub struct BufT {
@@ -118,10 +119,6 @@ pub struct TerminalT {
 pub struct WinT {
     _private: (),
 }
-/// Placeholder for `MTNode` (`struct mtnode_s`) - see `src/nvim/marktree_defs.h` (phase 3).
-pub struct MtNode {
-    _private: (),
-}
 
 /// `AdditionalData`: `nitems`/`nbytes` header followed by a C flexible array
 /// member (`char data[]`). Rust has no flexible array members, so the
@@ -136,9 +133,10 @@ pub struct AdditionalData {
 
 /// Used by marktree.c `marktree_splice`. Need to keep track of marks which
 /// moved in order to repair intersections.
+#[derive(Debug, Clone, Copy)]
 pub struct MtDamage {
-    pub old: *mut MtNode,
-    pub new: *mut MtNode,
+    pub old: *mut crate::marktree_defs::MtNode,
+    pub new: *mut crate::marktree_defs::MtNode,
     pub old_i: i32,
     pub new_i: i32,
 }
@@ -155,7 +153,7 @@ impl Default for MtDamage {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MtDamagePair {
     pub start: MtDamage,
     pub end: MtDamage,
