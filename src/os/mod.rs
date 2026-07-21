@@ -3,6 +3,7 @@
 //! umbrella header of its own in the original - each `os/*.c` file includes
 //! exactly the `os/*.h` it needs).
 
+pub mod fs_defs;
 pub mod os_defs;
 pub mod time_defs;
 #[cfg(unix)]
