@@ -171,6 +171,13 @@ pub struct AutoPatCmdT {
 pub struct RegmatchT {
     _private: (),
 }
+/// Placeholder for `reg_extmatch_T` (`struct reg_extmatch`) - see
+/// `src/nvim/regexp_defs.h` (phase 7). Only ever referenced by pointer
+/// in `globals.h` (`re_extmatch_in`/`re_extmatch_out`), so - unlike
+/// `RegmatchT` above - doesn't need to be `Default`-constructible.
+pub struct RegExtmatchT {
+    _private: (),
+}
 
 /// `AdditionalData`: `nitems`/`nbytes` header followed by a C flexible array
 /// member (`char data[]`). Rust has no flexible array members, so the

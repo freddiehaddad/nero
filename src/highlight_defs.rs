@@ -74,10 +74,11 @@ impl Default for HlAttrs {
 ///
 /// When making changes, also update `hlf_names` in `highlight.c` (not yet
 /// translated).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 #[repr(u8)]
 pub enum HlfT {
     /// no UI highlight active
+    #[default]
     None = 0,
     /// Meta & special keys listed with ":map", text that is displayed
     /// different from what it is
