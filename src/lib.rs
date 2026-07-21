@@ -34,6 +34,7 @@ pub mod log;
 pub mod macros_defs;
 pub mod map;
 pub mod mark_defs;
+pub mod marktree;
 pub mod marktree_defs;
 pub mod math;
 pub mod memory;
