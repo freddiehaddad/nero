@@ -558,40 +558,107 @@ fn unintersect_node(x: &mut Intersection, id: u64, strict: bool) {
     }
 }
 
-/// `intersect_merge`: merges the sorted sets `x` and `y` into `m` (like a
-/// merge-sort merge step; duplicates - an id present in both - are kept
-/// only once, matching set-union semantics).
-fn intersect_merge(m: &mut Intersection, x: &Intersection, y: &Intersection) {
-    m.clear();
-    m.reserve(x.len() + y.len());
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < x.len() && j < y.len() {
-        match x[i].cmp(&y[j]) {
+/// `intersect_merge`: similar to [`intersect_common`] but *also* mutates
+/// `x` and `y` in place to retain only the items *not* in common - i.e.
+/// simultaneously computes `m = x & y`, `x = x - m`, `y = y - m` (all
+/// sorted, all in one linear merge pass, matching the original's own doc
+/// comment: "similar to intersect_common but modify x and y in place to
+/// retain only the items which are NOT in common").
+fn intersect_merge(m: &mut Intersection, x: &mut Intersection, y: &mut Intersection) {
+    let (mut xi, mut yi) = (0usize, 0usize);
+    let (mut xn, mut yn) = (0usize, 0usize);
+    while xi < x.len() && yi < y.len() {
+        match x[xi].cmp(&y[yi]) {
+            std::cmp::Ordering::Equal => {
+                m.push(x[xi]);
+                xi += 1;
+                yi += 1;
+            }
             std::cmp::Ordering::Less => {
-                m.push(x[i]);
-                i += 1;
+                x[xn] = x[xi];
+                xn += 1;
+                xi += 1;
             }
             std::cmp::Ordering::Greater => {
-                m.push(y[j]);
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                m.push(x[i]);
-                i += 1;
-                j += 1;
+                y[yn] = y[yi];
+                yn += 1;
+                yi += 1;
             }
         }
     }
-    m.extend_from_slice(&x[i..]);
-    m.extend_from_slice(&y[j..]);
+    if xi < x.len() {
+        x.copy_within(xi.., xn);
+        xn += x.len() - xi;
+    }
+    if yi < y.len() {
+        y.copy_within(yi.., yn);
+        yn += y.len() - yi;
+    }
+    x.truncate(xn);
+    y.truncate(yn);
 }
 
-/// `intersect_mov`: moves every id in `y` that is `< pivot` out of `y` and
-/// into `x` (used when splitting a node's intersection set across the new
-/// left/right halves during a tree split/merge).
-fn intersect_mov(x: &mut Intersection, y: &mut Intersection, pivot: u64) {
-    let split = y.partition_point(|&v| v < pivot);
-    x.extend(y.drain(..split));
+/// `intersect_mov`: `w` used to be a child of `x` but it is now a child of
+/// `y`; adjusts intersections accordingly. `x` is read-only ("immutable
+/// in the context of intersect_mov", per the original's own unit-test
+/// comment, `intersect_mov_test`, kept as this function's own test
+/// vectors below); `y` and `w` are mutated in place. `d` (out-only)
+/// accumulates intersections which should additionally be added to the
+/// *old* children of `y`.
+fn intersect_mov(x: &Intersection, y: &mut Intersection, w: &mut Intersection, d: &mut Intersection) {
+    let (mut wi, mut yi, mut wn, mut yn, mut xi) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    while wi < w.len() || xi < x.len() {
+        if wi < w.len() && (xi >= x.len() || x[xi] >= w[wi]) {
+            if xi < x.len() && x[xi] == w[wi] {
+                xi += 1;
+            }
+            // Now w < x strictly.
+            while yi < y.len() && y[yi] < w[wi] {
+                d.push(y[yi]);
+                yi += 1;
+            }
+            if yi < y.len() && y[yi] == w[wi] {
+                y[yn] = y[yi];
+                yn += 1;
+                yi += 1;
+                wi += 1;
+            } else {
+                w[wn] = w[wi];
+                wn += 1;
+                wi += 1;
+            }
+        } else {
+            // x < w strictly.
+            while yi < y.len() && y[yi] < x[xi] {
+                d.push(y[yi]);
+                yi += 1;
+            }
+            if yi < y.len() && y[yi] == x[xi] {
+                y[yn] = y[yi];
+                yn += 1;
+                yi += 1;
+                xi += 1;
+            } else {
+                // Add x[xi] at w[wn], inserting (shifting up) if wi == wn.
+                if wi == wn {
+                    w.insert(wn, x[xi]);
+                    wn += 1;
+                    wi += 1; // no need to consider the added element again
+                } else {
+                    debug_assert!(wn < wi);
+                    w[wn] = x[xi];
+                    wn += 1;
+                }
+                xi += 1;
+            }
+        }
+    }
+    if yi < y.len() {
+        // Move remaining items to d.
+        d.extend_from_slice(&y[yi..]);
+    }
+    w.truncate(wn);
+    y.truncate(yn);
 }
 
 /// `intersect_common`: `i` becomes the sorted set-intersection of `x` and
@@ -612,14 +679,27 @@ fn intersect_common(i: &mut Intersection, x: &Intersection, y: &Intersection) {
     }
 }
 
-/// `intersect_add`: adds every id of `y` into `x` (set union, in place).
+/// `intersect_add`: in-place union, `x |= y` (translated directly from
+/// the original's own dedicated algorithm, not composed from
+/// [`intersect_merge`] - unlike that function, `intersect_add` never
+/// needs the "common part" output, and never mutates `y`).
 fn intersect_add(x: &mut Intersection, y: &Intersection) {
-    let merged = {
-        let mut m = Intersection::new();
-        intersect_merge(&mut m, x, y);
-        m
-    };
-    *x = merged;
+    let (mut xi, mut yi) = (0usize, 0usize);
+    while xi < x.len() && yi < y.len() {
+        if x[xi] == y[yi] {
+            xi += 1;
+            yi += 1;
+        } else if y[yi] < x[xi] {
+            x.insert(xi, y[yi]);
+            xi += 1; // newly added element
+            yi += 1;
+        } else {
+            xi += 1;
+        }
+    }
+    if yi < y.len() {
+        x.extend_from_slice(&y[yi..]);
+    }
 }
 
 /// `intersect_sub`: removes every id of `y` from `x` (set difference, in
@@ -1984,21 +2064,76 @@ mod tests {
     }
 
     #[test]
-    fn intersect_merge_unions_two_sorted_sets_dedup() {
-        let x: Intersection = vec![1, 3, 5];
-        let y: Intersection = vec![2, 3, 6];
+    fn intersect_merge_extracts_common_part_and_shrinks_both_inputs() {
+        // "similar to intersect_common but modify x and y in place to
+        // retain only the items which are NOT in common" (original's own
+        // doc comment) - m gets the common part, x/y keep only their
+        // unique-to-themselves elements.
+        let mut x: Intersection = vec![1, 3, 5];
+        let mut y: Intersection = vec![2, 3, 6];
         let mut m = Intersection::new();
-        intersect_merge(&mut m, &x, &y);
-        assert_eq!(m, vec![1, 2, 3, 5, 6]);
+        intersect_merge(&mut m, &mut x, &mut y);
+        assert_eq!(m, vec![3]);
+        assert_eq!(x, vec![1, 5]);
+        assert_eq!(y, vec![2, 6]);
     }
 
     #[test]
-    fn intersect_mov_moves_ids_below_pivot() {
-        let mut x: Intersection = vec![1];
-        let mut y: Intersection = vec![2, 5, 10, 15];
-        intersect_mov(&mut x, &mut y, 10);
-        assert_eq!(x, vec![1, 2, 5]);
-        assert_eq!(y, vec![10, 15]);
+    fn intersect_merge_disjoint_sets_leaves_both_unchanged() {
+        let mut x: Intersection = vec![1, 3, 5];
+        let mut y: Intersection = vec![2, 4, 6];
+        let mut m = Intersection::new();
+        intersect_merge(&mut m, &mut x, &mut y);
+        assert!(m.is_empty());
+        assert_eq!(x, vec![1, 3, 5]);
+        assert_eq!(y, vec![2, 4, 6]);
+    }
+
+    /// Ground truth for `intersect_mov` taken directly from the original's
+    /// own unit test (`test/unit/marktree_spec.lua`, "'intersect_mov'
+    /// function works correctly", via the C-side `intersect_mov_test`
+    /// helper) - verifying this Rust translation against the exact same
+    /// input/output vectors upstream neovim itself uses to test the C
+    /// version.
+    fn mov(x: &[u64], y: &[u64], w: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        let x: Intersection = x.to_vec();
+        let mut y: Intersection = y.to_vec();
+        let mut w: Intersection = w.to_vec();
+        let mut d = Intersection::new();
+        intersect_mov(&x, &mut y, &mut w, &mut d);
+        (w, d)
+    }
+
+    #[test]
+    fn intersect_mov_matches_upstream_unit_test_vectors() {
+        assert_eq!(mov(&[], &[2, 3], &[2, 3]), (vec![], vec![]));
+        assert_eq!(mov(&[], &[], &[2, 3]), (vec![2, 3], vec![]));
+        assert_eq!(mov(&[2, 3], &[], &[]), (vec![2, 3], vec![]));
+        assert_eq!(mov(&[], &[2, 3], &[]), (vec![], vec![2, 3]));
+
+        assert_eq!(mov(&[1, 2, 5], &[2, 3], &[3]), (vec![1, 5], vec![]));
+        assert_eq!(mov(&[1, 2, 5], &[5, 10], &[10]), (vec![1, 2], vec![]));
+        assert_eq!(mov(&[1, 2], &[5, 10], &[10]), (vec![1, 2], vec![5]));
+        assert_eq!(
+            mov(&[1, 3, 5, 7, 9], &[2, 4, 6, 8, 10], &[]),
+            (vec![1, 3, 5, 7, 9], vec![2, 4, 6, 8, 10])
+        );
+        assert_eq!(
+            mov(&[1, 3, 5, 7, 9], &[2, 4, 6, 8, 10], &[4, 8]),
+            (vec![1, 3, 5, 7, 9], vec![2, 6, 10])
+        );
+        assert_eq!(
+            mov(&[1, 3, 4, 6, 7, 9], &[2, 3, 5, 6, 8, 9], &[]),
+            (vec![1, 4, 7], vec![2, 5, 8])
+        );
+        assert_eq!(
+            mov(&[1, 3, 4, 6, 7, 9], &[2, 3, 5, 6, 8, 9], &[2, 5, 8]),
+            (vec![1, 4, 7], vec![])
+        );
+        assert_eq!(
+            mov(&[1, 3, 4, 6, 7, 9], &[2, 3, 5, 6, 8, 9], &[0, 2, 5, 8, 10]),
+            (vec![0, 1, 4, 7, 10], vec![])
+        );
     }
 
     #[test]
