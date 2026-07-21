@@ -23,6 +23,13 @@ pub struct DictT {
     _private: (),
 }
 
+/// Placeholder for `list_T` (`struct listvar_S`) - the Vimscript List
+/// type. Needs `typval_T`/`listitem_T`, deferred to the eval engine as a
+/// unit (phase 5).
+pub struct ListT {
+    _private: (),
+}
+
 /// Placeholder for `partial_T` (`struct partial_S`) - a Vimscript partial
 /// (a function reference bound to some arguments/a dict `self`). Needs
 /// `typval_T`, deferred to the eval engine as a unit (phase 5).
