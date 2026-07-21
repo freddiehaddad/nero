@@ -1,8 +1,8 @@
 //! Translated from `src/nvim/garray.c` ("Functions for handling growing
 //! arrays") and the macros in `src/nvim/garray.h`.
 //!
-//! Deferred (real forward dependencies, and a design mismatch - not faked):
-//! - `ga_concat_strings`, `ga_clear_strings`, `ga_remove_duplicate_strings`,
+//! - Real forward dependencies not yet translated: `ga_concat_strings`,
+//!   `ga_clear_strings`, `ga_remove_duplicate_strings`,
 //!   `GA_DEEP_CLEAR`/`GA_DEEP_CLEAR_PTR`: these all treat `ga_data` as an
 //!   array of *string pointers* (`char **`/`const char **`), a completely
 //!   different usage of `garray_T` than "one flat byte buffer" (which is
@@ -11,11 +11,11 @@
 //!   caller that uses `garray_T` as a string list is translated, it should
 //!   become a plain `Vec<Vec<u8>>` directly rather than routing through
 //!   `GarrayT` - so these functions aren't given a home here. Also,
-//!   `ga_remove_duplicate_strings` needs `sort_strings` (`strings.c`) and
-//!   `path_fnamecmp` (`path.c`, phase 8), neither translated yet.
-//! - `WLOG(...)` calls (`log.c`, this phase but not yet translated): the
-//!   surrounding logic is translated in full; only the warning-log side
-//!   effect itself is a deferred no-op, clearly marked below.
+//!   `ga_remove_duplicate_strings` needs `path_fnamecmp` (`path.c`, phase
+//!   8, not yet translated) in addition to `sort_strings`
+//!   (`strings.c::sort_strings`, now translated).
+//! - `WLOG(...)` calls now use `crate::log::logmsg` directly (`log.c` is
+//!   translated as of this revision).
 
 use crate::garray_defs::GarrayT;
 
@@ -44,7 +44,14 @@ impl GarrayT {
     #[inline]
     pub fn ga_set_growsize(&mut self, growsize: i32) {
         if growsize < 1 {
-            // WLOG("trying to set an invalid ga_growsize: %d", growsize) - deferred, see module docs.
+            crate::log::logmsg(
+                crate::log::LOGLVL_WRN,
+                None,
+                Some("ga_set_growsize"),
+                Some(line!() as i32),
+                true,
+                &format!("trying to set an invalid ga_growsize: {growsize}"),
+            );
             self.ga_growsize = 1;
         } else {
             self.ga_growsize = growsize;
@@ -59,7 +66,14 @@ impl GarrayT {
         }
 
         if self.ga_growsize < 1 {
-            // WLOG("ga_growsize(%d) is less than 1", gap->ga_growsize) - deferred, see module docs.
+            crate::log::logmsg(
+                crate::log::LOGLVL_WRN,
+                None,
+                Some("ga_grow"),
+                Some(line!() as i32),
+                true,
+                &format!("ga_growsize({}) is less than 1", self.ga_growsize),
+            );
         }
 
         // the garray grows by at least growsize
@@ -114,7 +128,14 @@ impl GarrayT {
     /// contract, which hands back a raw, uninitialized slot).
     pub unsafe fn ga_append_via_ptr(&mut self, item_size: usize) -> *mut u8 {
         if item_size as i32 != self.ga_itemsize {
-            // WLOG("wrong item size (%zu), should be %d", ...) - deferred, see module docs.
+            crate::log::logmsg(
+                crate::log::LOGLVL_WRN,
+                None,
+                Some("ga_append_via_ptr"),
+                Some(line!() as i32),
+                true,
+                &format!("wrong item size ({}), should be {}", item_size, self.ga_itemsize),
+            );
         }
         self.ga_grow(1);
         let idx = self.ga_len as usize * self.ga_itemsize as usize;

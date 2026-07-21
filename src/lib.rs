@@ -32,5 +32,6 @@ pub mod os;
 pub mod pos_defs;
 pub mod profile;
 pub mod sha256;
+pub mod strings;
 pub mod types_defs;
 pub mod vim_defs;
