@@ -5,27 +5,29 @@
 //! `clear_fmark`, `mark_jumplist_forget_file`, `mark_view_make`,
 //! `getnextmark`, `copy_jumplist`, `free_jumplist`, `set_last_cursor`,
 //! `free_all_marks`, `mark_check`/`mark_check_line_bounds`,
-//! `clrallmarks`.
+//! `clrallmarks`, `setpcmark`, `checkpcmark`, `get_changelist`,
+//! `pos_to_mark`, `mark_get_visual` (now tractable now that
+//! `crate::os::time::os_time` and `crate::option_vars` both exist).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `setmark`/`setmark_pos`/`setpcmark`/`mark_set_global`/
-//!   `mark_set_local`/the `SET_FMARK`/`RESET_FMARK`/`SET_XFMARK`/
-//!   `RESET_XFMARK` macros: need `os_time()` (`os/time.c`, not yet
-//!   translated - only `os/time_defs.h`'s types are done) and the
-//!   `MarkSet` autocmd (`autocmd.c`). `setpcmark()` additionally needs
-//!   `jop_flags` (`'jumpoptions'`, the options system, phase 4).
+//! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
+//!   `buflist_findnr` (`buffer.c`) and the `MarkSet` autocmd
+//!   (`autocmd.c`).
 //! - `mark_jumplist_iter`/`mark_global_iter`: only consumed by
 //!   `shada.c` (not yet translated); their C-style "raw pointer as an
 //!   opaque continuation token" API doesn't have an urgent caller yet.
 //! - `mark_forget_file`: needs `tagstack_clear_entry` (`tag.c`).
-//! - `get_jumplist`/`get_changelist`/`mark_get*`/`pos_to_mark`/
-//!   `switch_to_mark_buf`/`mark_move_to`: need buffer-list lookup
-//!   (`buflist_findnr`, `buffer.c`) and/or window switching.
+//! - `get_jumplist`/`mark_get`/`mark_get_global`/`mark_get_local`/
+//!   `mark_get_motion`/`switch_to_mark_buf`/`mark_move_to`: need
+//!   buffer-list lookup (`buflist_findnr`/`buflist_getfile`, still
+//!   deferred in `buffer.c`), window switching, or `findpar`/`findsent`
+//!   (`search.c`/`textobject.c`).
 //! - `mark_view_restore`: needs `set_topline`/`hasFolding`/
 //!   `linetabsize_eol` (the display/fold subsystem).
 //! - `fname2fnum`/`fmarks_check_names`/`fmarks_check_one`: need path
-//!   resolution (`expand_env`/`os_dirname`/`path_shorten_fname`) and
-//!   `buflist_new()` (`buffer.c`).
+//!   resolution (`expand_env`/`os_dirname`/`path_shorten_fname`),
+//!   `buflist_new()` (`buffer.c`), and `TabpageT`'s real window-list
+//!   fields (still an opaque placeholder).
 //! - `fm_getname`/`mark_line`: need `ml_get()` (`memline.c`).
 //! - `ex_marks`/`ex_delmarks`/`ex_jumps`/`ex_clearjumps`/`ex_changes`:
 //!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
@@ -37,8 +39,12 @@
 //!   `get_global_marks`: need `list_T`'s real fields (the eval engine,
 //!   phase 5).
 
+use crate::buffer_defs::{BufT, WinT};
+use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
-use crate::mark_defs::{lt, FmarkT, FmarkvT, XfmarkT, NGLOBALMARKS, NMARKS};
+use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS};
+use crate::option_vars::{opt_jop_flag, OPTION_VARS};
+use crate::os::time::os_time;
 use crate::os::time_defs::Timestamp;
 use crate::pos_defs::{PosT, MAXCOL};
 use crate::vim_defs::Direction;
@@ -292,10 +298,191 @@ pub fn clrallmarks(buf: &mut crate::buffer_defs::BufT, timestamp: Timestamp) {
     buf.b_changelistlen = 0;
 }
 
+/// A static scratch `fmark_T` reused by [`pos_to_mark`] when its caller
+/// doesn't provide its own output slot (`fmp == NULL`) - mirrors the
+/// original's own `static fmark_T fms` local. Per the original's doc
+/// comment ("some of the pointers are statically allocated, if in doubt
+/// make a copy"), callers must copy the result before calling
+/// `pos_to_mark` again if they need to keep it.
+static POS_TO_MARK_SCRATCH: std::sync::LazyLock<GlobalCell<FmarkT>> =
+    std::sync::LazyLock::new(|| GlobalCell::new(FmarkT::default()));
+
+/// Set the previous context mark to the current position and add it to
+/// the jump list (`setpcmark`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` and `crate::option_vars::OPTION_VARS`,
+/// each with the same requirement as every other function that touches
+/// them: no overlapping live access.
+pub unsafe fn setpcmark() {
+    let globals = unsafe { GLOBALS.get_mut() };
+    // for :global the mark is set only once
+    if globals.global_busy != 0
+        || globals.listcmd_busy
+        || globals.cmdmod.cmod_flags & cmod::KEEPJUMPS != 0
+    {
+        return;
+    }
+
+    let curbuf_handle = unsafe { &*globals.curbuf }.handle;
+    let curwin = unsafe { &mut *globals.curwin };
+
+    curwin.w_prev_pcmark = curwin.w_pcmark;
+    curwin.w_pcmark = curwin.w_cursor;
+
+    if curwin.w_pcmark.lnum == 0 {
+        curwin.w_pcmark.lnum = 1;
+    }
+
+    if unsafe { OPTION_VARS.get_mut() }.jop_flags & opt_jop_flag::STACK != 0
+        && curwin.w_jumplistidx < curwin.w_jumplistlen - 1
+    {
+        // jumpoptions=stack: if we're somewhere in the middle of the
+        // jumplist discard everything after the current index.
+        curwin.w_jumplistlen = curwin.w_jumplistidx + 1;
+    }
+
+    // If jumplist is full: remove oldest entry
+    curwin.w_jumplistlen += 1;
+    if curwin.w_jumplistlen > JUMPLISTSIZE {
+        curwin.w_jumplistlen = JUMPLISTSIZE;
+        free_xfmark(std::mem::take(&mut curwin.w_jumplist[0]));
+        for i in 0..(JUMPLISTSIZE as usize - 1) {
+            curwin.w_jumplist[i] = std::mem::take(&mut curwin.w_jumplist[i + 1]);
+        }
+    }
+    curwin.w_jumplistidx = curwin.w_jumplistlen;
+
+    let view = mark_view_make(curwin, curwin.w_pcmark);
+    curwin.w_jumplist[(curwin.w_jumplistlen - 1) as usize] = XfmarkT {
+        fname: None,
+        fmark: FmarkT {
+            mark: curwin.w_pcmark,
+            fnum: curbuf_handle,
+            timestamp: os_time(),
+            view,
+            additional_data: None,
+        },
+    };
+}
+
+/// To change context, call [`setpcmark`], then move the current
+/// position to wherever, then call `checkpcmark()`. This ensures that
+/// the previous context will only be changed if the cursor moved to a
+/// different line. If pcmark was deleted (with "dG") the previous mark
+/// is restored (`checkpcmark`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` - same requirement as every other
+/// function that does so: no overlapping live access.
+pub unsafe fn checkpcmark() {
+    let curwin = unsafe { &mut *GLOBALS.get_mut().curwin };
+    if curwin.w_prev_pcmark.lnum != 0
+        && (equalpos(curwin.w_pcmark, curwin.w_cursor) || curwin.w_pcmark.lnum == 0)
+    {
+        curwin.w_pcmark = curwin.w_prev_pcmark;
+    }
+    curwin.w_prev_pcmark.lnum = 0; // it has been checked
+}
+
+/// Get mark in `count` position in the changelist relative to the
+/// current index (`get_changelist`).
+///
+/// Changes `win.w_changelistidx`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curbuf` - same requirement as every
+/// other function that does so: no overlapping live access.
+#[must_use]
+pub unsafe fn get_changelist(buf: &mut BufT, win: &mut WinT, count: i32) -> *mut FmarkT {
+    if buf.b_changelistlen == 0 {
+        // nothing to jump to
+        return std::ptr::null_mut();
+    }
+
+    let mut n = win.w_changelistidx;
+    if n + count < 0 {
+        if n == 0 {
+            return std::ptr::null_mut();
+        }
+        n = 0;
+    } else if n + count >= buf.b_changelistlen {
+        if n == buf.b_changelistlen - 1 {
+            return std::ptr::null_mut();
+        }
+        n = buf.b_changelistlen - 1;
+    } else {
+        n += count;
+    }
+    win.w_changelistidx = n;
+    let curbuf_handle = unsafe { &*GLOBALS.get_mut().curbuf }.handle;
+    // Changelist marks are always buffer local, Shada does not set it
+    // when loading.
+    buf.b_changelist[n as usize].fnum = curbuf_handle;
+    &mut buf.b_changelist[n as usize] as *mut FmarkT
+}
+
+/// Wrap a `pos_T` into an `fmark_T`, used to abstract marks handling.
+/// View fields are set to 0 (`pos_to_mark`).
+///
+/// Pass an `fmp` if multiple calls are needed before copying out the
+/// result - `pos_to_mark` reuses a single static scratch value when
+/// `fmp` is `None`, exactly like the original's own out-parameter
+/// convention (see this function's own doc comment in the original).
+///
+/// # Safety
+/// Touches a `GlobalCell` when `fmp` is `None` - same requirement as
+/// every other function that touches one: no overlapping live access.
+#[must_use]
+pub unsafe fn pos_to_mark(buf: &BufT, fmp: Option<&mut FmarkT>, pos: PosT) -> *mut FmarkT {
+    let fm: *mut FmarkT = match fmp {
+        Some(fmp) => fmp as *mut FmarkT,
+        None => unsafe { POS_TO_MARK_SCRATCH.get_mut() as *mut FmarkT },
+    };
+    let fm_ref = unsafe { &mut *fm };
+    fm_ref.fnum = buf.handle;
+    fm_ref.mark = pos;
+    fm
+}
+
+/// Get visual marks `'<'`/`'>'` (`mark_get_visual`).
+///
+/// These marks are different to normal marks: never adjusted, behave
+/// differently depending on editor state (visual mode), not saved in
+/// ShaDa, and re-ordered when defined in reverse.
+///
+/// # Safety
+/// Touches a `GlobalCell` (via [`pos_to_mark`]) - same requirement as
+/// every other function that touches one: no overlapping live access.
+#[must_use]
+pub unsafe fn mark_get_visual(buf: &BufT, name: u8) -> *mut FmarkT {
+    if name != b'<' && name != b'>' {
+        return std::ptr::null_mut();
+    }
+    // start/end of visual area
+    let startp = buf.b_visual.vi_start;
+    let endp = buf.b_visual.vi_end;
+    let mark = if ((name == b'<') == lt(startp, endp) || endp.lnum == 0) && startp.lnum != 0 {
+        unsafe { pos_to_mark(buf, None, startp) }
+    } else {
+        unsafe { pos_to_mark(buf, None, endp) }
+    };
+
+    if buf.b_visual.vi_mode == b'V' as i32 {
+        let mark_ref = unsafe { &mut *mark };
+        if name == b'<' {
+            mark_ref.mark.col = 0;
+        } else {
+            mark_ref.mark.col = MAXCOL;
+        }
+        mark_ref.mark.coladd = 0;
+    }
+    mark
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer_defs::{BufT, WinT};
 
     #[test]
     fn mark_global_index_matches_c_macro() {
@@ -521,5 +708,246 @@ mod tests {
         free_all_marks();
         let namedfm = unsafe { NAMEDFM.get_mut() };
         assert_eq!(namedfm[0].fmark.mark.lnum, 0);
+    }
+
+    /// RAII guard restoring every `GLOBALS` field touched by
+    /// `setpcmark`/`checkpcmark` (`curwin`, `curbuf`, `global_busy`,
+    /// `listcmd_busy`, `cmdmod`) on drop, including on test panic via
+    /// unwinding - broader version of [`CurbufGuard`] for tests that
+    /// exercise these two functions.
+    struct MarkTestGuard {
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
+        prev_global_busy: i32,
+        prev_listcmd_busy: bool,
+        prev_cmdmod_flags: i32,
+    }
+
+    impl MarkTestGuard {
+        fn set(win: *mut WinT, buf: *mut BufT) -> Self {
+            let globals = unsafe { GLOBALS.get_mut() };
+            let guard = MarkTestGuard {
+                prev_curwin: globals.curwin,
+                prev_curbuf: globals.curbuf,
+                prev_global_busy: globals.global_busy,
+                prev_listcmd_busy: globals.listcmd_busy,
+                prev_cmdmod_flags: globals.cmdmod.cmod_flags,
+            };
+            globals.curwin = win;
+            globals.curbuf = buf;
+            globals.global_busy = 0;
+            globals.listcmd_busy = false;
+            globals.cmdmod.cmod_flags = 0;
+            guard
+        }
+    }
+
+    impl Drop for MarkTestGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { GLOBALS.get_mut() };
+            globals.curwin = self.prev_curwin;
+            globals.curbuf = self.prev_curbuf;
+            globals.global_busy = self.prev_global_busy;
+            globals.listcmd_busy = self.prev_listcmd_busy;
+            globals.cmdmod.cmod_flags = self.prev_cmdmod_flags;
+        }
+    }
+
+    #[test]
+    fn setpcmark_sets_pcmark_and_pushes_jumplist_entry() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_cursor: PosT { lnum: 42, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { setpcmark() };
+
+        assert_eq!(win.w_pcmark.lnum, 42);
+        assert_eq!(win.w_jumplistlen, 1);
+        assert_eq!(win.w_jumplistidx, 1);
+        assert_eq!(win.w_jumplist[0].fmark.mark.lnum, 42);
+    }
+
+    #[test]
+    fn setpcmark_is_noop_when_global_busy() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_cursor: PosT { lnum: 42, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        unsafe { GLOBALS.get_mut() }.global_busy = 1;
+
+        unsafe { setpcmark() };
+
+        assert_eq!(win.w_jumplistlen, 0);
+    }
+
+    #[test]
+    fn setpcmark_is_noop_when_cmod_keepjumps_set() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_cursor: PosT { lnum: 42, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags = cmod::KEEPJUMPS;
+
+        unsafe { setpcmark() };
+
+        assert_eq!(win.w_jumplistlen, 0);
+    }
+
+    #[test]
+    fn setpcmark_discards_forward_jumplist_when_jumpoptions_stack() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let prev_jop = unsafe { OPTION_VARS.get_mut() }.jop_flags;
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = opt_jop_flag::STACK;
+
+        // Simulate 3 marks already in the jumplist, with the index
+        // currently sitting in the middle (as if the user had jumped
+        // back with CTRL-O).
+        win.w_jumplistlen = 3;
+        win.w_jumplistidx = 1;
+
+        win.w_cursor = PosT { lnum: 99, col: 0, coladd: 0 };
+        unsafe { setpcmark() };
+
+        // Everything after index 1 is discarded (truncating to
+        // entries [0, 1]), then the new entry for the current position
+        // is appended, giving a final length of 3 with the new entry
+        // at index 2.
+        assert_eq!(win.w_jumplistlen, 3);
+        assert_eq!(win.w_jumplist[2].fmark.mark.lnum, 99);
+
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = prev_jop;
+    }
+
+    #[test]
+    fn checkpcmark_restores_prev_pcmark_when_cursor_unchanged() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_prev_pcmark: PosT { lnum: 5, col: 0, coladd: 0 },
+            w_pcmark: PosT { lnum: 10, col: 0, coladd: 0 },
+            w_cursor: PosT { lnum: 10, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { checkpcmark() };
+
+        assert_eq!(win.w_pcmark.lnum, 5);
+        assert_eq!(win.w_prev_pcmark.lnum, 0); // marked as checked
+    }
+
+    #[test]
+    fn checkpcmark_keeps_pcmark_when_cursor_moved() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_prev_pcmark: PosT { lnum: 5, col: 0, coladd: 0 },
+            w_pcmark: PosT { lnum: 10, col: 0, coladd: 0 },
+            w_cursor: PosT { lnum: 20, col: 0, coladd: 0 }, // moved elsewhere
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { checkpcmark() };
+
+        assert_eq!(win.w_pcmark.lnum, 10); // unchanged
+        assert_eq!(win.w_prev_pcmark.lnum, 0); // still marked as checked
+    }
+
+    #[test]
+    fn get_changelist_returns_null_when_empty() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        assert!(unsafe { get_changelist(&mut buf, &mut win, 0) }.is_null());
+    }
+
+    #[test]
+    fn get_changelist_clamps_and_updates_idx() {
+        let mut buf = BufT {
+            b_changelistlen: 3,
+            ..Default::default()
+        };
+        buf.b_changelist[0].mark.lnum = 1;
+        buf.b_changelist[1].mark.lnum = 2;
+        buf.b_changelist[2].mark.lnum = 3;
+        let mut win = WinT {
+            w_changelistidx: 0,
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let fm = unsafe { get_changelist(&mut buf, &mut win, 5) }; // clamp to last
+        assert!(!fm.is_null());
+        assert_eq!(unsafe { &*fm }.mark.lnum, 3);
+        assert_eq!(win.w_changelistidx, 2);
+
+        // Already at the end: moving further forward returns NULL.
+        assert!(unsafe { get_changelist(&mut buf, &mut win, 1) }.is_null());
+    }
+
+    #[test]
+    fn pos_to_mark_uses_provided_slot_when_given() {
+        let buf = BufT::default();
+        let mut fmp = FmarkT::default();
+        let pos = PosT { lnum: 7, col: 1, coladd: 0 };
+        let result = unsafe { pos_to_mark(&buf, Some(&mut fmp), pos) };
+        assert_eq!(result, &mut fmp as *mut FmarkT);
+        assert_eq!(fmp.mark.lnum, 7);
+        assert_eq!(fmp.fnum, buf.handle);
+    }
+
+    #[test]
+    fn pos_to_mark_uses_scratch_slot_when_none() {
+        let buf = BufT::default();
+        let pos = PosT { lnum: 8, col: 2, coladd: 0 };
+        let result = unsafe { pos_to_mark(&buf, None, pos) };
+        assert!(!result.is_null());
+        assert_eq!(unsafe { &*result }.mark.lnum, 8);
+    }
+
+    #[test]
+    fn mark_get_visual_picks_earlier_position_for_lt_mark() {
+        let mut buf = BufT::default();
+        buf.b_visual.vi_start = PosT { lnum: 3, col: 0, coladd: 0 };
+        buf.b_visual.vi_end = PosT { lnum: 8, col: 0, coladd: 0 };
+        buf.b_visual.vi_mode = b'v' as i32;
+
+        let start_mark = unsafe { mark_get_visual(&buf, b'<') };
+        assert!(!start_mark.is_null());
+        assert_eq!(unsafe { &*start_mark }.mark.lnum, 3);
+
+        let end_mark = unsafe { mark_get_visual(&buf, b'>') };
+        assert!(!end_mark.is_null());
+        assert_eq!(unsafe { &*end_mark }.mark.lnum, 8);
+    }
+
+    #[test]
+    fn mark_get_visual_returns_null_for_other_names() {
+        let buf = BufT::default();
+        assert!(unsafe { mark_get_visual(&buf, b'a') }.is_null());
+    }
+
+    #[test]
+    fn mark_get_visual_linewise_forces_col_extremes() {
+        let mut buf = BufT::default();
+        buf.b_visual.vi_start = PosT { lnum: 3, col: 5, coladd: 2 };
+        buf.b_visual.vi_end = PosT { lnum: 8, col: 5, coladd: 2 };
+        buf.b_visual.vi_mode = b'V' as i32; // linewise
+
+        let start_mark = unsafe { mark_get_visual(&buf, b'<') };
+        assert_eq!(unsafe { &*start_mark }.mark.col, 0);
+        assert_eq!(unsafe { &*start_mark }.mark.coladd, 0);
+
+        let end_mark = unsafe { mark_get_visual(&buf, b'>') };
+        assert_eq!(unsafe { &*end_mark }.mark.col, MAXCOL);
+        assert_eq!(unsafe { &*end_mark }.mark.coladd, 0);
     }
 }

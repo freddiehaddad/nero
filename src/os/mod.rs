@@ -5,6 +5,7 @@
 
 pub mod fs_defs;
 pub mod os_defs;
+pub mod time;
 pub mod time_defs;
 #[cfg(unix)]
 pub mod unix_defs;
