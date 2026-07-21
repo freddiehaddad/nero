@@ -59,9 +59,11 @@
 #![allow(dead_code)]
 
 use crate::decoration_defs::{DecorHighlightInline, DecorInline, DecorVirtText};
+use crate::map::Map;
 use crate::marktree_defs::{
     Intersection, MarkTree, MarkTreeIter, MetaFilter, MetaIndex, MtKey, MtNode, MtPos, K_MT_META_COUNT,
 };
+use crate::types_defs::MtDamagePair;
 use std::mem::ManuallyDrop;
 
 // --- src/nvim/marktree.h: flag bits on `MtKey.flags` ---
@@ -2486,6 +2488,351 @@ pub unsafe fn marktree_revise_meta(b: &mut MarkTree, itr: &MarkTreeIter, old_key
     }
 }
 
+/// `check_damage`: records that the key `itr1` currently refers to (which
+/// must be one side of a paired mark) has effectively moved to where
+/// `itr2` now points - used by [`swap_keys`] while splicing, so pair
+/// intersections can be repaired afterward.
+///
+/// # Safety
+/// `itr1`/`itr2` must be valid.
+unsafe fn check_damage(damage: &mut Map<u64, MtDamagePair>, itr1: &MarkTreeIter, itr2: &MarkTreeIter) {
+    // SAFETY: forwarded from caller.
+    let start_id = mt_lookup_key_side(unsafe { rawkey(itr1) }, false);
+    let mut p = damage.get_or_default(&start_id);
+    let me = if unsafe { mt_end(rawkey(itr1)) } { &mut p.end } else { &mut p.start };
+    debug_assert!(me.new.is_null());
+    *me = crate::types_defs::MtDamage { old: itr1.x, new: itr2.x, old_i: itr1.i, new_i: itr2.i };
+    damage.insert(start_id, p);
+}
+
+/// `swap_keys`: swaps the full key content (but not position) between the
+/// slots `itr1`/`itr2` currently refer to, propagating meta-count deltas
+/// up to their common ancestor if they live in different nodes, and
+/// recording pair-movement info in `damage` for either side that is
+/// paired (via [`check_damage`]).
+///
+/// # Safety
+/// `itr1`/`itr2` must be valid and refer to two genuinely different key
+/// slots (never the same slot - this is guaranteed by `marktree_splice`,
+/// the only caller, which never invokes this when `itr_eq(itr1, itr2)`).
+unsafe fn swap_keys(
+    b: &mut MarkTree,
+    itr1: &mut MarkTreeIter,
+    itr2: &mut MarkTreeIter,
+    damage: &mut Map<u64, MtDamagePair>,
+) {
+    // SAFETY: `itr1`/`itr2` valid.
+    if unsafe { (*itr1.x).level } != 0 || itr1.x != itr2.x {
+        if unsafe { mt_paired(rawkey(itr1)) } {
+            unsafe { check_damage(damage, itr1, itr2) };
+        }
+        if unsafe { mt_paired(rawkey(itr2)) } {
+            unsafe { check_damage(damage, itr2, itr1) };
+        }
+    }
+
+    if itr1.x != itr2.x {
+        let meta_inc_1 = meta_describe_key(unsafe { rawkey(itr1) });
+        let meta_inc_2 = meta_describe_key(unsafe { rawkey(itr2) });
+
+        if meta_inc_1 != meta_inc_2 {
+            let mut x1 = itr1.x;
+            let mut x2 = itr2.x;
+            while x1 != x2 {
+                // SAFETY: `x1`/`x2` valid; the root uniquely has the
+                // highest level, so as long as `x1 != x2`, whichever of
+                // the two has the (weakly) lower level cannot be the
+                // root, and so must have a valid parent.
+                if unsafe { (*x1).level } <= unsafe { (*x2).level } {
+                    let p_idx = unsafe { (*x1).p_idx };
+                    let parent = unsafe { (*x1).parent };
+                    let mut meta_node = unsafe { node_meta(parent, p_idx as usize) };
+                    for (dst, (&i1, &i2)) in meta_node.iter_mut().zip(meta_inc_1.iter().zip(meta_inc_2.iter())) {
+                        // Unsigned modular arithmetic, matching the
+                        // original's `uint32_t` `+=`/`-` exactly (the
+                        // subtraction may "underflow" and wrap, but the
+                        // final wrapping-add result is the same either way).
+                        *dst = dst.wrapping_add(i2.wrapping_sub(i1));
+                    }
+                    unsafe { node_set_meta(parent, p_idx as usize, meta_node) };
+                    x1 = parent;
+                }
+                if unsafe { (*x2).level } < unsafe { (*x1).level } {
+                    let p_idx = unsafe { (*x2).p_idx };
+                    let parent = unsafe { (*x2).parent };
+                    let mut meta_node = unsafe { node_meta(parent, p_idx as usize) };
+                    for (dst, (&i1, &i2)) in meta_node.iter_mut().zip(meta_inc_1.iter().zip(meta_inc_2.iter())) {
+                        *dst = dst.wrapping_add(i1.wrapping_sub(i2));
+                    }
+                    unsafe { node_set_meta(parent, p_idx as usize, meta_node) };
+                    x2 = parent;
+                }
+            }
+        }
+    }
+
+    // SAFETY: `itr1`/`itr2` valid.
+    let pos1 = unsafe { (*itr1.x).key[itr1.i as usize].pos };
+    let pos2 = unsafe { (*itr2.x).key[itr2.i as usize].pos };
+    if itr1.x == itr2.x {
+        // SAFETY: same node - a plain slice swap (never the same index,
+        // per this function's safety contract).
+        unsafe { (*itr1.x).key.swap(itr1.i as usize, itr2.i as usize) };
+    } else {
+        // SAFETY: `itr1.x`/`itr2.x` are different allocations, so taking
+        // one `&mut` into each simultaneously is sound.
+        unsafe {
+            std::mem::swap(&mut (*itr1.x).key[itr1.i as usize], &mut (*itr2.x).key[itr2.i as usize]);
+        }
+    }
+    unsafe {
+        (*itr1.x).key[itr1.i as usize].pos = pos1;
+        (*itr2.x).key[itr2.i as usize].pos = pos2;
+        refkey(b, itr1.x, itr1.i as usize);
+        refkey(b, itr2.x, itr2.i as usize);
+    }
+}
+
+/// `marktree_splice`: updates every mark's position to account for a text
+/// edit replacing the `old_extent`-sized region starting at
+/// `(start_line, start_col)` with a `new_extent`-sized region. Returns
+/// `true` if any mark actually moved.
+///
+/// Follows the original's own documented strategy ("messing things up
+/// and fix them later"): first (if the edit deletes text) every mark
+/// inside the deleted region is collapsed onto the start position
+/// (swapping right-gravity marks past the boundary with the last
+/// non-right-gravity mark in the deleted range, via `swap_keys`, so
+/// deleted-region marks end up in a well-defined relative order rather
+/// than arbitrarily jumbled); then every mark after the edited region has
+/// its position shifted by the row/col delta between the old and new
+/// extents; finally, paired marks whose start/end nodes changed
+/// ("damage") have their intersection tracking repaired.
+pub fn marktree_splice(
+    b: &mut MarkTree,
+    start_line: i32,
+    start_col: i32,
+    old_extent_line: i32,
+    old_extent_col: i32,
+    new_extent_line: i32,
+    new_extent_col: i32,
+) -> bool {
+    let start = MtPos::new(start_line, start_col);
+    let mut old_extent = MtPos::new(old_extent_line, old_extent_col);
+    let mut new_extent = MtPos::new(new_extent_line, new_extent_col);
+
+    let mut may_delete = old_extent.row != 0 || old_extent.col != 0;
+    let same_line = old_extent.row == 0 && new_extent.row == 0;
+    unrelative(start, &mut old_extent);
+    unrelative(start, &mut new_extent);
+    let mut itr = MarkTreeIter::default();
+    let mut enditr = MarkTreeIter::default();
+
+    let mut oldbase = [MtPos::default(); crate::marktree_defs::MT_MAX_DEPTH];
+
+    marktree_itr_get_ext(b, start, &mut itr, false, true, Some(&mut oldbase), None);
+    if itr.x.is_null() {
+        return false;
+    }
+    let delta = MtPos::new(new_extent.row - old_extent.row, new_extent.col - old_extent.col);
+
+    if may_delete {
+        // SAFETY: `itr` is valid (non-null `x`, checked above).
+        let ipos = unsafe { marktree_itr_pos(&itr) };
+        if !pos_leq(old_extent, ipos)
+            || (old_extent.row == ipos.row && old_extent.col == ipos.col && !unsafe { mt_right(rawkey(&itr)) })
+        {
+            marktree_itr_get_ext(b, old_extent, &mut enditr, true, true, None, None);
+            debug_assert!(!enditr.x.is_null());
+            // "assert" (itr <= enditr).
+        } else {
+            may_delete = false;
+        }
+    }
+
+    let mut past_right = false;
+    let mut moved = false;
+    let mut damage: Map<u64, MtDamagePair> = Map::default();
+
+    // Follow the general strategy of messing things up and fix them later.
+    // "oldbase" carries the information needed to calculate old position of
+    // children.
+    if may_delete {
+        'outer: while !itr.x.is_null() && !past_right {
+            let mut loc_start = start;
+            let mut loc_old = old_extent;
+            relative(itr.pos, &mut loc_start);
+            relative(oldbase[itr.lvl as usize], &mut loc_old);
+
+            // `continue_same_node:` in the original.
+            loop {
+                // SAFETY: `itr.x` non-null (outer loop condition).
+                if !pos_leq(unsafe { rawkey(&itr) }.pos, loc_old) {
+                    break 'outer;
+                }
+
+                if unsafe { mt_right(rawkey(&itr)) } {
+                    while !unsafe { itr_eq(&itr, &enditr) } && unsafe { mt_right(rawkey(&enditr)) } {
+                        marktree_itr_prev(b, &mut enditr);
+                    }
+                    if !unsafe { mt_right(rawkey(&enditr)) } {
+                        unsafe { swap_keys(b, &mut itr, &mut enditr, &mut damage) };
+                    } else {
+                        // Matches the original's own `past_right = true; //
+                        // NOLINT (void)past_right;` - the assignment is
+                        // immediately followed by `break`, so it's
+                        // observably redundant here too (kept for
+                        // documentation/clarity, exactly like upstream).
+                        #[allow(unused_assignments)]
+                        {
+                            past_right = true;
+                        }
+                        break 'outer;
+                    }
+                }
+
+                if unsafe { itr_eq(&itr, &enditr) } {
+                    // Actually, will be past_right after this key.
+                    past_right = true;
+                }
+
+                moved = true;
+                // SAFETY: `itr.x` valid.
+                if unsafe { (*itr.x).level } != 0 {
+                    let mut next_base = unsafe { rawkey(&itr) }.pos;
+                    unrelative(oldbase[itr.lvl as usize], &mut next_base);
+                    oldbase[itr.lvl as usize + 1] = next_base;
+                    unsafe { (*itr.x).key[itr.i as usize].pos = loc_start };
+                    marktree_itr_next_skip(&mut itr, false, false, Some(&mut oldbase), None);
+                    break;
+                } else {
+                    unsafe { (*itr.x).key[itr.i as usize].pos = loc_start };
+                    let x_n = unsafe { (*itr.x).n };
+                    if itr.i < x_n - 1 {
+                        itr.i += 1;
+                        if !past_right {
+                            continue;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        marktree_itr_next(b, &mut itr);
+                        break;
+                    }
+                }
+            }
+        }
+
+        'outer2: while !itr.x.is_null() {
+            let mut loc_new = new_extent;
+            relative(itr.pos, &mut loc_new);
+            let mut limit = old_extent;
+            relative(oldbase[itr.lvl as usize], &mut limit);
+
+            // `past_continue_same_node:` in the original.
+            loop {
+                if pos_leq(limit, unsafe { rawkey(&itr) }.pos) {
+                    break 'outer2;
+                }
+
+                let oldpos = unsafe { rawkey(&itr) }.pos;
+                unsafe { (*itr.x).key[itr.i as usize].pos = loc_new };
+                moved = true;
+                // SAFETY: `itr.x` valid.
+                if unsafe { (*itr.x).level } != 0 {
+                    let mut next_base = oldpos;
+                    unrelative(oldbase[itr.lvl as usize], &mut next_base);
+                    oldbase[itr.lvl as usize + 1] = next_base;
+                    marktree_itr_next_skip(&mut itr, false, false, Some(&mut oldbase), None);
+                    break;
+                } else {
+                    let x_n = unsafe { (*itr.x).n };
+                    if itr.i < x_n - 1 {
+                        itr.i += 1;
+                        continue;
+                    } else {
+                        marktree_itr_next(b, &mut itr);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    while !itr.x.is_null() {
+        // SAFETY: `itr.x` non-null (loop condition).
+        unsafe { unrelative(oldbase[itr.lvl as usize], &mut (*itr.x).key[itr.i as usize].pos) };
+        let realrow = unsafe { (*itr.x).key[itr.i as usize].pos.row };
+        debug_assert!(realrow >= old_extent.row);
+        let mut done = false;
+        if realrow == old_extent.row {
+            if delta.col != 0 {
+                unsafe { (*itr.x).key[itr.i as usize].pos.col += delta.col };
+            }
+        } else if same_line {
+            // Optimization: column only adjustment can skip remaining rows.
+            done = true;
+        }
+        if delta.row != 0 {
+            unsafe { (*itr.x).key[itr.i as usize].pos.row += delta.row };
+            moved = true;
+        }
+        unsafe { relative(itr.pos, &mut (*itr.x).key[itr.i as usize].pos) };
+        if done {
+            break;
+        }
+        marktree_itr_next_skip(&mut itr, true, false, None, None);
+    }
+
+    let entries: Vec<(u64, MtDamagePair)> = damage.iter().map(|(&k, &v)| (k, v)).collect();
+    for (start_id, d) in entries {
+        if !d.start.old.is_null() && !d.end.old.is_null() {
+            // Both ends of pair did move.
+            // SAFETY: `d.start.old`/`d.end.old`/`d.start.new`/`d.end.new`
+            // were recorded from live iterator positions in this same
+            // splice call and remain valid node pointers.
+            unsafe {
+                marktree_itr_set_node(b, Some(&mut itr), d.start.old, d.start.old_i);
+                marktree_itr_set_node(b, Some(&mut enditr), d.end.old, d.end.old_i);
+            }
+            marktree_intersect_pair(b, start_id, &mut itr, &enditr, true);
+            unsafe {
+                marktree_itr_set_node(b, Some(&mut itr), d.start.new, d.start.new_i);
+                marktree_itr_set_node(b, Some(&mut enditr), d.end.new, d.end.new_i);
+            }
+            marktree_intersect_pair(b, start_id, &mut itr, &enditr, false);
+        } else if !d.start.old.is_null() {
+            // Only start did move.
+            let mut endpos = MarkTreeIter::default();
+            marktree_lookup(b, start_id | MARKTREE_END_FLAG, Some(&mut endpos));
+            if !endpos.x.is_null() {
+                // SAFETY: `d.start.old`/`d.start.new` valid (see above).
+                unsafe { marktree_itr_set_node(b, Some(&mut itr), d.start.old, d.start.old_i) };
+                enditr = endpos;
+                marktree_intersect_pair(b, start_id, &mut itr, &enditr, true);
+                unsafe { marktree_itr_set_node(b, Some(&mut itr), d.start.new, d.start.new_i) };
+                enditr = endpos;
+                marktree_intersect_pair(b, start_id, &mut itr, &enditr, false);
+            }
+        } else if !d.end.old.is_null() {
+            // Only end did move.
+            let mut startpos = MarkTreeIter::default();
+            marktree_lookup(b, start_id, Some(&mut startpos));
+            if !startpos.x.is_null() {
+                itr = startpos;
+                // SAFETY: `d.end.old`/`d.end.new` valid (see above).
+                unsafe { marktree_itr_set_node(b, Some(&mut enditr), d.end.old, d.end.old_i) };
+                marktree_intersect_pair(b, start_id, &mut itr, &enditr, true);
+                itr = startpos;
+                unsafe { marktree_itr_set_node(b, Some(&mut enditr), d.end.new, d.end.new_i) };
+                marktree_intersect_pair(b, start_id, &mut itr, &enditr, false);
+            }
+        }
+    }
+
+    moved
+}
+
 /// `marktree_put_test`: convenience entry point used by the original's own
 /// unit tests, translated as a thin wrapper matching its shape - now that
 /// `marktree_put` itself is translated, this supports the paired case too
@@ -3671,6 +4018,185 @@ mod tests {
         marktree_check(&tree);
         assert_eq!(marktree_lookup_ns(&tree, 2, 7, false, None).pos, MtPos::new(-1, -1));
         assert_eq!(marktree_lookup_ns(&tree, 2, 7, true, None).pos, MtPos::new(-1, -1));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    // --- splice (text-edit position update) tests ---
+
+    #[test]
+    fn splice_pure_line_insert_shifts_marks_at_or_after_start() {
+        let mut tree = MarkTree::default();
+        for i in 0..10 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        // Insert 2 new lines at row 5 (old_extent=0 rows deleted, new_extent=2 rows added).
+        let moved = marktree_splice(&mut tree, 5, 0, 0, 0, 2, 0);
+        assert!(moved);
+        marktree_check(&tree);
+
+        // Rows 0..=5 are unaffected: row 5 has default (left) gravity, so
+        // a mark exactly at the insertion point stays attached to what's
+        // *before* it and does not get pushed forward by the new lines -
+        // standard editor mark-gravity semantics (matches
+        // marktree_itr_get_ext's `gravity=true` search: it deliberately
+        // lands *past* a left-gravity key at the exact search position).
+        for i in 0..=5 {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(i, 0), "row {i} at/before the insert point must be unchanged (left gravity)");
+        }
+        for i in 6..10 {
+            assert_eq!(
+                marktree_lookup_ns(&tree, 0, i as u32, false, None).pos,
+                MtPos::new(i + 2, 0),
+                "row {i} strictly after the insert point must shift down by 2"
+            );
+        }
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn splice_pure_line_delete_collapses_and_shifts() {
+        let mut tree = MarkTree::default();
+        for i in 0..10 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        // Delete 2 lines starting at row 3 (rows 3,4 are removed; row 5+ shift up by 2).
+        let moved = marktree_splice(&mut tree, 3, 0, 2, 0, 0, 0);
+        assert!(moved);
+        marktree_check(&tree);
+        assert_eq!(tree.n_keys, 10, "splice itself never removes marks, only repositions them");
+
+        for i in 0..3 {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(i, 0), "row {i} before the deleted region must be unchanged");
+        }
+        // Marks that were inside the deleted region (rows 3, 4) collapse
+        // onto the start of the edit.
+        for i in 3..5 {
+            assert_eq!(
+                marktree_lookup_ns(&tree, 0, i as u32, false, None).pos,
+                MtPos::new(3, 0),
+                "row {i} was inside the deleted region and must collapse to the edit start"
+            );
+        }
+        for i in 5..10 {
+            assert_eq!(
+                marktree_lookup_ns(&tree, 0, i as u32, false, None).pos,
+                MtPos::new(i - 2, 0),
+                "row {i} after the deleted region must shift up by 2"
+            );
+        }
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn splice_column_only_edit_on_same_line() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 0, 5, 2, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 1, 5, 10, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 2, 6, 0, false, -1, -1, false, false);
+        marktree_check(&tree);
+
+        // Replace 3 columns with 5 columns at (5, 4): a pure same-line
+        // column edit (old_extent/new_extent both have row == 0).
+        //
+        // Note: `marktree_splice`'s `moved` return value only reflects
+        // *row*-level shifts (it's set exclusively in the `delta.row`
+        // branch of the final position-fixup pass, per the original C -
+        // a faithfully-translated, if perhaps surprising, real property
+        // of the upstream algorithm) - so a pure column-only edit that
+        // doesn't delete/collapse any existing mark can legitimately
+        // return `false` even though a mark's column does shift, as
+        // verified directly below via position checks instead.
+        marktree_splice(&mut tree, 5, 4, 0, 3, 0, 5);
+        marktree_check(&tree);
+
+        // Mark before the edit column is untouched.
+        assert_eq!(marktree_lookup_ns(&tree, 0, 0, false, None).pos, MtPos::new(5, 2));
+        // Mark after the edit on the same line shifts by delta.col = 5-3 = 2.
+        assert_eq!(marktree_lookup_ns(&tree, 0, 1, false, None).pos, MtPos::new(5, 12));
+        // Mark on a later row is untouched (same_line optimization).
+        assert_eq!(marktree_lookup_ns(&tree, 0, 2, false, None).pos, MtPos::new(6, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn splice_no_op_when_before_all_marks_returns_false_if_nothing_moves() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 0, 5, 0, false, -1, -1, false, false);
+        marktree_check(&tree);
+
+        // An edit entirely after every existing mark: marktree_itr_get_ext
+        // finds no key at/after the edit start, so nothing can move.
+        let moved = marktree_splice(&mut tree, 100, 0, 0, 0, 1, 0);
+        assert!(!moved);
+        marktree_check(&tree);
+        assert_eq!(marktree_lookup_ns(&tree, 0, 0, false, None).pos, MtPos::new(5, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn splice_paired_mark_spanning_edit_maintains_invariants() {
+        let mut tree = MarkTree::default();
+        for i in 0..40 {
+            marktree_put_test(&mut tree, 0, i as u32 + 1000, i, 0, false, -1, -1, false, false);
+        }
+        // A pair spanning rows 5..35; an edit inside that range should
+        // move only one side into the edited region while the other stays
+        // outside - exercising the check_damage/swap_keys repair path.
+        marktree_put_test(&mut tree, 1, 1, 5, 0, false, 35, 0, false, false);
+        marktree_check(&tree);
+
+        let moved = marktree_splice(&mut tree, 20, 0, 5, 0, 1, 0);
+        assert!(moved);
+        marktree_check(&tree);
+
+        let start = marktree_lookup_ns(&tree, 1, 1, false, None);
+        let end = marktree_lookup_ns(&tree, 1, 1, true, None);
+        assert!(mt_paired(&start) && mt_paired(&end));
+        assert_eq!(marktree_get_altpos(&tree, &start, None), end.pos);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn splice_stress_sequence_of_edits_maintains_invariants() {
+        let mut tree = MarkTree::default();
+        for i in 0..200 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, i % 3 == 0, -1, -1, false, false);
+        }
+        // A few paired marks scattered through the tree too.
+        for p in 0..10 {
+            let s = p * 15;
+            marktree_put_test(&mut tree, 1, p as u32, s, 0, false, s + 8, 0, true, false);
+        }
+        marktree_check(&tree);
+
+        // A deterministic sequence of inserts/deletes/replacements at
+        // varying positions, each re-verified via marktree_check.
+        let edits: &[(i32, i32, i32, i32, i32, i32)] = &[
+            (10, 0, 0, 0, 3, 0),  // insert 3 lines at row 10
+            (50, 0, 5, 0, 0, 0),  // delete 5 lines at row 50
+            (5, 2, 0, 4, 0, 0),   // insert 4 columns mid-line
+            (100, 0, 2, 0, 2, 0), // replace 2 lines with 2 lines (net zero row delta)
+            (0, 0, 1, 0, 0, 0),   // delete the very first line
+            (150, 0, 0, 0, 10, 0), // insert 10 lines further down
+            (30, 0, 20, 0, 1, 0), // collapse a large deleted range to 1 line
+        ];
+        for &(sl, sc, oel, oec, nel, nec) in edits {
+            marktree_splice(&mut tree, sl, sc, oel, oec, nel, nec);
+            marktree_check(&tree);
+        }
+        // marktree_splice never changes the number of marks, only
+        // positions: 200 individual marks + 10 pairs (2 keys each) = 220.
+        assert_eq!(tree.n_keys, 220);
 
         unsafe { marktree_clear(&mut tree) };
     }
