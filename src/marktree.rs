@@ -58,7 +58,9 @@
 #![allow(dead_code)]
 
 use crate::decoration_defs::{DecorHighlightInline, DecorInline, DecorVirtText};
-use crate::marktree_defs::{Intersection, MarkTree, MetaFilter, MetaIndex, MtKey, MtNode, MtPos, K_MT_META_COUNT};
+use crate::marktree_defs::{
+    Intersection, MarkTree, MarkTreeIter, MetaFilter, MetaIndex, MtKey, MtNode, MtPos, K_MT_META_COUNT,
+};
 use std::mem::ManuallyDrop;
 
 // --- src/nvim/marktree.h: flag bits on `MtKey.flags` ---
@@ -1032,10 +1034,481 @@ pub fn marktree_put_key(b: &mut MarkTree, mut k: MtKey) {
     b.n_keys += 1;
 }
 
+/// `rawkey`: `itr->x->key[itr->i]` (the original's macro).
+///
+/// # Safety
+/// `itr.x` must be non-null/valid, and `itr.i` a valid key index into it
+/// (`0 <= itr.i < (*itr.x).n`).
+#[inline]
+unsafe fn rawkey(itr: &MarkTreeIter) -> &MtKey {
+    // SAFETY: forwarded from caller.
+    unsafe { &(*itr.x).key[itr.i as usize] }
+}
+
+/// `marktree_itr_get`: places `itr` at the first key `>= (row, col)`.
+pub fn marktree_itr_get(b: &MarkTree, row: i32, col: i32, itr: &mut MarkTreeIter) -> bool {
+    marktree_itr_get_ext(b, MtPos::new(row, col), itr, false, false, None, None)
+}
+
+/// `marktree_itr_get_ext`: the general form behind [`marktree_itr_get`].
+/// `last`: find the last key `<= p` instead of the first `>= p`.
+/// `gravity`: match only keys with `MT_FLAG_RIGHT_GRAVITY` set.
+/// `oldbase` (optional, indexed by tree level): filled in with the
+/// accumulated absolute position at each level descended through.
+/// `meta_filter` (optional): stop descending into a subtree that
+/// provably can't contain any key matching the filter.
+pub fn marktree_itr_get_ext(
+    b: &MarkTree,
+    p: MtPos,
+    itr: &mut MarkTreeIter,
+    last: bool,
+    gravity: bool,
+    mut oldbase: Option<&mut [MtPos]>,
+    meta_filter: Option<MetaFilter<'_>>,
+) -> bool {
+    if b.n_keys == 0 {
+        itr.x = std::ptr::null_mut();
+        return false;
+    }
+
+    let mut k = MtKey {
+        pos: p,
+        ns: 0,
+        id: 0,
+        flags: if gravity { MT_FLAG_RIGHT_GRAVITY } else { 0 },
+        decor_data: crate::decoration_defs::DecorInlineData { hl: DecorHighlightInline::default() },
+    };
+    if last && !gravity {
+        k.flags = MT_FLAG_LAST;
+    }
+    itr.pos = MtPos::default();
+    itr.x = b.root;
+    itr.lvl = 0;
+    if let Some(ob) = oldbase.as_deref_mut() {
+        ob[itr.lvl as usize] = itr.pos;
+    }
+    loop {
+        // SAFETY: `itr.x` starts as `b.root` (non-null since `n_keys > 0`)
+        // and is only ever reassigned to a valid child pointer below.
+        itr.i = unsafe { marktree_getp_aux(&*itr.x, &k, None) } + 1;
+
+        // SAFETY: `itr.x` valid.
+        if unsafe { (*itr.x).level } == 0 {
+            break;
+        }
+        if let Some(mf) = meta_filter {
+            // SAFETY: `itr.x` valid internal node.
+            if !meta_has(&unsafe { node_meta(itr.x, itr.i as usize) }, mf) {
+                // This takes us to the internal position after the first
+                // rejected node.
+                break;
+            }
+        }
+
+        itr.s[itr.lvl as usize].i = itr.i;
+        itr.s[itr.lvl as usize].oldcol = itr.pos.col;
+
+        if itr.i > 0 {
+            // SAFETY: `itr.x` valid.
+            let base = unsafe { (*itr.x).key[itr.i as usize - 1].pos };
+            compose(&mut itr.pos, base);
+            relative(base, &mut k.pos);
+        }
+        // SAFETY: `itr.x` valid internal node.
+        itr.x = unsafe { node_child(itr.x, itr.i as usize) };
+        itr.lvl += 1;
+        if let Some(ob) = oldbase.as_deref_mut() {
+            ob[itr.lvl as usize] = itr.pos;
+        }
+    }
+
+    if last {
+        marktree_itr_prev(b, itr)
+    } else if itr.i >= unsafe { (*itr.x).n } {
+        // No need for `meta_filter` here, this just goes up one step.
+        marktree_itr_next_skip(itr, true, false, None, None)
+    } else {
+        true
+    }
+}
+
+/// `marktree_itr_first`: places `itr` at the very first key in the tree.
+pub fn marktree_itr_first(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
+    if b.n_keys == 0 {
+        itr.x = std::ptr::null_mut();
+        return false;
+    }
+    itr.x = b.root;
+    itr.i = 0;
+    itr.lvl = 0;
+    itr.pos = MtPos::new(0, 0);
+    // SAFETY: `itr.x` is `b.root`, non-null (`n_keys > 0` checked above),
+    // and stays valid as it's only reassigned to a valid child below.
+    while unsafe { (*itr.x).level } > 0 {
+        itr.s[itr.lvl as usize].i = 0;
+        itr.s[itr.lvl as usize].oldcol = 0;
+        itr.lvl += 1;
+        itr.x = unsafe { node_child(itr.x, 0) };
+    }
+    true
+}
+
+/// `marktree_itr_last`: places `itr` at the very last key in the tree.
+/// Returns `bool` here (the original declares `int` but only ever returns
+/// `true`/`false` - a faithful behavioral match).
+// gives the first key that is greater or equal to p (kept verbatim from
+// the original's own doc comment, even though - per the implementation -
+// this takes no position parameter at all and always walks to the
+// rightmost leaf; presumably stale documentation upstream).
+pub fn marktree_itr_last(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
+    if b.n_keys == 0 {
+        itr.x = std::ptr::null_mut();
+        return false;
+    }
+    itr.pos = MtPos::new(0, 0);
+    itr.x = b.root;
+    itr.lvl = 0;
+    loop {
+        // SAFETY: `itr.x` valid (loop invariant).
+        itr.i = unsafe { (*itr.x).n };
+
+        if unsafe { (*itr.x).level } == 0 {
+            break;
+        }
+
+        itr.s[itr.lvl as usize].i = itr.i;
+        itr.s[itr.lvl as usize].oldcol = itr.pos.col;
+
+        debug_assert!(itr.i > 0);
+        // SAFETY: `itr.x` valid; `itr.i > 0`.
+        let base = unsafe { (*itr.x).key[itr.i as usize - 1].pos };
+        compose(&mut itr.pos, base);
+
+        itr.x = unsafe { node_child(itr.x, itr.i as usize) };
+        itr.lvl += 1;
+    }
+    itr.i -= 1;
+    true
+}
+
+/// `marktree_itr_next`: advances `itr` to the next key (in tree order).
+pub fn marktree_itr_next(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
+    let _ = b; // unused in the original too - kept for public signature parity
+    marktree_itr_next_skip(itr, false, false, None, None)
+}
+
+/// `marktree_itr_next_skip`: the general form behind [`marktree_itr_next`]
+/// (`static`/private in the original, so - unlike the public iterator
+/// functions - its unused `MarkTree *b` parameter is simply dropped here;
+/// nothing outside this file calls it directly).
+fn marktree_itr_next_skip(
+    itr: &mut MarkTreeIter,
+    mut skip: bool,
+    preload: bool,
+    mut oldbase: Option<&mut [MtPos]>,
+    meta_filter: Option<MetaFilter<'_>>,
+) -> bool {
+    if itr.x.is_null() {
+        return false;
+    }
+    itr.i += 1;
+    // SAFETY: `itr.x` non-null (checked above) and valid.
+    let level = unsafe { (*itr.x).level };
+    if let Some(mf) = meta_filter {
+        if level > 0 && !meta_has(&unsafe { node_meta(itr.x, itr.i as usize) }, mf) {
+            skip = true;
+        }
+    }
+    if level == 0 || skip {
+        // SAFETY: `itr.x` valid.
+        let n = unsafe { (*itr.x).n };
+        if preload && level == 0 && skip {
+            // Skip rest of this leaf node.
+            itr.i = n;
+        } else if itr.i < n {
+            return true;
+        }
+        // We ran out of non-internal keys. Go up until we find an internal key.
+        loop {
+            // SAFETY: `itr.x` valid.
+            if itr.i < unsafe { (*itr.x).n } {
+                break;
+            }
+            itr.x = unsafe { (*itr.x).parent };
+            if itr.x.is_null() {
+                return false;
+            }
+            itr.lvl -= 1;
+            itr.i = itr.s[itr.lvl as usize].i;
+            if itr.i > 0 {
+                // SAFETY: `itr.x` valid; `itr.i > 0`.
+                let key_row = unsafe { (*itr.x).key[itr.i as usize - 1].pos.row };
+                itr.pos.row -= key_row;
+                itr.pos.col = itr.s[itr.lvl as usize].oldcol;
+            }
+        }
+    } else {
+        // We stood at an "internal" key. Go down to the first non-internal
+        // key after it.
+        // SAFETY: `itr.x` valid.
+        while unsafe { (*itr.x).level } > 0 {
+            // Internal key, there is always a child after.
+            if itr.i > 0 {
+                itr.s[itr.lvl as usize].oldcol = itr.pos.col;
+                // SAFETY: `itr.x` valid.
+                let base = unsafe { (*itr.x).key[itr.i as usize - 1].pos };
+                compose(&mut itr.pos, base);
+            }
+            if itr.i == 0 {
+                if let Some(ob) = oldbase.as_deref_mut() {
+                    let lvl = itr.lvl as usize;
+                    ob[lvl + 1] = ob[lvl];
+                }
+            }
+            itr.s[itr.lvl as usize].i = itr.i;
+            // SAFETY: `itr.x` valid internal node.
+            debug_assert_eq!(unsafe { (*node_child(itr.x, itr.i as usize)).parent }, itr.x);
+            itr.lvl += 1;
+            itr.x = unsafe { node_child(itr.x, itr.i as usize) };
+            // SAFETY: `itr.x` valid (just reassigned).
+            if preload && unsafe { (*itr.x).level } != 0 {
+                itr.i = -1;
+                break;
+            }
+            itr.i = 0;
+            if let Some(mf) = meta_filter {
+                if unsafe { (*itr.x).level } != 0 && !meta_has(&unsafe { node_meta(itr.x, 0) }, mf) {
+                    // `itr.x` has filtered keys but `ptr[0]` does not, don't
+                    // enter the latter.
+                    break;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `marktree_itr_prev`: moves `itr` to the previous key (in tree order).
+pub fn marktree_itr_prev(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
+    let _ = b; // unused in the original too - kept for public signature parity
+    if itr.x.is_null() {
+        return false;
+    }
+    // SAFETY: `itr.x` non-null (checked above) and valid.
+    if unsafe { (*itr.x).level } == 0 {
+        itr.i -= 1;
+        if itr.i >= 0 {
+            return true;
+        }
+        // We ran out of non-internal keys. Go up until we find a non-internal key.
+        loop {
+            itr.x = unsafe { (*itr.x).parent };
+            if itr.x.is_null() {
+                return false;
+            }
+            itr.lvl -= 1;
+            itr.i = itr.s[itr.lvl as usize].i - 1;
+            if itr.i >= 0 {
+                // SAFETY: `itr.x` valid; `itr.i >= 0`.
+                let key_row = unsafe { (*itr.x).key[itr.i as usize].pos.row };
+                itr.pos.row -= key_row;
+                itr.pos.col = itr.s[itr.lvl as usize].oldcol;
+                break;
+            }
+        }
+    } else {
+        // We stood at an "internal" key. Go down to the last non-internal
+        // key before it.
+        // SAFETY: `itr.x` valid.
+        while unsafe { (*itr.x).level } > 0 {
+            // Internal key, there is always a child before.
+            if itr.i > 0 {
+                itr.s[itr.lvl as usize].oldcol = itr.pos.col;
+                // SAFETY: `itr.x` valid.
+                let base = unsafe { (*itr.x).key[itr.i as usize - 1].pos };
+                compose(&mut itr.pos, base);
+            }
+            itr.s[itr.lvl as usize].i = itr.i;
+            // SAFETY: `itr.x` valid internal node.
+            debug_assert_eq!(unsafe { (*node_child(itr.x, itr.i as usize)).parent }, itr.x);
+            itr.x = unsafe { node_child(itr.x, itr.i as usize) };
+            // SAFETY: `itr.x` valid (just reassigned).
+            itr.i = unsafe { (*itr.x).n };
+            itr.lvl += 1;
+        }
+        itr.i -= 1;
+    }
+    true
+}
+
+/// `marktree_itr_node_done`: is `itr` at the last key of its current node?
+pub fn marktree_itr_node_done(itr: &MarkTreeIter) -> bool {
+    // SAFETY: only dereferenced when non-null (short-circuit `||`).
+    itr.x.is_null() || itr.i == unsafe { (*itr.x).n } - 1
+}
+
+/// `marktree_itr_pos`: the current key's absolute position.
+///
+/// # Safety
+/// `itr` must be valid (`marktree_itr_valid`/`MarkTreeIter::is_valid`).
+pub unsafe fn marktree_itr_pos(itr: &MarkTreeIter) -> MtPos {
+    // SAFETY: forwarded from caller.
+    let mut pos = unsafe { rawkey(itr) }.pos;
+    unrelative(itr.pos, &mut pos);
+    pos
+}
+
+/// `marktree_itr_current`: the current key (with its position resolved to
+/// absolute), or [`mt_invalid_key`] if `itr` is not valid.
+pub fn marktree_itr_current(itr: &MarkTreeIter) -> MtKey {
+    if !itr.x.is_null() {
+        // SAFETY: `itr.x` non-null (checked above).
+        let mut key = unsafe { rawkey(itr) }.clone();
+        key.pos = unsafe { marktree_itr_pos(itr) };
+        key
+    } else {
+        mt_invalid_key()
+    }
+}
+
+/// `itr_eq`: do `itr1`/`itr2` currently refer to the exact same key slot?
+///
+/// # Safety
+/// Both iterators must be valid.
+#[allow(dead_code)]
+unsafe fn itr_eq(itr1: &MarkTreeIter, itr2: &MarkTreeIter) -> bool {
+    // SAFETY: forwarded from caller; a pointer-identity comparison,
+    // matching the original's `&rawkey(itr1) == &rawkey(itr2)`.
+    std::ptr::eq(unsafe { rawkey(itr1) }, unsafe { rawkey(itr2) })
+}
+
+/// `marktree_lookup`: looks up the mark with lookup id `id` (see
+/// `mt_lookup_id`/`mt_lookup_key`), optionally positioning `itr` there.
+/// Returns [`mt_invalid_key`] if not found.
+pub fn marktree_lookup(b: &MarkTree, id: u64, mut itr: Option<&mut MarkTreeIter>) -> MtKey {
+    let n = match lookup_id2node(b, id) {
+        Some(n) => n,
+        None => {
+            if let Some(itr) = itr.as_deref_mut() {
+                itr.x = std::ptr::null_mut();
+            }
+            return mt_invalid_key();
+        }
+    };
+    // SAFETY: `n` came from `id2node`, which only ever stores valid
+    // pointers into this same tree.
+    let node_n = unsafe { (*n).n };
+    for i in 0..node_n {
+        let key = unsafe { &(*n).key[i as usize] };
+        if mt_lookup_key(key) == id {
+            // SAFETY: `n`/`i` valid (just confirmed above).
+            return unsafe { marktree_itr_set_node(b, itr, n, i) };
+        }
+    }
+    unreachable!("marktree_lookup: id2node pointed at a node without the looked-up key");
+}
+
+/// `marktree_lookup_ns`: [`marktree_lookup`] by `(ns, id, end)` instead of
+/// a raw lookup id.
+pub fn marktree_lookup_ns(
+    b: &MarkTree,
+    ns: u32,
+    id: u32,
+    end: bool,
+    itr: Option<&mut MarkTreeIter>,
+) -> MtKey {
+    marktree_lookup(b, mt_lookup_id(ns, id, end), itr)
+}
+
+/// `marktree_itr_set_node`: returns the (absolute-position) key at slot
+/// `i` of node `n`, optionally positioning `itr` there by walking back up
+/// to the root to fill in `itr.s`/`itr.lvl`/`itr.pos`.
+///
+/// # Safety
+/// `n` must be a valid node pointer within `b`'s tree, and `i` a valid key
+/// index into it.
+pub unsafe fn marktree_itr_set_node(
+    b: &MarkTree,
+    mut itr: Option<&mut MarkTreeIter>,
+    n: *mut MtNode,
+    i: i32,
+) -> MtKey {
+    // SAFETY: caller guarantees `n`/`i` are valid.
+    let mut key = unsafe { (*n).key[i as usize].clone() };
+    if let Some(itr) = itr.as_deref_mut() {
+        itr.i = i;
+        itr.x = n;
+        // SAFETY: `b.root`/`n` valid.
+        itr.lvl = unsafe { (*b.root).level as i32 - (*n).level as i32 };
+    }
+    let mut n = n;
+    // SAFETY: walking up valid parent pointers.
+    while !unsafe { (*n).parent }.is_null() {
+        let p = unsafe { (*n).parent };
+        let i = unsafe { (*n).p_idx as i32 };
+        debug_assert_eq!(unsafe { node_child(p, i as usize) }, n);
+
+        if let Some(itr) = itr.as_deref_mut() {
+            let lvl = unsafe { (*b.root).level as i32 - (*p).level as i32 };
+            itr.s[lvl as usize].i = i;
+        }
+        if i > 0 {
+            // SAFETY: `p` valid.
+            let base = unsafe { (*p).key[i as usize - 1].pos };
+            unrelative(base, &mut key.pos);
+        }
+        n = p;
+    }
+    // Last use of `itr` in this function, so take it by value rather than
+    // re-borrowing via `as_deref_mut()` again.
+    if let Some(itr) = itr {
+        marktree_itr_fix_pos(b, itr);
+    }
+    key
+}
+
+/// `marktree_get_altpos`: the position of [`marktree_get_alt`].
+pub fn marktree_get_altpos(b: &MarkTree, mark: &MtKey, itr: Option<&mut MarkTreeIter>) -> MtPos {
+    marktree_get_alt(b, mark, itr).pos
+}
+
+/// @return alt mark for a paired mark or mark itself for unpaired mark
+pub fn marktree_get_alt(b: &MarkTree, mark: &MtKey, itr: Option<&mut MarkTreeIter>) -> MtKey {
+    if mt_paired(mark) {
+        marktree_lookup_ns(b, mark.ns, mark.id, !mt_end(mark), itr)
+    } else {
+        mark.clone()
+    }
+}
+
+/// `marktree_itr_fix_pos`: recomputes `itr.pos` from scratch by walking
+/// down from the root following `itr.s[0..itr.lvl]`'s recorded child
+/// indices (used after [`marktree_itr_set_node`] establishes `itr.s`/
+/// `itr.lvl` but not yet `itr.pos`).
+fn marktree_itr_fix_pos(b: &MarkTree, itr: &mut MarkTreeIter) {
+    itr.pos = MtPos::default();
+    let mut x = b.root;
+    for lvl in 0..itr.lvl {
+        itr.s[lvl as usize].oldcol = itr.pos.col;
+        let i = itr.s[lvl as usize].i;
+        if i > 0 {
+            // SAFETY: `x` valid (loop invariant, established by the walk
+            // itself and the caller's contract that `itr.s`/`itr.lvl`
+            // describe a real path from `b.root`).
+            let base = unsafe { (*x).key[i as usize - 1].pos };
+            compose(&mut itr.pos, base);
+        }
+        // SAFETY: `x` valid.
+        debug_assert_ne!(unsafe { (*x).level }, 0);
+        x = unsafe { node_child(x, i as usize) };
+    }
+    debug_assert_eq!(x, itr.x);
+}
+
 /// `marktree_put_test`: convenience entry point used by the original's own
 /// unit tests, translated as a thin wrapper matching its shape. Only the
 /// unpaired case (`end_row < 0`) is currently reachable, since
-/// [`marktree_put`] (needed for `end_row >= 0`) is not yet translated.
+/// `marktree_put` (needed for `end_row >= 0`) is not yet translated.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn marktree_put_test(
@@ -1679,6 +2152,194 @@ mod tests {
         }
         assert_eq!(tree.n_keys, 200);
         marktree_check(&tree);
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    // --- iterator tests ---
+
+    #[test]
+    fn itr_first_next_visits_all_keys_in_ascending_order() {
+        let mut tree = MarkTree::default();
+        for (id, &row) in shuffled_range(150).iter().enumerate() {
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, false);
+        }
+        marktree_check(&tree);
+
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_first(&tree, &mut itr));
+        let mut rows = Vec::new();
+        loop {
+            let key = marktree_itr_current(&itr);
+            assert!(key.pos.row >= 0, "current key must be valid while iterating");
+            rows.push(key.pos.row);
+            if !marktree_itr_next(&tree, &mut itr) {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 150);
+        let mut expected: Vec<i32> = (0..150).collect();
+        expected.sort_unstable();
+        assert_eq!(rows, expected);
+        // Iterator is exhausted: current() must now report invalid.
+        assert!(itr.x.is_null());
+        assert_eq!(marktree_itr_current(&itr).pos.row, -1);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn itr_last_prev_visits_all_keys_in_descending_order() {
+        let mut tree = MarkTree::default();
+        for (id, &row) in shuffled_range(150).iter().enumerate() {
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, false);
+        }
+        marktree_check(&tree);
+
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_last(&tree, &mut itr));
+        let mut rows = Vec::new();
+        loop {
+            let key = marktree_itr_current(&itr);
+            rows.push(key.pos.row);
+            if !marktree_itr_prev(&tree, &mut itr) {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 150);
+        let mut expected: Vec<i32> = (0..150).rev().collect();
+        assert_eq!(rows, expected);
+        // and verify the ascending set matches too, for good measure.
+        expected.sort_unstable();
+        rows.sort_unstable();
+        assert_eq!(rows, expected);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn itr_get_finds_first_key_at_or_after_gap_position() {
+        let mut tree = MarkTree::default();
+        // Keys at rows 0, 10, 20, ..., 190 (gaps in between).
+        for id in 0..20 {
+            marktree_put_test(&mut tree, 0, id, id as i32 * 10, 0, false, false);
+        }
+        marktree_check(&tree);
+
+        // Querying a position in a gap should land on the next key >= it.
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 25, 0, &mut itr));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(30, 0));
+
+        // Querying exactly on a key should land on that key.
+        let mut itr2 = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 100, 0, &mut itr2));
+        assert_eq!(marktree_itr_current(&itr2).pos, MtPos::new(100, 0));
+
+        // Querying past the last key finds nothing further.
+        let mut itr3 = MarkTreeIter::default();
+        assert!(!marktree_itr_get(&tree, 1000, 0, &mut itr3));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn itr_current_on_default_iterator_is_invalid() {
+        let itr = MarkTreeIter::default();
+        assert!(!itr.is_valid());
+        let key = marktree_itr_current(&itr);
+        assert_eq!(key.pos, MtPos::new(-1, -1));
+    }
+
+    #[test]
+    fn lookup_finds_inserted_keys_by_ns_and_id() {
+        let mut tree = MarkTree::default();
+        for id in 0..40u32 {
+            marktree_put_test(&mut tree, 3, id, id as i32, id as i32 * 2, id % 2 == 0, false);
+        }
+        marktree_check(&tree);
+
+        for id in 0..40u32 {
+            let mut itr = MarkTreeIter::default();
+            let key = marktree_lookup_ns(&tree, 3, id, false, Some(&mut itr));
+            assert_eq!(key.pos, MtPos::new(id as i32, id as i32 * 2));
+            assert_eq!(key.ns, 3);
+            assert_eq!(key.id, id);
+            assert_eq!(mt_right(&key), id % 2 == 0);
+            assert!(itr.is_valid());
+            // The iterator's own current-key view must agree.
+            assert_eq!(marktree_itr_current(&itr).pos, key.pos);
+        }
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn lookup_returns_invalid_key_for_unknown_id() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 0, 5, 5, false, false);
+        marktree_check(&tree);
+
+        let mut itr = MarkTreeIter::default();
+        let key = marktree_lookup_ns(&tree, 0, 999, false, Some(&mut itr));
+        assert_eq!(key.pos, MtPos::new(-1, -1));
+        assert!(!itr.is_valid());
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn get_alt_returns_self_for_unpaired_mark() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 7, 3, 3, false, false);
+        marktree_check(&tree);
+
+        let mark = marktree_lookup_ns(&tree, 0, 7, false, None);
+        assert!(!mt_paired(&mark));
+        let alt = marktree_get_alt(&tree, &mark, None);
+        assert_eq!(alt.pos, mark.pos);
+        assert_eq!(marktree_get_altpos(&tree, &mark, None), mark.pos);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn get_alt_finds_matching_pair_for_manually_paired_marks() {
+        // marktree_put (the paired-mark-aware entry point) isn't translated
+        // yet, but MT_FLAG_PAIRED/MT_FLAG_END plus two marktree_put_key
+        // calls with matching (ns, id) let us exercise marktree_get_alt's
+        // actual cross-lookup behavior directly.
+        let mut tree = MarkTree::default();
+        let start = MtKey {
+            pos: MtPos::new(2, 0),
+            ns: 5,
+            id: 42,
+            flags: MT_FLAG_PAIRED,
+            decor_data: crate::decoration_defs::DecorInlineData { hl: DecorHighlightInline::default() },
+        };
+        let end = MtKey {
+            pos: MtPos::new(9, 0),
+            ns: 5,
+            id: 42,
+            flags: MT_FLAG_PAIRED | MT_FLAG_END,
+            decor_data: crate::decoration_defs::DecorInlineData { hl: DecorHighlightInline::default() },
+        };
+        marktree_put_key(&mut tree, start);
+        marktree_put_key(&mut tree, end);
+        marktree_check(&tree);
+
+        let start_mark = marktree_lookup_ns(&tree, 5, 42, false, None);
+        assert!(mt_paired(&start_mark));
+        assert!(!mt_end(&start_mark));
+        let alt = marktree_get_alt(&tree, &start_mark, None);
+        assert_eq!(alt.pos, MtPos::new(9, 0));
+        assert!(mt_end(&alt));
+        assert_eq!(marktree_get_altpos(&tree, &start_mark, None), MtPos::new(9, 0));
+
+        let end_mark = marktree_lookup_ns(&tree, 5, 42, true, None);
+        let alt_of_end = marktree_get_alt(&tree, &end_mark, None);
+        assert_eq!(alt_of_end.pos, MtPos::new(2, 0));
+        assert!(!mt_end(&alt_of_end));
+
         unsafe { marktree_clear(&mut tree) };
     }
 }

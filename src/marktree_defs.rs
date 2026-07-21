@@ -158,6 +158,7 @@ pub struct MtNode {
 }
 
 /// A marktree traversal/search iterator (`MarkTreeIter`).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MarkTreeIter {
     pub pos: MtPos,
     pub lvl: i32,
