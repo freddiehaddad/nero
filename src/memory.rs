@@ -113,6 +113,85 @@ fn memchr(data: &[u8], c: u8) -> Option<usize> {
     data.iter().position(|&b| b == c)
 }
 
+/// Copies `src` into `dst` (which must have room for `src.len()` bytes) and
+/// returns the offset in `dst` just past the copied data (`xstpcpy`; the
+/// original also copies the terminating NUL and returns a pointer to it -
+/// this module doesn't store an explicit trailing NUL for byte buffers, so
+/// the returned offset already marks the equivalent position).
+///
+/// # Panics
+/// Panics if `dst` is shorter than `src` (matches the original's
+/// caller-guaranteed, unchecked buffer-overflow contract, just made loud
+/// instead of silently corrupting memory).
+#[inline]
+pub fn xstpcpy(dst: &mut [u8], src: &[u8]) -> usize {
+    dst[..src.len()].copy_from_slice(src);
+    src.len()
+}
+
+/// Copies not more than `maxlen` bytes from `src` to `dst`; always writes
+/// exactly `maxlen` bytes to `dst` (`xstpncpy`). Returns the offset of the
+/// implicit terminator written, or `maxlen` if `src` was truncated.
+///
+/// Note: like the rest of this module, `src` is modeled as exact-length
+/// string content rather than a raw NUL-scanned C buffer (see the note on
+/// [`strnequal`]), so "the NUL in `src`" from the original becomes simply
+/// "the end of `src`" here: if `src` is shorter than `maxlen`, the
+/// remainder of `dst` up to `maxlen` is zero-padded (matching the
+/// original's behavior when `src`'s own terminator falls within the
+/// `maxlen` window); otherwise `src` is truncated to `maxlen` bytes.
+#[inline]
+pub fn xstpncpy(dst: &mut [u8], src: &[u8], maxlen: usize) -> usize {
+    if src.len() < maxlen {
+        let srclen = src.len();
+        dst[..srclen].copy_from_slice(src);
+        dst[srclen..maxlen].fill(0);
+        srclen
+    } else {
+        dst[..maxlen].copy_from_slice(&src[..maxlen]);
+        maxlen
+    }
+}
+
+/// Copies a NUL-terminated string into a sized buffer, always producing a
+/// result that fits (`xstrlcpy`, *BSD `strlcpy`-compatible). Returns the
+/// length of `src` (may be greater than `dsize - 1`, meaning truncation
+/// occurred) - matching the original exactly.
+#[inline]
+pub fn xstrlcpy(dst: &mut [u8], src: &[u8], dsize: usize) -> usize {
+    let slen = src.len();
+    if dsize > 0 {
+        let len = slen.min(dsize - 1);
+        dst[..len].copy_from_slice(&src[..len]);
+        dst[len] = NUL;
+    }
+    slen
+}
+
+/// Appends `src` to `dst` (whose *full* size, including its own current
+/// content, is `dsize`) (`xstrlcat`). At most `dsize - 1` bytes total will
+/// occupy `dst`; always NUL-terminates. Returns the length of the resulting
+/// string as if `dsize` were unbounded (may be greater than `dsize - 1`,
+/// meaning truncation occurred).
+#[inline]
+pub fn xstrlcat(dst: &mut [u8], src: &[u8], dsize: usize) -> usize {
+    assert!(dsize > 0);
+    let dlen = memchr(dst, NUL).unwrap_or(dst.len());
+    assert!(dlen < dsize);
+    let slen = src.len();
+    if slen > dsize - dlen - 1 {
+        let n = dsize - dlen - 1;
+        dst[dlen..dlen + n].copy_from_slice(&src[..n]);
+        dst[dsize - 1] = NUL;
+    } else {
+        dst[dlen..dlen + slen].copy_from_slice(src);
+        if dlen + slen < dst.len() {
+            dst[dlen + slen] = NUL;
+        }
+    }
+    slen + dlen
+}
+
 /// Replaces every instance of `c` with `x` (`strchrsub`/`memchrsub` are
 /// unified here: Rust slices already carry their length, so there is no
 /// separate "NUL-terminated string" overload needed - callers pass the
@@ -226,6 +305,48 @@ mod tests {
         let v = xmallocz(3);
         assert_eq!(v.len(), 4);
         assert_eq!(v[3], 0);
+    }
+
+    #[test]
+    fn xstpcpy_copies_and_returns_end_offset() {
+        let mut dst = vec![0u8; 5];
+        let end = xstpcpy(&mut dst, b"ab");
+        assert_eq!(end, 2);
+        assert_eq!(&dst[..2], b"ab");
+    }
+
+    #[test]
+    fn xstpncpy_pads_with_zeroes_when_shorter() {
+        let mut dst = vec![0xffu8; 5];
+        let end = xstpncpy(&mut dst, b"ab", 5);
+        assert_eq!(end, 2);
+        assert_eq!(&dst, &[b'a', b'b', 0, 0, 0]);
+    }
+
+    #[test]
+    fn xstpncpy_truncates_when_no_nul_within_maxlen() {
+        let mut dst = vec![0u8; 3];
+        let end = xstpncpy(&mut dst, b"abcdef", 3);
+        assert_eq!(end, 3);
+        assert_eq!(&dst, b"abc");
+    }
+
+    #[test]
+    fn xstrlcpy_truncates_and_reports_full_length() {
+        let mut dst = vec![0u8; 3];
+        let slen = xstrlcpy(&mut dst, b"abcdef", 3);
+        assert_eq!(slen, 6); // full src length, even though truncated
+        assert_eq!(&dst, b"ab\0");
+    }
+
+    #[test]
+    fn xstrlcat_appends_and_truncates() {
+        let mut dst = vec![0u8; 6];
+        dst[0] = b'a';
+        dst[1] = b'b';
+        let total = xstrlcat(&mut dst, b"cdef", 6);
+        assert_eq!(total, 6); // 2 + 4
+        assert_eq!(&dst, b"abcde\0"); // truncated to fit dsize=6 (5 chars + NUL)
     }
 
     #[test]
