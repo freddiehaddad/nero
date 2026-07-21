@@ -2136,6 +2136,113 @@ pub fn marktree_intersect_pair(
     }
 }
 
+/// `marktree_move`: moves the mark `itr` currently points at to `(row,
+/// col)`. If the move stays within the same leaf node and doesn't cross
+/// the position of an adjacent internal key (the common, fast case), the
+/// key is reordered in place; otherwise this falls back to a full delete
+/// plus re-insert (restoring pair intersection tracking afterward if the
+/// mark was paired, via [`marktree_restore_pair`]).
+///
+/// @param itr iterator is invalid after call
+///
+/// # Safety
+/// `itr` must be valid.
+pub unsafe fn marktree_move(b: &mut MarkTree, itr: &mut MarkTreeIter, row: i32, col: i32) {
+    // SAFETY: caller guarantees `itr` is valid.
+    let mut key = unsafe { rawkey(itr) }.clone();
+    let x = itr.x;
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } == 0 {
+        let mut internal = false;
+        let mut newpos = MtPos::new(row, col);
+        // SAFETY: `x` valid.
+        if !unsafe { (*x).parent }.is_null() {
+            // Strictly _after_ key before `x` (not optimal when x is very
+            // first leaf of the entire tree, but that's fine).
+            if pos_less(itr.pos, newpos) {
+                relative(itr.pos, &mut newpos);
+                // Strictly before the end of x (this could be made
+                // sharper by finding the internal key just after x, but meh).
+                // SAFETY: `x` valid; a leaf always has `n >= 1`.
+                let last_key_pos = unsafe { (*x).key[(*x).n as usize - 1].pos };
+                if pos_less(newpos, last_key_pos) {
+                    internal = true;
+                }
+            }
+        } else {
+            // Tree is one node. newpos thus is already "relative" itr->pos.
+            internal = true;
+        }
+
+        if internal {
+            if key.pos.row == newpos.row && key.pos.col == newpos.col {
+                return;
+            }
+            key.pos = newpos;
+            let mut is_match = false;
+            // Tricky: could minimize movement in either direction better.
+            // SAFETY: `x` valid.
+            let mut new_i = unsafe { marktree_getp_aux(&*x, &key, Some(&mut is_match)) };
+            if !is_match {
+                new_i += 1;
+            }
+            // SAFETY: `x` valid; all indices below are in-bounds slots.
+            unsafe {
+                if new_i == itr.i {
+                    (*x).key[itr.i as usize].pos = newpos;
+                } else if new_i < itr.i {
+                    for j in (new_i..itr.i).rev() {
+                        let moved = std::mem::take(&mut (*x).key[j as usize]);
+                        (*x).key[j as usize + 1] = moved;
+                    }
+                    (*x).key[new_i as usize] = key;
+                } else {
+                    // new_i > itr.i
+                    for j in itr.i..(new_i - 1) {
+                        let moved = std::mem::take(&mut (*x).key[j as usize + 1]);
+                        (*x).key[j as usize] = moved;
+                    }
+                    (*x).key[new_i as usize - 1] = key;
+                }
+            }
+            return;
+        }
+    }
+    let other = unsafe { marktree_del_itr(b, itr, false) };
+    key.pos = MtPos::new(row, col);
+
+    marktree_put_key(b, key.clone());
+
+    if other != 0 {
+        marktree_restore_pair(b, &key);
+    }
+    itr.x = std::ptr::null_mut(); // itr might become invalid by put
+}
+
+/// `marktree_restore_pair`: re-establishes intersection tracking for a
+/// paired mark `key` whose start/end both currently exist (un-orphaning
+/// both sides). If either side isn't found (e.g. the other side is
+/// itself waiting to be restored by a subsequent call), this is a silent
+/// no-op - the original's own documented behavior.
+pub fn marktree_restore_pair(b: &mut MarkTree, key: &MtKey) {
+    let mut itr = MarkTreeIter::default();
+    let mut end_itr = MarkTreeIter::default();
+    marktree_lookup(b, mt_lookup_key_side(key, false), Some(&mut itr));
+    marktree_lookup(b, mt_lookup_key_side(key, true), Some(&mut end_itr));
+    if itr.x.is_null() || end_itr.x.is_null() {
+        // This could happen if the other end is waiting to be restored
+        // later; this function will be called again for the other end.
+        return;
+    }
+    // SAFETY: both iterators just confirmed non-null/valid above.
+    unsafe {
+        (*itr.x).key[itr.i as usize].flags &= !MT_FLAG_ORPHANED;
+        (*end_itr.x).key[end_itr.i as usize].flags &= !MT_FLAG_ORPHANED;
+    }
+
+    marktree_intersect_pair(b, mt_lookup_key_side(key, false), &mut itr, &end_itr, false);
+}
+
 /// `marktree_del_itr`: deletes the mark the iterator currently points at,
 /// leaving `itr` valid and pointing at the key *after* the deleted one.
 /// If the deleted mark was one side of a pair, returns the lookup id of
@@ -2831,6 +2938,58 @@ pub fn marktree_splice(
     }
 
     moved
+}
+
+/// `marktree_move_region`: moves every mark within the region
+/// `[start, start+extent)` to start at `new_row`/`new_col` instead - used
+/// for operations like folding a range of text elsewhere (e.g. `:move`).
+/// Implemented directly on top of already-translated primitives: save
+/// every mark inside the region (deleting them from the tree), splice the
+/// old region out, splice a same-sized region in at the new location, then
+/// re-insert the saved marks (relative to their original offsets within
+/// the region) at the new location, restoring pair intersection tracking
+/// for any that were paired.
+pub fn marktree_move_region(
+    b: &mut MarkTree,
+    start_row: i32,
+    start_col: crate::pos_defs::ColnrT,
+    extent_row: i32,
+    extent_col: crate::pos_defs::ColnrT,
+    new_row: i32,
+    new_col: crate::pos_defs::ColnrT,
+) {
+    let start = MtPos::new(start_row, start_col);
+    let size = MtPos::new(extent_row, extent_col);
+    let mut end = size;
+    unrelative(start, &mut end);
+    let mut itr = MarkTreeIter::default();
+    marktree_itr_get_ext(b, start, &mut itr, false, true, None, None);
+    let mut saved: Vec<MtKey> = Vec::new();
+    while !itr.x.is_null() {
+        let mut k = marktree_itr_current(&itr);
+        if !pos_leq(k.pos, end) || (k.pos.row == end.row && k.pos.col == end.col && mt_right(&k)) {
+            break;
+        }
+        relative(start, &mut k.pos);
+        saved.push(k);
+        // SAFETY: `itr` is valid (non-null, loop condition).
+        unsafe { marktree_del_itr(b, &mut itr, false) };
+    }
+
+    marktree_splice(b, start.row, start.col, size.row, size.col, 0, 0);
+    let new = MtPos::new(new_row, new_col);
+    marktree_splice(b, new.row, new.col, 0, 0, size.row, size.col);
+
+    for mut item in saved {
+        unrelative(new, &mut item.pos);
+        let restore_key = item.clone();
+        marktree_put_key(b, item);
+        if mt_paired(&restore_key) {
+            // Other end might be later in `saved`; this will safely bail
+            // out then.
+            marktree_restore_pair(b, &restore_key);
+        }
+    }
 }
 
 /// `marktree_put_test`: convenience entry point used by the original's own
@@ -4197,6 +4356,124 @@ mod tests {
         // marktree_splice never changes the number of marks, only
         // positions: 200 individual marks + 10 pairs (2 keys each) = 220.
         assert_eq!(tree.n_keys, 220);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    // --- marktree_move / marktree_move_region tests ---
+
+    #[test]
+    fn move_within_same_leaf_reorders_in_place() {
+        let mut tree = MarkTree::default();
+        for i in 0..10 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        // Move the mark at row 2 to row 7 (still within the single leaf
+        // this small tree lives in).
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 2, 0, &mut itr));
+        // SAFETY: itr freshly positioned above.
+        unsafe { marktree_move(&mut tree, &mut itr, 7, 3) };
+        marktree_check(&tree);
+
+        assert_eq!(marktree_lookup_ns(&tree, 0, 2, false, None).pos, MtPos::new(7, 3));
+        // Every other mark must be untouched.
+        for i in [0, 1, 3, 4, 5, 6, 7, 8, 9] {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(i, 0), "row {i} must be unaffected by moving a different mark");
+        }
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn move_across_nodes_falls_back_to_delete_and_reinsert() {
+        let mut tree = MarkTree::default();
+        for i in 0..300 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        // Move a mark from near the start to near the end - almost
+        // certainly crosses node boundaries in a 300-key multi-level tree.
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 5, 0, &mut itr));
+        // SAFETY: itr freshly positioned above.
+        unsafe { marktree_move(&mut tree, &mut itr, 290, 9) };
+        assert_eq!(tree.n_keys, 300, "move must not change the mark count");
+        marktree_check(&tree);
+        assert_eq!(marktree_lookup_ns(&tree, 0, 5, false, None).pos, MtPos::new(290, 9));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn move_paired_mark_restores_pair_tracking() {
+        let mut tree = MarkTree::default();
+        for i in 0..100 {
+            marktree_put_test(&mut tree, 0, i as u32 + 10, i, 0, false, -1, -1, false, false);
+        }
+        marktree_put_test(&mut tree, 5, 1, 10, 0, false, 40, 0, false, false);
+        marktree_check(&tree);
+
+        // Look up the pair's start mark specifically by (ns, id) rather
+        // than by position: an individual mark (ns=0, id=20, from the
+        // padding loop above) also happens to sit at (10, 0), and
+        // `marktree_itr_get`'s position search has no way to distinguish
+        // same-position keys by identity - only `marktree_lookup_ns` can.
+        let mut itr = MarkTreeIter::default();
+        marktree_lookup_ns(&tree, 5, 1, false, Some(&mut itr));
+        assert!(itr.is_valid());
+        // SAFETY: itr freshly positioned above.
+        unsafe { marktree_move(&mut tree, &mut itr, 80, 0) };
+        marktree_check(&tree);
+
+        let start = marktree_lookup_ns(&tree, 5, 1, false, None);
+        let end = marktree_lookup_ns(&tree, 5, 1, true, None);
+        assert_eq!(start.pos, MtPos::new(80, 0));
+        assert_eq!(end.pos, MtPos::new(40, 0));
+        assert!(mt_paired(&start) && mt_paired(&end));
+        assert_eq!(marktree_get_altpos(&tree, &start, None), end.pos);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn move_region_relocates_marks_inside_region_and_shifts_others() {
+        let mut tree = MarkTree::default();
+        for i in 0..30 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        // Move the 5-row region starting at row 10 (rows 10..15 in extent
+        // terms) to start at row 100 instead.
+        marktree_move_region(&mut tree, 10, 0, 5, 0, 100, 0);
+        marktree_check(&tree);
+        assert_eq!(tree.n_keys, 30, "move_region must not change the mark count");
+
+        // Marks strictly before the region are untouched.
+        for i in 0..10 {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(i, 0));
+        }
+        // A mark position denotes a *gap* immediately before that point,
+        // and (default/left) gravity means "stick with the gap's left
+        // side" - so the collected/moved region is asymmetric:
+        // exclusive of its own start (row 10 sticks to what's before it,
+        // i.e. outside the region - matching marktree_splice's own
+        // gravity-aware search boundary) but *inclusive* of its end (row
+        // 15 sticks to the content just before it, i.e. the region's own
+        // last bit of content) - standard editor mark-gravity semantics.
+        assert_eq!(marktree_lookup_ns(&tree, 0, 10, false, None).pos, MtPos::new(10, 0));
+        for i in 11..=15 {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(100 + (i - 10), 0));
+        }
+        // Marks strictly after the region shift up by the region's own
+        // size (5 rows removed from their original location).
+        for i in 16..30 {
+            assert_eq!(marktree_lookup_ns(&tree, 0, i as u32, false, None).pos, MtPos::new(i - 5, 0));
+        }
 
         unsafe { marktree_clear(&mut tree) };
     }
