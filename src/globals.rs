@@ -41,6 +41,8 @@
 //! reconfirmed against the true, full file before this was considered
 //! complete).
 
+use std::cell::UnsafeCell;
+
 use crate::arglist_defs::AlistT;
 use crate::buffer_defs::{BufT, DisptickT, FrameT, WinT};
 use crate::eval::typval_defs::SctxT;
@@ -1158,6 +1160,59 @@ impl Default for Globals {
     }
 }
 
+/// Wrapper providing the original's "one process-wide instance,
+/// reachable from any function with no explicit parameter" access
+/// pattern for [`Globals`] (see the module-level doc comment for why
+/// this crate keeps that architecture rather than threading an explicit
+/// parameter through every future translated function).
+///
+/// Neovim's C code assumes a single-threaded main loop touches this
+/// state (the same assumption every `EXTERN` global in the original
+/// relies on); this wrapper provides that exact same "trust the caller"
+/// contract via [`UnsafeCell`] rather than a bare `static mut` reference
+/// (increasingly restricted/lint-denied in modern Rust editions) or a
+/// `Mutex`/`RefCell` (which would add a runtime borrow-check/lock that
+/// doesn't exist in the original and could newly panic/deadlock on
+/// reentrant access patterns the original's C code does have, e.g.
+/// autocmd callbacks touching globals while already inside a global-
+/// touching function).
+pub struct GlobalsCell(UnsafeCell<Globals>);
+
+// SAFETY: matches the original's own single-threaded-main-loop
+// assumption; every `EXTERN` global in `globals.h` is likewise never
+// synchronized for multi-threaded access.
+unsafe impl Sync for GlobalsCell {}
+unsafe impl Send for GlobalsCell {}
+
+impl GlobalsCell {
+    /// Returns a mutable reference to the single global editor state.
+    ///
+    /// # Safety
+    /// Caller must not create two overlapping live references from this
+    /// method (e.g. holding one across a call that itself calls this
+    /// again) - the same non-reentrant-aliasing invariant the original's
+    /// single-threaded design already required of every function that
+    /// touches `curwin`/`curbuf`/etc.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get_mut(&self) -> &mut Globals {
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// The single, global, mutable editor state instance - the Rust
+/// equivalent of `globals.h`'s `EXTERN` mechanism (every `EXTERN`
+/// variable is declared in the header and defined exactly once, in
+/// `globals.h`'s own translation unit via `#define EXTERN` tricks in
+/// `main.c`; here it's simply one `static`).
+///
+/// Lazily initialized (via [`std::sync::LazyLock`]) rather than a
+/// direct `const` initializer, since `Globals::default()` (and its
+/// field types' own `Default` impls) aren't `const fn` - making all of
+/// them `const fn` purely to allow a non-lazy `static` would be a much
+/// larger, riskier cross-cutting change for no behavioral benefit here.
+pub static GLOBALS: std::sync::LazyLock<GlobalsCell> =
+    std::sync::LazyLock::new(|| GlobalsCell(UnsafeCell::new(Globals::default())));
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1233,5 +1288,26 @@ mod tests {
         let cs = CallerScope::default();
         assert!(cs.funccalp.is_null());
         assert!(cs.autocmd_fname.is_none());
+    }
+
+    #[test]
+    fn globals_singleton_is_readable_and_writable() {
+        // SAFETY: only one live `&mut Globals` is held at a time within
+        // this test's own critical section below.
+        //
+        // Caveat for future tests: `GLOBALS` is a genuine process-wide
+        // singleton (matching the original's own architecture - see the
+        // `GlobalsCell` doc comment), so tests that mutate it and run in
+        // parallel with other tests that also touch it could observe
+        // each other's writes. This test restores the field it changes
+        // immediately, but any future test suite that grows to rely on
+        // specific `GLOBALS` field values across many tests should
+        // consider `cargo test -- --test-threads=1` or a dedicated
+        // fixture/lock, the same care real neovim's own single "current
+        // editor state" requires of anything that isn't the main loop.
+        let original_rows = unsafe { GLOBALS.get_mut() }.Rows;
+        unsafe { GLOBALS.get_mut() }.Rows = 50;
+        assert_eq!(unsafe { GLOBALS.get_mut() }.Rows, 50);
+        unsafe { GLOBALS.get_mut() }.Rows = original_rows;
     }
 }
