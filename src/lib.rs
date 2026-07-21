@@ -17,6 +17,7 @@ pub mod arglist_defs;
 pub mod ascii_defs;
 pub mod assert_defs;
 pub mod base64;
+pub mod buffer;
 pub mod buffer_defs;
 pub mod charset;
 pub mod decoration_defs;

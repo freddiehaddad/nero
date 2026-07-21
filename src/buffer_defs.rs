@@ -39,9 +39,9 @@ use crate::types_defs::{HandleT, LuaRef, MapblockT, MatchitemT, OptInt, Proftime
 use crate::undo_defs::{UHeader, VisualinfoT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
-/// `bufref_valid()` (not yet translated) only needs to check `buf` when the
-/// count differs (`bufref_T`).
-#[derive(Debug, Clone, Copy)]
+/// `bufref_valid()` (`crate::buffer::bufref_valid`) only needs to check
+/// `buf` when the count differs (`bufref_T`).
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BufrefT {
     pub br_buf: *mut BufT,
     pub br_fnum: i32,

@@ -1,0 +1,347 @@
+//! Translated from `src/nvim/buffer.c` (tractable core only). This is one
+//! of the largest, most cross-cutting files in the whole codebase
+//! (~4349 lines, 91 top-level functions): almost every function needs
+//! real file I/O (`readfile`/`ml_open`, `os/fs.c`), `ctx_switch`/window
+//! management, `autocmd.c`'s `apply_autocmds`, the eval engine's `b:`
+//! dict watcher machinery, or `memline.c`'s `ml_get`/`ml_get_buf`.
+//!
+//! Translated: `calc_percentage`, `get_highest_fnum` (+ its own
+//! `top_file_num` private counter, mirrored as `TOP_FILE_NUM` since
+//! the original keeps it as a file-static, not an `EXTERN` global -
+//! same treatment as `memfile.c`'s own per-file statics), `set_bufref`/
+//! `bufref_valid`/`buf_valid` (+ its own `buf_free_count` private
+//! counter, `BUF_FREE_COUNT`), the `'buftype'`-testing predicate
+//! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
+//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, and
+//! `buf_hide`.
+//!
+//! Deferred (each needs a not-yet-translated subsystem):
+//! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
+//!   itself deferred (real file I/O) - translating it now would be
+//!   genuinely dead code.
+//! - `bt_dontwrite_msg`: needs `emsg()` (`message.c`).
+//! - `read_buffer`/`buf_ensure_loaded`/`open_buffer`/`close_buffer`/
+//!   `buf_freeall`/`free_buffer`/`buflist_new`/`buflist_getfile`/
+//!   `buflist_findnr`/etc.: need real file I/O, `ctx_switch` (window
+//!   management), and `autocmd.c`.
+//! - `set_buflisted`/`buf_contents_changed`/`wipe_buffer`: need
+//!   `apply_autocmds` (`autocmd.c`).
+//! - `buf_is_empty`: needs `ml_get_buf` (`memline.c`).
+//! - `buf_inc_changedtick`/`buf_set_changedtick`: need `b_vars`'s real
+//!   dict-watcher machinery (the eval engine, phase 5).
+//! - Everything else in this file (buffer-list management, window-
+//!   buffer association, `:buffer`/`:ls`/title-bar formatting, modeline
+//!   processing, etc.): each needs 2+ of the above, plus `tag.c`/
+//!   `quickfix.c`/`window.c`.
+
+use crate::buffer_defs::{BufT, BufrefT};
+use crate::ex_cmds_defs::cmod;
+use crate::globals::{GlobalCell, GLOBALS};
+use crate::option_vars::OPTION_VARS;
+
+/// Highest-ever-assigned buffer number counter (`buffer.c`'s own
+/// file-static `top_file_num`), starting at 1 like the original.
+static TOP_FILE_NUM: GlobalCell<i32> = GlobalCell::new(1);
+
+/// Incremented every time a `buf_T` is freed, letting [`bufref_valid`]
+/// skip a full buffer-list walk when nothing has been freed since
+/// [`set_bufref`] was called (`buffer.c`'s own file-static
+/// `buf_free_count`).
+static BUF_FREE_COUNT: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Returns byte `idx` of an option modeled as `Option<Vec<u8>>`, or NUL
+/// (`0`) if unset/short - matches how the original dereferences
+/// `buf->b_p_bt[idx]`/`buf->b_p_bh[idx]` (a `char *` that in practice is
+/// always at least NUL-terminated, never truly `NULL`).
+fn opt_byte(opt: &Option<Vec<u8>>, idx: usize) -> u8 {
+    opt.as_deref().and_then(|s| s.get(idx)).copied().unwrap_or(0)
+}
+
+/// Calculate the percentage that `part` is of `whole` (`calc_percentage`).
+#[must_use]
+pub fn calc_percentage(part: i64, whole: i64) -> i32 {
+    // With 32 bit longs and more than 21,474,836 lines multiplying by 100
+    // causes an overflow, thus for large numbers divide instead.
+    if part > 1_000_000 {
+        (part / (whole / 100)) as i32
+    } else {
+        ((part * 100) / whole) as i32
+    }
+}
+
+/// The highest possible buffer number (`get_highest_fnum`).
+///
+/// # Safety
+/// Touches a `GlobalCell` - same requirement as every other function
+/// that does so: no overlapping live access.
+#[must_use]
+pub unsafe fn get_highest_fnum() -> i32 {
+    unsafe { *TOP_FILE_NUM.get_mut() - 1 }
+}
+
+/// Fill in `bufref` to later check with [`bufref_valid`] whether `buf` is
+/// still a valid, live buffer (`set_bufref`).
+///
+/// # Safety
+/// Touches a `GlobalCell` - same requirement as every other function
+/// that does so: no overlapping live access.
+pub unsafe fn set_bufref(bufref: &mut BufrefT, buf: Option<&BufT>) {
+    bufref.br_buf = match buf {
+        Some(b) => b as *const BufT as *mut BufT,
+        None => std::ptr::null_mut(),
+    };
+    bufref.br_fnum = buf.map_or(0, |b| b.handle);
+    bufref.br_buf_free_count = unsafe { *BUF_FREE_COUNT.get_mut() };
+}
+
+/// Return true if `bufref->br_buf` points to the same buffer as when
+/// [`set_bufref`] was called and it is a valid buffer. Only goes through
+/// the buffer list if `buf_free_count` changed. Also checks if `b_fnum`
+/// is still the same, since a `:bwipe` followed by `:new` might get the
+/// same allocated memory, but it's a different buffer (`bufref_valid`).
+///
+/// # Safety
+/// `bufref.br_buf`, if non-null, must point to a live `BufT` (or one
+/// still reachable via the `lastbuf`/`b_prev` chain). Touches a
+/// `GlobalCell` - same requirement as every other function that does so:
+/// no overlapping live access.
+#[must_use]
+pub unsafe fn bufref_valid(bufref: &BufrefT) -> bool {
+    if bufref.br_buf_free_count == unsafe { *BUF_FREE_COUNT.get_mut() } {
+        return true;
+    }
+    (unsafe { buf_valid(bufref.br_buf) })
+        && bufref.br_fnum == unsafe { &*bufref.br_buf }.handle
+}
+
+/// Check that `buf` points to a valid buffer in the buffer list. Can be
+/// slow if there are many buffers, prefer using [`bufref_valid`]
+/// (`buf_valid`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` - same requirement as every other
+/// function that does so: no overlapping live access.
+#[must_use]
+pub unsafe fn buf_valid(buf: *const BufT) -> bool {
+    if buf.is_null() {
+        return false;
+    }
+    // Assume that we more often have a recent buffer, start with the
+    // last one.
+    let mut bp: *mut BufT = unsafe { GLOBALS.get_mut() }.lastbuf;
+    while !bp.is_null() {
+        if std::ptr::eq(bp as *const BufT, buf) {
+            return true;
+        }
+        bp = unsafe { &*bp }.b_prev;
+    }
+    false
+}
+
+/// `true` if `buf` is a prompt buffer (`bt_prompt`).
+#[must_use]
+pub fn bt_prompt(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == b'p')
+}
+
+/// `true` if `buf` is the `cmdwin` scratch buffer (`bt_cmdwin`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` - same requirement as every other
+/// function that does so: no overlapping live access.
+#[must_use]
+pub unsafe fn bt_cmdwin(buf: Option<&BufT>) -> bool {
+    match buf {
+        Some(b) => std::ptr::eq(
+            b as *const BufT,
+            unsafe { GLOBALS.get_mut() }.cmdwin_buf as *const BufT,
+        ),
+        None => false,
+    }
+}
+
+/// `true` if `buf` is a help buffer (`bt_help`).
+#[must_use]
+pub fn bt_help(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| b.b_help)
+}
+
+/// `true` if `buf` has `'buftype'` empty, i.e. a normal buffer
+/// (`bt_normal`).
+#[must_use]
+pub fn bt_normal(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == 0)
+}
+
+/// `true` if `buf` is a quickfix buffer (`bt_quickfix`).
+#[must_use]
+pub fn bt_quickfix(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == b'q')
+}
+
+/// `true` if `buf` is a terminal buffer (`bt_terminal`).
+#[must_use]
+pub fn bt_terminal(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == b't')
+}
+
+/// `true` if `buf` is "nofile", "acwrite", a terminal, or a prompt
+/// buffer - i.e. has no real backing file name (`bt_nofilename`).
+#[must_use]
+pub fn bt_nofilename(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| {
+        (opt_byte(&b.b_p_bt, 0) == b'n' && opt_byte(&b.b_p_bt, 2) == b'f')
+            || opt_byte(&b.b_p_bt, 0) == b'a'
+            || !b.terminal.is_null()
+            || opt_byte(&b.b_p_bt, 0) == b'p'
+    })
+}
+
+/// `true` if `buf` has `'buftype'` set to "nofile" (`bt_nofile`).
+#[must_use]
+pub fn bt_nofile(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == b'n' && opt_byte(&b.b_p_bt, 2) == b'f')
+}
+
+/// `true` if `buf` is "nowrite", "nofile", terminal, or prompt - i.e.
+/// should not be written to its file (`bt_dontwrite`).
+#[must_use]
+pub fn bt_dontwrite(buf: Option<&BufT>) -> bool {
+    buf.is_some_and(|b| {
+        opt_byte(&b.b_p_bt, 0) == b'n' || !b.terminal.is_null() || opt_byte(&b.b_p_bt, 0) == b'p'
+    })
+}
+
+/// `true` if the buffer should be hidden, according to `'bufhidden'`,
+/// `'hidden'`, and `":hide"` (`buf_hide`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` and `crate::option_vars::OPTION_VARS`,
+/// each with the same requirement as every other function that touches
+/// them: no overlapping live access.
+#[must_use]
+pub unsafe fn buf_hide(buf: &BufT) -> bool {
+    // 'bufhidden' overrules 'hidden' and ":hide", check it first.
+    match opt_byte(&buf.b_p_bh, 0) {
+        b'u' | b'w' | b'd' => return false, // "unload"/"wipe"/"delete"
+        b'h' => return true,                // "hide"
+        _ => {}
+    }
+    unsafe { OPTION_VARS.get_mut() }.p_hid != 0
+        || unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags & cmod::HIDE != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer_defs::BufT;
+
+    fn buf_with_bt(bt: &str) -> BufT {
+        BufT {
+            b_p_bt: Some(bt.as_bytes().to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn calc_percentage_matches_c_arithmetic() {
+        assert_eq!(calc_percentage(50, 100), 50);
+        assert_eq!(calc_percentage(1, 3), 33);
+        assert_eq!(calc_percentage(2_000_000, 4_000_000), 50);
+    }
+
+    #[test]
+    fn bt_prompt_checks_first_byte() {
+        assert!(bt_prompt(Some(&buf_with_bt("prompt"))));
+        assert!(!bt_prompt(Some(&buf_with_bt("nofile"))));
+        assert!(!bt_prompt(None));
+    }
+
+    #[test]
+    fn bt_normal_is_true_only_for_empty_buftype() {
+        assert!(bt_normal(Some(&buf_with_bt(""))));
+        assert!(!bt_normal(Some(&buf_with_bt("help"))));
+    }
+
+    #[test]
+    fn bt_quickfix_and_terminal_check_first_byte() {
+        assert!(bt_quickfix(Some(&buf_with_bt("quickfix"))));
+        assert!(bt_terminal(Some(&buf_with_bt("terminal"))));
+        assert!(!bt_quickfix(Some(&buf_with_bt("terminal"))));
+    }
+
+    #[test]
+    fn bt_nofile_checks_no_and_f_bytes() {
+        assert!(bt_nofile(Some(&buf_with_bt("nofile"))));
+        assert!(!bt_nofile(Some(&buf_with_bt("nowrite"))));
+    }
+
+    #[test]
+    fn bt_nofilename_covers_nofile_acwrite_terminal_prompt() {
+        assert!(bt_nofilename(Some(&buf_with_bt("nofile"))));
+        assert!(bt_nofilename(Some(&buf_with_bt("acwrite"))));
+        assert!(bt_nofilename(Some(&buf_with_bt("prompt"))));
+        assert!(!bt_nofilename(Some(&buf_with_bt("help"))));
+    }
+
+    #[test]
+    fn bt_dontwrite_covers_nowrite_terminal_prompt() {
+        assert!(bt_dontwrite(Some(&buf_with_bt("nowrite"))));
+        assert!(bt_dontwrite(Some(&buf_with_bt("prompt"))));
+        assert!(!bt_dontwrite(Some(&buf_with_bt("help"))));
+    }
+
+    #[test]
+    fn bt_help_checks_b_help_flag() {
+        let mut b = BufT::default();
+        assert!(!bt_help(Some(&b)));
+        b.b_help = true;
+        assert!(bt_help(Some(&b)));
+    }
+
+    #[test]
+    fn buf_valid_returns_false_for_null() {
+        // SAFETY: no overlapping GLOBALS access from other threads in tests.
+        unsafe {
+            assert!(!buf_valid(std::ptr::null()));
+        }
+    }
+
+    #[test]
+    fn set_bufref_and_bufref_valid_roundtrip() {
+        let buf = buf_with_bt("");
+        let mut bufref = BufrefT::default();
+        // SAFETY: single-threaded test, no overlapping GLOBALS access.
+        unsafe {
+            set_bufref(&mut bufref, Some(&buf));
+            assert_eq!(bufref.br_fnum, buf.handle);
+            // buf_free_count hasn't changed since set_bufref, so
+            // bufref_valid takes the fast path (true) without needing
+            // `buf` to actually be linked into the real buffer list.
+            assert!(bufref_valid(&bufref));
+        }
+    }
+
+    #[test]
+    fn set_bufref_none_gives_null_buf_and_zero_fnum() {
+        let mut bufref = BufrefT::default();
+        // SAFETY: single-threaded test, no overlapping GLOBALS access.
+        unsafe {
+            set_bufref(&mut bufref, None);
+        }
+        assert!(bufref.br_buf.is_null());
+        assert_eq!(bufref.br_fnum, 0);
+    }
+
+    #[test]
+    fn buf_hide_bufhidden_overrules_hidden_and_cmdmod() {
+        let mut b = buf_with_bt("");
+        b.b_p_bh = Some(b"hide".to_vec());
+        // SAFETY: single-threaded test, no overlapping GLOBALS/OPTION_VARS access.
+        unsafe {
+            assert!(buf_hide(&b));
+            b.b_p_bh = Some(b"unload".to_vec());
+            assert!(!buf_hide(&b));
+        }
+    }
+}
