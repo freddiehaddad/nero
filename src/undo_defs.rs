@@ -63,6 +63,25 @@ impl Default for UhLink {
     }
 }
 
+impl UhLink {
+    /// Extracts the `.ptr` field of the original's union, matching every
+    /// in-memory undo-tree traversal's implicit assumption that these
+    /// links hold a pointer (not yet a sequence number) - only true while
+    /// reading/writing the undo file (`u_read_undo()`/`u_write_undo()`,
+    /// not yet translated) does this link temporarily become a
+    /// [`UhLink::Seq`]. Panics on `Seq`, matching the original's own
+    /// unchecked `.ptr` access rather than silently returning null (which
+    /// would hide a real logic error at the call site instead of
+    /// surfacing it).
+    #[must_use]
+    pub fn ptr(&self) -> *mut UHeader {
+        match self {
+            UhLink::Ptr(p) => *p,
+            UhLink::Seq(_) => panic!("UhLink::ptr() called while link holds a Seq"),
+        }
+    }
+}
+
 /// `u_header_T`/`struct u_header`.
 #[derive(Debug, Clone, Default)]
 pub struct UHeader {
