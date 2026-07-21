@@ -19,8 +19,10 @@
 #[cfg(not(feature = "libintl"))]
 mod imp {
     /// `_(x)` macro: translate a string. No-libintl fallback: identity.
+    /// `const fn` so it can be used the same way `N_(x)` initializes
+    /// `static`/`const` string tables (e.g. `src/nvim/errors.h`).
     #[inline]
-    pub fn gettext(x: &str) -> &str {
+    pub const fn gettext(x: &str) -> &str {
         x
     }
 
@@ -28,7 +30,7 @@ mod imp {
     /// now (used for strings translated later, e.g. table initializers).
     /// No-libintl fallback: identity.
     #[inline]
-    pub fn gettext_noop(x: &str) -> &str {
+    pub const fn gettext_noop(x: &str) -> &str {
         x
     }
 

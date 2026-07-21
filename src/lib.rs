@@ -13,7 +13,11 @@
 //! references instead of nullable pointers, `-> !` for noreturn).
 
 pub mod assert_defs;
+pub mod errors;
+pub mod garray_defs;
 pub mod gettext_defs;
+pub mod hashtab_defs;
+pub mod iconv_defs;
 pub mod macros_defs;
 pub mod pos_defs;
 pub mod types_defs;
