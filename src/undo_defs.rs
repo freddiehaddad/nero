@@ -78,12 +78,17 @@ pub struct UHeader {
     pub uh_seq: i32,
     /// used by `undo_time()`
     pub uh_walk: i32,
-    /// entries, in place of the original's `uh_entry`/`uh_getbot_entry`
-    /// raw linked-list-of-`u_entry_T` pointers (owned directly here; "the
-    /// entry where `ue_bot` must be set" becomes whichever is
-    /// `uh_entries.last()` once `undo.c` establishes the actual append
-    /// order, deferred until then).
+    /// entries, in place of the original's `uh_entry` raw linked-list-of-
+    /// `u_entry_T` pointers (owned directly here, in append order).
     pub uh_entries: Vec<UEntry>,
+    /// index into `uh_entries` of the entry where `ue_bot` must be set (in
+    /// place of the original's raw `u_entry_T *uh_getbot_entry` pointer -
+    /// an index is the natural, sound Rust equivalent of "a pointer to one
+    /// specific entry already owned by `uh_entries`", since a raw pointer
+    /// into a `Vec`'s backing storage could be invalidated by reallocation
+    /// whenever the vec grows). `None` means "not set"/already consumed,
+    /// matching the original's `NULL`.
+    pub uh_getbot_entry: Option<usize>,
     /// cursor position before saving
     pub uh_cursor: PosT,
     pub uh_cursor_vcol: ColnrT,
@@ -151,6 +156,13 @@ mod tests {
             UhLink::Ptr(p) => assert!(p.is_null()),
             UhLink::Seq(_) => panic!("default UhLink should be the null Ptr variant"),
         }
+    }
+
+    #[test]
+    fn uheader_default_has_no_entries_and_no_getbot_entry() {
+        let uh = UHeader::default();
+        assert!(uh.uh_entries.is_empty());
+        assert!(uh.uh_getbot_entry.is_none());
     }
 
     #[test]
