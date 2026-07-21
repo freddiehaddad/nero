@@ -30,6 +30,7 @@ pub mod memory;
 pub mod memory_defs;
 pub mod os;
 pub mod pos_defs;
+pub mod profile;
 pub mod sha256;
 pub mod types_defs;
 pub mod vim_defs;
