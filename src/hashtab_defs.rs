@@ -27,6 +27,7 @@ pub const HT_INIT_SIZE: usize = 16;
 /// 1/3. (Preserved as-is: `hi_key` is a raw pointer into the surrounding
 /// value, not an owned `CString`.)
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct HashitemT {
     /// Cached hash number for `hi_key`.
     pub hi_hash: HashT,
@@ -39,13 +40,63 @@ pub struct HashitemT {
     pub hi_key: *mut std::os::raw::c_char,
 }
 
+impl Default for HashitemT {
+    fn default() -> Self {
+        HashitemT {
+            hi_hash: 0,
+            hi_key: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// The original's `ht_array` is a raw pointer that, for a small table,
+/// points *into this same struct's* `ht_smallarray` field - safe in C
+/// (structs aren't implicitly relocated), but a dangling-pointer hazard in
+/// Rust, where structs move freely (returned by value, put in a `Vec`,
+/// etc. - any such move would leave a raw self-pointer pointing at the
+/// old, now-invalid location). This enum gets the identical observable
+/// behavior (small inline array up to `HT_INIT_SIZE` items, falling back
+/// to a heap array beyond that) without a self-referential pointer.
+///
+/// `#[allow(clippy::large_enum_variant)]`: boxing `Small` (as clippy
+/// suggests by default) would defeat its entire purpose, which - per the
+/// original's own comment on `HT_INIT_SIZE` - is avoiding a heap
+/// allocation for small tables, the common case.
+#[allow(clippy::large_enum_variant)]
+pub enum HashArray {
+    Small([HashitemT; HT_INIT_SIZE]),
+    Large(Vec<HashitemT>),
+}
+
+impl HashArray {
+    #[inline]
+    pub fn as_slice(&self) -> &[HashitemT] {
+        match self {
+            HashArray::Small(a) => a,
+            HashArray::Large(v) => v,
+        }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [HashitemT] {
+        match self {
+            HashArray::Small(a) => a,
+            HashArray::Large(v) => v,
+        }
+    }
+
+    #[inline]
+    pub fn is_small(&self) -> bool {
+        matches!(self, HashArray::Small(_))
+    }
+}
+
 /// An array-based hashtable (`hashtab_T`).
 ///
 /// Keys are NUL terminated strings. They cannot be repeated within a table.
 /// Values are of any type.
 ///
 /// The hashtable grows to accommodate more entries when needed.
-#[repr(C)]
 pub struct HashtabT {
     /// mask used for hash value (nr of items in array is `ht_mask + 1`)
     pub ht_mask: HashT,
@@ -57,8 +108,7 @@ pub struct HashtabT {
     pub ht_changed: i32,
     /// counter for `hash_lock()`
     pub ht_locked: i32,
-    /// points to the array, allocated when it's not `ht_smallarray`
-    pub ht_array: *mut HashitemT,
-    /// initial array
-    pub ht_smallarray: [HashitemT; HT_INIT_SIZE],
+    /// the array (in place of the original's raw `ht_array` pointer +
+    /// inline `ht_smallarray` field - see [`HashArray`])
+    pub ht_array: HashArray,
 }
