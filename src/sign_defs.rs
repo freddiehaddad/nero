@@ -41,3 +41,31 @@ pub struct SignItem {
 pub const SIGN_SHOW_MAX: i32 = 9;
 /// Default sign highlight priority (`SIGN_DEF_PRIO`).
 pub const SIGN_DEF_PRIO: i32 = 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_text_attrs_has_sign_width_cells() {
+        let attrs = SignTextAttrs { text: [0; SIGN_WIDTH as usize], hl_id: 0 };
+        assert_eq!(attrs.text.len(), 2);
+    }
+
+    #[test]
+    fn sign_def_prio_used_as_sn_priority_sentinel() {
+        // -1 (not SIGN_DEF_PRIO) is the documented "use the default" sentinel.
+        let sign = SignT {
+            sn_name: b"test".to_vec(),
+            sn_icon: None,
+            sn_text: [0; SIGN_WIDTH as usize],
+            sn_line_hl: 0,
+            sn_text_hl: 0,
+            sn_cul_hl: 0,
+            sn_num_hl: 0,
+            sn_priority: -1,
+        };
+        assert_eq!(sign.sn_priority, -1);
+        assert_ne!(sign.sn_priority, SIGN_DEF_PRIO);
+    }
+}

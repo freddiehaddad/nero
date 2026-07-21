@@ -1,11 +1,12 @@
 //! Translated from `src/nvim/statusline_defs.h` (partial).
 //!
-//! Only `StlFlag`, `StlClickDefinition`, `StcClick`, `StlClickRecord` are
-//! translated here - what `map_defs.h` (phase 3) actually needs
-//! (`MAP_DECLS(int, StcClick)`). `statuscol_T` needs `foldinfo_T`
-//! (`fold_defs.h`) and `SignTextAttrs` (`sign_defs.h`), neither translated
-//! yet; `stl_hlrec_t`/`stl_item_t` belong with `statusline.c` itself
-//! (phase 8) and aren't needed before then.
+//! `StlFlag`, `StlClickDefinition`, `StcClick`, `StlClickRecord`,
+//! `StlHlrecT`, `statuscol_T` are translated here. `stl_item_t` is used
+//! only by `statusline.c` itself (phase 8) and isn't needed before then.
+
+use crate::fold_defs::FoldinfoT;
+use crate::pos_defs::{ColnrT, LinenrT};
+use crate::sign_defs::SignTextAttrs;
 
 /// `'statusline'` item flags (`StlFlag`). Kept as their literal ASCII byte
 /// values (matching the original's char-literal enum) via `u8` consts
@@ -141,4 +142,59 @@ pub struct StlClickRecord {
     /// Byte offset where region starts (in place of the original's raw
     /// `const char *start` pointer into the tabline buffer).
     pub start: usize,
+}
+
+/// Used for highlighting in the status line (`stl_hlrec_t` / `struct
+/// stl_hlrec`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StlHlrecT {
+    /// Byte offset where the item starts in the status line output buffer
+    /// (in place of the original's raw `char *start` pointer).
+    pub start: usize,
+    /// 0: no HL, 1-9: User HL, < 0 for syn ID
+    pub userhl: i32,
+    /// Item flag belonging to highlight (used for `'statuscolumn'`)
+    pub item: u8,
+}
+
+/// Struct to hold info for `'statuscolumn'` (`statuscol_T`).
+#[derive(Debug, Clone, Default)]
+pub struct StatuscolT {
+    /// width of the status column
+    pub width: i32,
+    /// buffer line being drawn
+    pub lnum: LinenrT,
+    /// cursorline sign highlight id
+    pub sign_cul_id: i32,
+    /// whether to draw the statuscolumn
+    pub draw: bool,
+    /// highlight groups (in place of the original's raw `stl_hlrec_t *`
+    /// pointer to a heap-allocated array).
+    pub hlrec: Vec<StlHlrecT>,
+    /// fold information
+    pub foldinfo: FoldinfoT,
+    /// vcol array filled for fold item
+    pub fold_vcol: [ColnrT; 9],
+    /// sign attributes (in place of the original's raw `SignTextAttrs *`
+    /// pointer to a heap-allocated array, max `SIGN_SHOW_MAX` entries).
+    pub sattrs: Vec<SignTextAttrs>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statuscol_default_has_no_signs_or_highlights() {
+        let sc = StatuscolT::default();
+        assert!(sc.hlrec.is_empty());
+        assert!(sc.sattrs.is_empty());
+        assert!(!sc.draw);
+    }
+
+    #[test]
+    fn stl_click_type_default_is_disabled() {
+        // Disabled = 0: clicks to this area are ignored by default.
+        assert_eq!(StlClickType::default(), StlClickType::Disabled);
+    }
 }

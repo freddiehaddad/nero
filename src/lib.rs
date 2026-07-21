@@ -23,6 +23,7 @@ pub mod decoration_defs;
 pub mod errors;
 pub mod eval;
 pub mod extmark_defs;
+pub mod fold_defs;
 pub mod fuzzy;
 pub mod garray;
 pub mod garray_defs;
