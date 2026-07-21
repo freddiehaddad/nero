@@ -9,14 +9,16 @@
 //! `syn_time_T`, `synblock_T`, `BufUpdateCallbacks`, the
 //! `BUF_HAS_*`/`MAX_MAPHASH` constants, `FloatAnchor`, `FloatRelative`,
 //! `WinKind`, `WinSplit`, `WinStyle`, `AlignTextPos`, `BorderTextType`,
-//! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`.
+//! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`, `DB_COUNT`,
+//! `diffblock_S`/`diffline_change_S`/`diffline_S` (-> `DiffT`/
+//! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`.
 //!
 //! Deferred: everything referencing `buf_T`'s actual fields (`struct
 //! file_buffer` itself, `ChangedtickDictItem` which needs the eval
 //! engine's `typval_T`), `match_T`/`llpos_T`/`matchitem_T` (need
 //! `regmmatch_T`, `regexp_defs.h`, phase 7), `file_buffer`/`window_S`
-//! themselves, `tabpage_S`, `frame_S`, `diffblock_S`/`diffline_change_S`/
-//! `diffline_S`, and `wline_T`.
+//! themselves, `tabpage_S` (needs `dict_T`/`ScopeDictDictItem`, the eval
+//! engine), and `frame_S`.
 
 use crate::eval::typval_defs::SctxT;
 use crate::garray_defs::GarrayT;
@@ -674,6 +676,106 @@ pub struct FcsCharsT {
     pub truncrl: crate::types_defs::ScharT,
 }
 
+// --- Stuff for diff mode. ---
+
+/// up to four buffers can be diff'ed (`DB_COUNT`)
+pub const DB_COUNT: usize = 8;
+
+/// Each diffblock defines where a block of lines starts in each of the
+/// buffers and how many lines it occupies in that buffer (`diffblock_S`,
+/// typedef'd as `diff_T`). When the lines are missing in the buffer the
+/// `df_count[]` is zero. This is all counted in buffer lines.
+///
+/// Usually there is always at least one unchanged line in between the
+/// diffs as otherwise it would have been included in the diff above or
+/// below it. When linematch or diff anchors are used, this is no longer
+/// guaranteed, and we may have adjacent diff blocks. In all cases they
+/// will not overlap, although it is possible to have multiple 0-count
+/// diff blocks at the same line. `df_lnum[] + df_count[]` is the lnum
+/// below the change. When in one buffer lines have been inserted, in the
+/// other buffer `df_lnum[]` is the line below the insertion and
+/// `df_count[]` is zero. When appending lines at the end of the buffer,
+/// `df_lnum[]` is one beyond the end!
+///
+/// This is using a linked list (`df_next`, in place of the original's raw
+/// `diff_T *`, matching this crate's established convention for intrusive
+/// linked structures elsewhere, e.g. `MtNode`), because the number of
+/// differences is expected to be reasonably small. The list is sorted on
+/// lnum. Each diffblock also contains a cached list of inline diff of
+/// changes within the block, used for highlighting.
+pub struct DiffT {
+    pub df_next: *mut DiffT,
+    /// line number in buffer
+    pub df_lnum: [crate::pos_defs::LinenrT; DB_COUNT],
+    /// nr of inserted/changed lines
+    pub df_count: [crate::pos_defs::LinenrT; DB_COUNT],
+    /// has the linematch algorithm ran on this diff hunk to divide it into
+    /// smaller diff hunks?
+    pub is_linematched: bool,
+    /// has cached list of inline changes
+    pub has_changes: bool,
+    /// list of inline changes (`diffline_change_T`)
+    pub df_changes: GarrayT,
+}
+
+/// Each entry stores a single inline change within a diff block. Line
+/// numbers are recorded as relative offsets, and columns are byte
+/// offsets, not character counts. Ranges are `[start,end)`, with the end
+/// being exclusive (`diffline_change_S`, typedef'd as `diffline_change_T`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DifflineChangeT {
+    /// byte offset of start of range in the line
+    pub dc_start: [crate::pos_defs::ColnrT; DB_COUNT],
+    /// 1 past byte offset of end of range in line
+    pub dc_end: [crate::pos_defs::ColnrT; DB_COUNT],
+    /// starting line offset
+    pub dc_start_lnum_off: [i32; DB_COUNT],
+    /// end line offset
+    pub dc_end_lnum_off: [i32; DB_COUNT],
+}
+
+/// Describes a single line's list of inline changes. Use
+/// `diff_change_parse()` (not yet translated) to parse this
+/// (`diffline_S`, typedef'd as `diffline_T`).
+#[derive(Debug, Clone, Default)]
+pub struct DifflineT {
+    /// in place of the original's raw `diffline_change_T *changes` pointer
+    /// to a heap-allocated array of `num_changes` entries.
+    pub changes: Vec<DifflineChangeT>,
+    pub bufidx: i32,
+    pub lineoff: i32,
+}
+
+pub const SNAP_HELP_IDX: usize = 0;
+pub const SNAP_AUCMD_IDX: usize = 1;
+pub const SNAP_QUICKFIX_IDX: usize = 2;
+pub const SNAP_COUNT: usize = 3;
+
+/// Structure to cache info for displayed lines in `w_lines[]` (`wline_T`).
+/// Each logical line has one entry. The entry tells how the logical line
+/// is currently displayed in the window. This is updated when displaying
+/// the window. When the display is changed (e.g. when clearing the
+/// screen) `w_lines_valid` is changed to exclude invalid entries. When
+/// making changes to the buffer, `wl_valid` is reset to indicate `wl_size`
+/// may not reflect what is actually in the buffer. When `wl_valid` is
+/// false, the entries can only be used to count the number of displayed
+/// lines used; `wl_lnum` and `wl_lastlnum` are invalid too.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WlineT {
+    /// buffer line number for logical line
+    pub wl_lnum: crate::pos_defs::LinenrT,
+    /// height in screen lines
+    pub wl_size: u16,
+    /// true values are valid for text in buffer
+    pub wl_valid: bool,
+    /// true when this is a range of folded lines
+    pub wl_folded: bool,
+    /// last buffer line number for folded line
+    pub wl_foldend: crate::pos_defs::LinenrT,
+    /// last buffer line number for logical line
+    pub wl_lastlnum: crate::pos_defs::LinenrT,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +909,38 @@ mod tests {
         assert!(lcs.leadmultispace.is_none());
         let fcs = FcsCharsT::default();
         assert_eq!(fcs.stl, 0);
+    }
+
+    #[test]
+    fn diffline_change_default_is_zeroed() {
+        let dc = DifflineChangeT::default();
+        assert_eq!(dc.dc_start, [0; DB_COUNT]);
+        assert_eq!(dc.dc_end, [0; DB_COUNT]);
+    }
+
+    #[test]
+    fn diffline_default_has_no_changes() {
+        let dl = DifflineT::default();
+        assert!(dl.changes.is_empty());
+        assert_eq!(dl.bufidx, 0);
+    }
+
+    #[test]
+    fn wline_default_is_invalid_and_zeroed() {
+        let wl = WlineT::default();
+        assert!(!wl.wl_valid);
+        assert!(!wl.wl_folded);
+        assert_eq!(wl.wl_lnum, 0);
+    }
+
+    #[test]
+    fn snap_indices_are_distinct() {
+        let all = [SNAP_HELP_IDX, SNAP_AUCMD_IDX, SNAP_QUICKFIX_IDX];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+        assert_eq!(SNAP_COUNT, 3);
     }
 }
