@@ -7,7 +7,8 @@
 //! translated here: `vim_ispathsep`(+`_nocolon`), `vim_ispathlistsep`,
 //! `path_head_length`, `is_path_head`, `path_skip_sep`, `get_past_head`,
 //! `path_tail`, `path_next_component`, `path_has_drive_letter`,
-//! `path_is_absolute`, `after_pathsep`, `add_pathsep`.
+//! `path_is_absolute`, `after_pathsep`, `add_pathsep`, `path_is_url`,
+//! `path_with_url`, `path_to_slash`, `path_to_slash_save`.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -219,6 +220,84 @@ pub fn add_pathsep(p: &mut Vec<u8>) -> bool {
     true
 }
 
+/// `path_is_url()` has found `":/"` (`URL_SLASH`).
+pub const URL_SLASH: i32 = 1;
+/// `path_is_url()` has found `":\"` (`URL_BACKSLASH`).
+pub const URL_BACKSLASH: i32 = 2;
+
+/// Check if the `":/"` or `":\"` of a URL is at `p` (`path_is_url`).
+///
+/// @return `URL_SLASH` for `"name:/"`, `URL_BACKSLASH` for `"name:\"`,
+///         zero otherwise.
+#[must_use]
+pub fn path_is_url(p: &[u8]) -> i32 {
+    // In the spec ':' is enough to recognize a scheme:
+    // <https://url.spec.whatwg.org/#scheme-state>
+    if p.starts_with(b":/") {
+        URL_SLASH
+    } else if p.starts_with(b":\\\\") {
+        URL_BACKSLASH
+    } else {
+        0
+    }
+}
+
+/// Check if `fname` starts with `"name:/"` or `"name:\"` (`path_with_url`).
+///
+/// @return URL_SLASH for `"name:/"`, URL_BACKSLASH for `"name:\"`, zero
+///         otherwise.
+#[must_use]
+pub fn path_with_url(fname: &[u8]) -> i32 {
+    // first character must be alpha
+    let Some(&first) = fname.first() else {
+        return 0;
+    };
+    if !crate::macros_defs::ascii_isalpha(first as i32) {
+        return 0;
+    }
+
+    if path_has_drive_letter(fname, fname.len()) {
+        return 0;
+    }
+
+    // check body: (alpha, digit, '+', '-', '.') following RFC3986
+    let mut i = 1;
+    while i < fname.len() {
+        let c = fname[i];
+        if crate::macros_defs::ascii_isalnum(c as i32) || c == b'+' || c == b'-' || c == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+
+    // check last char is not '+', '-', or '.'
+    let last = fname[i - 1];
+    if last == b'+' || last == b'-' || last == b'.' {
+        return 0;
+    }
+
+    // ":/" or ":\\" must follow
+    path_is_url(&fname[i..])
+}
+
+/// Convert `p` to use forward slashes in place, unless it looks like a
+/// URL (`path_to_slash`).
+pub fn path_to_slash(p: &mut [u8]) {
+    if path_with_url(p) == 0 {
+        crate::memory::memchrsub(p, b'\\', crate::ascii_defs::PATHSEP);
+    }
+}
+
+/// Get an owned copy of `p` with backslashes converted to forward
+/// slashes, unless it looks like a URL (`path_to_slash_save`).
+#[must_use]
+pub fn path_to_slash_save(p: &[u8]) -> Vec<u8> {
+    let mut owned = p.to_vec();
+    path_to_slash(&mut owned);
+    owned
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +367,55 @@ mod tests {
         let mut empty: Vec<u8> = Vec::new();
         assert!(add_pathsep(&mut empty)); // true, but stays empty
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn path_is_url_recognizes_slash_and_backslash_schemes() {
+        assert_eq!(path_is_url(b":/foo"), URL_SLASH);
+        assert_eq!(path_is_url(b":\\\\foo"), URL_BACKSLASH);
+        assert_eq!(path_is_url(b"foo"), 0);
+        assert_eq!(path_is_url(b""), 0);
+    }
+
+    #[test]
+    fn path_with_url_recognizes_http_scheme() {
+        assert_eq!(path_with_url(b"http://example.com"), URL_SLASH);
+        assert_eq!(path_with_url(b"file:\\\\C:\\foo"), URL_BACKSLASH);
+    }
+
+    #[test]
+    fn path_with_url_rejects_plain_paths_and_drive_letters() {
+        assert_eq!(path_with_url(b"/usr/local/bin"), 0);
+        assert_eq!(path_with_url(b"C:/foo"), 0); // drive letter, not a URL
+        assert_eq!(path_with_url(b""), 0);
+        assert_eq!(path_with_url(b"1nvalid://foo"), 0); // must start with alpha
+    }
+
+    #[test]
+    fn path_with_url_rejects_trailing_dot_before_colon() {
+        // scheme body ending in '.', '+', or '-' right before ':' is invalid
+        assert_eq!(path_with_url(b"foo.:/bar"), 0);
+    }
+
+    #[test]
+    fn path_to_slash_converts_backslashes_for_non_url_paths() {
+        let mut p = b"C:\\Users\\test".to_vec();
+        path_to_slash(&mut p);
+        assert_eq!(&p, b"C:/Users/test");
+    }
+
+    #[test]
+    fn path_to_slash_leaves_urls_untouched() {
+        let mut p = b"http:\\\\example.com\\path".to_vec();
+        path_to_slash(&mut p);
+        assert_eq!(&p, b"http:\\\\example.com\\path");
+    }
+
+    #[test]
+    fn path_to_slash_save_returns_new_converted_copy() {
+        let original = b"a\\b\\c".to_vec();
+        let converted = path_to_slash_save(&original);
+        assert_eq!(&converted, b"a/b/c");
+        assert_eq!(&original, b"a\\b\\c"); // original untouched
     }
 }
