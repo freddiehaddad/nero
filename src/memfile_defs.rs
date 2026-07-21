@@ -9,6 +9,55 @@ use crate::map::Map;
 /// file. The blocks with negative numbers are currently in memory only.
 pub type BlocknrT = i64;
 
+/// The payload of a [`BhdrT`] (`bh_data` in the original: a `void *`
+/// that is reinterpreted depending on the block's state).
+///
+/// The original's `bh_data` is a single `void *` field serving two
+/// entirely different purposes depending on which list the block is on
+/// (per the struct's own doc comment): for a block on the *used* list,
+/// it points at the block's actual allocated data; for a block on the
+/// *free* list ("no block of memory allocated"), `mf_ins_free`/
+/// `mf_rem_free` (`memfile.c`) instead store the free list's own `next`
+/// pointer directly in this same field (`hp->bh_data =
+/// mfp->mf_free_first;`). Translated as a proper tagged Rust enum -
+/// each variant directly carries its own payload - rather than
+/// replicating the untyped-pointer-reinterpretation trick, same
+/// reasoning as `Callback`/`UhLink`/`EsInfo` elsewhere in this crate:
+/// block headers are individually heap-allocated (not a hot, densely
+/// packed array), so there is no memory-layout reason to keep the
+/// original's type-erased `void *` here.
+pub enum BhData {
+    /// Allocated data buffer (block is on the used list / newly
+    /// allocated).
+    Data(Vec<u8>),
+    /// Next block in the free list (block is on the free list, no data
+    /// allocated).
+    FreeNext(*mut BhdrT),
+}
+
+impl BhData {
+    /// Returns the data buffer, panicking if this is a
+    /// [`BhData::FreeNext`] - mirrors the original's implicit assumption
+    /// (dereferencing `bh_data` as a data pointer) that callers only do
+    /// this for used-list blocks.
+    #[must_use]
+    pub fn as_data(&self) -> &[u8] {
+        match self {
+            BhData::Data(v) => v,
+            BhData::FreeNext(_) => panic!("BhData::as_data called on a free-list entry"),
+        }
+    }
+
+    /// Mutable version of [`BhData::as_data`].
+    #[must_use]
+    pub fn as_data_mut(&mut self) -> &mut Vec<u8> {
+        match self {
+            BhData::Data(v) => v,
+            BhData::FreeNext(_) => panic!("BhData::as_data_mut called on a free-list entry"),
+        }
+    }
+}
+
 /// A block header (`bhdr_T`).
 ///
 /// There is a block header for each previously used block in the
@@ -24,11 +73,9 @@ pub type BlocknrT = i64;
 pub struct BhdrT {
     /// key used in hash table
     pub bh_bnum: BlocknrT,
-    /// pointer to memory (for used block); in place of the original's raw
-    /// `void *bh_data` - the pointee's exact type depends on which kind of
-    /// block this is (data vs. pointer block, `memline.c`, not yet
-    /// translated), matching C's own type-erased usage here.
-    pub bh_data: *mut std::ffi::c_void,
+    /// pointer to memory (for used block), or the free-list `next`
+    /// pointer (for a free block) - see [`BhData`].
+    pub bh_data: BhData,
     /// number of pages in this block
     pub bh_page_count: u32,
     /// `BH_DIRTY` or `BH_LOCKED`
@@ -101,5 +148,35 @@ mod tests {
     fn bh_flags_are_distinct_bits() {
         assert_ne!(BH_DIRTY, BH_LOCKED);
         assert_eq!(BH_DIRTY & BH_LOCKED, 0);
+    }
+
+    #[test]
+    fn bh_data_as_data_reads_and_writes_through() {
+        let mut d = BhData::Data(vec![1, 2, 3]);
+        assert_eq!(d.as_data(), &[1, 2, 3]);
+        d.as_data_mut().push(4);
+        assert_eq!(d.as_data(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn bh_data_free_next_holds_a_pointer() {
+        let mut other = BhdrT {
+            bh_bnum: 0,
+            bh_data: BhData::Data(Vec::new()),
+            bh_page_count: 0,
+            bh_flags: 0,
+        };
+        let d = BhData::FreeNext(&mut other as *mut BhdrT);
+        match d {
+            BhData::FreeNext(p) => assert!(!p.is_null()),
+            BhData::Data(_) => panic!("expected FreeNext variant"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "as_data called on a free-list entry")]
+    fn bh_data_as_data_panics_on_free_next() {
+        let d = BhData::FreeNext(std::ptr::null_mut());
+        let _ = d.as_data();
     }
 }
