@@ -86,7 +86,6 @@ pub const SIGN_WIDTH: i32 = 2;
 // each becomes a real type when its owning file is translated. Kept as
 // opaque placeholder structs until then - never silently faked, just not
 // yet implemented:
-//   buf_T      -> struct file_buffer, src/nvim/buffer_defs.h   (phase 3)
 //   Loop       -> struct loop,        src/nvim/event/loop.h    (phase 11)
 //   regprog_T  -> struct regprog,     src/nvim/regexp_defs.h   (phase 7)
 //   synstate_T -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
@@ -101,11 +100,12 @@ pub const SIGN_WIDTH: i32 = 2;
 // no forward-declaration mechanism of its own to mirror precisely.)
 // MTNode (struct mtnode_s) is no longer a placeholder here: it is now
 // translated for real in `src/nvim/marktree_defs.h` -> `crate::marktree_defs::MtNode`.
+// buf_T (struct file_buffer) is likewise no longer a placeholder: it is
+// now translated for real as `crate::buffer_defs::BufT` (kept under the
+// same name, since `buf_T` - not `FileBuffer` - is the name actually used
+// throughout the rest of the original codebase; matches this crate's
+// "prefer the real typedef name" convention, e.g. `wininfo_S` -> `WinInfo`).
 
-/// Placeholder for `buf_T` (`struct file_buffer`) - see `src/nvim/buffer_defs.h` (phase 3).
-pub struct BufT {
-    _private: (),
-}
 /// Placeholder for `Loop` (`struct loop`) - see `src/nvim/event/loop.h` (phase 11).
 pub struct LoopT {
     _private: (),

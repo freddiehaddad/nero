@@ -11,7 +11,7 @@
 //! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`, `DB_COUNT`,
 //! `diffblock_S`/`diffline_change_S`/`diffline_S` (-> `DiffT`/
 //! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`, and
-//! now `struct file_buffer` (-> [`FileBuffer`]) itself, including its
+//! now `struct file_buffer` (-> [`BufT`]) itself, including its
 //! buffer-local options block.
 //!
 //! Deferred: `match_T`/`llpos_T`/`matchitem_T` (need `regmmatch_T`,
@@ -29,7 +29,7 @@ use crate::os::fs_defs::FileID;
 use crate::os::time_defs::Timestamp;
 use crate::pos_defs::{ColnrT, LinenrT, PosT};
 use crate::sign_defs::SIGN_SHOW_MAX;
-use crate::types_defs::{BufT, HandleT, LuaRef, MapblockT, OptInt, ProftimeT, TerminalT, WinT};
+use crate::types_defs::{HandleT, LuaRef, MapblockT, OptInt, ProftimeT, TerminalT, WinT};
 use crate::undo_defs::{UHeader, VisualinfoT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
@@ -885,7 +885,7 @@ pub struct BufSigncolsT {
 /// `additional_data`, `b_vars`) stay raw pointers, matching this crate's
 /// established convention (see `marktree.rs`'s module docs) rather than
 /// inventing an owning-container redesign the original doesn't have.
-pub struct FileBuffer {
+pub struct BufT {
     /// unique id for the buffer (buffer number). The original also names
     /// this field `b_fnum` via `#define b_fnum handle`; Rust has no field
     /// alias mechanism, so callers use `handle` directly (a same-named
@@ -897,8 +897,8 @@ pub struct FileBuffer {
     pub b_ml: MemlineT,
 
     /// links in list of buffers
-    pub b_next: *mut FileBuffer,
-    pub b_prev: *mut FileBuffer,
+    pub b_next: *mut BufT,
+    pub b_prev: *mut BufT,
 
     /// nr of windows open on this buffer
     pub b_nwindows: i32,
@@ -1468,7 +1468,7 @@ pub struct FileBuffer {
     pub flush_count: i32,
 }
 
-impl Default for FileBuffer {
+impl Default for BufT {
     /// A purely mechanical, structural default (every field zero/empty/
     /// null) - **not** a translation of `buflist_new()`'s real "freshly
     /// created buffer" initial state. That real initial state includes
@@ -1480,7 +1480,7 @@ impl Default for FileBuffer {
     /// fidelity than this impl actually has - so every field is
     /// deliberately left at its plain zero value for now.
     fn default() -> Self {
-        FileBuffer {
+        BufT {
             handle: 0,
             b_ml: MemlineT::default(),
             b_next: std::ptr::null_mut(),
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn file_buffer_default_has_null_links_and_empty_collections() {
-        let buf = FileBuffer::default();
+        let buf = BufT::default();
         assert_eq!(buf.handle, 0);
         assert!(buf.b_next.is_null());
         assert!(buf.b_prev.is_null());
@@ -1970,7 +1970,7 @@ mod tests {
 
     #[test]
     fn file_buffer_default_callbacks_are_none() {
-        let buf = FileBuffer::default();
+        let buf = BufT::default();
         assert_eq!(buf.b_cfu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
         assert_eq!(buf.b_ofu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
         assert_eq!(buf.b_tfu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
