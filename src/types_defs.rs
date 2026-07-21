@@ -93,6 +93,12 @@ pub const SIGN_WIDTH: i32 = 2;
 //   Terminal   -> struct terminal,    src/nvim/terminal.h      (phase 14)
 //   win_T      -> struct window_S,    src/nvim/buffer_defs.h   (phase 3/8)
 //   qf_info_T  -> struct qf_info_S,   src/nvim/quickfix.c      (phase 8)
+//   mapblock_T -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
+// (mapblock_T/qf_info_T are actually forward-declared in their own headers,
+// not types_defs.h itself, unlike the others above - but this crate keeps
+// all such opaque cross-cutting placeholders here regardless of exactly
+// which original header contains the forward declaration, since Rust has
+// no forward-declaration mechanism of its own to mirror precisely.)
 // MTNode (struct mtnode_s) is no longer a placeholder here: it is now
 // translated for real in `src/nvim/marktree_defs.h` -> `crate::marktree_defs::MtNode`.
 
@@ -122,6 +128,10 @@ pub struct WinT {
 }
 /// Placeholder for `qf_info_T` (`struct qf_info_S`) - see `src/nvim/quickfix.c` (phase 8).
 pub struct QfInfoT {
+    _private: (),
+}
+/// Placeholder for `mapblock_T` (`struct mapblock`) - see `src/nvim/mapping_defs.h` (phase 7).
+pub struct MapblockT {
     _private: (),
 }
 

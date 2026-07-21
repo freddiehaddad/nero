@@ -1,8 +1,7 @@
-//! Translated from `src/nvim/buffer_defs.h` (partial - `buf_T`/`win_T`
-//! themselves (`struct file_buffer`/`struct window_S`, each several
-//! hundred lines and referencing memline internals, quickfix state, etc.
-//! not yet translated) are substantial and deliberately deferred to a
-//! dedicated pass rather than rushed).
+//! Translated from `src/nvim/buffer_defs.h` (partial - `win_T` itself
+//! (`struct window_S`, several hundred lines referencing quickfix/tag
+//! state etc. not yet translated) is substantial and deliberately
+//! deferred to a dedicated pass rather than rushed).
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
 //! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`),
@@ -11,20 +10,27 @@
 //! `WinKind`, `WinSplit`, `WinStyle`, `AlignTextPos`, `BorderTextType`,
 //! `WinConfig`, `pos_save_T`, `lcs_chars_T`, `fcs_chars_T`, `DB_COUNT`,
 //! `diffblock_S`/`diffline_change_S`/`diffline_S` (-> `DiffT`/
-//! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`.
+//! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`, and
+//! now `struct file_buffer` (-> [`FileBuffer`]) itself, including its
+//! buffer-local options block.
 //!
-//! Deferred: everything referencing `buf_T`'s actual fields (`struct
-//! file_buffer` itself, `ChangedtickDictItem` which needs the eval
-//! engine's `typval_T`), `match_T`/`llpos_T`/`matchitem_T` (need
-//! `regmmatch_T`, `regexp_defs.h`, phase 7), `file_buffer`/`window_S`
-//! themselves, `tabpage_S` (needs `dict_T`/`ScopeDictDictItem`, the eval
-//! engine), and `frame_S`.
+//! Deferred: `match_T`/`llpos_T`/`matchitem_T` (need `regmmatch_T`,
+//! `regexp_defs.h`, phase 7), `window_S` itself, `tabpage_S` (needs
+//! `dict_T`'s real fields, the eval engine), and `frame_S`.
 
-use crate::eval::typval_defs::SctxT;
+use crate::eval::typval_defs::{Callback, ChangedtickDictItem, DictT, ScopeDictDictItem, SctxT, VarnumberT};
 use crate::garray_defs::GarrayT;
 use crate::hashtab_defs::HashtabT;
-use crate::mark_defs::FmarkT;
-use crate::types_defs::{BufT, LuaRef, OptInt, ProftimeT, WinT};
+use crate::map::Map;
+use crate::mark_defs::{FmarkT, JUMPLISTSIZE, NMARKS};
+use crate::marktree_defs::MarkTree;
+use crate::memline_defs::MemlineT;
+use crate::os::fs_defs::FileID;
+use crate::os::time_defs::Timestamp;
+use crate::pos_defs::{ColnrT, LinenrT, PosT};
+use crate::sign_defs::SIGN_SHOW_MAX;
+use crate::types_defs::{BufT, HandleT, LuaRef, MapblockT, OptInt, ProftimeT, TerminalT, WinT};
+use crate::undo_defs::{UHeader, VisualinfoT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
 /// `bufref_valid()` (not yet translated) only needs to check `buf` when the
@@ -433,6 +439,64 @@ pub struct SynblockT {
     pub b_syn_isk: Option<Vec<u8>>,
 }
 
+impl Default for SynblockT {
+    /// Manual (not derived): `b_spell_ismw: [bool; 256]` exceeds the array
+    /// length Rust's standard library provides a blanket `Default` impl
+    /// for (`0..=32`), and `b_keywtab`/`b_keywtab_ic` (`HashtabT`) are
+    /// constructed via `hashtab.c`'s own translated `hash_init()`
+    /// (`hashtab::hash_init()`), not a `Default` impl - `hashtab_defs.rs`
+    /// deliberately has none, matching the original's split between pure
+    /// type declarations and the algorithm that initializes them.
+    fn default() -> Self {
+        SynblockT {
+            b_keywtab: HashtabT::hash_init(),
+            b_keywtab_ic: HashtabT::hash_init(),
+            b_syn_error: false,
+            b_syn_slow: false,
+            b_syn_ic: 0,
+            b_syn_foldlevel: 0,
+            b_syn_spell: 0,
+            b_syn_patterns: GarrayT::default(),
+            b_syn_clusters: GarrayT::default(),
+            b_spell_cluster_id: 0,
+            b_nospell_cluster_id: 0,
+            b_syn_containedin: 0,
+            b_syn_sync_flags: 0,
+            b_syn_sync_id: 0,
+            b_syn_sync_minlines: 0,
+            b_syn_sync_maxlines: 0,
+            b_syn_sync_linebreaks: 0,
+            b_syn_linecont_pat: None,
+            b_syn_linecont_prog: std::ptr::null_mut(),
+            b_syn_linecont_time: SynTimeT::default(),
+            b_syn_linecont_ic: 0,
+            b_syn_topgrp: 0,
+            b_syn_conceal: 0,
+            b_syn_folditems: 0,
+            b_sst_array: std::ptr::null_mut(),
+            b_sst_len: 0,
+            b_sst_first: std::ptr::null_mut(),
+            b_sst_firstfree: std::ptr::null_mut(),
+            b_sst_freecount: 0,
+            b_sst_check_lnum: 0,
+            b_sst_lasttick: 0,
+            b_idlist_cache: std::ptr::null_mut(),
+            b_langp: GarrayT::default(),
+            b_spell_ismw: [false; 256],
+            b_spell_ismw_mb: None,
+            b_p_spc: None,
+            b_cap_prog: std::ptr::null_mut(),
+            b_p_spf: None,
+            b_p_spl: None,
+            b_p_spo: None,
+            b_p_spo_flags: 0,
+            b_cjk: 0,
+            b_syn_chartab: [0; 32],
+            b_syn_isk: None,
+        }
+    }
+}
+
 /// Callbacks registered via `nvim_buf_attach` (`BufUpdateCallbacks`).
 #[derive(Debug, Clone, Copy)]
 pub struct BufUpdateCallbacks {
@@ -776,6 +840,909 @@ pub struct WlineT {
     pub wl_lastlnum: crate::pos_defs::LinenrT,
 }
 
+// Values for b_p_iminsert and b_p_imsearch.
+/// Use b_p_iminsert value for search (`B_IMODE_USE_INSERT`).
+pub const B_IMODE_USE_INSERT: OptInt = -1;
+/// Input via none (`B_IMODE_NONE`).
+pub const B_IMODE_NONE: OptInt = 0;
+/// Input via langmap (`B_IMODE_LMAP`).
+pub const B_IMODE_LMAP: OptInt = 1;
+pub const B_IMODE_LAST: OptInt = 1;
+
+// Flags for b_kmap_state.
+/// `'keymap'` was set, call `keymap_init()` (`KEYMAP_INIT`).
+pub const KEYMAP_INIT: i16 = 1;
+/// `'keymap'` mappings have been loaded (`KEYMAP_LOADED`).
+pub const KEYMAP_LOADED: i16 = 2;
+
+/// Per-line sign-count bookkeeping, kept for `'signcolumn'` display
+/// (originally an anonymous `struct { ... } b_signcols;` inside
+/// `file_buffer` - given a name, `BufSigncolsT`, since Rust has no
+/// anonymous-struct-field syntax).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BufSigncolsT {
+    /// maximum number of signs on a single line
+    pub max: i32,
+    /// value of max when the buffer was last drawn
+    pub last_max: i32,
+    /// number of lines with number of signs
+    pub count: [i32; SIGN_SHOW_MAX as usize],
+    /// whether `'signcolumn'` is displayed in an `"auto:n>1"` configured
+    /// window; `b_signcols` calculation is skipped if false.
+    pub autom: bool,
+}
+
+/// Structure that holds information about one file (`struct file_buffer`,
+/// typedef'd as `buf_T`).
+///
+/// Several windows can share a single buffer. A buffer is unallocated if
+/// there is no memfile for it. A buffer is new if the associated file has
+/// never been loaded yet.
+///
+/// Pointer fields to not-yet-translated owning subsystems (`b_next`/
+/// `b_prev` intrusive list links, `b_u_*` undo header pointers,
+/// `b_maphash`/`b_first_abbr` mapblock_T pointers, `terminal`,
+/// `additional_data`, `b_vars`) stay raw pointers, matching this crate's
+/// established convention (see `marktree.rs`'s module docs) rather than
+/// inventing an owning-container redesign the original doesn't have.
+pub struct FileBuffer {
+    /// unique id for the buffer (buffer number). The original also names
+    /// this field `b_fnum` via `#define b_fnum handle`; Rust has no field
+    /// alias mechanism, so callers use `handle` directly (a same-named
+    /// accessor method can be added if a real translated caller needs the
+    /// `b_fnum` spelling specifically).
+    pub handle: HandleT,
+
+    /// associated memline (also contains line count)
+    pub b_ml: MemlineT,
+
+    /// links in list of buffers
+    pub b_next: *mut FileBuffer,
+    pub b_prev: *mut FileBuffer,
+
+    /// nr of windows open on this buffer
+    pub b_nwindows: i32,
+
+    /// various `BF_*` flags (see [`b_flags`])
+    pub b_flags: i32,
+    /// Buffer is being closed or referenced, don't let autocommands wipe
+    /// it out.
+    pub b_locked: i32,
+    /// Buffer is being closed, don't allow opening it in more windows.
+    pub b_locked_split: i32,
+    /// Non-zero when the buffer can't be changed. Used for FileChangedRO.
+    pub b_ro_locked: i32,
+
+    /// full path file name, allocated (`NULL` for no name).
+    pub b_ffname: Option<Vec<u8>>,
+    /// short file name, allocated, may be equal to `b_ffname`.
+    pub b_sfname: Option<Vec<u8>>,
+    /// current file name: in the original, points to `b_ffname` or
+    /// `b_sfname` (an alias, not a separate allocation); modeled here as
+    /// its own owned copy for now since the aliasing is only meaningful
+    /// once the code that sets these (`buffer.c`, not yet translated)
+    /// exists to establish exactly when each alias applies.
+    pub b_fname: Option<Vec<u8>>,
+
+    pub file_id_valid: bool,
+    pub file_id: FileID,
+
+    /// `'modified'`: Set to true if something in the file has been changed
+    /// and not written out.
+    pub b_changed: i32,
+
+    /// Change-identifier incremented for each change, including undo.
+    /// This is a dict item used to store `b:changedtick`.
+    pub changedtick_di: ChangedtickDictItem,
+
+    /// `b:changedtick` when `TextChanged` was last triggered.
+    pub b_last_changedtick: VarnumberT,
+    /// `b:changedtick` for `TextChangedI`/`TextChangedT`.
+    pub b_last_changedtick_i: VarnumberT,
+    /// `b:changedtick` for `TextChangedP`.
+    pub b_last_changedtick_pum: VarnumberT,
+
+    /// Set to true if we are in the middle of saving the buffer.
+    pub b_saving: bool,
+
+    // Changes to a buffer require updating of the display. To minimize
+    // the work, remember changes made and update everything at once.
+    /// true when there are changes since the last time the display was
+    /// updated
+    pub b_mod_set: bool,
+    /// topmost lnum that was changed
+    pub b_mod_top: LinenrT,
+    /// lnum below last changed line, AFTER the change
+    pub b_mod_bot: LinenrT,
+    /// number of extra buffer lines inserted; negative when lines were
+    /// deleted
+    pub b_mod_xlines: LinenrT,
+    /// list of last used info for each window (`kvec_t(WinInfo *)`)
+    pub b_wininfo: Vec<*mut WinInfo>,
+    /// last display tick syntax was updated
+    pub b_mod_tick_syn: DisptickT,
+    /// last display tick decoration providers were invoked
+    pub b_mod_tick_decor: DisptickT,
+
+    /// last change time of original file
+    pub b_mtime: i64,
+    /// nanoseconds of last change time
+    pub b_mtime_ns: i64,
+    /// last change time when reading
+    pub b_mtime_read: i64,
+    /// nanoseconds of last read time
+    pub b_mtime_read_ns: i64,
+    /// size of original file in bytes
+    pub b_orig_size: u64,
+    /// mode of original file
+    pub b_orig_mode: i32,
+    /// time when the buffer was last used; used for viminfo
+    pub b_last_used: Timestamp,
+
+    /// current named marks (mark.c)
+    pub b_namedm: [FmarkT; NMARKS as usize],
+
+    // These variables are set when Visual.active becomes false.
+    pub b_visual: VisualinfoT,
+    /// `b_visual.vi_mode` for `visualmode()`
+    pub b_visual_mode_eval: i32,
+
+    /// cursor position when last unloading this buffer
+    pub b_last_cursor: FmarkT,
+    /// where Insert mode was left
+    pub b_last_insert: FmarkT,
+    /// position of last change: `'.` mark
+    pub b_last_change: FmarkT,
+
+    // The changelist contains old change positions.
+    pub b_changelist: [FmarkT; JUMPLISTSIZE as usize],
+    /// number of active entries
+    pub b_changelistlen: i32,
+    /// set by `u_savecommon()`
+    pub b_new_change: bool,
+
+    /// Character table, only used in charset.c for `'iskeyword'`: bitset
+    /// with `4*64=256` bits, 1 bit per character 0-255.
+    pub b_chartab: [u64; 4],
+
+    /// Table used for mappings local to a buffer.
+    pub b_maphash: [*mut MapblockT; MAX_MAPHASH as usize],
+    /// First abbreviation local to a buffer.
+    pub b_first_abbr: *mut MapblockT,
+    /// User commands local to the buffer.
+    pub b_ucmds: GarrayT,
+    /// start and end of an operator, also used for `'[` and `']`
+    pub b_op_start: PosT,
+    /// used for `Ins.start_orig`
+    pub b_op_start_orig: PosT,
+    pub b_op_end: PosT,
+
+    /// Have we read ShaDa marks yet?
+    pub b_marks_read: bool,
+
+    /// did `":set modified"`
+    pub b_modified_was_set: bool,
+    /// `FileType` event found
+    pub b_did_filetype: bool,
+    /// value for `did_filetype` when starting to execute autocommands
+    pub b_keep_filetype: bool,
+
+    /// Set by the apply_autocmds_group function if the given event is
+    /// equal to `EVENT_FILETYPE`. Used by `readfile()` to determine
+    /// whether read autocommands triggered `EVENT_FILETYPE`.
+    ///
+    /// Relying on this value requires one to reset it prior calling
+    /// `apply_autocmds_group()`.
+    pub b_au_did_filetype: bool,
+
+    // The following are only used in undo.c.
+    /// pointer to oldest header
+    pub b_u_oldhead: *mut UHeader,
+    /// pointer to newest header; may not be valid if `b_u_curhead` is not
+    /// `NULL`
+    pub b_u_newhead: *mut UHeader,
+    /// pointer to current header
+    pub b_u_curhead: *mut UHeader,
+    /// current number of headers
+    pub b_u_numhead: i32,
+    /// entry lists are synced
+    pub b_u_synced: bool,
+    /// last used undo sequence number
+    pub b_u_seq_last: i32,
+    /// counter for last file write
+    pub b_u_save_nr_last: i32,
+    /// `uh_seq` of header below which we are now
+    pub b_u_seq_cur: i32,
+    /// `uh_time` of header below which we are now
+    pub b_u_time_cur: Timestamp,
+    /// file write nr after which we are now
+    pub b_u_save_nr_cur: i32,
+
+    // Variables for the "U" command in undo.c.
+    /// saved line for "U" command
+    pub b_u_line_ptr: Option<Vec<u8>>,
+    /// line number of line in `u_line`
+    pub b_u_line_lnum: LinenrT,
+    /// optional column number
+    pub b_u_line_colnr: ColnrT,
+
+    /// `^N`/`^P` have scanned this buffer
+    pub b_scanned: bool,
+
+    // Flags for use of ":lmap" and IM control.
+    /// input mode for insert
+    pub b_p_iminsert: OptInt,
+    /// input mode for search
+    pub b_p_imsearch: OptInt,
+
+    /// using "lmap" mappings (see [`KEYMAP_INIT`]/[`KEYMAP_LOADED`])
+    pub b_kmap_state: i16,
+    /// the keymap table
+    pub b_kmap_ga: GarrayT,
+
+    // Options local to a buffer. They are here because their value
+    // depends on the type of file or contents of the file being edited.
+    /// set when options initialized
+    pub b_p_initialized: bool,
+
+    /// SCTXs for buffer-local options (`sctx_T b_p_script_ctx[kBufOptCount]`
+    /// in the original). Same `Vec`-stands-in-for-codegen-sized-array
+    /// reasoning as `WinoptT.wo_script_ctx` (`kBufOptCount` is a
+    /// codegen-derived constant not available without running
+    /// `src/gen/*.lua`, flagged and deferred since phase 1).
+    pub b_p_script_ctx: Vec<SctxT>,
+
+    /// `'autocomplete'`
+    pub b_p_ac: i32,
+    /// `'autoindent'`
+    pub b_p_ai: i32,
+    /// `b_p_ai` saved for paste mode
+    pub b_p_ai_nopaste: i32,
+    /// `'backupcopy'`
+    pub b_p_bkc: Option<Vec<u8>>,
+    /// flags for `'backupcopy'`
+    pub b_bkc_flags: u32,
+    /// `'copyindent'`
+    pub b_p_ci: i32,
+    /// `'binary'`
+    pub b_p_bin: i32,
+    /// `'bomb'`
+    pub b_p_bomb: i32,
+    /// `'bufhidden'`
+    pub b_p_bh: Option<Vec<u8>>,
+    /// `'buftype'`
+    pub b_p_bt: Option<Vec<u8>>,
+    /// `'busy'`
+    pub b_p_busy: OptInt,
+    /// quickfix exists for buffer
+    pub b_has_qf_entry: i32,
+    /// `'buflisted'`
+    pub b_p_bl: i32,
+    /// `'channel'`
+    pub b_p_channel: OptInt,
+    /// `'cindent'`
+    pub b_p_cin: i32,
+    /// `'cinoptions'`
+    pub b_p_cino: Option<Vec<u8>>,
+    /// `'cinkeys'`
+    pub b_p_cink: Option<Vec<u8>>,
+    /// `'cinwords'`
+    pub b_p_cinw: Option<Vec<u8>>,
+    /// `'cinscopedecls'`
+    pub b_p_cinsd: Option<Vec<u8>>,
+    /// `'comments'`
+    pub b_p_com: Option<Vec<u8>>,
+    /// `'commentstring'`
+    pub b_p_cms: Option<Vec<u8>>,
+    /// `'completeopt'` local value
+    pub b_p_cot: Option<Vec<u8>>,
+    /// flags for `'completeopt'`
+    pub b_cot_flags: u32,
+    /// `'complete'`
+    pub b_p_cpt: Option<Vec<u8>>,
+    /// `'completeslash'` (Windows-only: `#ifdef BACKSLASH_IN_FILENAME` in
+    /// the original, which is defined exactly on Windows builds - see
+    /// `os/win_defs.rs`/`os/os_defs.rs`'s existing `#[cfg(windows)]`
+    /// precedent for the same macro).
+    #[cfg(windows)]
+    pub b_p_csl: Option<Vec<u8>>,
+    /// `F{func}` in `'complete'` callback (`Callback *b_p_cpt_cb` in the
+    /// original: a heap array of `b_p_cpt_count` entries - folded into a
+    /// single `Vec`, dropping the separate redundant count field, same as
+    /// `UEntry.ue_array`/`ue_size` in `undo_defs.rs`).
+    pub b_p_cpt_cb: Vec<Callback>,
+    /// `'completefunc'`
+    pub b_p_cfu: Option<Vec<u8>>,
+    /// `'completefunc'` callback
+    pub b_cfu_cb: Callback,
+    /// `'omnifunc'`
+    pub b_p_ofu: Option<Vec<u8>>,
+    /// `'omnifunc'` callback
+    pub b_ofu_cb: Callback,
+    /// `'tagfunc'` option value
+    pub b_p_tfu: Option<Vec<u8>>,
+    /// `'tagfunc'` callback
+    pub b_tfu_cb: Callback,
+    /// `'findfunc'` option value
+    pub b_p_ffu: Option<Vec<u8>>,
+    /// `'findfunc'` callback
+    pub b_ffu_cb: Callback,
+    /// `'endoffile'`
+    pub b_p_eof: i32,
+    /// `'endofline'`
+    pub b_p_eol: i32,
+    /// `'fixendofline'`
+    pub b_p_fixeol: i32,
+    /// `'expandtab'`
+    pub b_p_et: i32,
+    /// `b_p_et` saved for binary mode
+    pub b_p_et_nobin: i32,
+    /// `b_p_et` saved for paste mode
+    pub b_p_et_nopaste: i32,
+    /// `'fileencoding'`
+    pub b_p_fenc: Option<Vec<u8>>,
+    /// `'fileformat'`
+    pub b_p_ff: Option<Vec<u8>>,
+    /// `'filetype'`
+    pub b_p_ft: Option<Vec<u8>>,
+    /// `'formatoptions'`
+    pub b_p_fo: Option<Vec<u8>>,
+    /// `'formatlistpat'`
+    pub b_p_flp: Option<Vec<u8>>,
+    /// `'infercase'`
+    pub b_p_inf: i32,
+    /// `'iskeyword'`
+    pub b_p_isk: Option<Vec<u8>>,
+    /// `'define'` local value
+    pub b_p_def: Option<Vec<u8>>,
+    /// `'include'`
+    pub b_p_inc: Option<Vec<u8>>,
+    /// `'includeexpr'`
+    pub b_p_inex: Option<Vec<u8>>,
+    /// flags for `'includeexpr'`
+    pub b_p_inex_flags: u32,
+    /// `'indentexpr'`
+    pub b_p_inde: Option<Vec<u8>>,
+    /// flags for `'indentexpr'`
+    pub b_p_inde_flags: u32,
+    /// `'indentkeys'`
+    pub b_p_indk: Option<Vec<u8>>,
+    /// `'formatprg'`
+    pub b_p_fp: Option<Vec<u8>>,
+    /// `'formatexpr'`
+    pub b_p_fex: Option<Vec<u8>>,
+    /// flags for `'formatexpr'`
+    pub b_p_fex_flags: u32,
+    /// `'fsync'`
+    pub b_p_fs: i32,
+    /// `'keywordprg'`
+    pub b_p_kp: Option<Vec<u8>>,
+    /// `'lisp'`
+    pub b_p_lisp: i32,
+    /// `'lispoptions'`
+    pub b_p_lop: Option<Vec<u8>>,
+    /// `'makeencoding'`
+    pub b_p_menc: Option<Vec<u8>>,
+    /// `'matchpairs'`
+    pub b_p_mps: Option<Vec<u8>>,
+    /// `'modeline'`
+    pub b_p_ml: i32,
+    /// `b_p_ml` saved for binary mode
+    pub b_p_ml_nobin: i32,
+    /// `'modifiable'`
+    pub b_p_ma: i32,
+    /// `'nrformats'`
+    pub b_p_nf: Option<Vec<u8>>,
+    /// `'preserveindent'`
+    pub b_p_pi: i32,
+    /// `'quoteescape'`
+    pub b_p_qe: Option<Vec<u8>>,
+    /// `'readonly'`
+    pub b_p_ro: i32,
+    /// `'shiftwidth'`
+    pub b_p_sw: OptInt,
+    /// `'scrollback'`
+    pub b_p_scbk: OptInt,
+    /// `'smartindent'`
+    pub b_p_si: i32,
+    /// `'softtabstop'`
+    pub b_p_sts: OptInt,
+    /// `b_p_sts` saved for paste mode
+    pub b_p_sts_nopaste: OptInt,
+    /// `'suffixesadd'`
+    pub b_p_sua: Option<Vec<u8>>,
+    /// `'swapfile'`
+    pub b_p_swf: i32,
+    /// `'synmaxcol'`
+    pub b_p_smc: OptInt,
+    /// `'syntax'`
+    pub b_p_syn: Option<Vec<u8>>,
+    /// `'tabstop'`
+    pub b_p_ts: OptInt,
+    /// `'textwidth'`
+    pub b_p_tw: OptInt,
+    /// `b_p_tw` saved for binary mode
+    pub b_p_tw_nobin: OptInt,
+    /// `b_p_tw` saved for paste mode
+    pub b_p_tw_nopaste: OptInt,
+    /// `'wrapmargin'`
+    pub b_p_wm: OptInt,
+    /// `b_p_wm` saved for binary mode
+    pub b_p_wm_nobin: OptInt,
+    /// `b_p_wm` saved for paste mode
+    pub b_p_wm_nopaste: OptInt,
+    /// `'varsofttabstop'`
+    pub b_p_vsts: Option<Vec<u8>>,
+    /// `'varsofttabstop'` in internal format
+    pub b_p_vsts_array: Option<Vec<ColnrT>>,
+    /// `b_p_vsts` saved for paste mode
+    pub b_p_vsts_nopaste: Option<Vec<u8>>,
+    /// `'vartabstop'`
+    pub b_p_vts: Option<Vec<u8>>,
+    /// `'vartabstop'` in internal format
+    pub b_p_vts_array: Option<Vec<ColnrT>>,
+    /// `'keymap'`
+    pub b_p_keymap: Option<Vec<u8>>,
+
+    // Local values for options which are normally global.
+    /// `'grepformat'` local value
+    pub b_p_gefm: Option<Vec<u8>>,
+    /// `'grepprg'` local value
+    pub b_p_gp: Option<Vec<u8>>,
+    /// `'makeprg'` local value
+    pub b_p_mp: Option<Vec<u8>>,
+    /// `'errorformat'` local value
+    pub b_p_efm: Option<Vec<u8>>,
+    /// `'equalprg'` local value
+    pub b_p_ep: Option<Vec<u8>>,
+    /// `'path'` local value
+    pub b_p_path: Option<Vec<u8>>,
+    /// `'autoread'` local value
+    pub b_p_ar: i32,
+    /// `'tags'` local value
+    pub b_p_tags: Option<Vec<u8>>,
+    /// `'tagcase'` local value
+    pub b_p_tc: Option<Vec<u8>>,
+    /// flags for `'tagcase'`
+    pub b_tc_flags: u32,
+    /// `'dictionary'` local value
+    pub b_p_dict: Option<Vec<u8>>,
+    /// `'diffanchors'` local value
+    pub b_p_dia: Option<Vec<u8>>,
+    /// `'thesaurus'` local value
+    pub b_p_tsr: Option<Vec<u8>>,
+    /// `'thesaurusfunc'` local value
+    pub b_p_tsrfu: Option<Vec<u8>>,
+    /// `'thesaurusfunc'` callback
+    pub b_tsrfu_cb: Callback,
+    /// `'undolevels'` local value
+    pub b_p_ul: OptInt,
+    /// `'undofile'`
+    pub b_p_udf: i32,
+    /// `'lispwords'` local value
+    pub b_p_lw: Option<Vec<u8>>,
+    // end of buffer options
+
+    // Values set from b_p_cino.
+    pub b_ind_level: i32,
+    pub b_ind_open_imag: i32,
+    pub b_ind_no_brace: i32,
+    pub b_ind_first_open: i32,
+    pub b_ind_open_extra: i32,
+    pub b_ind_close_extra: i32,
+    pub b_ind_open_left_imag: i32,
+    pub b_ind_jump_label: i32,
+    pub b_ind_case: i32,
+    pub b_ind_case_code: i32,
+    pub b_ind_case_break: i32,
+    pub b_ind_param: i32,
+    pub b_ind_func_type: i32,
+    pub b_ind_comment: i32,
+    pub b_ind_in_comment: i32,
+    pub b_ind_in_comment2: i32,
+    pub b_ind_cpp_baseclass: i32,
+    pub b_ind_continuation: i32,
+    pub b_ind_unclosed: i32,
+    pub b_ind_unclosed2: i32,
+    pub b_ind_unclosed_noignore: i32,
+    pub b_ind_unclosed_wrapped: i32,
+    pub b_ind_unclosed_whiteok: i32,
+    pub b_ind_matching_paren: i32,
+    pub b_ind_paren_prev: i32,
+    pub b_ind_maxparen: i32,
+    pub b_ind_maxcomment: i32,
+    pub b_ind_scopedecl: i32,
+    pub b_ind_scopedecl_code: i32,
+    pub b_ind_java: i32,
+    pub b_ind_js: i32,
+    pub b_ind_keep_case_label: i32,
+    pub b_ind_hash_comment: i32,
+    pub b_ind_cpp_namespace: i32,
+    pub b_ind_if_for_while: i32,
+    pub b_ind_cpp_extern_c: i32,
+    pub b_ind_pragma: i32,
+
+    /// non-zero lnum when last line of next binary write should not have
+    /// an end-of-line
+    pub b_no_eol_lnum: LinenrT,
+
+    /// last line had eof (CTRL-Z) when it was read
+    pub b_start_eof: i32,
+    /// last line had eol when it was read
+    pub b_start_eol: i32,
+    /// first char of `'ff'` when edit started
+    pub b_start_ffc: i32,
+    /// `'fileencoding'` when edit started or `NULL`
+    pub b_start_fenc: Option<Vec<u8>>,
+    /// `"++bad="` argument when edit started or 0
+    pub b_bad_char: i32,
+    /// `'bomb'` when it was read
+    pub b_start_bomb: i32,
+
+    /// Variable for "b:" Dict.
+    pub b_bufvar: ScopeDictDictItem,
+    /// b: scope Dict.
+    pub b_vars: *mut DictT,
+
+    // When a buffer is created, it starts without a swap file. b_may_swap
+    // is then set to indicate that a swap file may be opened later. It is
+    // reset if a swap file could not be opened.
+    pub b_may_swap: bool,
+    /// Set to true if user has been warned on first change of a read-only
+    /// file
+    pub b_did_warn: bool,
+
+    // Two special kinds of buffers:
+    // help buffer  - used for help files, won't use a swap file.
+    // spell buffer - used for spell info, never displayed and doesn't
+    //                have a file name.
+    /// true for help file buffer (when set `b_p_bt` is "help")
+    pub b_help: bool,
+    /// True for a spell file buffer, most fields are not used!
+    pub b_spell: bool,
+
+    /// set by `prompt_setprompt()`
+    pub b_prompt_text: Option<Vec<u8>>,
+    /// set by `prompt_setcallback()`
+    pub b_prompt_callback: Callback,
+    /// set by `prompt_setinterrupt()`
+    pub b_prompt_interrupt: Callback,
+    /// `prompt_appendlines()` should start a newline
+    pub b_prompt_append_new_line: bool,
+    /// value for `restart_edit` when entering a prompt buffer window.
+    pub b_prompt_insert: i32,
+    /// Start of the editable area of a prompt buffer.
+    pub b_prompt_start: FmarkT,
+
+    /// Info related to syntax highlighting. `w_s` normally points to this,
+    /// but some windows may use a different `synblock_T`.
+    pub b_s: SynblockT,
+
+    pub b_signcols: BufSigncolsT,
+
+    /// Terminal instance associated with the buffer
+    pub terminal: *mut TerminalT,
+
+    /// Additional data from shada file if any.
+    pub additional_data: *mut crate::types_defs::AdditionalData,
+
+    /// modes where CTRL-C is mapped
+    pub b_mapped_ctrl_c: i32,
+
+    /// `MarkTree b_marktree[1]` in the original: a single-element-array
+    /// idiom for "embed by value, but the surrounding code always takes
+    /// its address" - translated as a plain by-value field, since Rust
+    /// references make the address-of-an-owned-field idiom unnecessary.
+    pub b_marktree: MarkTree,
+    /// extmark namespaces (`Map(uint32_t, uint32_t) b_extmark_ns[1]` in
+    /// the original - same single-element-array-for-by-value idiom as
+    /// `b_marktree` above).
+    pub b_extmark_ns: Map<u32, u32>,
+
+    /// Store the line count as it was before appending or inserting
+    /// lines. Used to determine a valid range before splicing marks, when
+    /// the line count has already changed.
+    pub b_prev_line_count: i32,
+
+    /// array of channel ids which have asked to receive updates for this
+    /// buffer.
+    pub update_channels: Vec<u64>,
+    /// array of lua callbacks for buffer updates.
+    pub update_callbacks: Vec<BufUpdateCallbacks>,
+
+    /// whether an update callback has requested codepoint size of deleted
+    /// regions.
+    pub update_need_codepoints: bool,
+
+    // Measurements of the deleted or replaced region since the last
+    // update event. Some consumers of buffer changes need to know the
+    // byte size (like treesitter) or the corresponding UTF-32/UTF-16 size
+    // (like LSP) of the deleted text.
+    pub deleted_bytes: usize,
+    pub deleted_bytes2: usize,
+    pub deleted_codepoints: usize,
+    pub deleted_codeunits: usize,
+
+    /// The number of times the current line has been flushed in the
+    /// memline.
+    pub flush_count: i32,
+}
+
+impl Default for FileBuffer {
+    /// A purely mechanical, structural default (every field zero/empty/
+    /// null) - **not** a translation of `buflist_new()`'s real "freshly
+    /// created buffer" initial state. That real initial state includes
+    /// e.g. copying the current global option values into every `b_p_*`
+    /// field, which needs `option.c`'s options table (phase 4, not yet
+    /// translated). Reflecting a few individually-recalled "realistic"
+    /// option defaults here (e.g. `'tabstop'`'s well-known default of 8)
+    /// while leaving the rest at 0 would misleadingly suggest more
+    /// fidelity than this impl actually has - so every field is
+    /// deliberately left at its plain zero value for now.
+    fn default() -> Self {
+        FileBuffer {
+            handle: 0,
+            b_ml: MemlineT::default(),
+            b_next: std::ptr::null_mut(),
+            b_prev: std::ptr::null_mut(),
+            b_nwindows: 0,
+            b_flags: 0,
+            b_locked: 0,
+            b_locked_split: 0,
+            b_ro_locked: 0,
+            b_ffname: None,
+            b_sfname: None,
+            b_fname: None,
+            file_id_valid: false,
+            file_id: FileID::default(),
+            b_changed: 0,
+            changedtick_di: ChangedtickDictItem::default(),
+            b_last_changedtick: 0,
+            b_last_changedtick_i: 0,
+            b_last_changedtick_pum: 0,
+            b_saving: false,
+            b_mod_set: false,
+            b_mod_top: 0,
+            b_mod_bot: 0,
+            b_mod_xlines: 0,
+            b_wininfo: Vec::new(),
+            b_mod_tick_syn: 0,
+            b_mod_tick_decor: 0,
+            b_mtime: 0,
+            b_mtime_ns: 0,
+            b_mtime_read: 0,
+            b_mtime_read_ns: 0,
+            b_orig_size: 0,
+            b_orig_mode: 0,
+            b_last_used: 0,
+            b_namedm: std::array::from_fn(|_| FmarkT::default()),
+            b_visual: VisualinfoT::default(),
+            b_visual_mode_eval: 0,
+            b_last_cursor: FmarkT::default(),
+            b_last_insert: FmarkT::default(),
+            b_last_change: FmarkT::default(),
+            b_changelist: std::array::from_fn(|_| FmarkT::default()),
+            b_changelistlen: 0,
+            b_new_change: false,
+            b_chartab: [0; 4],
+            b_maphash: [std::ptr::null_mut(); MAX_MAPHASH as usize],
+            b_first_abbr: std::ptr::null_mut(),
+            b_ucmds: GarrayT::default(),
+            b_op_start: PosT::default(),
+            b_op_start_orig: PosT::default(),
+            b_op_end: PosT::default(),
+            b_marks_read: false,
+            b_modified_was_set: false,
+            b_did_filetype: false,
+            b_keep_filetype: false,
+            b_au_did_filetype: false,
+            b_u_oldhead: std::ptr::null_mut(),
+            b_u_newhead: std::ptr::null_mut(),
+            b_u_curhead: std::ptr::null_mut(),
+            b_u_numhead: 0,
+            b_u_synced: false,
+            b_u_seq_last: 0,
+            b_u_save_nr_last: 0,
+            b_u_seq_cur: 0,
+            b_u_time_cur: 0,
+            b_u_save_nr_cur: 0,
+            b_u_line_ptr: None,
+            b_u_line_lnum: 0,
+            b_u_line_colnr: 0,
+            b_scanned: false,
+            b_p_iminsert: 0,
+            b_p_imsearch: 0,
+            b_kmap_state: 0,
+            b_kmap_ga: GarrayT::default(),
+            b_p_initialized: false,
+            b_p_script_ctx: Vec::new(),
+            b_p_ac: 0,
+            b_p_ai: 0,
+            b_p_ai_nopaste: 0,
+            b_p_bkc: None,
+            b_bkc_flags: 0,
+            b_p_ci: 0,
+            b_p_bin: 0,
+            b_p_bomb: 0,
+            b_p_bh: None,
+            b_p_bt: None,
+            b_p_busy: 0,
+            b_has_qf_entry: 0,
+            b_p_bl: 0,
+            b_p_channel: 0,
+            b_p_cin: 0,
+            b_p_cino: None,
+            b_p_cink: None,
+            b_p_cinw: None,
+            b_p_cinsd: None,
+            b_p_com: None,
+            b_p_cms: None,
+            b_p_cot: None,
+            b_cot_flags: 0,
+            b_p_cpt: None,
+            #[cfg(windows)]
+            b_p_csl: None,
+            b_p_cpt_cb: Vec::new(),
+            b_p_cfu: None,
+            b_cfu_cb: Callback::default(),
+            b_p_ofu: None,
+            b_ofu_cb: Callback::default(),
+            b_p_tfu: None,
+            b_tfu_cb: Callback::default(),
+            b_p_ffu: None,
+            b_ffu_cb: Callback::default(),
+            b_p_eof: 0,
+            b_p_eol: 0,
+            b_p_fixeol: 0,
+            b_p_et: 0,
+            b_p_et_nobin: 0,
+            b_p_et_nopaste: 0,
+            b_p_fenc: None,
+            b_p_ff: None,
+            b_p_ft: None,
+            b_p_fo: None,
+            b_p_flp: None,
+            b_p_inf: 0,
+            b_p_isk: None,
+            b_p_def: None,
+            b_p_inc: None,
+            b_p_inex: None,
+            b_p_inex_flags: 0,
+            b_p_inde: None,
+            b_p_inde_flags: 0,
+            b_p_indk: None,
+            b_p_fp: None,
+            b_p_fex: None,
+            b_p_fex_flags: 0,
+            b_p_fs: 0,
+            b_p_kp: None,
+            b_p_lisp: 0,
+            b_p_lop: None,
+            b_p_menc: None,
+            b_p_mps: None,
+            b_p_ml: 0,
+            b_p_ml_nobin: 0,
+            b_p_ma: 0,
+            b_p_nf: None,
+            b_p_pi: 0,
+            b_p_qe: None,
+            b_p_ro: 0,
+            b_p_sw: 0,
+            b_p_scbk: 0,
+            b_p_si: 0,
+            b_p_sts: 0,
+            b_p_sts_nopaste: 0,
+            b_p_sua: None,
+            b_p_swf: 0,
+            b_p_smc: 0,
+            b_p_syn: None,
+            b_p_ts: 0,
+            b_p_tw: 0,
+            b_p_tw_nobin: 0,
+            b_p_tw_nopaste: 0,
+            b_p_wm: 0,
+            b_p_wm_nobin: 0,
+            b_p_wm_nopaste: 0,
+            b_p_vsts: None,
+            b_p_vsts_array: None,
+            b_p_vsts_nopaste: None,
+            b_p_vts: None,
+            b_p_vts_array: None,
+            b_p_keymap: None,
+            b_p_gefm: None,
+            b_p_gp: None,
+            b_p_mp: None,
+            b_p_efm: None,
+            b_p_ep: None,
+            b_p_path: None,
+            b_p_ar: 0,
+            b_p_tags: None,
+            b_p_tc: None,
+            b_tc_flags: 0,
+            b_p_dict: None,
+            b_p_dia: None,
+            b_p_tsr: None,
+            b_p_tsrfu: None,
+            b_tsrfu_cb: Callback::default(),
+            b_p_ul: 0,
+            b_p_udf: 0,
+            b_p_lw: None,
+            b_ind_level: 0,
+            b_ind_open_imag: 0,
+            b_ind_no_brace: 0,
+            b_ind_first_open: 0,
+            b_ind_open_extra: 0,
+            b_ind_close_extra: 0,
+            b_ind_open_left_imag: 0,
+            b_ind_jump_label: 0,
+            b_ind_case: 0,
+            b_ind_case_code: 0,
+            b_ind_case_break: 0,
+            b_ind_param: 0,
+            b_ind_func_type: 0,
+            b_ind_comment: 0,
+            b_ind_in_comment: 0,
+            b_ind_in_comment2: 0,
+            b_ind_cpp_baseclass: 0,
+            b_ind_continuation: 0,
+            b_ind_unclosed: 0,
+            b_ind_unclosed2: 0,
+            b_ind_unclosed_noignore: 0,
+            b_ind_unclosed_wrapped: 0,
+            b_ind_unclosed_whiteok: 0,
+            b_ind_matching_paren: 0,
+            b_ind_paren_prev: 0,
+            b_ind_maxparen: 0,
+            b_ind_maxcomment: 0,
+            b_ind_scopedecl: 0,
+            b_ind_scopedecl_code: 0,
+            b_ind_java: 0,
+            b_ind_js: 0,
+            b_ind_keep_case_label: 0,
+            b_ind_hash_comment: 0,
+            b_ind_cpp_namespace: 0,
+            b_ind_if_for_while: 0,
+            b_ind_cpp_extern_c: 0,
+            b_ind_pragma: 0,
+            b_no_eol_lnum: 0,
+            b_start_eof: 0,
+            b_start_eol: 0,
+            b_start_ffc: 0,
+            b_start_fenc: None,
+            b_bad_char: 0,
+            b_start_bomb: 0,
+            b_bufvar: ScopeDictDictItem::default(),
+            b_vars: std::ptr::null_mut(),
+            b_may_swap: false,
+            b_did_warn: false,
+            b_help: false,
+            b_spell: false,
+            b_prompt_text: None,
+            b_prompt_callback: Callback::default(),
+            b_prompt_interrupt: Callback::default(),
+            b_prompt_append_new_line: false,
+            b_prompt_insert: 0,
+            b_prompt_start: FmarkT::default(),
+            b_s: SynblockT::default(),
+            b_signcols: BufSigncolsT::default(),
+            terminal: std::ptr::null_mut(),
+            additional_data: std::ptr::null_mut(),
+            b_mapped_ctrl_c: 0,
+            b_marktree: MarkTree::default(),
+            b_extmark_ns: Map::default(),
+            b_prev_line_count: 0,
+            update_channels: Vec::new(),
+            update_callbacks: Vec::new(),
+            update_need_codepoints: false,
+            deleted_bytes: 0,
+            deleted_bytes2: 0,
+            deleted_codepoints: 0,
+            deleted_codeunits: 0,
+            flush_count: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +1909,73 @@ mod tests {
             }
         }
         assert_eq!(SNAP_COUNT, 3);
+    }
+
+    #[test]
+    fn synblock_default_has_empty_hashtabs_and_zeroed_arrays() {
+        let sb = SynblockT::default();
+        assert_eq!(sb.b_keywtab.ht_used, 0);
+        assert_eq!(sb.b_keywtab_ic.ht_used, 0);
+        assert!(sb.b_spell_ismw.iter().all(|&b| !b));
+        assert!(sb.b_syn_chartab.iter().all(|&b| b == 0));
+        assert!(sb.b_syn_linecont_prog.is_null());
+    }
+
+    #[test]
+    fn buf_signcols_default_is_zeroed() {
+        let sc = BufSigncolsT::default();
+        assert_eq!(sc.max, 0);
+        assert_eq!(sc.last_max, 0);
+        assert!(sc.count.iter().all(|&c| c == 0));
+        assert!(!sc.autom);
+        assert_eq!(sc.count.len(), SIGN_SHOW_MAX as usize);
+    }
+
+    #[test]
+    fn imode_and_keymap_constants_match_c_macros() {
+        assert_eq!(B_IMODE_USE_INSERT, -1);
+        assert_eq!(B_IMODE_NONE, 0);
+        assert_eq!(B_IMODE_LMAP, 1);
+        assert_eq!(B_IMODE_LAST, 1);
+        assert_eq!(KEYMAP_INIT, 1);
+        assert_eq!(KEYMAP_LOADED, 2);
+    }
+
+    #[test]
+    fn file_buffer_default_has_null_links_and_empty_collections() {
+        let buf = FileBuffer::default();
+        assert_eq!(buf.handle, 0);
+        assert!(buf.b_next.is_null());
+        assert!(buf.b_prev.is_null());
+        assert!(buf.b_ffname.is_none());
+        assert!(!buf.file_id_valid);
+        assert_eq!(buf.file_id, crate::os::fs_defs::FileID::empty());
+        assert!(buf.b_wininfo.is_empty());
+        assert_eq!(buf.b_namedm.len(), NMARKS as usize);
+        assert_eq!(buf.b_changelist.len(), JUMPLISTSIZE as usize);
+        assert_eq!(buf.b_maphash.len(), MAX_MAPHASH as usize);
+        assert!(buf.b_maphash.iter().all(|p| p.is_null()));
+        assert!(buf.b_first_abbr.is_null());
+        assert!(buf.b_u_oldhead.is_null());
+        assert!(buf.terminal.is_null());
+        assert!(buf.additional_data.is_null());
+        assert!(buf.b_vars.is_null());
+        assert_eq!(buf.b_marktree.n_keys, 0);
+        assert_eq!(buf.b_extmark_ns.len(), 0);
+        assert!(buf.update_channels.is_empty());
+        assert!(buf.update_callbacks.is_empty());
+        assert_eq!(buf.deleted_bytes, 0);
+        assert_eq!(buf.flush_count, 0);
+    }
+
+    #[test]
+    fn file_buffer_default_callbacks_are_none() {
+        let buf = FileBuffer::default();
+        assert_eq!(buf.b_cfu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
+        assert_eq!(buf.b_ofu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
+        assert_eq!(buf.b_tfu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
+        assert_eq!(buf.b_ffu_cb.kind(), crate::eval::typval_defs::CallbackType::None);
+        assert_eq!(buf.b_prompt_callback.kind(), crate::eval::typval_defs::CallbackType::None);
+        assert!(buf.b_p_cpt_cb.is_empty());
     }
 }

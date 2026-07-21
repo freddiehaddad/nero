@@ -61,6 +61,7 @@ pub const ML_ALLOCATED: i32 = 0x10;
 /// matching this crate's established convention for not-yet-translated
 /// owning subsystems (`memfile.c`/`memline.c` themselves aren't
 /// translated yet - only their plain-data `_defs.h` type declarations).
+#[derive(Default)]
 pub struct MemlineT {
     /// number of lines in the buffer
     pub ml_line_count: LinenrT,
