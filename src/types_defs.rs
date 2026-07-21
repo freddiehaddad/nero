@@ -89,12 +89,17 @@ pub const SIGN_WIDTH: i32 = 2;
 // yet implemented:
 //   Loop        -> struct loop,        src/nvim/event/loop.h    (phase 11)
 //   regprog_T   -> struct regprog,     src/nvim/regexp_defs.h   (phase 7)
+//   regmatch_T  -> struct regmatch,    src/nvim/regexp_defs.h   (phase 7)
 //   synstate_T  -> struct syn_state,   src/nvim/syntax_defs.h   (phase 8)
 //   Terminal    -> struct terminal,    src/nvim/terminal.h      (phase 14)
 //   qf_info_T   -> struct qf_info_S,   src/nvim/quickfix.c      (phase 8)
 //   mapblock_T  -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
 //   matchitem_T -> struct matchitem,   src/nvim/buffer_defs.h   (phase 7,
 //                                      needs regmmatch_T)
+//   tabpage_T   -> struct tabpage_S,   src/nvim/buffer_defs.h   (phase 3,
+//                                      needs dict_T's real fields)
+//   ufunc_T     -> struct ufunc_S,     src/nvim/eval/userfunc.h (phase 5)
+//   AutoPatCmd  -> struct AutoPatCmd_S, src/nvim/autocmd_defs.h (phase 6)
 // (mapblock_T/qf_info_T/matchitem_T are actually forward-declared in their
 // own headers, not types_defs.h itself, unlike the others above - but this
 // crate keeps all such opaque cross-cutting placeholders here regardless
@@ -139,6 +144,31 @@ pub struct MapblockT {
 /// `src/nvim/buffer_defs.h` (phase 7: needs `regmmatch_T`, same blocker as
 /// `match_T`/`llpos_T`, which are deferred for the same reason).
 pub struct MatchitemT {
+    _private: (),
+}
+/// Placeholder for `tabpage_T` (`struct tabpage_S`) - see
+/// `src/nvim/buffer_defs.h` (phase 3: needs `dict_T`'s real fields for
+/// `tp_winvar`, the eval engine).
+pub struct TabpageT {
+    _private: (),
+}
+/// Placeholder for `ufunc_T` (`struct ufunc_S`) - see
+/// `src/nvim/eval/userfunc.h` (phase 5).
+pub struct UfuncT {
+    _private: (),
+}
+/// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see
+/// `src/nvim/autocmd_defs.h` (phase 6).
+pub struct AutoPatCmdT {
+    _private: (),
+}
+/// Placeholder for `regmatch_T` (`struct regmatch`) - see
+/// `src/nvim/regexp_defs.h` (phase 7). Derives `Default` (a trivial
+/// zero-sized value for now) since `cmdmod_T.cmod_filter_regmatch`
+/// embeds it by value, same reasoning as `ChangedtickDictItem`/
+/// `ScopeDictDictItem` in `eval/typval_defs.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RegmatchT {
     _private: (),
 }
 
