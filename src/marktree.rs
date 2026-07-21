@@ -456,6 +456,419 @@ pub unsafe fn marktree_clear(b: &mut MarkTree) {
     debug_assert_eq!(b.n_nodes, 0);
 }
 
+/// `merge_node`: merges children `p.ptr[i]` and `p.ptr[i+1]` (`x`/`y`) of
+/// `p`, along with the parent key `p.key[i]` that separated them, into a
+/// single node (`x`, grown; `y` is freed). Returns the merged node.
+///
+/// # Safety
+/// `p` must be a valid internal node with `p.ptr[i]`/`p.ptr[i+1]` valid
+/// nodes such that `x.n + 1 + y.n <= 2*T - 1` (i.e. merging them doesn't
+/// overflow a node - the original relies on both being minimally full,
+/// `T - 1` keys each, plus the one parent key, totaling exactly `2*T -
+/// 1`, the maximum).
+unsafe fn merge_node(b: &mut MarkTree, p: *mut MtNode, i: i32) -> *mut MtNode {
+    const T: i32 = crate::marktree_defs::MT_BRANCH_FACTOR as i32;
+    // SAFETY: caller guarantees `p.ptr[i]`/`p.ptr[i+1]` are valid.
+    let x = unsafe { node_child(p, i as usize) };
+    let y = unsafe { node_child(p, i as usize + 1) };
+    let mut mi = Intersection::new();
+    // SAFETY: `x`/`y` valid.
+    unsafe { intersect_merge(&mut mi, &mut (*x).intersect, &mut (*y).intersect) };
+
+    // SAFETY: `x`/`p` valid; `x.n` is a fresh (default-valued) slot.
+    let x_n = unsafe { (*x).n };
+    unsafe { (*x).key[x_n as usize] = std::mem::take(&mut (*p).key[i as usize]) };
+    unsafe { refkey(b, x, x_n as usize) };
+    if i > 0 {
+        // SAFETY: `p` valid; `i > 0`.
+        let base = unsafe { (*p).key[i as usize - 1].pos };
+        unsafe { relative(base, &mut (*x).key[x_n as usize].pos) };
+    }
+
+    // SAFETY: `x` valid.
+    let meta_inc = meta_describe_key(unsafe { &(*x).key[x_n as usize] });
+
+    // SAFETY: `x`/`y` valid; destination slots in `x` (indices `x_n+1..`)
+    // are fresh, never-yet-used slots, and `y`'s keys are being genuinely
+    // moved out (`y` is freed at the end of this function).
+    let y_n = unsafe { (*y).n };
+    for k in 0..y_n {
+        unsafe {
+            (*x).key[(x_n + 1 + k) as usize] = std::mem::take(&mut (*y).key[k as usize]);
+            refkey(b, x, (x_n + 1 + k) as usize);
+            let base = (*x).key[x_n as usize].pos;
+            unrelative(base, &mut (*x).key[(x_n + 1 + k) as usize].pos);
+        }
+    }
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } != 0 {
+        // SAFETY: `x`/`y` valid internal nodes.
+        unsafe {
+            let inner_y = (*y).inner.as_ref().expect("internal node must have `inner`");
+            let y_ptrs: Vec<*mut MtNode> = inner_y.i_ptr[..=(y_n as usize)].to_vec();
+            let y_metas: Vec<[u32; K_MT_META_COUNT]> = inner_y.i_meta[..=(y_n as usize)].to_vec();
+            let inner_x = (*x).inner.as_mut().expect("internal node must have `inner`");
+            for (offset, (&ptr, &meta)) in y_ptrs.iter().zip(y_metas.iter()).enumerate() {
+                inner_x.i_ptr[x_n as usize + 1 + offset] = ptr;
+                inner_x.i_meta[x_n as usize + 1 + offset] = meta;
+            }
+            let x_ids = (*x).intersect.clone();
+            for k in 0..=x_n {
+                for &id in &x_ids {
+                    intersect_node(&mut (*node_child(x, k as usize)).intersect, id);
+                }
+            }
+            let y_ids = (*y).intersect.clone();
+            for ky in 0..=y_n {
+                let k = x_n + ky + 1;
+                let child = node_child(x, k as usize);
+                (*child).parent = x;
+                (*child).p_idx = k as i16;
+                for &id in &y_ids {
+                    intersect_node(&mut (*child).intersect, id);
+                }
+            }
+        }
+    }
+    // SAFETY: `x` valid.
+    unsafe { (*x).n += y_n + 1 };
+    {
+        // SAFETY: `p` valid.
+        let mut meta_i = unsafe { node_meta(p, i as usize) };
+        let meta_ip1 = unsafe { node_meta(p, i as usize + 1) };
+        for m in 0..K_MT_META_COUNT {
+            // x now contains everything of y plus old p->key[i].
+            meta_i[m] += meta_ip1[m] + meta_inc[m];
+        }
+        unsafe { node_set_meta(p, i as usize, meta_i) };
+    }
+
+    // SAFETY: `p` valid; shifting out the now-removed key/child at index i/i+1.
+    let p_n = unsafe { (*p).n };
+    let shift_count = (p_n - i - 1) as usize;
+    for j in (i as usize)..(i as usize + shift_count) {
+        // SAFETY: `p` valid.
+        unsafe {
+            let moved = std::mem::take(&mut (*p).key[j + 1]);
+            (*p).key[j] = moved;
+        }
+    }
+    unsafe {
+        let inner = (*p).inner.as_mut().expect("internal node must have `inner`");
+        inner.i_ptr.copy_within((i as usize + 2)..(i as usize + 2 + shift_count), i as usize + 1);
+        inner.i_meta.copy_within((i as usize + 2)..(i as usize + 2 + shift_count), i as usize + 1);
+    }
+    for j in (i + 1)..p_n {
+        // SAFETY: `p` valid internal node.
+        let child = unsafe { node_child(p, j as usize) };
+        unsafe { (*child).p_idx = j as i16 };
+    }
+    unsafe { (*p).n -= 1 };
+    unsafe { marktree_free_node(b, y) };
+
+    // SAFETY: `x` valid; replacing its (now-exhausted) intersect set with
+    // the common part computed at the very start (`kvi_move` in the
+    // original - a plain move/replace here, no manual buffer-ownership
+    // dance needed since `Intersection` is just a `Vec`).
+    unsafe { (*x).intersect = mi };
+
+    x
+}
+
+/// `pivot_right`: steals one key from `p.ptr[i]` (`x`) and gives it to
+/// `p.ptr[i+1]` (`y`), rotating `p.key[i]` through the middle (used when
+/// `y` underflowed but its left sibling `x` has a spare key to lend).
+///
+/// `p_pos` (the absolute position of the key just before `x`, or a dummy
+/// key strictly less than any key inside `x` if `x` is the first leaf) is
+/// unused in the original's own implementation (confirmed against the
+/// upstream source - not a translation omission), kept only for signature
+/// fidelity with its caller.
+///
+/// # Safety
+/// `p` must be valid with `p.ptr[i]`/`p.ptr[i+1]` valid nodes, `x.n > T -
+/// 1` (has a spare key to give up).
+unsafe fn pivot_right(b: &mut MarkTree, p_pos: MtPos, p: *mut MtNode, i: i32) {
+    let _ = p_pos; // unused in the original too - kept for signature parity
+    // SAFETY: caller guarantees `p.ptr[i]`/`p.ptr[i+1]` are valid.
+    let x = unsafe { node_child(p, i as usize) };
+    let y = unsafe { node_child(p, i as usize + 1) };
+
+    // Shift y's keys right by one to make room at index 0 (move, not
+    // clone/copy: `y.key[]` slots being shifted own real data).
+    let y_n = unsafe { (*y).n };
+    for j in (0..y_n).rev() {
+        // SAFETY: `y` valid.
+        unsafe {
+            let moved = std::mem::take(&mut (*y).key[j as usize]);
+            (*y).key[j as usize + 1] = moved;
+        }
+    }
+    // SAFETY: `y` valid.
+    if unsafe { (*y).level } != 0 {
+        unsafe {
+            let inner = (*y).inner.as_mut().expect("internal node must have `inner`");
+            inner.i_ptr.copy_within(0..(y_n as usize + 1), 1);
+            inner.i_meta.copy_within(0..(y_n as usize + 1), 1);
+            for j in 1..=(y_n as usize + 1) {
+                (*inner.i_ptr[j]).p_idx = j as i16;
+            }
+        }
+    }
+
+    // SAFETY: `p`/`x`/`y` valid.
+    unsafe {
+        (*y).key[0] = std::mem::take(&mut (*p).key[i as usize]);
+        refkey(b, y, 0);
+        let x_n = (*x).n;
+        (*p).key[i as usize] = std::mem::take(&mut (*x).key[x_n as usize - 1]);
+        refkey(b, p, i as usize);
+    }
+
+    let meta_inc_y = meta_describe_key(unsafe { &(*y).key[0] });
+    let meta_inc_x = meta_describe_key(unsafe { &(*p).key[i as usize] });
+    {
+        let mut meta_i = unsafe { node_meta(p, i as usize) };
+        let mut meta_ip1 = unsafe { node_meta(p, i as usize + 1) };
+        for m in 0..K_MT_META_COUNT {
+            meta_ip1[m] += meta_inc_y[m];
+            meta_i[m] -= meta_inc_x[m];
+        }
+        unsafe {
+            node_set_meta(p, i as usize, meta_i);
+            node_set_meta(p, i as usize + 1, meta_ip1);
+        }
+    }
+
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } != 0 {
+        unsafe {
+            let x_n = (*x).n;
+            let moved_child = node_child(x, x_n as usize);
+            let moved_meta = node_meta(x, x_n as usize);
+            node_set_child(y, 0, moved_child);
+            node_set_meta(y, 0, moved_meta);
+            let mut meta_i = node_meta(p, i as usize);
+            let mut meta_ip1 = node_meta(p, i as usize + 1);
+            for m in 0..K_MT_META_COUNT {
+                meta_ip1[m] += moved_meta[m];
+                meta_i[m] -= moved_meta[m];
+            }
+            node_set_meta(p, i as usize, meta_i);
+            node_set_meta(p, i as usize + 1, meta_ip1);
+            (*moved_child).parent = y;
+            (*moved_child).p_idx = 0;
+        }
+    }
+    unsafe {
+        (*x).n -= 1;
+        (*y).n += 1;
+    }
+    if i > 0 {
+        // SAFETY: `p` valid; `i > 0`.
+        unsafe {
+            let base = (*p).key[i as usize - 1].pos;
+            unrelative(base, &mut (*p).key[i as usize].pos);
+        }
+    }
+    // SAFETY: `p`/`y` valid.
+    unsafe {
+        let base = (*p).key[i as usize].pos;
+        relative(base, &mut (*y).key[0].pos);
+        let y_n = (*y).n;
+        for k in 1..y_n {
+            let base = (*y).key[0].pos;
+            unrelative(base, &mut (*y).key[k as usize].pos);
+        }
+    }
+
+    // Repair intersections of x.
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } != 0 {
+        // SAFETY: `x`/`y` valid; `y.ptr[0]` was just moved from `x` above.
+        unsafe {
+            let mut d = Intersection::new();
+            let y_ptr0 = node_child(y, 0);
+            intersect_mov(&(*x).intersect, &mut (*y).intersect, &mut (*y_ptr0).intersect, &mut d);
+            if !d.is_empty() {
+                let y_n = (*y).n;
+                for yi in 1..=y_n {
+                    let child = node_child(y, yi as usize);
+                    intersect_add(&mut (*child).intersect, &d);
+                }
+            }
+            bubble_up(x);
+        }
+    } else {
+        // If the last element of x used to be an end node, check if it now
+        // covers all of x.
+        // SAFETY: `p`/`x`/`y` valid.
+        unsafe {
+            if mt_end(&(*p).key[i as usize]) {
+                let pi = pseudo_index(x, 0); // note: sloppy pseudo-index
+                let start_id = mt_lookup_key_side(&(*p).key[i as usize], false);
+                let pi_start = pseudo_index_for_id(b, start_id, true);
+                if pi_start > 0 && pi_start < pi {
+                    intersect_node(&mut (*x).intersect, start_id);
+                }
+            }
+            if mt_start(&(*y).key[0]) {
+                // No need for a check, just delete it if it was there.
+                let id = mt_lookup_key(&(*y).key[0]);
+                unintersect_node(&mut (*y).intersect, id, false);
+            }
+        }
+    }
+}
+
+/// `pivot_left`: the mirror image of [`pivot_right`] - steals one key
+/// from `p.ptr[i+1]` (`y`) and gives it to `p.ptr[i]` (`x`), rotating
+/// `p.key[i]` through the middle.
+///
+/// # Safety
+/// `p` must be valid with `p.ptr[i]`/`p.ptr[i+1]` valid nodes, `y.n > T -
+/// 1` (has a spare key to give up).
+unsafe fn pivot_left(b: &mut MarkTree, p_pos: MtPos, p: *mut MtNode, i: i32) {
+    let _ = p_pos; // unused in the original too - kept for signature parity
+    // SAFETY: caller guarantees `p.ptr[i]`/`p.ptr[i+1]` are valid.
+    let x = unsafe { node_child(p, i as usize) };
+    let y = unsafe { node_child(p, i as usize + 1) };
+
+    // Reverse from how we "always" do it, but pivot_left is just the
+    // inverse of pivot_right, so reverse it literally (per the original's
+    // own comment).
+    let y_n = unsafe { (*y).n };
+    for k in 1..y_n {
+        // SAFETY: `y` valid.
+        unsafe {
+            let base = (*y).key[0].pos;
+            relative(base, &mut (*y).key[k as usize].pos);
+        }
+    }
+    // SAFETY: `p`/`y` valid.
+    unsafe {
+        let base = (*p).key[i as usize].pos;
+        unrelative(base, &mut (*y).key[0].pos);
+    }
+    if i > 0 {
+        // SAFETY: `p` valid; `i > 0`.
+        unsafe {
+            let base = (*p).key[i as usize - 1].pos;
+            relative(base, &mut (*p).key[i as usize].pos);
+        }
+    }
+
+    // SAFETY: `p`/`x`/`y` valid.
+    unsafe {
+        let x_n = (*x).n;
+        (*x).key[x_n as usize] = std::mem::take(&mut (*p).key[i as usize]);
+        refkey(b, x, x_n as usize);
+        (*p).key[i as usize] = std::mem::take(&mut (*y).key[0]);
+        refkey(b, p, i as usize);
+    }
+
+    let meta_inc_x = meta_describe_key(unsafe { &(*x).key[(*x).n as usize] });
+    let meta_inc_y = meta_describe_key(unsafe { &(*p).key[i as usize] });
+    {
+        let mut meta_i = unsafe { node_meta(p, i as usize) };
+        let mut meta_ip1 = unsafe { node_meta(p, i as usize + 1) };
+        for m in 0..K_MT_META_COUNT {
+            meta_i[m] += meta_inc_x[m];
+            meta_ip1[m] -= meta_inc_y[m];
+        }
+        unsafe {
+            node_set_meta(p, i as usize, meta_i);
+            node_set_meta(p, i as usize + 1, meta_ip1);
+        }
+    }
+
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } != 0 {
+        unsafe {
+            let x_n = (*x).n;
+            let moved_child = node_child(y, 0);
+            let moved_meta = node_meta(y, 0);
+            node_set_child(x, x_n as usize + 1, moved_child);
+            node_set_meta(x, x_n as usize + 1, moved_meta);
+            let mut meta_i = node_meta(p, i as usize);
+            let mut meta_ip1 = node_meta(p, i as usize + 1);
+            for m in 0..K_MT_META_COUNT {
+                meta_ip1[m] -= moved_meta[m];
+                meta_i[m] += moved_meta[m];
+            }
+            node_set_meta(p, i as usize, meta_i);
+            node_set_meta(p, i as usize + 1, meta_ip1);
+            (*moved_child).parent = x;
+            (*moved_child).p_idx = x_n as i16 + 1;
+        }
+    }
+    // Shift y's keys/children left by one (removing the now-moved index 0).
+    // SAFETY: `y` valid.
+    for j in 0..(y_n - 1) {
+        unsafe {
+            let moved = std::mem::take(&mut (*y).key[j as usize + 1]);
+            (*y).key[j as usize] = moved;
+        }
+    }
+    if unsafe { (*y).level } != 0 {
+        unsafe {
+            let inner = (*y).inner.as_mut().expect("internal node must have `inner`");
+            inner.i_ptr.copy_within(1..=(y_n as usize), 0);
+            inner.i_meta.copy_within(1..=(y_n as usize), 0);
+            for j in 0..(y_n as usize) {
+                // note: last item deleted
+                (*inner.i_ptr[j]).p_idx = j as i16;
+            }
+        }
+    }
+    unsafe {
+        (*x).n += 1;
+        (*y).n -= 1;
+    }
+
+    // Repair intersections of x, y.
+    // SAFETY: `x` valid.
+    if unsafe { (*x).level } != 0 {
+        // SAFETY: `x`/`y` valid; `x.ptr[x.n-1]` (post-increment, the last
+        // slot) was just moved from `y` above.
+        unsafe {
+            let mut d = Intersection::new();
+            let x_n = (*x).n;
+            let x_last = node_child(x, x_n as usize - 1);
+            intersect_mov(&(*y).intersect, &mut (*x).intersect, &mut (*x_last).intersect, &mut d);
+            if !d.is_empty() {
+                for xi in 0..(x_n - 1) {
+                    // ptr[x.n - 1] deliberately skipped
+                    let child = node_child(x, xi as usize);
+                    intersect_add(&mut (*child).intersect, &d);
+                }
+            }
+            bubble_up(y);
+        }
+    } else {
+        // If the first element of y used to be a start node, check if it
+        // now covers all of y.
+        // SAFETY: `p`/`x`/`y` valid.
+        unsafe {
+            if mt_start(&(*p).key[i as usize]) {
+                let pi = pseudo_index(y, 0); // note: sloppy pseudo-index
+                let end_id = mt_lookup_key_side(&(*p).key[i as usize], true);
+                let pi_end = pseudo_index_for_id(b, end_id, true);
+                if pi_end > pi {
+                    let id = mt_lookup_key(&(*p).key[i as usize]);
+                    intersect_node(&mut (*y).intersect, id);
+                }
+            }
+            let x_n = (*x).n;
+            if mt_end(&(*x).key[x_n as usize - 1]) {
+                // No need for a check, just delete it if it was there.
+                let id = mt_lookup_key_side(&(*x).key[x_n as usize - 1], false);
+                unintersect_node(&mut (*x).intersect, id, false);
+            }
+        }
+    }
+}
+
 // really meta_inc[kMTMetaCount]
 
 /// `meta_describe_key_inc`: accumulates the "kind" counts contributed by a
@@ -1720,6 +2133,358 @@ pub fn marktree_intersect_pair(
     }
 }
 
+/// `marktree_del_itr`: deletes the mark the iterator currently points at,
+/// leaving `itr` valid and pointing at the key *after* the deleted one.
+/// If the deleted mark was one side of a pair, returns the lookup id of
+/// the other side (0 if it was unpaired or already orphaned).
+///
+/// The original's own "INITIATING DELETION PROTOCOL" comment (preserved
+/// on the C side) documents the six repair steps: (1) construct a valid
+/// iterator to the key to delete; (2) if it's an "internal" key, step to
+/// an adjacent leaf key to find a real (leaf-level) "auxiliary key" to
+/// delete instead; (3) delete that leaf key; (4) if step 2 applied,
+/// splice the auxiliary key up into the internal slot it vacated,
+/// adjusting relative positions/meta counts along the way; (5) repair
+/// undersized nodes by stealing from a sibling (`pivot_left`/
+/// `pivot_right`) or merging (`merge_node`), walking up as needed; (6) if
+/// the root ends up empty, replace it with its sole child (or, if the
+/// tree is now empty, invalidate the iterator).
+///
+/// @param rev should be true if we plan to iterate _backwards_ and
+/// delete stuff before this key. Most of the time this is false (the
+/// recommended strategy is to always iterate forward) - and `rev = true`
+/// is in fact unimplemented upstream (`abort()`), so it is left
+/// untranslated here too (`unimplemented!()`) rather than guessing a
+/// behavior neovim itself has never defined.
+///
+/// # Safety
+/// `itr` must be a valid iterator (`itr.is_valid()`) into `b`'s tree.
+pub unsafe fn marktree_del_itr(b: &mut MarkTree, itr: &mut MarkTreeIter, rev: bool) -> u64 {
+    const T: i32 = crate::marktree_defs::MT_BRANCH_FACTOR as i32;
+    let mut adjustment: i32 = 0;
+
+    let cur = itr.x;
+    let curi = itr.i;
+    // SAFETY: caller guarantees `itr` is valid.
+    let id = unsafe { mt_lookup_key(&(*cur).key[curi as usize]) };
+
+    // SAFETY: `itr` valid.
+    let raw = unsafe { rawkey(itr) }.clone();
+    let mut other: u64 = 0;
+    if mt_paired(&raw) && raw.flags & MT_FLAG_ORPHANED == 0 {
+        other = mt_lookup_key_side(&raw, !mt_end(&raw));
+
+        let mut other_itr = MarkTreeIter::default();
+        marktree_lookup(b, other, Some(&mut other_itr));
+        // `rawkey(other_itr).flags |= MT_FLAG_ORPHANED;` in the original -
+        // this mutating use needs direct raw-pointer field access, since
+        // this module's `rawkey()` helper returns a shared `&MtKey` (read
+        // access only).
+        // SAFETY: `other_itr` was just set to a valid position by the
+        // successful lookup above (a paired mark's other side always
+        // exists while this side isn't orphaned yet).
+        unsafe {
+            (*other_itr.x).key[other_itr.i as usize].flags |= MT_FLAG_ORPHANED;
+        }
+        // Remove intersect markers. NB: must match exactly!
+        if mt_start(&raw) {
+            let mut this_itr = *itr; // mutated copy (MarkTreeIter: Copy)
+            marktree_intersect_pair(b, id, &mut this_itr, &other_itr, true);
+        } else {
+            marktree_intersect_pair(b, other, &mut other_itr, itr, true);
+        }
+    }
+
+    // 2.
+    // SAFETY: `itr.x` valid.
+    if unsafe { (*itr.x).level } != 0 {
+        if rev {
+            unimplemented!("marktree_del_itr: rev=true is unimplemented upstream too (abort())");
+        } else {
+            // Steal previous node.
+            marktree_itr_prev(b, itr);
+            adjustment = -1;
+        }
+    }
+
+    // 3.
+    let x = itr.x;
+    // SAFETY: `x` valid.
+    debug_assert_eq!(unsafe { (*x).level }, 0);
+    let mut intkey = unsafe { (*x).key[itr.i as usize].clone() };
+
+    let mut meta_inc = meta_describe_key(&intkey);
+    // SAFETY: `x` valid.
+    let x_n = unsafe { (*x).n };
+    if x_n > itr.i + 1 {
+        for j in (itr.i as usize)..(x_n as usize - 1) {
+            unsafe {
+                let moved = std::mem::take(&mut (*x).key[j + 1]);
+                (*x).key[j] = moved;
+            }
+        }
+    }
+    unsafe { (*x).n -= 1 };
+
+    b.n_keys -= 1;
+    b.id2node.remove(&id);
+
+    // 4.
+    if adjustment == -1 {
+        let mut ilvl = itr.lvl - 1;
+        let mut lnode = x;
+        let mut start_id: u64 = 0;
+        let mut did_bubble = false;
+        if mt_end(&intkey) {
+            start_id = mt_lookup_key_side(&intkey, false);
+        }
+        loop {
+            // SAFETY: `lnode` valid.
+            let p = unsafe { (*lnode).parent };
+            assert!(ilvl >= 0, "marktree_del_itr: ilvl underflow (corrupt iterator state)");
+            let i = itr.s[ilvl as usize].i;
+            // SAFETY: `p` valid.
+            debug_assert_eq!(unsafe { node_child(p, i as usize) }, lnode);
+            if i > 0 {
+                // SAFETY: `p` valid.
+                let base = unsafe { (*p).key[i as usize - 1].pos };
+                unrelative(base, &mut intkey.pos);
+            }
+
+            if p != cur && start_id != 0 {
+                // SAFETY: `p` valid.
+                let p0 = unsafe { node_child(p, 0) };
+                if unsafe { intersection_has(&(*p0).intersect, start_id) } {
+                    // If not the first time, we need to undo the addition
+                    // in the previous step (`intersect_node` just below).
+                    let last = i32::from(lnode != x);
+                    // SAFETY: `p` valid.
+                    let p_n = unsafe { (*p).n };
+                    for k in 0..(p_n + last) {
+                        let child = unsafe { node_child(p, k as usize) };
+                        unsafe { unintersect_node(&mut (*child).intersect, start_id, true) };
+                    }
+                    unsafe { intersect_node(&mut (*p).intersect, start_id) };
+                    did_bubble = true;
+                }
+            }
+
+            {
+                // SAFETY: `p`/`lnode` valid.
+                let p_idx = unsafe { (*lnode).p_idx };
+                let mut meta_p = unsafe { node_meta(p, p_idx as usize) };
+                for m in 0..K_MT_META_COUNT {
+                    meta_p[m] -= meta_inc[m];
+                }
+                unsafe { node_set_meta(p, p_idx as usize, meta_p) };
+            }
+
+            lnode = p;
+            ilvl -= 1;
+            if lnode == cur {
+                break;
+            }
+        }
+
+        // SAFETY: `cur` valid.
+        let deleted_orig = unsafe { (*cur).key[curi as usize].clone() };
+        meta_inc = meta_describe_key(&deleted_orig);
+        unsafe { (*cur).key[curi as usize] = intkey.clone() };
+        unsafe { refkey(b, cur, curi as usize) };
+        // SAFETY: `cur` valid.
+        if unsafe { mt_end(&(*cur).key[curi as usize]) } && !did_bubble {
+            let pi = unsafe { pseudo_index(x, 0) }; // note: sloppy pseudo-index
+            let pi_start = unsafe { pseudo_index_for_id(b, start_id, true) };
+            if pi_start > 0 && pi_start < pi {
+                unsafe { intersect_node(&mut (*x).intersect, start_id) };
+            }
+        }
+
+        let mut deleted = deleted_orig;
+        relative(intkey.pos, &mut deleted.pos);
+        // SAFETY: `cur` valid internal node.
+        let mut y = unsafe { node_child(cur, curi as usize + 1) };
+        if deleted.pos.row != 0 || deleted.pos.col != 0 {
+            while !y.is_null() {
+                // SAFETY: `y` valid.
+                let y_n = unsafe { (*y).n };
+                for k in 0..y_n {
+                    unsafe { unrelative(deleted.pos, &mut (*y).key[k as usize].pos) };
+                }
+                y = if unsafe { (*y).level } != 0 { unsafe { node_child(y, 0) } } else { std::ptr::null_mut() };
+            }
+        }
+        itr.i -= 1;
+    }
+
+    let mut lnode = cur;
+    // SAFETY: `lnode` valid; walks up valid parent pointers.
+    while !unsafe { (*lnode).parent }.is_null() {
+        let parent = unsafe { (*lnode).parent };
+        let p_idx = unsafe { (*lnode).p_idx };
+        let mut meta_p = unsafe { node_meta(parent, p_idx as usize) };
+        for m in 0..K_MT_META_COUNT {
+            meta_p[m] -= meta_inc[m];
+        }
+        unsafe { node_set_meta(parent, p_idx as usize, meta_p) };
+        lnode = parent;
+    }
+    for (dst, &inc) in b.meta_root.iter_mut().zip(meta_inc.iter()) {
+        debug_assert!(*dst >= inc);
+        *dst -= inc;
+    }
+
+    // 5.
+    let mut itr_dirty = false;
+    let mut rlvl = itr.lvl - 1;
+    // `lasti`: the original's `int *lasti = &itr->i;`, later possibly
+    // repointed to `&itr->s[rlvl].i` - translated as a raw pointer for the
+    // same reason the rest of this module uses them (an intrusive,
+    // manually-tracked reference that outlives any single safe borrow's
+    // natural scope across loop iterations).
+    let mut lasti: *mut i32 = &mut itr.i;
+    let mut ppos = itr.pos;
+    let mut x = x;
+    while x != b.root {
+        debug_assert!(rlvl >= 0);
+        // SAFETY: `x` valid.
+        let p = unsafe { (*x).parent };
+        if unsafe { (*x).n } >= T - 1 {
+            // We are done: if this node is fine the rest of the tree will be.
+            break;
+        }
+        let pi = itr.s[rlvl as usize].i;
+        // SAFETY: `p` valid.
+        debug_assert_eq!(unsafe { node_child(p, pi as usize) }, x);
+        if pi > 0 {
+            // SAFETY: `p` valid.
+            let key_row = unsafe { (*p).key[pi as usize - 1].pos.row };
+            ppos.row -= key_row;
+            ppos.col = itr.s[rlvl as usize].oldcol;
+        }
+        // ppos is now the pos of p.
+
+        // SAFETY: `p` valid.
+        let left_spare = pi > 0 && unsafe { (*node_child(p, pi as usize - 1)).n } > T - 1;
+        let right_spare = pi < unsafe { (*p).n } && unsafe { (*node_child(p, pi as usize + 1)).n } > T - 1;
+        if left_spare {
+            unsafe {
+                *lasti += 1;
+            }
+            itr_dirty = true;
+            // Steal one key from the left neighbour.
+            unsafe { pivot_right(b, ppos, p, pi - 1) };
+            break;
+        } else if right_spare {
+            // Steal one key from right neighbour.
+            unsafe { pivot_left(b, ppos, p, pi) };
+            break;
+        } else if pi > 0 {
+            // SAFETY: `p` valid.
+            debug_assert_eq!(unsafe { (*node_child(p, pi as usize - 1)).n }, T - 1);
+            unsafe {
+                *lasti += T;
+            }
+            x = unsafe { merge_node(b, p, pi - 1) };
+            if std::ptr::eq(lasti, &itr.i as *const i32 as *mut i32) {
+                // TRICKY: we merged the node the iterator was on.
+                itr.x = x;
+            }
+            itr.s[rlvl as usize].i -= 1;
+            itr_dirty = true;
+        } else {
+            // SAFETY: `p` valid.
+            debug_assert!(pi < unsafe { (*p).n } && unsafe { (*node_child(p, pi as usize + 1)).n } == T - 1);
+            unsafe { merge_node(b, p, pi) };
+            // No iter adjustment needed.
+        }
+        lasti = &mut itr.s[rlvl as usize].i;
+        rlvl -= 1;
+        x = p;
+    }
+
+    // 6.
+    // SAFETY: `b.root` valid.
+    if unsafe { (*b.root).n } == 0 {
+        if itr.lvl > 0 {
+            for l in 0..(itr.lvl as usize - 1) {
+                itr.s[l] = itr.s[l + 1];
+            }
+            itr.lvl -= 1;
+        }
+        // SAFETY: `b.root` valid.
+        if unsafe { (*b.root).level } != 0 {
+            let oldroot = b.root;
+            // SAFETY: `oldroot` valid internal node.
+            b.root = unsafe { node_child(oldroot, 0) };
+            for m in 0..K_MT_META_COUNT {
+                debug_assert_eq!(b.meta_root[m], unsafe { node_meta(oldroot, 0)[m] });
+            }
+            unsafe { (*b.root).parent = std::ptr::null_mut() };
+            unsafe { marktree_free_node(b, oldroot) };
+        } else {
+            // No items, nothing for iterator to point to.
+            itr.x = std::ptr::null_mut();
+        }
+    }
+
+    if !itr.x.is_null() && itr_dirty {
+        marktree_itr_fix_pos(b, itr);
+    }
+
+    // BONUS STEP: fix the iterator, so that it points to the key afterwards.
+    // TODO(bfredl) (kept from the original): with "rev" should point before.
+    if adjustment == -1 {
+        // Tricky: we stand at the deleted space in the previous leaf node.
+        // But the inner key is now the previous key we stole, so we need
+        // to skip that one as well.
+        marktree_itr_next(b, itr);
+        marktree_itr_next(b, itr);
+    } else if !itr.x.is_null() && itr.i >= unsafe { (*itr.x).n } {
+        // We deleted the last key of a leaf node; go to the inner key after that.
+        debug_assert_eq!(unsafe { (*itr.x).level }, 0);
+        marktree_itr_next(b, itr);
+    }
+
+    other
+}
+
+/// `marktree_revise_meta`: after a key's flags have changed in a way that
+/// might alter its meta-kind contribution (e.g. toggling a decoration
+/// flag on an already-inserted key in place), recomputes the difference
+/// against `old_key` and propagates it up through every ancestor's cached
+/// meta counts (and `b.meta_root`) - avoiding a full node-by-node
+/// `meta_describe_node` recount.
+///
+/// # Safety
+/// `itr` must be a valid iterator into `b`'s tree.
+pub unsafe fn marktree_revise_meta(b: &mut MarkTree, itr: &MarkTreeIter, old_key: &MtKey) {
+    let meta_old = meta_describe_key(old_key);
+    // SAFETY: caller guarantees `itr` is valid.
+    let meta_new = meta_describe_key(unsafe { rawkey(itr) });
+
+    if meta_old == meta_new {
+        return;
+    }
+
+    let mut lnode = itr.x;
+    // SAFETY: `lnode` valid; walks up valid parent pointers.
+    while !unsafe { (*lnode).parent }.is_null() {
+        let parent = unsafe { (*lnode).parent };
+        let p_idx = unsafe { (*lnode).p_idx };
+        let mut meta_p = unsafe { node_meta(parent, p_idx as usize) };
+        for m in 0..K_MT_META_COUNT {
+            meta_p[m] = (meta_p[m] as i64 + meta_new[m] as i64 - meta_old[m] as i64) as u32;
+        }
+        unsafe { node_set_meta(parent, p_idx as usize, meta_p) };
+        lnode = parent;
+    }
+
+    for m in 0..K_MT_META_COUNT {
+        b.meta_root[m] = (b.meta_root[m] as i64 + meta_new[m] as i64 - meta_old[m] as i64) as u32;
+    }
+}
+
 /// `marktree_put_test`: convenience entry point used by the original's own
 /// unit tests, translated as a thin wrapper matching its shape - now that
 /// `marktree_put` itself is translated, this supports the paired case too
@@ -2686,6 +3451,190 @@ mod tests {
             }
         }
         assert!(found, "expected the wide pair to be marked as intersecting somewhere on the ancestor chain of a key between its start and end");
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    // --- deletion tests ---
+
+    #[test]
+    fn del_itr_removes_single_key_and_updates_bookkeeping() {
+        let mut tree = MarkTree::default();
+        for i in 0..10 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, false);
+        }
+        marktree_check(&tree);
+
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 5, 0, &mut itr));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(5, 0));
+        // SAFETY: itr is a valid, freshly-positioned iterator into `tree`.
+        let other = unsafe { marktree_del_itr(&mut tree, &mut itr, false) };
+        assert_eq!(other, 0, "unpaired mark's other-side return must be 0");
+
+        assert_eq!(tree.n_keys, 9);
+        marktree_check(&tree);
+        // The deleted key must no longer be findable.
+        assert_eq!(marktree_lookup_ns(&tree, 0, 5, false, None).pos, MtPos::new(-1, -1));
+        // The iterator must now point at the next key (row 6).
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(6, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn del_itr_deleting_last_key_leaves_iterator_invalid() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 0, 1, 0, false, -1, -1, false, false);
+        marktree_check(&tree);
+
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get(&tree, 1, 0, &mut itr));
+        // SAFETY: itr is valid.
+        unsafe { marktree_del_itr(&mut tree, &mut itr, false) };
+        assert_eq!(tree.n_keys, 0);
+        // The root is a persistent leaf, kept (empty, n=0) rather than
+        // freed/nulled when the tree becomes empty via deletion - this is
+        // the original's own real behavior (an alloc/free-churn avoidance
+        // optimization), confirmed by marktree_check_node's own invariant
+        // assert allowing `x.n == 0` specifically for the root
+        // (`assert(x->n >= (x != b->root ? T - 1 : 0));`). `root == NULL`
+        // only represents the *pristine, never-inserted-into* state.
+        assert!(!tree.root.is_null());
+        assert_eq!(tree.n_nodes, 1);
+        marktree_check(&tree);
+        assert!(itr.x.is_null());
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    /// Repeatedly deletes every key from a tree (one at a time, by
+    /// position via a fresh `marktree_itr_get` lookup each time - matching
+    /// how a real caller might delete arbitrary marks rather than only
+    /// ever consuming the tree via a single forward sweep), verifying
+    /// `marktree_check`'s full invariant set after *every single*
+    /// deletion. This exercises every rebalancing path (steal-left,
+    /// steal-right, merge-left, merge-right, root-shrink) many times over
+    /// across a real, evolving tree shape - the same style of stress test
+    /// already used for the insert/split path.
+    fn del_all_keys_stress_test(rows: &[i32]) {
+        let mut tree = MarkTree::default();
+        for (id, &row) in rows.iter().enumerate() {
+            marktree_put_test(&mut tree, 0, id as u32, row, 0, false, -1, -1, false, false);
+        }
+        assert_eq!(tree.n_keys, rows.len());
+        marktree_check(&tree);
+
+        let mut remaining = rows.len();
+        for &row in rows {
+            let mut itr = MarkTreeIter::default();
+            assert!(marktree_itr_get(&tree, row, 0, &mut itr), "row {row} should still be found before deleting it");
+            assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(row, 0));
+            // SAFETY: itr was just freshly positioned by marktree_itr_get above.
+            unsafe { marktree_del_itr(&mut tree, &mut itr, false) };
+            remaining -= 1;
+            assert_eq!(tree.n_keys, remaining);
+            marktree_check(&tree);
+        }
+        assert_eq!(tree.n_keys, 0);
+        // The root persists as a single empty leaf rather than being freed
+        // (see del_itr_deleting_last_key_leaves_iterator_invalid's comment
+        // for why) - so the correct "no leaks" check is n_nodes == 1 (that
+        // one persistent leaf), not 0.
+        assert!(!tree.root.is_null());
+        assert_eq!(tree.n_nodes, 1, "every node except the persistent empty root leaf must have been freed, no leaks");
+    }
+
+    #[test]
+    fn del_itr_stress_ascending_insert_ascending_delete() {
+        let rows: Vec<i32> = (0..300).collect();
+        del_all_keys_stress_test(&rows);
+    }
+
+    #[test]
+    fn del_itr_stress_ascending_insert_descending_delete() {
+        let rows: Vec<i32> = (0..300).rev().collect();
+        del_all_keys_stress_test(&rows);
+    }
+
+    #[test]
+    fn del_itr_stress_shuffled_insert_shuffled_delete() {
+        let rows = shuffled_range(300);
+        del_all_keys_stress_test(&rows);
+    }
+
+    #[test]
+    fn del_itr_stress_small_tree_all_orders() {
+        // Small trees exercise root-shrink and single-leaf edge cases more
+        // densely than the 300-key stress tests (which spend most of
+        // their life multi-level).
+        for n in [1, 2, 3, 5, 10, 19, 20, 21, 39, 40, 41] {
+            let ascending: Vec<i32> = (0..n).collect();
+            del_all_keys_stress_test(&ascending);
+            let descending: Vec<i32> = (0..n).rev().collect();
+            del_all_keys_stress_test(&descending);
+        }
+    }
+
+    #[test]
+    fn del_itr_paired_mark_returns_other_side_and_orphans_it() {
+        let mut tree = MarkTree::default();
+        // Some padding keys so the pair isn't trivially alone in one leaf.
+        for i in 0..30 {
+            marktree_put_test(&mut tree, 0, i as u32 + 100, i, 1, false, -1, -1, false, false);
+        }
+        marktree_put_test(&mut tree, 0, 1, 2, 0, false, 20, 0, true, false);
+        marktree_check(&tree);
+
+        let mut start_itr = MarkTreeIter::default();
+        let start = marktree_lookup_ns(&tree, 0, 1, false, Some(&mut start_itr));
+        assert_eq!(start.pos, MtPos::new(2, 0));
+        let end_id_before = mt_lookup_key(&marktree_lookup_ns(&tree, 0, 1, true, None));
+
+        // SAFETY: start_itr is a valid, freshly-positioned iterator.
+        let other = unsafe { marktree_del_itr(&mut tree, &mut start_itr, false) };
+        assert_eq!(other, end_id_before, "deleting one side of a pair must return the other side's lookup id");
+        assert_eq!(tree.n_keys, 30 + 1, "only the start key should be gone (30 padding + 1 remaining end key)");
+        marktree_check(&tree);
+
+        // The remaining (end) side must now be orphaned.
+        let end_after = marktree_lookup_ns(&tree, 0, 1, true, None);
+        assert_eq!(end_after.pos, MtPos::new(20, 0));
+        assert!(end_after.flags & MT_FLAG_ORPHANED != 0, "surviving side of a broken pair must be marked orphaned");
+
+        // Deleting the now-orphaned remaining side must not try to
+        // cross-delete anything else (other == 0, since MT_FLAG_ORPHANED
+        // short-circuits the pair-lookup branch).
+        let mut end_itr = MarkTreeIter::default();
+        marktree_lookup_ns(&tree, 0, 1, true, Some(&mut end_itr));
+        // SAFETY: end_itr is a valid, freshly-positioned iterator.
+        let other2 = unsafe { marktree_del_itr(&mut tree, &mut end_itr, false) };
+        assert_eq!(other2, 0);
+        assert_eq!(tree.n_keys, 30);
+        marktree_check(&tree);
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn del_itr_meta_root_tracks_remaining_inline_decor_count() {
+        let mut tree = MarkTree::default();
+        for i in 0..60 {
+            marktree_put_test(&mut tree, 0, i as u32, i, 0, false, -1, -1, false, i % 2 == 0);
+        }
+        marktree_check(&tree);
+        assert_eq!(tree.meta_root[MetaIndex::Inline as usize], 30);
+
+        // Delete all the even (inline-flagged) keys.
+        for i in (0..60).step_by(2) {
+            let mut itr = MarkTreeIter::default();
+            assert!(marktree_itr_get(&tree, i, 0, &mut itr));
+            // SAFETY: itr freshly positioned above.
+            unsafe { marktree_del_itr(&mut tree, &mut itr, false) };
+        }
+        marktree_check(&tree);
+        assert_eq!(tree.n_keys, 30);
+        assert_eq!(tree.meta_root[MetaIndex::Inline as usize], 0);
 
         unsafe { marktree_clear(&mut tree) };
     }
