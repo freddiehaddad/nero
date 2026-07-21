@@ -1,0 +1,20 @@
+[package]
+name = "nero"
+version = "0.1.0"
+edition = "2021"
+description = "Line-by-line Rust translation of Neovim's C source (src/nvim)."
+
+[lib]
+name = "nero"
+path = "src/lib.rs"
+
+[dependencies]
+# Bindings to libc's toupper()/tolower(), used by TOUPPER_LOC/TOLOWER_LOC
+# (src/nvim/macros_defs.h), which must respect the current C locale exactly
+# like the original.
+libc = "0.2"
+
+[features]
+# Mirrors HAVE_WORKING_LIBINTL / ENABLE_LIBINTL from src/nvim/gettext_defs.h
+# and src/nvim/CMakeLists.txt. Not implemented yet - see src/gettext_defs.rs.
+libintl = []
