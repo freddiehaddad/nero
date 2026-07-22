@@ -342,6 +342,31 @@ pub fn os_rename(path: &Path, new_path: &Path) -> i32 {
     }
 }
 
+/// Serializes tests that read or mutate the real, process-wide current
+/// working directory (`std::env::current_dir`/`set_current_dir`) -
+/// genuine OS-level global state shared by every thread in this test
+/// binary (Rust's test harness runs tests concurrently across
+/// threads), unlike a per-test temp directory. Without this, a chdir
+/// test running concurrently with a cwd-*reading* test (e.g. in
+/// `path.rs`, which may read cwd more than once within a single test)
+/// could observe the directory change mid-test, causing a rare,
+/// non-deterministic failure - confirmed to happen in practice (one
+/// `path.rs` test failed once across dozens of repeated full-suite
+/// runs before this lock was added, traced to exactly this race with
+/// `os_chdir`'s own test).
+///
+/// Acquire this for the entire body of any test that reads OR writes
+/// the real current directory - even read-only tests need it, since a
+/// concurrent writer could still invalidate an in-progress multi-read
+/// sequence. Uses `PoisonError::into_inner` so one panicking test
+/// under the lock doesn't permanently poison it for every subsequent
+/// test that needs it.
+#[cfg(test)]
+pub(crate) fn cwd_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +617,7 @@ mod tests {
 
     #[test]
     fn os_dirname_returns_current_dir_with_forward_slashes() {
+        let _guard = cwd_test_lock();
         let dir = os_dirname().expect("current dir should be readable");
         assert!(!dir.is_empty());
         assert!(!dir.contains(&b'\\'));
@@ -599,6 +625,7 @@ mod tests {
 
     #[test]
     fn os_chdir_changes_and_reports_failure_for_missing_dir() {
+        let _guard = cwd_test_lock();
         let original = std::env::current_dir().unwrap();
         let scratch = TempScratch::new("chdir");
 

@@ -654,6 +654,7 @@ mod tests {
 
     #[test]
     fn path_full_dir_name_empty_directory_returns_cwd() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let cwd = path_full_dir_name(b"").unwrap();
         let real_cwd = crate::os::fs::os_dirname().unwrap();
         assert_eq!(cwd, real_cwd);
@@ -661,6 +662,7 @@ mod tests {
 
     #[test]
     fn path_full_dir_name_resolves_existing_relative_dir() {
+        let _guard = crate::os::fs::cwd_test_lock();
         // "." always exists and is relative; path_full_dir_name should
         // resolve it to the (absolute) current directory via
         // os_realpath.
@@ -670,6 +672,7 @@ mod tests {
 
     #[test]
     fn path_to_absolute_relative_filename_joins_with_cwd() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let cwd = crate::os::fs::os_dirname().unwrap();
         let result = path_to_absolute(b"foo.txt", false).unwrap();
         let mut expected = cwd;
@@ -679,6 +682,7 @@ mod tests {
 
     #[test]
     fn path_to_absolute_relative_subdir_joins_with_cwd() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let cwd = crate::os::fs::os_dirname().unwrap();
         let result = path_to_absolute(b"sub/foo.txt", false).unwrap();
         let mut expected = cwd;
@@ -689,6 +693,7 @@ mod tests {
 
     #[test]
     fn path_to_absolute_dotdot_resolves_to_parent_of_cwd() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let cwd = std::env::current_dir().unwrap();
         let parent = cwd.parent();
         let Some(parent) = parent else {
@@ -704,6 +709,7 @@ mod tests {
 
     #[test]
     fn path_to_absolute_already_absolute_without_force_is_unchanged() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let abs = crate::os::fs::os_dirname().unwrap();
         let result = path_to_absolute(&abs, false).unwrap();
         assert_eq!(result, abs);
@@ -718,6 +724,7 @@ mod tests {
 
     #[test]
     fn vim_full_name_relative_path_succeeds_and_slash_converts() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let (result, ok) = vim_full_name(b"foo.txt", false);
         assert!(ok);
         assert!(!result.contains(&b'\\'));
@@ -731,12 +738,14 @@ mod tests {
 
     #[test]
     fn full_name_save_relative_path_gives_absolute_result() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let result = full_name_save(Some(b"foo.txt"), false).unwrap();
         assert!(path_is_absolute(&result));
     }
 
     #[test]
     fn save_abs_path_of_already_absolute_path_is_slash_converted_copy() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let abs = crate::os::fs::os_dirname().unwrap();
         let result = save_abs_path(&abs);
         assert_eq!(result, abs); // already absolute and slash-normalized
@@ -744,6 +753,7 @@ mod tests {
 
     #[test]
     fn save_abs_path_of_relative_path_resolves_against_cwd() {
+        let _guard = crate::os::fs::cwd_test_lock();
         let result = save_abs_path(b"foo.txt");
         assert!(path_is_absolute(&result));
     }
