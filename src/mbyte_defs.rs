@@ -5,15 +5,15 @@
 //! `GRAPHEME_STATE_INIT` (now that the `utf8proc` FFI dependency this
 //! type is meaningless without has actually been added), `CharInfo`
 //! (now that `mbyte.c`'s `utf_ptr2char_info` has a real caller in
-//! `strings.c`'s `mb_strup_buf`/`strcase_save`), and `kInvalidByteCells`
-//! (from `mbyte.h`, needed by `plines.c`'s `charsize_nowrap`).
+//! `strings.c`'s `mb_strup_buf`/`strcase_save`), `kInvalidByteCells`
+//! (from `mbyte.h`, needed by `plines.c`'s `charsize_nowrap`), and
+//! `StrCharInfo` (needed by `plines.c`'s `linesize_fast`).
 //!
 //! Deferred (each needs a subsystem not yet reached in this pass):
 //! - `ConvFlags`/`vimconv_T`: needs a real `iconv_t` FFI/crate decision
 //!   (`iconv_defs.rs` already notes this - the real iconv binding is a
 //!   vendored third-party dependency, not yet reached via FFI).
-//! - `StrCharInfo`/`CharBoundsOff`: not needed by any translated
-//!   caller yet.
+//! - `CharBoundsOff`: not needed by any translated caller yet.
 
 /// Maximum number of bytes in a multi-byte character. It can be one
 /// 32-bit character of up to 6 bytes, or one 16-bit character of up to
@@ -34,6 +34,24 @@ pub const MB_MAXCHAR: usize = 6;
 pub struct CharInfo {
     pub value: i32,
     pub len: usize,
+}
+
+/// A character together with its byte position in some larger buffer
+/// (`StrCharInfo`).
+///
+/// Unlike the original's raw `char *ptr` (a pointer directly into the
+/// buffer, so callers can start `utf_ptr2StrCharInfo`/`utfc_next` at
+/// any arbitrary position with no extra bookkeeping), `pos` is a byte
+/// OFFSET relative to whatever buffer the caller passes back into
+/// [`crate::mbyte::utfc_next`] alongside it - Rust has no equivalent
+/// of "a pointer that remembers which slice it came from" without a
+/// lifetime-carrying reference, and a byte offset is this crate's
+/// established substitute (matching `path.rs`'s own
+/// index-instead-of-pointer convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StrCharInfo {
+    pub pos: usize,
+    pub chr: CharInfo,
 }
 
 /// Number of display cells to use for an invalid/illegal byte

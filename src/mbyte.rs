@@ -1163,6 +1163,105 @@ pub fn utf_ptr2char_info(p: &[u8]) -> crate::mbyte_defs::CharInfo {
     crate::mbyte_defs::CharInfo { value: code_point, len }
 }
 
+/// Return information about the first character of `line` as a
+/// [`crate::mbyte_defs::StrCharInfo`] positioned at offset 0
+/// (`utf_ptr2StrCharInfo`, an inline function in the original's own
+/// header).
+///
+/// The original can be called with `ptr` pointing anywhere inside a
+/// buffer; callers here that need to start partway through a larger
+/// buffer pass a sub-slice (`&line[start..]`) instead, and account for
+/// `start` themselves when interpreting the resulting `pos` - see
+/// [`crate::mbyte_defs::StrCharInfo`]'s own doc comment for why.
+///
+/// # Panics
+/// If `line` is empty (matching the original's `FUNC_ATTR_NONNULL_ALL`).
+#[must_use]
+pub fn utf_ptr2str_char_info(line: &[u8]) -> crate::mbyte_defs::StrCharInfo {
+    crate::mbyte_defs::StrCharInfo { pos: 0, chr: utf_ptr2char_info(line) }
+}
+
+/// Return information about the next character after `cur`, given the
+/// same `line` buffer `cur.pos` is an offset into. Composing and
+/// combining characters are considered part of the current character
+/// (`utfc_next`).
+///
+/// Like [`utfc_ptr2len`], running out of `line` partway through
+/// (rather than hitting `line`'s own trailing NUL, per this crate's
+/// line-storage convention) is treated the same as hitting a byte that
+/// ends the sequence, rather than panicking - the original relies on
+/// always eventually finding a real NUL terminator.
+///
+/// # Safety
+/// Touches global grapheme-break state via [`utf_iscomposing`]
+/// (forwarded from that function's own safety doc) - though the
+/// common ASCII-fast-path below never actually reaches it.
+#[must_use]
+pub unsafe fn utfc_next(
+    line: &[u8],
+    cur: crate::mbyte_defs::StrCharInfo,
+) -> crate::mbyte_defs::StrCharInfo {
+    let next_pos = cur.pos + cur.chr.len;
+    let next_byte = line.get(next_pos).copied().unwrap_or(0);
+    if next_byte < 0x80 {
+        return crate::mbyte_defs::StrCharInfo {
+            pos: next_pos,
+            chr: crate::mbyte_defs::CharInfo { value: i32::from(next_byte), len: 1 },
+        };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { utfc_next_impl(line, cur) }
+}
+
+/// The non-ASCII-fast-path core of [`utfc_next`] (`utfc_next_impl`).
+/// Assumes the caller already handled the ASCII case.
+///
+/// `next_pos` is always in-bounds and `>= 0x80` on every entry into
+/// the loop below - guaranteed by construction, not just assumed: the
+/// only caller ([`utfc_next`]) only reaches this function when its own
+/// bounds-checked read of `line[next_pos]` was `Some(byte >= 0x80)`,
+/// and the loop's own bottom re-establishes the same guarantee for
+/// each subsequent iteration before looping back (mirroring the
+/// original's own reliance on always eventually finding a real NUL
+/// terminator in a well-formed buffer).
+///
+/// # Safety
+/// Same as [`utfc_next`].
+unsafe fn utfc_next_impl(
+    line: &[u8],
+    cur: crate::mbyte_defs::StrCharInfo,
+) -> crate::mbyte_defs::StrCharInfo {
+    let mut prev_code = cur.chr.value;
+    let mut next_pos = cur.pos + cur.chr.len;
+    debug_assert!(line[next_pos] >= 0x80);
+    let mut state = crate::mbyte_defs::GRAPHEME_STATE_INIT;
+
+    loop {
+        let next_len = usize::from(UTF8LEN_TAB[usize::from(line[next_pos])]);
+        let next_code = utf_ptr2char_info_impl(&line[next_pos..], next_len);
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { utf_iscomposing(prev_code, next_code, &mut state) } {
+            return crate::mbyte_defs::StrCharInfo {
+                pos: next_pos,
+                chr: crate::mbyte_defs::CharInfo {
+                    value: next_code,
+                    len: if next_code < 0 { 1 } else { next_len },
+                },
+            };
+        }
+
+        prev_code = next_code;
+        next_pos += next_len;
+        let next_byte = line.get(next_pos).copied().unwrap_or(0);
+        if next_byte < 0x80 {
+            return crate::mbyte_defs::StrCharInfo {
+                pos: next_pos,
+                chr: crate::mbyte_defs::CharInfo { value: i32::from(next_byte), len: 1 },
+            };
+        }
+    }
+}
+
 /// `true` if boundclass `bc` always starts a new cluster regardless of
 /// what's before. False negatives are allowed (perf cost, not
 /// correctness) (`always_break`, `static` in the original - kept
@@ -1455,6 +1554,70 @@ mod tests {
         let info = utf_ptr2char_info(&[0xC2, b'A']);
         assert!(info.value < 0);
         assert_eq!(info.len, 1);
+    }
+
+    #[test]
+    fn utf_ptr2str_char_info_starts_at_offset_zero() {
+        let ci = utf_ptr2str_char_info(b"abc");
+        assert_eq!(ci.pos, 0);
+        assert_eq!(ci.chr.value, i32::from(b'a'));
+        assert_eq!(ci.chr.len, 1);
+    }
+
+    #[test]
+    fn utfc_next_walks_plain_ascii_one_byte_at_a_time() {
+        let line = b"abc";
+        let ci0 = utf_ptr2str_char_info(line);
+        let ci1 = unsafe { utfc_next(line, ci0) };
+        assert_eq!(ci1.pos, 1);
+        assert_eq!(ci1.chr.value, i32::from(b'b'));
+        let ci2 = unsafe { utfc_next(line, ci1) };
+        assert_eq!(ci2.pos, 2);
+        assert_eq!(ci2.chr.value, i32::from(b'c'));
+    }
+
+    #[test]
+    fn utfc_next_advances_past_a_multibyte_character() {
+        // "日" is 3 bytes (0x65E5), followed by ASCII 'A'.
+        let line = "日A".as_bytes();
+        let ci0 = utf_ptr2str_char_info(line);
+        assert_eq!(ci0.chr.value, 0x65E5);
+        assert_eq!(ci0.chr.len, 3);
+        let ci1 = unsafe { utfc_next(line, ci0) };
+        assert_eq!(ci1.pos, 3);
+        assert_eq!(ci1.chr.value, i32::from(b'A'));
+    }
+
+    #[test]
+    fn utfc_next_skips_a_composing_combining_mark() {
+        // "e" + COMBINING ACUTE ACCENT (U+0301, 2 bytes: 0xCC 0x81) + "f".
+        // utfc_next treats the combining mark as part of the CURRENT
+        // character, so advancing past "e" lands directly on "f" (byte
+        // offset 3 = 1 ('e') + 2 (combining mark)), never stopping on
+        // the combining mark itself. Verified against the real
+        // utf8proc-backed behavior via a throwaway scratch probe before
+        // writing this assertion.
+        let line = "e\u{0301}f".as_bytes();
+        let ci0 = utf_ptr2str_char_info(line);
+        assert_eq!(ci0.pos, 0);
+        assert_eq!(ci0.chr.value, i32::from(b'e'));
+        let ci1 = unsafe { utfc_next(line, ci0) };
+        assert_eq!(ci1.pos, 3);
+        assert_eq!(ci1.chr.value, i32::from(b'f'));
+    }
+
+    #[test]
+    fn utfc_next_past_the_end_of_a_nul_terminated_line_reads_the_nul() {
+        // Matches this crate's line-storage convention (a "line" byte
+        // slice includes its own trailing NUL) - advancing off the end
+        // reads that NUL, exactly like the original's own reliance on a
+        // real NUL terminator (not a special "out of bounds" case).
+        let line = b"a\0"; // 1-byte line, NUL-terminated per convention
+        let ci0 = utf_ptr2str_char_info(line);
+        let ci1 = unsafe { utfc_next(line, ci0) };
+        assert_eq!(ci1.pos, 1);
+        assert_eq!(ci1.chr.value, 0);
+        assert_eq!(ci1.chr.len, 1);
     }
 
     #[test]
