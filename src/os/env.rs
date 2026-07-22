@@ -10,7 +10,12 @@
 //! rather than waiting on the still-open libuv FFI-vs-Rust-runtime
 //! decision (phase 11). Also `os_homedir`/`init_homedir` (+ its own
 //! `os_uv_homedir` file-static, only partially implemented - see its
-//! own doc comment).
+//! own doc comment), and `os_get_hostname` (hand-written Win32 FFI on
+//! Windows/`libc::uname` on Unix - same "small, self-contained OS
+//! wrapper" treatment as `os/proc.c`'s `os_proc_running` and
+//! `os/users.c`'s `os_get_username`; Unix-only code additionally
+//! cross-checked via `cargo check --target x86_64-unknown-linux-gnu`,
+//! since this crate's dev machine is Windows-only).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `os_getenv_buf`/`os_getenv_noalloc`: write into `NameBuff`
@@ -20,8 +25,8 @@
 //! - `os_free_fullenv`/`os_getenvname_at_index`: need libuv's
 //!   `uv_os_environ`/raw platform `environ`/`GetEnvironmentStringsW`
 //!   enumeration API, not just a single-variable get/set.
-//! - `os_hint_priority`/`os_get_hostname`: platform process/host APIs
-//!   not yet decided (would need raw libc/Win32 FFI).
+//! - `os_hint_priority`: platform-specific process scheduling-priority
+//!   hints (`setpriority`/`task_policy_set`), no real caller yet.
 //! - `free_homedir`: `#ifdef EXITFREE`-only (debug/leak-detection
 //!   build flag with no equivalent concept in this crate, same
 //!   reasoning as other `EXITFREE`-gated functions elsewhere); also
@@ -149,6 +154,80 @@ pub unsafe fn os_unsetenv(name: &[u8]) -> i32 {
 #[must_use]
 pub fn os_get_pid() -> i64 {
     std::process::id() as i64
+}
+
+/// Gets the hostname of the current machine (`os_get_hostname`).
+///
+/// Returns an empty `Vec` on failure, matching the original's "leaves
+/// the output buffer as an empty string" behavior on error (`uname()`
+/// failing on Unix, or `GetComputerNameW` failing on Windows) - never
+/// a hard failure indicator, since callers (e.g. `memline.c`'s
+/// `ml_open`) just use whatever comes back, truncated or empty, rather
+/// than checking a separate status code.
+#[must_use]
+pub fn os_get_hostname() -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        os_get_hostname_unix()
+    }
+    #[cfg(windows)]
+    {
+        os_get_hostname_windows()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
+}
+
+/// Unix implementation of [`os_get_hostname`]: `uname()`'s `nodename`
+/// field (matches the original's own `HAVE_SYS_UTSNAME_H` branch
+/// exactly - not `gethostname()`, a different, simpler POSIX call the
+/// original doesn't use here).
+#[cfg(unix)]
+fn os_get_hostname_unix() -> Vec<u8> {
+    // SAFETY: `buf` is a plain-old-data struct the syscall fills in;
+    // `uname` has no other preconditions.
+    let mut buf: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: buf is a valid, correctly-sized out-parameter.
+    let ret = unsafe { libc::uname(&mut buf) };
+    if ret < 0 {
+        return Vec::new();
+    }
+    // SAFETY: uname() succeeded, so nodename is a valid
+    // NUL-terminated C string.
+    unsafe { std::ffi::CStr::from_ptr(buf.nodename.as_ptr()) }
+        .to_bytes()
+        .to_vec()
+}
+
+/// Windows implementation of [`os_get_hostname`]: `GetComputerNameW`,
+/// hand-written Win32 FFI (no new crate dependency, matching this
+/// crate's existing `os/proc.rs` precedent) plus Rust's own
+/// `String::from_utf16_lossy` instead of the original's manual
+/// `utf16_to_utf8` conversion helper (not itself translated - Rust's
+/// std already covers this natively).
+#[cfg(windows)]
+fn os_get_hostname_windows() -> Vec<u8> {
+    // Real Win32 constant (`winbase.h`): the NetBIOS computer-name
+    // length limit, verified against Microsoft's own documentation.
+    const MAX_COMPUTERNAME_LENGTH: usize = 15;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetComputerNameW(lp_buffer: *mut u16, n_size: *mut u32) -> i32;
+    }
+
+    let mut buf = [0u16; MAX_COMPUTERNAME_LENGTH + 1];
+    let mut size = buf.len() as u32;
+    // SAFETY: buf/size describe a valid, correctly-sized mutable
+    // buffer and its capacity (as GetComputerNameW's contract
+    // requires); both live for the duration of this call.
+    let ok = unsafe { GetComputerNameW(buf.as_mut_ptr(), &mut size) };
+    if ok == 0 {
+        return Vec::new();
+    }
+    String::from_utf16_lossy(&buf[..size as usize]).into_bytes()
 }
 
 /// The "real", resolved user home directory, set by [`init_homedir`]
@@ -510,5 +589,20 @@ mod tests {
         env_init();
         let expected = os_env_exists(b"NVIM_TEST", false);
         assert_eq!(unsafe { *NVIM_TESTING.get_mut() }, expected);
+    }
+
+    #[test]
+    fn os_get_hostname_returns_a_nonempty_name_on_a_real_machine() {
+        // Any real, correctly configured machine (Unix or Windows)
+        // should have a resolvable hostname - this doesn't assert a
+        // specific value (machine-dependent), just that the happy
+        // path produces something.
+        let name = os_get_hostname();
+        assert!(!name.is_empty());
+        // Must be valid UTF-8 (uname's nodename is whatever the OS
+        // reports, but on Windows this is always guaranteed by
+        // from_utf16_lossy; on Unix, real hostnames are ASCII/UTF-8 in
+        // virtually every real deployment).
+        assert!(std::str::from_utf8(&name).is_ok());
     }
 }

@@ -123,6 +123,14 @@ pub fn path_skip_sep(path: &[u8], colon: bool) -> usize {
 /// (`get_past_head`). Unix: after `"/"`; Windows: after `"c:\"`. If there is
 /// no head, returns `0`.
 pub fn get_past_head(path: &[u8]) -> usize {
+    // `i` is only ever mutated inside the `#[cfg(windows)]` block
+    // below; on other platforms that block is compiled out entirely,
+    // which would otherwise make plain rustc/clippy flag `mut` as
+    // unused there - suppressed since it's a real, needed `mut` on
+    // Windows, not a genuine bug (verified via cross-compiling this
+    // crate for `x86_64-unknown-linux-gnu`, since this Windows dev
+    // machine can't otherwise catch non-Windows-only lints).
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut i = 0;
     #[cfg(windows)]
     {

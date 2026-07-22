@@ -448,12 +448,17 @@ mod tests {
         let scratch = TempScratch::new("open_creat_excl");
         let path = scratch.path.join("new.txt");
 
-        let mut file = os_open(
-            &path,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-            libc::S_IREAD | libc::S_IWRITE,
-        )
-        .expect("new file should be creatable");
+        // S_IREAD/S_IWRITE's type varies by platform in the libc crate
+        // (i32 on Windows, u32 on Linux); `as i32` unifies them for
+        // this always-small, always-positive value. clippy flags this
+        // as redundant on whichever single target it happens to check
+        // (both Windows and Linux already use i32) - allowed
+        // explicitly since it's still required for portability to any
+        // Unix libc where these are u32.
+        #[allow(clippy::unnecessary_cast)]
+        let mode = (libc::S_IREAD | libc::S_IWRITE) as i32;
+        let mut file = os_open(&path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode)
+            .expect("new file should be creatable");
         std::io::Write::write_all(&mut file, b"data").unwrap();
         drop(file);
 
@@ -466,15 +471,12 @@ mod tests {
         let path = scratch.path.join("existing.txt");
         std::fs::write(&path, b"pre-existing").unwrap();
 
+        #[allow(clippy::unnecessary_cast)]
+        let mode = (libc::S_IREAD | libc::S_IWRITE) as i32;
         // O_EXCL must refuse to open/create when something is already
         // there - the exact "symlink attack" protection mf_open_file
         // relies on (see os_open's own doc comment).
-        assert!(os_open(
-            &path,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-            libc::S_IREAD | libc::S_IWRITE
-        )
-        .is_none());
+        assert!(os_open(&path, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode).is_none());
         // The pre-existing content must be untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"pre-existing");
     }

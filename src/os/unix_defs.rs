@@ -4,9 +4,9 @@
 pub const TEMP_DIR_NAMES: &[&str] = &["$TMPDIR", "/tmp", ".", "~"];
 pub const TEMP_FILE_PATH_MAXLEN: i32 = 256;
 
-/// `HAVE_ACL (HAVE_POSIX_ACL || HAVE_SOLARIS_ACL)` - deferred: depends on
-/// `auto/config.h` feature detection (build-system probing), not yet
-/// translated.
+// `HAVE_ACL (HAVE_POSIX_ACL || HAVE_SOLARIS_ACL)` - deferred: depends on
+// `auto/config.h` feature detection (build-system probing), not yet
+// translated.
 // pub const HAVE_ACL: bool = ...;
 
 /// Special wildcards that need to be handled by the shell.

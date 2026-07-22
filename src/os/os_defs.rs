@@ -12,6 +12,19 @@
 //! already uses a 64-bit offset (`i64`) uniformly on every platform Rust
 //! supports; C's split between 32-bit and 64-bit file APIs doesn't exist
 //! here.
+//!
+//! This crate's default/CI-verified target is Windows (this dev
+//! machine); Unix-only code here is additionally cross-checked via
+//! `cargo check --target x86_64-unknown-linux-gnu` (no native Unix
+//! machine available). Several `as i32`/`as u32` casts below are
+//! genuinely redundant specifically on that Linux target (`clippy`
+//! flags them there) because `libc`'s `NAME_MAX`/`PATH_MAX`/`S_IFMT`-
+//! family constants already happen to be that exact type on Linux -
+//! but their type isn't guaranteed to be identical across every other
+//! Unix `libc` supports (macOS, the BSDs), so the explicit casts are
+//! kept intentionally for portability beyond the one Unix flavor this
+//! crate can actually cross-check, rather than chasing a single
+//! target's clippy output.
 
 #[cfg(windows)]
 pub use crate::os::win_defs::*;
@@ -23,6 +36,19 @@ pub use crate::os::unix_defs::*;
 pub const BACKSLASH_IN_FILENAME_BOOL: bool = true;
 #[cfg(not(windows))]
 pub const BACKSLASH_IN_FILENAME_BOOL: bool = false;
+
+/// `NAME_MAX`. On Unix, the original expects this already defined by
+/// the system's own `<limits.h>` (transitively included via
+/// `<sys/stat.h>`/`<stdlib.h>`), falling back to `_XOPEN_NAME_MAX`
+/// only on the rare system that lacks it - a fallback that virtually
+/// never fires on any real glibc/musl/BSD/macOS libc, all of which
+/// define `NAME_MAX` directly. `libc::NAME_MAX` already reflects
+/// whatever the real system defines, so it's used directly here
+/// rather than replicating that rarely-hit fallback. (Windows'
+/// `NAME_MAX` is instead its own direct definition, `_MAX_PATH`,
+/// already provided by the `win_defs::*` glob import above.)
+#[cfg(unix)]
+pub const NAME_MAX: i32 = libc::NAME_MAX as i32;
 
 /// `BASENAMELEN` (`NAME_MAX - 5`)
 pub const BASENAMELEN: i32 = NAME_MAX - 5;

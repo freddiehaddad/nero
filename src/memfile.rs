@@ -227,13 +227,20 @@ fn mf_do_open(mfp: &mut MemfileT, fname: Vec<u8>, flags: i32) -> bool {
         // try to open the file
         let flags = flags | crate::os::fs::O_NOFOLLOW;
         mfp.mf_flags = flags;
-        mfp.mf_fd = fname_str.and_then(|s| {
-            crate::os::fs::os_open(
-                std::path::Path::new(s),
-                flags,
-                libc::S_IREAD | libc::S_IWRITE,
-            )
-        });
+        // S_IREAD/S_IWRITE's type varies by platform in the libc crate
+        // (i32 on Windows, u32 on Linux) even though the original's
+        // own `os_open`'s `mode` parameter is plainly `int` on every
+        // platform - `as i32` unifies them (both values are tiny and
+        // always positive, so this is always lossless). clippy only
+        // checks one target at a time, so it flags this cast as
+        // "unnecessary" on whichever platform happens to already use
+        // i32 (verified: both Windows and, surprisingly, Linux do) -
+        // allowed explicitly since the cast is still required for
+        // portability to any Unix libc where S_IREAD/S_IWRITE are u32.
+        #[allow(clippy::unnecessary_cast)]
+        let mode = (libc::S_IREAD | libc::S_IWRITE) as i32;
+        mfp.mf_fd =
+            fname_str.and_then(|s| crate::os::fs::os_open(std::path::Path::new(s), flags, mode));
     }
 
     // If the file cannot be opened, use memory only.

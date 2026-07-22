@@ -19,5 +19,6 @@ pub mod time;
 pub mod time_defs;
 #[cfg(unix)]
 pub mod unix_defs;
+pub mod users;
 #[cfg(windows)]
 pub mod win_defs;
