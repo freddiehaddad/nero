@@ -1,12 +1,14 @@
-//! Translated from `src/nvim/eval/typval.c` (tractable core only:
-//! `dict_T`/`dictitem_T` allocation, lookup, and insertion).
+//! Translated from `src/nvim/eval/typval.c` (tractable core: the
+//! `dict_T`/`list_T`/`blob_T` alloc/free/refcount/insertion primitives,
+//! plus `tv_copy`).
 //!
 //! `typval.c` (~4000 lines) is the core of the Vimscript value system:
 //! `typval_T`/`list_T`/`dict_T`/`blob_T` construction, (de)serialization
 //! via a shared encode-traversal abstraction, deep copying, and every
-//! built-in operation on those types. Only the foundational `dict_T`
-//! allocation/lookup/insertion primitives are translated here; see
-//! this module's own per-function deferral notes below for the rest.
+//! built-in operation on those types. Only the foundational alloc/
+//! free/refcount/insertion primitives for all three container types
+//! are translated here; see this module's own per-function deferral
+//! notes below for the rest.
 //!
 //! # `dict_T`/`dictitem_T` representation (the design decision this
 //! unblocks)
@@ -31,56 +33,87 @@
 //! `TV_DICT_HI2DI` - every function below that would use that macro
 //! consults `dv_index` instead.
 //!
-//! `DictitemT`/`DictT` are heap-allocated via `Box::into_raw`/
-//! `Box::from_raw`, matching `ListitemT`'s established raw-pointer-
-//! linked convention (not `Rc`/`RefCell`).
+//! `DictitemT`/`DictT`/`ListT`/`ListitemT`/`BlobT` are all heap-
+//! allocated via `Box::into_raw`/`Box::from_raw`, matching this
+//! crate's established raw-pointer-linked convention (not
+//! `Rc`/`RefCell`).
 //!
 //! # Translated
-//! `tv_dict_item_alloc`(`_len`) (collapsed into one function taking
-//! `&[u8]`, matching this crate's established "no separate NUL-scanning
-//! variant needed" precedent - e.g. `hashtab.rs`'s `hash_find`/
-//! `hash_find_len`); `tv_dict_item_free` (the List/Dict/Blob/Partial-
-//! valued-item branches are `unimplemented!()` - see its own doc
-//! comment); `tv_dict_item_copy`; `tv_dict_item_remove`; `tv_dict_alloc`/
-//! `tv_dict_free_contents`/`tv_dict_free_dict`/`tv_dict_free`;
-//! `tv_dict_find`/`tv_dict_has_key`; `tv_dict_add` (omits the
-//! original's `tv_dict_wrong_func_name` g:/l: validation - needs
+//! **Dict**: `tv_dict_item_alloc`(`_len`, collapsed into one function
+//! taking `&[u8]`), `tv_dict_item_free`, `tv_dict_item_copy`,
+//! `tv_dict_item_remove`, `tv_dict_alloc`, `tv_dict_free_contents`/
+//! `tv_dict_free_dict`/`tv_dict_free`/`tv_dict_unref`, `tv_dict_find`/
+//! `tv_dict_has_key`, `tv_dict_add` (omits the original's
+//! `tv_dict_wrong_func_name` g:/l: validation - needs
 //! `get_globvar_dict`/`get_funccal_local_ht`/`var_wrong_func_name`,
 //! none translated, and nothing in this crate can even construct a
 //! real global/local-funccall scope dict yet for that check to apply
-//! to); `tv_copy` (the `VAR_FUNC` branch omits the original's own
+//! to).
+//!
+//! **List**: `tv_list_alloc`, `tv_list_item_alloc` (private, matching
+//! the original's own `static`), `tv_list_free_contents`/
+//! `tv_list_free_list`/`tv_list_free`/`tv_list_unref`/`tv_list_ref`,
+//! `tv_list_append`/`tv_list_append_tv`/`tv_list_append_owned_tv`,
+//! `tv_list_insert`/`tv_list_insert_tv`, `tv_list_drop_items`/
+//! `tv_list_remove_items`/`tv_list_item_remove`, `tv_list_watch_add`/
+//! `tv_list_watch_remove`/`tv_list_watch_fix`.
+//!
+//! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`.
+//!
+//! **Copy**: `tv_copy` (the `VAR_FUNC` branch omits the original's own
 //! `func_ref` refcount increment - needs a function-name registry,
 //! `eval/userfunc.c`'s `ufunc_T` table, not yet translated, though the
 //! function-name *string* itself is still copied correctly; the
 //! `VAR_PARTIAL` branch is `unimplemented!()` - needs `partial_T`'s
-//! real `pt_refcount` field, still an opaque placeholder); `tv_list_ref`
-//! (`eval/typval_defs.rs`'s own `list_T`/`listitem_T` companion,
-//! translated here since `tv_copy` is its first real caller).
+//! real `pt_refcount` field, still an opaque placeholder pending
+//! `ufunc_T`).
 //!
-//! `gc_first_dict` (the original's file-static "list of all live
-//! dicts, for `:garbagecollect`" linked-list head) is translated as
-//! its own `GlobalCell`-backed static, matching `buffer.rs`'s
-//! `TOP_FILE_NUM`/`BUF_FREE_COUNT` precedent - the linked-list
-//! bookkeeping itself (`dv_used_next`/`dv_used_prev`) is maintained
-//! faithfully even though the actual garbage collector that would walk
-//! it is a much later phase, so that phase won't need to retrofit this
-//! bookkeeping later.
+//! A shared private `tv_clear_simple` helper (this crate's own,
+//! replacing the original's `tv_clear`'s simple-value branches - see
+//! "Deferred" below) is used by both `tv_dict_item_free` and every
+//! list-item-freeing function above to release a value's List/Dict/
+//! Blob reference (via the real `tv_list_unref`/`tv_dict_unref`/
+//! `tv_blob_unref` above) or panic narrowly on `VAR_PARTIAL` -
+//! Number/String/Bool/Special/Float/Func/Unknown need no explicit
+//! release at all (Rust's own ownership drops their `Vec<u8>`/etc.
+//! automatically).
 //!
-//! `watchers`/`lua_table_ref` are left inert: `DictT` has no `watchers`
-//! field at all yet (needs a `QUEUE` intrusive-linked-list translation
-//! first - see `typval_defs.rs`), and `lua_table_ref` is always
-//! `LUA_NOREF` (the Lua host, phase 13, isn't started).
+//! `gc_first_dict`/`gc_first_list` (the original's file-static "list
+//! of all live dicts/lists, for `:garbagecollect`" linked-list heads)
+//! are translated as their own `GlobalCell`-backed statics, matching
+//! `buffer.rs`'s `TOP_FILE_NUM`/`BUF_FREE_COUNT` precedent - the
+//! linked-list bookkeeping itself (`dv_used_next`/`dv_used_prev`,
+//! `lv_used_next`/`lv_used_prev`) is maintained faithfully even though
+//! the actual garbage collector that would walk it is a much later
+//! phase, so that phase won't need to retrofit this bookkeeping later.
+//!
+//! `watchers`/`lua_table_ref` are left inert: `DictT` has no
+//! `watchers` field at all yet (needs a `QUEUE` intrusive-linked-list
+//! translation first - see `typval_defs.rs`; `ListT`'s own `lv_watch`
+//! chain *is* translated, since it's a plain raw-pointer singly-linked
+//! list already modeled directly on `ListwatchT`, not a `QUEUE`), and
+//! every `lua_table_ref` is always `LUA_NOREF` (the Lua host, phase
+//! 13, isn't started).
 //!
 //! # Deferred
 //! - `tv_clear`/`tv_free` themselves: `tv_clear`'s *real* behavior is
 //!   implemented via a shared encode-traversal abstraction
 //!   (`encode_vim_to_nothing`, `viml_encode.c` - reused for JSON/
 //!   msgpack encoding too, not just clearing) - a separate, substantial
-//!   subsystem of its own, not attempted here.
-//! - Every other `tv_dict_*` function (`tv_dict_get_string`,
-//!   `tv_dict_add_list`/`_dict`/`_str`/`_nr`/`_float`/`_allocated_str`,
-//!   `tv_dict_extend`, iteration helpers, etc.): straightforward to add
-//!   once needed, layered on top of the primitives here.
+//!   subsystem of its own, not attempted here. This module's own
+//!   `tv_clear_simple` covers everything that subsystem would do
+//!   *except* recursing into nested containers' own contents (List/
+//!   Dict values are unref'd, i.e. their own top-level refcount is
+//!   decremented and they're freed at zero, but freeing one doesn't
+//!   need to recurse further here since `tv_list_free_contents`/
+//!   `tv_dict_free_contents` themselves already do that recursion one
+//!   level at a time via the same helper).
+//! - Every other `tv_dict_*`/`tv_list_*`/`tv_blob_*` function
+//!   (`tv_dict_get_string`, `tv_dict_add_list`/`_dict`/`_str`/`_nr`/
+//!   `_float`/`_allocated_str`, `tv_dict_extend`, `tv_list_copy`,
+//!   `tv_list_concat`, blob byte-level accessors, iteration helpers,
+//!   etc.): straightforward to add once needed, layered on top of the
+//!   primitives here.
 
 use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
@@ -202,12 +235,56 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
 
 /// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
 ///
-/// The original's `tv_clear(&item->di_tv)` recursively decrements
-/// refcounts for List/Dict/Blob/Partial-valued items via the not-yet-
-/// translated encode-traversal machinery; those 4 branches are
-/// `unimplemented!()` here - narrow, reached only when actually
-/// freeing an item whose value is one of those 4 types (nothing in
-/// this crate's own test suite constructs one yet).
+/// Shared "clear a typval's value, releasing what it owns/references"
+/// core used by [`tv_dict_item_free`] and (once list_T support exists)
+/// list item freeing too - the original's `tv_clear`, minus its
+/// String/Number/etc. no-op branches (Rust's own ownership already
+/// handles those - see this module's own doc comment) and minus its
+/// `VAR_PARTIAL` branch (`unimplemented!()` - needs `partial_T`'s real
+/// `pt_refcount` field, still an opaque placeholder).
+///
+/// # Safety
+/// If `tv`'s value is `List`/`Dict`/`Blob`-typed with a non-null
+/// pointer, that pointer must be valid (matching every other function
+/// in this crate that touches those types).
+unsafe fn tv_clear_simple(tv: &TypvalT) {
+    match &tv.value {
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_unref(*l) };
+        }
+        TypvalValue::Dict(d) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_dict_unref(*d) };
+        }
+        TypvalValue::Blob(b) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_blob_unref(*b) };
+        }
+        TypvalValue::Partial(_) => {
+            unimplemented!(
+                "tv_clear: VAR_PARTIAL refcount decrement needs partial_T's real pt_refcount \
+                 field, not yet translated (partial_T is still an opaque placeholder)"
+            );
+        }
+        TypvalValue::Unknown
+        | TypvalValue::Number(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::Bool(_)
+        | TypvalValue::Special(_)
+        | TypvalValue::String(_)
+        | TypvalValue::Func(_) => {
+            // Rust's own ownership drops String/Func's owned Vec<u8>
+            // naturally - no manual xfree needed, unlike the original.
+        }
+    }
+}
+
+/// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
+///
+/// The original's `tv_clear(&item->di_tv)` is replicated via
+/// `tv_clear_simple` - see that function's own doc comment for the
+/// one remaining gap (`VAR_PARTIAL`).
 ///
 /// # Safety
 /// `item` must be a valid pointer previously returned by
@@ -217,21 +294,11 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
 /// `ChangedtickDictItem`), not yet freed, and no longer reachable from
 /// any hashtable/other structure (the caller's job - see
 /// [`tv_dict_item_remove`] for the usual "remove from hashtab, then
-/// free" pairing this crate expects).
+/// free" pairing this crate expects). Forwards `tv_clear_simple`'s
+/// own safety requirements too.
 pub unsafe fn tv_dict_item_free(item: *mut DictitemT) {
     // SAFETY: forwarded from this function's own safety doc.
-    let value_is_refcounted = unsafe {
-        matches!(
-            (*item).di_tv.value,
-            TypvalValue::List(_) | TypvalValue::Dict(_) | TypvalValue::Blob(_) | TypvalValue::Partial(_)
-        )
-    };
-    if value_is_refcounted {
-        unimplemented!(
-            "tv_dict_item_free: freeing a List/Dict/Blob/Partial-valued item needs \
-             tv_list_unref/tv_dict_unref/tv_blob_unref/partial_unref, none translated yet"
-        );
-    }
+    unsafe { tv_clear_simple(&(*item).di_tv) };
 
     // SAFETY: forwarded from this function's own safety doc.
     let flags = unsafe { (*item).di_flags };
@@ -394,6 +461,25 @@ pub unsafe fn tv_dict_free(d: *mut DictT) {
     unsafe { tv_dict_free_dict(d) };
 }
 
+/// Unreference a dictionary: decrements the reference count and frees
+/// the dictionary when it becomes zero or less (`tv_dict_unref`).
+///
+/// # Safety
+/// `d`, if non-null, must be a valid pointer previously returned by
+/// [`tv_dict_alloc`], not yet freed.
+pub unsafe fn tv_dict_unref(d: *mut DictT) {
+    if d.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*d).dv_refcount -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*d).dv_refcount } <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_free(d) };
+    }
+}
+
 /// Find item in dictionary (`tv_dict_find`).
 ///
 /// Unlike the original (`ptrdiff_t len`, negative meaning
@@ -440,6 +526,497 @@ pub unsafe fn tv_dict_add(d: &mut DictT, item: *mut DictitemT) -> i32 {
         d.dv_index.insert(key_ptr as usize, item);
     }
     rc
+}
+
+/// Allocate a blob. Caller should take care of the reference count
+/// (`tv_blob_alloc`).
+#[must_use]
+pub fn tv_blob_alloc() -> *mut crate::eval::typval_defs::BlobT {
+    let mut bv_ga = crate::garray_defs::GarrayT::default();
+    bv_ga.ga_init(1, 100);
+    Box::into_raw(Box::new(crate::eval::typval_defs::BlobT {
+        bv_ga,
+        bv_refcount: 0,
+        bv_lock: VarLockStatus::Unlocked,
+    }))
+}
+
+/// Free a blob. Ignores the reference count (`tv_blob_free`).
+///
+/// # Safety
+/// `b` must be a valid pointer previously returned by [`tv_blob_alloc`],
+/// not yet freed.
+pub unsafe fn tv_blob_free(b: *mut crate::eval::typval_defs::BlobT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    drop(unsafe { Box::from_raw(b) });
+}
+
+/// Unreference a blob: decrements the reference count and frees the
+/// blob when it becomes zero (`tv_blob_unref`).
+///
+/// # Safety
+/// `b`, if non-null, must be a valid pointer previously returned by
+/// [`tv_blob_alloc`], not yet freed.
+pub unsafe fn tv_blob_unref(b: *mut crate::eval::typval_defs::BlobT) {
+    if b.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*b).bv_refcount -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*b).bv_refcount } <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_blob_free(b) };
+    }
+}
+
+/// `gc_first_list`: head of the linked list of all live lists (via
+/// `lv_used_next`/`lv_used_prev`), maintained for a future
+/// `:garbagecollect` implementation - same reasoning as
+/// [`GC_FIRST_DICT`].
+static GC_FIRST_LIST: GlobalCell<*mut crate::eval::typval_defs::ListT> =
+    GlobalCell::new(std::ptr::null_mut());
+
+/// Allocate an empty list. Caller should take care of the reference
+/// count (`tv_list_alloc`).
+///
+/// `_len` (expected number of items to be populated before the list
+/// becomes accessible from Vimscript) is accepted for signature
+/// fidelity but unused, matching the original's own "currently does
+/// nothing" note.
+#[must_use]
+pub fn tv_list_alloc(_len: isize) -> *mut crate::eval::typval_defs::ListT {
+    let list = Box::into_raw(Box::new(crate::eval::typval_defs::ListT {
+        lv_first: std::ptr::null_mut(),
+        lv_last: std::ptr::null_mut(),
+        lv_watch: std::ptr::null_mut(),
+        lv_idx_item: std::ptr::null_mut(),
+        lv_copylist: std::ptr::null_mut(),
+        lv_used_next: std::ptr::null_mut(),
+        lv_used_prev: std::ptr::null_mut(),
+        lv_refcount: 0,
+        lv_len: 0,
+        lv_idx: 0,
+        lv_copy_id: 0,
+        lv_lock: VarLockStatus::Unlocked,
+        lua_table_ref: LUA_NOREF,
+    }));
+
+    // Prepend the list to the list of lists for garbage collection.
+    // SAFETY: GC_FIRST_LIST is only ever read/written through this
+    // module's own functions, which never hold a live reference across
+    // another call into this same cell.
+    let gc_first = unsafe { *GC_FIRST_LIST.get_mut() };
+    if !gc_first.is_null() {
+        // SAFETY: gc_first is either null (checked above) or a live
+        // pointer previously produced by this same function.
+        unsafe { (*gc_first).lv_used_prev = list };
+    }
+    // SAFETY: forwarded from this function's own reasoning above.
+    unsafe { (*list).lv_used_next = gc_first };
+    // SAFETY: forwarded from this function's own reasoning above.
+    unsafe { *GC_FIRST_LIST.get_mut() = list };
+
+    list
+}
+
+/// Allocate a list item. The type/value of the item (`.li_tv`) still
+/// need to be initialized by the caller (`tv_list_item_alloc`).
+///
+/// The original's own item is a bare, uninitialized `xmalloc` (with a
+/// warning to initialize `li_tv`/`li_next`/`li_prev` immediately
+/// afterward) - this translation instead starts every field at a real
+/// default value, since Rust has no safe equivalent of returning
+/// genuinely uninitialized memory, and every real call site already
+/// overwrites these fields immediately anyway.
+fn tv_list_item_alloc() -> *mut crate::eval::typval_defs::ListitemT {
+    Box::into_raw(Box::new(crate::eval::typval_defs::ListitemT {
+        li_next: std::ptr::null_mut(),
+        li_prev: std::ptr::null_mut(),
+        li_tv: TypvalT::default(),
+    }))
+}
+
+/// Advance watchers to the next item. Used just before removing an
+/// item from a list (`tv_list_watch_fix`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`, and every
+/// `listwatch_T` reachable via its `lv_watch` chain must be valid.
+/// `item` must be a valid, non-null pointer to a live `ListitemT`.
+unsafe fn tv_list_watch_fix(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *const crate::eval::typval_defs::ListitemT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lw = unsafe { (*l).lv_watch };
+    while !lw.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*lw).lw_item } == item.cast_mut() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*lw).lw_item = (*item).li_next };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        lw = unsafe { (*lw).lw_next };
+    }
+}
+
+/// Add a watcher to a list (`tv_list_watch_add`).
+///
+/// # Safety
+/// `l` and `lw` must be valid, non-null pointers to a live `ListT`/
+/// `ListwatchT` respectively; `lw` must outlive its presence in `l`'s
+/// watcher chain (the caller's job, matching the original's own raw-
+/// pointer contract).
+pub unsafe fn tv_list_watch_add(
+    l: *mut crate::eval::typval_defs::ListT,
+    lw: *mut crate::eval::typval_defs::ListwatchT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*lw).lw_next = (*l).lv_watch };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_watch = lw };
+}
+
+/// Remove a watcher from a list. Does not warn if the watcher was not
+/// found (`tv_list_watch_remove`).
+///
+/// # Safety
+/// Same as [`tv_list_watch_add`].
+pub unsafe fn tv_list_watch_remove(
+    l: *mut crate::eval::typval_defs::ListT,
+    lwrem: *mut crate::eval::typval_defs::ListwatchT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lwp: *mut *mut crate::eval::typval_defs::ListwatchT = unsafe { &mut (*l).lv_watch };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lw = unsafe { (*l).lv_watch };
+    while !lw.is_null() {
+        if lw == lwrem {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *lwp = (*lw).lw_next };
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        lwp = unsafe { &mut (*lw).lw_next };
+        // SAFETY: forwarded from this function's own safety doc.
+        lw = unsafe { (*lw).lw_next };
+    }
+}
+
+/// Remove items `item` to `item2` from list `l`. Does not free the
+/// listitem or the value (`tv_list_drop_items`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`; `item`/
+/// `item2` must be valid, non-null pointers to items actually present
+/// (in order) in `l`'s own `li_next` chain.
+pub unsafe fn tv_list_drop_items(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+    item2: *mut crate::eval::typval_defs::ListitemT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let item2_next = unsafe { (*item2).li_next };
+    let mut ip = item;
+    while ip != item2_next {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_len -= 1 };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_watch_fix(l, ip) };
+        // SAFETY: forwarded from this function's own safety doc.
+        ip = unsafe { (*ip).li_next };
+    }
+
+    if item2_next.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_last = (*item).li_prev };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item2_next).li_prev = (*item).li_prev };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let item_prev = unsafe { (*item).li_prev };
+    if item_prev.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_first = item2_next };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item_prev).li_next = item2_next };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_idx_item = std::ptr::null_mut() };
+}
+
+/// Like [`tv_list_drop_items`], but also frees all removed items
+/// (`tv_list_remove_items`).
+///
+/// # Safety
+/// Same as [`tv_list_drop_items`], plus every item from `item` to
+/// `item2` (inclusive) must have been allocated via
+/// `tv_list_item_alloc`/`Box::into_raw`, matching
+/// `tv_clear_simple`'s own safety contract for each one's value.
+pub unsafe fn tv_list_remove_items(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+    item2: *mut crate::eval::typval_defs::ListitemT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_drop_items(l, item, item2) };
+    let mut li = item;
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&(*li).li_tv) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let nli = unsafe { (*li).li_next };
+        let done = li == item2;
+        // SAFETY: forwarded from this function's own safety doc.
+        drop(unsafe { Box::from_raw(li) });
+        if done {
+            break;
+        }
+        li = nli;
+    }
+}
+
+/// Remove a list item from a list and free it (also clears the
+/// value). Returns a pointer to the list item just after the removed
+/// one, null if the removed item was the last one
+/// (`tv_list_item_remove`).
+///
+/// # Safety
+/// Same as [`tv_list_remove_items`], restricted to a single item.
+pub unsafe fn tv_list_item_remove(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+) -> *mut crate::eval::typval_defs::ListitemT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let next_item = unsafe { (*item).li_next };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_drop_items(l, item, item) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(&(*item).li_tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    drop(unsafe { Box::from_raw(item) });
+    next_item
+}
+
+/// Free items contained in a list (`tv_list_free_contents`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT` whose items
+/// were all allocated via `tv_list_item_alloc`/`Box::into_raw`,
+/// matching `tv_clear_simple`'s own safety contract for each item's
+/// value.
+pub unsafe fn tv_list_free_contents(l: *mut crate::eval::typval_defs::ListT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { (*l).lv_first };
+    while !item.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*item).li_next };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_first = next };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&(*item).li_tv) };
+        // SAFETY: forwarded from this function's own safety doc.
+        drop(unsafe { Box::from_raw(item) });
+        item = next;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let l_ref = unsafe { &mut *l };
+    l_ref.lv_len = 0;
+    l_ref.lv_idx_item = std::ptr::null_mut();
+    l_ref.lv_last = std::ptr::null_mut();
+    debug_assert!(l_ref.lv_watch.is_null(), "tv_list_free_contents: lv_watch should be empty");
+}
+
+/// Free a list itself, ignoring items it contains. Ignores the
+/// reference count (`tv_list_free_list`).
+///
+/// # Safety
+/// `l` must be a valid pointer previously returned by [`tv_list_alloc`],
+/// not yet freed.
+pub unsafe fn tv_list_free_list(l: *mut crate::eval::typval_defs::ListT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (used_prev, used_next) = unsafe { ((*l).lv_used_prev, (*l).lv_used_next) };
+    if used_prev.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *GC_FIRST_LIST.get_mut() = used_next };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*used_prev).lv_used_next = used_next };
+    }
+    if !used_next.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*used_next).lv_used_prev = used_prev };
+    }
+
+    // NLUA_CLEAR_REF(l->lua_table_ref): omitted - the Lua host (phase
+    // 13) isn't started, and lua_table_ref is always LUA_NOREF here.
+
+    // SAFETY: forwarded from this function's own safety doc.
+    drop(unsafe { Box::from_raw(l) });
+}
+
+/// Free a list, including all items it points to. Ignores the
+/// reference count (`tv_list_free`).
+///
+/// # Safety
+/// Same as [`tv_list_free_contents`]/[`tv_list_free_list`] combined.
+pub unsafe fn tv_list_free(l: *mut crate::eval::typval_defs::ListT) {
+    // The original's `tv_in_free_unref_items` re-entrancy guard is
+    // always false here - same reasoning as `tv_dict_free`.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_free_contents(l) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_free_list(l) };
+}
+
+/// Unreference a list: decrements the reference count and frees when
+/// it becomes zero or less (`tv_list_unref`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer previously returned by
+/// [`tv_list_alloc`], not yet freed.
+pub unsafe fn tv_list_unref(l: *mut crate::eval::typval_defs::ListT) {
+    if l.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_refcount -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*l).lv_refcount } <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_free(l) };
+    }
+}
+
+/// Append item to the end of a list (`tv_list_append`).
+///
+/// # Safety
+/// `l`/`item` must be valid, non-null pointers to a live `ListT`/
+/// `ListitemT`; `item` must not already be linked into any list.
+pub unsafe fn tv_list_append(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let last = unsafe { (*l).lv_last };
+    if last.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_first = item };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_last = item };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item).li_prev = std::ptr::null_mut() };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*last).li_next = item };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item).li_prev = last };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_last = item };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_len += 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*item).li_next = std::ptr::null_mut() };
+}
+
+/// Append a Vimscript value to the end of a list; `tv` is copied (see
+/// [`tv_copy`]) into a freshly-allocated item (`tv_list_append_tv`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`. Forwards
+/// [`tv_copy`]'s own safety requirements for `tv`.
+pub unsafe fn tv_list_append_tv(l: *mut crate::eval::typval_defs::ListT, tv: &TypvalT) {
+    let li = tv_list_item_alloc();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(tv, &mut (*li).li_tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append(l, li) };
+}
+
+/// Like [`tv_list_append_tv`], but `tv` is moved into the list rather
+/// than copied - it is no longer valid to use `tv` after this
+/// function returns. Returns a pointer to the newly-owned value
+/// (`tv_list_append_owned_tv`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+pub unsafe fn tv_list_append_owned_tv(
+    l: *mut crate::eval::typval_defs::ListT,
+    tv: TypvalT,
+) -> *mut TypvalT {
+    let li = tv_list_item_alloc();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*li).li_tv = tv };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append(l, li) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut (*li).li_tv as *mut TypvalT }
+}
+
+/// Insert a list item before `item` (or at the end, if `item` is
+/// null) (`tv_list_insert`).
+///
+/// # Safety
+/// `l`/`ni` must be valid, non-null pointers to a live `ListT`/
+/// `ListitemT` (`ni` not already linked into any list); `item`, if
+/// non-null, must be a valid pointer to an item actually present in
+/// `l`.
+pub unsafe fn tv_list_insert(
+    l: *mut crate::eval::typval_defs::ListT,
+    ni: *mut crate::eval::typval_defs::ListitemT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+) {
+    if item.is_null() {
+        // Append new item at end of list.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_append(l, ni) };
+    } else {
+        // Insert new item before existing item.
+        // SAFETY: forwarded from this function's own safety doc.
+        let item_prev = unsafe { (*item).li_prev };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*ni).li_prev = item_prev };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*ni).li_next = item };
+        if item_prev.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*l).lv_first = ni };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*l).lv_idx += 1 };
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*item_prev).li_next = ni };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*l).lv_idx_item = std::ptr::null_mut() };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item).li_prev = ni };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*l).lv_len += 1 };
+    }
+}
+
+/// Insert a Vimscript value into a list, before `item` (or at the end,
+/// if `item` is null); `tv` is copied (see [`tv_copy`]) into a
+/// freshly-allocated item (`tv_list_insert_tv`).
+///
+/// # Safety
+/// Same as [`tv_list_insert`]. Forwards [`tv_copy`]'s own safety
+/// requirements for `tv`.
+pub unsafe fn tv_list_insert_tv(
+    l: *mut crate::eval::typval_defs::ListT,
+    tv: &TypvalT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+) {
+    let ni = tv_list_item_alloc();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(tv, &mut (*ni).li_tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_insert(l, ni, item) };
 }
 
 #[cfg(test)]
@@ -591,10 +1168,30 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "tv_list_unref/tv_dict_unref/tv_blob_unref/partial_unref")]
-    fn tv_dict_item_free_panics_on_dict_valued_item() {
+    fn tv_dict_item_free_decrements_dict_value_refcount_instead_of_panicking() {
+        // Dict/List/Blob-valued items are now properly handled by
+        // tv_clear_simple (calling tv_dict_unref/tv_list_unref/
+        // tv_blob_unref) - only Partial still panics (see below).
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            (*d).dv_refcount = 2;
+            let mut item = DictitemT {
+                di_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d) },
+                di_flags: 0,
+                di_key: b"x\0".to_vec(),
+            };
+            tv_dict_item_free(&mut item as *mut DictitemT);
+            assert_eq!((*d).dv_refcount, 1);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "VAR_PARTIAL refcount decrement")]
+    fn tv_dict_item_free_panics_on_partial_valued_item() {
         let mut item = DictitemT {
-            di_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) },
+            di_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Partial(std::ptr::null_mut()) },
             di_flags: 0,
             di_key: b"x\0".to_vec(),
         };
@@ -743,6 +1340,246 @@ mod tests {
 
             tv_dict_item_free(original);
             tv_dict_item_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_dict_unref_null_is_noop() {
+        unsafe { tv_dict_unref(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn tv_dict_unref_decrements_without_freeing_when_still_referenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            (*d).dv_refcount = 2;
+            tv_dict_unref(d);
+            assert_eq!((*d).dv_refcount, 1);
+            tv_dict_free(d); // clean up manually since refcount never hit 0
+        }
+    }
+
+    #[test]
+    fn tv_blob_alloc_and_free_round_trip() {
+        let b = tv_blob_alloc();
+        unsafe {
+            assert_eq!((*b).bv_refcount, 0);
+            assert_eq!((*b).bv_ga.ga_len, 0);
+            tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn tv_blob_unref_null_is_noop() {
+        unsafe { tv_blob_unref(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn tv_blob_unref_decrements_without_freeing_when_still_referenced() {
+        let b = tv_blob_alloc();
+        unsafe {
+            (*b).bv_refcount = 2;
+            tv_blob_unref(b);
+            assert_eq!((*b).bv_refcount, 1);
+            tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn tv_list_alloc_and_free_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(0);
+        unsafe {
+            assert_eq!((*l).lv_refcount, 0);
+            assert_eq!((*l).lv_len, 0);
+            assert!((*l).lv_first.is_null());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_unref_null_is_noop() {
+        unsafe { tv_list_unref(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn tv_list_unref_decrements_without_freeing_when_still_referenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(0);
+        unsafe {
+            (*l).lv_refcount = 2;
+            tv_list_unref(l);
+            assert_eq!((*l).lv_refcount, 1);
+            tv_list_free(l); // clean up manually since refcount never hit 0
+        }
+    }
+
+    #[test]
+    fn multiple_lists_maintain_the_gc_linked_list_correctly() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(0);
+        let l2 = tv_list_alloc(0);
+        unsafe {
+            assert_eq!(*GC_FIRST_LIST.get_mut(), l2);
+            assert_eq!((*l2).lv_used_next, l1);
+            assert!((*l1).lv_used_next.is_null());
+
+            tv_list_free(l1);
+            assert!((*l2).lv_used_next.is_null());
+
+            tv_list_free(l2);
+            assert!((*GC_FIRST_LIST.get_mut()).is_null());
+        }
+    }
+
+    fn number_tv(n: crate::eval::typval_defs::VarnumberT) -> TypvalT {
+        TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(n) }
+    }
+
+    #[test]
+    fn tv_list_append_tv_builds_a_list_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            for n in [1, 2, 3] {
+                tv_list_append_tv(l, &number_tv(n));
+            }
+
+            assert_eq!((*l).lv_len, 3);
+            let item1 = (*l).lv_first;
+            assert!(matches!((*item1).li_tv.value, TypvalValue::Number(1)));
+            let item2 = (*item1).li_next;
+            assert!(matches!((*item2).li_tv.value, TypvalValue::Number(2)));
+            let item3 = (*item2).li_next;
+            assert!(matches!((*item3).li_tv.value, TypvalValue::Number(3)));
+            assert!((*item3).li_next.is_null());
+            assert_eq!((*l).lv_last, item3);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_owned_tv_moves_the_value_in() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            let tv = TypvalT {
+                v_lock: VarLockStatus::Unlocked,
+                value: TypvalValue::String(Some(b"owned".to_vec())),
+            };
+            let stored = tv_list_append_owned_tv(l, tv);
+            assert!(matches!(&(*stored).value, TypvalValue::String(Some(s)) if s == b"owned"));
+            assert_eq!((*l).lv_len, 1);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_insert_before_existing_item_and_at_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_tv(l, &number_tv(1));
+            tv_list_append_tv(l, &number_tv(3));
+            let item1 = (*l).lv_first;
+            let item3 = (*item1).li_next;
+
+            // Insert 2 before item3.
+            tv_list_insert_tv(l, &number_tv(2), item3);
+            assert_eq!((*l).lv_len, 3);
+            let item2 = (*item1).li_next;
+            assert!(matches!((*item2).li_tv.value, TypvalValue::Number(2)));
+            assert_eq!((*item2).li_next, item3);
+            assert_eq!((*item3).li_prev, item2);
+
+            // Insert 4 at the end (item == NULL).
+            tv_list_insert_tv(l, &number_tv(4), std::ptr::null_mut());
+            assert_eq!((*l).lv_len, 4);
+            assert_eq!((*item3).li_next, (*l).lv_last);
+            assert!(matches!((*(*l).lv_last).li_tv.value, TypvalValue::Number(4)));
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_item_remove_unlinks_middle_item_and_returns_next() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            for n in [1, 2, 3] {
+                tv_list_append_tv(l, &number_tv(n));
+            }
+            let item1 = (*l).lv_first;
+            let item2 = (*item1).li_next;
+            let item3 = (*item2).li_next;
+
+            let returned = tv_list_item_remove(l, item2);
+            assert_eq!(returned, item3);
+            assert_eq!((*l).lv_len, 2);
+            assert_eq!((*item1).li_next, item3);
+            assert_eq!((*item3).li_prev, item1);
+            assert_eq!((*l).lv_first, item1);
+            assert_eq!((*l).lv_last, item3);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_remove_items_removes_and_frees_a_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(4);
+        unsafe {
+            for n in [1, 2, 3, 4] {
+                tv_list_append_tv(l, &number_tv(n));
+            }
+            let item1 = (*l).lv_first;
+            let item2 = (*item1).li_next;
+            let item3 = (*item2).li_next;
+            let item4 = (*item3).li_next;
+
+            // Remove the middle range (items 2 and 3).
+            tv_list_remove_items(l, item2, item3);
+            assert_eq!((*l).lv_len, 2);
+            assert_eq!((*item1).li_next, item4);
+            assert_eq!((*item4).li_prev, item1);
+            assert_eq!((*l).lv_first, item1);
+            assert_eq!((*l).lv_last, item4);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_watch_fix_advances_past_a_removed_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_tv(l, &number_tv(1));
+            tv_list_append_tv(l, &number_tv(2));
+            let item1 = (*l).lv_first;
+            let item2 = (*item1).li_next;
+
+            let mut watch =
+                crate::eval::typval_defs::ListwatchT { lw_item: item1, lw_next: std::ptr::null_mut() };
+            tv_list_watch_add(l, &mut watch as *mut _);
+            assert_eq!((*l).lv_watch, &mut watch as *mut _);
+
+            // Removing item1 (which the watcher points at) should
+            // advance the watcher to item2.
+            tv_list_item_remove(l, item1);
+            assert_eq!(watch.lw_item, item2);
+
+            // Must remove the watcher before freeing the list -
+            // tv_list_free_contents debug_asserts lv_watch is empty,
+            // matching the original's own assert().
+            tv_list_watch_remove(l, &mut watch as *mut _);
+            assert!((*l).lv_watch.is_null());
+
+            tv_list_free(l);
         }
     }
 }
