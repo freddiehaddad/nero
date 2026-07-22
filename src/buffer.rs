@@ -13,8 +13,10 @@
 //! counter, `BUF_FREE_COUNT`), the `'buftype'`-testing predicate
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
 //! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, `buf_hide`,
-//! and `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
-//! exists).
+//! `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
+//! exists), and `buffer.h`'s `buf_meta_total` (a tiny `static inline`
+//! header function, not from `buffer.c` itself - harvested for
+//! `drawscreen.c`'s `number_width`).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -240,6 +242,16 @@ pub unsafe fn buf_hide(buf: &BufT) -> bool {
 #[must_use]
 pub unsafe fn buf_is_empty(buf: &mut BufT) -> bool {
     buf.b_ml.ml_line_count == 1 && unsafe { crate::memline::ml_get_buf(buf, 1) }[0] == 0
+}
+
+/// Return the total count of a given kind of extmark metadata in
+/// `buf` (`buf_meta_total`). Actually a `static inline` function in
+/// `buffer.h`, not `buffer.c` itself - harvested here alongside its
+/// real caller, `drawscreen.c`'s `number_width`, since `buffer.h` has
+/// no dedicated module of its own in this crate.
+#[must_use]
+pub fn buf_meta_total(buf: &BufT, m: crate::marktree_defs::MetaIndex) -> u32 {
+    buf.b_marktree.meta_root[m as usize]
 }
 
 #[cfg(test)]
