@@ -50,9 +50,10 @@
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
 //! Deferred: everything else, including `get_fileformat_force` (needs
-//! `exarg_T`), `was_set_insecurely`/`insecure_flag` (need the real
-//! `options[]` table's own `.flags` field for their fallback case,
-//! plus `OptIndex`), `parse_winhl_opt` (needs the decoration/highlight-
+//! `exarg_T`), `was_set_insecurely`/`insecure_flag` (`OptIndex` itself
+//! now exists in `option_defs.rs`, but these still need the real
+//! `options[]` table's own `.flags` field for their fallback case),
+//! `parse_winhl_opt` (needs the decoration/highlight-
 //! group subsystem: `nvim_create_namespace`/`get_decor_provider`/
 //! `syn_check_group`/`ns_hl_def`), and every function needing the real
 //! `options[]` table (`get_option_value`/`set_option_value`/
