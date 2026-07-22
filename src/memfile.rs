@@ -1262,9 +1262,12 @@ mod tests {
 
     #[test]
     fn mf_write_sets_did_swapwrite_msg_on_failure_and_clears_on_success() {
-        // GLOBALS.did_swapwrite_msg is shared process-wide state; guard
-        // it like every other GLOBALS-touching test in this crate.
-        //
+        // GLOBALS.did_swapwrite_msg is shared process-wide state with
+        // zero built-in synchronization (see
+        // crate::globals::global_state_test_lock's own doc comment for
+        // why this lock - not just a save/restore - is required).
+        let _lock = crate::globals::global_state_test_lock();
+
         // Use a *read-only*-opened file so the actual write attempt
         // inside mf_write's loop fails (as opposed to the early "no
         // file at all" check up front, which returns FAIL without ever
@@ -1555,6 +1558,11 @@ mod tests {
 
     #[test]
     fn mf_sync_preserves_pre_existing_got_int() {
+        // GLOBALS.got_int is shared process-wide state with zero
+        // built-in synchronization (see
+        // crate::globals::global_state_test_lock's own doc comment).
+        let _lock = crate::globals::global_state_test_lock();
+
         let mut mfp = test_mfp(); // no file -> early FAIL return
         unsafe {
             let globals = crate::globals::GLOBALS.get_mut();

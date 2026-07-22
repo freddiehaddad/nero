@@ -1229,6 +1229,40 @@ pub type GlobalsCell = GlobalCell<Globals>;
 pub static GLOBALS: std::sync::LazyLock<GlobalsCell> =
     std::sync::LazyLock::new(|| GlobalCell::new(Globals::default()));
 
+/// Serializes tests, in *any* file in this crate, that read or write
+/// [`GLOBALS`]/[`crate::option_vars::OPTION_VARS`] (or any other
+/// [`GlobalCell`]) via `.get_mut()`. `GlobalCell` itself provides zero
+/// synchronization (`unsafe impl Sync` - a deliberate, faithful match
+/// for the original's own single-threaded, unsynchronized `EXTERN`
+/// globals), so two tests running concurrently on different threads
+/// (Rust's default test runner) and both calling `.get_mut()` create
+/// overlapping `&mut` references from different threads - undefined
+/// behavior, not just "a wrong assertion", regardless of whether the
+/// two tests happen to touch different fields of the same struct.
+///
+/// This is not a hypothetical: this exact class of bug was caught for
+/// real by running this crate's test suite natively on Linux for the
+/// first time (via WSL) - `mark.rs`'s `MarkTestGuard`/`CurbufGuard`
+/// mutated `GLOBALS.curwin`/`curbuf` with no synchronization at all,
+/// and Linux's thread scheduling surfaced the resulting race
+/// reliably (never observed across dozens of Windows-only runs).
+/// Auditing the rest of the crate afterwards found the same
+/// unprotected pattern in `memfile.rs`'s `did_swapwrite_msg`/`got_int`
+/// tests too - fixed alongside this lock's introduction.
+///
+/// Every test anywhere in the crate that calls `GLOBALS.get_mut()` or
+/// `crate::option_vars::OPTION_VARS.get_mut()` should acquire this for
+/// its entire body (held via the returned guard, dropped at the end of
+/// the test function). Uses `PoisonError::into_inner` so one
+/// panicking test under the lock can't permanently poison it for every
+/// later test - same pattern as `crate::os::fs::cwd_test_lock`/
+/// `os::env`'s `homedir_test_lock`.
+#[cfg(test)]
+pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,19 +1342,16 @@ mod tests {
 
     #[test]
     fn globals_singleton_is_readable_and_writable() {
-        // SAFETY: only one live `&mut Globals` is held at a time within
-        // this test's own critical section below.
-        //
-        // Caveat for future tests: `GLOBALS` is a genuine process-wide
-        // singleton (matching the original's own architecture - see the
-        // `GlobalsCell` doc comment), so tests that mutate it and run in
-        // parallel with other tests that also touch it could observe
-        // each other's writes. This test restores the field it changes
-        // immediately, but any future test suite that grows to rely on
-        // specific `GLOBALS` field values across many tests should
-        // consider `cargo test -- --test-threads=1` or a dedicated
-        // fixture/lock, the same care real neovim's own single "current
-        // editor state" requires of anything that isn't the main loop.
+        // Uses global_state_test_lock() for its entire body: GLOBALS is
+        // a genuine process-wide singleton (matching the original's own
+        // architecture - see the GlobalsCell doc comment) with zero
+        // built-in synchronization, so without this lock, a concurrently
+        // running test that also touches GLOBALS could create
+        // overlapping &mut references from a different thread -
+        // undefined behavior, not just a wrong assertion (see
+        // global_state_test_lock's own doc comment for a real instance
+        // of this class of bug, caught via native Linux testing).
+        let _lock = global_state_test_lock();
         let original_rows = unsafe { GLOBALS.get_mut() }.Rows;
         unsafe { GLOBALS.get_mut() }.Rows = 50;
         assert_eq!(unsafe { GLOBALS.get_mut() }.Rows, 50);

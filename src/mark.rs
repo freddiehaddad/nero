@@ -723,26 +723,13 @@ mod tests {
 
     /// Serializes every test that mutates `GLOBALS.curwin`/`curbuf`
     /// (genuinely global, shared mutable state) via [`CurbufGuard`]/
-    /// [`MarkTestGuard`] below - Rust's default test runner executes
-    /// tests concurrently across threads, and without this, two such
-    /// tests running at once could interleave their `curwin`/`curbuf`
-    /// assignments, making one test's `checkpcmark()`/etc. call
-    /// silently operate on a *different* test's window/buffer.
-    ///
-    /// This is not a hypothetical: this exact race was caught for
-    /// real by running this crate's test suite natively on Linux (via
-    /// WSL) for the first time - a `checkpcmark` test failed
-    /// intermittently there (this dev machine's usual Windows-only
-    /// testing hadn't hit the race, but Linux's thread scheduling
-    /// surfaced it reliably), tracing back to `MarkTestGuard::set`
-    /// mutating `GLOBALS.curwin` with no synchronization at all. Uses
-    /// `PoisonError::into_inner` so one panicking test under the lock
-    /// can't permanently poison it for every later test - same pattern
-    /// as `crate::os::fs::cwd_test_lock`/`os::env`'s
-    /// `homedir_test_lock`.
+    /// [`MarkTestGuard`] below. Delegates to the crate-wide
+    /// `crate::globals::global_state_test_lock` (shared by every file
+    /// touching `GLOBALS`/`OPTION_VARS` in tests, not a separate mutex
+    /// of its own) - see that function's own doc comment for why a
+    /// single shared lock is used instead of one per file/field.
     fn globals_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::globals::global_state_test_lock()
     }
 
     /// RAII guard restoring `GLOBALS.curbuf` on drop (including on test
