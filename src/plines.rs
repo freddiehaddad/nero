@@ -55,14 +55,26 @@
 //! into `csarg`, matching the original's own reuse of the same
 //! function for this purpose.
 //!
-//! Deferred: `getvcol`/`getvvcol`/`linetabsize*` (need `init_charsize_arg`'s
-//! own remaining gap: none currently known, worth a fresh look), and
-//! everything past the file's own "horizontal size" section (vertical
-//! size / fold-aware line-height calculations, needing `fold.c`).
+//! Also translated: **`getvcol`/`getvcol_nolist`/`getvvcol`/`getvcols`**
+//! (virtual-column lookups for a given buffer position - `cursor.c`'s
+//! `coladvance` family and the whole Visual-block-mode machinery's
+//! real dependency, now that `state.c`'s `virtual_active` exists) and
+//! the small `linetabsize*`/`win_linetabsize`/`win_charsize` wrapper
+//! family. `getvcol`'s three optional `colnr_T *` out-parameters
+//! (`start`/`cursor`/`end`) are modeled as `Option<&mut ColnrT>`,
+//! matching this crate's established convention for genuinely-nullable
+//! C out-parameters (e.g. `marktree.rs`'s `marktree_lookup`).
+//!
+//! Deferred: everything past the file's own "horizontal size" section
+//! (vertical size / fold-aware line-height calculations, needing
+//! `fold.c`).
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
-use crate::pos_defs::{ColnrT, LinenrT, MAXCOL};
+use crate::pos_defs::{ColnrT, LinenrT, MAXCOL, PosT};
+
+/// Flags used by [`getvcol`] (`plines.h`'s anonymous `enum`).
+pub const GETVCOL_END_EXCL_LBR: i32 = 1;
 
 /// Which character-size computation mode applies to a given line
 /// (`CSType`, a plain `bool` in the original - `kCharsizeRegular`/
@@ -727,6 +739,340 @@ pub unsafe fn linesize_fast(csarg: &CharsizeArg, vcol_arg: i32, len: ColnrT) -> 
     vcol_arg
 }
 
+/// Like [`linetabsize_col`] but for a given window/line instead of
+/// `curwin` (`win_linetabsize`, a `static inline` in the original).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn win_linetabsize(wp: *mut WinT, lnum: LinenrT, line: &[u8], len: ColnrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { init_charsize_arg(wp, lnum, line) };
+    if cstype == CsType::Fast {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { linesize_fast(&csarg, 0, len) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { linesize_regular(&mut csarg, 0, len) }
+    }
+}
+
+/// Like [`crate::plines::linesize_regular`]/[`linesize_fast`] combined
+/// with [`init_charsize_arg`], but `s` starts at virtual column
+/// `startvcol` (`linetabsize_col`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn linetabsize_col(startvcol: i32, s: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { init_charsize_arg(curwin, 0, s) };
+    if cstype == CsType::Fast {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { linesize_fast(&csarg, startvcol, MAXCOL) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { linesize_regular(&mut csarg, startvcol, MAXCOL) }
+    }
+}
+
+/// Return the number of cells line `lnum` of window `wp` will take on
+/// the screen, taking into account the size of a tab and inline
+/// virtual text. Doesn't count the size of `'listchars'` "eol"
+/// (`linetabsize`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn linetabsize(wp: *mut WinT, lnum: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_linetabsize(wp, lnum, &line, MAXCOL) }
+}
+
+/// Like [`linetabsize`], but counts the size of `'listchars'` "eol"
+/// (`linetabsize_eol`).
+///
+/// # Safety
+/// Same as [`linetabsize`].
+#[must_use]
+pub unsafe fn linetabsize_eol(wp: *mut WinT, lnum: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let size = unsafe { linetabsize(wp, lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let wpref = unsafe { &*wp };
+    size + i32::from(wpref.w_onebuf_opt.wo_list != 0 && wpref.w_p_lcs_chars.eol != 0)
+}
+
+/// Get virtual column number of `pos`.
+///  - `start`: on the first position of this character (TAB, ctrl)
+///  - `cursor`: where the cursor is on this character (first char,
+///    except for TAB)
+///  - `end`: on the last position of this character (TAB, ctrl)
+///
+/// When `'linebreak'` follows this character, `end` is set to the
+/// position before `'linebreak'` if `flags` contains
+/// [`GETVCOL_END_EXCL_LBR`], otherwise it's set to the end of
+/// `'linebreak'`.
+///
+/// This is used very often, keep it fast! (`getvcol`)
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Touches `crate::globals::GLOBALS` and
+/// `crate::option_vars::OPTION_VARS`.
+pub unsafe fn getvcol(
+    wp: *mut WinT,
+    pos: &mut PosT,
+    start: Option<&mut ColnrT>,
+    cursor: Option<&mut ColnrT>,
+    end: Option<&mut ColnrT>,
+    flags: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // start of the line
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, pos.lnum) };
+    let end_col = pos.col;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { init_charsize_arg(wp, pos.lnum, &line) };
+    let mut on_nul = false;
+    csarg.max_head_vcol = -1;
+
+    let mut vcol: i32 = 0;
+    let mut char_size;
+    let mut ci = crate::mbyte::utf_ptr2str_char_info(&line);
+    if cstype == CsType::Fast {
+        let use_tabstop = csarg.use_tabstop;
+        loop {
+            if line.get(ci.pos).copied().unwrap_or(0) == 0 {
+                // if cursor is at NUL, it is treated like 1 cell char
+                char_size = CharSize { width: 1, ..CharSize::default() };
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            char_size = unsafe {
+                charsize_fast_impl(&mut *wp, &line[ci.pos..], use_tabstop, vcol, ci.chr.value)
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            let next = unsafe { crate::mbyte::utfc_next(&line, ci) };
+            if next.pos as i32 > end_col {
+                break;
+            }
+            ci = next;
+            vcol += char_size.width;
+        }
+    } else {
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            char_size = unsafe {
+                charsize_regular(&mut csarg, &line[ci.pos..], ci.pos as i32, vcol, ci.chr.value)
+            };
+            // make sure we don't go past the end of the line
+            if line.get(ci.pos).copied().unwrap_or(0) == 0 {
+                // NUL at end of line only takes one column unless there is virtual text
+                char_size.width = 1 + csarg.cur_text_width_left + csarg.cur_text_width_right;
+                on_nul = true;
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let next = unsafe { crate::mbyte::utfc_next(&line, ci) };
+            if next.pos as i32 > end_col {
+                break;
+            }
+            ci = next;
+            vcol += char_size.width;
+        }
+    }
+
+    if line.get(ci.pos).copied().unwrap_or(0) == 0 && end_col < MAXCOL && end_col > ci.pos as i32 {
+        pos.col = ci.pos as ColnrT;
+    }
+
+    let incr = char_size.width;
+    let head = char_size.head;
+    let tail = char_size.tail;
+
+    if let Some(start) = start {
+        *start = vcol + head;
+    }
+    if let Some(end) = end {
+        *end = vcol + incr - (if flags & GETVCOL_END_EXCL_LBR != 0 { tail } else { 0 }) - 1;
+    }
+    if let Some(cursor) = cursor {
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let sel_is_e = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sel
+            .as_deref()
+            .and_then(|s| s.first())
+            .copied()
+            == Some(b'e');
+        // SAFETY: forwarded from this function's own safety doc.
+        let wpref = unsafe { &*wp };
+        if ci.chr.value == i32::from(TAB)
+            && (g.State & crate::state_defs::mode::NORMAL as i32) != 0
+            && wpref.w_onebuf_opt.wo_list == 0
+            && !crate::state::virtual_active(wpref)
+            && !(g.Visual.active
+                && (sel_is_e || crate::mark_defs::ltoreq(*pos, g.Visual.start)))
+        {
+            // TODO(zeertzjq): subtracting "tail" may lead to better cursor position
+            *cursor = vcol + incr - 1; // cursor at end
+        } else {
+            vcol += virt_text_cursor_off(&csarg, on_nul);
+            *cursor = vcol + head; // cursor at start
+        }
+    }
+}
+
+/// Get virtual cursor column in the current window, pretending
+/// `'list'` is off (`getvcol_nolist`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn getvcol_nolist(posp: &mut PosT) -> ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let list_save = unsafe { &*curwin }.w_onebuf_opt.wo_list;
+    let mut vcol = 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_onebuf_opt.wo_list = 0;
+    if posp.coladd != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvvcol(curwin, posp, None, Some(&mut vcol), None, 0) };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvcol(curwin, posp, None, Some(&mut vcol), None, 0) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_onebuf_opt.wo_list = list_save;
+    vcol
+}
+
+/// Get virtual column in virtual mode (`getvvcol`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+pub unsafe fn getvvcol(
+    wp: *mut WinT,
+    pos: &mut PosT,
+    start: Option<&mut ColnrT>,
+    cursor: Option<&mut ColnrT>,
+    end: Option<&mut ColnrT>,
+    flags: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::state::virtual_active(&*wp) } {
+        // For virtual mode, only want one value.
+        let mut col = 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvcol(wp, pos, Some(&mut col), None, None, flags) };
+
+        let mut coladd = pos.coladd;
+        let mut endadd = 0;
+
+        // Cannot put the cursor on part of a wide character.
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &mut *(*wp).w_buffer };
+        // SAFETY: forwarded from this function's own safety doc.
+        let ptr = unsafe { crate::memline::ml_get_buf(buf, pos.lnum) };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if pos.col < unsafe { crate::memline::ml_get_buf_len(buf, pos.lnum) } {
+            let c = crate::mbyte::utf_ptr2char(&ptr[pos.col as usize..]);
+            if c != i32::from(TAB) && crate::charset::vim_isprintc(c) {
+                // SAFETY: forwarded from this function's own safety doc.
+                endadd = unsafe { crate::charset::ptr2cells(&ptr[pos.col as usize..]) } - 1;
+                if coladd > endadd {
+                    endadd = 0; // past end of line
+                } else {
+                    coladd = 0;
+                }
+            }
+        }
+        col += coladd;
+
+        if let Some(start) = start {
+            *start = col;
+        }
+        if let Some(cursor) = cursor {
+            *cursor = col;
+        }
+        if let Some(end) = end {
+            *end = col + endadd;
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvcol(wp, pos, start, cursor, end, flags) };
+    }
+}
+
+/// Get the leftmost and rightmost virtual column of `pos1` and `pos2`.
+/// Used for Visual block mode (`getvcols`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+pub unsafe fn getvcols(
+    wp: *mut WinT,
+    pos1: &mut PosT,
+    pos2: &mut PosT,
+    left: &mut ColnrT,
+    right: &mut ColnrT,
+    flags: i32,
+) {
+    let mut from1 = 0;
+    let mut from2 = 0;
+    let mut to1 = 0;
+    let mut to2 = 0;
+
+    if crate::mark_defs::lt(*pos1, *pos2) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvvcol(wp, pos1, Some(&mut from1), None, Some(&mut to1), flags) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvvcol(wp, pos2, Some(&mut from2), None, Some(&mut to2), flags) };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvvcol(wp, pos2, Some(&mut from1), None, Some(&mut to1), flags) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getvvcol(wp, pos1, Some(&mut from2), None, Some(&mut to2), flags) };
+    }
+
+    *left = if from2 < from1 { from2 } else { from1 };
+
+    *right = if to2 > to1 {
+        let sel_is_e = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sel
+            .as_deref()
+            .and_then(|s| s.first())
+            .copied()
+            == Some(b'e');
+        if sel_is_e && from2 > to1 {
+            from2 - 1
+        } else {
+            to2
+        }
+    } else {
+        to1
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,5 +1576,257 @@ mod tests {
         // (not yet over - `vcol > MAXCOL` is false when equal), 'b'
         // pushes it to MAXCOL+1 (over) - clamped back to MAXCOL.
         assert_eq!(unsafe { linesize_fast(&csarg, MAXCOL - 1, MAXCOL) }, MAXCOL);
+    }
+
+    /// Opens `buf` (real block 0/data block allocation via `ml_open`)
+    /// and replaces its single starting empty line with `line`.
+    /// Callers must already hold `crate::globals::global_state_test_lock()`
+    /// for their whole test body (this touches `mf_sync` internally via
+    /// `ml_open`, per the crate-wide test-lock gotcha), and must clean
+    /// up via `Box::from_raw(buf.b_ml.ml_mfp)` + `mf_close` when done.
+    unsafe fn buf_with_line(line: &[u8]) -> BufT {
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, line) }, crate::vim_defs::OK);
+        buf
+    }
+
+    unsafe fn close_buf(buf: BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn getvcol_plain_ascii_middle_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let mut pos = PosT { lnum: 1, col: 2, coladd: 0 }; // 'l' in "hello"
+            let mut start = 0;
+            let mut cursor = 0;
+            let mut end = 0;
+            getvcol(
+                &mut win as *mut WinT,
+                &mut pos,
+                Some(&mut start),
+                Some(&mut cursor),
+                Some(&mut end),
+                0,
+            );
+            assert_eq!(start, 2);
+            assert_eq!(end, 2);
+            assert_eq!(cursor, 2);
+
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcol_tab_cursor_at_start_outside_normal_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(&[b'a', TAB, b'b', 0]);
+            buf.b_p_ts = 8;
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            // GLOBALS.State defaults to MODE_NORMAL (see Globals::default),
+            // so explicitly switch to Insert mode to exercise the "TAB
+            // special case doesn't apply" branch - cursor lands at the
+            // TAB's own start column instead of its end.
+            let g = crate::globals::GLOBALS.get_mut();
+            let prev_state = g.State;
+            g.State = crate::state_defs::mode::INSERT as i32;
+
+            let mut pos = PosT { lnum: 1, col: 1, coladd: 0 }; // the TAB itself
+            let mut start = 0;
+            let mut cursor = 0;
+            getvcol(&mut win as *mut WinT, &mut pos, Some(&mut start), Some(&mut cursor), None, 0);
+            // vcol before the TAB is 1 ('a'); padding = 8 - (1%8) = 7.
+            assert_eq!(start, 1);
+            assert_eq!(cursor, 1);
+
+            crate::globals::GLOBALS.get_mut().State = prev_state;
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcol_tab_cursor_at_end_in_normal_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(&[b'a', TAB, b'b', 0]);
+            buf.b_p_ts = 8;
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let g = crate::globals::GLOBALS.get_mut();
+            let prev_state = g.State;
+            g.State = crate::state_defs::mode::NORMAL as i32;
+
+            let mut pos = PosT { lnum: 1, col: 1, coladd: 0 }; // the TAB itself
+            let mut cursor = 0;
+            getvcol(&mut win as *mut WinT, &mut pos, None, Some(&mut cursor), None, 0);
+            // vcol before TAB = 1, padding = 7, incr = 7 -> cursor at
+            // end = vcol(1) + incr(7) - 1 = 7.
+            assert_eq!(cursor, 7);
+
+            crate::globals::GLOBALS.get_mut().State = prev_state;
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcol_col_past_end_of_line_gets_clamped_to_real_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"ab\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let mut pos = PosT { lnum: 1, col: 5, coladd: 0 }; // past the end, but < MAXCOL
+            getvcol(&mut win as *mut WinT, &mut pos, None, None, None, 0);
+            assert_eq!(pos.col, 2); // clamped to the NUL's own byte offset
+
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcol_maxcol_position_stays_maxcol_and_treats_nul_as_one_cell() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"ab\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let mut pos = PosT { lnum: 1, col: MAXCOL, coladd: 0 };
+            let mut start = 0;
+            let mut end = 0;
+            getvcol(&mut win as *mut WinT, &mut pos, Some(&mut start), None, Some(&mut end), 0);
+            assert_eq!(pos.col, MAXCOL); // never clamped: end_col was not < MAXCOL
+            assert_eq!(start, 2);
+            assert_eq!(end, 2);
+
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcol_nolist_basic_ascii() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let g = crate::globals::GLOBALS.get_mut();
+            let prev_curwin = g.curwin;
+            g.curwin = &mut win as *mut WinT;
+
+            let mut pos = PosT { lnum: 1, col: 2, coladd: 0 };
+            let vcol = getvcol_nolist(&mut pos);
+            assert_eq!(vcol, 2);
+
+            crate::globals::GLOBALS.get_mut().curwin = prev_curwin;
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvvcol_passes_through_to_getvcol_when_not_virtual_active() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+            // Default `w_onebuf_opt.wo_ve_flags`/`OPTION_VARS.ve_flags`
+            // are both 0, so `virtual_active` is false - `getvvcol`
+            // should behave identically to a direct `getvcol` call.
+            let mut pos = PosT { lnum: 1, col: 2, coladd: 0 };
+            let mut start = 0;
+            getvvcol(&mut win as *mut WinT, &mut pos, Some(&mut start), None, None, 0);
+            assert_eq!(start, 2);
+
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn getvcols_reports_leftmost_and_rightmost_columns() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello world\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+            let mut pos1 = PosT { lnum: 1, col: 6, coladd: 0 }; // 'w'
+            let mut pos2 = PosT { lnum: 1, col: 2, coladd: 0 }; // 'l' (pos2 < pos1)
+            let mut left = 0;
+            let mut right = 0;
+            getvcols(&mut win as *mut WinT, &mut pos1, &mut pos2, &mut left, &mut right, 0);
+            // lt(pos1, pos2) is false (pos1.col=6 > pos2.col=2), so the
+            // original swaps which position feeds "from1"/"from2" - but
+            // left/right end up the same either way for single-width text.
+            assert_eq!(left, 2);
+            assert_eq!(right, 6);
+
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn linetabsize_col_plain_ascii() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = g.curwin;
+        g.curwin = &mut win as *mut WinT;
+
+        // lnum=0 means init_charsize_arg never dereferences w_buffer,
+        // so no real memline/ml_open setup is needed for this case.
+        assert_eq!(unsafe { linetabsize_col(0, b"abc\0") }, 3);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn win_linetabsize_plain_ascii() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        assert_eq!(unsafe { win_linetabsize(&mut win as *mut WinT, 0, b"abc\0", MAXCOL) }, 3);
+    }
+
+    #[test]
+    fn linetabsize_reads_real_buffer_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"abc\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+            assert_eq!(linetabsize(&mut win as *mut WinT, 1), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn linetabsize_eol_adds_one_when_list_and_eol_char_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"abc\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+            win.w_onebuf_opt.wo_list = 1;
+            win.w_p_lcs_chars.eol = u32::from(b'$');
+            assert_eq!(linetabsize_eol(&mut win as *mut WinT, 1), 4);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn linetabsize_eol_no_extra_without_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"abc\0");
+            let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+            assert_eq!(linetabsize_eol(&mut win as *mut WinT, 1), 3);
+            close_buf(buf);
+        }
     }
 }
