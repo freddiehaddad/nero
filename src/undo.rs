@@ -19,9 +19,16 @@
 //!   I/O for its own core paths) and autocmd triggers (`autocmd.c`).
 //! - `u_compute_hash`/`u_get_undo_file_name`/`u_write_undo`/
 //!   `u_read_undo`/`serialize_*`/`unserialize_*`: undo-FILE
-//!   persistence, needs real file I/O (`os/fs.c`, blocked on the
-//!   libuv FFI-vs-crate decision, phase 11) and SHA-256 hashing of file
-//!   state (have `sha256.rs`, but not wired to real file reads yet).
+//!   persistence. Re-checked after `os/fs.rs` gained real `os_open` -
+//!   the "blocked on the libuv FFI-vs-crate decision" framing was
+//!   stale (real file I/O is no longer the blocker), but these are
+//!   still genuinely blocked for other reasons: `u_write_undo` alone
+//!   needs real user-facing `smsg`/verbose messages (`message.c`,
+//!   still not tractable), `os_getperm` (still deferred, see
+//!   `os/fs.rs`'s own module doc), `'undodir'`-based directory search
+//!   (`u_get_undo_file_name`), and its own serialization format
+//!   (`serialize_header`/`serialize_uhp`/etc., not yet examined) -
+//!   still a substantial, separate undertaking.
 //! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: need
 //!   `ml_get_buf`/`ml_replace` (`memline.c`).
 //! - `bufIsChanged`/`anyBufIsChanged`/`curbufIsChanged`: `bt_prompt`/

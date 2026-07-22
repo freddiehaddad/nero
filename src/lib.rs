@@ -49,6 +49,7 @@ pub mod marktree_defs;
 pub mod math;
 pub mod memfile;
 pub mod memfile_defs;
+pub mod memline;
 pub mod memline_defs;
 pub mod memory;
 pub mod memory_defs;
