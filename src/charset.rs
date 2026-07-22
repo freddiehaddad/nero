@@ -49,15 +49,17 @@
 //!   it's a pure subset of what `vim_isprintc` itself already covers
 //!   for `c <= 0xFF`, and `chartab_initialized` can never become `true`
 //!   in this crate anyway (nothing sets it).
-//! - `trans_characters`/`transstr_len`/`transstr_buf`/`str_foldcase`:
-//!   `transstr` itself is now translated (this pass) - see its own doc
-//!   comment for why `transstr_len` isn't (no real caller, superseded
-//!   by `Vec`'s dynamic growth) and why `transstr_buf`'s own
-//!   length-truncating variant is deferred separately (needed by
-//!   `drawline.c`/`statusline.c`, neither yet translated).
-//!   `trans_characters` (in-place, fixed-buffer-with-room-budget
-//!   mutation of a caller's own buffer) and `str_foldcase` remain
-//!   deferred - re-examine once a real caller of either surfaces.
+//! - `trans_characters`/`transstr_len`/`transstr_buf`: `transstr`
+//!   itself is now translated - see its own doc comment for why
+//!   `transstr_len` isn't (no real caller, superseded by `Vec`'s
+//!   dynamic growth) and why `transstr_buf`'s own length-truncating
+//!   variant is deferred separately (needed by `drawline.c`/
+//!   `statusline.c`, neither yet translated). `str_foldcase` is now
+//!   translated too (its unlimited/`buf == NULL` case; the
+//!   fixed-buffer-truncating variant, used by `syntax.c`, is deferred
+//!   the same way as `transstr_buf`'s). `trans_characters` (in-place,
+//!   fixed-buffer-with-room-budget mutation of a caller's own buffer)
+//!   remains deferred - re-examine once a real caller surfaces.
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -553,6 +555,71 @@ pub unsafe fn transstr(s: &[u8], untab: bool) -> Vec<u8> {
     out
 }
 
+/// Convert `str_` to lowercase, treating multi-byte characters as
+/// well as possible (`str_foldcase`, the unlimited/`buf == NULL` case
+/// only - see this function's own "Deferred" note).
+///
+/// Similar in spirit to `strings.rs`'s own `strcase_save(orig, false)`,
+/// but NOT identical: this preserves the original's own extra gating
+/// condition, `(c < 0x80 || olen > 1) && c != lc` - a single INVALID
+/// byte `>= 0x80` (`olen == 1` for an otherwise-illegal UTF-8 lead
+/// byte) is left completely untouched here, whereas `strcase_save`
+/// would still attempt `mb_tolower` on it. Composing/combining marks
+/// following a base character are always copied through byte-for-byte
+/// unchanged (only the base character itself is ever decoded via
+/// `utf_ptr2char`/replaced) - matches the original's own
+/// `i += utfc_ptr2len(...)` advance (the *composed* length) versus
+/// `olen = utf_ptr2len(...)` (the base character's own length used
+/// for the replacement decision).
+///
+/// `str_` is treated as NUL-terminated (this crate's usual
+/// line-storage convention), not scanned for exactly `orglen` bytes as
+/// the original's own explicit length parameter allows (no current
+/// caller needs an embedded-NUL substring).
+///
+/// # Deferred
+/// The original's `buf != NULL` fixed-buffer, `buflen`-truncating
+/// variant (used by `syntax.c`, not yet translated) is not
+/// implemented here - only the unlimited/allocating case.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`crate::mbyte::mb_tolower`]/[`crate::mbyte::utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn str_foldcase(str_: &[u8]) -> Vec<u8> {
+    let mut res = Vec::with_capacity(str_.len() + 1);
+    let mut pos = 0usize;
+
+    while pos < str_.len() && str_[pos] != 0 {
+        let c = crate::mbyte::utf_ptr2char(&str_[pos..]);
+        let olen = crate::mbyte::utf_ptr2len(&str_[pos..]) as usize;
+        // SAFETY: forwarded from this function's own safety doc.
+        let lc = unsafe { crate::mbyte::mb_tolower(c) };
+
+        // Only replace when it's not an invalid sequence (ASCII
+        // character or more than one byte) and mb_tolower() actually
+        // changes it.
+        if (c < 0x80 || olen > 1) && c != lc {
+            let mut buf = [0u8; crate::mbyte_defs::MB_MAXBYTES];
+            let nlen = crate::mbyte::utf_char2bytes(lc, &mut buf) as usize;
+            res.extend_from_slice(&buf[..nlen]);
+        } else {
+            res.extend_from_slice(&str_[pos..pos + olen]);
+        }
+
+        // Composing/combining marks (if any) are never decoded or
+        // replaced above - copy them through unchanged.
+        // SAFETY: forwarded from this function's own safety doc.
+        let composed_len = unsafe { crate::mbyte::utfc_ptr2len(&str_[pos..]) } as usize;
+        if composed_len > olen {
+            res.extend_from_slice(&str_[pos + olen..pos + composed_len]);
+        }
+        pos += composed_len;
+    }
+    res.push(0);
+    res
+}
+
 /// Return number of display cells occupied by character at `p`
 /// (`ptr2cells`).
 ///
@@ -971,6 +1038,55 @@ mod tests {
         let mut buf = crate::buffer_defs::BufT::default();
         let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
         assert_eq!(unsafe { transstr(b"\0", false) }, b"\0");
+    }
+
+    #[test]
+    fn str_foldcase_plain_ascii_is_lowercased() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { str_foldcase(b"ABC\0") }, b"abc\0");
+    }
+
+    #[test]
+    fn str_foldcase_already_lowercase_is_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { str_foldcase(b"abc\0") }, b"abc\0");
+    }
+
+    #[test]
+    fn str_foldcase_lone_invalid_byte_is_left_untouched() {
+        // 0xC0 alone (an illegal UTF-8 lead byte with no continuation)
+        // would become 0xE0 under a blind mb_tolower call - verified
+        // directly via a throwaway scratch probe - but str_foldcase's
+        // own gate (c < 0x80 || olen > 1) excludes single invalid
+        // bytes >= 0x80 from ever being replaced, matching the
+        // original's own explicit intent.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { str_foldcase(&[0xC0, 0]) }, [0xC0, 0]);
+    }
+
+    #[test]
+    fn str_foldcase_preserves_a_following_combining_mark() {
+        // "E" + COMBINING ACUTE ACCENT (U+0301) - only the base letter
+        // is decoded/replaced; the combining mark is copied through
+        // byte-for-byte unchanged (verified against the composing
+        // behavior already confirmed for mbyte.rs's utfc_next).
+        let _guard = crate::globals::global_state_test_lock();
+        let input = "E\u{0301}\0".as_bytes();
+        let expected = "e\u{0301}\0".as_bytes();
+        assert_eq!(unsafe { str_foldcase(input) }, expected);
+    }
+
+    #[test]
+    fn str_foldcase_cjk_character_has_no_case_and_is_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        let input = "一\0".as_bytes();
+        assert_eq!(unsafe { str_foldcase(input) }, input);
+    }
+
+    #[test]
+    fn str_foldcase_empty_string_is_just_the_nul() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { str_foldcase(b"\0") }, b"\0");
     }
 
     #[test]
