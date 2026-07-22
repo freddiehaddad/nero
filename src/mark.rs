@@ -7,7 +7,11 @@
 //! `free_all_marks`, `mark_check`/`mark_check_line_bounds`,
 //! `clrallmarks`, `setpcmark`, `checkpcmark`, `get_changelist`,
 //! `pos_to_mark`, `mark_get_visual` (now tractable now that
-//! `crate::os::time::os_time` and `crate::option_vars` both exist).
+//! `crate::os::time::os_time` and `crate::option_vars` both exist);
+//! `tag.c`'s `tagstack_clear_entry` (small enough to translate
+//! alongside its only real consumer rather than waiting on the rest
+//! of `tag.c`) and `mark_forget_file` (now tractable now that
+//! `tagstack_clear_entry` exists).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -16,7 +20,6 @@
 //! - `mark_jumplist_iter`/`mark_global_iter`: only consumed by
 //!   `shada.c` (not yet translated); their C-style "raw pointer as an
 //!   opaque continuation token" API doesn't have an urgent caller yet.
-//! - `mark_forget_file`: needs `tagstack_clear_entry` (`tag.c`).
 //! - `get_jumplist`/`mark_get`/`mark_get_global`/`mark_get_local`/
 //!   `mark_get_motion`/`switch_to_mark_buf`/`mark_move_to`: need
 //!   buffer-list lookup (`buflist_findnr`/`buflist_getfile`, still
@@ -25,10 +28,18 @@
 //! - `mark_view_restore`: needs `set_topline`/`hasFolding`/
 //!   `linetabsize_eol` (the display/fold subsystem).
 //! - `fname2fnum`/`fmarks_check_names`/`fmarks_check_one`: need path
-//!   resolution (`expand_env`/`os_dirname`/`path_shorten_fname`),
-//!   `buflist_new()` (`buffer.c`), and `TabpageT`'s real window-list
-//!   fields (still an opaque placeholder).
-//! - `fm_getname`/`mark_line`: need `ml_get()` (`memline.c`).
+//!   resolution (`expand_env`/`path_shorten_fname` - the latter
+//!   re-checked this session and found to need `path_fnamencmp`,
+//!   which itself needs `mbyte.c`'s UTF-8 helpers - `mbyte.c` needs
+//!   its own FFI-vs-crate decision for `utf8proc`, not yet made),
+//!   `buflist_new()` (`buffer.c`, itself needing the eval engine's
+//!   `dict_T` - re-checked this session by reading the real function,
+//!   genuinely phase-5 material, not close), and `TabpageT`'s real
+//!   window-list fields (still an opaque placeholder).
+//! - `fm_getname`/`mark_line`: need `ml_get()` (`memline.c` - `ml_open`
+//!   now exists, but `ml_get` itself needs `ml_find_line`'s real
+//!   B-tree traversal algorithm, deliberately not rushed - see
+//!   `memline.rs`'s own module doc comment).
 //! - `ex_marks`/`ex_delmarks`/`ex_jumps`/`ex_clearjumps`/`ex_changes`:
 //!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
 //!   (see `ex_cmds_defs.rs`'s own module doc).
@@ -39,7 +50,7 @@
 //!   `get_global_marks`: need `list_T`'s real fields (the eval engine,
 //!   phase 5).
 
-use crate::buffer_defs::{BufT, WinT};
+use crate::buffer_defs::{BufT, TaggyT, WinT};
 use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
 use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS};
@@ -129,6 +140,41 @@ pub fn mark_jumplist_forget_file(wp: &mut crate::buffer_defs::WinT, fnum: i32) {
             wp.w_jumplistlen -= 1;
             for j in idx..(wp.w_jumplistlen as usize) {
                 wp.w_jumplist[j] = std::mem::take(&mut wp.w_jumplist[j + 1]);
+            }
+        }
+        i -= 1;
+    }
+}
+
+/// Free a single entry in a tag stack (`tagstack_clear_entry`).
+pub fn tagstack_clear_entry(item: &mut TaggyT) {
+    item.tagname = Vec::new();
+    item.user_data = None;
+}
+
+/// Delete every entry referring to file `fnum` from both the jumplist
+/// and the tag stack (`mark_forget_file`).
+pub fn mark_forget_file(wp: &mut crate::buffer_defs::WinT, fnum: i32) {
+    mark_jumplist_forget_file(wp, fnum);
+
+    // Remove all tag stack entries that match the deleted buffer.
+    let mut i = wp.w_tagstacklen - 1;
+    while i >= 0 {
+        let idx = i as usize;
+        if wp.w_tagstack[idx].fmark.fnum == fnum {
+            // Found an entry that we want to delete.
+            tagstack_clear_entry(&mut wp.w_tagstack[idx]);
+
+            // If the current tag stack index is behind the entry we
+            // want to delete, move it back by one.
+            if wp.w_tagstackidx > i {
+                wp.w_tagstackidx -= 1;
+            }
+
+            // Actually remove the entry from the tag stack.
+            wp.w_tagstacklen -= 1;
+            for j in idx..(wp.w_tagstacklen as usize) {
+                wp.w_tagstack[j] = std::mem::take(&mut wp.w_tagstack[j + 1]);
             }
         }
         i -= 1;
@@ -528,6 +574,50 @@ mod tests {
         assert_eq!(wp.w_jumplistlen, 1);
         assert_eq!(wp.w_jumplist[0].fmark.fnum, 2);
         assert_eq!(wp.w_jumplistidx, 1);
+    }
+
+    #[test]
+    fn tagstack_clear_entry_clears_tagname_and_user_data() {
+        let mut item = TaggyT {
+            tagname: b"myfunc".to_vec(),
+            user_data: Some(b"extra".to_vec()),
+            ..Default::default()
+        };
+        tagstack_clear_entry(&mut item);
+        assert!(item.tagname.is_empty());
+        assert!(item.user_data.is_none());
+    }
+
+    #[test]
+    fn mark_forget_file_removes_matching_entries_from_both_jumplist_and_tagstack() {
+        let mut wp = WinT {
+            w_jumplistlen: 2,
+            w_jumplistidx: 2,
+            w_tagstacklen: 3,
+            w_tagstackidx: 3,
+            ..Default::default()
+        };
+        wp.w_jumplist[0].fmark.fnum = 1;
+        wp.w_jumplist[1].fmark.fnum = 2;
+        wp.w_tagstack[0].fmark.fnum = 1;
+        wp.w_tagstack[0].tagname = b"one".to_vec();
+        wp.w_tagstack[1].fmark.fnum = 2;
+        wp.w_tagstack[1].tagname = b"two".to_vec();
+        wp.w_tagstack[2].fmark.fnum = 1;
+        wp.w_tagstack[2].tagname = b"three".to_vec();
+
+        mark_forget_file(&mut wp, 1);
+
+        // jumplist: entry 0 (fnum 1) removed.
+        assert_eq!(wp.w_jumplistlen, 1);
+        assert_eq!(wp.w_jumplist[0].fmark.fnum, 2);
+
+        // tagstack: entries 0 and 2 (fnum 1) removed, entry 1 (fnum 2)
+        // remains, shifted down to index 0.
+        assert_eq!(wp.w_tagstacklen, 1);
+        assert_eq!(wp.w_tagstack[0].fmark.fnum, 2);
+        assert_eq!(wp.w_tagstack[0].tagname, b"two");
+        assert_eq!(wp.w_tagstackidx, 1);
     }
 
     #[test]
