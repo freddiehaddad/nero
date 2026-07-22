@@ -10,8 +10,12 @@
 //! `in_win_border`), `set_valid_virtcol` (needed by `cursor.c`'s
 //! `coladvance`/`coladvance_force`), and now, with `plines.c`'s
 //! `getvvcol` available: `check_cursor_moved`, `validate_virtcol`,
-//! `update_curswant`/`update_curswant_force`, `cursor_valid`. Each
-//! omits the same kind of pure redraw-scheduling side effect already
+//! `validate_cursor_col`, `update_curswant`/`update_curswant_force`,
+//! `cursor_valid`, plus the trivial `w_valid`-bit-clearing family
+//! `changed_cline_bef_curs`/`changed_line_abv_curs`/
+//! `changed_line_abv_curs_win`/`invalidate_botline_win`/
+//! `approximate_botline_win`. Each of the non-trivial functions omits
+//! the same kind of pure redraw-scheduling side effect already
 //! established for `set_valid_virtcol` (`redraw_for_cursorcolumn`), and
 //! `check_cursor_moved`'s own "concealed line visibility toggled"
 //! inner branch (reached only when `wp == curwin`,
@@ -20,10 +24,18 @@
 //! `decoration.c`'s `conceal_cursor_line`/`decor_conceal_line`, neither
 //! translated yet.
 //!
+//! `validate_botline_win` (which would otherwise be a trivial one-line
+//! wrapper) was investigated and NOT translated: its real work,
+//! `comp_botline`, needs `plines_correct_topline` (fold-aware,
+//! `fold.c`'s real tree search), `redraw_for_cursorline`/
+//! `set_empty_rows`/`win_check_anchored_floats` (redraw + floating-
+//! window machinery) - genuinely substantial, not a quick win.
+//!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
-//! `validate_cursor`/`curs_rows`/`validate_cheight` - all need
-//! `fold.c`'s real fold-tree search and/or the redraw pipeline).
+//! `validate_cursor`/`curs_rows`/`validate_cheight`/`validate_botline_win`,
+//! all needing `fold.c`'s real fold-tree search and/or the redraw
+//! pipeline).
 
 use crate::buffer_defs::{w_valid, WinT};
 use crate::types_defs::SIGN_WIDTH;
@@ -280,6 +292,72 @@ pub unsafe fn validate_cursor_col(wp: *mut WinT) {
     w.w_wcol = col;
 
     w.w_valid |= i32::from(w_valid::VALID_WCOL);
+}
+
+/// Called when text before the cursor changed in a way that affects
+/// its screen position - clears bits related to lines up to and
+/// including the cursor's own line, but not `w_botline`
+/// (`changed_cline_bef_curs`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn changed_cline_bef_curs(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_valid &= !(i32::from(w_valid::VALID_WROW)
+        | i32::from(w_valid::VALID_WCOL)
+        | i32::from(w_valid::VALID_VIRTCOL)
+        | i32::from(w_valid::VALID_CROW)
+        | i32::from(w_valid::VALID_CHEIGHT)
+        | i32::from(w_valid::VALID_TOPLINE));
+}
+
+/// Call this when the length of a line (in screen characters) above
+/// the cursor has changed. Need to take care of `w_botline`
+/// separately! (`changed_line_abv_curs_win`)
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn changed_line_abv_curs_win(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_valid &= !(i32::from(w_valid::VALID_WROW)
+        | i32::from(w_valid::VALID_WCOL)
+        | i32::from(w_valid::VALID_VIRTCOL)
+        | i32::from(w_valid::VALID_CROW)
+        | i32::from(w_valid::VALID_CHEIGHT)
+        | i32::from(w_valid::VALID_TOPLINE));
+}
+
+/// Like [`changed_line_abv_curs_win`], but for `curwin`
+/// (`changed_line_abv_curs`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+pub unsafe fn changed_line_abv_curs() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_line_abv_curs_win(curwin) };
+}
+
+/// Mark `wp.w_botline` as invalid, because of some change in the
+/// buffer (`invalidate_botline_win`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn invalidate_botline_win(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_valid &=
+        !(i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP));
+}
+
+/// Mark `wp.w_botline` as only approximately valid (`approximate_botline_win`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn approximate_botline_win(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_valid &= !i32::from(w_valid::VALID_BOTLINE);
 }
 
 #[cfg(test)]
@@ -640,5 +718,76 @@ mod tests {
         assert_eq!(win.w_curswant, 99); // untouched
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn changed_cline_bef_curs_clears_expected_bits_only() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_WROW)
+            | i32::from(w_valid::VALID_WCOL)
+            | i32::from(w_valid::VALID_VIRTCOL)
+            | i32::from(w_valid::VALID_CROW)
+            | i32::from(w_valid::VALID_CHEIGHT)
+            | i32::from(w_valid::VALID_TOPLINE)
+            | i32::from(w_valid::VALID_BOTLINE); // must survive
+
+        unsafe { changed_cline_bef_curs(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
+    }
+
+    #[test]
+    fn changed_line_abv_curs_win_clears_expected_bits_only() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_WROW)
+            | i32::from(w_valid::VALID_TOPLINE)
+            | i32::from(w_valid::VALID_BOTLINE); // must survive
+
+        unsafe { changed_line_abv_curs_win(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
+    }
+
+    #[test]
+    fn changed_line_abv_curs_operates_on_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_WROW) | i32::from(w_valid::VALID_BOTLINE);
+
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        unsafe { changed_line_abv_curs() };
+
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn invalidate_botline_win_clears_both_botline_bits() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_BOTLINE)
+            | i32::from(w_valid::VALID_BOTLINE_AP)
+            | i32::from(w_valid::VALID_WROW); // must survive
+
+        unsafe { invalidate_botline_win(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_WROW));
+    }
+
+    #[test]
+    fn approximate_botline_win_clears_only_botline() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP); // must survive
+
+        unsafe { approximate_botline_win(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE_AP));
     }
 }
