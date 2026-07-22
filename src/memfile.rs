@@ -7,30 +7,38 @@
 //! translated as a `debug_assert!` instead - see `mf_put`'s own doc
 //! comment), `mf_free`, `mf_trans_add`, `mf_trans_del`, `mf_need_trans`,
 //! `mf_free_fnames`, `mf_fullname`, `mf_set_fnames` (via
-//! `crate::path::full_name_save`).
+//! `crate::path::full_name_save`), `mf_read`, `mf_write`.
+//!
+//! `mf_read`/`mf_write` each call `PERROR()`/`emsg()` (`message.c`) on
+//! their error paths purely as a side effect before returning `FAIL` -
+//! this doesn't change either function's own control flow (they
+//! already know to return `FAIL` regardless of whether the message
+//! displays), so the message display itself is omitted here rather
+//! than blocking translation on `message.c`; `did_swapwrite_msg`
+//! (`crate::globals::GLOBALS`, a real `EXTERN` global, not a stub) is
+//! still updated faithfully, since it's genuine program state read
+//! elsewhere (`input.c`), not just message-display plumbing.
+//! `mf_write` additionally omits its retry-with-reopen-on-failure
+//! fallback (recovering from e.g. a disconnected network drive): that
+//! needs `mf_do_open`'s flag-translation logic, out of scope for this
+//! pass - documented on `mf_write`'s own doc comment as a narrow,
+//! explicit gap, not silently dropped.
 //!
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
 //! - `mf_open`/`mf_open_file`/`mf_close`/`mf_close_file`/`mf_do_open`/
-//!   `mf_read`/`mf_write`/`mf_sync`: need real byte-level file
-//!   read/write/seek. `MemfileT.mf_fd` is now `Option<std::fs::File>`
-//!   (done - see `memfile_defs.rs`'s own doc comment on that field),
-//!   ready for these to be built on top of `std::io::{Read, Write,
-//!   Seek}` directly, same "std covers synchronous I/O without needing
-//!   libuv" reasoning already validated for `os/time.rs`/`os/env.rs`/
-//!   `os/fs.rs`. `mf_write` in particular has real remaining
-//!   complexity beyond the type change alone (gap-filling the file
-//!   with data from other still-hashed blocks, a two-attempt
-//!   retry-with-reopen loop, and a genuine `emsg()` call on final
-//!   failure that can't be simplified away like `mf_put`'s
-//!   internal-only `iemsg()` could).
-//! - `mf_get`: calls `mf_read()` on a cache miss, so can't be completed
-//!   without it.
+//!   `mf_sync`: need the file-open flag translation and/or
+//!   symlink-attack security checks (`os_fileinfo_link`) not yet
+//!   built.
+//! - `mf_get`: calls `mf_read()` (done) but also `mf_alloc_bhdr`/hash
+//!   bookkeeping in a cache-miss path intertwined with `mf_open`'s
+//!   not-yet-translated state; revisit once `mf_open` exists.
 //! - `mf_release_all`: calls `mf_close()`.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
-use crate::vim_defs::OK;
+use crate::vim_defs::{FAIL, OK};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// `mf_new_page_size`.
 pub fn mf_new_page_size(mfp: &mut MemfileT, new_size: u32) {
@@ -170,6 +178,144 @@ pub unsafe fn mf_new(mfp: &mut MemfileT, negative: bool, page_count: u32) -> *mu
     }
 
     hp
+}
+
+/// Read a block from disk (`mf_read`).
+///
+/// @return `OK` on success, `FAIL` on failure (no file, seek error, or
+///         short read - see the module doc comment for why the
+///         original's `PERROR()` message display is omitted here).
+///
+/// # Safety
+/// `hp` must be a valid `BhdrT` pointer whose `bh_data` is a
+/// [`BhData::Data`] buffer of exactly `mfp.mf_page_size * bh_page_count`
+/// bytes (true for every block this crate allocates via
+/// [`mf_alloc_bhdr`]/[`mf_new`]).
+pub unsafe fn mf_read(mfp: &mut MemfileT, hp: *mut BhdrT) -> i32 {
+    let Some(file) = mfp.mf_fd.as_mut() else {
+        return FAIL; // there is no file, can't read
+    };
+
+    let page_size = mfp.mf_page_size;
+    // SAFETY: caller contract (see function doc).
+    let bh_bnum = unsafe { (*hp).bh_bnum };
+    let offset = (page_size as u64) * (bh_bnum as u64);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return FAIL; // Seek error in swap file read
+    }
+
+    // SAFETY: caller contract (see function doc).
+    let buf = unsafe { (*hp).bh_data.as_data_mut() };
+    if file.read_exact(buf).is_err() {
+        return FAIL; // Read error in swap file
+    }
+
+    OK
+}
+
+/// Write a block to disk (`mf_write`).
+///
+/// We don't want gaps in the file. Write the blocks in front of `hp`
+/// to extend the file. If block `mfp.mf_infile_count` is not in the
+/// hash list, it has been freed - fill the space in the file with
+/// (duplicated) data from the current block, exactly like the
+/// original (not zeros - simpler/more portable than a sparse-file
+/// hole).
+///
+/// Two things are intentionally simplified from the original, both
+/// documented in the module doc comment: the `PERROR()`/`emsg()`
+/// message displays on each failure path are omitted (control flow is
+/// unaffected either way; `did_swapwrite_msg` bookkeeping is still
+/// updated faithfully), and the retry-with-reopen-on-failure fallback
+/// (recovering from e.g. a disconnected network drive) is not
+/// implemented, collapsing the original's two-attempt loop to one.
+///
+/// @return `OK` on success, `FAIL` on failure (no file, couldn't
+///         translate a negative block number, seek error, or write
+///         error).
+///
+/// # Safety
+/// `hp` must be a valid `BhdrT` pointer, as must every block header
+/// reachable via `mfp.mf_hash`.
+pub unsafe fn mf_write(mfp: &mut MemfileT, hp: *mut BhdrT) -> i32 {
+    if mfp.mf_fd.is_none() && !mfp.mf_reopen {
+        // there is no file and there was no file, can't write
+        return FAIL;
+    }
+
+    // SAFETY: caller contract (see function doc).
+    if unsafe { (*hp).bh_bnum } < 0 {
+        // must assign file block number
+        if unsafe { mf_trans_add(mfp, hp) } == FAIL {
+            return FAIL;
+        }
+    }
+
+    let page_size = mfp.mf_page_size;
+
+    loop {
+        // SAFETY: caller contract (see function doc).
+        let hp_bnum = unsafe { (*hp).bh_bnum };
+        let mut nr = hp_bnum;
+        // `None` means "freed block, fill with dummy data"; `Some(hp)`
+        // is the common case (writing the block we were asked to write).
+        let hp2: Option<*mut BhdrT> = if nr > mfp.mf_infile_count {
+            // beyond end of file
+            nr = mfp.mf_infile_count;
+            mfp.mf_hash.get(&nr).copied() // None caught below
+        } else {
+            Some(hp)
+        };
+
+        let offset = (page_size as u64) * (nr as u64);
+        // page_count/data source: 1 page of hp's own data when filling a
+        // gap (hp2 == None, matching the original: it still reads from
+        // hp->bh_data, just capped to a single page), else hp2's real
+        // page count/data.
+        let page_count = match hp2 {
+            // SAFETY: hp2 is valid per this function's own safety doc.
+            Some(p) => unsafe { (*p).bh_page_count },
+            None => 1,
+        };
+        let size = (page_size * page_count) as usize;
+        let data_ptr = hp2.unwrap_or(hp);
+        // SAFETY: data_ptr (hp2 or hp) is valid per this function's own
+        // safety doc; this borrow is of *data_ptr, unrelated to mfp, so
+        // it coexists fine with the `mfp.mf_fd.as_mut()` borrow below.
+        let full_data: &[u8] = unsafe { (*data_ptr).bh_data.as_data() };
+        let data = &full_data[..size];
+
+        let write_ok = match mfp.mf_fd.as_mut() {
+            Some(file) => {
+                file.seek(SeekFrom::Start(offset)).is_ok() && file.write_all(data).is_ok()
+            }
+            None => false,
+        };
+
+        if !write_ok {
+            // Avoid repeating the error message, this mostly happens when
+            // the disk is full. We give the message again only after a
+            // successful write or when hitting a key (message display
+            // itself omitted here - see this function's own doc comment).
+            unsafe { crate::globals::GLOBALS.get_mut() }.did_swapwrite_msg = true;
+            return FAIL;
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.did_swapwrite_msg = false;
+        if let Some(hp2) = hp2 {
+            // written a non-dummy block
+            unsafe { (*hp2).bh_flags &= !BH_DIRTY };
+        }
+        if nr + BlocknrT::from(page_count) > mfp.mf_infile_count {
+            // appended to file
+            mfp.mf_infile_count = nr + BlocknrT::from(page_count);
+        }
+        if nr == hp_bnum {
+            // written the desired block
+            break;
+        }
+    }
+    OK
 }
 
 /// Signal that block `hp` has been modified, updating dirty state and
@@ -537,6 +683,183 @@ mod tests {
             // fresh non-negative number.
             assert!((*hp).bh_bnum >= 0);
 
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    /// A unique temp file path under the system temp dir, removed on
+    /// drop (RAII) - same pattern as `crate::os::fs`'s own test helper.
+    struct TempFilePath {
+        path: std::path::PathBuf,
+    }
+
+    impl TempFilePath {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "nero_memfile_test_{name}_{}_{unique}",
+                std::process::id()
+            ));
+            TempFilePath { path }
+        }
+    }
+
+    impl Drop for TempFilePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn open_rw_truncate(path: &std::path::Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap()
+    }
+
+    #[test]
+    fn mf_read_fails_when_no_file() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            assert_eq!(mf_read(&mut mfp, hp), FAIL);
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_write_fails_when_no_file_and_not_reopening() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            assert_eq!(mf_write(&mut mfp, hp), FAIL);
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_write_then_mf_read_roundtrip() {
+        let tmp = TempFilePath::new("rw_roundtrip");
+        let mut mfp = MemfileT {
+            mf_page_size: 16,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1); // bnum 0
+            assert_eq!((*hp).bh_bnum, 0);
+            (*hp)
+                .bh_data
+                .as_data_mut()
+                .copy_from_slice(b"0123456789ABCDEF");
+
+            assert_eq!(mf_write(&mut mfp, hp), OK);
+            assert_eq!(mfp.mf_infile_count, 1); // one page written
+            assert_eq!((*hp).bh_flags & BH_DIRTY, 0); // cleared by mf_write
+
+            // Corrupt the in-memory buffer, then read it back from disk
+            // to verify mf_write really persisted the right bytes at the
+            // right offset.
+            (*hp).bh_data.as_data_mut().fill(0);
+            assert_eq!(mf_read(&mut mfp, hp), OK);
+            assert_eq!((*hp).bh_data.as_data(), b"0123456789ABCDEF");
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_read_fails_past_end_of_file() {
+        let tmp = TempFilePath::new("read_past_eof");
+        let mut mfp = MemfileT {
+            mf_page_size: 16,
+            mf_fd: Some(open_rw_truncate(&tmp.path)), // empty file
+            ..default_memfile()
+        };
+
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            assert_eq!(mf_read(&mut mfp, hp), FAIL); // nothing written yet
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_write_fills_gaps_with_dummy_data_for_freed_blocks() {
+        let tmp = TempFilePath::new("gap_fill");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+        // Simulate blocks 0,1,2 having existed in memory only and
+        // already been freed (so mf_hash has no entries for them),
+        // while nothing has ever actually been written to disk yet.
+        mfp.mf_blocknr_max = 3;
+
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            assert_eq!((*hp).bh_bnum, 3);
+            (*hp).bh_data.as_data_mut().copy_from_slice(b"REALDATA");
+
+            assert_eq!(mf_write(&mut mfp, hp), OK);
+            // Caught up to block 3 (0-indexed) + 1 page = 4 pages total.
+            assert_eq!(mfp.mf_infile_count, 4);
+
+            let file_len = std::fs::metadata(&tmp.path).unwrap().len();
+            assert_eq!(file_len, 8 * 4);
+
+            // The real block (bnum 3) must read back correctly.
+            assert_eq!(mf_read(&mut mfp, hp), OK);
+            assert_eq!((*hp).bh_data.as_data(), b"REALDATA");
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_write_sets_did_swapwrite_msg_on_failure_and_clears_on_success() {
+        // GLOBALS.did_swapwrite_msg is shared process-wide state; guard
+        // it like every other GLOBALS-touching test in this crate.
+        //
+        // Use a *read-only*-opened file so the actual write attempt
+        // inside mf_write's loop fails (as opposed to the early "no
+        // file at all" check up front, which returns FAIL without ever
+        // touching did_swapwrite_msg - verified against the original's
+        // own source: that check precedes the loop entirely).
+        let tmp = TempFilePath::new("swapwrite_msg");
+        std::fs::write(&tmp.path, []).unwrap(); // create an empty file first
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(std::fs::File::open(&tmp.path).unwrap()), // read-only
+            ..default_memfile()
+        };
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            let previous = crate::globals::GLOBALS.get_mut().did_swapwrite_msg;
+
+            assert_eq!(mf_write(&mut mfp, hp), FAIL);
+            assert!(crate::globals::GLOBALS.get_mut().did_swapwrite_msg);
+
+            // Re-open read-write: the next successful write must clear
+            // the flag back to false.
+            mfp.mf_fd = Some(open_rw_truncate(&tmp.path));
+            assert_eq!(mf_write(&mut mfp, hp), OK);
+            assert!(!crate::globals::GLOBALS.get_mut().did_swapwrite_msg);
+
+            crate::globals::GLOBALS.get_mut().did_swapwrite_msg = previous;
             mf_free(&mut mfp, hp);
             drain_free_list(&mut mfp);
         }
