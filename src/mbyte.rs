@@ -3,12 +3,13 @@
 //! Translated: the pure byte<->codepoint algorithms that need no
 //! external library - `utf8len_tab`/`utf8len_tab_zero`,
 //! `utf_byte2len`, `utf_ptr2len`, `utf_ptr2len_len`, `utf_ptr2char`,
-//! `utf_char2len`, `utf_char2bytes` - plus, now that the `utf8proc-sys`
-//! FFI dependency has actually been added (see `Cargo.toml`'s own
-//! comment recording that decision): `utf_iscomposing_first`,
-//! `utf_composinglike`, `utf_iscomposing`, `utfc_ptr2len`,
-//! `utfc_ptr2len_len`, `utf_fold`, `mb_toupper`/`mb_tolower`/
-//! `mb_islower`/`mb_isupper`.
+//! `utf_char2len`, `utf_char2bytes`, `utf_safe_read_char_adv`
+//! (`static`/private), `utf_strnicmp`, `mb_strnicmp` - plus, now that
+//! the `utf8proc-sys` FFI dependency has actually been added (see
+//! `Cargo.toml`'s own comment recording that decision):
+//! `utf_iscomposing_first`, `utf_composinglike`, `utf_iscomposing`,
+//! `utfc_ptr2len`, `utfc_ptr2len_len`, `utf_fold`, `mb_toupper`/
+//! `mb_tolower`/`mb_islower`/`mb_isupper`.
 //!
 //! `mbyte.c` as a whole (~3060 lines) is far larger than even this:
 //! character *display width* (`utf_char2cells`/`utf_ptr2cells`/
@@ -34,8 +35,8 @@
 //! Deferred (need another not-yet-decided subsystem):
 //! `utf_char2cells`/`utf_ptr2cells`/`ptr2cells` (character display
 //! width), `utf_head_off` (composing-character offset backscan),
-//! `mb_strnicmp`/`mb_stricmp`/`utf_strnicmp` (case-insensitive
-//! comparison), and everything else in the file (encoding-name tables,
+//! `mb_stricmp` (`STRICMP`-adjacent bytewise fallback details not yet
+//! checked), and everything else in the file (encoding-name tables,
 //! `iconv` conversion, `show_utf8`, etc.).
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
@@ -629,6 +630,156 @@ pub unsafe fn mb_isupper(a: i32) -> bool {
     unsafe { mb_tolower(a) != a }
 }
 
+/// Read a single (possibly multi-byte) character from `s`, never
+/// reading past `s`'s own bounds (`utf_safe_read_char_adv`, `static` in
+/// the original - kept private here too).
+///
+/// Returns `(codepoint, consumed)`:
+/// - `(0, 0)` if `s` is empty (end of buffer).
+/// - `(-1, 0)` if the byte sequence is illegal or incomplete (does not
+///   advance).
+/// - `(c, k)` otherwise: the decoded codepoint and the number of bytes
+///   it occupies.
+///
+/// The original also treats a real embedded NUL byte as "end of
+/// string" (returns 0, advances by 1) because it scans a NUL-terminated
+/// C string bounded additionally by a caller-supplied length. This
+/// translation takes an explicit, already-bounded byte slice instead,
+/// so an embedded NUL is just an ordinary ASCII byte (length 1, value
+/// 0) like [`utf_ptr2char`] treats it elsewhere in this module; no
+/// caller here relies on embedded-NUL-as-terminator semantics.
+fn utf_safe_read_char_adv(s: &[u8]) -> (i32, usize) {
+    let Some(&b0) = s.first() else {
+        return (0, 0); // end of buffer
+    };
+
+    let k = usize::from(UTF8LEN_TAB_ZERO[b0 as usize]);
+
+    if k == 1 {
+        // ASCII character (or NUL, see doc comment above).
+        return (i32::from(b0), 1);
+    }
+
+    if k <= s.len() {
+        // We have a multibyte sequence and it isn't truncated by the
+        // slice's own bounds, so utf_ptr2char() is safe to use. Or the
+        // first byte is illegal (k == 0), and it's also safe to use
+        // utf_ptr2char() (0 <= s.len() always holds, and s is
+        // non-empty here).
+        let c = utf_ptr2char(s);
+
+        // On failure, utf_ptr2char() returns the first byte, so check
+        // equality with the first byte. The only non-ASCII character
+        // which equals the first byte of its own UTF-8 representation
+        // is U+00C3 (UTF-8: 0xC3 0x83), so that special case is also
+        // checked. Safe even if s.len() == 1: k > 1 here always means
+        // s.len() >= k >= 2 (k == 0 never reaches the 0xC3 check since
+        // c would then equal b0 exactly, failing the first half of the
+        // condition).
+        if c != i32::from(b0) || (c == 0xC3 && s.get(1) == Some(&0x83)) {
+            // byte sequence was successfully decoded
+            return (c, k);
+        }
+    }
+
+    // byte sequence is incomplete or illegal
+    (-1, 0)
+}
+
+/// Version of `strnicmp()` that handles multi-byte characters. Needed
+/// for Big5, Shift-JIS and UTF-8 encoding (`utf_strnicmp`).
+///
+/// Compares at most `n1` bytes of `s1` and `n2` bytes of `s2`.
+///
+/// @return zero if `s1` and `s2` are equal (ignoring case), the
+/// difference between two characters otherwise.
+#[must_use]
+pub fn utf_strnicmp(s1: &[u8], s2: &[u8], n1: usize, n2: usize) -> i32 {
+    let mut p1 = &s1[..n1.min(s1.len())];
+    let mut p2 = &s2[..n2.min(s2.len())];
+    let mut c1;
+    let mut c2;
+
+    loop {
+        let (v1, k1) = utf_safe_read_char_adv(p1);
+        let (v2, k2) = utf_safe_read_char_adv(p2);
+        c1 = v1;
+        c2 = v2;
+        p1 = &p1[k1..];
+        p2 = &p2[k2..];
+
+        if c1 <= 0 || c2 <= 0 {
+            break;
+        }
+
+        if c1 == c2 {
+            continue;
+        }
+
+        let cdiff = utf_fold(c1) - utf_fold(c2);
+        if cdiff != 0 {
+            return cdiff;
+        }
+    }
+
+    // some string ended or has an incomplete/illegal character sequence
+
+    if c1 == 0 || c2 == 0 {
+        // some string ended. shorter string is smaller
+        if c1 == 0 && c2 == 0 {
+            return 0;
+        }
+        return if c1 == 0 { -1 } else { 1 };
+    }
+
+    // Continue with bytewise comparison to produce some result that
+    // would make comparison operations involving this function
+    // transitive.
+    //
+    // If only one string had an error, comparison should be made with
+    // the folded version of the other string. In this case it is
+    // enough to fold just one character to determine the result of
+    // comparison.
+    let mut buffer1 = [0u8; 6];
+    let mut buffer2 = [0u8; 6];
+    if c1 != -1 && c2 == -1 {
+        let len = utf_char2bytes(utf_fold(c1), &mut buffer1) as usize;
+        p1 = &buffer1[..len];
+    } else if c2 != -1 && c1 == -1 {
+        let len = utf_char2bytes(utf_fold(c2), &mut buffer2) as usize;
+        p2 = &buffer2[..len];
+    }
+
+    while !p1.is_empty() && !p2.is_empty() && p1[0] != 0 && p2[0] != 0 {
+        let cdiff = i32::from(p1[0]) - i32::from(p2[0]);
+        if cdiff != 0 {
+            return cdiff;
+        }
+        p1 = &p1[1..];
+        p2 = &p2[1..];
+    }
+
+    // Treat "ran out of bytes" and "hit an embedded NUL" as the same
+    // ending condition for the final determination.
+    let n1_done = p1.is_empty() || p1[0] == 0;
+    let n2_done = p2.is_empty() || p2[0] == 0;
+
+    if n1_done && n2_done {
+        return 0;
+    }
+    if n1_done { -1 } else { 1 }
+}
+
+/// Compare strings case-insensitively, handling multi-byte characters
+/// (`mb_strnicmp`). Compares at most `nn` bytes of each string.
+///
+/// @return zero if `s1` and `s2` are equal (ignoring case), the
+/// difference between two characters otherwise.
+#[must_use]
+pub fn mb_strnicmp(s1: &[u8], s2: &[u8], nn: usize) -> i32 {
+    utf_strnicmp(s1, s2, nn, nn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +1021,56 @@ mod tests {
         assert_eq!(unsafe { mb_tolower(i32::from(b'A')) }, i32::from(b'a'));
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cmp_flags = prev;
+    }
+
+    #[test]
+    fn utf_safe_read_char_adv_handles_ascii_multibyte_truncation_and_illegal() {
+        assert_eq!(utf_safe_read_char_adv(b""), (0, 0));
+        assert_eq!(utf_safe_read_char_adv(b"A"), (i32::from(b'A'), 1));
+        assert_eq!(utf_safe_read_char_adv("é".as_bytes()), (0xE9, 2));
+        // Truncated 3-byte sequence (only the lead byte present).
+        assert_eq!(utf_safe_read_char_adv(&"日".as_bytes()[..1]), (-1, 0));
+        // Illegal lead byte (a lone continuation byte).
+        assert_eq!(utf_safe_read_char_adv(&[0x80]), (-1, 0));
+        // Embedded NUL is just an ordinary ASCII byte here (see doc
+        // comment).
+        assert_eq!(utf_safe_read_char_adv(&[0]), (0, 1));
+    }
+
+    #[test]
+    fn utf_strnicmp_ascii_case_insensitive() {
+        assert_eq!(utf_strnicmp(b"Hello", b"hello", 5, 5), 0);
+        assert_eq!(utf_strnicmp(b"abc", b"abd", 3, 3), -1);
+        assert_eq!(utf_strnicmp(b"abd", b"abc", 3, 3), 1);
+    }
+
+    #[test]
+    fn utf_strnicmp_shorter_string_is_smaller() {
+        assert!(utf_strnicmp(b"ab", b"abc", 2, 3) < 0);
+        assert!(utf_strnicmp(b"abc", b"ab", 3, 2) > 0);
+        assert_eq!(utf_strnicmp(b"abc", b"abc", 3, 3), 0);
+    }
+
+    #[test]
+    fn utf_strnicmp_respects_length_bounds() {
+        // Only the first 2 bytes of each are compared: "he" == "HE".
+        assert_eq!(utf_strnicmp(b"hello", b"HELLO", 2, 2), 0);
+        // Comparing "he" (len 2) against "hel" (len 3): shorter is
+        // smaller.
+        assert!(utf_strnicmp(b"hello", b"hello", 2, 3) < 0);
+    }
+
+    #[test]
+    fn utf_strnicmp_multibyte_case_folding() {
+        // U+00C9 (É) vs U+00E9 (é): equal under case folding.
+        assert_eq!(utf_strnicmp("É".as_bytes(), "é".as_bytes(), 2, 2), 0);
+        // Different codepoints entirely.
+        assert_ne!(utf_strnicmp("日".as_bytes(), "本".as_bytes(), 3, 3), 0);
+    }
+
+    #[test]
+    fn mb_strnicmp_matches_utf_strnicmp_with_same_bound() {
+        assert_eq!(mb_strnicmp(b"FOO", b"foo", 3), 0);
+        assert_eq!(mb_strnicmp(b"FOO", b"bar", 3), utf_strnicmp(b"FOO", b"bar", 3, 3));
     }
 }
