@@ -36,21 +36,22 @@
 //! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
 //!   `vim_isfilec` (hence the real `g_chartab`).
 //! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
-//!   `transchar_nonprint`: need `curbuf`/`get_fileformat` integration, a
-//!   shared static scratch buffer (`transchar_charbuf`, matching this
-//!   crate's `POS_TO_MARK_SCRATCH`-style precedent), and the `IS_SPECIAL`/
-//!   `K_SECOND` special-key branch (`keycodes.h`, not yet translated) -
-//!   worth its own dedicated pass rather than folding in alongside
-//!   `transchar_hex` (self-contained, harvested now). Also note: the
-//!   original's `!chartab_initialized && ...` disjunct is a pure subset
-//!   of what `vim_isprintc` itself already covers for `c <= 0xFF` (and
-//!   `chartab_initialized` can never become `true` in this crate anyway,
-//!   since nothing sets it - `init_chartab`/`buf_init_chartab` aren't
-//!   translated) - when this family is eventually translated, the whole
-//!   condition should provably simplify to just `vim_isprintc(c)`, not a
-//!   two-part check.
+//!   `transchar_nonprint` are now translated too (this pass), returning
+//!   an owned `Vec<u8>` (including trailing NUL) instead of a pointer
+//!   into the original's shared static `transchar_charbuf` - this
+//!   crate's usual preference for owned return values over the
+//!   original's shared-mutable-scratch-buffer memory model when
+//!   nothing yet depends on pointer stability across calls. The
+//!   `IS_SPECIAL`/`K_SECOND` special-key prefix (`keycodes.h`, not yet
+//!   translated) is NOT handled - no current caller passes an encoded
+//!   special-key value. The original's `!chartab_initialized && (c >=
+//!   ' ' && c <= '~')` disjunct is also omitted from `transchar_buf`:
+//!   it's a pure subset of what `vim_isprintc` itself already covers
+//!   for `c <= 0xFF`, and `chartab_initialized` can never become `true`
+//!   in this crate anyway (nothing sets it).
 //! - `trans_characters`/`transstr`/`transstr_len`/`transstr_buf`/
-//!   `str_foldcase` family: need the `transchar*` family above.
+//!   `str_foldcase` family: build on top of the `transchar*` family
+//!   above (now translated) - re-examine next.
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -378,7 +379,115 @@ pub fn transchar_hex(c: i32) -> Vec<u8> {
     buf
 }
 
+/// Convert a non-printable character to 2-4 printable ones
+/// (`transchar_nonprint`). Doesn't work for multi-byte characters -
+/// `c` must be `<= 0xFF`.
+///
+/// `buf` is `Option<&BufT>` (the original's nullable `const buf_T *`)
+/// - only consulted for `'fileformat'` when translating a lone CR.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'display'`'s
+/// `"uhex"` flag).
+#[must_use]
+pub unsafe fn transchar_nonprint(buf: Option<&crate::buffer_defs::BufT>, c: i32) -> Vec<u8> {
+    let mut c = c;
+    if c == i32::from(crate::ascii_defs::NL) {
+        // we use newline in place of a NUL
+        c = i32::from(crate::ascii_defs::NUL);
+    } else if buf.is_some_and(|b| {
+        c == i32::from(crate::ascii_defs::CAR)
+            && crate::option::get_fileformat(b) == crate::option_vars::EOL_MAC
+    }) {
+        // we use CR in place of NL in this case
+        c = i32::from(crate::ascii_defs::NL);
+    }
+    debug_assert!(c <= 0xff);
 
+    // SAFETY: forwarded from this function's own safety doc.
+    let dy_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
+    if dy_flags & crate::option_vars::opt_dy_flag::UHEX != 0 || c > 0x7f {
+        // 'display' has "uhex"
+        transchar_hex(c)
+    } else {
+        // 0x00 - 0x1f and 0x7f: DEL displayed as ^?
+        vec![b'^', (c as u8) ^ 0x40, 0]
+    }
+}
+
+/// Convert character `c` for displaying (`transchar_buf`).
+///
+/// # Deferred
+/// The original's `IS_SPECIAL(c)`/`K_SECOND(c)` special-key prefix
+/// (`"~@"` followed by the second byte) is NOT handled here - needs
+/// `keycodes.h` (not yet translated), and no caller in this crate
+/// currently passes an encoded special-key value. The original's
+/// `!chartab_initialized && (c >= ' ' && c <= '~')` disjunct is also
+/// omitted: it's a pure subset of what [`vim_isprintc`] itself already
+/// covers for `c <= 0xFF`, and `chartab_initialized` can never become
+/// `true` in this crate anyway (nothing sets it - `init_chartab`/
+/// `buf_init_chartab` aren't translated).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`vim_isprintc`]/
+/// [`transchar_nonprint`]).
+#[must_use]
+pub unsafe fn transchar_buf(buf: Option<&crate::buffer_defs::BufT>, c: i32) -> Vec<u8> {
+    if c <= 0xFF && vim_isprintc(c) {
+        // printable character
+        vec![c as u8, 0]
+    } else if c <= 0xFF {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { transchar_nonprint(buf, c) }
+    } else {
+        transchar_hex(c)
+    }
+}
+
+/// Like [`transchar_buf`] but for the current buffer (`transchar`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`'s `curbuf` plus everything
+/// [`transchar_buf`] touches.
+#[must_use]
+pub unsafe fn transchar(c: i32) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { transchar_buf(Some(curbuf), c) }
+}
+
+/// Like [`transchar_buf`], but called with a byte instead of a
+/// character. Checks for an illegal UTF-8 byte
+/// (`transchar_byte_buf`).
+///
+/// # Safety
+/// Same as [`transchar_buf`].
+#[must_use]
+pub unsafe fn transchar_byte_buf(buf: Option<&crate::buffer_defs::BufT>, c: i32) -> Vec<u8> {
+    if c >= 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { transchar_nonprint(buf, c) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { transchar_buf(buf, c) }
+}
+
+/// Like [`transchar_byte_buf`] but for the current buffer
+/// (`transchar_byte`).
+///
+/// # Safety
+/// Same as [`transchar`].
+#[must_use]
+pub unsafe fn transchar_byte(c: i32) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { transchar_byte_buf(Some(curbuf), c) }
+}
+
+/// Return number of display cells occupied by character at `p`
+/// (`ptr2cells`).
 ///
 /// # Safety
 /// Touches `crate::option_vars::OPTION_VARS` (via
@@ -623,6 +732,93 @@ mod tests {
     #[test]
     fn transchar_hex_zero_is_two_digits() {
         assert_eq!(transchar_hex(0), b"<00>\0");
+    }
+
+    #[test]
+    fn transchar_nonprint_nul_displays_as_caret_at() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_nonprint(None, i32::from(crate::ascii_defs::NL)) }, b"^@\0");
+    }
+
+    #[test]
+    fn transchar_nonprint_del_displays_as_caret_question() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_nonprint(None, 0x7f) }, b"^?\0");
+    }
+
+    #[test]
+    fn transchar_nonprint_cr_in_mac_fileformat_displays_as_caret_j() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { ..Default::default() };
+        buf.b_p_ff = Some(b"mac".to_vec());
+        assert_eq!(
+            unsafe { transchar_nonprint(Some(&buf), i32::from(crate::ascii_defs::CAR)) },
+            b"^J\0"
+        );
+    }
+
+    #[test]
+    fn transchar_nonprint_cr_outside_mac_fileformat_displays_as_caret_m() {
+        let _guard = crate::globals::global_state_test_lock();
+        let buf = crate::buffer_defs::BufT { ..Default::default() }; // default fileformat isn't mac
+        assert_eq!(
+            unsafe { transchar_nonprint(Some(&buf), i32::from(crate::ascii_defs::CAR)) },
+            b"^M\0"
+        );
+    }
+
+    #[test]
+    fn transchar_nonprint_above_0x7f_uses_hex_form() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_nonprint(None, 0x80) }, transchar_hex(0x80));
+    }
+
+    #[test]
+    fn transchar_nonprint_uhex_flag_forces_hex_form_for_control_chars() {
+        let _guard = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.dy_flags;
+        opts.dy_flags = crate::option_vars::opt_dy_flag::UHEX;
+
+        assert_eq!(unsafe { transchar_nonprint(None, 1) }, transchar_hex(1));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = prev;
+    }
+
+    #[test]
+    fn transchar_buf_printable_ascii_is_the_char_itself() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_buf(None, i32::from(b'A')) }, b"A\0");
+    }
+
+    #[test]
+    fn transchar_buf_control_char_delegates_to_transchar_nonprint() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_buf(None, 1) }, b"^A\0");
+    }
+
+    #[test]
+    fn transchar_buf_above_0xff_uses_hex_form_directly() {
+        let _guard = crate::globals::global_state_test_lock();
+        // U+4E00 (CJK): > 0xFF, so goes straight to transchar_hex,
+        // never through vim_isprintc/transchar_nonprint's c<=0xFF path.
+        assert_eq!(unsafe { transchar_buf(None, 0x4e00) }, transchar_hex(0x4e00));
+    }
+
+    #[test]
+    fn transchar_byte_buf_below_0x80_delegates_to_transchar_buf() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_byte_buf(None, i32::from(b'A')) }, unsafe {
+            transchar_buf(None, i32::from(b'A'))
+        });
+    }
+
+    #[test]
+    fn transchar_byte_buf_at_or_above_0x80_goes_straight_to_nonprint() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transchar_byte_buf(None, 0x80) }, unsafe {
+            transchar_nonprint(None, 0x80)
+        });
     }
 
     #[test]
