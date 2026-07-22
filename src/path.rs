@@ -4,15 +4,17 @@
 //! (`os/fs.c`), option state (`'fileignorecase'` etc., `option.c`), or
 //! multi-byte-aware case folding (`mbyte.c`). Now that `os/fs.rs`
 //! translates a synchronous-file-op core (`os_dirname`/`os_realpath`/
-//! etc.), the pure-string functions plus a few real-filesystem-touching
-//! ones built directly on top of them are translated here:
-//! `vim_ispathsep`(+`_nocolon`), `vim_ispathlistsep`, `path_head_length`,
-//! `is_path_head`, `path_skip_sep`, `get_past_head`, `path_tail`,
-//! `path_next_component`, `path_has_drive_letter`, `path_is_absolute`,
-//! `after_pathsep`, `add_pathsep`, `path_is_url`, `path_with_url`,
-//! `path_to_slash`, `path_to_slash_save`, `append_path`,
-//! `path_full_dir_name`, `path_to_absolute`, `vim_full_name`
-//! (`vim_FullName`), `full_name_save` (`FullName_save`), `save_abs_path`.
+//! etc.) and `mbyte.c`'s FFI-dependent functions exist, the pure-string
+//! functions plus the option-/multibyte-dependent ones built directly
+//! on top of them are translated here: `vim_ispathsep`(+`_nocolon`),
+//! `vim_ispathlistsep`, `path_head_length`, `is_path_head`,
+//! `path_skip_sep`, `get_past_head`, `path_tail`, `path_next_component`,
+//! `path_has_drive_letter`, `path_is_absolute`, `after_pathsep`,
+//! `add_pathsep`, `path_is_url`, `path_with_url`, `path_to_slash`,
+//! `path_to_slash_save`, `append_path`, `path_full_dir_name`,
+//! `path_to_absolute`, `vim_full_name` (`vim_FullName`), `full_name_save`
+//! (`FullName_save`), `save_abs_path`, `path_fnamencmp`, `path_fnamecmp`,
+//! `pathcmp`, `path_shorten_fname`, `path_try_shorten_fname`.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -31,11 +33,29 @@
 //! arbitrary non-UTF-8 byte sequences as native paths isn't expressible
 //! via safe, dependency-free `std` APIs.
 //!
-//! Deferred: everything else requiring options or multibyte case-
-//! folding, including `path_fnamecmp`/`path_fnamencmp` (needed by
-//! `garray.c`'s `ga_remove_duplicate_strings` - on Windows these need
-//! `'fileignorecase'`, `_getdrive()`, and `utf_fold`, a deeper
-//! dependency than initially assumed; still not translated).
+//! `path_fnamencmp`/`path_fnamecmp`/`pathcmp` needed `mbyte.c`'s
+//! `utf_ptr2char`/`utfc_ptr2len`/`utf_fold`/`mb_toupper`/`utf_strnicmp`/
+//! `mb_strnicmp` (all now translated) plus a hand-written FFI to the
+//! MSVC CRT's `_getdrive()` (Windows-only, see `win32_getdrive`). Their
+//! Windows (`BACKSLASH_IN_FILENAME`) and non-Windows implementations
+//! are genuinely different algorithms in the original (Windows: a
+//! per-character, drive-letter- and separator-aware walk; elsewhere:
+//! plain `strncmp`/`mb_strnicmp`, since `\\` isn't a separator there) -
+//! translated as such, not unified into one shared code path.
+//! `path_fnamencmp`'s Windows-only drive-letter pre-processing loop
+//! (comparing an explicit-drive path like `C:\xxx` against an
+//! implicit-drive one like `\xxx`) restores the pre-advance pointer by
+//! saving and returning to it directly rather than replicating the
+//! original's `p2 -= utfc_ptr2len(p2)` retreat-by-remeasuring - behaves
+//! identically for every realistic input (a drive letter is always
+//! followed by a single ASCII byte) and is strictly safer (a true
+//! restore, not pointer arithmetic that could otherwise land off a
+//! character boundary for a pathological input).
+//!
+//! Deferred: `same_directory` (needs `path_tail_with_sep`, not yet
+//! translated) and everything else requiring options, multibyte case
+//! folding, or subsystems not yet ported (wildcard expansion,
+//! `'suffixes'`/`'wildignore'`, etc.).
 
 use crate::os::os_defs::MAXPATHL;
 
@@ -502,6 +522,407 @@ pub fn save_abs_path(name: &[u8]) -> Vec<u8> {
     }
 }
 
+/// [`crate::mbyte::utf_ptr2char`], but treating an empty slice as the C
+/// original's implicit NUL terminator (returning 0/`NUL`) instead of
+/// panicking. Needed because the byte slices in this module are plain
+/// filename buffers, not NUL-terminated C strings, yet several
+/// functions here (mirroring the original's own pointer walks) need to
+/// read "one past the end" and see a NUL exactly like the original
+/// does.
+fn utf_ptr2char_or_nul(p: &[u8]) -> i32 {
+    if p.is_empty() { 0 } else { crate::mbyte::utf_ptr2char(p) }
+}
+
+/// Hand-written FFI to the MSVC C runtime's `_getdrive()` (declared in
+/// `<direct.h>`), needed by [`path_fnamencmp`]'s Windows-only
+/// drive-letter handling. No new crate dependency: like this crate's
+/// other hand-written Win32 FFI (see `os/proc.rs`, `os/users.rs`), a
+/// single narrowly-scoped `extern` declaration is used instead. Unlike
+/// those, `_getdrive()` is a plain CRT function (cdecl), not a
+/// `kernel32.dll` "system"-call API, and needs no explicit `#[link]`
+/// attribute: every Rust binary built for `*-pc-windows-msvc` already
+/// links the C runtime that provides it (verified with a standalone
+/// scratch `cargo run` probe during translation).
+///
+/// Returns the current default drive number: 1 = A, 2 = B, 3 = C, etc.
+#[cfg(windows)]
+fn win32_getdrive() -> i32 {
+    extern "C" {
+        fn _getdrive() -> i32;
+    }
+    // SAFETY: _getdrive() takes no arguments, has no preconditions, and
+    // cannot fail.
+    unsafe { _getdrive() }
+}
+
+/// Compare two file names, handling `'fileignorecase'` and (per
+/// `BACKSLASH_IN_FILENAME`, Windows-only) treating `/`/`\` as
+/// equivalent (the per-character loop used by the Windows variant of
+/// [`path_fnamencmp`], after its drive-letter pre-processing).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'fileignorecase'`).
+#[cfg(windows)]
+unsafe fn path_fnamencmp_loop(mut p1: &[u8], mut p2: &[u8], mut len: usize) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_fic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic;
+    let mut c1 = 0i32;
+    let mut c2 = 0i32;
+
+    while len > 0 {
+        c1 = utf_ptr2char_or_nul(p1);
+        c2 = utf_ptr2char_or_nul(p2);
+        if c1 == 0
+            || c2 == 0
+            || (c1 != c2
+                && ((c1 != i32::from(b'/') && c1 != i32::from(b'\\'))
+                    || (c2 != i32::from(b'/') && c2 != i32::from(b'\\')))
+                && (p_fic == 0 || crate::mbyte::utf_fold(c1) != crate::mbyte::utf_fold(c2)))
+        {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc
+        // (utfc_ptr2len touches OPTION_VARS transitively).
+        let step1 = unsafe { crate::mbyte::utfc_ptr2len(p1) } as usize;
+        // SAFETY: same as above.
+        let step2 = unsafe { crate::mbyte::utfc_ptr2len(p2) } as usize;
+        // The original decrements `len` (a C `size_t`) unconditionally,
+        // which would wrap around to a huge value if a single
+        // character's byte length ever exceeded the remaining `len` -
+        // unreachable for this function's two current callers (`len`
+        // is always derived from one of the compared strings' own full
+        // byte length, so it always lands on a character boundary
+        // within that string), but `saturating_sub` is used here
+        // rather than blindly replicating unsigned wraparound, which
+        // would silently make the length bound meaningless for any
+        // future caller that passes a `len` splitting a multi-byte
+        // character.
+        len = len.saturating_sub(step1);
+        p1 = &p1[step1..];
+        p2 = &p2[step2..];
+    }
+
+    if p_fic != 0 {
+        crate::mbyte::utf_fold(c1) - crate::mbyte::utf_fold(c2)
+    } else {
+        c1 - c2
+    }
+}
+
+/// A byte-oriented `strncmp(s1, s2, n)` equivalent: compares up to `n`
+/// bytes, stopping early at the first difference or an embedded NUL in
+/// either slice (matching a NUL-terminated C string's own natural
+/// bound - `fname1`/`fname2` here are plain byte slices, not
+/// guaranteed NUL-terminated, but no real path ever contains an
+/// embedded NUL, so this only matters for the "ran off the end of a
+/// too-short slice" case, treated identically to hitting a real NUL).
+///
+/// Returns 0 if equal, the signed byte-value difference otherwise.
+#[cfg(not(windows))]
+fn strncmp_bytes(s1: &[u8], s2: &[u8], n: usize) -> i32 {
+    for k in 0..n {
+        let b1 = s1.get(k).copied().unwrap_or(0);
+        let b2 = s2.get(k).copied().unwrap_or(0);
+        if b1 != b2 {
+            return i32::from(b1) - i32::from(b2);
+        }
+        if b1 == 0 {
+            return 0; // both ended (via NUL or slice end) at the same spot
+        }
+    }
+    0
+}
+
+/// Compare two file names, handling `'/'` and `'\\'` correctly and
+/// dealing with `'fileignorecase'` (`path_fnamencmp`). Compares at most
+/// `len` bytes.
+///
+/// Note: does not account for maximum name lengths and things like
+/// `"../dir"`, thus it is not 100% accurate. The OS may also use a
+/// different algorithm for case-insensitive comparison.
+///
+/// @return 0 if they are equal, non-zero otherwise.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'fileignorecase'`
+/// and, on Windows, [`crate::mbyte::mb_toupper`]) - same requirement as
+/// every other function that does so.
+#[must_use]
+pub unsafe fn path_fnamencmp(fname1: &[u8], fname2: &[u8], len: usize) -> i32 {
+    // BACKSLASH_IN_FILENAME is defined only on Windows (win_defs.h);
+    // on every other platform '\\' is just an ordinary filename byte,
+    // and the original uses a completely different, much simpler
+    // implementation (plain strncmp/mb_strnicmp - no per-character,
+    // separator-aware walk at all).
+    #[cfg(windows)]
+    {
+        let (mut p1, mut p2): (&[u8], &[u8]) = (fname1, fname2);
+
+        // To allow proper comparison of absolute paths:
+        //   - one with explicit drive letter C:\xxx
+        //   - another with implicit drive letter \xxx
+        // advance the pointer, of the explicit one, to skip the drive.
+        for _swap in 0..2 {
+            let c1 = utf_ptr2char_or_nul(p1);
+            let mut c2 = utf_ptr2char_or_nul(p2);
+
+            if (c1 == i32::from(b'/') || c1 == i32::from(b'\\'))
+                && crate::macros_defs::ascii_isalpha(c2)
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                let drive = unsafe { crate::mbyte::mb_toupper(c2) } - i32::from(b'A') + 1;
+
+                // Check for the colon.
+                let before_colon_check = p2;
+                // SAFETY: forwarded from this function's own safety doc.
+                let advance = unsafe { crate::mbyte::utfc_ptr2len(p2) } as usize;
+                p2 = &p2[advance..];
+                c2 = utf_ptr2char_or_nul(p2);
+                let current_drive = win32_getdrive();
+                if c2 == i32::from(b':') && drive == current_drive {
+                    // skip the drive for comparison
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let advance2 = unsafe { crate::mbyte::utfc_ptr2len(p2) } as usize;
+                    p2 = &p2[advance2..];
+                    break;
+                }
+                // ignore: undo the "check for colon" advance. The
+                // original does this via `p2 -= utfc_ptr2len(p2)`
+                // (re-measuring the length of whatever follows the
+                // presumed drive letter); restoring the exact
+                // previously-saved slice instead is equivalent for
+                // every realistic input (the two lengths always match
+                // when what follows the letter is itself a single
+                // ASCII byte, as any real path separator/colon is),
+                // and is strictly safer than replicating pointer
+                // arithmetic that could otherwise land on a
+                // non-character boundary.
+                p2 = before_colon_check;
+            }
+
+            std::mem::swap(&mut p1, &mut p2);
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { path_fnamencmp_loop(p1, p2, len) }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p_fic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic;
+        if p_fic != 0 {
+            crate::mbyte::mb_strnicmp(fname1, fname2, len)
+        } else {
+            strncmp_bytes(fname1, fname2, len)
+        }
+    }
+}
+
+/// Compare two file names (`path_fnamecmp`).
+///
+/// On some systems case in a file name does not matter, on others it
+/// does.
+///
+/// Handles `'/'` and `'\\'` correctly and deals with `'fileignorecase'`.
+///
+/// @return 0 if they are equal, non-zero otherwise.
+///
+/// # Safety
+/// Same as [`path_fnamencmp`] (Windows), or [`pathcmp`] (elsewhere).
+#[must_use]
+pub unsafe fn path_fnamecmp(fname1: &[u8], fname2: &[u8]) -> i32 {
+    #[cfg(windows)]
+    {
+        let len = std::cmp::max(fname1.len(), fname2.len());
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { path_fnamencmp(fname1, fname2, len) }
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { pathcmp(fname1, fname2, None) }
+    }
+}
+
+/// Compare path `p` to `q` (`pathcmp`).
+///
+/// @param maxlen If `Some`, compare at most `maxlen` bytes of each;
+///        `None` compares the whole of both.
+///
+/// Return value like `strcmp(p, q)`, but consider path separators (a
+/// trailing slash is ignored, and - when built with
+/// `BACKSLASH_IN_FILENAME` - `/` and `\` compare equal).
+///
+/// See also [`crate::path::path_fnamencmp`].
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'fileignorecase'`
+/// and [`crate::mbyte::mb_toupper`]) - same requirement as every other
+/// function that does so.
+#[must_use]
+pub unsafe fn pathcmp(p: &[u8], q: &[u8], maxlen: Option<usize>) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_fic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic;
+
+    let mut i = 0usize;
+    let mut j = 0usize;
+    // `s` remembers which of `p`/`q` "won" (the one that didn't end
+    // first, or that ended with just a trailing slash) - `None` means
+    // neither has been determined yet (still scanning), matching the
+    // original's `s == NULL` sentinel.
+    let mut s: Option<&[u8]> = None;
+
+    loop {
+        if let Some(maxlen) = maxlen {
+            if i >= maxlen || j >= maxlen {
+                break;
+            }
+        }
+
+        let c1 = utf_ptr2char_or_nul(&p[i.min(p.len())..]);
+        let c2 = utf_ptr2char_or_nul(&q[j.min(q.len())..]);
+
+        // End of "p": check if "q" also ends or just has a slash.
+        if c1 == 0 {
+            if c2 == 0 {
+                return 0; // full match
+            }
+            s = Some(q);
+            i = j;
+            break;
+        }
+
+        // End of "q": check if "p" just has a slash.
+        if c2 == 0 {
+            s = Some(p);
+            break;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let differs = if p_fic != 0 {
+            unsafe { crate::mbyte::mb_toupper(c1) != crate::mbyte::mb_toupper(c2) }
+        } else {
+            c1 != c2
+        };
+        #[cfg(windows)]
+        let differs = differs
+            && !((c1 == i32::from(b'/') && c2 == i32::from(b'\\'))
+                || (c1 == i32::from(b'\\') && c2 == i32::from(b'/')));
+
+        if differs {
+            if vim_ispathsep(c1) {
+                return -1;
+            }
+            if vim_ispathsep(c2) {
+                return 1;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            return if p_fic != 0 {
+                unsafe { crate::mbyte::mb_toupper(c1) - crate::mbyte::mb_toupper(c2) }
+            } else {
+                c1 - c2
+            };
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        i += unsafe { crate::mbyte::utfc_ptr2len(&p[i.min(p.len())..]) } as usize;
+        // SAFETY: same as above.
+        j += unsafe { crate::mbyte::utfc_ptr2len(&q[j.min(q.len())..]) } as usize;
+    }
+
+    let Some(s) = s else {
+        return 0; // "i" or "j" ran into maxlen
+    };
+
+    let c1 = utf_ptr2char_or_nul(&s[i.min(s.len())..]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let step = unsafe { crate::mbyte::utfc_ptr2len(&s[i.min(s.len())..]) } as usize;
+    let c2 = utf_ptr2char_or_nul(&s[(i + step).min(s.len())..]);
+
+    // ignore a trailing slash, but not "//" or ":/"
+    let is_slash = if cfg!(windows) {
+        c1 == i32::from(b'/') || c1 == i32::from(b'\\')
+    } else {
+        c1 == i32::from(b'/')
+    };
+    if c2 == 0 && i > 0 && !after_pathsep(s, i) && is_slash {
+        return 0; // match with trailing slash
+    }
+    if std::ptr::eq(s, q) {
+        return -1; // no match
+    }
+    1
+}
+
+/// Try to find a shortname by comparing the fullname with `dir_name`
+/// (`path_shorten_fname`).
+///
+/// @param full_path The full path of the file.
+/// @param dir_name The directory to shorten relative to.
+///
+/// @return
+///   - `Some` (a sub-slice into `full_path`) if shortened.
+///   - `None` if no shorter name is possible.
+///
+/// # Safety
+/// Same as [`path_fnamencmp`].
+#[must_use]
+pub unsafe fn path_shorten_fname<'a>(full_path: &'a [u8], dir_name: &[u8]) -> Option<&'a [u8]> {
+    let len = dir_name.len();
+
+    // If full_path and dir_name do not match, it's impossible to make
+    // one relative to the other.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { path_fnamencmp(dir_name, full_path, len) } != 0 {
+        return None;
+    }
+
+    // If dir_name is a path head, full_path can always be made relative.
+    if len == path_head_length() as usize && is_path_head(dir_name) {
+        return Some(&full_path[len.min(full_path.len())..]);
+    }
+
+    let p = &full_path[len.min(full_path.len())..];
+
+    // If p is not pointing to a path separator, this means that
+    // full_path's last directory name is longer than dir_name's last
+    // directory, so they don't actually match.
+    let first = *p.first()?;
+    if !vim_ispathsep(i32::from(first)) {
+        return None;
+    }
+
+    // Skip the matched separator, then any following separators (but
+    // not a colon).
+    let skip = path_skip_sep(&p[1..], false);
+    Some(&p[(1 + skip).min(p.len())..])
+}
+
+/// Try to find a shortname by comparing the fullname with the current
+/// directory (`path_try_shorten_fname`).
+///
+/// @param full_path The full path of the file.
+///
+/// @return
+///   - A sub-slice into `full_path` if shortened.
+///   - `full_path` unchanged if no shorter name is possible or the
+///     current directory couldn't be determined.
+///
+/// # Safety
+/// Same as [`path_shorten_fname`].
+#[must_use]
+pub unsafe fn path_try_shorten_fname(full_path: &[u8]) -> &[u8] {
+    let Some(dirname) = crate::os::fs::os_dirname() else {
+        return full_path;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { path_shorten_fname(full_path, &dirname) } {
+        Some(p) if !p.is_empty() => p,
+        _ => full_path,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,5 +1177,183 @@ mod tests {
         let _guard = crate::os::fs::cwd_test_lock();
         let result = save_abs_path(b"foo.txt");
         assert!(path_is_absolute(&result));
+    }
+
+    #[test]
+    fn path_fnamencmp_equal_strings_compare_equal() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { path_fnamencmp(b"/foo/bar", b"/foo/bar", 8) }, 0);
+    }
+
+    #[test]
+    fn path_fnamencmp_different_strings_compare_nonzero() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_ne!(unsafe { path_fnamencmp(b"/foo/bar", b"/foo/baz", 8) }, 0);
+    }
+
+    #[test]
+    fn path_fnamencmp_respects_len_bound() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Only the first 4 bytes ("/foo") are compared.
+        assert_eq!(unsafe { path_fnamencmp(b"/foo/bar", b"/foo/baz", 4) }, 0);
+    }
+
+    #[test]
+    fn path_fnamencmp_case_sensitive_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Default OptionVars::default() zero-initializes p_fic (off).
+        assert_ne!(unsafe { path_fnamencmp(b"/FOO", b"/foo", 4) }, 0);
+    }
+
+    #[test]
+    fn path_fnamencmp_case_insensitive_when_fileignorecase_set() {
+        let _guard = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_fic;
+        opts.p_fic = 1;
+
+        assert_eq!(unsafe { path_fnamencmp(b"/FOO", b"/foo", 4) }, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_fnamencmp_windows_treats_forward_and_back_slash_as_equal() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { path_fnamencmp(b"a/b", b"a\\b", 3) }, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_fnamencmp_windows_matches_explicit_and_implicit_drive_when_current() {
+        let _guard = crate::globals::global_state_test_lock();
+        // win32_getdrive() returns the CWD's drive; build an explicit
+        // path using that same drive letter so it should compare equal
+        // to the implicit-drive form.
+        let drive = win32_getdrive();
+        let letter = (b'A' + (drive - 1) as u8) as char;
+        let explicit = format!("{letter}:/foo/bar");
+        assert_eq!(
+            unsafe { path_fnamencmp(b"/foo/bar", explicit.as_bytes(), 8) },
+            0
+        );
+    }
+
+    #[test]
+    fn path_fnamecmp_equal_and_different() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { path_fnamecmp(b"/a/b", b"/a/b") }, 0);
+        assert_ne!(unsafe { path_fnamecmp(b"/a/b", b"/a/c") }, 0);
+    }
+
+    #[test]
+    fn pathcmp_equal_paths_match() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { pathcmp(b"/a/b", b"/a/b", None) }, 0);
+    }
+
+    #[test]
+    fn pathcmp_trailing_slash_still_matches() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { pathcmp(b"/a/b/", b"/a/b", None) }, 0);
+        assert_eq!(unsafe { pathcmp(b"/a/b", b"/a/b/", None) }, 0);
+    }
+
+    #[test]
+    fn pathcmp_double_slash_does_not_match_via_trailing_slash_rule() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "//' is not just a single trailing separator, so this must
+        // not spuriously match like a single trailing slash would.
+        assert_ne!(unsafe { pathcmp(b"/a/b//", b"/a/b", None) }, 0);
+    }
+
+    #[test]
+    fn pathcmp_path_separator_sorts_before_other_characters() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "/a" vs "/ab": at the mismatch point, "/a"'s NUL-equivalent
+        // position is a path separator boundary in effect; more
+        // directly, comparing "/a/x" vs "/aXx" - '/' should sort
+        // first.
+        assert!(unsafe { pathcmp(b"/a/x", b"/aXx", None) } < 0);
+    }
+
+    #[test]
+    fn pathcmp_respects_maxlen() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Differ only after byte 3, which is excluded by maxlen.
+        assert_eq!(unsafe { pathcmp(b"/ab/1", b"/ab/2", Some(3)) }, 0);
+    }
+
+    #[test]
+    fn path_shorten_fname_strips_matching_directory_prefix() {
+        let _guard = crate::globals::global_state_test_lock();
+        let result = unsafe { path_shorten_fname(b"/home/user/project/file.txt", b"/home/user") };
+        assert_eq!(result, Some(&b"project/file.txt"[..]));
+    }
+
+    #[test]
+    fn path_shorten_fname_returns_none_when_not_a_prefix() {
+        let _guard = crate::globals::global_state_test_lock();
+        let result = unsafe { path_shorten_fname(b"/var/log/file.txt", b"/home/user") };
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn path_shorten_fname_returns_none_when_last_dir_name_only_longer() {
+        let _guard = crate::globals::global_state_test_lock();
+        // dir_name matches as a byte prefix but doesn't end at a
+        // separator boundary in full_path ("/home/user2" vs
+        // "/home/user").
+        let result = unsafe { path_shorten_fname(b"/home/user2/file.txt", b"/home/user") };
+        assert_eq!(result, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_shorten_fname_root_dir_name_always_shortens() {
+        let _guard = crate::globals::global_state_test_lock();
+        let result = unsafe { path_shorten_fname(b"/etc/hosts", b"/") };
+        assert_eq!(result, Some(&b"etc/hosts"[..]));
+    }
+
+    #[test]
+    fn path_shorten_fname_exact_match_returns_none() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Verified against the real C source: when full_path exactly
+        // equals dir_name, `p` (full_path + len) points at the NUL
+        // terminator, and `vim_ispathsep(NUL)` is false - so the
+        // original itself returns NULL here (there's no trailing
+        // separator to skip past), not an empty-but-successful
+        // shortening.
+        let result = unsafe { path_shorten_fname(b"/home/user", b"/home/user") };
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn path_try_shorten_fname_relative_to_cwd() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _cwd_guard = crate::os::fs::cwd_test_lock();
+        let cwd = crate::os::fs::os_dirname().unwrap();
+        let mut full = cwd.clone();
+        assert!(append_path(&mut full, b"file.txt", MAXPATHL as usize));
+
+        let shortened = unsafe { path_try_shorten_fname(&full) };
+        assert_eq!(shortened, b"file.txt");
+    }
+
+    #[test]
+    fn path_try_shorten_fname_unrelated_path_returns_full_path_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _cwd_guard = crate::os::fs::cwd_test_lock();
+        // A path that (almost certainly) doesn't share a prefix with
+        // the cwd should come back unchanged.
+        let unrelated: &[u8] = if cfg!(windows) {
+            b"Z:\\definitely\\not\\the\\cwd\\file.txt"
+        } else {
+            b"/definitely/not/the/cwd/file.txt"
+        };
+        let shortened = unsafe { path_try_shorten_fname(unrelated) };
+        assert_eq!(shortened, unrelated);
     }
 }
