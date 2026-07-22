@@ -54,6 +54,7 @@ pub mod memory;
 pub mod memory_defs;
 pub mod menu_defs;
 pub mod normal_defs;
+pub mod option;
 pub mod option_defs;
 pub mod option_vars;
 pub mod os;
