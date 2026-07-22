@@ -21,16 +21,34 @@
 //! far). `CharsizeArg`/`CsType` are translated field-for-field/
 //! variant-for-variant in full.
 //!
-//! Deferred: `charsize_regular`/`linesize_regular` (need inline
-//! virtual text rendering + `'linebreak'`/`'breakindent'`/
-//! `'showbreak'` wrap arithmetic on top of what `CharsizeArg.iter` now
-//! provides access to), `getvcol`/`getvvcol`/`linetabsize*` (need the
-//! above - `getvcol` itself already calls `init_charsize_arg`
-//! unconditionally, even on the `kCharsizeFast` path, so it still
-//! needs `charsize_regular` to exist before it can be translated even
-//! though the fast path alone wouldn't otherwise need it), and
-//! everything past the file's own "horizontal size" section (vertical
-//! size / fold-aware line-height calculations, needing `fold.c`).
+//! Deferred: `charsize_regular`/`linesize_regular` - **re-investigated
+//! precisely this session, now that `get_breakindent_win`/`ns_in_win`/
+//! `marktree_itr_next_filter`/`mt_decor`/`mt_right`/`mt_invalid`/
+//! `DecorVirtText` all exist**: `charsize_regular`'s OWN body still has
+//! three distinct, non-trivial sub-algorithms beyond what those
+//! prerequisites unlock, each deserving unhurried, dedicated attention
+//! rather than being rushed alongside everything else already done
+//! this session:
+//! 1. Inline-virtual-text width accumulation (walks `csarg.iter` via
+//!    `marktree_itr_current`/`marktree_itr_next_filter`, needs
+//!    `mt_decor_virt`'s `DecorVirtText` linked list - tractable now,
+//!    but not yet attempted).
+//! 2. `'breakindent'`/`'showbreak'` wrap-position arithmetic - THREE
+//!    separate rounding-arithmetic branches for where a wrapped
+//!    screen line's head-indent applies (`max_head_vcol` positive/
+//!    zero/negative), needing careful hand-tracing before trusting
+//!    any test.
+//! 3. `'linebreak'` word-wrap boundary detection (break at a blank
+//!    before a non-blank, scanning back to the last non-blank-after-
+//!    blank) - needs `vim_isbreak` (`charset.c`, not yet translated)
+//!    and `virt_text_cursor_off` (not yet checked).
+//! `getvcol`/`getvvcol`/`linetabsize*` need the above too - `getvcol`
+//! itself already calls `init_charsize_arg` unconditionally, even on
+//! the `kCharsizeFast` path, so it still needs `charsize_regular` to
+//! exist before it can be translated even though the fast path alone
+//! wouldn't otherwise need it. Everything past the file's own
+//! "horizontal size" section (vertical size / fold-aware line-height
+//! calculations, needing `fold.c`) remains deferred too.
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
