@@ -77,6 +77,7 @@ pub mod runtime_defs;
 pub mod search_defs;
 pub mod sha256;
 pub mod sign_defs;
+pub mod state;
 pub mod state_defs;
 pub mod statusline_defs;
 pub mod strings;
