@@ -45,15 +45,23 @@
 //! `dict_T`/`dictitem_T` (the generic, variable-key-length case -
 //! distinct from the already-existing fixed-size `ChangedtickDictItem`/
 //! `ScopeDictDictItem` instantiations of the same `TV_DICTITEM_STRUCT`
-//! macro, both updated in this pass to use the new, real `TypvalT`)
-//! and `ufunc_T`/`funccall_T`/`partial_T`'s own real fields remain
-//! deferred - `dict_T` specifically needs a real design decision for
-//! how its `hashtab_T` (generic, `hi_key`-points-into-external-value
-//! scheme) should relate to externally-allocated `dictitem_T`
-//! instances, which deserves its own dedicated, unhurried pass rather
-//! than a rushed choice bolted on here. `partial_T`/`DictT` themselves
-//! stay opaque placeholders (same convention as `types_defs.rs`'s
-//! cross-cutting placeholder list) for exactly this reason.
+//! macro) now have their real design (as `DictT`/`DictitemT`): see
+//! `DictitemT`'s own doc comment for the full reasoning - `di_key` is
+//! an owned `Vec<u8>` rather than the original's flexible array
+//! member, and `DictT` carries a new `dv_index` side table (a
+//! `HashMap` from each item's `hi_key` address to its owning
+//! `*mut DictitemT`) in place of the original's `TV_DICT_HI2DI`
+//! pointer-arithmetic recovery, which has no safe Rust equivalent
+//! here. The actual allocation/lookup/insertion *functions*
+//! (`tv_dict_alloc`, `tv_dict_find`, etc.) live in `eval/typval.rs`,
+//! translated from `eval/typval.c`.
+//!
+//! `ufunc_T`/`funccall_T`/`partial_T`'s own real fields remain
+//! deferred - `partial_T` needs `ufunc_T` (for `pt_func`), itself a
+//! separate, substantial piece of the eval engine's user-defined-
+//! function machinery. `partial_T` stays an opaque placeholder (same
+//! convention as `types_defs.rs`'s cross-cutting placeholder list) for
+//! exactly this reason.
 
 use crate::pos_defs::LinenrT;
 use crate::types_defs::LuaRef;
@@ -146,13 +154,91 @@ impl TypvalValue {
     }
 }
 
-/// Placeholder for `dict_T` (`struct dictvar_S`) - the Vimscript
-/// Dictionary type. Needs a real design decision for how its
-/// `hashtab_T` relates to externally-allocated `dictitem_T` instances -
-/// deferred to its own dedicated pass (see this module's own doc
-/// comment).
+/// Structure to hold an item of a Dictionary (`dictitem_T`).
+///
+/// The original stores `di_key` as a C "flexible array member"
+/// (`char di_key[]`) placed directly after `di_flags`, in the SAME
+/// heap allocation as the rest of the struct - this lets
+/// `hashtab_defs.rs`'s `HashitemT.hi_key` point straight at those
+/// bytes, and (`TV_DICT_HI2DI` in the original) recover the owning
+/// `dictitem_T*` via `hi_key - offsetof(dictitem_T, di_key)` pointer
+/// arithmetic, with no extra pointer stored per item.
+///
+/// Rust has no safe/ergonomic equivalent of a flexible array member -
+/// a faithful replication would need a hand-rolled dynamically-sized
+/// type (manual `Layout` computation, raw `alloc`/`dealloc`, and
+/// reconstructing a fat pointer on every access): a large amount of
+/// error-prone unsafe code, disproportionate to what is, in the
+/// original, purely a one-pointer memory optimization with zero
+/// observable behavioral difference to any caller. So `di_key` is
+/// instead an owned `Vec<u8>` (NUL-terminated, matching the byte
+/// layout `hi_key`'s C-string readers expect) - a genuinely separate
+/// heap allocation from `DictitemT` itself, exactly the same choice
+/// already made for the fixed-key-size `ChangedtickDictItem`/
+/// `ScopeDictDictItem` instantiations of this same original macro,
+/// above.
+///
+/// This means `hi_key -> owning DictitemT` can no longer be recovered
+/// via pointer arithmetic; `eval/typval.rs`'s `DictT` instead keeps
+/// its own side index (`dv_index`, a `HashMap` keyed by each item's
+/// `hi_key` address) for that lookup - matching this crate's own
+/// `hashtab.rs` module doc, which already anticipated this exact
+/// tension for `hash_clear_all` ("the right Rust shape (probably a
+/// trait or closure parameter instead of raw offset arithmetic)").
+///
+/// Heap-allocated via `Box::into_raw`/`Box::from_raw`, matching
+/// `ListitemT`'s established raw-pointer-linked convention - NOT
+/// `Rc`/`RefCell`, for the same reasons given there.
+#[derive(Debug)]
+pub struct DictitemT {
+    /// Structure that holds the value (`di_tv`).
+    pub di_tv: TypvalT,
+    /// Flags, see [`dict_item_flags`] (`di_flags`).
+    pub di_flags: u8,
+    /// Key value, NUL-terminated (`di_key`) - see this struct's own
+    /// doc comment for why this is an owned `Vec<u8>` rather than a
+    /// true flexible array member.
+    pub di_key: Vec<u8>,
+}
+
+/// Structure representing a Dictionary (`dictvar_S` / `dict_T`).
+///
+/// `dv_hashtab` is used exactly as the original for key-uniqueness/
+/// existence hashing (via `hashtab.rs`'s existing `HashtabT`), but see
+/// [`DictitemT`]'s own doc comment for why the classic `TV_DICT_HI2DI`
+/// `hi_key`-to-owning-item pointer-arithmetic recovery isn't
+/// replicated. `dv_index` (new, not in the original) is this crate's
+/// own substitute: a side table from each live item's `hi_key` address
+/// (as a `usize`) to its owning `*mut DictitemT`, populated/
+/// depopulated in lockstep with `dv_hashtab` by every insert/remove in
+/// `eval/typval.rs`.
+///
+/// `watchers` (the original's `QUEUE` of dict-key watchers set by user
+/// code, e.g. `dictwatcheradd()`) is deferred - needs a `QUEUE`
+/// intrusive-linked-list translation first, and has no caller yet
+/// among the functions translated so far.
 pub struct DictT {
-    _private: (),
+    /// Whole dictionary lock status (`dv_lock`).
+    pub dv_lock: VarLockStatus,
+    /// Non-zero (`Scope`/`DefScope`) if dictionary represents a scope
+    /// (i.e. `g:`, `l:`, ...) (`dv_scope`).
+    pub dv_scope: ScopeType,
+    /// Reference count (`dv_refcount`).
+    pub dv_refcount: i32,
+    /// ID used when recursively traversing a value (`dv_copy_id`).
+    pub dv_copy_id: i32,
+    /// Hashtab containing all items (`dv_hashtab`).
+    pub dv_hashtab: crate::hashtab_defs::HashtabT,
+    /// This crate's own side index from each live item's `hi_key`
+    /// address to its owning item - see this struct's own doc comment.
+    pub dv_index: std::collections::HashMap<usize, *mut DictitemT>,
+    /// Copied dict used by `deepcopy()` (`dv_copydict`).
+    pub dv_copydict: *mut DictT,
+    /// Next dictionary in used dictionaries list (`dv_used_next`).
+    pub dv_used_next: *mut DictT,
+    /// Previous dictionary in used dictionaries list (`dv_used_prev`).
+    pub dv_used_prev: *mut DictT,
+    pub lua_table_ref: LuaRef,
 }
 
 /// Structure to hold an item of a list (`listitem_T`).
