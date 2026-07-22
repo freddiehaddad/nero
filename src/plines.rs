@@ -4,9 +4,7 @@
 //! size of text as displayed in a window - screen-column/character-
 //! width computation, a substantial subsystem of its own comparable in
 //! scope to `mbyte.c` but for on-screen width rather than byte-level
-//! decoding. `charsize_regular`/`linesize_regular` additionally need
-//! `'linebreak'`/`'breakindent'`/`'showbreak'`-aware wrapping
-//! arithmetic on top of what `init_charsize_arg` itself now provides.
+//! decoding.
 //!
 //! Translated: `win_chartabsize`, `charsize_nowrap` (needed `indent.c`'s
 //! `tabstop_padding` and `charset.c`'s `ptr2cells`); `in_win_border`
@@ -16,40 +14,42 @@
 //! `StrCharInfo`/`utf_ptr2StrCharInfo`/`utfc_next`); `init_charsize_arg`
 //! (decides which of the two modes applies for a given line, and -
 //! when there's a preceding line - populates `CharsizeArg.iter`/
-//! `virt_row` via `marktree.c`'s `marktree_itr_get_filter`, translated
-//! alongside since this was its only real caller in this crate so
-//! far). `CharsizeArg`/`CsType` are translated field-for-field/
+//! `virt_row` via `marktree.c`'s `marktree_itr_get_filter`); and now
+//! **`charsize_regular`/`virt_text_cursor_off`** - the full inline-
+//! virtual-text-aware, `'linebreak'`/`'breakindent'`/`'showbreak'`-
+//! aware character-size computation, the single most consequential
+//! function in this file. Needed `charset.c`'s `vim_isbreak`,
+//! `marktree.c`'s `mt_decor_virt`/`mt_right`/`mt_invalid`/
+//! `marktree_itr_current`/`marktree_itr_next_filter`,
+//! `decoration_defs.rs`'s `DecorVirtText`/`VirtTextPos`, `api/extmark.rs`'s
+//! `ns_in_win`, and `indent.c`'s `get_breakindent_win` - all translated
+//! earlier this session specifically to unblock this function. `col`
+//! (the byte offset of `cur` within `line`) is an explicit parameter
+//! here, unlike the original's `cur - line` pointer subtraction -
+//! matching this crate's established index-instead-of-pointer
+//! convention for buffer positions (e.g. `mbyte.rs`'s
+//! `StrCharInfo.pos`). Its own three sub-algorithms (inline virtual
+//! text accumulation, three-branch breakindent/showbreak wrap-position
+//! rounding arithmetic, and linebreak word-wrap boundary detection)
+//! were each hand-traced and verified independently via scratch probes
+//! before writing permanent tests - some hand-traces of the
+//! *algorithm's own behavior* (not the translation) were wrong on the
+//! first attempt (e.g. assuming the linebreak scan would walk through
+//! an entire multi-word phrase, when it actually stops at the first
+//! blank-to-non-blank transition after the starting position) and were
+//! corrected by reading the actual probe output rather than trusting
+//! the initial derivation.
+//!
+//! `CharsizeArg`/`CsType` are translated field-for-field/
 //! variant-for-variant in full.
 //!
-//! Deferred: `charsize_regular`/`linesize_regular` - **re-investigated
-//! precisely this session, now that `get_breakindent_win`/`ns_in_win`/
-//! `marktree_itr_next_filter`/`mt_decor`/`mt_right`/`mt_invalid`/
-//! `DecorVirtText` all exist**: `charsize_regular`'s OWN body still has
-//! three distinct, non-trivial sub-algorithms beyond what those
-//! prerequisites unlock, each deserving unhurried, dedicated attention
-//! rather than being rushed alongside everything else already done
-//! this session:
-//! 1. Inline-virtual-text width accumulation (walks `csarg.iter` via
-//!    `marktree_itr_current`/`marktree_itr_next_filter`, needs
-//!    `mt_decor_virt`'s `DecorVirtText` linked list - tractable now,
-//!    but not yet attempted).
-//! 2. `'breakindent'`/`'showbreak'` wrap-position arithmetic - THREE
-//!    separate rounding-arithmetic branches for where a wrapped
-//!    screen line's head-indent applies (`max_head_vcol` positive/
-//!    zero/negative), needing careful hand-tracing before trusting
-//!    any test.
-//! 3. `'linebreak'` word-wrap boundary detection (break at a blank
-//!    before a non-blank, scanning back to the last non-blank-after-
-//!    blank) - needs `charset.c`'s `vim_isbreak` (now translated) and
-//!    `virt_text_cursor_off` (not yet checked).
-//!
-//! `getvcol`/`getvvcol`/`linetabsize*` need the above too - `getvcol`
-//! itself already calls `init_charsize_arg` unconditionally, even on
-//! the `kCharsizeFast` path, so it still needs `charsize_regular` to
-//! exist before it can be translated even though the fast path alone
-//! wouldn't otherwise need it. Everything past the file's own
-//! "horizontal size" section (vertical size / fold-aware line-height
-//! calculations, needing `fold.c`) remains deferred too.
+//! Deferred: `linesize_regular` (the whole-line-width counterpart of
+//! `charsize_regular`, straightforward to add now that `charsize_regular`
+//! itself exists - not yet attempted, purely for lack of a real caller
+//! yet), `getvcol`/`getvvcol`/`linetabsize*` (need `init_charsize_arg`'s
+//! own remaining gap: none currently known, worth a fresh look), and
+//! everything past the file's own "horizontal size" section (vertical
+//! size / fold-aware line-height calculations, needing `fold.c`).
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
@@ -139,6 +139,316 @@ pub unsafe fn init_charsize_arg<'a>(
     };
 
     (csarg, cstype)
+}
+
+/// Get how many virtual columns inline virtual text should offset the
+/// cursor (`virt_text_cursor_off`).
+///
+/// @param csarg   should contain information stored by [`charsize_regular`]
+///                about widths of left and right gravity virtual text
+/// @param on_nul  whether this is the end of the line
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (for the current editor mode).
+fn virt_text_cursor_off(csarg: &CharsizeArg, on_nul: bool) -> i32 {
+    let mut off = 0;
+    // SAFETY: forwarded from this function's own safety doc - GLOBALS
+    // access is inherently safe here (a plain `i32` read), the
+    // `unsafe` requirement is only for consistency with this crate's
+    // established `GlobalCell::get_mut` convention.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    let is_normal = state & crate::state_defs::mode::NORMAL != 0;
+    if !on_nul || !is_normal {
+        off += csarg.cur_text_width_left;
+    }
+    if !on_nul && is_normal {
+        off += csarg.cur_text_width_right;
+    }
+    off
+}
+
+/// Get the number of cells taken up on the screen for the given
+/// arguments (`charsize_regular`). `csarg.cur_text_width_left`/
+/// `csarg.cur_text_width_right` are set to the extra size for inline
+/// virtual text.
+///
+/// When `csarg.max_head_vcol` is positive, only count in `head` the
+/// size of `'showbreak'`/`'breakindent'` before `csarg.max_head_vcol`.
+/// When `csarg.max_head_vcol` is negative, only count in `head` the
+/// size of `'showbreak'`/`'breakindent'` before where the cursor
+/// should be placed.
+///
+/// `col` is the byte offset of `cur` within `csarg.line` - the
+/// original derives this via pointer subtraction (`cur - line`); this
+/// crate represents buffer positions as explicit indices rather than
+/// raw pointers throughout (e.g. `mbyte.rs`'s `StrCharInfo.pos`), so
+/// an explicit parameter here matches that same established
+/// convention rather than relying on `cur`/`csarg.line` sharing a
+/// provable pointer relationship.
+///
+/// # Safety
+/// `csarg.win` must be a valid, non-null pointer to a live `WinT`
+/// whose own `w_buffer` is also valid. Touches
+/// `crate::option_vars::OPTION_VARS` (via `ptr2cells`/`utfc_ptr2len`/
+/// `vim_strsize`/etc.) and `crate::globals::GLOBALS` (via
+/// `virt_text_cursor_off`).
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub unsafe fn charsize_regular(
+    csarg: &mut CharsizeArg,
+    cur: &[u8],
+    col: ColnrT,
+    vcol: ColnrT,
+    cur_char: i32,
+) -> CharSize {
+    csarg.cur_text_width_left = 0;
+    csarg.cur_text_width_right = 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { &mut *csarg.win };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*wp.w_buffer };
+    let line = csarg.line;
+    let use_tabstop = cur_char == i32::from(TAB) && csarg.use_tabstop;
+    let mut mb_added = 0;
+
+    let has_lcs_eol = wp.w_onebuf_opt.wo_list != 0 && wp.w_p_lcs_chars.eol != 0;
+
+    // First get normal size, without 'linebreak' or inline virtual text
+    let mut size;
+    let mut is_doublewidth = false;
+    if use_tabstop {
+        size = crate::indent::tabstop_padding(vcol, buf.b_p_ts, buf.b_p_vts_array.as_deref());
+    } else if cur.first().copied().unwrap_or(0) == 0 {
+        // 1 cell for EOL list char (if present), as opposed to the two
+        // cell ^@ for a NUL character in the text.
+        size = i32::from(has_lcs_eol);
+    } else if cur_char < 0 {
+        size = crate::mbyte_defs::K_INVALID_BYTE_CELLS;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        size = unsafe { crate::charset::ptr2cells(cur) };
+        is_doublewidth = size == 2 && cur_char >= 0x80;
+    }
+
+    if csarg.virt_row >= 0 {
+        let mut tab_size = size;
+        loop {
+            let mark = crate::marktree::marktree_itr_current(&csarg.iter);
+            if mark.pos.row != csarg.virt_row || mark.pos.col > col {
+                break;
+            } else if mark.pos.col == col
+                && !crate::marktree::mt_invalid(&mark)
+                // SAFETY: forwarded from this function's own safety doc.
+                && unsafe { crate::api::extmark::ns_in_win(mark.ns, wp) }
+            {
+                let mut vt = crate::marktree::mt_decor_virt(&mark);
+                while let Some(v) = vt {
+                    if v.flags & crate::decoration_defs::VT_IS_LINES == 0
+                        && v.pos == crate::decoration_defs::VirtTextPos::Inline
+                    {
+                        if crate::marktree::mt_right(&mark) {
+                            csarg.cur_text_width_right += v.width;
+                        } else {
+                            csarg.cur_text_width_left += v.width;
+                        }
+                        size += v.width;
+                        if use_tabstop {
+                            // tab size changes because of the inserted text
+                            size -= tab_size;
+                            tab_size = crate::indent::tabstop_padding(
+                                vcol + size,
+                                buf.b_p_ts,
+                                buf.b_p_vts_array.as_deref(),
+                            );
+                            size += tab_size;
+                        }
+                    }
+                    vt = v.next.as_deref();
+                }
+            }
+            crate::marktree::marktree_itr_next_filter(
+                &buf.b_marktree,
+                &mut csarg.iter,
+                csarg.virt_row + 1,
+                0,
+                &INLINE_FILTER,
+            );
+        }
+    }
+
+    if is_doublewidth
+        && wp.w_onebuf_opt.wo_wrap != 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { in_win_border(wp, vcol + size - 2) }
+    {
+        // Count the ">" in the last column.
+        size += 1;
+        mb_added = 1;
+    }
+
+    let sbr = crate::option::get_showbreak_value(wp);
+
+    // May have to add something for 'breakindent' and/or 'showbreak'
+    // string at the start of a screen line.
+    let mut head = mb_added;
+    // When "size" is 0, no new screen line is started.
+    if size > 0
+        && wp.w_onebuf_opt.wo_wrap != 0
+        && (!sbr.is_empty() || wp.w_onebuf_opt.wo_bri != 0)
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut col_off_prev = unsafe { crate::r#move::win_col_off(wp) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let width2 = wp.w_view_width - col_off_prev + unsafe { crate::r#move::win_col_off2(wp) };
+        let mut wcol = vcol + col_off_prev;
+        let max_head_vcol = csarg.max_head_vcol;
+        let mut added = 0;
+
+        // cells taken by 'showbreak'/'breakindent' before current char
+        let mut head_prev = 0;
+        if wcol >= wp.w_view_width {
+            wcol -= wp.w_view_width;
+            col_off_prev = wp.w_view_width - width2;
+            if wcol >= width2 && width2 > 0 {
+                wcol %= width2;
+            }
+            head_prev = csarg.indent_width;
+            if head_prev == i32::MIN {
+                head_prev = 0;
+                if !sbr.is_empty() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    head_prev += unsafe { crate::charset::vim_strsize(&sbr) };
+                }
+                if wp.w_onebuf_opt.wo_bri != 0 {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    head_prev += unsafe { crate::indent::get_breakindent_win(wp, line) };
+                }
+                csarg.indent_width = head_prev;
+            }
+            if wcol < head_prev {
+                head_prev -= wcol;
+                wcol += head_prev;
+                added += head_prev;
+                if max_head_vcol <= 0 || vcol < max_head_vcol {
+                    head += head_prev;
+                }
+            } else {
+                head_prev = 0;
+            }
+            wcol += col_off_prev;
+        }
+
+        if wcol + size > wp.w_view_width {
+            // cells taken by 'showbreak'/'breakindent' halfway current char
+            let mut head_mid = csarg.indent_width;
+            if head_mid == i32::MIN {
+                head_mid = 0;
+                if !sbr.is_empty() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    head_mid += unsafe { crate::charset::vim_strsize(&sbr) };
+                }
+                if wp.w_onebuf_opt.wo_bri != 0 {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    head_mid += unsafe { crate::indent::get_breakindent_win(wp, line) };
+                }
+                csarg.indent_width = head_mid;
+            }
+            if head_mid > 0 {
+                // Calculate effective window width.
+                let prev_rem = wp.w_view_width - wcol;
+                let mut width = width2 - head_mid;
+
+                if width <= 0 {
+                    width = 1;
+                }
+                // Divide "size - prev_rem" by "width", rounding up.
+                let cnt = (size - prev_rem + width - 1) / width;
+                added += cnt * head_mid;
+
+                if max_head_vcol == 0 || vcol + size + added < max_head_vcol {
+                    head += cnt * head_mid;
+                } else if width2 > 0 && max_head_vcol > vcol + head_prev + prev_rem {
+                    head += (max_head_vcol - (vcol + head_prev + prev_rem) + width2 - 1) / width2
+                        * head_mid;
+                } else if max_head_vcol < 0 {
+                    let on_nul = cur.first().copied().unwrap_or(0) == 0;
+                    let off = mb_added + virt_text_cursor_off(csarg, on_nul);
+                    if off >= prev_rem {
+                        if size > off {
+                            head += (1 + (off - prev_rem) / width) * head_mid;
+                        } else {
+                            head += (off - prev_rem + width - 1) / width * head_mid;
+                        }
+                    }
+                }
+            }
+        }
+
+        size += added;
+    }
+
+    let size_before_lbr = size;
+    let mut need_lbr = false;
+    // If 'linebreak' set check at a blank before a non-blank if the
+    // line needs a break here.
+    if wp.w_onebuf_opt.wo_lbr != 0
+        && wp.w_onebuf_opt.wo_wrap != 0
+        && wp.w_view_width != 0
+        && crate::charset::vim_isbreak(i32::from(cur.first().copied().unwrap_or(0)))
+        && !crate::charset::vim_isbreak(i32::from(cur.get(1).copied().unwrap_or(0)))
+    {
+        let mut t_pos = 0usize;
+        while crate::charset::vim_isbreak(i32::from(line.get(t_pos).copied().unwrap_or(0))) {
+            t_pos += 1;
+        }
+        // 'linebreak' is only needed when not in leading whitespace.
+        need_lbr = (col as usize) >= t_pos;
+    }
+    if need_lbr {
+        // Count all characters from first non-blank after a blank up
+        // to next non-blank after a blank.
+        // SAFETY: forwarded from this function's own safety doc.
+        let numberextra = unsafe { crate::r#move::win_col_off(wp) };
+        let col_adj = size - 1;
+        let mut colmax = wp.w_view_width - numberextra - col_adj;
+        if vcol >= colmax {
+            colmax += col_adj;
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = colmax + unsafe { crate::r#move::win_col_off2(wp) };
+            if n > 0 {
+                colmax += (((vcol - colmax) / n) + 1) * n - col_adj;
+            }
+        }
+
+        let mut vcol2 = vcol;
+        let mut pos = col as usize;
+        loop {
+            let ps_pos = pos;
+            // SAFETY: forwarded from this function's own safety doc.
+            pos += unsafe { crate::mbyte::utfc_ptr2len(&line[pos..]) } as usize;
+            let c = line.get(pos).copied().unwrap_or(0);
+            if !(c != 0
+                && (crate::charset::vim_isbreak(i32::from(c))
+                    || vcol2 == vcol
+                    || !crate::charset::vim_isbreak(i32::from(line[ps_pos]))))
+            {
+                break;
+            }
+
+            // SAFETY: forwarded from this function's own safety doc.
+            vcol2 += unsafe { win_chartabsize(wp, &line[pos..], vcol2) };
+            if vcol2 >= colmax {
+                // doesn't fit
+                size = colmax - vcol + col_adj;
+                break;
+            }
+        }
+    }
+
+    let tail = size - size_before_lbr;
+
+    CharSize { width: size, head, tail }
 }
 
 /// Return the number of cells the first char in `p` will take on the
@@ -463,6 +773,163 @@ mod tests {
         win.w_p_lcs_chars.tab1 = 1;
         let (csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, b"a\0") };
         assert!(csarg.use_tabstop);
+    }
+
+    #[test]
+    fn charsize_regular_plain_ascii_no_wrap_options() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line = b"hello\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        let cs = unsafe { charsize_regular(&mut csarg, &line[0..], 0, 0, i32::from(b'h')) };
+        assert_eq!(cs, CharSize { width: 1, head: 0, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_tab_with_tabstop() {
+        let mut buf = BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line: &[u8] = &[TAB, b'x', 0];
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        let cs = unsafe { charsize_regular(&mut csarg, &line[0..], 0, 2, i32::from(TAB)) };
+        // tabstop_padding(vcol=2, ts=8, no vts) = 8 - (2%8) = 6.
+        assert_eq!(cs, CharSize { width: 6, head: 0, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_doublewidth_char_not_at_border() {
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 5; // number_width == 1
+        let mut win = border_test_win(&mut buf as *mut BufT); // w_view_width=10, wo_nu=1
+        win.w_onebuf_opt.wo_wrap = 1;
+        let cjk = "一\0".as_bytes(); // U+4E00, East Asian Wide: 2 cells
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, cjk) };
+        // vcol=6 is not at the border (hand-traced against move.rs's own
+        // win_col_off tests using this exact border_test_win setup).
+        let cs = unsafe { charsize_regular(&mut csarg, &cjk[0..], 0, 6, 0x4E00) };
+        assert_eq!(cs, CharSize { width: 2, head: 0, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_doublewidth_char_at_border_gets_overflow_marker() {
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 5; // number_width == 1
+        let mut win = border_test_win(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 1;
+        let cjk = "一\0".as_bytes();
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, cjk) };
+        // vcol=7 IS at the border.
+        let cs = unsafe { charsize_regular(&mut csarg, &cjk[0..], 0, 7, 0x4E00) };
+        assert_eq!(cs, CharSize { width: 3, head: 1, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_breakindent_head_prev_branch() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 201, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 20;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_bri = 1;
+        let line = b"    text\0"; // 4-space indent
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        let cs = unsafe { charsize_regular(&mut csarg, &line[4..], 4, 21, i32::from(b't')) };
+        // Hand-traced: get_breakindent_win("    text\0")=4 (4-space indent,
+        // no clamping since eff_wwidth=20 is ample); wcol wraps from
+        // vcol=21 to 1 (21-20), head_prev(4) > wcol(1) so head_prev
+        // shrinks to 3 and is added to both `head` and `size`.
+        assert_eq!(cs, CharSize { width: 4, head: 3, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_head_mid_branch_when_char_still_overflows_after_wrap() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 203, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 4;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_bri = 1;
+        let line = b"    text\0"; // 4-space indent
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        let cs = unsafe { charsize_regular(&mut csarg, &line[4..], 4, 9, i32::from(b't')) };
+        // Hand-traced (verified via scratch probe first): with a
+        // narrow 4-column window, after the head_prev wrap adjustment
+        // (wcol=4), the character (size=1) still doesn't fit
+        // (4+1>4), triggering the head_mid branch's own rounding-up
+        // arithmetic: cnt=1, added += cnt*head_mid(4)=4 (on top of
+        // head_prev's own +3), head += cnt*head_mid(4).
+        assert_eq!(cs, CharSize { width: 8, head: 7, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_linebreak_shrinks_size_when_word_does_not_fit() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 6;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_lbr = 1;
+        let line = b"one reallylongword\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        // Position at the space right after "one" (index 3), vcol=3.
+        // Hand-traced (verified via scratch probe first): the
+        // following word doesn't fit before colmax(6), so size shrinks
+        // to colmax(6) - vcol(3) + col_adj(0) = 3.
+        let cs = unsafe { charsize_regular(&mut csarg, &line[3..], 3, 3, i32::from(b' ')) };
+        assert_eq!(cs, CharSize { width: 3, head: 0, tail: 2 });
+    }
+
+    #[test]
+    fn charsize_regular_linebreak_no_break_needed_when_word_fits() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 10;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_lbr = 1;
+        let line = b"one two three\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        // The scan naturally stops at the next blank-to-non-blank
+        // transition ("three" starting a new word) before ever
+        // exceeding colmax, so size is left unchanged.
+        let cs = unsafe { charsize_regular(&mut csarg, &line[3..], 3, 3, i32::from(b' ')) };
+        assert_eq!(cs, CharSize { width: 1, head: 0, tail: 0 });
+    }
+
+    #[test]
+    fn charsize_regular_accumulates_inline_virtual_text_width() {
+        let mut buf = BufT::default();
+        let decor_ext = crate::decoration_defs::DecorExt {
+            sh_idx: 0,
+            vt: Some(Box::new(crate::decoration_defs::DecorVirtText {
+                width: 5,
+                pos: crate::decoration_defs::VirtTextPos::Inline,
+                ..Default::default()
+            })),
+        };
+        let key = crate::marktree_defs::MtKey {
+            pos: crate::marktree_defs::MtPos::new(4, 0), // row=4 (lnum-1=5-1), col=0
+            ns: 0,
+            id: 1,
+            flags: crate::marktree::mt_flags(false, false, false, true) // decor_ext=true
+                | crate::marktree::MT_FLAG_DECOR_VIRT_TEXT_INLINE,
+            decor_data: crate::decoration_defs::DecorInlineData {
+                ext: std::mem::ManuallyDrop::new(decor_ext),
+            },
+        };
+        crate::marktree::marktree_put(&mut buf.b_marktree, key, -1, -1, false);
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+        let line = b"abc\0";
+        let (mut csarg, cstype) = unsafe { init_charsize_arg(&mut win as *mut WinT, 5, line) };
+        assert_eq!(cstype, CsType::Regular);
+        assert_eq!(csarg.virt_row, 4);
+
+        // col=0 matches the mark's own column - the virtual text
+        // attaches to the character at position 0 ('a').
+        let cs = unsafe { charsize_regular(&mut csarg, &line[0..], 0, 0, i32::from(b'a')) };
+        // 'a' itself is 1 cell + 5 cells of virtual text = 6.
+        assert_eq!(cs.width, 6);
+        assert_eq!(csarg.cur_text_width_left, 5); // not right-gravity -> left
+        assert_eq!(csarg.cur_text_width_right, 0);
     }
 
     #[test]
