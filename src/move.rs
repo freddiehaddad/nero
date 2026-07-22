@@ -245,6 +245,43 @@ pub unsafe fn cursor_valid(wp: *mut WinT) -> bool {
     (valid_flags & want) == want
 }
 
+/// Validate `wp.w_wcol` and `wp.w_virtcol` only (`validate_cursor_col`).
+///
+/// # Safety
+/// Same as [`validate_virtcol`].
+pub unsafe fn validate_cursor_col(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { validate_virtcol(wp) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*wp }.w_valid & i32::from(w_valid::VALID_WCOL) != 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let mut col = w.w_virtcol;
+    // SAFETY: forwarded from this function's own safety doc.
+    let off = unsafe { win_col_off(w) };
+    col += off;
+    // SAFETY: forwarded from this function's own safety doc.
+    let width = w.w_view_width - off + unsafe { win_col_off2(w) };
+
+    // long line wrapping, adjust wp->w_wrow
+    if w.w_onebuf_opt.wo_wrap != 0 && col >= w.w_view_width && width > 0 {
+        // use same formula as what is used in curs_columns()
+        col -= ((col - w.w_view_width) / width + 1) * width;
+    }
+    if col > w.w_leftcol {
+        col -= w.w_leftcol;
+    } else {
+        col = 0;
+    }
+    w.w_wcol = col;
+
+    w.w_valid |= i32::from(w_valid::VALID_WCOL);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +486,88 @@ mod tests {
 
         assert_eq!(win.w_virtcol, 3); // plain ASCII 'l' at col 3 in "hello"
         assert_ne!(win.w_valid & i32::from(w_valid::VALID_VIRTCOL), 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn validate_cursor_col_basic_no_wrap_no_leftcol() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+
+        unsafe { validate_cursor_col(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_wcol, 2);
+        assert_ne!(win.w_valid & i32::from(w_valid::VALID_WCOL), 0);
+        assert_ne!(win.w_valid & i32::from(w_valid::VALID_VIRTCOL), 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn validate_cursor_col_short_circuits_when_already_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        // w_valid_cursor must match w_cursor (and w_valid_leftcol/
+        // w_valid_skipcol match their counterparts) so the internal
+        // check_cursor_moved call (via validate_virtcol) is a true
+        // no-op and doesn't clear the bits pre-marked below.
+        win.w_valid_cursor = win.w_cursor;
+        // Pre-mark both VALID_VIRTCOL and VALID_WCOL, with a
+        // deliberately WRONG w_wcol - it must be left untouched since
+        // the function should short-circuit without recomputing.
+        win.w_valid = i32::from(w_valid::VALID_VIRTCOL) | i32::from(w_valid::VALID_WCOL);
+        win.w_wcol = 999;
+
+        unsafe { validate_cursor_col(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_wcol, 999);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn validate_cursor_col_clamps_to_zero_when_leftcol_exceeds_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        win.w_leftcol = 5; // scrolled right past the cursor's own column
+
+        unsafe { validate_cursor_col(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_wcol, 0);
 
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
