@@ -11,7 +11,11 @@
 //! `curbuf_is_changed` - adapted to snake_case, matching this crate's
 //! usual convention even though the originals are themselves
 //! camelCase) - now tractable now that `change.c`'s `file_ff_differs`
-//! exists (needed `memline.c`'s `ml_get_buf`).
+//! exists (needed `memline.c`'s `ml_get_buf`); `u_find_first_changed`
+//! (now tractable now that `memline.c`'s `ml_get_buf` exists - only
+//! needed `UHeader.uh_entries`/`ue_top`/`ue_bot`/`ue_array`, already
+//! present in `undo_defs.rs`, plus `mark_defs.rs`'s already-translated
+//! `clearpos`).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -19,10 +23,10 @@
 //!   debug-only `uh_magic`/`ue_magic` fields (no equivalent debug-build
 //!   concept established in this crate yet, same reasoning as
 //!   marktree.rs's deferred `mt_inspect*` debug functions).
-//! - `u_save*`/`u_undo*`/`u_redo*`/`undo_time`: need `ml_replace`/
-//!   `ml_delete`/`ml_append` (`memline.c`'s write side, not yet
-//!   translated - the read side, `ml_get`/`ml_get_buf`/`ml_find_line`,
-//!   now exists) and autocmd triggers (`autocmd.c`).
+//! - `u_save*`/`u_undo*`/`u_redo*`/`undo_time`: need `autocmd.c`
+//!   triggers (`memline.c`'s write side, `ml_replace`/`ml_delete`/
+//!   `ml_append`, now exists, but these are still substantial
+//!   undertakings in their own right - not (re-)examined yet).
 //! - `u_compute_hash`/`u_get_undo_file_name`/`u_write_undo`/
 //!   `u_read_undo`/`serialize_*`/`unserialize_*`: undo-FILE
 //!   persistence. Re-checked after `os/fs.rs` gained real `os_open` -
@@ -35,19 +39,16 @@
 //!   (`u_get_undo_file_name`), and its own serialization format
 //!   (`serialize_header`/`serialize_uhp`/etc., not yet examined) -
 //!   still a substantial, separate undertaking.
-//! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: need
-//!   `ml_replace` (`memline.c`'s write side, not yet translated).
+//! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: needed
+//!   `ml_replace` (`memline.c`'s write side) - now exists, worth a
+//!   fresh look, not yet (re-)examined this pass.
 //! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
 //!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
 //!   `ex_*` functions).
-//! - `u_find_first_changed`: needs `curbuf.b_u_newhead`/`b_u_curhead`'s
-//!   `uh_entries`/`ue_top`/`ue_bot`/`ue_array` (all already exist in
-//!   `undo_defs.rs`) plus `clearpos` (not yet checked) - genuinely
-//!   tractable-looking on a first read, but not yet attempted this
-//!   pass; re-visit directly rather than assuming still blocked.
 //! - `u_get_headentry`/`u_getbot`: need `iemsg()` (`message.c`).
 
 use crate::buffer_defs::BufT;
+use crate::pos_defs::LinenrT;
 use crate::undo_defs::{uh_flags, UHeader, UhLink};
 
 /// Free one header `uhp` and its entry list and adjust the pointers
@@ -252,6 +253,63 @@ pub fn u_clearline(buf: &mut BufT) {
     }
     buf.b_u_line_ptr = None;
     buf.b_u_line_lnum = 0;
+}
+
+/// After reloading a buffer which was saved for `'undoreload'`: find
+/// the first line that was changed and set the cursor there
+/// (`u_find_first_changed`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` whose `b_u_newhead`, if non-null, is a valid
+/// `UHeader` pointer, and whose `b_ml.ml_mfp`, if non-null, points to
+/// a live `MemfileT`.
+pub unsafe fn u_find_first_changed() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    let uhp = curbuf.b_u_newhead;
+
+    if !curbuf.b_u_curhead.is_null() || uhp.is_null() {
+        return; // undid something in an autocmd?
+    }
+
+    // Check that the last undo block was for the whole file. `uhp.
+    // uh_entries.first()` stands in for the original's `uhp->uh_entry`
+    // (the first entry of a singly-linked list there; owned directly
+    // in `Vec<UEntry>` order here).
+    // SAFETY: forwarded from this function's own safety doc.
+    let uh = unsafe { &mut *uhp };
+    let Some(uep) = uh.uh_entries.first() else {
+        // (matches the original's implicit assumption that uh_entry is
+        // non-null when ue_top/ue_bot are read next - an empty
+        // uh_entries here would itself be a pre-existing invariant
+        // violation, not something reachable in practice.)
+        return;
+    };
+    if uep.ue_top != 0 || uep.ue_bot != 0 {
+        return;
+    }
+    // `uep.ue_array.len()` stands in for the original's separate
+    // `ue_size` count (a `Vec` already tracks its own length - see
+    // `UEntry`'s own doc comment in undo_defs.rs).
+    let ue_size = uep.ue_array.len() as LinenrT;
+
+    let mut lnum: LinenrT = 1;
+    while lnum < curbuf.b_ml.ml_line_count && lnum <= ue_size {
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(curbuf, lnum) };
+        if line != uh.uh_entries[0].ue_array[(lnum - 1) as usize] {
+            crate::mark_defs::clearpos(&mut uh.uh_cursor);
+            uh.uh_cursor.lnum = lnum;
+            return;
+        }
+        lnum += 1;
+    }
+    if curbuf.b_ml.ml_line_count != ue_size {
+        // lines added or deleted at the end, put the cursor there
+        crate::mark_defs::clearpos(&mut uh.uh_cursor);
+        uh.uh_cursor.lnum = lnum;
+    }
 }
 
 /// Check if the `'modified'` flag is set, or `'ff'` has changed (only
@@ -582,5 +640,221 @@ mod tests {
         assert!(!unsafe { any_buf_is_changed() });
 
         unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = prev_firstbuf;
+    }
+
+    /// Builds a working 2-line memline ("one\0", "two\0") on a fresh
+    /// buffer, for `u_find_first_changed` tests.
+    fn buf_with_two_lines() -> BufT {
+        let mut buf = BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false),
+                crate::vim_defs::OK
+            );
+        }
+        assert_eq!(buf.b_ml.ml_line_count, 2);
+        buf
+    }
+
+    /// Builds a working 3-line memline ("one\0", "two\0", "three\0") on
+    /// a fresh buffer, for `u_find_first_changed` tests that need a
+    /// non-last differing line (the original's own loop bound,
+    /// `lnum < ml_line_count`, never inspects the very last line when
+    /// `ue_size == ml_line_count` - see undo.c:2804).
+    fn buf_with_three_lines() -> BufT {
+        let mut buf = BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 2, b"three\0", 6, false),
+                crate::vim_defs::OK
+            );
+        }
+        assert_eq!(buf.b_ml.ml_line_count, 3);
+        buf
+    }
+
+    fn close_buf_with_memline(buf: BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn u_find_first_changed_leaves_cursor_untouched_when_nothing_differs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let uhp = new_header();
+        unsafe {
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"one\0".to_vec(), b"two\0".to_vec()],
+            });
+        }
+        buf.b_u_newhead = uhp;
+        buf.b_u_curhead = std::ptr::null_mut();
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { u_find_first_changed() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        // same line count, all lines matched: cursor position untouched
+        // (stays at UHeader::default()'s zeroed pos_T).
+        assert_eq!(unsafe { (*uhp).uh_cursor.lnum }, 0);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_find_first_changed_finds_the_differing_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        // 3 lines, difference on the middle line: the original's own
+        // loop bound (`lnum < ml_line_count`) never inspects the very
+        // last line when `ue_size == ml_line_count` (see undo.c:2804),
+        // so the differing line must not be the last one here.
+        let mut buf = buf_with_three_lines();
+        let uhp = new_header();
+        unsafe {
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![
+                    b"one\0".to_vec(),
+                    b"CHANGED\0".to_vec(),
+                    b"three\0".to_vec(),
+                ],
+            });
+        }
+        buf.b_u_newhead = uhp;
+        buf.b_u_curhead = std::ptr::null_mut();
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { u_find_first_changed() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(unsafe { (*uhp).uh_cursor.lnum }, 2);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_find_first_changed_handles_lines_added_at_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let uhp = new_header();
+        unsafe {
+            // ue_array only recorded 1 line - the buffer gained a line
+            // at the end (matching lines stay matching).
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"one\0".to_vec()],
+            });
+        }
+        buf.b_u_newhead = uhp;
+        buf.b_u_curhead = std::ptr::null_mut();
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { u_find_first_changed() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        // loop stops at lnum=2 (lnum <= ue_size(1) fails first), line
+        // counts differ (2 != 1), so cursor is placed at lnum=2.
+        assert_eq!(unsafe { (*uhp).uh_cursor.lnum }, 2);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_find_first_changed_is_noop_when_curhead_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let uhp = new_header();
+        unsafe {
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"DIFFERENT\0".to_vec(), b"two\0".to_vec()],
+            });
+        }
+        buf.b_u_newhead = uhp;
+        // Non-null b_u_curhead means "undid something in an autocmd" -
+        // bail out immediately without touching uh_cursor.
+        buf.b_u_curhead = new_header();
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { u_find_first_changed() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(unsafe { (*uhp).uh_cursor.lnum }, 0);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+            drop(Box::from_raw(buf.b_u_curhead));
+        }
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_find_first_changed_is_noop_when_last_undo_block_was_not_whole_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let uhp = new_header();
+        unsafe {
+            // ue_top != 0 means this undo block wasn't for the whole
+            // file - bail out without touching uh_cursor.
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 1,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"DIFFERENT\0".to_vec(), b"two\0".to_vec()],
+            });
+        }
+        buf.b_u_newhead = uhp;
+        buf.b_u_curhead = std::ptr::null_mut();
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { u_find_first_changed() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(unsafe { (*uhp).uh_cursor.lnum }, 0);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+        close_buf_with_memline(buf);
     }
 }
