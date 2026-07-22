@@ -1,6 +1,7 @@
 //! Translated from `src/nvim/memline.c` (partial, but now covers the
-//! real B-tree read *and* write paths for the common case, not just
-//! "open a brand new empty memline").
+//! *complete* B-tree read and write core - including block-splitting
+//! on append and block-removal on delete - for a real, working
+//! in-memory line store, not just "open a brand new empty memline").
 //!
 //! Translated: `ml_open` (the whole function is translated, but two of
 //! its own sub-paths are narrower than the original - see below),
@@ -17,14 +18,14 @@
 //! `ml_get_buf`/`ml_get_buf_mut`** (via `ml_get_buf_impl`, both
 //! `will_change` values), `ml_get_buf_len`/`ml_get_len`/
 //! `ml_get_pos_len`/`ml_get_pos`, **`ml_append_int`/`ml_append_flush`/
-//! `ml_append_flags`/`ml_append`/`ml_append_buf`** (the "fits in the
-//! target data block" fast path only - see below), **`ml_replace_buf_len`
+//! `ml_append_flags`/`ml_append`/`ml_append_buf`** now in full,
+//! including block-splitting (see below), **`ml_replace_buf_len`
 //! /`ml_replace`** (also serving `ml_replace_len`/`ml_replace_buf`'s
 //! role, since a Rust byte slice already knows its own length), and
 //! **`ml_flush_line`** now in full (both the in-place `memmove`-based
 //! rewrite and the delete-then-append fallback), and **`ml_delete_int`/
 //! `ml_delete_flags`/`ml_delete`/`ml_delete_buf`** now in full,
-//! including the block-removal path (see below).
+//! including block-removal (see below).
 //!
 //! **`ZeroBlock`/`PointerBlock`/`DataBlock` are NOT translated as
 //! `#[repr(C)]` structs reinterpreting a raw byte buffer** (the
@@ -103,21 +104,34 @@
 //! to exercise this specific case directly - noted here rather than
 //! silently overclaiming full coverage).
 //!
-//! **`ml_append_int`'s block-splitting path is still deferred** (see
-//! its own doc comment) - creating a new data block and, recursively,
-//! splitting pointer blocks up to the root when they're also full,
-//! including a "block 1 becomes the new root" special case in the
-//! original - a substantial, self-contained undertaking deserving its
-//! own dedicated pass. When the fast path doesn't apply, it returns
-//! `FAIL` *cleanly*: it first undoes the pointer-block line-count
-//! adjustment `ml_find_line`'s own tree walk already committed for
-//! `ML_INSERT` (via `ml_lineadd(buf, -1)` - exactly what
-//! `ml_find_line`'s own `error_noblock` path does for the same
-//! action), so hitting this limitation never leaves an overstated line
-//! count in the pointer blocks above, and never partially applies a
-//! change. Verified directly via a test
-//! (`ml_append_int_not_enough_room_fails_without_corrupting_state`)
-//! using a deliberately tiny page size to force the fast path to miss.
+//! **`ml_append_int`'s block-splitting path is now translated in
+//! full**, including the "insert in front of the next block" redirect
+//! and the "block 1 becomes the new root" special case (the tree
+//! gaining an extra level when the actual root, block 1, itself needs
+//! to split - since the root has no parent to insert a sibling entry
+//! into, its own content is relocated into a fresh child block first,
+//! then that child is split normally). Verified with two tests: a
+//! single data-block split (with a page size generous enough that the
+//! pointer block itself never needs to grow) and a repeated-append
+//! stress test deliberately using a small `pb_count_max` (3) to force
+//! several data-block splits *and* at least one root-pointer-block
+//! split within 12 appends, confirmed by reading back every appended
+//! line afterward in order with its exact original content - proving
+//! the tree, now several levels deep, stays fully navigable.
+//!
+//! **A genuinely adversarial page size (32 bytes) was tried first and
+//! discovered to hang** during this work - not a translation bug, but
+//! a real, inherent property of the original algorithm: with
+//! `pb_count_max == 1` (the maximum a pointer block this tiny can
+//! ever hold), inserting a second data block reference always
+//! requires *another* "block 1 becomes root" cycle, forever, since no
+//! pointer block at any level can ever hold more than one child. Real
+//! neovim never configures a page this small (always >= 4096 bytes,
+//! giving `pb_count_max` in the hundreds), so this never arises in
+//! practice - confirmed by adding temporary `eprintln!` tracing to
+//! pinpoint the exact repeating state before concluding it was a test
+//! configuration issue, not a bug, and re-choosing a still-small-but-
+//! realistic page size (80 bytes, `pb_count_max == 3`) instead.
 //!
 //! `ml_updatechunk` (the `line2byte()`/`byte2line()` fast-lookup chunk
 //! cache) is a no-op stub: a pure performance optimization with its
@@ -758,24 +772,11 @@ fn ml_updatechunk(_buf: &mut BufT, _line: LinenrT, _len: i32, _updtype: i32) {}
 
 /// Append a line after `lnum` (`lnum` can be 0) (`ml_append_int`).
 ///
-/// Only the "the new line fits directly in the target data block"
-/// fast path is translated. Deferred: the original's "insert in front
-/// of the next block" redirect (a narrow efficiency optimization when
-/// appending exactly at a full block's own last line) and the full
-/// block-splitting algorithm (creating a new data block and,
-/// transitively, splitting pointer blocks up to the root when they
-/// too are full - the original's own most complex branch in this
-/// function, ~290 lines including a "block 1 becomes the new root"
-/// special case) - both are substantial, separate undertakings in
-/// their own right, deliberately not rushed here (matching the
-/// precedent already set for `ml_find_line`/`utf_head_off`). When
-/// neither applies, this returns `FAIL` cleanly: it first undoes the
-/// pointer-block line-count increments `ml_find_line`'s own tree walk
-/// already committed for `ML_INSERT` (via `ml_lineadd(buf, -1)`,
-/// exactly what `ml_find_line`'s own `error_noblock` path does for the
-/// same action) before touching anything else, so a caller hitting
-/// this limitation never observes a partially-applied change or an
-/// overstated line count in the pointer blocks above.
+/// Includes the "insert in front of the next block" redirect and the
+/// full block-splitting algorithm (creating a new data block and,
+/// transitively, splitting pointer blocks up to the root when they too
+/// are full, including the "block 1 becomes the new root" special
+/// case).
 ///
 /// `len_arg`: the number of bytes of `line` to use, including its own
 /// trailing NUL; `0` uses all of `line` as-is (the original instead
@@ -803,80 +804,520 @@ unsafe fn ml_append_int(buf: &mut BufT, lnum: LinenrT, line: &[u8], len_arg: i32
     }
 
     let len = if len_arg == 0 { line.len() as i32 } else { len_arg };
-    let space_needed = i64::from(len) + i64::from(INDEX_SIZE);
+    let mut space_needed = i64::from(len) + i64::from(INDEX_SIZE);
+
+    let page_size = i64::from(unsafe { &*buf.b_ml.ml_mfp }.mf_page_size);
 
     // Find the data block containing the previous line. This also
     // fills the stack with the blocks from the root to the data block
     // (bumping each visited pointer block's own line count along the
     // way) and releases any locked block.
     // SAFETY: forwarded from this function's own safety doc.
-    let hp = unsafe { ml_find_line(buf, if lnum == 0 { 1 } else { lnum }, ML_INSERT) };
+    let mut hp = unsafe { ml_find_line(buf, if lnum == 0 { 1 } else { lnum }, ML_INSERT) };
     if hp.is_null() {
         return FAIL;
     }
 
-    let db_idx: i32 = if lnum == 0 { -1 } else { lnum - buf.b_ml.ml_locked_low };
-    let line_count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low;
+    buf.b_ml.ml_flags &= !ML_EMPTY;
+
+    // index for lnum in data block; if lnum == 0, got line one
+    // instead, correct db_idx (careful, it is negative!)
+    let mut db_idx: i32 = if lnum == 0 { -1 } else { lnum - buf.b_ml.ml_locked_low };
+    // line count (number of indexes in current block) before the insertion
+    let mut line_count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low;
 
     // SAFETY: hp is a valid, just-locked data block.
-    let dp = unsafe { (*hp).bh_data.as_data_mut() };
+    let mut dp = unsafe { (*hp).bh_data.as_data_mut() };
 
-    if i64::from(db_free(dp)) < space_needed {
-        // Not enough room - see this function's own doc comment for
-        // exactly what's deferred and why undoing via ml_lineadd(-1)
-        // here is necessary, not optional.
+    // If
+    // - there is not enough room in the current block
+    // - appending to the last line in the block
+    // - not appending to the last line in the file
+    // insert in front of the next block.
+    if i64::from(db_free(dp)) < space_needed
+        && db_idx == line_count - 1
+        && lnum < buf.b_ml.ml_line_count
+    {
+        // Now that the line is not going to be inserted in the block
+        // that we expected, the line count has to be adjusted in the
+        // pointer blocks by using ml_locked_lineadd.
+        buf.b_ml.ml_locked_lineadd -= 1;
+        buf.b_ml.ml_locked_high -= 1;
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { ml_lineadd(buf, -1) };
-        buf.b_ml.ml_stack_top = 0;
-        return FAIL;
+        hp = unsafe { ml_find_line(buf, lnum + 1, ML_INSERT) };
+        if hp.is_null() {
+            return FAIL;
+        }
+
+        db_idx = -1; // careful, it is negative!
+        // get line count before the insertion
+        line_count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low;
+        debug_assert_eq!(buf.b_ml.ml_locked_low, lnum + 1, "locked_low != lnum + 1");
+
+        // SAFETY: hp is a valid, just-locked data block.
+        dp = unsafe { (*hp).bh_data.as_data_mut() };
     }
 
-    buf.b_ml.ml_flags &= !ML_EMPTY;
     if buf.b_prev_line_count == 0 {
         buf.b_prev_line_count = buf.b_ml.ml_line_count;
     }
     buf.b_ml.ml_line_count += 1;
 
-    // enough room in the data block
-    let new_txt_start = db_txt_start(dp) - (len as u32);
-    set_db_txt_start(dp, new_txt_start);
-    let new_free = db_free(dp) - (space_needed as u32);
-    set_db_free(dp, new_free);
-    let new_line_count = db_line_count(dp) + 1;
-    set_db_line_count(dp, new_line_count);
+    if i64::from(db_free(dp)) >= space_needed {
+        // enough room in data block
+        // Insert the new line in an existing data block, or in the
+        // data block allocated above.
+        let new_txt_start = db_txt_start(dp) - (len as u32);
+        set_db_txt_start(dp, new_txt_start);
+        let new_free = db_free(dp) - (space_needed as u32);
+        set_db_free(dp, new_free);
+        let new_line_count = db_line_count(dp) + 1;
+        set_db_line_count(dp, new_line_count);
 
-    // move the text of the lines that follow to the front and adjust
-    // the indexes of the lines that follow
-    if line_count > db_idx + 1 {
-        // there are following lines
-        let offset: u32 = if db_idx < 0 {
-            db_txt_end(dp)
+        // move the text of the lines that follow to the front and
+        // adjust the indexes of the lines that follow
+        if line_count > db_idx + 1 {
+            // there are following lines
+            // Offset is the start of the previous line. This will
+            // become the character just after the new line.
+            let offset: u32 = if db_idx < 0 {
+                db_txt_end(dp)
+            } else {
+                db_index(dp, db_idx as usize) & DB_INDEX_MASK
+            };
+            let src_start = new_txt_start + (len as u32);
+            dp.copy_within(src_start as usize..offset as usize, new_txt_start as usize);
+            for i in (db_idx + 1..line_count).rev() {
+                let v = db_index(dp, i as usize) - (len as u32);
+                set_db_index(dp, (i + 1) as usize, v);
+            }
+            set_db_index(dp, (db_idx + 1) as usize, offset - (len as u32));
         } else {
-            db_index(dp, db_idx as usize) & DB_INDEX_MASK
-        };
-        let src_start = new_txt_start + (len as u32);
-        dp.copy_within(src_start as usize..offset as usize, new_txt_start as usize);
-        for i in (db_idx + 1..line_count).rev() {
-            let v = db_index(dp, i as usize) - (len as u32);
-            set_db_index(dp, (i + 1) as usize, v);
+            // add line at the end (which is the start of the text)
+            set_db_index(dp, (db_idx + 1) as usize, new_txt_start);
         }
-        set_db_index(dp, (db_idx + 1) as usize, offset - (len as u32));
+
+        // copy the text into the block
+        let dest = db_index(dp, (db_idx + 1) as usize) as usize;
+        dp[dest..dest + len as usize].copy_from_slice(&line[..len as usize]);
+        if flags & ML_APPEND_MARK != 0 {
+            let v = db_index(dp, (db_idx + 1) as usize) | DB_MARKED;
+            set_db_index(dp, (db_idx + 1) as usize, v);
+        }
+
+        // Mark the block dirty.
+        buf.b_ml.ml_flags |= ML_LOCKED_DIRTY;
+        if flags & ML_APPEND_NEW == 0 {
+            buf.b_ml.ml_flags |= ML_LOCKED_POS;
+        }
     } else {
-        // add line at the end (which is the start of the text)
-        set_db_index(dp, (db_idx + 1) as usize, new_txt_start);
-    }
+        // not enough space in data block: create a new data block and
+        // copy some lines into it, then insert an entry in the pointer
+        // block. If that pointer block is also full, go up another
+        // block, and so on, up to the root if necessary. The line
+        // counts in the pointer blocks have already been adjusted by
+        // ml_find_line().
+        //
+        // We are going to allocate a new data block. Depending on the
+        // situation it will be put to the left or right of the
+        // existing block. If possible we put the new line in the left
+        // block and move the lines after it to the right block.
+        // Otherwise the new line is also put in the right block. This
+        // method is more efficient when inserting a lot of lines at
+        // one place.
+        let lines_moved: i32;
+        let mut data_moved: i32 = 0;
+        let mut total_moved: i32 = 0;
+        let in_left: bool;
+        if db_idx < 0 {
+            // left block is new, right block is existing
+            lines_moved = 0;
+            in_left = true;
+            // space_needed does not change
+        } else {
+            // left block is existing, right block is new
+            lines_moved = line_count - db_idx - 1;
+            if lines_moved == 0 {
+                in_left = false; // put new line in right block
+                                  // space_needed does not change
+            } else {
+                data_moved = (db_index(dp, db_idx as usize) & DB_INDEX_MASK) as i32 - db_txt_start(dp) as i32;
+                total_moved = data_moved + lines_moved * (INDEX_SIZE as i32);
+                if i64::from(db_free(dp)) + i64::from(total_moved) >= space_needed {
+                    in_left = true; // put new line in left block
+                    space_needed = i64::from(total_moved);
+                } else {
+                    in_left = false; // put new line in right block
+                    space_needed += i64::from(total_moved);
+                }
+            }
+        }
 
-    // copy the text into the block
-    let dest = db_index(dp, (db_idx + 1) as usize) as usize;
-    dp[dest..dest + len as usize].copy_from_slice(&line[..len as usize]);
-    if flags & ML_APPEND_MARK != 0 {
-        let v = db_index(dp, (db_idx + 1) as usize) | DB_MARKED;
-        set_db_index(dp, (db_idx + 1) as usize, v);
-    }
+        let page_count = ((space_needed + i64::from(DATA_HEADER_SIZE)) + page_size - 1) / page_size;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mfp_new = unsafe { &mut *buf.b_ml.ml_mfp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut hp_new = unsafe { ml_new_data(mfp_new, flags & ML_APPEND_NEW != 0, page_count as u32) };
 
-    buf.b_ml.ml_flags |= ML_LOCKED_DIRTY;
-    if flags & ML_APPEND_NEW == 0 {
-        buf.b_ml.ml_flags |= ML_LOCKED_POS;
+        let (hp_left, hp_right, mut line_count_left, mut line_count_right);
+        if db_idx < 0 {
+            // left block is new
+            hp_left = hp_new;
+            hp_right = hp;
+            line_count_left = 0;
+            line_count_right = line_count;
+        } else {
+            // right block is new
+            hp_left = hp;
+            hp_right = hp_new;
+            line_count_left = line_count;
+            line_count_right = 0;
+        }
+        let bnum_left_orig = unsafe { (*hp_left).bh_bnum };
+        let mut bnum_right = unsafe { (*hp_right).bh_bnum };
+        let page_count_left_orig = unsafe { (*hp_left).bh_page_count } as i32;
+        let mut page_count_right = unsafe { (*hp_right).bh_page_count } as i32;
+        let mut bnum_left = bnum_left_orig;
+        let mut page_count_left = page_count_left_orig;
+
+        // May move the new line into the right/new block.
+        if !in_left {
+            // SAFETY: hp_right is a valid, just-allocated or
+            // just-found data block.
+            let dp_right = unsafe { (*hp_right).bh_data.as_data_mut() };
+            let new_txt_start = db_txt_start(dp_right) - (len as u32);
+            set_db_txt_start(dp_right, new_txt_start);
+            let new_free = db_free(dp_right) - (len as u32) - INDEX_SIZE;
+            set_db_free(dp_right, new_free);
+            set_db_index(dp_right, 0, new_txt_start);
+            if flags & ML_APPEND_MARK != 0 {
+                let v = db_index(dp_right, 0) | DB_MARKED;
+                set_db_index(dp_right, 0, v);
+            }
+            dp_right[new_txt_start as usize..new_txt_start as usize + len as usize]
+                .copy_from_slice(&line[..len as usize]);
+            line_count_right += 1;
+        }
+        // may move lines from the left/old block to the right/new one.
+        if lines_moved != 0 {
+            // SAFETY: hp_left is a valid data block.
+            let left_txt_start = db_txt_start(unsafe { (*hp_left).bh_data.as_data() });
+            let moved_bytes = {
+                // SAFETY: hp_left is a valid data block.
+                let dp_left_ro = unsafe { (*hp_left).bh_data.as_data() };
+                dp_left_ro[left_txt_start as usize..left_txt_start as usize + data_moved as usize].to_vec()
+            };
+            // SAFETY: hp_right is valid.
+            let dp_right = unsafe { (*hp_right).bh_data.as_data_mut() };
+            let new_txt_start = db_txt_start(dp_right) - (data_moved as u32);
+            set_db_txt_start(dp_right, new_txt_start);
+            let new_free = db_free(dp_right) - (total_moved as u32);
+            set_db_free(dp_right, new_free);
+            dp_right[new_txt_start as usize..new_txt_start as usize + data_moved as usize]
+                .copy_from_slice(&moved_bytes);
+            let offset = new_txt_start as i32 - left_txt_start as i32;
+
+            // update indexes in the new block
+            for (to, from) in (line_count_right..).zip((db_idx + 1)..line_count_left) {
+                let v = (db_index(dp, from as usize) as i32 + offset) as u32;
+                set_db_index(dp_right, to as usize, v);
+            }
+
+            // SAFETY: hp_left is valid.
+            let dp_left = unsafe { (*hp_left).bh_data.as_data_mut() };
+            let new_left_txt_start = db_txt_start(dp_left) + (data_moved as u32);
+            set_db_txt_start(dp_left, new_left_txt_start);
+            let new_left_free = db_free(dp_left) + (total_moved as u32);
+            set_db_free(dp_left, new_left_free);
+
+            line_count_right += lines_moved;
+            line_count_left -= lines_moved;
+        }
+
+        // May move the new line into the left (old or new) block.
+        if in_left {
+            // SAFETY: hp_left is valid.
+            let dp_left = unsafe { (*hp_left).bh_data.as_data_mut() };
+            let new_txt_start = db_txt_start(dp_left) - (len as u32);
+            set_db_txt_start(dp_left, new_txt_start);
+            let new_free = db_free(dp_left) - (len as u32) - INDEX_SIZE;
+            set_db_free(dp_left, new_free);
+            set_db_index(dp_left, line_count_left as usize, new_txt_start);
+            if flags & ML_APPEND_MARK != 0 {
+                let v = db_index(dp_left, line_count_left as usize) | DB_MARKED;
+                set_db_index(dp_left, line_count_left as usize, v);
+            }
+            dp_left[new_txt_start as usize..new_txt_start as usize + len as usize]
+                .copy_from_slice(&line[..len as usize]);
+            line_count_left += 1;
+        }
+
+        let (mut lnum_left, mut lnum_right);
+        if db_idx < 0 {
+            // left block is new
+            lnum_left = lnum + 1;
+            lnum_right = 0;
+        } else {
+            // right block is new
+            lnum_left = 0;
+            lnum_right = if in_left { lnum + 2 } else { lnum + 1 };
+        }
+        // SAFETY: hp_left/hp_right are valid.
+        unsafe {
+            set_db_line_count((*hp_left).bh_data.as_data_mut(), i64::from(line_count_left));
+            set_db_line_count((*hp_right).bh_data.as_data_mut(), i64::from(line_count_right));
+        }
+
+        // release the two data blocks
+        // The new one (hp_new) already has a correct blocknumber.
+        // The old one (hp, in ml_locked) gets a positive blocknumber
+        // if we changed it and we are not editing a new file.
+        if lines_moved != 0 || in_left {
+            buf.b_ml.ml_flags |= ML_LOCKED_DIRTY;
+        }
+        if flags & ML_APPEND_NEW == 0 && db_idx >= 0 && in_left {
+            buf.b_ml.ml_flags |= ML_LOCKED_POS;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { mf_put(&mut *buf.b_ml.ml_mfp, hp_new, true, false) };
+
+        // flush the old data block
+        // set ml_locked_lineadd to 0, because the updating of the
+        // pointer blocks is done below
+        let lineadd = buf.b_ml.ml_locked_lineadd;
+        buf.b_ml.ml_locked_lineadd = 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ml_find_line(buf, 0, ML_FLUSH) }; // flush data block
+
+        // update pointer blocks for the new data block
+        let mut stack_idx = buf.b_ml.ml_stack_top - 1;
+        while stack_idx >= 0 {
+            let ip = buf.b_ml.ml_stack[stack_idx as usize];
+            let pb_idx = ip.ip_index;
+            // SAFETY: forwarded from this function's own safety doc.
+            hp = unsafe { mf_get(&mut *buf.b_ml.ml_mfp, ip.ip_bnum, 1) };
+            if hp.is_null() {
+                return FAIL;
+            }
+            // SAFETY: hp is a valid, just-locked block; must be a
+            // pointer block.
+            let pp_ro = unsafe { (*hp).bh_data.as_data() };
+            if block_id(pp_ro) != PTR_ID {
+                // (iemsg(E317: pointer block id wrong 3) omitted -
+                // display-pipeline-bound, see this module's own doc
+                // comment; the state change below still happens.)
+                // SAFETY: forwarded.
+                unsafe { mf_put(&mut *buf.b_ml.ml_mfp, hp, false, false) };
+                return FAIL;
+            }
+
+            // TODO(vim): If the pointer block is full and we are
+            // adding at the end try to insert in front of the next
+            // block. Block not full, add one entry.
+            // SAFETY: hp is valid.
+            let pp = unsafe { (*hp).bh_data.as_data_mut() };
+            let pb_count_max = pb_count_max(unsafe { &*buf.b_ml.ml_mfp }.mf_page_size);
+            if pb_count(pp) < pb_count_max {
+                let old_count = pb_count(pp);
+                if pb_idx + 1 < i32::from(old_count) {
+                    for i in (pb_idx + 1..i32::from(old_count)).rev() {
+                        let e = pb_pointer(pp, i as usize);
+                        pointer_block_set_entry(pp, (i + 1) as usize, e);
+                    }
+                }
+                pointer_block_set_count(pp, old_count + 1);
+                let old_pe_old_lnum_left = pb_pointer(pp, pb_idx as usize).pe_old_lnum;
+                pointer_block_set_entry(
+                    pp,
+                    pb_idx as usize,
+                    PointerEntry {
+                        pe_bnum: bnum_left,
+                        pe_line_count: line_count_left,
+                        pe_old_lnum: if lnum_left != 0 { lnum_left } else { old_pe_old_lnum_left },
+                        pe_page_count: page_count_left,
+                    },
+                );
+                let old_pe_old_lnum_right = pb_pointer(pp, (pb_idx + 1) as usize).pe_old_lnum;
+                pointer_block_set_entry(
+                    pp,
+                    (pb_idx + 1) as usize,
+                    PointerEntry {
+                        pe_bnum: bnum_right,
+                        pe_line_count: line_count_right,
+                        pe_old_lnum: if lnum_right != 0 { lnum_right } else { old_pe_old_lnum_right },
+                        pe_page_count: page_count_right,
+                    },
+                );
+
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { mf_put(&mut *buf.b_ml.ml_mfp, hp, true, false) };
+                buf.b_ml.ml_stack_top = stack_idx + 1; // truncate stack
+
+                if lineadd != 0 {
+                    buf.b_ml.ml_stack_top -= 1;
+                    // fix line count for rest of blocks in the stack
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { ml_lineadd(buf, lineadd) };
+                    // fix stack itself
+                    buf.b_ml.ml_stack[buf.b_ml.ml_stack_top as usize].ip_high += lineadd;
+                    buf.b_ml.ml_stack_top += 1;
+                }
+
+                // We are finished, break the loop here.
+                break;
+            }
+
+            // pointer block full
+            //
+            // split the pointer block
+            // allocate a new pointer block
+            // move some of the pointer into the new block
+            // prepare for updating the parent block
+            let mut ip_index_update = false;
+            loop {
+                // do this twice when splitting block 1
+                // SAFETY: forwarded from this function's own safety doc.
+                hp_new = unsafe { ml_new_ptr(&mut *buf.b_ml.ml_mfp) };
+                if hp_new.is_null() {
+                    // TODO(vim): try to fix tree
+                    return FAIL;
+                }
+
+                if unsafe { (*hp).bh_bnum } != 1 {
+                    break;
+                }
+
+                // if block 1 becomes full the tree is given an extra
+                // level. The pointers from block 1 are moved into the
+                // new block. block 1 is updated to point to the new
+                // block, then continue to split the new block.
+                // SAFETY: hp/hp_new are both valid pointer blocks of
+                // exactly page_size bytes.
+                unsafe {
+                    let src = (*hp).bh_data.as_data().to_vec();
+                    (*hp_new).bh_data.as_data_mut()[..src.len()].copy_from_slice(&src);
+                }
+                let ml_line_count = buf.b_ml.ml_line_count;
+                // SAFETY: hp is valid.
+                let pp_block1 = unsafe { (*hp).bh_data.as_data_mut() };
+                pointer_block_set_count(pp_block1, 1);
+                pointer_block_set_entry(
+                    pp_block1,
+                    0,
+                    PointerEntry {
+                        pe_bnum: unsafe { (*hp_new).bh_bnum },
+                        pe_line_count: ml_line_count,
+                        pe_old_lnum: 1,
+                        pe_page_count: 1,
+                    },
+                );
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { mf_put(&mut *buf.b_ml.ml_mfp, hp, true, false) }; // release block 1
+                hp = hp_new; // new block is to be split
+                debug_assert_eq!(stack_idx, 0, "stack_idx should be 0");
+                ip_index_update = true;
+                stack_idx += 1; // do block 1 again later
+            }
+            if ip_index_update {
+                buf.b_ml.ml_stack[stack_idx as usize - 1].ip_index = 0;
+            }
+
+            // move the pointers after the current one to the new
+            // block. If there are none, the new entry will be in the
+            // new block. `pb_idx` is deliberately the SAME value
+            // captured at the very top of the outer loop, never
+            // re-read here - matching the original exactly (the
+            // `ip->ip_index = 0` assignment above only updates the
+            // persistent stack bookkeeping for future lookups, it does
+            // not feed back into this iteration's own `pb_idx`).
+            // SAFETY: hp is valid.
+            let pp = unsafe { (*hp).bh_data.as_data_mut() };
+            let cur_count = i32::from(pb_count(pp));
+            total_moved = cur_count - pb_idx - 1;
+            if total_moved != 0 {
+                for i in 0..total_moved {
+                    let e = pb_pointer(pp, (pb_idx + 1 + i) as usize);
+                    // SAFETY: hp_new is valid.
+                    unsafe { pointer_block_set_entry((*hp_new).bh_data.as_data_mut(), i as usize, e) };
+                }
+                // SAFETY: hp_new is valid.
+                unsafe { pointer_block_set_count((*hp_new).bh_data.as_data_mut(), total_moved as u16) };
+                pointer_block_set_count(pp, (cur_count - (total_moved - 1)) as u16);
+                let old_pe_old_lnum_right = pb_pointer(pp, (pb_idx + 1) as usize).pe_old_lnum;
+                pointer_block_set_entry(
+                    pp,
+                    (pb_idx + 1) as usize,
+                    PointerEntry {
+                        pe_bnum: bnum_right,
+                        pe_line_count: line_count_right,
+                        pe_old_lnum: if lnum_right != 0 { lnum_right } else { old_pe_old_lnum_right },
+                        pe_page_count: page_count_right,
+                    },
+                );
+            } else {
+                // SAFETY: hp_new is valid.
+                unsafe {
+                    let hp_new_buf = (*hp_new).bh_data.as_data_mut();
+                    pointer_block_set_count(hp_new_buf, 1);
+                    pointer_block_set_entry(
+                        hp_new_buf,
+                        0,
+                        PointerEntry {
+                            pe_bnum: bnum_right,
+                            pe_line_count: line_count_right,
+                            pe_old_lnum: lnum_right,
+                            pe_page_count: page_count_right,
+                        },
+                    );
+                }
+            }
+            let old_pe_old_lnum_left = pb_pointer(pp, pb_idx as usize).pe_old_lnum;
+            pointer_block_set_entry(
+                pp,
+                pb_idx as usize,
+                PointerEntry {
+                    pe_bnum: bnum_left,
+                    pe_line_count: line_count_left,
+                    pe_old_lnum: if lnum_left != 0 { lnum_left } else { old_pe_old_lnum_left },
+                    pe_page_count: page_count_left,
+                },
+            );
+            lnum_left = 0;
+            lnum_right = 0;
+
+            // recompute line counts
+            // SAFETY: hp_new is valid.
+            let pp_new_ro = unsafe { (*hp_new).bh_data.as_data() };
+            line_count_right = 0;
+            for i in 0..i32::from(pb_count(pp_new_ro)) {
+                line_count_right += pb_pointer(pp_new_ro, i as usize).pe_line_count;
+            }
+            let pp_ro = unsafe { (*hp).bh_data.as_data() };
+            line_count_left = 0;
+            for i in 0..i32::from(pb_count(pp_ro)) {
+                line_count_left += pb_pointer(pp_ro, i as usize).pe_line_count;
+            }
+
+            bnum_left = unsafe { (*hp).bh_bnum };
+            bnum_right = unsafe { (*hp_new).bh_bnum };
+            page_count_left = 1;
+            page_count_right = 1;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                mf_put(&mut *buf.b_ml.ml_mfp, hp, true, false);
+                mf_put(&mut *buf.b_ml.ml_mfp, hp_new, true, false);
+            }
+
+            stack_idx -= 1;
+        }
+
+        // Safety check: fallen out of for loop?
+        if stack_idx < 0 {
+            // (iemsg(E318: Updated too many blocks?) omitted -
+            // display-pipeline-bound; the state change below still
+            // happens.)
+            buf.b_ml.ml_stack_top = 0; // invalidate stack
+        }
     }
 
     // The line was inserted below 'lnum'.
@@ -1947,12 +2388,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ml_append_int_not_enough_room_fails_without_corrupting_state() {
+    /// Manually builds a minimal, working memline (dummy block 0, root
+    /// pointer block at bnum 1, one data block at bnum 2 with a single
+    /// empty line) with a custom `page_size` - for tests that need
+    /// precise control over data/pointer block capacity to force
+    /// `ml_append_int`'s block-splitting path.
+    fn buf_with_custom_page_size(page_size: u32) -> BufT {
         let mut mfp = mf_open(None, 0).unwrap();
-        mfp.mf_page_size = 32; // tiny page: header (24) + 8 bytes free
+        mfp.mf_page_size = page_size;
 
-        let mut buf = unsafe {
+        unsafe {
             let dummy = mf_new(&mut mfp, false, 1); // consume bnum 0
             mf_put(&mut mfp, dummy, false, false);
 
@@ -1985,28 +2430,108 @@ mod tests {
                 );
             }
             mf_put(&mut mfp, root_hp, true, false);
+        }
 
-            let mut buf = BufT::default();
-            buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
-            buf.b_ml.ml_line_count = 1;
-            buf
-        };
+        let mut buf = BufT::default();
+        buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
+        buf.b_ml.ml_line_count = 1;
+        buf
+    }
 
-        // Only a few bytes of free space remain - try to append a line
-        // that clearly cannot fit (space_needed = len + INDEX_SIZE).
-        let big_line = b"this line is definitely too big to fit\0";
+    #[test]
+    fn ml_append_int_splits_a_full_data_block_into_two() {
+        // page_size=128: pb_count_max = (128-8)/24 = 5 (plenty of
+        // headroom - this test only needs the DATA block to split, not
+        // the pointer block).
+        let mut buf = buf_with_custom_page_size(128);
         unsafe {
-            let ret = ml_append_buf(&mut buf, 1, big_line, big_line.len() as i32, false);
-            assert_eq!(ret, FAIL);
-            // state must be completely unchanged - no partial insert,
-            // no overstated line count.
-            assert_eq!(buf.b_ml.ml_line_count, 1);
-            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+            // Fill line 1 with a line that leaves very little free
+            // space in the data block (data capacity for a 1-page,
+            // 128-byte block is 128-24=104 bytes; a 90-byte line
+            // leaves only 104-90-INDEX_SIZE(4)=10 bytes free).
+            let big_line = vec![b'a'; 89]
+                .into_iter()
+                .chain(std::iter::once(0u8))
+                .collect::<Vec<u8>>();
+            assert_eq!(big_line.len(), 90);
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, &big_line), OK);
+
+            // Appending a 20-byte line needs 24 bytes (20 + INDEX_SIZE)
+            // - more than the 10 bytes left, forcing a real split.
+            let new_line = vec![b'b'; 19]
+                .into_iter()
+                .chain(std::iter::once(0u8))
+                .collect::<Vec<u8>>();
+            assert_eq!(new_line.len(), 20);
+            let ret = ml_append_buf(&mut buf, 1, &new_line, new_line.len() as i32, false);
+            assert_eq!(ret, OK);
+
+            assert_eq!(buf.b_ml.ml_line_count, 2);
+            assert_eq!(ml_get_buf(&mut buf, 1), big_line);
+            assert_eq!(ml_get_buf(&mut buf, 2), new_line);
+
+            // Root pointer block should now have 2 entries (the split
+            // created a new data block, referenced as a sibling).
+            let mfp = &mut *buf.b_ml.ml_mfp;
+            let root_hp = mf_get(mfp, 1, 1);
+            assert!(!root_hp.is_null());
+            let root_buf = (*root_hp).bh_data.as_data();
+            assert_eq!(pb_count(root_buf), 2);
+            let e0 = pb_pointer(root_buf, 0);
+            let e1 = pb_pointer(root_buf, 1);
+            assert_eq!(e0.pe_line_count + e1.pe_line_count, 2);
+            mf_put(mfp, root_hp, false, false);
 
             let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp_owned, false);
         }
     }
+
+    #[test]
+    fn ml_append_int_grows_tree_through_repeated_splits_including_block_1_becomes_root() {
+        // page_size=80: pb_count_max = (80-8)/24 = 3 - small enough
+        // that appending enough long lines will force the root
+        // pointer block to fill up and split (triggering the "block 1
+        // becomes the new root" special case), but not so small that
+        // the tree grows unboundedly (unlike page_size=32, where
+        // pb_count_max=1 forces the tree to grow forever - verified
+        // this is a genuine property of the original algorithm, not a
+        // translation bug, via a throwaway debug reproduction before
+        // choosing this test's page size).
+        let mut buf = buf_with_custom_page_size(80);
+        // Each appended line is long enough that only 1 line fits per
+        // data block (80-24=56 byte capacity per page), forcing a new
+        // data block - and therefore a new pointer-block entry - on
+        // every single append.
+        let make_line = |n: u8| -> Vec<u8> {
+            let mut v = vec![b'0' + (n % 10); 40];
+            v.push(0);
+            v
+        };
+        unsafe {
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, &make_line(0)), OK);
+            for i in 1..12 {
+                let line = make_line(i as u8);
+                let ret = ml_append_buf(&mut buf, i as LinenrT, &line, line.len() as i32, false);
+                assert_eq!(ret, OK, "append {i} failed");
+            }
+            assert_eq!(buf.b_ml.ml_line_count, 12);
+
+            // All 12 lines must still be retrievable, in order, with
+            // their exact original content - proving the tree (now
+            // several levels deep) is still fully navigable after
+            // however many splits (including at least one "block 1
+            // becomes root" event, given pb_count_max=3 and 12 data
+            // blocks) occurred along the way.
+            for i in 1..=12 {
+                assert_eq!(ml_get_buf(&mut buf, i as LinenrT), make_line((i - 1) as u8), "line {i}");
+            }
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
 
     fn test_buf() -> BufT {
         BufT::default()
