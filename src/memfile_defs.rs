@@ -102,8 +102,17 @@ pub struct MemfileT {
     pub mf_fname: Option<Vec<u8>>,
     /// idem, full path
     pub mf_ffname: Option<Vec<u8>>,
-    /// file descriptor
-    pub mf_fd: i32,
+    /// open file handle, or `None` for memory-only (`mf_fd`).
+    ///
+    /// The original stores a raw `int` file descriptor (`-1` meaning
+    /// "no file"); this crate uses `Option<std::fs::File>` instead -
+    /// the idiomatic Rust equivalent of the same resource (an owned,
+    /// automatically-closed file handle), matching this crate's
+    /// established pattern of using a properly-typed Rust construct
+    /// instead of a C primitive when it's a strict improvement with no
+    /// loss of real behavior (e.g. `Option<Vec<u8>>` for `char*`,
+    /// `BhData`'s tagged enum for `void*`).
+    pub mf_fd: Option<std::fs::File>,
     /// flags used when opening this memfile
     pub mf_flags: i32,
     /// `mf_fd` was closed, retry opening

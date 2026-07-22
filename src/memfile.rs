@@ -12,11 +12,18 @@
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
 //! - `mf_open`/`mf_open_file`/`mf_close`/`mf_close_file`/`mf_do_open`/
-//!   `mf_read`/`mf_write`/`mf_sync`: need real file I/O beyond what
-//!   `os/fs.rs` covers so far (byte-level read/write/seek). Planned:
-//!   `MemfileT.mf_fd` should become `Option<std::fs::File>` (currently
-//!   `i32`, matching the C field 1:1) when these are translated - see
-//!   the session plan/stored memory for the reasoning.
+//!   `mf_read`/`mf_write`/`mf_sync`: need real byte-level file
+//!   read/write/seek. `MemfileT.mf_fd` is now `Option<std::fs::File>`
+//!   (done - see `memfile_defs.rs`'s own doc comment on that field),
+//!   ready for these to be built on top of `std::io::{Read, Write,
+//!   Seek}` directly, same "std covers synchronous I/O without needing
+//!   libuv" reasoning already validated for `os/time.rs`/`os/env.rs`/
+//!   `os/fs.rs`. `mf_write` in particular has real remaining
+//!   complexity beyond the type change alone (gap-filling the file
+//!   with data from other still-hashed blocks, a two-attempt
+//!   retry-with-reopen loop, and a genuine `emsg()` call on final
+//!   failure that can't be simplified away like `mf_put`'s
+//!   internal-only `iemsg()` could).
 //! - `mf_get`: calls `mf_read()` on a cache miss, so can't be completed
 //!   without it.
 //! - `mf_release_all`: calls `mf_close()`.
@@ -341,7 +348,7 @@ mod tests {
         MemfileT {
             mf_fname: None,
             mf_ffname: None,
-            mf_fd: -1,
+            mf_fd: None,
             mf_flags: 0,
             mf_reopen: false,
             mf_free_first: std::ptr::null_mut(),
