@@ -15,7 +15,14 @@
 //!   `vim_strnsave_up`/`vim_strcpy_up`/`vim_strncpy_up`/`vim_memcpy_up`'s
 //!   role - a Rust `&[u8]` slice already knows its own exact length, so
 //!   there's no separate "whole string" vs. "first `n` bytes" variant to
-//!   keep apart), `mb_strup_buf`, `strcase_save`.
+//!   keep apart), `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
+//!   an earlier note claimed this needed `charset.c`'s real `g_chartab`/
+//!   `option.c`, but re-reading the actual body shows it only needs
+//!   `strchr`/`strstr`-equivalent byte/substring search plus the
+//!   already-translated `utf_char2bytes` - no chartab dependency at all;
+//!   used extremely widely - 380+ call sites - across the rest of the
+//!   original source, so this was worth double-checking rather than
+//!   trusting the stale note).
 //!
 //! `vim_strup`/`vim_strsave_up`/`mb_strup_buf`/`strcase_save` are all
 //! self-bounding via NUL-scanning (matching the original's own
@@ -25,11 +32,17 @@
 //! included" primitive taking an explicit length, which deliberately
 //! does *not* stop at an embedded NUL, per its own doc comment). Each
 //! returns/leaves its own trailing NUL byte, matching this crate's
-//! established `Vec<u8>`-includes-its-own-NUL convention.
+//! established `Vec<u8>`-includes-its-own-NUL convention. `vim_strchr`
+//! is the same way (stops at the first embedded NUL, matching real
+//! `strchr`/`strstr` on a NUL-terminated C string), but returns a byte
+//! offset (`Option<usize>`) rather than a NUL-terminated `Vec<u8>`,
+//! matching this crate's established "index instead of a raw pointer
+//! into the same buffer" convention (e.g. `path.rs`'s `path_tail`/
+//! `get_past_head`).
 //!
 //! Deferred:
 //! - `vim_strsave_escaped`/`_ext`, `vim_strnsave_unquoted`,
-//!   `vim_strsave_shellescape`, `del_trailing_spaces`, `vim_strchr`:
+//!   `vim_strsave_shellescape`, `del_trailing_spaces`:
 //!   need `charset.c`'s real `g_chartab`/`option.c`.
 //! - `vim_snprintf`/`vim_vsnprintf`/`kv_do_printf` and the whole custom
 //!   positional-argument printf machinery: Rust's native `format!`/
@@ -270,6 +283,40 @@ pub unsafe fn strcase_save(orig: &[u8], upper: bool) -> Vec<u8> {
     res
 }
 
+/// `strchr()` version which handles multibyte strings (`vim_strchr`).
+///
+/// @param string  String to search in.
+/// @param c  Character to search for.
+///
+/// @return the byte offset of the first occurrence of character `c` in
+/// `string`, or `None` if it was not found or the character is invalid.
+/// The NUL character is never found (matching the original's own
+/// documented caveat - use `.len()` instead), and the scan never looks
+/// past the first embedded NUL (matching the original's own
+/// NUL-terminated-C-string `strchr`/`strstr` semantics, since a Rust
+/// `&[u8]` has no implicit terminator of its own).
+#[must_use]
+pub fn vim_strchr(string: &[u8], c: i32) -> Option<usize> {
+    if c <= 0 {
+        return None;
+    }
+
+    let end = string.iter().position(|&b| b == NUL).unwrap_or(string.len());
+    let string = &string[..end];
+
+    if c < 0x80 {
+        return string.iter().position(|&b| b == c as u8);
+    }
+
+    let mut u8char = [0u8; crate::mbyte_defs::MB_MAXCHAR];
+    let len = crate::mbyte::utf_char2bytes(c, &mut u8char) as usize;
+    let needle = &u8char[..len];
+    if needle.is_empty() || needle.len() > string.len() {
+        return None;
+    }
+    string.windows(needle.len()).position(|w| w == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +435,45 @@ mod tests {
         // SAFETY: touches OPTION_VARS via mb_tolower, guarded above.
         let result = unsafe { strcase_save("HÉLLO\0".as_bytes(), false) };
         assert_eq!(result, "héllo\0".as_bytes());
+    }
+
+    #[test]
+    fn vim_strchr_finds_ascii_byte() {
+        assert_eq!(vim_strchr(b"hello\0", i32::from(b'l')), Some(2));
+    }
+
+    #[test]
+    fn vim_strchr_not_found_returns_none() {
+        assert_eq!(vim_strchr(b"hello\0", i32::from(b'z')), None);
+    }
+
+    #[test]
+    fn vim_strchr_never_finds_nul() {
+        assert_eq!(vim_strchr(b"hello\0", 0), None);
+    }
+
+    #[test]
+    fn vim_strchr_rejects_negative_c() {
+        assert_eq!(vim_strchr(b"hello\0", -1), None);
+    }
+
+    #[test]
+    fn vim_strchr_stops_at_first_embedded_nul() {
+        // "z" only appears after the embedded NUL - matching real
+        // strchr()'s own NUL-terminated-string semantics, it must not
+        // be found.
+        assert_eq!(vim_strchr(b"ab\0z", i32::from(b'z')), None);
+    }
+
+    #[test]
+    fn vim_strchr_finds_multibyte_character() {
+        // "héllo\0": h=1 byte, é=2 bytes (U+00E9), so 'é' starts at
+        // byte offset 1.
+        assert_eq!(vim_strchr("héllo\0".as_bytes(), 0xe9), Some(1));
+    }
+
+    #[test]
+    fn vim_strchr_multibyte_not_found() {
+        assert_eq!(vim_strchr("hello\0".as_bytes(), 0xe9), None);
     }
 }

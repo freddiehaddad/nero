@@ -2,20 +2,54 @@
 //!
 //! `option.c` is a massive (~6897-line) file implementing the entire
 //! `:set`/options-parsing engine, deeply entangled with the eval
-//! engine, autocmd triggers, and nearly every other subsystem. Only
-//! this one genuinely standalone, pure function is translated so far -
-//! harvested because it directly unblocks part of `memline.c`'s
-//! `ml_open` (still blocked overall by `mf_open`/`iemsg`, but this
-//! removes one of its several real dependencies):
+//! engine, autocmd triggers, and nearly every other subsystem: the
+//! generic `get_option_value`/`set_option_value` entry points, the
+//! `:set` command parser (`do_set`/`ex_set`), and most of the
+//! per-option getters all bottleneck through the huge generated
+//! `vimoption_T options[]` table (~8000 lines) and/or `exarg_T`
+//! (blocked on the `ex_cmds.lua`-generated `cmdidx_T`, same blocker as
+//! `mark.c`'s `ex_*` functions) - none of that is attempted here.
 //!
-//! Translated: `get_fileformat`.
+//! Translated: `get_fileformat` (harvested first because it directly
+//! unblocks part of `memline.c`'s `ml_open`); and a batch of small,
+//! genuinely standalone option-value accessors that read already-
+//! translated `option_vars.rs`/`buffer_defs.rs`/`globals.rs` fields
+//! directly, without needing the options table at all: `magic_isset`,
+//! `shortmess`, `can_bs`, `get_bkc_flags`, `get_flp_value`,
+//! `get_ve_flags`, `get_showbreak_value`, `default_fileformat`,
+//! `csh_like_shell`, `fish_like_shell`, `get_scrolloff_value`,
+//! `get_scrolloffpad_value`, `get_sidescrolloff_value`. `can_bs`/
+//! `shortmess` needed `strings.c`'s `vim_strchr` (also translated this
+//! pass - re-examined and found NOT actually blocked on `g_chartab`/
+//! `option.c` as an earlier note claimed, see `strings.rs`'s own module
+//! doc).
+//!
+//! Established convention (this file's first real readers of
+//! `Option<Vec<u8>>` *option string values*, as opposed to freshly
+//! produced/NUL-scanned output buffers elsewhere in this crate):
+//! **these fields carry NO trailing NUL byte** - the `Vec`'s own
+//! `.len()` is authoritative, matching `get_fileformat`'s own
+//! pre-existing test data (`b_p_ff: Some("unix".as_bytes().to_vec())`,
+//! no NUL). This is deliberately different from this crate's `Vec<u8>`-
+//! includes-its-own-trailing-NUL convention used for line storage
+//! (`memline.rs`) and freshly-copied/NUL-scanned string outputs
+//! (`strings.rs`'s `vim_strup`/`mb_strup_buf`/`strcase_save`) - those
+//! mirror a real heap-allocated `char *` the original explicitly
+//! NUL-terminates itself; a persistent *option value*, once stored as
+//! an exact-length Rust `Vec<u8>`, has no such need (a redundant
+//! trailing NUL only invites bugs like direct content comparisons
+//! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
 //! Deferred: everything else, including `get_fileformat_force` (needs
-//! `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T` - same
-//! blocker as `mark.c`'s `ex_*` functions).
+//! `exarg_T`), and every function needing the real `options[]` table
+//! (`get_option_value`/`set_option_value`/`option_was_set`/
+//! `is_option_hidden`/`option_has_type`/`option_has_scope`/
+//! `get_winbuf_options`/`get_vimoption`/etc.) or `do_set`/`ex_set`'s
+//! command-line parsing.
 
-use crate::buffer_defs::BufT;
+use crate::buffer_defs::{BufT, WinT};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
+use crate::types_defs::OptInt;
 
 /// Gets the `'fileformat'` of `buf` as an `EOL_*` constant
 /// (`get_fileformat`).
@@ -35,6 +69,217 @@ pub fn get_fileformat(buf: &BufT) -> i32 {
         return EOL_MAC;
     }
     EOL_DOS
+}
+
+/// Get the value of `'magic'` taking `magic_overruled` into account
+/// (`magic_isset`).
+#[must_use]
+pub fn magic_isset() -> bool {
+    match unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled {
+        crate::regexp_defs::OptmagicT::MagicOn => true,
+        crate::regexp_defs::OptmagicT::MagicOff => false,
+        crate::regexp_defs::OptmagicT::NotSet => {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_magic != 0
+        }
+    }
+}
+
+/// @return true if `x` is present in `'shortmess'` option, or
+/// `'shortmess'` contains `'a'` and `x` is present in
+/// `SHM_ALL_ABBREVIATIONS` (`shortmess`).
+#[must_use]
+pub fn shortmess(x: u8) -> bool {
+    let p_shm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm.clone();
+    let Some(p_shm) = p_shm else {
+        return false;
+    };
+
+    crate::strings::vim_strchr(&p_shm, i32::from(x)).is_some()
+        || (crate::strings::vim_strchr(&p_shm, i32::from(b'a')).is_some()
+            && crate::strings::vim_strchr(&crate::option_vars::SHM_ALL_ABBREVIATIONS, i32::from(x))
+                .is_some())
+}
+
+/// Check if backspacing over something is allowed (`can_bs`).
+///
+/// @param what one of [`crate::option_vars::BS_INDENT`]/
+/// [`crate::option_vars::BS_EOL`]/[`crate::option_vars::BS_START`]/
+/// [`crate::option_vars::BS_NOSTOP`].
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (matches every other `curbuf`-touching function in
+/// this crate).
+#[must_use]
+pub unsafe fn can_bs(what: u8) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    if what == crate::option_vars::BS_START && crate::buffer::bt_prompt(Some(curbuf)) {
+        return false;
+    }
+
+    let p_bs = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_bs
+        .clone()
+        .unwrap_or_default();
+
+    // support for number values was removed but we keep '2' since it
+    // is used in legacy tests
+    if p_bs.first() == Some(&b'2') {
+        return what != crate::option_vars::BS_NOSTOP;
+    }
+
+    crate::strings::vim_strchr(&p_bs, i32::from(what)).is_some()
+}
+
+/// Get the local or global value of `'backupcopy'` flags
+/// (`get_bkc_flags`).
+#[must_use]
+pub fn get_bkc_flags(buf: &BufT) -> u32 {
+    if buf.b_bkc_flags != 0 {
+        buf.b_bkc_flags
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags
+    }
+}
+
+/// Get the local or global value of `'formatlistpat'` (`get_flp_value`).
+#[must_use]
+pub fn get_flp_value(buf: &BufT) -> Vec<u8> {
+    match buf.b_p_flp.as_deref() {
+        Some(flp) if !flp.is_empty() => flp.to_vec(),
+        _ => unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_flp
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
+/// Get the local or global value of `'virtualedit'` flags
+/// (`get_ve_flags`).
+#[must_use]
+pub fn get_ve_flags(wp: &WinT) -> u32 {
+    let flags = if wp.w_onebuf_opt.wo_ve_flags != 0 {
+        wp.w_onebuf_opt.wo_ve_flags
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags
+    };
+    flags & !(crate::option_vars::opt_ve_flag::NONE | crate::option_vars::opt_ve_flag::NONE_U)
+}
+
+/// Get the local or global value of `'showbreak'` (`get_showbreak_value`).
+///
+/// Deviates from the original's `char *` return (always non-NULL,
+/// backed by the `empty_string_option` sentinel for "nothing") by
+/// returning an owned `Vec<u8>` directly (empty when there's nothing to
+/// show) - see `option_vars.rs`'s own module doc for why
+/// `empty_string_option` itself needs no Rust equivalent.
+#[must_use]
+pub fn get_showbreak_value(win: &WinT) -> Vec<u8> {
+    match win.w_onebuf_opt.wo_sbr.as_deref() {
+        Some(sbr) if !sbr.is_empty() => {
+            if sbr == b"NONE" {
+                Vec::new()
+            } else {
+                sbr.to_vec()
+            }
+        }
+        _ => unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sbr
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
+/// Return the default fileformat from `'fileformats'`
+/// (`default_fileformat`).
+#[must_use]
+pub fn default_fileformat() -> i32 {
+    let p_ffs = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs.clone();
+    match p_ffs.as_deref().and_then(|s| s.first()) {
+        Some(b'm') => EOL_MAC,
+        Some(b'd') => EOL_DOS,
+        _ => EOL_UNIX,
+    }
+}
+
+/// Returns whether `haystack` contains `needle` anywhere (a `strstr`-
+/// equivalent boolean check, used by [`csh_like_shell`]/
+/// [`fish_like_shell`] below - the original itself has no shared helper
+/// for this, it's purely a Rust-side convenience).
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Return true when `'shell'` has "csh" in the tail (`csh_like_shell`).
+#[must_use]
+pub fn csh_like_shell() -> bool {
+    let p_sh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh.clone().unwrap_or_default();
+    let tail_start = crate::path::path_tail(&p_sh);
+    contains(&p_sh[tail_start..], b"csh")
+}
+
+/// Return true when `'shell'` has "fish" in the tail (`fish_like_shell`).
+#[must_use]
+pub fn fish_like_shell() -> bool {
+    let p_sh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh.clone().unwrap_or_default();
+    let tail_start = crate::path::path_tail(&p_sh);
+    contains(&p_sh[tail_start..], b"fish")
+}
+
+/// Return the effective `'scrolloff'` value for the current window,
+/// using the global value when appropriate (`get_scrolloff_value`).
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+#[must_use]
+pub unsafe fn get_scrolloff_value(wp: &WinT) -> OptInt {
+    // Disallow scrolloff in terminal-mode. #11915
+    // Still allow 'scrolloff' for non-terminal buffers. #34447
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_terminal_buf = !unsafe { &*wp.w_buffer }.terminal.is_null();
+    if (state as u32 & crate::state_defs::mode::TERMINAL) != 0 && is_terminal_buf {
+        return 0;
+    }
+    if wp.w_onebuf_opt.wo_so < 0 {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_so
+    } else {
+        wp.w_onebuf_opt.wo_so
+    }
+}
+
+/// Return the effective `'scrolloffpad'` value for the current window,
+/// using the global value when appropriate (`get_scrolloffpad_value`).
+///
+/// Note: the original's own `else` branch reads `curwin->w_p_sop`, NOT
+/// `wp->w_p_sop` - preserved exactly as-is (every real caller always
+/// passes `curwin` itself, so this divergence is unobservable in
+/// practice; this project translates the original faithfully rather
+/// than "fixing" perceived upstream inconsistencies).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+#[must_use]
+pub unsafe fn get_scrolloffpad_value(wp: &WinT) -> OptInt {
+    if wp.w_onebuf_opt.wo_sop == -1 {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sop
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_onebuf_opt.wo_sop
+    }
+}
+
+/// Return the effective `'sidescrolloff'` value for the current window,
+/// using the global value when appropriate (`get_sidescrolloff_value`).
+#[must_use]
+pub fn get_sidescrolloff_value(wp: &WinT) -> OptInt {
+    if wp.w_onebuf_opt.wo_siso < 0 {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso
+    } else {
+        wp.w_onebuf_opt.wo_siso
+    }
 }
 
 #[cfg(test)]
@@ -73,5 +318,334 @@ mod tests {
     fn get_fileformat_empty_ff_defaults_to_dos() {
         let buf = BufT::default(); // b_p_ff is None
         assert_eq!(get_fileformat(&buf), EOL_DOS);
+    }
+
+    #[test]
+    fn magic_isset_not_set_follows_p_magic() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled;
+        let prev_magic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_magic;
+        unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled =
+            crate::regexp_defs::OptmagicT::NotSet;
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_magic = 1;
+        assert!(magic_isset());
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_magic = 0;
+        assert!(!magic_isset());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_magic = prev_magic;
+    }
+
+    #[test]
+    fn magic_isset_overruled_on_and_off() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled =
+            crate::regexp_defs::OptmagicT::MagicOn;
+        assert!(magic_isset());
+        unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled =
+            crate::regexp_defs::OptmagicT::MagicOff;
+        assert!(!magic_isset());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.magic_overruled = prev;
+    }
+
+    #[test]
+    fn shortmess_false_when_p_shm_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = None;
+
+        assert!(!shortmess(b'r'));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = prev;
+    }
+
+    #[test]
+    fn shortmess_true_when_x_directly_present() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = Some(b"rl".to_vec());
+
+        assert!(shortmess(b'r'));
+        assert!(!shortmess(b'x'));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = prev;
+    }
+
+    #[test]
+    fn shortmess_true_via_all_abbreviations_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm.clone();
+        // 'a' present, and 'm' (SHM_MOD) is in SHM_ALL_ABBREVIATIONS.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = Some(b"a".to_vec());
+
+        assert!(shortmess(crate::option_vars::shm::MOD));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = prev;
+    }
+
+    #[test]
+    fn can_bs_false_for_start_in_prompt_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let result = unsafe { can_bs(crate::option_vars::BS_START) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(!result);
+    }
+
+    #[test]
+    fn can_bs_legacy_numeric_2_excludes_only_nostop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let prev_bs = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs.clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = Some(b"2".to_vec());
+
+        let indent_result = unsafe { can_bs(crate::option_vars::BS_INDENT) };
+        let nostop_result = unsafe { can_bs(crate::option_vars::BS_NOSTOP) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev_bs;
+        assert!(indent_result);
+        assert!(!nostop_result);
+    }
+
+    #[test]
+    fn can_bs_checks_flag_presence_in_p_bs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let prev_bs = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs.clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs =
+            Some(vec![crate::option_vars::BS_INDENT]);
+
+        let indent_result = unsafe { can_bs(crate::option_vars::BS_INDENT) };
+        let eol_result = unsafe { can_bs(crate::option_vars::BS_EOL) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev_bs;
+        assert!(indent_result);
+        assert!(!eol_result);
+    }
+
+    #[test]
+    fn get_bkc_flags_prefers_buffer_local() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags = 7;
+
+        let buf_local = BufT { b_bkc_flags: 3, ..Default::default() };
+        let buf_unset = BufT::default();
+        assert_eq!(get_bkc_flags(&buf_local), 3);
+        assert_eq!(get_bkc_flags(&buf_unset), 7);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags = prev;
+    }
+
+    #[test]
+    fn get_flp_value_prefers_non_empty_buffer_local() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_flp.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_flp = Some(b"global".to_vec());
+
+        let buf_local = BufT { b_p_flp: Some(b"local".to_vec()), ..Default::default() };
+        let buf_empty = BufT { b_p_flp: Some(Vec::new()), ..Default::default() };
+        let buf_unset = BufT::default();
+        assert_eq!(get_flp_value(&buf_local), b"local");
+        assert_eq!(get_flp_value(&buf_empty), b"global");
+        assert_eq!(get_flp_value(&buf_unset), b"global");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_flp = prev;
+    }
+
+    #[test]
+    fn get_ve_flags_prefers_window_local_and_masks_none_bits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags =
+            crate::option_vars::opt_ve_flag::ALL;
+
+        let mut win_local = WinT::default();
+        win_local.w_onebuf_opt.wo_ve_flags =
+            crate::option_vars::opt_ve_flag::ONEMORE | crate::option_vars::opt_ve_flag::NONE;
+        assert_eq!(get_ve_flags(&win_local), crate::option_vars::opt_ve_flag::ONEMORE);
+
+        let win_unset = WinT::default();
+        assert_eq!(get_ve_flags(&win_unset), crate::option_vars::opt_ve_flag::ALL);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = prev;
+    }
+
+    #[test]
+    fn get_showbreak_value_variants() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sbr.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sbr = Some(b">>".to_vec());
+
+        let mut win_local = WinT::default();
+        win_local.w_onebuf_opt.wo_sbr = Some(b"++".to_vec());
+        assert_eq!(get_showbreak_value(&win_local), b"++");
+
+        let mut win_none_literal = WinT::default();
+        win_none_literal.w_onebuf_opt.wo_sbr = Some(b"NONE".to_vec());
+        assert_eq!(get_showbreak_value(&win_none_literal), Vec::<u8>::new());
+
+        let win_unset = WinT::default();
+        assert_eq!(get_showbreak_value(&win_unset), b">>");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sbr = prev;
+    }
+
+    #[test]
+    fn default_fileformat_variants() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs.clone();
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs = Some(b"mac".to_vec());
+        assert_eq!(default_fileformat(), EOL_MAC);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs = Some(b"dos".to_vec());
+        assert_eq!(default_fileformat(), EOL_DOS);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs = Some(b"unix".to_vec());
+        assert_eq!(default_fileformat(), EOL_UNIX);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs = None;
+        assert_eq!(default_fileformat(), EOL_UNIX);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffs = prev;
+    }
+
+    #[test]
+    fn csh_and_fish_like_shell_detect_tail() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh.clone();
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh = Some(b"/bin/tcsh".to_vec());
+        assert!(csh_like_shell());
+        assert!(!fish_like_shell());
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh = Some(b"/usr/bin/fish".to_vec());
+        assert!(fish_like_shell());
+        assert!(!csh_like_shell());
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh = Some(b"/bin/bash".to_vec());
+        assert!(!csh_like_shell());
+        assert!(!fish_like_shell());
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh = prev;
+    }
+
+    #[test]
+    fn get_scrolloff_value_zero_in_terminal_mode_for_terminal_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::TERMINAL as i32;
+
+        let mut dummy_terminal: u8 = 0;
+        let mut buf = BufT {
+            terminal: (&mut dummy_terminal as *mut u8).cast(),
+            ..Default::default()
+        };
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+        let result = unsafe { get_scrolloff_value(&win) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn get_scrolloff_value_falls_back_to_global_when_local_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        let prev_so = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_so;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_so = 5;
+
+        let mut buf = BufT::default(); // terminal is null - not a terminal buffer
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_onebuf_opt.wo_so = -1;
+
+        let result = unsafe { get_scrolloff_value(&win) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_so = prev_so;
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn get_scrolloff_value_uses_local_when_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_onebuf_opt.wo_so = 9;
+
+        let result = unsafe { get_scrolloff_value(&win) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        assert_eq!(result, 9);
+    }
+
+    #[test]
+    fn get_scrolloffpad_value_falls_back_to_curwin_global() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_sop = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sop;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sop = 2;
+
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_sop = -1;
+
+        let result = unsafe { get_scrolloffpad_value(&wp) };
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sop = prev_sop;
+        assert_eq!(result, 2);
+    }
+
+    #[test]
+    fn get_scrolloffpad_value_non_default_reads_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        let mut curwin_win = WinT::default();
+        curwin_win.w_onebuf_opt.wo_sop = 8;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut curwin_win as *mut WinT;
+
+        // wp itself is a *different* WinT whose own w_p_sop is merely
+        // used for the != -1 check; the actual returned value, per the
+        // original's own (preserved) quirk, comes from curwin instead.
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_sop = 3;
+
+        let result = unsafe { get_scrolloffpad_value(&wp) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        assert_eq!(result, 8);
+    }
+
+    #[test]
+    fn get_sidescrolloff_value_variants() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso = 4;
+
+        let mut win_negative = WinT::default();
+        win_negative.w_onebuf_opt.wo_siso = -1;
+        assert_eq!(get_sidescrolloff_value(&win_negative), 4);
+
+        let mut win_local = WinT::default();
+        win_local.w_onebuf_opt.wo_siso = 6;
+        assert_eq!(get_sidescrolloff_value(&win_local), 6);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso = prev;
     }
 }
