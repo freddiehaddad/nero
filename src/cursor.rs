@@ -73,9 +73,23 @@
 //!   (drawscreen.c's redraw-tracking side).
 //! - `check_cursor_lnum`/`get_cursor_rel_lnum`: need `fold.c`'s
 //!   `hasFolding`/`hasFoldingWin`/`hasAnyFolding`.
-//! - `check_cursor_col`/`check_cursor`: need `check_cursor_lnum`
-//!   (fold.c, above) - `getvcol` itself no longer blocks these (it now
-//!   exists), but the fold dependency still does.
+//! - `check_cursor` (the `check_cursor_lnum` + `check_cursor_col`
+//!   combo): needs `check_cursor_lnum` (fold.c, above).
+//!
+//! **`check_cursor_col`** itself (unlike `check_cursor`, its combo
+//! caller) turned out to need NO fold.c dependency at all - re-read
+//! directly rather than assumed blocked alongside `check_cursor`/
+//! `check_cursor_lnum`, and translated in full (col-bounds clamping
+//! for Normal/Insert/Terminal/Visual/`'virtualedit'` modes, plus the
+//! `'virtualedit'=all` coladd fine-tuning via `getvcol`). One
+//! genuine, if pathological, overflow risk was caught and fixed the
+//! same way as `mbyte.rs`'s `utf_ptr2char`: `oldcoladd = col + coladd`
+//! uses `wrapping_add` (and the later `oldcoladd - new_col` uses
+//! `wrapping_sub`) since `col == MAXCOL` paired with a nonzero
+//! `coladd` - not a state legitimate callers ever produce, but not
+//! provably unreachable either - would otherwise panic in a debug
+//! build instead of silently producing a nonsensical-but-harmless
+//! value like the original's own C `int` arithmetic would.
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::pos_defs::{ColnrT, MAXCOL, PosT};
@@ -91,6 +105,116 @@ pub unsafe fn check_pos(buf: &mut BufT, pos: &mut PosT) {
     if pos.col > 0 {
         // SAFETY: forwarded from this function's own safety doc.
         pos.col = pos.col.min(unsafe { crate::memline::ml_get_buf_len(buf, pos.lnum) });
+    }
+}
+
+/// Make sure `win.w_cursor.col` is valid. Special handling of
+/// insert-mode (`check_cursor_col`).
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Touches `crate::globals::GLOBALS` and
+/// `crate::option_vars::OPTION_VARS`.
+pub unsafe fn check_cursor_col(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (oldcol, oldcoladd, lnum) = unsafe {
+        let w = &*win;
+        // wrapping_add: matches the original's plain `+` (C signed
+        // overflow is UB but wraps in practice on every real target);
+        // `col == MAXCOL && coladd > 0` is not a state legitimate
+        // callers produce (MAXCOL is always paired with coladd == 0,
+        // e.g. coladvance2's own MAXCOL branch), but this must not
+        // panic if it's ever reached anyway - same reasoning as
+        // mbyte.rs's utf_ptr2char overflow fix.
+        (w.w_cursor.col, w.w_cursor.col.wrapping_add(w.w_cursor.coladd), w.w_cursor.lnum)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur_ve_flags = unsafe { crate::option::get_ve_flags(&*win) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*win).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { crate::memline::ml_get_buf_len(buf, lnum) };
+
+    if len == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win }.w_cursor.col = 0;
+    } else if oldcol >= len {
+        let (state, restart_edit, visual_active) = {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            (g.State, g.restart_edit, g.Visual.active)
+        };
+        let sel_first_byte = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sel
+            .as_deref()
+            .and_then(|s| s.first())
+            .copied();
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_virtual_active = unsafe { crate::state::virtual_active(&*win) };
+
+        // Allow cursor past end-of-line when:
+        // - in Insert mode or restarting Insert mode
+        // - in Terminal mode
+        // - in Visual mode and 'selection' isn't "old"
+        // - 'virtualedit' is set
+        if (state & crate::state_defs::mode::INSERT as i32) != 0
+            || restart_edit != 0
+            || (state & crate::state_defs::mode::TERMINAL as i32) != 0
+            || (visual_active && sel_first_byte != Some(b'o'))
+            || (cur_ve_flags & crate::option_vars::opt_ve_flag::ONEMORE) != 0
+            || is_virtual_active
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *win }.w_cursor.col = len;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *win }.w_cursor.col = len - 1;
+            // Move the cursor to the head byte.
+            // SAFETY: forwarded from this function's own safety doc.
+            let buf = unsafe { &mut *(*win).w_buffer };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mark::mark_mb_adjustpos(buf, &mut (*win).w_cursor) };
+        }
+    } else if oldcol < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win }.w_cursor.col = 0;
+    }
+
+    // If virtual editing is on, we can leave the cursor on the old
+    // position, only we must set it to virtual. But don't do it when
+    // at the end of the line.
+    if oldcol == MAXCOL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win }.w_cursor.coladd = 0;
+    } else if cur_ve_flags == crate::option_vars::opt_ve_flag::ALL {
+        // SAFETY: forwarded from this function's own safety doc.
+        let new_col = unsafe { &*win }.w_cursor.col;
+        if oldcoladd > new_col {
+            let mut coladd = oldcoladd.wrapping_sub(new_col);
+
+            if new_col + 1 < len {
+                debug_assert!(coladd > 0);
+                let mut cs = 0;
+                let mut ce = 0;
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::plines::getvcol(
+                        win,
+                        &mut (*win).w_cursor,
+                        Some(&mut cs),
+                        None,
+                        Some(&mut ce),
+                        0,
+                    );
+                }
+                coladd = coladd.min(ce - cs);
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *win }.w_cursor.coladd = coladd;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *win }.w_cursor.coladd = 0;
+        }
     }
 }
 
@@ -684,6 +808,169 @@ mod tests {
         let mut pos = PosT { lnum: 1, col: 0, coladd: 0 };
         unsafe { check_pos(&mut buf, &mut pos) };
         assert_eq!(pos.col, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_empty_line_clamps_to_zero() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 5, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"\0");
+
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_within_bounds_is_unchanged() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 2, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 2);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_out_of_bounds_normal_mode_clamps_to_last_char() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 10, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        // Default GLOBALS.State is MODE_NORMAL (not Insert/Terminal),
+        // no Visual, no 've' - so the cursor clamps to the LAST real
+        // character (len-1), not one past it.
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 4);
+        assert_eq!(win.w_cursor.coladd, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_out_of_bounds_insert_mode_clamps_to_len() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 10, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let g = unsafe { GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::INSERT as i32;
+
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 5); // one past the last char
+
+        unsafe { GLOBALS.get_mut() }.State = prev_state;
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_negative_clamps_to_zero() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: -1, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_maxcol_resets_coladd() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            // col == MAXCOL with a nonzero coladd is not a state
+            // legitimate callers produce (coladvance2 always pairs
+            // MAXCOL with coladd == 0), but this deliberately uses a
+            // nonzero coladd anyway to exercise the wrapping_add fix
+            // (`MAXCOL + coladd` would otherwise overflow i32) and
+            // confirm the wrapped, nonsensical value still safely
+            // resets to 0 via the `oldcol == MAXCOL` branch rather
+            // than panicking or producing garbage.
+            w_cursor: PosT { lnum: 1, col: MAXCOL, coladd: 7 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 4); // clamped like any other out-of-range col
+        assert_eq!(win.w_cursor.coladd, 0); // reset because oldcol == MAXCOL
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_ve_all_preserves_coladd_on_last_character() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 4, coladd: 3 }, // 'o', the LAST char
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_ve_flags = crate::option_vars::opt_ve_flag::ALL;
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        // new_col + 1 == len, so the getvcol-based clamp is skipped -
+        // coladd is preserved exactly as oldcoladd - new_col.
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 4);
+        assert_eq!(win.w_cursor.coladd, 3);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_col_ve_all_clamps_coladd_via_getvcol_mid_line() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 2, coladd: 5 }, // 'l', NOT the last char
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_ve_flags = crate::option_vars::opt_ve_flag::ALL;
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        // new_col + 1 < len, so getvcol clamps coladd to (ce - cs) for
+        // the character at the new column - a plain 1-cell ASCII
+        // character has ce == cs, so coladd is clamped all the way to 0.
+        unsafe { check_cursor_col(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.col, 2);
+        assert_eq!(win.w_cursor.coladd, 0);
 
         drop(guard);
         close_buf_with_memline(buf);
