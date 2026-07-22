@@ -18,11 +18,20 @@
 //! `shortmess`, `can_bs`, `get_bkc_flags`, `get_flp_value`,
 //! `get_ve_flags`, `get_showbreak_value`, `default_fileformat`,
 //! `csh_like_shell`, `fish_like_shell`, `get_scrolloff_value`,
-//! `get_scrolloffpad_value`, `get_sidescrolloff_value`. `can_bs`/
-//! `shortmess` needed `strings.c`'s `vim_strchr` (also translated this
-//! pass - re-examined and found NOT actually blocked on `g_chartab`/
-//! `option.c` as an earlier note claimed, see `strings.rs`'s own module
-//! doc).
+//! `get_scrolloffpad_value`, `get_sidescrolloff_value`, `valid_name`,
+//! `check_blending`. `can_bs`/`shortmess`/`valid_name` needed
+//! `strings.c`'s `vim_strchr` (also translated this pass - re-examined
+//! and found NOT actually blocked on `g_chartab`/`option.c` as an
+//! earlier note claimed, see `strings.rs`'s own module doc).
+//!
+//! **No Rust equivalent needed** (not "deferred" - genuinely
+//! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
+//! exist in the original purely to manually manage `OptVal`'s C union
+//! (freeing/duplicating/comparing the `String` case's heap buffer by
+//! hand). `option_defs.rs`'s `OptVal` is already a safe tagged Rust
+//! `enum` with `#[derive(Debug, Clone, PartialEq)]` - so plain
+//! `drop(val)`/`val.clone()`/`val1 == val2` already do exactly what
+//! these three functions do, automatically, for free.
 //!
 //! Established convention (this file's first real readers of
 //! `Option<Vec<u8>>` *option string values*, as opposed to freshly
@@ -41,11 +50,15 @@
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
 //! Deferred: everything else, including `get_fileformat_force` (needs
-//! `exarg_T`), and every function needing the real `options[]` table
-//! (`get_option_value`/`set_option_value`/`option_was_set`/
-//! `is_option_hidden`/`option_has_type`/`option_has_scope`/
-//! `get_winbuf_options`/`get_vimoption`/etc.) or `do_set`/`ex_set`'s
-//! command-line parsing.
+//! `exarg_T`), `was_set_insecurely`/`insecure_flag` (need the real
+//! `options[]` table's own `.flags` field for their fallback case,
+//! plus `OptIndex`), `parse_winhl_opt` (needs the decoration/highlight-
+//! group subsystem: `nvim_create_namespace`/`get_decor_provider`/
+//! `syn_check_group`/`ns_hl_def`), and every function needing the real
+//! `options[]` table (`get_option_value`/`set_option_value`/
+//! `option_was_set`/`is_option_hidden`/`option_has_type`/
+//! `option_has_scope`/`get_winbuf_options`/`get_vimoption`/etc.) or
+//! `do_set`/`ex_set`'s command-line parsing.
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
@@ -225,6 +238,27 @@ pub fn fish_like_shell() -> bool {
     let p_sh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sh.clone().unwrap_or_default();
     let tail_start = crate::path::path_tail(&p_sh);
     contains(&p_sh[tail_start..], b"fish")
+}
+
+/// Check that every character in `val` is either alphanumeric or present
+/// in `allowed` (`valid_name`).
+#[must_use]
+pub fn valid_name(val: &[u8], allowed: &[u8]) -> bool {
+    let end = val.iter().position(|&b| b == 0).unwrap_or(val.len());
+    for &b in &val[..end] {
+        if !crate::macros_defs::ascii_isalnum(i32::from(b))
+            && crate::strings::vim_strchr(allowed, i32::from(b)).is_none()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Update `wp.w_grid_alloc.blending` from `'winblend'`/the floating
+/// window's shadow setting (`check_blending`).
+pub fn check_blending(wp: &mut WinT) {
+    wp.w_grid_alloc.blending = wp.w_onebuf_opt.wo_winbl > 0 || (wp.w_floating && wp.w_config.shadow);
 }
 
 /// Return the effective `'scrolloff'` value for the current window,
@@ -647,5 +681,48 @@ mod tests {
         assert_eq!(get_sidescrolloff_value(&win_local), 6);
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso = prev;
+    }
+
+    #[test]
+    fn valid_name_allows_alnum_and_allowed_chars() {
+        assert!(valid_name(b"abc123", b"_-"));
+        assert!(valid_name(b"ab_c-1", b"_-"));
+        assert!(!valid_name(b"ab c", b"_-")); // space not allowed
+        assert!(!valid_name(b"ab.c", b"_-")); // dot not allowed
+    }
+
+    #[test]
+    fn valid_name_stops_at_first_embedded_nul() {
+        // Only the (empty) allowed-set matters here since everything
+        // before the NUL is alphanumeric.
+        assert!(valid_name(b"abc\0!!!", b""));
+    }
+
+    #[test]
+    fn check_blending_true_when_winblend_positive() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_winbl = 30;
+        check_blending(&mut wp);
+        assert!(wp.w_grid_alloc.blending);
+    }
+
+    #[test]
+    fn check_blending_true_when_floating_with_shadow() {
+        let mut wp = WinT { w_floating: true, ..Default::default() };
+        wp.w_config.shadow = true;
+        check_blending(&mut wp);
+        assert!(wp.w_grid_alloc.blending);
+    }
+
+    #[test]
+    fn check_blending_false_otherwise() {
+        let mut wp = WinT::default();
+        check_blending(&mut wp);
+        assert!(!wp.w_grid_alloc.blending);
+
+        // Floating without shadow also stays false.
+        let mut wp2 = WinT { w_floating: true, ..Default::default() };
+        check_blending(&mut wp2);
+        assert!(!wp2.w_grid_alloc.blending);
     }
 }
