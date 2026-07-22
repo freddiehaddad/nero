@@ -7,7 +7,9 @@
 //! in this pass (no such dependency, or only a documented default-table
 //! approximation of `g_chartab` - see below): the `skip*` family, the
 //! `getdigits*` family, `vim_isblankline`, `hex2nr`, `hexhex2nr`,
-//! `vim_isprintc`, `char2cells`, `ptr2cells`.
+//! `vim_isprintc`, `char2cells`, `ptr2cells`; and now that `mbyte.c`'s
+//! `utfc_ptr2len` exists too: `vim_strsize`/`vim_strnsize` (screen-cell
+//! width of a whole string, counting TABs as two cells).
 //!
 //! `vim_isprintc`/`char2cells` need `g_chartab`, which isn't translated
 //! (needs `buf_T`/option parsing), but their *default* (pre-`'isprint'`-
@@ -31,10 +33,16 @@
 //!   (`'iskeyword'`'s default already varies by `'encoding'`).
 //! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
 //!   `vim_isfilec` (hence the real `g_chartab`).
-//! - `trans_characters`/`transstr`/`str_foldcase`/`transchar`* family,
-//!   `byte2cells`/`vim_strsize`/`vim_strnsize`: need more of `mbyte.c`
-//!   (`utf_head_off` in particular, deliberately not rushed - see
-//!   `mbyte.rs`'s own module doc).
+//! - `byte2cells`: needs the real `g_chartab` directly (`g_chartab[b] &
+//!   CT_CELL_MASK`) - unlike `char2cells`/`ptr2cells`, its `>= 0x80`
+//!   case returns 0 unconditionally rather than delegating to
+//!   `utf_char2cells`, so there's no analogous fixed-default-rule
+//!   shortcut available for the `< 0x80` case either (it's meant to be
+//!   read consistently with the real table, not approximated).
+//! - `trans_characters`/`transstr`/`transstr_len`/`transstr_buf`/
+//!   `str_foldcase`/`transchar`* family: need `byte2cells` (above) and
+//!   `transchar_byte`/`transchar_hex` (not yet checked) - re-examine
+//!   once `byte2cells` itself is unblocked.
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -317,6 +325,52 @@ pub unsafe fn ptr2cells(p: &[u8]) -> i32 {
     unsafe { char2cells(i32::from(b0)) }
 }
 
+/// Return the number of character cells string `s` will take on the
+/// screen, counting TABs as two characters: "^I" (`vim_strsize`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`vim_strnsize`]).
+#[must_use]
+pub unsafe fn vim_strsize(s: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { vim_strnsize(s, crate::pos_defs::MAXCOL) }
+}
+
+/// Return the number of character cells the first `len` bytes of `s`
+/// will take on the screen, counting TABs as two characters: "^I"
+/// (`vim_strnsize`). Stops early at a NUL byte, same as the original's
+/// own NUL-terminated-string handling.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`crate::mbyte::utfc_ptr2len`]/[`ptr2cells`]).
+#[must_use]
+pub unsafe fn vim_strnsize(s: &[u8], len: i32) -> i32 {
+    let mut size = 0i32;
+    let mut len = len;
+    let mut pos = 0usize;
+    loop {
+        // Matches the original's `while (*s != NUL && --len >= 0)`
+        // exactly, including its short-circuit evaluation order: `len`
+        // is only ever decremented once we know there's a real byte
+        // left to process.
+        if pos >= s.len() || s[pos] == 0 {
+            break;
+        }
+        len -= 1;
+        if len < 0 {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::mbyte::utfc_ptr2len(&s[pos..]) };
+        // SAFETY: forwarded from this function's own safety doc.
+        size += unsafe { ptr2cells(&s[pos..]) };
+        pos += l as usize;
+        len -= l - 1;
+    }
+    size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +521,51 @@ mod tests {
         let _guard = crate::globals::global_state_test_lock();
         let cjk = "一".as_bytes();
         assert_eq!(unsafe { ptr2cells(cjk) }, unsafe { crate::mbyte::utf_ptr2cells(cjk) });
+    }
+
+    #[test]
+    fn vim_strsize_counts_ascii_as_one_cell_each() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsize(b"hello") }, 5);
+    }
+
+    #[test]
+    fn vim_strsize_counts_tab_as_two_cells() {
+        let _guard = crate::globals::global_state_test_lock();
+        // TAB (control char, no 'isprint' customization) is 2 cells
+        // per this crate's own documented default-g_chartab rule.
+        assert_eq!(unsafe { vim_strsize(b"a\tb") }, 1 + 2 + 1);
+    }
+
+    #[test]
+    fn vim_strsize_counts_double_wide_cjk_as_two_cells() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "一本" - two East Asian Wide characters, 2 cells each.
+        assert_eq!(unsafe { vim_strsize("一本".as_bytes()) }, 4);
+    }
+
+    #[test]
+    fn vim_strsize_stops_at_the_trailing_nul() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsize(b"ab\0cd") }, 2);
+    }
+
+    #[test]
+    fn vim_strnsize_stops_early_at_the_byte_bound() {
+        let _guard = crate::globals::global_state_test_lock();
+        // len=3 means "process at most 3 bytes" - stops after "abc",
+        // never reaching "de".
+        assert_eq!(unsafe { vim_strnsize(b"abcde", 3) }, 3);
+    }
+
+    #[test]
+    fn vim_strnsize_len_bound_can_split_a_multibyte_character() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "一" is 3 bytes/2 cells; a len bound of 2 still counts it in
+        // full once entered (matches the original's own `len -= l - 1`
+        // bookkeeping, which only checks the byte budget *before*
+        // consuming each whole character, never mid-character).
+        let bytes = "一x".as_bytes();
+        assert_eq!(unsafe { vim_strnsize(bytes, 2) }, 2);
     }
 }
