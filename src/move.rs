@@ -74,6 +74,24 @@ pub unsafe fn win_col_off2(wp: &mut WinT) -> i32 {
     0
 }
 
+/// Set `wp.w_virtcol`/`w_valid`'s `VALID_VIRTCOL` bit for virtual
+/// column `vcol` (`set_valid_virtcol`).
+///
+/// Deviates from the original by omitting the
+/// `redraw_for_cursorcolumn(wp)` call: a pure redraw-scheduling side
+/// effect (marks dirty regions for `'cursorcolumn'`/`'cursorlineopt'=
+/// "screenline"` redraws) that doesn't feed back into any value this
+/// crate currently computes - matches the established
+/// "skip the deferred-subsystem side effect, keep the state correct"
+/// policy (e.g. `mf_write`/`ml_open`/`u_sync`'s omitted `iemsg`/`emsg`
+/// calls). `redraw_for_cursorcolumn` itself needs `conceal_cursor_line`/
+/// `redrawWinline`/`redraw_later` (decoration.c/drawscreen.c's redraw-
+/// tracking side, not yet translated).
+pub fn set_valid_virtcol(wp: &mut WinT, vcol: crate::pos_defs::ColnrT) {
+    wp.w_virtcol = vcol;
+    wp.w_valid |= i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

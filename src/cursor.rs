@@ -40,29 +40,45 @@
 //! persistent storage this crate uses for "the currently locked/cached
 //! line", equivalent to the original's pointer-based mutation.
 //!
+//! Also translated, now that `plines.c`'s `getvcol`/`getvvcol`/
+//! character-width machinery and `state.c`'s `virtual_active` both
+//! exist: `getviscol`/`getviscol2` (thin `getvvcol` wrappers over
+//! `curwin.w_cursor`), `coladvance`/`coladvance2`/`getvpos` (advance
+//! the cursor to a target screen column). `coladvance2`'s
+//! `win_charsize(cstype, col, ci.ptr, ci.chr.value, &csarg)` dispatch
+//! is inlined directly (matching `getvcol`'s own approach) rather than
+//! adding a standalone `win_charsize` wrapper, since `charsize_regular`
+//! needs an explicit byte-offset `col` parameter (this crate's
+//! replacement for the original's `cur - csarg->line` pointer
+//! subtraction) that's naturally available here as `ci.pos` - a real
+//! call site finally resolved the ambiguity `plines.rs`'s own module
+//! doc flagged when `win_charsize` was investigated and skipped there.
+//!
+//! `coladvance2`'s own `'virtualedit'`-space-filling branch (reached
+//! only when `virtual_active(wp)` is true, `addspaces` is set, AND the
+//! computed column doesn't already land on the target - a genuinely
+//! narrow, opt-in-only combination) is `unimplemented!()`: it needs
+//! `change.c`'s `inserted_bytes` plus a real `ml_replace` call wired
+//! through the undo/redraw-notification machinery, neither of which
+//! this crate has assembled yet. `coladvance_force` (which always
+//! passes `addspaces = true`) is still fully correct for every case
+//! that DOESN'T hit that inner branch (i.e. whenever `'virtualedit'`
+//! is unset, the overwhelmingly common case) - matches this crate's
+//! established "narrow, discrete, opt-in configuration branch" `unimplemented!()`
+//! precedent (`window.rs`'s `win_fdccol_count`, `indent.rs`'s
+//! `get_breakindent_win`).
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `getviscol`/`getviscol2`/`coladvance_force`/`coladvance`/
-//!   `coladvance2`/`getvpos`/`set_leftcol`: need `plines.c`'s
-//!   `getvcol`/`getvvcol`/character-width machinery, and (`set_leftcol`
-//!   specifically) `redraw_later`/`changed_cline_bef_curs`.
+//! - `set_leftcol`: needs `redraw_later`/`changed_cline_bef_curs`
+//!   (drawscreen.c's redraw-tracking side).
 //! - `check_cursor_lnum`/`get_cursor_rel_lnum`: need `fold.c`'s
 //!   `hasFolding`/`hasFoldingWin`/`hasAnyFolding`.
-//! - `check_cursor_col`/`check_cursor`: need `plines.c`'s `getvcol`
-//!   (only for the narrow `'virtualedit'=all` coladd-clamping branch -
-//!   deliberately not translated with that branch silently dropped,
-//!   since that would be a real, if narrow, behavioral deviation, not
-//!   a faithful translation) and `check_cursor_lnum` (fold.c, above).
-//! - `virtual_active` (from `state.c`, not `cursor.c` itself, but
-//!   checked while investigating `check_cursor_col`/`coladvance2`
-//!   above, its only callers here): confirmed fully tractable
-//!   whenever needed (`crate::globals::GLOBALS.State`/`virtual_op`/
-//!   `Visual`, `crate::option_vars`'s `get_ve_flags`/`opt_ve_flag`,
-//!   and `crate::ascii_defs::CTRL_V` all already exist) - not
-//!   translated *yet* only because its own real callers
-//!   (`coladvance2`/`check_cursor_col`) are themselves still deferred.
+//! - `check_cursor_col`/`check_cursor`: need `check_cursor_lnum`
+//!   (fold.c, above) - `getvcol` itself no longer blocks these (it now
+//!   exists), but the fold dependency still does.
 
-use crate::buffer_defs::BufT;
-use crate::pos_defs::{ColnrT, PosT};
+use crate::buffer_defs::{BufT, WinT};
+use crate::pos_defs::{ColnrT, MAXCOL, PosT};
 
 /// Make sure `pos.lnum` and `pos.col` are valid in `buf`. This allows
 /// for the col to be on the NUL byte (`check_pos`).
@@ -274,6 +290,306 @@ pub unsafe fn dec_cursor() -> i32 {
     let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::memline::dec(&mut curwin.w_cursor) }
+}
+
+/// @return the screen position of the cursor (`getviscol`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn getviscol() -> ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let mut x = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::plines::getvvcol(curwin, &mut (*curwin).w_cursor, Some(&mut x), None, None, 0);
+    }
+    x
+}
+
+/// @return the screen position of character `col` with a `coladd` in
+/// the cursor line (`getviscol2`).
+///
+/// # Safety
+/// Same as [`getviscol`].
+#[must_use]
+pub unsafe fn getviscol2(col: ColnrT, coladd: ColnrT) -> ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    let mut pos = PosT { lnum, col, coladd };
+    let mut x = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::plines::getvvcol(curwin, &mut pos, Some(&mut x), None, None, 0) };
+    x
+}
+
+/// The internal implementation shared by [`coladvance`]/
+/// [`coladvance_force`]/[`getvpos`] (`coladvance2`).
+///
+/// Its `'virtualedit'`-space-filling branch (reached only when
+/// `virtual_active(wp)` is true, `addspaces` is set, AND the computed
+/// column doesn't already land on the target - a genuinely narrow,
+/// opt-in-only combination) is `unimplemented!()`: it needs
+/// `change.c`'s `inserted_bytes` plus a real `ml_replace` call wired
+/// through the undo/redraw-notification machinery, neither assembled
+/// yet. Every other case (in particular every call with
+/// `'virtualedit'` unset, the overwhelmingly common case) is fully
+/// translated.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Touches `crate::globals::GLOBALS` and
+/// `crate::option_vars::OPTION_VARS`.
+unsafe fn coladvance2(
+    wp: *mut WinT,
+    pos: &mut PosT,
+    addspaces: bool,
+    finetune: bool,
+    wcol_arg: ColnrT,
+) -> i32 {
+    let mut wcol = wcol_arg;
+    let mut idx: i32;
+    let mut col: ColnrT;
+    let mut head = 0;
+
+    let sel_first_byte = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_sel
+        .as_deref()
+        .and_then(|s| s.first())
+        .copied();
+    let (state, restart_edit, visual_active) = {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        (g.State, g.restart_edit, g.Visual.active)
+    };
+    let one_more = (state & crate::state_defs::mode::INSERT as i32) != 0
+        || (state & crate::state_defs::mode::TERMINAL as i32) != 0
+        || restart_edit != 0
+        || (visual_active && sel_first_byte != Some(b'o'))
+        || ((crate::option::get_ve_flags(unsafe { &*wp })
+            & crate::option_vars::opt_ve_flag::ONEMORE)
+            != 0
+            && wcol < MAXCOL);
+    let one_more_i32 = i32::from(one_more);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, pos.lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let linelen = unsafe { crate::memline::ml_get_buf_len(buf, pos.lnum) };
+
+    if wcol == MAXCOL {
+        idx = linelen - 1 + one_more_i32;
+        col = wcol;
+
+        if (addspaces || finetune) && !visual_active {
+            // SAFETY: forwarded from this function's own safety doc.
+            let size = unsafe { crate::plines::linetabsize(wp, pos.lnum) } + one_more_i32;
+            // SAFETY: forwarded from this function's own safety doc.
+            let wpref = unsafe { &mut *wp };
+            wpref.w_curswant = size;
+            if wpref.w_curswant > 0 {
+                wpref.w_curswant -= 1;
+            }
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wpref = unsafe { &mut *wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let width = wpref.w_view_width - unsafe { crate::r#move::win_col_off(wpref) };
+        let mut csize = 0;
+
+        if finetune
+            && wpref.w_onebuf_opt.wo_wrap != 0
+            && wpref.w_view_width != 0
+            && wcol >= width
+            && width > 0
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            csize = unsafe { crate::plines::linetabsize_eol(wp, pos.lnum) };
+            if csize > 0 {
+                csize -= 1;
+            }
+
+            if wcol / width > csize / width
+                && (state & crate::state_defs::mode::INSERT as i32 == 0 || wcol > csize + 1)
+            {
+                wcol = (csize / width + 1) * width - 1;
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let (mut csarg, cstype) = unsafe { crate::plines::init_charsize_arg(wp, pos.lnum, &line) };
+        let mut ci = crate::mbyte::utf_ptr2str_char_info(&line);
+        col = 0;
+        while col <= wcol && line.get(ci.pos).copied().unwrap_or(0) != 0 {
+            let cs = if cstype == crate::plines::CsType::Fast {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::plines::charsize_fast(&csarg, &line[ci.pos..], col, ci.chr.value) }
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::plines::charsize_regular(
+                        &mut csarg,
+                        &line[ci.pos..],
+                        ci.pos as i32,
+                        col,
+                        ci.chr.value,
+                    )
+                }
+            };
+            csize = cs.width;
+            head = cs.head;
+            col += cs.width;
+            // SAFETY: forwarded from this function's own safety doc.
+            ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+        }
+        idx = ci.pos as i32;
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_virtual_active = unsafe { crate::state::virtual_active(&*wp) };
+        if col > wcol || (!is_virtual_active && !one_more) {
+            idx -= 1;
+            csize -= head;
+            col -= csize;
+        }
+
+        if is_virtual_active
+            && addspaces
+            && wcol >= 0
+            && ((col != wcol && col != wcol + 1) || csize > 1)
+        {
+            // 'virtualedit' is set: the difference between wcol and
+            // col needs to be filled with spaces - see this
+            // function's own doc comment for why this is deferred.
+            unimplemented!(
+                "coladvance2: 'virtualedit' space-filling needs change.c's \
+                 inserted_bytes + a real ml_replace call"
+            );
+        }
+    }
+
+    pos.col = idx.max(0);
+    pos.coladd = 0;
+
+    if finetune {
+        if wcol == MAXCOL {
+            if !one_more {
+                let mut scol = 0;
+                let mut ecol = 0;
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::plines::getvcol(wp, pos, Some(&mut scol), None, Some(&mut ecol), 0);
+                }
+                pos.coladd = ecol - scol;
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let view_width = unsafe { &*wp }.w_view_width;
+            let b = wcol - col;
+            if b > 0 && b < (MAXCOL - 2 * view_width) {
+                pos.coladd = b;
+            }
+            col += b;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::mark_mb_adjustpos(buf, pos) };
+
+    if wcol < 0 || col < wcol {
+        crate::vim_defs::FAIL
+    } else {
+        crate::vim_defs::OK
+    }
+}
+
+/// Go to column `wcol`, and add/insert white space as necessary to get
+/// the cursor in that column. The caller must have saved the cursor
+/// line for undo! (`coladvance_force`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+pub unsafe fn coladvance_force(wcol: ColnrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let rc = unsafe { coladvance2(curwin, &mut (*curwin).w_cursor, true, false, wcol) };
+
+    if wcol == MAXCOL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_valid &= !i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+    } else {
+        // Virtcol is valid.
+        // SAFETY: forwarded from this function's own safety doc.
+        crate::r#move::set_valid_virtcol(unsafe { &mut *curwin }, wcol);
+    }
+    rc
+}
+
+/// Try to advance the Cursor to the specified screen column. If
+/// virtual editing: fine tune the cursor position. Note that all
+/// virtual positions off the end of a line should share a
+/// `wp.w_cursor.col` value (this is equal to the line's own length),
+/// beginning at coladd 0 (`coladvance`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. `crate::globals::GLOBALS.curwin` must
+/// also be valid (see this function's own note about a verified
+/// upstream quirk).
+pub unsafe fn coladvance(wp: *mut WinT, wcol: ColnrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let rc = unsafe { getvpos(wp, &mut (*wp).w_cursor, wcol) };
+
+    if wcol == MAXCOL || rc == crate::vim_defs::FAIL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *wp }.w_valid &= !i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (buf_ptr, lnum, col) = unsafe {
+            let wpref = &*wp;
+            (wpref.w_buffer, wpref.w_cursor.lnum, wpref.w_cursor.col)
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &mut *buf_ptr };
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+        if line.get(col as usize).copied() != Some(crate::ascii_defs::TAB) {
+            // Virtcol is valid when not on a TAB.
+            //
+            // NOTE: the original genuinely calls
+            // `set_valid_virtcol(curwin, wcol)` here - the GLOBAL
+            // current window, not `wp` - a verified upstream quirk
+            // (matches `option.rs`'s `get_scrolloffpad_value`
+            // precedent), kept exactly as-is rather than "fixed" to
+            // use `wp`.
+            // SAFETY: forwarded from this function's own safety doc.
+            let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
+            crate::r#move::set_valid_virtcol(curwin, wcol);
+        }
+    }
+    rc
+}
+
+/// Return in `pos` the position of the cursor advanced to screen
+/// column `wcol` (`getvpos`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+pub unsafe fn getvpos(wp: *mut WinT, pos: &mut PosT, wcol: ColnrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_virtual_active = unsafe { crate::state::virtual_active(&*wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { coladvance2(wp, pos, false, is_virtual_active, wcol) }
 }
 
 #[cfg(test)]
@@ -496,6 +812,117 @@ mod tests {
 
         assert_eq!(unsafe { dec_cursor() }, 0);
         assert_eq!(unsafe { &*GLOBALS.get_mut().curwin }.w_cursor.col, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn getviscol_plain_ascii_middle_position() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 2, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        assert_eq!(unsafe { getviscol() }, 2);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn getviscol2_explicit_col_and_coladd() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        assert_eq!(unsafe { getviscol2(3, 0) }, 3);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn coladvance_lands_on_target_column() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let rc = unsafe { coladvance(&mut win as *mut WinT, 2) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(win.w_cursor.col, 2);
+        assert_eq!(win.w_cursor.coladd, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn coladvance_maxcol_lands_on_last_real_character() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let rc = unsafe { coladvance(&mut win as *mut WinT, MAXCOL) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        // "hello" is 5 chars (indices 0..4); with one_more=false
+        // (default State is MODE_NORMAL, not Insert/Terminal, no 've'),
+        // the cursor lands on the LAST real character, not past it.
+        assert_eq!(win.w_cursor.col, 4);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn coladvance_force_basic_via_curwin() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let rc = unsafe { coladvance_force(3) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(unsafe { &*GLOBALS.get_mut().curwin }.w_cursor.col, 3);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn getvpos_does_not_mutate_the_actual_cursor() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let mut pos = PosT { lnum: 1, col: 0, coladd: 0 };
+        let rc = unsafe { getvpos(&mut win as *mut WinT, &mut pos, 3) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(pos.col, 3);
+        // The real cursor (win.w_cursor) is untouched.
+        assert_eq!(win.w_cursor.col, 0);
 
         drop(guard);
         close_buf_with_memline(buf);
