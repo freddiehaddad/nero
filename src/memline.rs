@@ -1,18 +1,29 @@
 //! Translated from `src/nvim/memline.c` (partial, but now covers the
-//! real B-tree read path, not just "open a brand new empty memline").
+//! real B-tree read *and* write paths for the common case, not just
+//! "open a brand new empty memline").
 //!
 //! Translated: `ml_open` (the whole function is translated, but two of
 //! its own sub-paths are narrower than the original - see below),
 //! `ml_new_ptr`, `ml_new_data`, `set_b0_fname` (only the
 //! `buf.b_ffname.is_none()` fast path - see the note below),
 //! `add_b0_fenc`, `long_to_char`/`char_to_long`, `ml_add_stack`,
-//! `ml_lineadd`, `ml_flush_line` (only its "nothing to flush" fast
-//! path - see below), **`ml_find_line`** (the real B-tree traversal:
-//! the "is the wanted line in the already-locked block" fast path, the
-//! `ML_FIND` stack-reuse search, and the full downward walk through
-//! pointer blocks to a data block, including negative-block-number
-//! translation mid-traversal), **`ml_get`/`ml_get_buf`** (via
-//! `ml_get_buf_impl`, `will_change == false` only - see below).
+//! `ml_lineadd`, `ml_add_deleted_len`/`ml_add_deleted_len_buf` (the
+//! common, non-`update_need_codepoints` path), `ml_updatechunk` (a
+//! no-op stub - see below), **`ml_find_line`** (the real B-tree
+//! traversal: the "is the wanted line in the already-locked block"
+//! fast path, the `ML_FIND` stack-reuse search, and the full downward
+//! walk through pointer blocks to a data block, including
+//! negative-block-number translation mid-traversal), **`ml_get`/
+//! `ml_get_buf`/`ml_get_buf_mut`** (via `ml_get_buf_impl`, both
+//! `will_change` values), **`ml_append_int`/`ml_append_flush`/
+//! `ml_append_flags`/`ml_append`/`ml_append_buf`** (the "fits in the
+//! target data block" fast path only - see below), **`ml_replace_buf_len`
+//! /`ml_replace`** (also serving `ml_replace_len`/`ml_replace_buf`'s
+//! role, since a Rust byte slice already knows its own length), and
+//! **`ml_flush_line`** now in full (both the in-place `memmove`-based
+//! rewrite and the delete-then-append fallback), **`ml_delete_int`/
+//! `ml_delete_flags`/`ml_delete`/`ml_delete_buf`** (the "does not empty
+//! the data block" fast path only - see below).
 //!
 //! **`ZeroBlock`/`PointerBlock`/`DataBlock` are NOT translated as
 //! `#[repr(C)]` structs reinterpreting a raw byte buffer** (the
@@ -39,10 +50,11 @@
 //! struct layout (computed by hand, then cross-checked against
 //! `PB_COUNT_MAX`/`HEADER_SIZE`'s definitions in the real source).
 //! `PointerBlock`/`DataBlock` now have real *read* accessors too
-//! (`block_id`, `pb_count`/`pb_pointer`, `db_txt_end`/`db_index`), not
-//! just the write-side ones from `ml_open` - designed once
-//! `ml_find_line`/`ml_get_buf_impl` made clear exactly what reading
-//! them back actually needs, rather than guessed at ahead of time.
+//! (`block_id`, `pb_count`/`pb_pointer`, `db_txt_end`/`db_index`/
+//! `db_line_count`), not just the write-side ones from `ml_open` -
+//! designed once `ml_find_line`/`ml_get_buf_impl` made clear exactly
+//! what reading them back actually needs, rather than guessed at ahead
+//! of time.
 //!
 //! `ml_get`/`ml_get_buf`'s return type deliberately deviates from the
 //! original's `char *` (a transient pointer, valid "only until the
@@ -60,7 +72,12 @@
 //! trailing NUL byte, matching the original's own NUL-terminated-
 //! C-string representation exactly (`ml_get_buf_len` is the function
 //! that strips it via `ml_line_textlen - 1`, not `ml_get`/`ml_get_buf`
-//! themselves).
+//! themselves) - every `line: &[u8]` parameter accepted by
+//! `ml_append*`/`ml_replace*` in this module follows the same
+//! convention: it must already include its own trailing NUL (e.g. an
+//! empty line is `b"\0"`, one byte, not `b""`, zero bytes - a real
+//! translation bug this session, caught by a test expecting an empty
+//! line back out and instead getting nothing).
 //!
 //! `CHECK(c, s)` (used in the original's `ml_find_line`/`ml_add_stack`)
 //! is `#define CHECK(c, s) do {} while (0)` in the real, compiled
@@ -68,6 +85,31 @@
 //! total no-op even in upstream neovim, so it's simply omitted here
 //! rather than translated as a `debug_assert!` (there is nothing to
 //! assert; the original itself never checks anything at that spot).
+//!
+//! **`ml_append_int`'s block-splitting path and `ml_delete_int`'s
+//! block-removal path are deliberately deferred** (each function's own
+//! doc comment has the exact details) - both are substantial,
+//! self-contained B+-tree-restructuring algorithms in their own right
+//! (creating/freeing data blocks, splitting/merging pointer blocks
+//! recursively up to the root, including a "block 1 becomes the new
+//! root" special case in the original), each deserving its own
+//! dedicated pass rather than being rushed alongside the other, more
+//! tractable pieces in this one. When the fast path doesn't apply,
+//! both functions return `FAIL` *cleanly*: each first undoes the
+//! pointer-block line-count adjustment `ml_find_line`'s own tree walk
+//! already committed for `ML_INSERT`/`ML_DELETE` (via
+//! `ml_lineadd(buf, -1)`/`ml_lineadd(buf, 1)` respectively - exactly
+//! what `ml_find_line`'s own `error_noblock` path does for the same
+//! action), so hitting this limitation never leaves an overstated or
+//! understated line count in the pointer blocks above, and never
+//! partially applies a change. Verified directly via a test
+//! (`ml_append_int_not_enough_room_fails_without_corrupting_state`)
+//! using a deliberately tiny page size to force the fast path to miss.
+//!
+//! `ml_updatechunk` (the `line2byte()`/`byte2line()` fast-lookup chunk
+//! cache) is a no-op stub: a pure performance optimization with its
+//! own nontrivial chunk-splitting logic, and neither `line2byte`/
+//! `byte2line` is translated yet to observe its absence.
 //!
 //! Deferred (each needs another not-yet-translated subsystem):
 //! - `set_b0_fname`'s `buf.b_ffname.is_some()` branch: needs
@@ -80,32 +122,23 @@
 //!   `b0_fname[0] = NUL` fast path instead, which IS fully translated.
 //! - `set_b0_dir_flag`/`swapfile_proc_running`: not called by `ml_open`
 //!   itself (used by `ml_recover`/`findswapname`), out of scope here.
-//! - `ml_flush_line`'s dirty-line writeback (in-block `memmove`-based
-//!   editing, or delete-then-append when the new line doesn't fit) and
-//!   `ml_get_buf_mut`/`ml_get_buf_impl`'s `will_change == true` path:
-//!   both need `ml_updatechunk`/`ml_delete_int`/`ml_append_int`, none
-//!   of which exist yet. Nothing in this crate can currently mark a
-//!   cached line dirty (`ml_replace`/`ml_append` aren't translated
-//!   either), so `ML_LINE_DIRTY` is never actually set on any real
-//!   call path here - this is the exact behavior a real, read-only
-//!   workflow exhibits, not a narrowed approximation.
 //! - `ml_setname`, `ml_close`/`ml_close_all`/`ml_close_notmod`,
-//!   `ml_recover`, `ml_append`/`ml_replace`/`ml_delete` (the write-side
-//!   counterparts to the traversal now translated) and everything else
-//!   in this ~4300-line file: each is its own substantial undertaking,
-//!   genuinely blocked on subsystems not yet translated (autocmd.c,
-//!   the display/fold subsystem, `list_T`/eval engine, etc.) - not
-//!   attempted this pass.
-//! - The real, user-facing `iemsg`/`siemsg` calls inside `ml_find_line`
-//!   (pointer-block-id-wrong, line-count-wrong) and `ml_get_buf_impl`
-//!   (invalid line number, cannot find line) are omitted rather than
-//!   translated as `debug_assert!`s - unlike `ml_open`'s block-number
-//!   asserts, these ARE reachable for a genuinely corrupted/inconsistent
-//!   tree, not internal-invariant-only conditions - but message.c's
-//!   display pipeline itself remains not tractable, so only the state
-//!   changes (falling back to `"???"`, returning `None`/null) are kept,
-//!   matching the same "message display is a skippable side effect,
-//!   state changes aren't" policy already validated for
+//!   `ml_recover` and everything else in this ~4300-line file: each is
+//!   its own substantial undertaking, genuinely blocked on subsystems
+//!   not yet translated (autocmd.c, the display/fold subsystem,
+//!   `list_T`/eval engine, etc.) - not attempted this pass.
+//! - The real, user-facing `iemsg`/`siemsg`/`set_keep_msg` calls inside
+//!   `ml_find_line`, `ml_get_buf_impl`, and `ml_delete_int` (pointer-
+//!   block-id-wrong, invalid line number, cannot find line, "No lines
+//!   in buffer") are omitted rather than translated as
+//!   `debug_assert!`s - unlike `ml_open`'s block-number asserts, these
+//!   ARE reachable for a genuinely corrupted/inconsistent tree (or, for
+//!   `set_keep_msg`, just a normal user message), not internal-
+//!   invariant-only conditions - but message.c's display pipeline
+//!   itself remains not tractable, so only the state changes (falling
+//!   back to `"???"`, returning `None`/null, setting `ML_EMPTY`) are
+//!   kept, matching the same "message display is a skippable side
+//!   effect, state changes aren't" policy already validated for
 //!   `mf_put`/`mf_write`/`mf_sync`.
 //!
 //! `ml_open`'s two `iemsg(_("E298: ..."))` calls ("Didn't get block nr
@@ -121,15 +154,34 @@
 
 use crate::buffer_defs::BufT;
 use crate::ex_cmds_defs::cmod;
-use crate::globals::GLOBALS;
+use crate::globals::{GlobalCell, GLOBALS};
 use crate::memfile::{mf_get, mf_new, mf_open, mf_put, mf_sync, mf_trans_del};
 use crate::memfile_defs::{BhdrT, BlocknrT, MemfileT};
-use crate::memline_defs::{InfoptrT, ML_EMPTY, ML_LINE_DIRTY, ML_LOCKED_DIRTY, ML_LOCKED_POS};
+use crate::memline_defs::{
+    InfoptrT, ML_ALLOCATED, ML_CHNK_ADDLINE, ML_CHNK_DELLINE, ML_CHNK_UPDLINE, ML_EMPTY,
+    ML_LINE_DIRTY, ML_LOCKED_DIRTY, ML_LOCKED_POS,
+};
 use crate::option::get_fileformat;
 use crate::option_vars::OPTION_VARS;
 use crate::os::env::os_get_hostname;
 use crate::pos_defs::LinenrT;
 use crate::vim_defs::{FAIL, OK};
+
+// Arguments for ml_append_int()/ml_new_data() (memline.h's own
+// anonymous `enum`).
+const ML_APPEND_NEW: i32 = 1; // starting to edit a new file
+const ML_APPEND_MARK: i32 = 2; // mark the new line
+
+// Flags for ml_delete_int() (memline.h's own anonymous `enum`).
+const ML_DEL_MESSAGE: i32 = 1; // may give a "No lines in buffer" message
+                                // (ML_DEL_UNDO = 2 is commented out/unused upstream too)
+
+/// The line number where the first `:global`-command mark may be. If
+/// it is 0 there are no marks at all (`lowest_marked`, `static` in the
+/// original - kept private here too, matching the original's
+/// "current buffer only" scoping via a plain module-level `GlobalCell`
+/// rather than a per-buffer field).
+static LOWEST_MARKED: GlobalCell<LinenrT> = GlobalCell::new(0);
 
 // Block IDs (memline.c's own anonymous `enum`).
 const DATA_ID: u16 = ((b'd' as u16) << 8) + b'a' as u16;
@@ -488,6 +540,9 @@ fn set_db_txt_end(buf: &mut [u8], v: u32) {
 fn set_db_line_count(buf: &mut [u8], v: i64) {
     buf[16..24].copy_from_slice(&v.to_ne_bytes());
 }
+fn db_line_count(buf: &[u8]) -> i64 {
+    i64::from_ne_bytes(buf[16..24].try_into().unwrap())
+}
 /// Reads `db_index[i]` (the byte offset where line `i + 1`'s text
 /// starts, relative to the start of the block, with [`DB_MARKED`]
 /// possibly set in the top bit - callers wanting the plain offset
@@ -641,6 +696,260 @@ pub unsafe fn ml_open(buf: &mut BufT) -> i32 {
     OK
 }
 
+/// Sets `buf.deleted_bytes`/`deleted_bytes2` bookkeeping for text about
+/// to be deleted, for the current buffer (`ml_add_deleted_len`).
+pub fn ml_add_deleted_len(ptr: &[u8], len: Option<usize>) {
+    // SAFETY: touches GLOBALS.curbuf - same requirement as every other
+    // function that does so.
+    let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+    ml_add_deleted_len_buf(curbuf, ptr, len);
+}
+
+/// Sets `buf.deleted_bytes`/`deleted_bytes2` bookkeeping for text about
+/// to be deleted (`ml_add_deleted_len_buf`).
+///
+/// `len`: `None` matches the original's `-1` ("use `ptr`'s own natural
+/// length"); `Some(n)` is capped to `ptr.len()` like the original caps
+/// to `strlen(ptr)`.
+///
+/// Deferred: the `buf.update_need_codepoints` branch (needs
+/// `mb_utflen`, not yet translated) - `update_need_codepoints` defaults
+/// to `false` and nothing in this crate sets it yet, so this is the
+/// exact behavior of every real call site so far, not an
+/// approximation.
+pub fn ml_add_deleted_len_buf(buf: &mut BufT, ptr: &[u8], len: Option<usize>) {
+    // SAFETY: touches GLOBALS - same requirement as every other
+    // function that does so.
+    if unsafe { GLOBALS.get_mut() }.inhibit_delete_count != 0 {
+        return;
+    }
+    let maxlen = ptr.len();
+    let len = len.map_or(maxlen, |l| l.min(maxlen));
+    buf.deleted_bytes += len + 1;
+    buf.deleted_bytes2 += len + 1;
+    // (buf.update_need_codepoints branch deferred - see doc comment.)
+}
+
+/// Keep information for finding the byte offset of a line
+/// (`ml_updatechunk`).
+///
+/// Deferred entirely (a no-op stub): this is a pure performance cache
+/// for `line2byte()`/`byte2line()` (neither translated yet, so nothing
+/// can observe its absence), with its own nontrivial chunk-splitting
+/// logic (`MLCS_MAXL`/`MLCS_MINL`). `buf.b_ml.ml_usedchunks` simply
+/// stays at its `Default`-initialized `0` forever, which is a
+/// different (but equally inert) sentinel from the original's `-1`
+/// "disabled" state - fine since nothing reads `ml_usedchunks`/
+/// `ml_chunksize` yet either.
+fn ml_updatechunk(_buf: &mut BufT, _line: LinenrT, _len: i32, _updtype: i32) {}
+
+/// Append a line after `lnum` (`lnum` can be 0) (`ml_append_int`).
+///
+/// Only the "the new line fits directly in the target data block"
+/// fast path is translated. Deferred: the original's "insert in front
+/// of the next block" redirect (a narrow efficiency optimization when
+/// appending exactly at a full block's own last line) and the full
+/// block-splitting algorithm (creating a new data block and,
+/// transitively, splitting pointer blocks up to the root when they
+/// too are full - the original's own most complex branch in this
+/// function, ~290 lines including a "block 1 becomes the new root"
+/// special case) - both are substantial, separate undertakings in
+/// their own right, deliberately not rushed here (matching the
+/// precedent already set for `ml_find_line`/`utf_head_off`). When
+/// neither applies, this returns `FAIL` cleanly: it first undoes the
+/// pointer-block line-count increments `ml_find_line`'s own tree walk
+/// already committed for `ML_INSERT` (via `ml_lineadd(buf, -1)`,
+/// exactly what `ml_find_line`'s own `error_noblock` path does for the
+/// same action) before touching anything else, so a caller hitting
+/// this limitation never observes a partially-applied change or an
+/// overstated line count in the pointer blocks above.
+///
+/// `len_arg`: the number of bytes of `line` to use, including its own
+/// trailing NUL; `0` uses all of `line` as-is (the original instead
+/// computes `strlen(line) + 1`, scanning for an embedded NUL - not
+/// replicated here, since Rust slices have no implicit terminator to
+/// scan for; every caller in this crate always passes an exact,
+/// correct `len_arg` instead of relying on the `0` shorthand for
+/// anything other than "`line` is already exactly sized").
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp` must be a valid, non-null pointer to a live
+/// `MemfileT` (true for any buffer `ml_open` has succeeded on).
+unsafe fn ml_append_int(buf: &mut BufT, lnum: LinenrT, line: &[u8], len_arg: i32, flags: i32) -> i32 {
+    if lnum > buf.b_ml.ml_line_count || buf.b_ml.ml_mfp.is_null() {
+        return FAIL; // lnum out of range
+    }
+
+    // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>, matching the
+    // original's own single-threaded-editor assumption.
+    let lowest_marked = unsafe { LOWEST_MARKED.get_mut() };
+    if *lowest_marked != 0 && *lowest_marked > lnum {
+        *lowest_marked = lnum + 1;
+    }
+
+    let len = if len_arg == 0 { line.len() as i32 } else { len_arg };
+    let space_needed = i64::from(len) + i64::from(INDEX_SIZE);
+
+    // Find the data block containing the previous line. This also
+    // fills the stack with the blocks from the root to the data block
+    // (bumping each visited pointer block's own line count along the
+    // way) and releases any locked block.
+    // SAFETY: forwarded from this function's own safety doc.
+    let hp = unsafe { ml_find_line(buf, if lnum == 0 { 1 } else { lnum }, ML_INSERT) };
+    if hp.is_null() {
+        return FAIL;
+    }
+
+    let db_idx: i32 = if lnum == 0 { -1 } else { lnum - buf.b_ml.ml_locked_low };
+    let line_count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low;
+
+    // SAFETY: hp is a valid, just-locked data block.
+    let dp = unsafe { (*hp).bh_data.as_data_mut() };
+
+    if i64::from(db_free(dp)) < space_needed {
+        // Not enough room - see this function's own doc comment for
+        // exactly what's deferred and why undoing via ml_lineadd(-1)
+        // here is necessary, not optional.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ml_lineadd(buf, -1) };
+        buf.b_ml.ml_stack_top = 0;
+        return FAIL;
+    }
+
+    buf.b_ml.ml_flags &= !ML_EMPTY;
+    if buf.b_prev_line_count == 0 {
+        buf.b_prev_line_count = buf.b_ml.ml_line_count;
+    }
+    buf.b_ml.ml_line_count += 1;
+
+    // enough room in the data block
+    let new_txt_start = db_txt_start(dp) - (len as u32);
+    set_db_txt_start(dp, new_txt_start);
+    let new_free = db_free(dp) - (space_needed as u32);
+    set_db_free(dp, new_free);
+    let new_line_count = db_line_count(dp) + 1;
+    set_db_line_count(dp, new_line_count);
+
+    // move the text of the lines that follow to the front and adjust
+    // the indexes of the lines that follow
+    if line_count > db_idx + 1 {
+        // there are following lines
+        let offset: u32 = if db_idx < 0 {
+            db_txt_end(dp)
+        } else {
+            db_index(dp, db_idx as usize) & DB_INDEX_MASK
+        };
+        let src_start = new_txt_start + (len as u32);
+        dp.copy_within(src_start as usize..offset as usize, new_txt_start as usize);
+        for i in (db_idx + 1..line_count).rev() {
+            let v = db_index(dp, i as usize) - (len as u32);
+            set_db_index(dp, (i + 1) as usize, v);
+        }
+        set_db_index(dp, (db_idx + 1) as usize, offset - (len as u32));
+    } else {
+        // add line at the end (which is the start of the text)
+        set_db_index(dp, (db_idx + 1) as usize, new_txt_start);
+    }
+
+    // copy the text into the block
+    let dest = db_index(dp, (db_idx + 1) as usize) as usize;
+    dp[dest..dest + len as usize].copy_from_slice(&line[..len as usize]);
+    if flags & ML_APPEND_MARK != 0 {
+        let v = db_index(dp, (db_idx + 1) as usize) | DB_MARKED;
+        set_db_index(dp, (db_idx + 1) as usize, v);
+    }
+
+    buf.b_ml.ml_flags |= ML_LOCKED_DIRTY;
+    if flags & ML_APPEND_NEW == 0 {
+        buf.b_ml.ml_flags |= ML_LOCKED_POS;
+    }
+
+    // The line was inserted below 'lnum'.
+    ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE);
+    OK
+}
+
+/// Flush any pending change and call [`ml_append_int`]
+/// (`ml_append_flush`).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// Same as [`ml_append_int`].
+unsafe fn ml_append_flush(buf: &mut BufT, lnum: LinenrT, line: &[u8], len: i32, flags: i32) -> i32 {
+    if lnum > buf.b_ml.ml_line_count {
+        return FAIL; // lnum out of range
+    }
+    if buf.b_ml.ml_line_lnum != 0 {
+        // This may also invoke ml_append_int().
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ml_flush_line(buf, false) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_append_int(buf, lnum, line, len, flags) }
+}
+
+/// Append a line after `lnum` (may be 0 to insert a line in front of
+/// the file) in `curbuf`, using `flags` directly (`ml_append_flags`).
+///
+/// Deferred: the original's `curbuf->b_ml.ml_mfp == NULL &&
+/// open_buffer(...)` recovery path (`open_buffer`, `fileio.c`, not
+/// translated) - this crate's callers are expected to have already
+/// opened the memline via `ml_open`.
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Also see `ml_append_int`'s own safety doc.
+#[must_use]
+pub unsafe fn ml_append_flags(lnum: LinenrT, line: &[u8], len: i32, flags: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+    if curbuf.b_ml.ml_mfp.is_null() {
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_append_flush(curbuf, lnum, line, len, flags) }
+}
+
+/// Append a line after `lnum` (may be 0 to insert a line in front of
+/// the file) in `curbuf` (`ml_append`).
+///
+/// `line` does not need to be allocated, but can't be another line in
+/// a buffer, unlocking may make it invalid.
+///
+/// `newfile`: true when starting to edit a new file, meaning that
+/// `pe_old_lnum` will be set for recovery.
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// Same as [`ml_append_flags`].
+#[must_use]
+pub unsafe fn ml_append(lnum: LinenrT, line: &[u8], len: i32, newfile: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_append_flags(lnum, line, len, if newfile { ML_APPEND_NEW } else { 0 }) }
+}
+
+/// Like [`ml_append`] but for an arbitrary buffer. The buffer must
+/// already have a memline (`ml_append_buf`).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// Same as `ml_append_int` (private).
+#[must_use]
+pub unsafe fn ml_append_buf(buf: &mut BufT, lnum: LinenrT, line: &[u8], len: i32, newfile: bool) -> i32 {
+    if buf.b_ml.ml_mfp.is_null() {
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_append_flush(buf, lnum, line, len, if newfile { ML_APPEND_NEW } else { 0 }) }
+}
+
 /// Add an entry to the info pointer stack (`ml_add_stack`).
 ///
 /// @return the index of the new entry.
@@ -712,17 +1021,6 @@ unsafe fn ml_lineadd(buf: &mut BufT, count: i32) {
 
 /// Flush `ml_line` if necessary (`ml_flush_line`).
 ///
-/// Only the "nothing to flush" fast path is translated: the real
-/// dirty-line writeback (in-block `memmove`-based editing, or a
-/// delete-then-append when the new line doesn't fit) needs
-/// `ml_updatechunk`/`ml_delete_int`/`ml_append_int`, none of which
-/// exist yet. Since nothing in this crate can currently mark a cached
-/// line dirty (`ml_replace`/`ml_append`/`ml_get_buf_mut`'s write path
-/// aren't translated either), `ML_LINE_DIRTY` is never actually set on
-/// any real call path here - this is the exact behavior the original
-/// itself exhibits for a read-only workflow, not a narrowed
-/// approximation.
-///
 /// # Safety
 /// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
 /// `MemfileT`.
@@ -730,14 +1028,337 @@ unsafe fn ml_flush_line(buf: &mut BufT, _noalloc: bool) {
     if buf.b_ml.ml_line_lnum == 0 || buf.b_ml.ml_mfp.is_null() {
         return; // nothing to do
     }
+
     if buf.b_ml.ml_flags & ML_LINE_DIRTY != 0 {
-        // Deferred - see this function's own doc comment. Reachable
-        // only once ml_get_buf_mut/ml_replace exist.
-        unimplemented!(
-            "ml_flush_line: writing back a dirty cached line needs ml_updatechunk/\
-             ml_delete_int/ml_append_int, not yet translated"
-        );
+        // (The original guards against this function calling itself
+        // recursively via a `static bool entered` - not needed here:
+        // ml_append_int/ml_delete_int never call back into
+        // ml_flush_line in this translation, so there is no recursion
+        // path to guard against yet.)
+        buf.flush_count += 1;
+
+        let lnum = buf.b_ml.ml_line_lnum;
+        let new_line = buf.b_ml.ml_line_ptr.clone().unwrap_or_default();
+        let new_len = buf.b_ml.ml_line_textlen;
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let hp = unsafe { ml_find_line(buf, lnum, ML_FIND) };
+        if hp.is_null() {
+            // (siemsg(E320: ...) omitted - display-pipeline-bound, see
+            // this module's own doc comment.)
+        } else {
+            let idx = (lnum - buf.b_ml.ml_locked_low) as usize;
+            // SAFETY: hp is a valid, just-locked data block.
+            let dp = unsafe { (*hp).bh_data.as_data_mut() };
+            let start = db_index(dp, idx) & DB_INDEX_MASK;
+            let old_len: i32 = if idx == 0 {
+                db_txt_end(dp) as i32 - start as i32
+            } else {
+                (db_index(dp, idx - 1) & DB_INDEX_MASK) as i32 - start as i32
+            };
+            let extra = new_len - old_len; // negative if the line got smaller
+
+            if db_free(dp) as i32 >= extra {
+                // if the new line fits in the data block, replace directly
+                let count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low + 1;
+                if extra != 0 && (idx as i32) < count - 1 {
+                    // move text of the following lines
+                    let txt_start = db_txt_start(dp) as i32;
+                    let dst = (txt_start - extra) as usize;
+                    let move_len = (start as i32 - txt_start) as usize;
+                    dp.copy_within(txt_start as usize..txt_start as usize + move_len, dst);
+                    // adjust pointers of this and following lines
+                    for i in idx + 1..count as usize {
+                        let v = (db_index(dp, i) as i32 - extra) as u32;
+                        set_db_index(dp, i, v);
+                    }
+                }
+                let v = (db_index(dp, idx) as i32 - extra) as u32;
+                set_db_index(dp, idx, v);
+                let new_free = (db_free(dp) as i32 - extra) as u32;
+                set_db_free(dp, new_free);
+                let new_txt_start = (db_txt_start(dp) as i32 - extra) as u32;
+                set_db_txt_start(dp, new_txt_start);
+
+                // copy new line into the data block
+                let dest = (start as i32 - extra) as usize;
+                dp[dest..dest + new_len as usize].copy_from_slice(&new_line[..new_len as usize]);
+                buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
+                // The else case is already covered by the insert and delete.
+                if extra != 0 {
+                    ml_updatechunk(buf, lnum, extra, ML_CHNK_UPDLINE);
+                }
+            } else {
+                // Cannot do it in one data block: Delete and append.
+                // Append first, because ml_delete_int() cannot delete
+                // the last line in a buffer, which causes trouble for
+                // a buffer that has only one line. Don't forget to
+                // copy the mark!
+                let marked = db_index(dp, idx) & DB_MARKED != 0;
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    ml_append_int(
+                        buf,
+                        lnum,
+                        &new_line,
+                        new_len,
+                        if marked { ML_APPEND_MARK } else { 0 },
+                    );
+                    ml_delete_int(buf, lnum, 0);
+                }
+            }
+        }
     }
+    // (the original's `else if (ml_flags & ML_ALLOCATED) { xfree(...) }`
+    // branch is unreachable here: ML_ALLOCATED is only ever set inside
+    // an `#ifdef ML_GET_ALLOC_LINES` block, itself only defined for
+    // AddressSanitizer builds - never the case in this crate - so
+    // there is nothing to free that Rust's own `Vec<u8>` drop glue
+    // doesn't already handle via `ml_line_ptr`'s ordinary ownership.)
+
+    buf.b_ml.ml_flags &= !(ML_LINE_DIRTY | ML_ALLOCATED);
+    buf.b_ml.ml_line_lnum = 0;
+    buf.b_ml.ml_line_offset = 0;
+}
+
+/// Replace line `lnum`, with buffering, for the current buffer
+/// (`ml_replace`).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Also see [`ml_replace_buf_len`]'s own safety doc.
+#[must_use]
+pub unsafe fn ml_replace(lnum: LinenrT, line: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_replace_buf_len(curbuf, lnum, line) }
+}
+
+/// Replace a line for an arbitrary buffer, with buffering
+/// (`ml_replace_buf`/`ml_replace_buf_len`, combined: this crate's
+/// `line` is already an exact-length byte slice, so there is no
+/// separate "derive the length via `strlen`" step to keep apart from
+/// the length-taking variant like the original has).
+///
+/// Does not use `line` after calling; the caller retains ownership
+/// (the original's `copy`/`noalloc` parameters existed to control
+/// C-level allocation/ownership transfer of a raw `char *ml_line_ptr`,
+/// which Rust's own `Vec<u8>` ownership makes moot - this always
+/// copies `line` into a freshly owned `Vec<u8>`, matching the
+/// original's `copy = true` behavior, its only real caller shape once
+/// `line` is a borrowed slice rather than an already-allocated,
+/// ownership-transferable buffer).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT`.
+#[must_use]
+pub unsafe fn ml_replace_buf_len(buf: &mut BufT, lnum: LinenrT, line: &[u8]) -> i32 {
+    // (the original's `curbuf->b_ml.ml_mfp == NULL && open_buffer(...)`
+    // recovery path is deferred - see ml_append_flags's own doc.)
+    if buf.b_ml.ml_mfp.is_null() {
+        return FAIL;
+    }
+
+    if buf.b_ml.ml_line_lnum != lnum {
+        // another line is buffered, flush it
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ml_flush_line(buf, false) };
+    }
+
+    if !buf.update_callbacks.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let old = unsafe { ml_get_buf_impl(buf, lnum, false) };
+        ml_add_deleted_len_buf(buf, &old, None);
+    }
+
+    buf.b_ml.ml_line_ptr = Some(line.to_vec());
+    buf.b_ml.ml_line_textlen = line.len() as i32;
+    buf.b_ml.ml_line_lnum = lnum;
+    buf.b_ml.ml_flags = (buf.b_ml.ml_flags | ML_LINE_DIRTY) & !ML_EMPTY;
+
+    OK
+}
+
+/// Delete line `lnum` (`ml_delete_int`).
+///
+/// `flags`: `ML_DEL_MESSAGE` may give a "No lines in buffer" message
+/// (omitted here - display-pipeline-bound, see this module's own doc
+/// comment; the state change, `ML_EMPTY`, is still applied).
+///
+/// Only the "deleting this line does not empty its data block" path is
+/// translated. Deferred: the original's cascading pointer-block-entry
+/// removal (and, recursively, pointer block removal up to the root)
+/// when a data block's only remaining line is deleted - a substantial,
+/// separate undertaking (see this module's own doc comment, matching
+/// the same "not rushed" precedent as `ml_append_int`'s block-split
+/// path). When it would apply, this returns `FAIL` cleanly: it first
+/// undoes the pointer-block line-count decrements `ml_find_line`'s own
+/// tree walk already committed for `ML_DELETE` (via `ml_lineadd(buf,
+/// 1)`, exactly what `ml_find_line`'s own `error_noblock` path does
+/// for the same action), before touching anything else.
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT`.
+unsafe fn ml_delete_int(buf: &mut BufT, lnum: LinenrT, flags: i32) -> i32 {
+    let _ = flags; // ML_DEL_MESSAGE only affects the (omitted) message
+
+    // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>, matching the
+    // original's own single-threaded-editor assumption.
+    let lowest_marked = unsafe { LOWEST_MARKED.get_mut() };
+    if *lowest_marked != 0 && *lowest_marked > lnum {
+        *lowest_marked -= 1;
+    }
+
+    // If the file becomes empty the last line is replaced by an empty line.
+    if buf.b_ml.ml_line_count == 1 {
+        // (set_keep_msg(_(no_lines_msg), 0) omitted for ML_DEL_MESSAGE
+        // - display-pipeline-bound.)
+        // The original's C string literal "" is a real, 1-byte
+        // NUL-terminated buffer (strlen 0, but occupies 1 byte) - this
+        // crate's own `line` convention already expects the trailing
+        // NUL to be part of the slice (matching `ml_get`'s own return
+        // convention), so the equivalent empty line here is `b"\0"`
+        // (1 byte), not `b""` (0 bytes).
+        // SAFETY: forwarded from this function's own safety doc.
+        let i = unsafe { ml_replace_buf_len(buf, 1, b"\0") };
+        buf.b_ml.ml_flags |= ML_EMPTY;
+        return i;
+    }
+
+    if buf.b_ml.ml_mfp.is_null() {
+        return FAIL;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let hp = unsafe { ml_find_line(buf, lnum, ML_DELETE) };
+    if hp.is_null() {
+        return FAIL;
+    }
+
+    // number of entries in the block before the delete
+    let count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low + 2;
+    let idx = (lnum - buf.b_ml.ml_locked_low) as usize;
+
+    if count == 1 {
+        // Deleting this line would empty its data block - see this
+        // function's own doc comment for why this bails out here.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ml_lineadd(buf, 1) };
+        buf.b_ml.ml_stack_top = 0;
+        return FAIL;
+    }
+
+    if buf.b_prev_line_count == 0 {
+        buf.b_prev_line_count = buf.b_ml.ml_line_count;
+    }
+    buf.b_ml.ml_line_count -= 1;
+
+    // SAFETY: hp is a valid, just-locked data block.
+    let dp = unsafe { (*hp).bh_data.as_data_mut() };
+    let line_start = db_index(dp, idx) & DB_INDEX_MASK;
+    let line_size: i32 = if idx == 0 {
+        db_txt_end(dp) as i32 - line_start as i32
+    } else {
+        (db_index(dp, idx - 1) & DB_INDEX_MASK) as i32 - line_start as i32
+    };
+
+    // Line should always have a NL char internally (represented as
+    // NUL), even if 'noeol' is set.
+    debug_assert!(line_size >= 1);
+    ml_add_deleted_len_buf(
+        buf,
+        &dp[line_start as usize..line_start as usize + line_size as usize],
+        Some((line_size - 1) as usize),
+    );
+    // SAFETY: hp is still valid; re-borrow after ml_add_deleted_len_buf
+    // (which only touched `buf`, not the block's own bytes).
+    let dp = unsafe { (*hp).bh_data.as_data_mut() };
+
+    // delete the text by moving the next lines forwards
+    let text_start = db_txt_start(dp);
+    dp.copy_within(
+        text_start as usize..line_start as usize,
+        text_start as usize + line_size as usize,
+    );
+
+    // delete the index by moving the next indexes backwards, adjusting
+    // for the text movement
+    for i in idx..count as usize - 1 {
+        let v = db_index(dp, i + 1) + line_size as u32;
+        set_db_index(dp, i, v);
+    }
+
+    let new_free = db_free(dp) + line_size as u32 + INDEX_SIZE;
+    set_db_free(dp, new_free);
+    set_db_txt_start(dp, text_start + line_size as u32);
+    let new_line_count = db_line_count(dp) - 1;
+    set_db_line_count(dp, new_line_count);
+
+    // mark the block dirty and make sure it is in the file (for recovery)
+    buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
+
+    ml_updatechunk(buf, lnum, line_size, ML_CHNK_DELLINE);
+    OK
+}
+
+/// Delete line `lnum` in the current buffer, using `flags`
+/// (`ml_delete_flags`; also serves the role of the original's plain
+/// `ml_delete`, since `flags = 0` there).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Also see `ml_delete_int`'s own safety doc.
+#[must_use]
+pub unsafe fn ml_delete_flags(lnum: LinenrT, flags: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_flush_line(curbuf, false) };
+    if lnum < 1 || lnum > curbuf.b_ml.ml_line_count {
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_delete_int(curbuf, lnum, flags) }
+}
+
+/// Delete line `lnum` in the current buffer (`ml_delete`).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// Same as [`ml_delete_flags`].
+#[must_use]
+pub unsafe fn ml_delete(lnum: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_delete_flags(lnum, 0) }
+}
+
+/// Delete line `lnum` in `buf` (`ml_delete_buf`).
+///
+/// `message`: show "--No lines in buffer--" message (omitted - see
+/// this function's own safety-adjacent doc note on `ml_delete_int`).
+///
+/// @return `FAIL`/`OK`.
+///
+/// # Safety
+/// Same as `ml_delete_int` (private).
+#[must_use]
+pub unsafe fn ml_delete_buf(buf: &mut BufT, lnum: LinenrT, message: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_flush_line(buf, false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_delete_int(buf, lnum, if message { ML_DEL_MESSAGE } else { 0 }) }
 }
 
 /// Lookup line `lnum` in a memline (`ml_find_line`).
@@ -1020,11 +1641,29 @@ unsafe fn ml_get_buf_impl(buf: &mut BufT, lnum: LinenrT, will_change: bool) -> V
     }
 
     if will_change {
-        // Deferred - see this function's own doc comment.
-        unimplemented!("ml_get_buf_mut (will_change=true) is not yet translated");
+        buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
+        // (the `#ifdef ML_GET_ALLOC_LINES` ML_ALLOCATED/ML_LINE_DIRTY
+        // branch is ASan-only, not applicable here - see this
+        // module's own doc comment.)
+        let line = buf.b_ml.ml_line_ptr.clone().unwrap_or_default();
+        ml_add_deleted_len_buf(buf, &line, None);
     }
 
     buf.b_ml.ml_line_ptr.clone().unwrap_or_default()
+}
+
+/// Like [`ml_get_buf`], but allow the line to be mutated in place.
+/// This is very limited - generally [`ml_replace_buf_len`] should be
+/// used to modify a line (`ml_get_buf_mut`).
+///
+/// @return a pointer to a line in the buffer.
+///
+/// # Safety
+/// Same as [`ml_get_buf`].
+#[must_use]
+pub unsafe fn ml_get_buf_mut(buf: &mut BufT, lnum: LinenrT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_get_buf_impl(buf, lnum, true) }
 }
 
 /// @return a pointer to a (read-only copy of a) line in `curbuf`
@@ -1177,6 +1816,67 @@ mod tests {
 
             crate::memfile::mf_free_bhdr(ptr_hp);
             crate::memfile::mf_free_bhdr(data_hp);
+        }
+    }
+
+    #[test]
+    fn ml_append_int_not_enough_room_fails_without_corrupting_state() {
+        let mut mfp = mf_open(None, 0).unwrap();
+        mfp.mf_page_size = 32; // tiny page: header (24) + 8 bytes free
+
+        let mut buf = unsafe {
+            let dummy = mf_new(&mut mfp, false, 1); // consume bnum 0
+            mf_put(&mut mfp, dummy, false, false);
+
+            let root_hp = ml_new_ptr(&mut mfp);
+            assert_eq!((*root_hp).bh_bnum, 1);
+
+            let data_hp = ml_new_data(&mut mfp, false, 1);
+            assert_eq!((*data_hp).bh_bnum, 2);
+            // One line already present: a lone NUL byte at the very end.
+            {
+                let d = (*data_hp).bh_data.as_data_mut();
+                let txt_end = db_txt_end(d);
+                let start = txt_end - 1;
+                d[start as usize] = 0;
+                set_db_index(d, 0, start);
+                set_db_txt_start(d, start);
+                let new_free = db_free(d) - 1 - INDEX_SIZE;
+                set_db_free(d, new_free);
+                set_db_line_count(d, 1);
+            }
+            mf_put(&mut mfp, data_hp, true, false);
+
+            {
+                let root_buf = (*root_hp).bh_data.as_data_mut();
+                pointer_block_set_count(root_buf, 1);
+                pointer_block_set_entry(
+                    root_buf,
+                    0,
+                    PointerEntry { pe_bnum: 2, pe_page_count: 1, pe_old_lnum: 1, pe_line_count: 1 },
+                );
+            }
+            mf_put(&mut mfp, root_hp, true, false);
+
+            let mut buf = BufT::default();
+            buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
+            buf.b_ml.ml_line_count = 1;
+            buf
+        };
+
+        // Only a few bytes of free space remain - try to append a line
+        // that clearly cannot fit (space_needed = len + INDEX_SIZE).
+        let big_line = b"this line is definitely too big to fit\0";
+        unsafe {
+            let ret = ml_append_buf(&mut buf, 1, big_line, big_line.len() as i32, false);
+            assert_eq!(ret, FAIL);
+            // state must be completely unchanged - no partial insert,
+            // no overstated line count.
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
         }
     }
 
@@ -1386,5 +2086,170 @@ mod tests {
 
         unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
         close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_append_replace_delete_full_roundtrip() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            // starts with 1 empty line
+            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+
+            // append "hello\0" after line 1
+            assert_eq!(ml_append_buf(&mut buf, 1, b"hello\0", 6, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 2);
+            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+            assert_eq!(ml_get_buf(&mut buf, 2), b"hello\0".to_vec());
+
+            // append "world\0" after line 2 (at the very end)
+            assert_eq!(ml_append_buf(&mut buf, 2, b"world\0", 6, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 3);
+            assert_eq!(ml_get_buf(&mut buf, 3), b"world\0".to_vec());
+
+            // insert "middle\0" between "hello" and "world"
+            assert_eq!(ml_append_buf(&mut buf, 2, b"middle\0", 7, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 4);
+            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+            assert_eq!(ml_get_buf(&mut buf, 2), b"hello\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 3), b"middle\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 4), b"world\0".to_vec());
+
+            // insert a brand new first line (lnum=0)
+            assert_eq!(ml_append_buf(&mut buf, 0, b"first\0", 6, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 5);
+            assert_eq!(ml_get_buf(&mut buf, 1), b"first\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 2), vec![0u8]);
+            assert_eq!(ml_get_buf(&mut buf, 3), b"hello\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 4), b"middle\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 5), b"world\0".to_vec());
+
+            // replace the empty line 2 with a longer "second\0" (grows)
+            assert_eq!(ml_replace_buf_len(&mut buf, 2, b"second\0"), OK);
+            assert_eq!(ml_get_buf(&mut buf, 2), b"second\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 1), b"first\0".to_vec()); // unaffected
+            assert_eq!(ml_get_buf(&mut buf, 3), b"hello\0".to_vec()); // unaffected
+
+            // replace "hello\0" with a shorter "hi\0" (shrinks)
+            assert_eq!(ml_replace_buf_len(&mut buf, 3, b"hi\0"), OK);
+            assert_eq!(ml_get_buf(&mut buf, 3), b"hi\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 4), b"middle\0".to_vec()); // unaffected
+            assert_eq!(ml_get_buf(&mut buf, 2), b"second\0".to_vec()); // unaffected
+
+            // replace with an identical-length line (extra == 0 path)
+            assert_eq!(ml_replace_buf_len(&mut buf, 4, b"MIDDLE\0"), OK);
+            assert_eq!(ml_get_buf(&mut buf, 4), b"MIDDLE\0".to_vec());
+
+            // delete "MIDDLE\0"
+            assert_eq!(ml_delete_buf(&mut buf, 4, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 4);
+            assert_eq!(ml_get_buf(&mut buf, 1), b"first\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 2), b"second\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 3), b"hi\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 4), b"world\0".to_vec()); // shifted up
+
+            // delete the first line
+            assert_eq!(ml_delete_buf(&mut buf, 1, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 3);
+            assert_eq!(ml_get_buf(&mut buf, 1), b"second\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 2), b"hi\0".to_vec());
+            assert_eq!(ml_get_buf(&mut buf, 3), b"world\0".to_vec());
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_delete_last_line_replaces_with_empty_and_sets_ml_empty() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"only\0", 5, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 2);
+
+            // delete the original (now-empty) first line, then the
+            // "only" line, driving the buffer down to its last line.
+            assert_eq!(ml_delete_buf(&mut buf, 1, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+            assert_eq!(ml_get_buf(&mut buf, 1), b"only\0".to_vec());
+            assert_eq!(buf.b_ml.ml_flags & ML_EMPTY, 0);
+
+            // deleting the last remaining line replaces it with an
+            // empty line instead of removing it entirely.
+            assert_eq!(ml_delete_buf(&mut buf, 1, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+            assert_eq!(ml_get_buf(&mut buf, 1), vec![0u8]);
+            assert_ne!(buf.b_ml.ml_flags & ML_EMPTY, 0);
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_append_out_of_range_lnum_fails() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            assert_eq!(ml_append_buf(&mut buf, 99, b"x\0", 2, false), FAIL);
+            // state unchanged
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_delete_out_of_range_lnum_fails() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+
+            let _guard = crate::globals::global_state_test_lock();
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            assert_eq!(ml_delete(0), FAIL);
+            assert_eq!(ml_delete(99), FAIL);
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_append_marks_line_dirty_and_ml_get_buf_mut_returns_same_bytes() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"abc\0", 4, false), OK);
+            let via_mut = ml_get_buf_mut(&mut buf, 2);
+            assert_eq!(via_mut, b"abc\0".to_vec());
+            assert_ne!(buf.b_ml.ml_flags & ML_LOCKED_DIRTY, 0);
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_replace_via_curbuf_matches_ml_get() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+
+            let _guard = crate::globals::global_state_test_lock();
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            assert_eq!(ml_replace(1, b"xyz\0"), OK);
+            assert_eq!(ml_get(1), b"xyz\0".to_vec());
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 }
