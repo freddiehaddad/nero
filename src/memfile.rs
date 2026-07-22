@@ -10,10 +10,8 @@
 //! `crate::path::full_name_save`), `mf_read`, `mf_write`, `mf_close`,
 //! `mf_sync` (`memfile.h`'s `MFS_*` flags moved here alongside it -
 //! same "header content lives with its .c file's translation"
-//! convention already used for `mark.h`), `mf_set_dirty` (no current
-//! caller yet - `ml_open`/`ml_setname` in `memline.c` aren't
-//! translated - but it's a genuinely public, non-`static` function in
-//! the original, so it's translated now rather than waiting for one).
+//! convention already used for `mark.h`), `mf_set_dirty`, `mf_open`,
+//! `mf_open_file`, `mf_do_open`, `mf_get`.
 //!
 //! `mf_read`/`mf_write`/`mf_close` each call `PERROR()`/`emsg()`
 //! (`message.c`) on their error paths purely as a side effect before
@@ -26,19 +24,22 @@
 //! state read elsewhere (`input.c`), not just message-display
 //! plumbing. `mf_write` additionally omits its retry-with-reopen-on-
 //! failure fallback (recovering from e.g. a disconnected network
-//! drive): that needs `mf_do_open`'s flag-translation logic, out of
-//! scope for this pass - documented on `mf_write`'s own doc comment as
-//! a narrow, explicit gap, not silently dropped.
+//! drive): that needs `mf_do_open`'s flag-translation logic, which now
+//! exists, but wiring the retry loop itself is left for a future pass
+//! (documented on `mf_write`'s own doc comment as a narrow, explicit
+//! gap, not silently dropped). `mf_do_open` itself likewise omits
+//! `emsg()`'s "E300: swap file already exists" message text under the
+//! same policy - the real, observable effect (`mf_fd` staying `None`)
+//! is preserved faithfully.
 //!
 //! `mf_close` takes `mfp: MemfileT` *by value* (unlike this file's
-//! other functions, which take `&mut MemfileT` since nothing yet
-//! constructs an owned `MemfileT` - `mf_open`, not yet translated, is
-//! deferred pending the file-open-flags/symlink-attack-security-check
-//! translation). This still matches the original's own "frees `mfp`
-//! itself" contract: the caller can no longer use `mfp` after calling
-//! this, exactly like the original's pointer becomes dangling after
-//! `mf_close()` - Rust's ordinary `Drop` at the end of the function
-//! body plays the role of the original's explicit `xfree(mfp)`.
+//! other functions, which take `&mut MemfileT`, since `mf_open` now
+//! constructs an owned `MemfileT` to hand off). This still matches the
+//! original's own "frees `mfp` itself" contract: the caller can no
+//! longer use `mfp` after calling this, exactly like the original's
+//! pointer becomes dangling after `mf_close()` - Rust's ordinary
+//! `Drop` at the end of the function body plays the role of the
+//! original's explicit `xfree(mfp)`.
 //!
 //! `mf_sync` (translated) omits its interruptibility mechanism
 //! (`os_char_avail()`/`os_breakcheck()`, needing `os/input.c`/the event
@@ -49,24 +50,42 @@
 //! the final `if got_int { break; }` check can never trigger here and
 //! is correctly omitted rather than silently changed.
 //!
-//! Deferred (each needs real disk I/O or another not-yet-translated
-//! subsystem):
-//! - `mf_open`/`mf_open_file`/`mf_do_open`: need the file-open flag
-//!   translation and/or symlink-attack security checks
-//!   (`os_fileinfo_link`) not yet built.
+//! `mf_open` omits the original's page-size-from-device-block-size
+//! optimization (`os_fileinfo_fd`/`os_fileinfo_blocksize`, needing the
+//! still-deferred `FileInfo` struct): `mf_page_size` always keeps its
+//! `MEMFILE_PAGE_SIZE` default instead. This is purely a performance
+//! tuning step - any page size is equally *correct* - so it is
+//! documented as an accepted, narrow gap rather than blocking `mf_open`
+//! on the full `FileInfo` translation.
+//!
+//! Deferred (each needs another not-yet-translated subsystem):
 //! - `mf_close_file`: needs `ml_get_buf` (`memline.c`) for its
 //!   `getlines` branch.
-//! - `mf_get`: calls `mf_read()` (done) but also `mf_alloc_bhdr`/hash
-//!   bookkeeping in a cache-miss path intertwined with `mf_open`'s
-//!   not-yet-translated state; revisit once `mf_open` exists.
-//! - `mf_release_all`: calls `mf_close()` (done) but also iterates
-//!   `first_buffer`'s buffer list (`globals.h`) and `curbuf`/window
-//!   state not yet wired up to real multi-buffer support.
+//! - `mf_release_all`: calls `mf_close()`/`mf_write()` (done) but also
+//!   iterates `first_buffer`'s buffer list (`globals.h`) and
+//!   `curbuf`/window state not yet wired up to real multi-buffer
+//!   support, plus `memline.c`'s `ml_open_file`.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
 use crate::vim_defs::{FAIL, OK};
 use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Default page size for a new memfile, in bytes (`MEMFILE_PAGE_SIZE`,
+/// `memfile.c`).
+pub const MEMFILE_PAGE_SIZE: u32 = 4096;
+
+/// Minimum page size this crate would accept from the underlying
+/// device's block size (`MIN_SWAP_PAGE_SIZE`, `memfile.h`) - not
+/// currently read anywhere, since the block-size-detection step that
+/// would consult it is deferred (see the module doc comment); kept
+/// here for documentation/future use, matching the original header's
+/// own declared constant.
+pub const MIN_SWAP_PAGE_SIZE: u64 = 1048;
+/// Maximum page size this crate would accept from the underlying
+/// device's block size (`MAX_SWAP_PAGE_SIZE`, `memfile.h`) - see
+/// [`MIN_SWAP_PAGE_SIZE`].
+pub const MAX_SWAP_PAGE_SIZE: u64 = 50000;
 
 /// Flags for [`mf_sync`] (`memfile.h`'s anonymous `enum`).
 pub mod mfs_flag {
@@ -80,6 +99,223 @@ pub mod mfs_flag {
     pub const FLUSH: i32 = 4;
     /// Only write block 0 (`MFS_ZERO`).
     pub const ZERO: i32 = 8;
+}
+
+/// Open a new or existing memfile (`mf_open`).
+///
+/// `fname`:
+/// - `None`: no file, use memory only.
+/// - `Some(fname)`: should correspond to an existing file (or, with
+///   `O_CREAT`, a file to create) - consumed either way, matching the
+///   original's "must have been allocated... freed if opening fails"
+///   contract (`Vec<u8>` ownership makes this automatic).
+///
+/// @return `Some(mfp)` on success, `None` on failure (e.g. file does
+///         not exist).
+#[must_use]
+pub fn mf_open(fname: Option<Vec<u8>>, flags: i32) -> Option<MemfileT> {
+    // Start with the "no file, memory only" defaults for every field;
+    // mf_fname/mf_ffname/mf_fd are overwritten by mf_do_open below
+    // when fname is Some, matching the original's own
+    // field-by-field construction order.
+    let mut mfp = MemfileT {
+        mf_fname: None,
+        mf_ffname: None,
+        mf_fd: None,
+        mf_flags: 0,
+        mf_reopen: false,
+        mf_free_first: std::ptr::null_mut(),
+        mf_hash: crate::map::Map::default(),
+        mf_trans: crate::map::Map::default(),
+        mf_blocknr_max: 0,
+        mf_blocknr_min: -1,
+        mf_neg_count: 0,
+        mf_infile_count: 0,
+        mf_page_size: MEMFILE_PAGE_SIZE,
+        mf_dirty: MfdirtyT::No,
+    };
+
+    if let Some(fname) = fname {
+        // try to open the file
+        if !mf_do_open(&mut mfp, fname, flags) {
+            return None; // fail if file could not be opened
+        }
+    }
+    // else: no file, use memory only - mfp already has the right
+    // mf_fname/mf_ffname/mf_fd defaults (None/None/None).
+
+    // Try to set the page size equal to device's block size: deferred
+    // (see the module doc comment) - mf_page_size keeps its
+    // MEMFILE_PAGE_SIZE default from construction above.
+
+    // When recovering, the actual block size will be retrieved from
+    // block 0 in ml_recover(). The size used here may be wrong,
+    // therefore mf_blocknr_max must be rounded up.
+    let flags_trunc_or_excl = flags & (libc::O_TRUNC | libc::O_EXCL) != 0;
+    let size: Option<u64> = if mfp.mf_fd.is_none() || flags_trunc_or_excl {
+        None // matches the original's `||`-chain short-circuiting
+             // before ever calling vim_lseek() in these cases.
+    } else {
+        mfp.mf_fd.as_mut().and_then(|f| f.seek(SeekFrom::End(0)).ok())
+    };
+    let page_size = u64::from(mfp.mf_page_size);
+    mfp.mf_blocknr_max = match size {
+        Some(sz) if sz > 0 => {
+            // no file or empty file otherwise falls through to 0 below.
+            sz.div_ceil(page_size) as BlocknrT
+        }
+        _ => 0,
+    };
+    mfp.mf_blocknr_min = -1;
+    mfp.mf_neg_count = 0;
+    mfp.mf_infile_count = mfp.mf_blocknr_max;
+
+    Some(mfp)
+}
+
+/// Open a file for an existing memfile (`mf_open_file`).
+///
+/// Used when `updatecount` set from 0 to some value.
+///
+/// `fname`: name of file to use - consumed either way, see [`mf_open`]'s
+/// doc comment.
+///
+/// @return `OK` on success, `FAIL` if the file could not be opened.
+#[must_use]
+pub fn mf_open_file(mfp: &mut MemfileT, fname: Vec<u8>) -> i32 {
+    if mf_do_open(mfp, fname, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) {
+        mfp.mf_dirty = MfdirtyT::Yes;
+        return OK;
+    }
+
+    FAIL
+}
+
+/// Open memfile's swapfile (`mf_do_open`).
+///
+/// `fname` is consumed either way (stored into `mfp.mf_fname`, or
+/// freed via [`mf_free_fnames`] on failure), matching the original's
+/// "fname is consumed (also when error)" contract.
+///
+/// @return whether the `open` succeeded.
+fn mf_do_open(mfp: &mut MemfileT, fname: Vec<u8>, flags: i32) -> bool {
+    // fname cannot be NameBuff, because it must have been allocated -
+    // N/A in this translation (a `Vec<u8>` is always independently
+    // owned).
+    mf_set_fnames(mfp, fname);
+    debug_assert!(mfp.mf_fname.is_some());
+
+    // Extra security check: When creating a swap file it really
+    // shouldn't exist yet. If there is a symbolic link, this is most
+    // likely an attack. `os_fileinfo_link`'s actual contract is just
+    // "does lstat succeed" (a boolean); `std::fs::symlink_metadata`
+    // gives the same answer without needing the full deferred
+    // `FileInfo` struct.
+    let fname_str = mfp
+        .mf_fname
+        .as_ref()
+        .and_then(|f| std::str::from_utf8(f).ok());
+    let link_exists = fname_str.is_some_and(|s| std::fs::symlink_metadata(s).is_ok());
+
+    if flags & libc::O_CREAT != 0 && link_exists {
+        mfp.mf_fd = None;
+        // E300: Swap file already exists (symlink attack?) - message
+        // display omitted (see the module doc comment's "message
+        // display is a skippable side effect" policy); mf_fd staying
+        // None is the real, observable effect callers depend on.
+    } else {
+        // try to open the file
+        let flags = flags | crate::os::fs::O_NOFOLLOW;
+        mfp.mf_flags = flags;
+        mfp.mf_fd = fname_str.and_then(|s| {
+            crate::os::fs::os_open(
+                std::path::Path::new(s),
+                flags,
+                libc::S_IREAD | libc::S_IWRITE,
+            )
+        });
+    }
+
+    // If the file cannot be opened, use memory only.
+    if mfp.mf_fd.is_none() {
+        mf_free_fnames(mfp);
+        return false;
+    }
+
+    // os_set_cloexec(mfp->mf_fd): not translated - std::fs::File
+    // already opens close-on-exec (Unix) / with a non-inheritable
+    // handle (Windows) by default, see os/fs.rs's module doc comment.
+
+    true
+}
+
+/// Get existing block `nr` with `page_count` pages (`mf_get`).
+///
+/// Caller should first check a negative `nr` with [`mf_trans_del`].
+///
+/// @return null if not found.
+///
+/// # Safety
+/// Every `*mut BhdrT` reachable via `mfp.mf_hash` must be a valid
+/// pointer (allocated via `mf_alloc_bhdr`) - true for every block this
+/// crate allocates via `mf_alloc_bhdr`/`mf_new`.
+#[must_use]
+pub unsafe fn mf_get(mfp: &mut MemfileT, nr: BlocknrT, page_count: u32) -> *mut BhdrT {
+    // check block number exists
+    if nr >= mfp.mf_blocknr_max || nr <= mfp.mf_blocknr_min {
+        return std::ptr::null_mut();
+    }
+
+    // see if it is in the cache
+    let hp = match mfp.mf_hash.get(&nr).copied() {
+        None => {
+            // not in the hash list
+            if nr < 0 || nr >= mfp.mf_infile_count {
+                // can't be in the file
+                return std::ptr::null_mut();
+            }
+
+            // could check here if the block is in the free list
+
+            if page_count == 0 {
+                return std::ptr::null_mut();
+            }
+            let hp = mf_alloc_bhdr(mfp, page_count);
+
+            // SAFETY: mf_alloc_bhdr always returns a valid,
+            // just-allocated pointer (xmalloc-backed, aborts on OOM
+            // rather than returning null).
+            unsafe {
+                (*hp).bh_bnum = nr;
+                (*hp).bh_flags = 0;
+                (*hp).bh_page_count = page_count;
+            }
+            // SAFETY: caller contract (see function doc); hp was just
+            // allocated above with a data buffer of exactly
+            // mf_page_size * page_count bytes.
+            if unsafe { mf_read(mfp, hp) } == FAIL {
+                // cannot read the block
+                unsafe { mf_free_bhdr(hp) };
+                return std::ptr::null_mut();
+            }
+            hp
+        }
+        Some(hp) => {
+            // SAFETY: caller contract (see function doc).
+            let bnum = unsafe { (*hp).bh_bnum };
+            mfp.mf_hash.remove(&bnum);
+            hp
+        }
+    };
+
+    // SAFETY: caller contract (see function doc).
+    unsafe {
+        (*hp).bh_flags |= BH_LOCKED;
+        let bnum = (*hp).bh_bnum;
+        mfp.mf_hash.insert(bnum, hp);
+    }
+
+    hp
 }
 
 /// `mf_new_page_size`.
@@ -1394,5 +1630,174 @@ mod tests {
         let ffname = mfp.mf_ffname.expect("full_name_save should succeed for a plain relative name");
         assert!(crate::path::path_is_absolute(&ffname));
         assert!(ffname.ends_with(b"swap.tmp"));
+    }
+
+    fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+
+    #[test]
+    fn mf_open_with_no_fname_is_memory_only() {
+        let mfp = mf_open(None, 0).expect("memory-only open never fails");
+        assert!(mfp.mf_fname.is_none());
+        assert!(mfp.mf_ffname.is_none());
+        assert!(mfp.mf_fd.is_none());
+        assert_eq!(mfp.mf_blocknr_max, 0);
+        assert_eq!(mfp.mf_blocknr_min, -1);
+        assert_eq!(mfp.mf_neg_count, 0);
+        assert_eq!(mfp.mf_infile_count, 0);
+        assert_eq!(mfp.mf_page_size, MEMFILE_PAGE_SIZE);
+    }
+
+    #[test]
+    fn mf_open_rdonly_existing_file_computes_blocknr_max() {
+        let tmp = TempFilePath::new("open_rdonly");
+        // Exactly 2 pages (using the default MEMFILE_PAGE_SIZE, since
+        // mf_open always starts from that default - see the module
+        // doc comment on the deferred block-size-from-device step).
+        std::fs::write(&tmp.path, vec![0u8; (MEMFILE_PAGE_SIZE * 2) as usize]).unwrap();
+
+        let mfp =
+            mf_open(Some(path_bytes(&tmp.path)), libc::O_RDONLY).expect("existing file should open");
+        assert!(mfp.mf_fd.is_some());
+        assert_eq!(mfp.mf_page_size, MEMFILE_PAGE_SIZE);
+        assert_eq!(mfp.mf_blocknr_max, 2);
+        assert_eq!(mfp.mf_infile_count, 2);
+        assert_eq!(mfp.mf_blocknr_min, -1);
+        assert_eq!(mfp.mf_neg_count, 0);
+    }
+
+    #[test]
+    fn mf_open_rdonly_missing_file_fails() {
+        let tmp = TempFilePath::new("open_rdonly_missing");
+        assert!(mf_open(Some(path_bytes(&tmp.path)), libc::O_RDONLY).is_none());
+    }
+
+    #[test]
+    fn mf_open_empty_file_has_zero_blocknr_max() {
+        let tmp = TempFilePath::new("open_empty");
+        std::fs::write(&tmp.path, b"").unwrap();
+        let mfp = mf_open(Some(path_bytes(&tmp.path)), libc::O_RDONLY).unwrap();
+        assert_eq!(mfp.mf_blocknr_max, 0);
+        assert_eq!(mfp.mf_infile_count, 0);
+    }
+
+    #[test]
+    fn mf_open_file_creates_a_new_file_and_marks_dirty() {
+        let tmp = TempFilePath::new("open_file_new");
+        let mut mfp = default_memfile();
+        assert_eq!(mf_open_file(&mut mfp, path_bytes(&tmp.path)), OK);
+        assert!(mfp.mf_fd.is_some());
+        assert_eq!(mfp.mf_dirty, MfdirtyT::Yes);
+        assert!(tmp.path.exists());
+    }
+
+    #[test]
+    fn mf_open_file_fails_if_file_already_exists() {
+        let tmp = TempFilePath::new("open_file_exists");
+        std::fs::write(&tmp.path, b"pre-existing").unwrap();
+        let mut mfp = default_memfile();
+
+        assert_eq!(mf_open_file(&mut mfp, path_bytes(&tmp.path)), FAIL);
+        assert!(mfp.mf_fd.is_none());
+        // freed via mf_free_fnames on the failure path.
+        assert!(mfp.mf_fname.is_none());
+        assert!(mfp.mf_ffname.is_none());
+        // The pre-existing file must be untouched.
+        assert_eq!(std::fs::read(&tmp.path).unwrap(), b"pre-existing");
+    }
+
+    #[test]
+    fn mf_get_returns_null_for_out_of_range_block_number() {
+        let mut mfp = test_mfp();
+        mfp.mf_blocknr_max = 5;
+        mfp.mf_blocknr_min = -5;
+        unsafe {
+            assert!(mf_get(&mut mfp, 5, 1).is_null()); // == max
+            assert!(mf_get(&mut mfp, -5, 1).is_null()); // == min
+            assert!(mf_get(&mut mfp, 10, 1).is_null()); // > max
+        }
+    }
+
+    #[test]
+    fn mf_get_returns_null_for_uncached_block_beyond_infile_count() {
+        let mut mfp = test_mfp();
+        mfp.mf_blocknr_max = 100;
+        mfp.mf_infile_count = 2; // only blocks < 2 are "in the file"
+        unsafe {
+            assert!(mf_get(&mut mfp, 5, 1).is_null());
+        }
+    }
+
+    #[test]
+    fn mf_get_returns_cached_block_and_keeps_it_in_the_hash() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1); // bnum 0, already in mf_hash
+            assert!(mfp.mf_hash.get(&0).is_some());
+
+            let got = mf_get(&mut mfp, 0, 1);
+            assert_eq!(got, hp);
+            assert_ne!((*got).bh_flags & BH_LOCKED, 0);
+            // Removed then reinserted - still present afterward.
+            assert!(mfp.mf_hash.get(&0).is_some());
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_get_reads_an_uncached_in_file_block_from_disk() {
+        let tmp = TempFilePath::new("get_from_disk");
+        let mut mfp = MemfileT {
+            mf_page_size: 16,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1); // bnum 0
+            (*hp)
+                .bh_data
+                .as_data_mut()
+                .copy_from_slice(b"0123456789ABCDEF");
+            assert_eq!(mf_write(&mut mfp, hp), OK);
+            assert_eq!(mfp.mf_infile_count, 1);
+
+            // Simulate the block header having been evicted from the
+            // in-memory cache (e.g. by the not-yet-translated
+            // mf_release_all) while its data remains on disk -
+            // mf_get's cache-miss path must then re-read it.
+            mfp.mf_hash.remove(&0);
+            mf_free_bhdr(hp);
+
+            let got = mf_get(&mut mfp, 0, 1);
+            assert!(!got.is_null());
+            assert_eq!((*got).bh_data.as_data(), b"0123456789ABCDEF");
+            assert_ne!((*got).bh_flags & BH_LOCKED, 0);
+
+            mf_free(&mut mfp, got);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mf_do_open_refuses_a_preexisting_symlink_when_creating() {
+        let tmp = TempFilePath::new("do_open_symlink_unix");
+        let target = tmp.path.with_extension("target");
+        std::fs::write(&target, b"attacker-controlled").unwrap();
+        std::os::unix::fs::symlink(&target, &tmp.path).unwrap();
+
+        let mut mfp = default_memfile();
+        // O_CREAT is set (via mf_open_file), so the symlink-attack
+        // pre-check (os_fileinfo_link-equivalent) must refuse to
+        // proceed, matching the original's E300 path.
+        assert_eq!(mf_open_file(&mut mfp, path_bytes(&tmp.path)), FAIL);
+        assert!(mfp.mf_fd.is_none());
+
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&tmp.path);
     }
 }
