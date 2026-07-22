@@ -23,7 +23,10 @@
 //! module doc for exactly what that means); and now the substantial
 //! standalone backward-scanning algorithm this file is most known for:
 //! `utf_ptr2CharInfo_impl` (as `utf_ptr2char_info_impl`, `static`/
-//! private in the original too), `always_break`/`always_break_two`
+//! private in the original too), `utf_ptr2CharInfo` (as
+//! `utf_ptr2char_info`, an inline function in the original's own
+//! header - now has a real caller in `strings.c`'s `mb_strup_buf`/
+//! `strcase_save`), `always_break`/`always_break_two`
 //! (`static`/private), and **`utf_head_off`** itself - the
 //! bidirectional (backward-then-forward) grapheme-cluster-boundary
 //! scan used to find where a composing-character sequence really
@@ -1135,6 +1138,31 @@ fn utf_ptr2char_info_impl(p: &[u8], len: usize) -> i32 {
     code_point.wrapping_sub(0x80 + (0x80 << 6) + (0x80 << 12) + (0x80 << 18) + (0x80 << 24)) as i32
 }
 
+/// Return information (decoded codepoint + byte length) about the
+/// character at `p` (`utf_ptr2CharInfo`, an inline function in the
+/// original's own header).
+///
+/// @return information about the character. When the sequence is
+/// illegal, [`crate::mbyte_defs::CharInfo`]'s `value` is negative and
+/// `len` is 1.
+///
+/// # Panics
+/// If `p` is empty (matching the original's `FUNC_ATTR_NONNULL_ALL` -
+/// an empty slice has no analogous "first byte" to inspect).
+#[must_use]
+pub fn utf_ptr2char_info(p: &[u8]) -> crate::mbyte_defs::CharInfo {
+    let first = p[0];
+    if first < 0x80 {
+        return crate::mbyte_defs::CharInfo { value: i32::from(first), len: 1 };
+    }
+    let mut len = usize::from(UTF8LEN_TAB[first as usize]);
+    let code_point = utf_ptr2char_info_impl(p, len);
+    if code_point < 0 {
+        len = 1;
+    }
+    crate::mbyte_defs::CharInfo { value: code_point, len }
+}
+
 /// `true` if boundclass `bc` always starts a new cluster regardless of
 /// what's before. False negatives are allowed (perf cost, not
 /// correctness) (`always_break`, `static` in the original - kept
@@ -1391,6 +1419,42 @@ mod tests {
         // `i32::MAX` (0x7FFFFFFF).
         let bytes = [0xFDu8, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF];
         assert_eq!(utf_ptr2char(&bytes), i32::MAX);
+    }
+
+    #[test]
+    fn utf_ptr2char_info_ascii_is_length_one() {
+        let info = utf_ptr2char_info(b"A");
+        assert_eq!(info.value, i32::from(b'A'));
+        assert_eq!(info.len, 1);
+    }
+
+    #[test]
+    fn utf_ptr2char_info_decodes_multibyte_with_correct_length() {
+        let info = utf_ptr2char_info("日".as_bytes());
+        assert_eq!(info.value, 0x65E5);
+        assert_eq!(info.len, 3);
+    }
+
+    #[test]
+    fn utf_ptr2char_info_illegal_sequence_reports_negative_value_and_length_one() {
+        // A lone continuation byte: illegal lead byte per UTF8LEN_TAB,
+        // so utf_ptr2char_info_impl reports a negative value here too
+        // (unlike utf_ptr2char, which degrades to the raw byte value).
+        let info = utf_ptr2char_info(&[0x80]);
+        assert!(info.value < 0);
+        assert_eq!(info.len, 1);
+    }
+
+    #[test]
+    fn utf_ptr2char_info_overlong_or_truncated_sequence_falls_back_to_length_one() {
+        // 0xC2 is a valid 2-byte lead, but followed by an ASCII byte
+        // (not a continuation byte) - illegal, so utf_ptr2char_info
+        // forces len back to 1 (matching the original's `if
+        // (code_point < 0) { len = 1; }`), even though UTF8LEN_TAB
+        // itself would have claimed 2 bytes.
+        let info = utf_ptr2char_info(&[0xC2, b'A']);
+        assert!(info.value < 0);
+        assert_eq!(info.len, 1);
     }
 
     #[test]

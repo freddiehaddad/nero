@@ -3,14 +3,16 @@
 //! Translated: `MB_MAXBYTES`/`MB_MAXCHAR`, the `ENC_*` encoding-
 //! property flags, `UNICODE_INVALID`, `GraphemeState`/
 //! `GRAPHEME_STATE_INIT` (now that the `utf8proc` FFI dependency this
-//! type is meaningless without has actually been added).
+//! type is meaningless without has actually been added), `CharInfo`
+//! (now that `mbyte.c`'s `utf_ptr2char_info` has a real caller in
+//! `strings.c`'s `mb_strup_buf`/`strcase_save`).
 //!
 //! Deferred (each needs a subsystem not yet reached in this pass):
 //! - `ConvFlags`/`vimconv_T`: needs a real `iconv_t` FFI/crate decision
 //!   (`iconv_defs.rs` already notes this - the real iconv binding is a
 //!   vendored third-party dependency, not yet reached via FFI).
-//! - `CharInfo`/`StrCharInfo`/`CharBoundsOff`: not needed by any
-//!   translated caller yet.
+//! - `StrCharInfo`/`CharBoundsOff`: not needed by any translated
+//!   caller yet.
 
 /// Maximum number of bytes in a multi-byte character. It can be one
 /// 32-bit character of up to 6 bytes, or one 16-bit character of up to
@@ -20,6 +22,18 @@ pub const MB_MAXBYTES: usize = 21;
 /// Maximum length of a Unicode character, excluding composing
 /// characters (`MB_MAXCHAR`).
 pub const MB_MAXCHAR: usize = 6;
+
+/// Information about a single (possibly multi-byte) character:
+/// its decoded codepoint and its byte length (`CharInfo`).
+///
+/// When the byte sequence is illegal, `value` is negative and `len` is
+/// 1 - matching [`crate::mbyte::utf_ptr2char_info`]'s own documented
+/// contract exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CharInfo {
+    pub value: i32,
+    pub len: usize,
+}
 
 /// Properties used in `enc_canon_table[]` (first three mutually
 /// exclusive) (`ENC_*`).
