@@ -2,17 +2,26 @@
 //!
 //! `change.c` (~2200 lines) is the buffer-modification/change-tracking
 //! core (`changed`/`changed_bytes`/`changed_lines`, insert-mode byte
-//! insertion, indent-preservation helpers, etc.) - almost all of it
-//! needs the display/redraw pipeline, the fold subsystem, and/or
-//! `ml_replace`/`ml_append`/`ml_delete` (`memline.c`'s write side, not
-//! yet translated). Only the one genuinely self-contained function
-//! needed by `undo.c`'s `bufIsChanged` is translated here:
-//! `file_ff_differs`.
+//! insertion, indent-preservation helpers, etc.). Re-examined after
+//! `memline.c`'s write side (`ml_replace`/`ml_append`/`ml_delete`)
+//! was completed later in the same session that first wrote this
+//! comment - that specific blocker is gone, but `changed`/
+//! `changed_internal`/`changed_common`/`changed_lines_invalidate_win`
+//! (etc.) turn out to need a wide spread of OTHER not-yet-translated
+//! subsystems instead: `change_warning` (`apply_autocmds`, real
+//! autocmd triggers - see `undo.rs`'s own module doc for the same
+//! blocker), `ml_open_file` (swap-file creation), window/fold display
+//! bookkeeping (`redraw_buf_status_later`, `find_wl_entry`,
+//! `invalidate_botline_win`, `buf_meta_total`), `diff_internal`/
+//! `diff_update_line` (`diff.c`), and `buf_inc_changedtick` (the real
+//! `b:` dict watcher machinery, eval engine/phase 5). Only the one
+//! genuinely self-contained function needed by `undo.c`'s
+//! `bufIsChanged` is translated here: `file_ff_differs`.
 //!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display
-//! pipeline, `memline.c`'s write side, `extmark.c`, `mark.c`'s
-//! `MarkSet`-adjacent autocmd triggers, etc.).
+//! pipeline, the fold/diff subsystems, `autocmd.c`, the eval engine's
+//! `b:` dict watchers, etc. - see above).
 
 use crate::buffer_defs::{b_flags, BufT};
 
