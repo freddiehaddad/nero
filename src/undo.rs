@@ -1049,6 +1049,10 @@ mod tests {
 
     #[test]
     fn u_save_line_buf_returns_the_exact_line_bytes() {
+        // buf_with_two_lines() calls ml_open, which touches shared
+        // GLOBALS.got_int internally via mf_sync - must hold the lock
+        // like every other GlobalCell-touching test.
+        let _lock = crate::globals::global_state_test_lock();
         let mut buf = buf_with_two_lines();
         assert_eq!(unsafe { u_save_line_buf(&mut buf, 1) }, b"one\0".to_vec());
         assert_eq!(unsafe { u_save_line_buf(&mut buf, 2) }, b"two\0".to_vec());

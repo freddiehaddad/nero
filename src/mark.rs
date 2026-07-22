@@ -1399,9 +1399,19 @@ mod tests {
     /// the duration of the returned guard, matching [`CurbufGuard`]'s
     /// existing pattern. Callers must close `buf.b_ml.ml_mfp`
     /// themselves after the guard is dropped (see call sites).
+    ///
+    /// `CurbufGuard::set` is constructed *before* `ml_open` runs (even
+    /// though `ml_open` doesn't itself need `curbuf` set) specifically
+    /// so its internally-acquired `globals_test_lock()` is already held
+    /// before `ml_open`'s own `mf_sync` call touches the shared
+    /// `GLOBALS.got_int` - otherwise that touch would race, unguarded,
+    /// against any other test reading/writing it concurrently (found
+    /// via a real, if rare, flaky failure in a from-scratch flakiness
+    /// re-run).
     fn open_and_set_curbuf(buf: &mut BufT) -> CurbufGuard {
+        let guard = CurbufGuard::set(buf as *mut BufT);
         assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
-        CurbufGuard::set(buf as *mut BufT)
+        guard
     }
 
     #[test]

@@ -1178,6 +1178,12 @@ mod tests {
 
     #[test]
     fn mf_write_then_mf_read_roundtrip() {
+        // mf_write touches shared GLOBALS.did_swapwrite_msg internally
+        // on every call (success or failure) whenever mf_fd is real -
+        // see mf_write_sets_did_swapwrite_msg_on_failure_and_clears_on_
+        // success's own comment - must hold the lock like every other
+        // GlobalCell-touching test.
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("rw_roundtrip");
         let mut mfp = MemfileT {
             mf_page_size: 16,
@@ -1228,6 +1234,9 @@ mod tests {
 
     #[test]
     fn mf_write_fills_gaps_with_dummy_data_for_freed_blocks() {
+        // mf_write touches shared GLOBALS.did_swapwrite_msg internally
+        // (see mf_write_then_mf_read_roundtrip's own comment).
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("gap_fill");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1405,6 +1414,12 @@ mod tests {
 
     #[test]
     fn mf_sync_writes_only_positive_bnum_blocks_without_mfs_all() {
+        // mf_sync touches the shared GLOBALS.got_int internally
+        // whenever mf_fd is real (see mf_sync_preserves_pre_existing_
+        // got_int's own comment) - must hold the lock like every other
+        // GlobalCell-touching test, even though this test itself never
+        // reads/asserts on got_int.
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("sync_positive_only");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1437,6 +1452,9 @@ mod tests {
 
     #[test]
     fn mf_sync_with_mfs_all_writes_negative_bnum_blocks_too() {
+        // See mf_sync_writes_only_positive_bnum_blocks_without_mfs_all's
+        // comment: mf_sync touches shared GLOBALS.got_int internally.
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("sync_mfs_all");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1462,6 +1480,9 @@ mod tests {
 
     #[test]
     fn mf_sync_with_mfs_zero_only_writes_block_zero() {
+        // See mf_sync_writes_only_positive_bnum_blocks_without_mfs_all's
+        // comment: mf_sync touches shared GLOBALS.got_int internally.
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("sync_mfs_zero");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1490,6 +1511,10 @@ mod tests {
 
     #[test]
     fn mf_sync_leaves_dirty_flag_unchanged_when_hash_nonempty_and_ok() {
+        // mf_sync touches shared GLOBALS.got_int internally (see
+        // mf_sync_writes_only_positive_bnum_blocks_without_mfs_all's
+        // comment).
+        let _lock = crate::globals::global_state_test_lock();
         // Verified against the real `map_foreach_value` macro expansion
         // (src/nvim/map_defs.h): it assigns `hp` to each hash entry's
         // value in turn, so after the loop `hp` holds the *last*
@@ -1523,6 +1548,10 @@ mod tests {
 
     #[test]
     fn mf_sync_clears_dirty_flag_when_hash_is_empty() {
+        // mf_sync touches shared GLOBALS.got_int internally (see
+        // mf_sync_writes_only_positive_bnum_blocks_without_mfs_all's
+        // comment).
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("sync_empty_hash");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1539,6 +1568,10 @@ mod tests {
 
     #[test]
     fn mf_sync_with_mfs_flush_calls_fsync_successfully() {
+        // mf_sync touches shared GLOBALS.got_int internally (see
+        // mf_sync_writes_only_positive_bnum_blocks_without_mfs_all's
+        // comment).
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("sync_flush");
         let mut mfp = MemfileT {
             mf_page_size: 8,
@@ -1764,6 +1797,9 @@ mod tests {
 
     #[test]
     fn mf_get_reads_an_uncached_in_file_block_from_disk() {
+        // mf_write touches shared GLOBALS.did_swapwrite_msg internally
+        // (see mf_write_then_mf_read_roundtrip's own comment).
+        let _lock = crate::globals::global_state_test_lock();
         let tmp = TempFilePath::new("get_from_disk");
         let mut mfp = MemfileT {
             mf_page_size: 16,

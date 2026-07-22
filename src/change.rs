@@ -71,6 +71,11 @@ mod tests {
 
     #[test]
     fn file_ff_differs_false_for_new_empty_buffer_when_ignoring_empty() {
+        // ml_open touches shared GLOBALS.got_int internally via
+        // mf_sync - must hold the lock like every other GlobalCell-
+        // touching test (see memfile.rs's mf_sync tests for the same
+        // reasoning).
+        let _lock = crate::globals::global_state_test_lock();
         let mut buf = BufT::default();
         assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
         buf.b_flags = b_flags::BF_NEW as i32;
@@ -85,6 +90,9 @@ mod tests {
 
     #[test]
     fn file_ff_differs_true_when_new_empty_buffer_not_ignored() {
+        // See file_ff_differs_false_for_new_empty_buffer_when_ignoring_
+        // empty's own comment: ml_open touches shared GLOBALS.got_int.
+        let _lock = crate::globals::global_state_test_lock();
         let mut buf = BufT::default();
         assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
         buf.b_flags = b_flags::BF_NEW as i32;

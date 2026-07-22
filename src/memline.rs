@@ -2540,6 +2540,7 @@ mod tests {
     #[test]
     fn ml_open_on_a_fresh_buffer_succeeds_and_wires_up_memline() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         let ret = unsafe { ml_open(&mut buf) };
         assert_eq!(ret, OK);
         assert!(!buf.b_ml.ml_mfp.is_null());
@@ -2555,6 +2556,7 @@ mod tests {
     #[test]
     fn ml_open_writes_a_readable_block_zero() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             let mfp = &mut *buf.b_ml.ml_mfp;
@@ -2571,6 +2573,7 @@ mod tests {
     #[test]
     fn ml_get_buf_on_freshly_opened_buffer_returns_the_single_empty_line() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             // ml_open's one line is empty: just its own NUL terminator
@@ -2590,6 +2593,7 @@ mod tests {
     #[test]
     fn ml_get_buf_out_of_range_lnum_returns_questionmarks_without_panicking() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             assert_eq!(ml_get_buf(&mut buf, 99), b"???".to_vec());
@@ -2829,6 +2833,7 @@ mod tests {
     #[test]
     fn ml_get_buf_len_is_zero_for_an_empty_line() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             assert_eq!(ml_get_buf_len(&mut buf, 1), 0);
@@ -2859,6 +2864,7 @@ mod tests {
     #[test]
     fn ml_append_replace_delete_full_roundtrip() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             // starts with 1 empty line
@@ -2931,6 +2937,7 @@ mod tests {
     #[test]
     fn ml_delete_last_line_replaces_with_empty_and_sets_ml_empty() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"only\0", 5, false), OK);
@@ -2958,6 +2965,7 @@ mod tests {
     #[test]
     fn ml_append_out_of_range_lnum_fails() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             assert_eq!(ml_append_buf(&mut buf, 99, b"x\0", 2, false), FAIL);
@@ -2972,10 +2980,10 @@ mod tests {
     #[test]
     fn ml_delete_out_of_range_lnum_fails() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
 
-            let _guard = crate::globals::global_state_test_lock();
             let prev_curbuf = GLOBALS.get_mut().curbuf;
             GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
             assert_eq!(ml_delete(0), FAIL);
@@ -2991,6 +2999,7 @@ mod tests {
     #[test]
     fn ml_append_marks_line_dirty_and_ml_get_buf_mut_returns_same_bytes() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"abc\0", 4, false), OK);
@@ -3006,10 +3015,10 @@ mod tests {
     #[test]
     fn ml_replace_via_curbuf_matches_ml_get() {
         let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
 
-            let _guard = crate::globals::global_state_test_lock();
             let prev_curbuf = GLOBALS.get_mut().curbuf;
             GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
             assert_eq!(ml_replace(1, b"xyz\0"), OK);
