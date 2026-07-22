@@ -3,22 +3,19 @@
 //! Translated: the pure in-memory block-allocation/free-list/hash-map
 //! bookkeeping - `mf_new_page_size`, `mf_alloc_bhdr`, `mf_free_bhdr`,
 //! `mf_ins_free`, `mf_rem_free`, `mf_new`, `mf_free`, `mf_trans_add`,
-//! `mf_trans_del`, `mf_need_trans`, `mf_free_fnames`, `mf_fullname`.
+//! `mf_trans_del`, `mf_need_trans`, `mf_free_fnames`, `mf_fullname`,
+//! `mf_set_fnames` (now tractable via `crate::path::full_name_save`).
 //!
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
 //! - `mf_open`/`mf_open_file`/`mf_close`/`mf_close_file`/`mf_do_open`/
-//!   `mf_read`/`mf_write`/`mf_sync`: need real file I/O (`os/fs.c`'s
-//!   actual implementation - only its `_defs.h` types are translated
-//!   so far).
+//!   `mf_read`/`mf_write`/`mf_sync`: need real file I/O beyond what
+//!   `os/fs.rs` covers so far (byte-level read/write, `FileInfo`).
 //! - `mf_get`: calls `mf_read()` on a cache miss, so can't be completed
 //!   without it.
 //! - `mf_put`: calls `iemsg()` (`message.c`, not yet translated) on its
 //!   "block was not locked" internal-error path.
 //! - `mf_release_all`: calls `mf_close()`.
-//! - `mf_set_fnames`: calls `FullName_save()` (`path.c`'s real path
-//!   resolution, not yet translated - only the pure in-memory
-//!   path-string helpers are done so far).
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
@@ -268,6 +265,19 @@ pub fn mf_free_fnames(mfp: &mut MemfileT) {
     mfp.mf_ffname = None;
 }
 
+/// Sets the memfile's swapfile name, also computing and storing its
+/// full (absolute) path (`mf_set_fnames`).
+///
+/// Computes `mf_ffname` before moving `fname` into `mf_fname` (the
+/// original assigns `mf_fname` first, then reads it back to compute
+/// `mf_ffname` - reordered here only to satisfy Rust's ownership rules
+/// around moving `fname`; `full_name_save` is a pure function of its
+/// input, so this has no observable behavior difference).
+pub fn mf_set_fnames(mfp: &mut MemfileT, fname: Vec<u8>) {
+    mfp.mf_ffname = crate::path::full_name_save(Some(&fname), false);
+    mfp.mf_fname = Some(fname);
+}
+
 /// Make name of memfile's swapfile a full path. Used before doing a
 /// `:cd` (`mf_fullname`).
 pub fn mf_fullname(mfp: &mut MemfileT) {
@@ -501,5 +511,15 @@ mod tests {
         let mut mfp = test_mfp();
         mf_fullname(&mut mfp); // both None
         assert!(mfp.mf_fname.is_none());
+    }
+
+    #[test]
+    fn mf_set_fnames_sets_fname_and_computes_absolute_ffname() {
+        let mut mfp = test_mfp();
+        mf_set_fnames(&mut mfp, b"swap.tmp".to_vec());
+        assert_eq!(mfp.mf_fname, Some(b"swap.tmp".to_vec()));
+        let ffname = mfp.mf_ffname.expect("full_name_save should succeed for a plain relative name");
+        assert!(crate::path::path_is_absolute(&ffname));
+        assert!(ffname.ends_with(b"swap.tmp"));
     }
 }

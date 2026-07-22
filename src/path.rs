@@ -2,13 +2,17 @@
 //!
 //! `path.c` is large (75.7KB) and most of it needs filesystem I/O
 //! (`os/fs.c`), option state (`'fileignorecase'` etc., `option.c`), or
-//! multi-byte-aware case folding (`mbyte.c`) - none translated yet. Only
-//! the pure, in-memory path-string functions with no such dependency are
-//! translated here: `vim_ispathsep`(+`_nocolon`), `vim_ispathlistsep`,
-//! `path_head_length`, `is_path_head`, `path_skip_sep`, `get_past_head`,
-//! `path_tail`, `path_next_component`, `path_has_drive_letter`,
-//! `path_is_absolute`, `after_pathsep`, `add_pathsep`, `path_is_url`,
-//! `path_with_url`, `path_to_slash`, `path_to_slash_save`.
+//! multi-byte-aware case folding (`mbyte.c`). Now that `os/fs.rs`
+//! translates a synchronous-file-op core (`os_dirname`/`os_realpath`/
+//! etc.), the pure-string functions plus a few real-filesystem-touching
+//! ones built directly on top of them are translated here:
+//! `vim_ispathsep`(+`_nocolon`), `vim_ispathlistsep`, `path_head_length`,
+//! `is_path_head`, `path_skip_sep`, `get_past_head`, `path_tail`,
+//! `path_next_component`, `path_has_drive_letter`, `path_is_absolute`,
+//! `after_pathsep`, `add_pathsep`, `path_is_url`, `path_with_url`,
+//! `path_to_slash`, `path_to_slash_save`, `append_path`,
+//! `path_full_dir_name`, `path_to_absolute`, `vim_full_name`
+//! (`vim_FullName`), `full_name_save` (`FullName_save`), `save_abs_path`.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -19,10 +23,18 @@
 //! equal one of those ASCII separator bytes - so a naive byte scan and a
 //! UTF-8-character-aware scan agree on every separator position.
 //!
-//! Deferred: everything requiring filesystem access, options, or
-//! multibyte case-folding, including `path_fnamecmp`/`path_fnamencmp`
-//! (needed by `garray.c`'s `ga_remove_duplicate_strings` - on Windows
-//! these need `'fileignorecase'`, `_getdrive()`, and `utf_fold`, a deeper
+//! `path_full_dir_name`/`path_to_absolute` convert their `&[u8]` inputs
+//! to `&str`/`Path` to call into `os/fs.rs`, failing (returning `None`)
+//! on invalid UTF-8 - a known, documented simplification (same
+//! tradeoff already made by `os/env.rs`'s `os_getenv`), since real-world
+//! paths are overwhelmingly valid UTF-8 and losslessly handling
+//! arbitrary non-UTF-8 byte sequences as native paths isn't expressible
+//! via safe, dependency-free `std` APIs.
+//!
+//! Deferred: everything else requiring options or multibyte case-
+//! folding, including `path_fnamecmp`/`path_fnamencmp` (needed by
+//! `garray.c`'s `ga_remove_duplicate_strings` - on Windows these need
+//! `'fileignorecase'`, `_getdrive()`, and `utf_fold`, a deeper
 //! dependency than initially assumed; still not translated).
 
 use crate::os::os_defs::MAXPATHL;
@@ -298,6 +310,190 @@ pub fn path_to_slash_save(p: &[u8]) -> Vec<u8> {
     owned
 }
 
+/// Append `to_append` to `path` with a slash in between, in place, up
+/// to `max_len` bytes total (`append_path`).
+///
+/// @return `true` (`OK`) on success, `false` (`FAIL`) if there isn't
+///         room for the appended path within `max_len`.
+pub fn append_path(path: &mut Vec<u8>, to_append: &[u8], max_len: usize) -> bool {
+    // Do not append empty string or a dot.
+    if to_append.is_empty() || to_append == b"." {
+        return true;
+    }
+
+    // Combine the path segments, separated by a slash.
+    if let Some(&last) = path.last() {
+        if !vim_ispathsep_nocolon(last as i32) {
+            // +1 for the NUL at the end.
+            if path.len() + crate::ascii_defs::PATHSEPSTR.len() + 1 > max_len {
+                return false; // No space for trailing slash.
+            }
+            path.push(crate::ascii_defs::PATHSEP);
+        }
+    }
+
+    // +1 for the NUL at the end.
+    if path.len() + to_append.len() + 1 > max_len {
+        return false;
+    }
+
+    path.extend_from_slice(to_append);
+    true
+}
+
+/// Used by `path_to_absolute` to expand `directory` to its full path
+/// (`path_full_dir_name`).
+///
+/// @return `Some(full_path)` on success, `None` on failure.
+#[must_use]
+pub fn path_full_dir_name(directory: &[u8]) -> Option<Vec<u8>> {
+    if directory.is_empty() {
+        return crate::os::fs::os_dirname();
+    }
+
+    if let Some(real) = crate::os::fs::os_realpath(std::path::Path::new(
+        std::str::from_utf8(directory).ok()?,
+    )) {
+        return Some(real);
+    }
+
+    // Path does not exist (yet). For a full path fail, will use the
+    // path as-is.
+    if path_is_absolute(directory) {
+        return None;
+    }
+    // For a relative path use the current directory and append the
+    // directory name.
+    let mut buffer = crate::os::fs::os_dirname()?;
+    if !append_path(&mut buffer, directory, MAXPATHL as usize) {
+        return None;
+    }
+    Some(buffer)
+}
+
+/// Used by [`vim_full_name`]/`fix_fname` (not yet translated) to expand
+/// a filename to its full path (`path_to_absolute`).
+///
+/// @param force  Also expand when `fname` is already absolute.
+///
+/// @return `Some(full_path)` on success, `None` on failure.
+fn path_to_absolute(fname: &[u8], force: bool) -> Option<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut end_of_path: Vec<u8> = fname.to_vec();
+
+    // expand it if forced or not an absolute path
+    let needs_expand = force
+        || !path_is_absolute(fname)
+        || (cfg!(windows) && matches!(fname.first(), Some(b'/') | Some(b'\\')));
+
+    if needs_expand {
+        // Find the last path separator (or, on Windows, a drive-letter
+        // colon, or the special ".." with no separator at all),
+        // splitting `fname` into a "relative_directory" prefix (used to
+        // resolve the base directory) and an "end_of_path" suffix
+        // (appended back on at the very end).
+        let mut p_idx: Option<usize> = fname.iter().rposition(|&b| b == b'/');
+
+        if cfg!(windows) {
+            if p_idx.is_none() {
+                p_idx = fname.iter().rposition(|&b| b == b'\\');
+            }
+            if p_idx.is_none()
+                && fname.len() >= 2
+                && crate::macros_defs::ascii_isalpha(fname[0] as i32)
+                && fname[1] == b':'
+            {
+                // drive letter
+                p_idx = Some(1);
+            }
+        }
+
+        if p_idx.is_none() && fname == b".." {
+            // Handle ".." without path separators.
+            p_idx = Some(2);
+        }
+
+        let relative_directory: Vec<u8>;
+        match p_idx {
+            Some(mut idx) => {
+                if idx < fname.len()
+                    && vim_ispathsep(fname[idx] as i32)
+                    && fname[idx + 1..] == b".."[..]
+                {
+                    // For "/path/dir/.." include the "/..".
+                    idx += 3;
+                }
+                let copy_end = (idx + 1).min(fname.len());
+                relative_directory = fname[..copy_end].to_vec();
+                let end_start = if idx < fname.len() && vim_ispathsep(fname[idx] as i32) {
+                    idx + 1
+                } else {
+                    idx
+                }
+                .min(fname.len());
+                end_of_path = fname[end_start..].to_vec();
+            }
+            None => {
+                relative_directory = Vec::new();
+                // end_of_path stays as the whole fname (set above).
+            }
+        }
+
+        buf = path_full_dir_name(&relative_directory)?;
+    }
+
+    if !append_path(&mut buf, &end_of_path, MAXPATHL as usize) {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Turn `fname` into a full path (`vim_FullName`).
+///
+/// @param force  Also expand when `fname` is already absolute.
+///
+/// @return `(full_path, success)` - `full_path` is always populated,
+///         falling back to `fname` (slash-converted) on failure exactly
+///         like the original's own out-parameter contract; `success`
+///         is `false` (`FAIL`) if expansion failed.
+#[must_use]
+pub fn vim_full_name(fname: &[u8], force: bool) -> (Vec<u8>, bool) {
+    if path_with_url(fname) != 0 {
+        return (fname.to_vec(), true);
+    }
+
+    let (mut result, ok) = match path_to_absolute(fname, force) {
+        Some(full) => (full, true),
+        None => (fname.to_vec(), false), // something failed; use the filename
+    };
+    path_to_slash(&mut result);
+    (result, ok)
+}
+
+/// Get an allocated copy of the full path to `fname` (`FullName_save`).
+///
+/// @param force  Also expand when `fname` is already absolute.
+#[must_use]
+pub fn full_name_save(fname: Option<&[u8]>, force: bool) -> Option<Vec<u8>> {
+    let fname = fname?;
+    Some(vim_full_name(fname, force).0)
+}
+
+/// Saves the absolute path (`save_abs_path`).
+///
+/// @param name An absolute or relative path.
+/// @return The absolute path of `name`.
+#[must_use]
+pub fn save_abs_path(name: &[u8]) -> Vec<u8> {
+    if !path_is_absolute(name) {
+        // `full_name_save` only returns `None` when its own `fname`
+        // argument is `None`, which it never is here.
+        full_name_save(Some(name), true).expect("Some(name) input never yields None")
+    } else {
+        path_to_slash_save(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +613,130 @@ mod tests {
         let converted = path_to_slash_save(&original);
         assert_eq!(&converted, b"a/b/c");
         assert_eq!(&original, b"a\\b\\c"); // original untouched
+    }
+
+    #[test]
+    fn append_path_adds_separator_when_missing() {
+        let mut path = b"C:/Users".to_vec();
+        assert!(append_path(&mut path, b"test", MAXPATHL as usize));
+        assert_eq!(&path, b"C:/Users/test");
+    }
+
+    #[test]
+    fn append_path_avoids_double_separator() {
+        let mut path = b"C:/Users/".to_vec();
+        assert!(append_path(&mut path, b"test", MAXPATHL as usize));
+        assert_eq!(&path, b"C:/Users/test");
+    }
+
+    #[test]
+    fn append_path_ignores_empty_and_dot() {
+        let mut path = b"C:/Users".to_vec();
+        assert!(append_path(&mut path, b"", MAXPATHL as usize));
+        assert_eq!(&path, b"C:/Users");
+        assert!(append_path(&mut path, b".", MAXPATHL as usize));
+        assert_eq!(&path, b"C:/Users");
+    }
+
+    #[test]
+    fn append_path_fails_when_exceeding_max_len() {
+        let mut path = b"C:/Users".to_vec();
+        assert!(!append_path(&mut path, b"test", 9)); // no room
+    }
+
+    #[test]
+    fn path_full_dir_name_empty_directory_returns_cwd() {
+        let cwd = path_full_dir_name(b"").unwrap();
+        let real_cwd = crate::os::fs::os_dirname().unwrap();
+        assert_eq!(cwd, real_cwd);
+    }
+
+    #[test]
+    fn path_full_dir_name_resolves_existing_relative_dir() {
+        // "." always exists and is relative; path_full_dir_name should
+        // resolve it to the (absolute) current directory via
+        // os_realpath.
+        let resolved = path_full_dir_name(b".").unwrap();
+        assert!(path_is_absolute(&resolved));
+    }
+
+    #[test]
+    fn path_to_absolute_relative_filename_joins_with_cwd() {
+        let cwd = crate::os::fs::os_dirname().unwrap();
+        let result = path_to_absolute(b"foo.txt", false).unwrap();
+        let mut expected = cwd;
+        assert!(append_path(&mut expected, b"foo.txt", MAXPATHL as usize));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn path_to_absolute_relative_subdir_joins_with_cwd() {
+        let cwd = crate::os::fs::os_dirname().unwrap();
+        let result = path_to_absolute(b"sub/foo.txt", false).unwrap();
+        let mut expected = cwd;
+        assert!(append_path(&mut expected, b"sub/", MAXPATHL as usize));
+        assert!(append_path(&mut expected, b"foo.txt", MAXPATHL as usize));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn path_to_absolute_dotdot_resolves_to_parent_of_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent();
+        let Some(parent) = parent else {
+            return; // cwd is filesystem root; ".." has no distinct parent to compare
+        };
+        let result = path_to_absolute(b"..", false).unwrap();
+        let result_path = std::path::Path::new(std::str::from_utf8(&result).unwrap());
+        assert_eq!(
+            result_path.canonicalize().unwrap(),
+            parent.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn path_to_absolute_already_absolute_without_force_is_unchanged() {
+        let abs = crate::os::fs::os_dirname().unwrap();
+        let result = path_to_absolute(&abs, false).unwrap();
+        assert_eq!(result, abs);
+    }
+
+    #[test]
+    fn vim_full_name_url_is_passed_through_unchanged() {
+        let (result, ok) = vim_full_name(b"http://example.com/foo", false);
+        assert!(ok);
+        assert_eq!(result, b"http://example.com/foo");
+    }
+
+    #[test]
+    fn vim_full_name_relative_path_succeeds_and_slash_converts() {
+        let (result, ok) = vim_full_name(b"foo.txt", false);
+        assert!(ok);
+        assert!(!result.contains(&b'\\'));
+        assert!(path_is_absolute(&result));
+    }
+
+    #[test]
+    fn full_name_save_none_input_gives_none() {
+        assert_eq!(full_name_save(None, false), None);
+    }
+
+    #[test]
+    fn full_name_save_relative_path_gives_absolute_result() {
+        let result = full_name_save(Some(b"foo.txt"), false).unwrap();
+        assert!(path_is_absolute(&result));
+    }
+
+    #[test]
+    fn save_abs_path_of_already_absolute_path_is_slash_converted_copy() {
+        let abs = crate::os::fs::os_dirname().unwrap();
+        let result = save_abs_path(&abs);
+        assert_eq!(result, abs); // already absolute and slash-normalized
+    }
+
+    #[test]
+    fn save_abs_path_of_relative_path_resolves_against_cwd() {
+        let result = save_abs_path(b"foo.txt");
+        assert!(path_is_absolute(&result));
     }
 }

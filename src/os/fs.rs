@@ -13,7 +13,8 @@
 //! now instead of waiting on that decision.
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
-//! `os_isrealdir`, `os_mkdir`, `os_rmdir`, `os_remove`, `os_rename`.
+//! `os_isrealdir`, `os_mkdir`, `os_rmdir`, `os_remove`, `os_rename`,
+//! `os_realpath`.
 //! Functions that in the original return a raw libuv error code
 //! (`os_chdir`/`os_mkdir`/`os_rmdir`/`os_remove`) are translated to
 //! return `0` on success and `-1` on any failure: this collapses
@@ -47,8 +48,11 @@
 //!   `os_mkdir` plus recursive-creation logic not ported this pass.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
-//! - `os_realpath`/`os_resolve_shortcut`/`os_is_reparse_point_include`:
-//!   symlink/shortcut resolution, deferred alongside `FileInfo`.
+//! - `os_resolve_shortcut`/`os_is_reparse_point_include`: Windows
+//!   shortcut (`*.lnk`)/reparse-point resolution via COM
+//!   (`IPersistFile`), a genuinely different, more complex API surface
+//!   than plain symlink resolution - out of scope until a COM-FFI
+//!   decision is made.
 
 use crate::vim_defs::{FAIL, OK};
 use std::path::Path;
@@ -113,6 +117,46 @@ pub fn os_isrealdir(name: &Path) -> bool {
     match std::fs::symlink_metadata(name) {
         Ok(meta) => !meta.is_symlink() && meta.is_dir(),
         Err(_) => false,
+    }
+}
+
+/// Resolve `name` to its canonical (symlink-free, absolute) path
+/// (`os_realpath`).
+///
+/// Simplified from the original's caller-supplied-buffer-plus-length
+/// contract to an owned `Option<Vec<u8>>` - same convention already
+/// used by [`os_dirname`].
+///
+/// @return `Some(real_path)` on success, `None` on failure.
+#[must_use]
+pub fn os_realpath(name: &Path) -> Option<Vec<u8>> {
+    let real = std::fs::canonicalize(name).ok()?;
+    let mut bytes = real.to_string_lossy().into_owned().into_bytes();
+    // `std::fs::canonicalize` returns Windows's `\\?\`-prefixed
+    // "verbatim" extended-length paths (e.g. `\\?\C:\foo`, or
+    // `\\?\UNC\server\share` for UNC paths); libuv's `uv_fs_realpath`
+    // (what the original wraps) strips this prefix so plain drive-
+    // letter/UNC paths come back out, matching what the rest of this
+    // codebase's path functions (e.g. `path_has_drive_letter`) expect.
+    // This normalization is a no-op on non-Windows targets.
+    strip_windows_verbatim_prefix(&mut bytes);
+    crate::path::path_to_slash(&mut bytes);
+    Some(bytes)
+}
+
+/// Strips a Windows extended-length-path `\\?\` prefix in place,
+/// converting `\\?\UNC\server\share` back to `\\server\share` and
+/// `\\?\C:\foo` back to `C:\foo`. No-op if the prefix isn't present.
+fn strip_windows_verbatim_prefix(path: &mut Vec<u8>) {
+    const VERBATIM_UNC_PREFIX: &[u8] = br"\\?\UNC\";
+    const VERBATIM_PREFIX: &[u8] = br"\\?\";
+    if path.starts_with(VERBATIM_UNC_PREFIX) {
+        let rest = path[VERBATIM_UNC_PREFIX.len()..].to_vec();
+        path.clear();
+        path.extend_from_slice(br"\\");
+        path.extend_from_slice(&rest);
+    } else if path.starts_with(VERBATIM_PREFIX) {
+        path.drain(..VERBATIM_PREFIX.len());
     }
 }
 
@@ -206,6 +250,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_plain_prefix() {
+        let mut p = br"\\?\C:\Users\test".to_vec();
+        strip_windows_verbatim_prefix(&mut p);
+        assert_eq!(p, br"C:\Users\test");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_converts_unc_prefix() {
+        let mut p = br"\\?\UNC\server\share\dir".to_vec();
+        strip_windows_verbatim_prefix(&mut p);
+        assert_eq!(p, br"\\server\share\dir");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_is_noop_without_prefix() {
+        let mut p = br"C:\Users\test".to_vec();
+        strip_windows_verbatim_prefix(&mut p);
+        assert_eq!(p, br"C:\Users\test");
+    }
+
+    #[test]
+    fn os_realpath_resolves_and_has_no_verbatim_prefix() {
+        let scratch = TempScratch::new("realpath");
+        let resolved = os_realpath(&scratch.path).expect("scratch dir exists");
+        assert!(!resolved.starts_with(br"\\?\"));
+        // The resolved path must still point at the same real
+        // directory (compare canonicalized to sidestep any 8.3-name or
+        // case differences).
+        let resolved_path = std::path::Path::new(std::str::from_utf8(&resolved).unwrap());
+        assert_eq!(
+            resolved_path.canonicalize().unwrap(),
+            scratch.path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn os_realpath_returns_none_for_missing_path() {
+        let scratch = TempScratch::new("realpath_missing");
+        assert_eq!(os_realpath(&scratch.path.join("does_not_exist")), None);
     }
 
     #[test]
