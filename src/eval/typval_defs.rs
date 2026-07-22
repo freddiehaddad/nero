@@ -1,72 +1,272 @@
 //! Translated from `src/nvim/eval/typval_defs.h` (partial: the numeric
 //! type aliases needed by `undo_defs.h`, plus `scid_T`/`sctx_T` needed by
-//! `buffer_defs.h`'s `winopt_T`, and `Callback`/`CallbackType` needed by
-//! `buffer_defs.h`'s buffer-local-options block, phase 3; plus, added
-//! later, the remaining fully self-contained enums/constants with no
-//! pointer fields and no cross-struct dependency on `list_T`/`dict_T`/
-//! `ufunc_T` themselves - `VarType`/`VAR_TYPE_*`, `VarLockStatus`,
-//! `ScopeType`, `BoolVarValue`, `SpecialVarValue`, `DictItemFlags`,
-//! `ListLenSpecials`, `DO_NOT_FREE_CNT`, `MAX_FUNC_ARGS`/
-//! `VAR_SHORT_LEN`/`FIXVAR_CNT`).
+//! `buffer_defs.h`'s `winopt_T`, `Callback`/`CallbackType` needed by
+//! `buffer_defs.h`'s buffer-local-options block (phase 3), the
+//! self-contained enums/constants with no pointer fields
+//! (`VarType`/`VAR_TYPE_*`, `VarLockStatus`, `ScopeType`,
+//! `BoolVarValue`, `SpecialVarValue`, `DictItemFlags`, `ListLenSpecials`,
+//! `DO_NOT_FREE_CNT`, `MAX_FUNC_ARGS`/`VAR_SHORT_LEN`/`FIXVAR_CNT`); and
+//! now `typval_T` itself (as `TypvalT`/`TypvalValue`), `list_T`/
+//! `listitem_T`/`listwatch_T` (as `ListT`/`ListitemT`/`ListwatchT`), and
+//! `blob_T` (as `BlobT`) - the foundational *data shapes* of the eval
+//! engine's value system, translated ahead of the actual allocation/
+//! refcounting/garbage-collection *algorithms* that operate on them
+//! (`tv_list_alloc`, `tv_dict_alloc`, etc. - `eval/list.c`/`typval.c`,
+//! still not started), mirroring how `option_defs.rs`'s `OptIndex`
+//! family was translated well ahead of `option.c`'s real engine.
 //!
-//! The bulk of this header (the `typval_T` tagged union representing every
-//! Vimscript value type, `list_T`, `dict_T`, `partial_T`'s real fields,
-//! etc.) is substantial and belongs with the eval engine as a unit
-//! (phase 5) - deferred, not started. `dict_T`/`partial_T` themselves are
-//! forward-declared here as opaque placeholders (same convention as
-//! `types_defs.rs`'s cross-cutting placeholder list) purely so that
-//! `Callback`/`ScopeDictDictItem`/`ChangedtickDictItem` - real types other
-//! not-yet-translated files reference by pointer/value - can exist now
-//! without faking their eventual real contents.
+//! `typval_T` (`TypvalT`/`TypvalValue`) is translated as a proper safe
+//! Rust enum rather than replicating the original's `v_type: VarType`
+//! tag + raw C union `vval` split - matching this same file's own
+//! established `Callback` precedent ("no hot-path memory layout reason
+//! not to"). Given how central and how heavily this type is
+//! constructed/mutated throughout the entire eval engine, a safe
+//! representation here is especially valuable (eliminates a whole
+//! class of "read the wrong union field" undefined behavior) and
+//! matches this crate's overall "correctness over exact C memory
+//! layout" philosophy (e.g. `Vec<u8>` instead of raw pointers,
+//! `Option` instead of null) - unlike e.g. `decoration_defs.rs`'s
+//! `DecorInlineData`, which stays a raw union because callers actually
+//! rely on its externally co-located discriminant/FFI-observable
+//! layout; nothing here does.
+//!
+//! `list_T`/`listitem_T`/`listwatch_T` are translated with the same
+//! raw-pointer-linked-structure convention already established for
+//! `marktree.rs`'s `MtNode`/`MtNodeInner` (not `Rc`/`RefCell`) - pointer
+//! fields (`li_next`, `lv_used_next`, etc.) mirror the original's own
+//! manual, reference-counted, doubly-linked/intrusive-list ownership
+//! model exactly, since Rust's ownership types don't have a
+//! direct-enough equivalent for a structure this pervasively
+//! pointer-aliased (list items are simultaneously reachable from
+//! `lv_first`/`lv_last` traversal AND any live `listwatch_T`/
+//! `lv_idx_item` cache AND (for nested lists) another list's own
+//! item value) without introducing unsafe cells everywhere anyway.
+//!
+//! `dict_T`/`dictitem_T` (the generic, variable-key-length case -
+//! distinct from the already-existing fixed-size `ChangedtickDictItem`/
+//! `ScopeDictDictItem` instantiations of the same `TV_DICTITEM_STRUCT`
+//! macro, both updated in this pass to use the new, real `TypvalT`)
+//! and `ufunc_T`/`funccall_T`/`partial_T`'s own real fields remain
+//! deferred - `dict_T` specifically needs a real design decision for
+//! how its `hashtab_T` (generic, `hi_key`-points-into-external-value
+//! scheme) should relate to externally-allocated `dictitem_T`
+//! instances, which deserves its own dedicated, unhurried pass rather
+//! than a rushed choice bolted on here. `partial_T`/`DictT` themselves
+//! stay opaque placeholders (same convention as `types_defs.rs`'s
+//! cross-cutting placeholder list) for exactly this reason.
 
 use crate::pos_defs::LinenrT;
 use crate::types_defs::LuaRef;
 
+/// Structure that holds an internal variable value (`typval_T`).
+///
+/// See this module's own doc comment for why this is a safe Rust enum
+/// (via [`TypvalValue`]) rather than the original's `v_type` tag + raw
+/// C union `vval` split.
+///
+/// `v_lock` (the original's separate `VarLockStatus` field, sitting
+/// alongside `v_type`/`vval`) is kept as its own field here too - it's
+/// orthogonal to which variant is active (any variant can be locked or
+/// not), so folding it into the enum itself would needlessly duplicate
+/// a `v_lock` field onto every single variant.
+#[derive(Debug, Clone, Default)]
+pub struct TypvalT {
+    /// Variable lock status (`v_lock`).
+    pub v_lock: VarLockStatus,
+    /// The actual value (`v_type` + `vval`, combined).
+    pub value: TypvalValue,
+}
+
+impl TypvalT {
+    /// The `VarType` tag this value corresponds to (`v_type`) -
+    /// mirroring the original's separate discriminant field, derived
+    /// here instead of stored redundantly.
+    #[must_use]
+    pub fn var_type(&self) -> VarType {
+        self.value.var_type()
+    }
+}
+
+/// The tagged payload of a [`TypvalT`] (`typval_T.v_type` combined
+/// with `typval_T.vval`, the union member the tag selects).
+#[derive(Debug, Clone, Default)]
+pub enum TypvalValue {
+    /// Unknown (unspecified) value (`VAR_UNKNOWN`).
+    #[default]
+    Unknown,
+    /// Number (`VAR_NUMBER`, `.v_number`).
+    Number(VarnumberT),
+    /// String (`VAR_STRING`, `.v_string`) - can be absent, matching
+    /// the original's nullable `char *v_string`.
+    String(Option<Vec<u8>>),
+    /// Function reference (`VAR_FUNC`) - the original reuses
+    /// `v_string` to hold the function name for this tag too, but a
+    /// distinct variant here is more useful/self-documenting than
+    /// requiring every match site to separately track "was this a
+    /// `VAR_STRING` or a `VAR_FUNC`" alongside a value that doesn't
+    /// itself carry that distinction.
+    Func(Option<Vec<u8>>),
+    /// List (`VAR_LIST`, `.v_list`) - can be null, matching the
+    /// original's nullable `list_T *v_list`.
+    List(*mut ListT),
+    /// Dict (`VAR_DICT`, `.v_dict`) - can be null, matching the
+    /// original's nullable `dict_T *v_dict`.
+    Dict(*mut DictT),
+    /// Floating-point value (`VAR_FLOAT`, `.v_float`).
+    Float(f64),
+    /// `true`/`false` (`VAR_BOOL`, `.v_bool`).
+    Bool(BoolVarValue),
+    /// Special value (null) (`VAR_SPECIAL`, `.v_special`).
+    Special(SpecialVarValue),
+    /// Closure: function with args (`VAR_PARTIAL`, `.v_partial`) - can
+    /// be null, matching the original's nullable `partial_T *`.
+    Partial(*mut PartialT),
+    /// Blob (`VAR_BLOB`, `.v_blob`) - can be null, matching the
+    /// original's nullable `blob_T *`.
+    Blob(*mut BlobT),
+}
+
+impl TypvalValue {
+    /// The [`VarType`] tag this variant corresponds to (`v_type`).
+    #[must_use]
+    pub fn var_type(&self) -> VarType {
+        match self {
+            TypvalValue::Unknown => VarType::Unknown,
+            TypvalValue::Number(_) => VarType::Number,
+            TypvalValue::String(_) => VarType::String,
+            TypvalValue::Func(_) => VarType::Func,
+            TypvalValue::List(_) => VarType::List,
+            TypvalValue::Dict(_) => VarType::Dict,
+            TypvalValue::Float(_) => VarType::Float,
+            TypvalValue::Bool(_) => VarType::Bool,
+            TypvalValue::Special(_) => VarType::Special,
+            TypvalValue::Partial(_) => VarType::Partial,
+            TypvalValue::Blob(_) => VarType::Blob,
+        }
+    }
+}
+
 /// Placeholder for `dict_T` (`struct dictvar_S`) - the Vimscript
-/// Dictionary type. Needs `typval_T`/`dictitem_T`, deferred to the eval
-/// engine as a unit (phase 5).
+/// Dictionary type. Needs a real design decision for how its
+/// `hashtab_T` relates to externally-allocated `dictitem_T` instances -
+/// deferred to its own dedicated pass (see this module's own doc
+/// comment).
 pub struct DictT {
     _private: (),
 }
 
-/// Placeholder for `list_T` (`struct listvar_S`) - the Vimscript List
-/// type. Needs `typval_T`/`listitem_T`, deferred to the eval engine as a
-/// unit (phase 5).
+/// Structure to hold an item of a list (`listitem_T`).
+///
+/// `li_next`/`li_prev` mirror the original's raw, manually-managed
+/// doubly-linked-list pointers exactly (see this module's own doc
+/// comment for why - not `Option<Box<_>>`/`Rc`).
+pub struct ListitemT {
+    /// Next item in list, null if none (`li_next`).
+    pub li_next: *mut ListitemT,
+    /// Previous item in list, null if none (`li_prev`).
+    pub li_prev: *mut ListitemT,
+    /// Item value (`li_tv`).
+    pub li_tv: TypvalT,
+}
+
+/// Structure used by those that are iterating over an item in a list
+/// while it may be concurrently modified (`listwatch_T`).
+pub struct ListwatchT {
+    /// Item being watched (`lw_item`).
+    pub lw_item: *mut ListitemT,
+    /// Next watcher, null if none (`lw_next`).
+    pub lw_next: *mut ListwatchT,
+}
+
+/// Structure to hold info about a list (`listvar_S` / `list_T`).
+///
+/// Field order matches the original exactly (its own comment notes it
+/// was "optimized to reduce padding" - preserved rather than
+/// reordered for Rust's own layout rules, which don't guarantee
+/// field-declaration-order layout for a plain `struct` anyway, but
+/// there's no reason to needlessly diverge from the source either).
 pub struct ListT {
-    _private: (),
+    /// First item, null if none (`lv_first`).
+    pub lv_first: *mut ListitemT,
+    /// Last item, null if none (`lv_last`).
+    pub lv_last: *mut ListitemT,
+    /// First watcher, null if none (`lv_watch`).
+    pub lv_watch: *mut ListwatchT,
+    /// When not null, item at index `lv_idx` (`lv_idx_item`).
+    pub lv_idx_item: *mut ListitemT,
+    /// Copied list used by `deepcopy()` (`lv_copylist`).
+    pub lv_copylist: *mut ListT,
+    /// Next list in the used-lists list (`lv_used_next`).
+    pub lv_used_next: *mut ListT,
+    /// Previous list in the used-lists list (`lv_used_prev`).
+    pub lv_used_prev: *mut ListT,
+    /// Reference count (`lv_refcount`).
+    pub lv_refcount: i32,
+    /// Number of items (`lv_len`).
+    pub lv_len: i32,
+    /// Index of a cached item, used to optimize repeated `l[idx]`
+    /// (`lv_idx`).
+    pub lv_idx: i32,
+    /// ID used by `deepcopy()` (`lv_copyID`).
+    pub lv_copy_id: i32,
+    /// Zero, `VAR_LOCKED`, or `VAR_FIXED` (`lv_lock`).
+    pub lv_lock: VarLockStatus,
+    pub lua_table_ref: LuaRef,
 }
 
 /// Placeholder for `partial_T` (`struct partial_S`) - a Vimscript partial
 /// (a function reference bound to some arguments/a dict `self`). Needs
-/// `typval_T`, deferred to the eval engine as a unit (phase 5).
+/// `ufunc_T` (for `pt_func`), deferred to the eval engine as a unit
+/// (phase 5).
 pub struct PartialT {
     _private: (),
 }
 
+/// Structure to hold info about a Blob (`blobvar_S` / `blob_T`).
+#[derive(Debug, Clone, Default)]
+pub struct BlobT {
+    /// Growarray with the data (`bv_ga`).
+    pub bv_ga: crate::garray_defs::GarrayT,
+    /// Reference count (`bv_refcount`).
+    pub bv_refcount: i32,
+    /// `VAR_UNLOCKED`, `VAR_LOCKED`, or `VAR_FIXED` (`bv_lock`).
+    pub bv_lock: VarLockStatus,
+}
+
+
 /// Type used for the `changedtick_di` member in `buf_T`
 /// (`ChangedtickDictItem`, a `TV_DICTITEM_STRUCT(sizeof("changedtick"))`
-/// instance). Exists upstream primarily so that literals of the relevant
-/// type can be made; every `TV_DICTITEM_STRUCT` instantiation embeds a
-/// `typval_T di_tv` field directly (by value, not by pointer), so this
-/// can't be modeled even partially until `typval_T` itself exists -
-/// deferred to the eval engine as a unit (phase 5). Derives `Default` (a
-/// trivial zero-sized value for now) so it stays embeddable by value in
-/// `buf_T` (-> `FileBuffer`) exactly like the original, rather than
-/// forcing a pointer-based workaround purely to dodge that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// instance - the generic `dictitem_T`'s macro-generated shape, fixed
+/// at this particular key size).
+///
+/// `di_key`'s fixed-size C array (`char di_key[sizeof("changedtick")]`)
+/// becomes an owned `Vec<u8>` here, matching this crate's usual
+/// preference for `Vec<u8>` over fixed-size byte arrays/raw C strings
+/// throughout (e.g. `option.rs`'s `Option<Vec<u8>>` values) - nothing
+/// about this particular use site needs the original's exact
+/// allocation size, just its content.
+#[derive(Debug, Clone, Default)]
 pub struct ChangedtickDictItem {
-    _private: (),
+    /// Structure that holds the `changedtick` value itself (`di_tv`).
+    pub di_tv: TypvalT,
+    /// Flags (`di_flags`).
+    pub di_flags: u8,
+    /// Key value (`di_key`).
+    pub di_key: Vec<u8>,
 }
 
 /// Structure to hold a scope dictionary (e.g. `b:`/`w:`/`t:`), pretending
 /// to `find_var_in_ht()` (not yet translated) to be a `dictitem_T`
 /// (`ScopeDictDictItem`, a `TV_DICTITEM_STRUCT(1)` instance). Same
-/// `typval_T`-embeds-by-value blocker as [`ChangedtickDictItem`] - deferred
-/// to the eval engine as a unit (phase 5); same trivial `Default` for the
-/// same by-value-embedding reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `di_key`-as-`Vec<u8>` reasoning as [`ChangedtickDictItem`] above.
+#[derive(Debug, Clone, Default)]
 pub struct ScopeDictDictItem {
-    _private: (),
+    /// Structure that holds the scope dictionary itself (`di_tv`).
+    pub di_tv: TypvalT,
+    /// Flags (`di_flags`).
+    pub di_flags: u8,
+    /// Key value (`di_key`).
+    pub di_key: Vec<u8>,
 }
 
 /// Discriminant for which kind of callback a [`Callback`] holds
@@ -302,6 +502,116 @@ pub struct SctxT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typval_default_is_unknown_and_unlocked() {
+        let tv = TypvalT::default();
+        assert!(matches!(tv.value, TypvalValue::Unknown));
+        assert_eq!(tv.v_lock, VarLockStatus::Unlocked);
+        assert_eq!(tv.var_type(), VarType::Unknown);
+    }
+
+    #[test]
+    fn typval_value_var_type_matches_every_variant() {
+        assert_eq!(TypvalValue::Unknown.var_type(), VarType::Unknown);
+        assert_eq!(TypvalValue::Number(5).var_type(), VarType::Number);
+        assert_eq!(TypvalValue::String(Some(b"hi".to_vec())).var_type(), VarType::String);
+        assert_eq!(TypvalValue::Func(Some(b"MyFunc".to_vec())).var_type(), VarType::Func);
+        assert_eq!(TypvalValue::List(std::ptr::null_mut()).var_type(), VarType::List);
+        assert_eq!(TypvalValue::Dict(std::ptr::null_mut()).var_type(), VarType::Dict);
+        assert_eq!(TypvalValue::Float(1.5).var_type(), VarType::Float);
+        assert_eq!(TypvalValue::Bool(BoolVarValue::True).var_type(), VarType::Bool);
+        assert_eq!(TypvalValue::Special(SpecialVarValue::Null).var_type(), VarType::Special);
+        assert_eq!(TypvalValue::Partial(std::ptr::null_mut()).var_type(), VarType::Partial);
+        assert_eq!(TypvalValue::Blob(std::ptr::null_mut()).var_type(), VarType::Blob);
+    }
+
+    #[test]
+    fn typval_number_roundtrips_through_the_enum() {
+        let tv = TypvalT { v_lock: VarLockStatus::Locked, value: TypvalValue::Number(42) };
+        assert_eq!(tv.var_type(), VarType::Number);
+        match tv.value {
+            TypvalValue::Number(n) => assert_eq!(n, 42),
+            _ => panic!("expected Number variant"),
+        }
+        assert_eq!(tv.v_lock, VarLockStatus::Locked);
+    }
+
+    #[test]
+    fn blob_t_default_is_empty_and_unlocked() {
+        let blob = BlobT::default();
+        assert_eq!(blob.bv_ga.ga_len, 0);
+        assert_eq!(blob.bv_refcount, 0);
+        assert_eq!(blob.bv_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn changedtick_dict_item_default_is_empty() {
+        let item = ChangedtickDictItem::default();
+        assert!(matches!(item.di_tv.value, TypvalValue::Unknown));
+        assert_eq!(item.di_flags, 0);
+        assert!(item.di_key.is_empty());
+    }
+
+    #[test]
+    fn scope_dict_dict_item_default_is_empty() {
+        let item = ScopeDictDictItem::default();
+        assert!(matches!(item.di_tv.value, TypvalValue::Unknown));
+        assert_eq!(item.di_flags, 0);
+        assert!(item.di_key.is_empty());
+    }
+
+    #[test]
+    fn listitem_chain_links_and_unlinks_via_raw_pointers() {
+        // A minimal 3-item list built and traversed entirely by hand,
+        // matching the original's own raw-pointer doubly-linked-list
+        // model (no ListT-level allocation/refcounting logic exists
+        // yet - this only exercises the plain struct shape).
+        let mut a = ListitemT {
+            li_next: std::ptr::null_mut(),
+            li_prev: std::ptr::null_mut(),
+            li_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(1) },
+        };
+        let mut b = ListitemT {
+            li_next: std::ptr::null_mut(),
+            li_prev: &mut a as *mut ListitemT,
+            li_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(2) },
+        };
+        a.li_next = &mut b as *mut ListitemT;
+
+        let list = ListT {
+            lv_first: &mut a as *mut ListitemT,
+            lv_last: &mut b as *mut ListitemT,
+            lv_watch: std::ptr::null_mut(),
+            lv_idx_item: std::ptr::null_mut(),
+            lv_copylist: std::ptr::null_mut(),
+            lv_used_next: std::ptr::null_mut(),
+            lv_used_prev: std::ptr::null_mut(),
+            lv_refcount: 1,
+            lv_len: 2,
+            lv_idx: 0,
+            lv_copy_id: 0,
+            lv_lock: VarLockStatus::Unlocked,
+            lua_table_ref: 0,
+        };
+
+        // Traverse from lv_first, collecting each item's Number value.
+        let mut values = Vec::new();
+        let mut cur = list.lv_first;
+        while !cur.is_null() {
+            // SAFETY: every pointer in this hand-built chain points at
+            // a still-live local (`a`/`b`), never freed during this test.
+            let item = unsafe { &*cur };
+            if let TypvalValue::Number(n) = item.li_tv.value {
+                values.push(n);
+            }
+            cur = item.li_next;
+        }
+        assert_eq!(values, vec![1, 2]);
+        assert_eq!(list.lv_len, 2);
+        // SAFETY: same as above.
+        assert_eq!(unsafe { &*list.lv_last }.li_prev, &mut a as *mut ListitemT);
+    }
 
     #[test]
     fn sctx_default_is_zeroed() {
