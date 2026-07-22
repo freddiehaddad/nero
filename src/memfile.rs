@@ -7,33 +7,46 @@
 //! translated as a `debug_assert!` instead - see `mf_put`'s own doc
 //! comment), `mf_free`, `mf_trans_add`, `mf_trans_del`, `mf_need_trans`,
 //! `mf_free_fnames`, `mf_fullname`, `mf_set_fnames` (via
-//! `crate::path::full_name_save`), `mf_read`, `mf_write`.
+//! `crate::path::full_name_save`), `mf_read`, `mf_write`, `mf_close`.
 //!
-//! `mf_read`/`mf_write` each call `PERROR()`/`emsg()` (`message.c`) on
-//! their error paths purely as a side effect before returning `FAIL` -
-//! this doesn't change either function's own control flow (they
-//! already know to return `FAIL` regardless of whether the message
-//! displays), so the message display itself is omitted here rather
-//! than blocking translation on `message.c`; `did_swapwrite_msg`
+//! `mf_read`/`mf_write`/`mf_close` each call `PERROR()`/`emsg()`
+//! (`message.c`) on their error paths purely as a side effect before
+//! returning/continuing - this doesn't change any of their own control
+//! flow (they already know what to do regardless of whether the
+//! message displays), so the message display itself is omitted here
+//! rather than blocking translation on `message.c`; `did_swapwrite_msg`
 //! (`crate::globals::GLOBALS`, a real `EXTERN` global, not a stub) is
-//! still updated faithfully, since it's genuine program state read
-//! elsewhere (`input.c`), not just message-display plumbing.
-//! `mf_write` additionally omits its retry-with-reopen-on-failure
-//! fallback (recovering from e.g. a disconnected network drive): that
-//! needs `mf_do_open`'s flag-translation logic, out of scope for this
-//! pass - documented on `mf_write`'s own doc comment as a narrow,
-//! explicit gap, not silently dropped.
+//! still updated faithfully by `mf_write`, since it's genuine program
+//! state read elsewhere (`input.c`), not just message-display
+//! plumbing. `mf_write` additionally omits its retry-with-reopen-on-
+//! failure fallback (recovering from e.g. a disconnected network
+//! drive): that needs `mf_do_open`'s flag-translation logic, out of
+//! scope for this pass - documented on `mf_write`'s own doc comment as
+//! a narrow, explicit gap, not silently dropped.
+//!
+//! `mf_close` takes `mfp: MemfileT` *by value* (unlike this file's
+//! other functions, which take `&mut MemfileT` since nothing yet
+//! constructs an owned `MemfileT` - `mf_open`, not yet translated, is
+//! deferred pending the file-open-flags/symlink-attack-security-check
+//! translation). This still matches the original's own "frees `mfp`
+//! itself" contract: the caller can no longer use `mfp` after calling
+//! this, exactly like the original's pointer becomes dangling after
+//! `mf_close()` - Rust's ordinary `Drop` at the end of the function
+//! body plays the role of the original's explicit `xfree(mfp)`.
 //!
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
-//! - `mf_open`/`mf_open_file`/`mf_close`/`mf_close_file`/`mf_do_open`/
-//!   `mf_sync`: need the file-open flag translation and/or
-//!   symlink-attack security checks (`os_fileinfo_link`) not yet
-//!   built.
+//! - `mf_open`/`mf_open_file`/`mf_do_open`/`mf_sync`: need the
+//!   file-open flag translation and/or symlink-attack security checks
+//!   (`os_fileinfo_link`) not yet built.
+//! - `mf_close_file`: needs `ml_get_buf` (`memline.c`) for its
+//!   `getlines` branch.
 //! - `mf_get`: calls `mf_read()` (done) but also `mf_alloc_bhdr`/hash
 //!   bookkeeping in a cache-miss path intertwined with `mf_open`'s
 //!   not-yet-translated state; revisit once `mf_open` exists.
-//! - `mf_release_all`: calls `mf_close()`.
+//! - `mf_release_all`: calls `mf_close()` (done) but also iterates
+//!   `first_buffer`'s buffer list (`globals.h`) and `curbuf`/window
+//!   state not yet wired up to real multi-buffer support.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
@@ -441,6 +454,50 @@ pub fn mf_trans_del(mfp: &mut MemfileT, old_nr: BlocknrT) -> BlocknrT {
     mfp.mf_trans.remove(&old_nr);
 
     new_bnum
+}
+
+/// Close a memory file and optionally delete the associated file
+/// (`mf_close`).
+///
+/// @param del_file  Whether to delete the associated file.
+///
+/// # Safety
+/// Every `*mut BhdrT` reachable via `mfp.mf_hash`/`mfp.mf_free_first`
+/// must be a valid, uniquely-owned pointer (allocated via
+/// `mf_alloc_bhdr`, not aliased elsewhere) - true for every block this
+/// crate allocates via `mf_alloc_bhdr`/`mf_new`.
+pub unsafe fn mf_close(mut mfp: MemfileT, del_file: bool) {
+    // Closing the file (if any) is just dropping it - no separate
+    // close() call/error check needed (see the module doc comment for
+    // why the original's emsg() on a close error is omitted).
+    mfp.mf_fd = None;
+
+    if del_file {
+        if let Some(fname) = &mfp.mf_fname {
+            if let Ok(fname_str) = std::str::from_utf8(fname) {
+                crate::os::fs::os_remove(std::path::Path::new(fname_str));
+            }
+        }
+    }
+
+    // free entries in used list (`map_foreach_value`) - no need to
+    // remove them one by one, `mfp.mf_hash` itself is dropped when this
+    // function returns (matching the original's `map_destroy` right
+    // after this same loop).
+    let bhdrs: Vec<*mut BhdrT> = mfp.mf_hash.iter().map(|(_, v)| *v).collect();
+    for hp in bhdrs {
+        unsafe { mf_free_bhdr(hp) };
+    }
+
+    // free entries in free list
+    while !mfp.mf_free_first.is_null() {
+        let hp = unsafe { mf_rem_free(&mut mfp) };
+        unsafe { mf_free_bhdr(hp) };
+    }
+
+    mf_free_fnames(&mut mfp);
+    // `mfp` itself is dropped here at the end of scope, matching the
+    // original's `xfree(mfp)`.
 }
 
 /// Frees `mf_fname` and `mf_ffname` (`mf_free_fnames`).
@@ -916,6 +973,49 @@ mod tests {
         assert!(!mf_need_trans(&mfp));
         mfp.mf_neg_count = 1;
         assert!(mf_need_trans(&mfp));
+    }
+
+    #[test]
+    fn mf_close_deletes_file_when_requested() {
+        let tmp = TempFilePath::new("close_delete");
+        std::fs::write(&tmp.path, b"anything").unwrap();
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(std::fs::File::open(&tmp.path).unwrap()),
+            mf_fname: Some(tmp.path.to_string_lossy().into_owned().into_bytes()),
+            ..default_memfile()
+        };
+        // A used-list block and a free-list block, to exercise both
+        // cleanup loops without panicking or leaking (verified only by
+        // the test completing normally - no memory sanitizer available
+        // here, but this at least exercises every code path).
+        unsafe {
+            let used = mf_new(&mut mfp, false, 1);
+            let freed = mf_new(&mut mfp, false, 1);
+            mf_free(&mut mfp, freed); // moves `freed` onto the free list
+            assert!(!mfp.mf_free_first.is_null());
+            let _ = used; // still registered in mf_hash
+
+            mf_close(mfp, true);
+        }
+
+        assert!(!tmp.path.exists(), "mf_close(del_file=true) should remove the file");
+    }
+
+    #[test]
+    fn mf_close_keeps_file_when_not_requested() {
+        let tmp = TempFilePath::new("close_keep");
+        std::fs::write(&tmp.path, b"anything").unwrap();
+        let mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(std::fs::File::open(&tmp.path).unwrap()),
+            mf_fname: Some(tmp.path.to_string_lossy().into_owned().into_bytes()),
+            ..default_memfile()
+        };
+        unsafe {
+            mf_close(mfp, false);
+        }
+        assert!(tmp.path.exists(), "mf_close(del_file=false) should keep the file");
     }
 
     #[test]
