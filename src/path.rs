@@ -8,13 +8,19 @@
 //! functions plus the option-/multibyte-dependent ones built directly
 //! on top of them are translated here: `vim_ispathsep`(+`_nocolon`),
 //! `vim_ispathlistsep`, `path_head_length`, `is_path_head`,
-//! `path_skip_sep`, `get_past_head`, `path_tail`, `path_next_component`,
-//! `path_has_drive_letter`, `path_is_absolute`, `after_pathsep`,
-//! `add_pathsep`, `path_is_url`, `path_with_url`, `path_to_slash`,
-//! `path_to_slash_save`, `append_path`, `path_full_dir_name`,
-//! `path_to_absolute`, `vim_full_name` (`vim_FullName`), `full_name_save`
-//! (`FullName_save`), `save_abs_path`, `path_fnamencmp`, `path_fnamecmp`,
-//! `pathcmp`, `path_shorten_fname`, `path_try_shorten_fname`.
+//! `path_skip_sep`, `get_past_head`, `path_tail`, `path_tail_with_sep`,
+//! `path_next_component`, `path_has_drive_letter`, `path_is_absolute`,
+//! `after_pathsep`, `add_pathsep`, `path_is_url`, `path_with_url`,
+//! `path_to_slash`, `path_to_slash_save`, `append_path`,
+//! `path_full_dir_name`, `path_to_absolute`, `vim_full_name`
+//! (`vim_FullName`), `full_name_save` (`FullName_save`),
+//! `save_abs_path`, `path_fnamencmp`, `path_fnamecmp`, `pathcmp`,
+//! `path_shorten_fname`, `path_try_shorten_fname`, `same_directory`
+//! (now tractable now that `path_tail_with_sep` exists too - its
+//! nullable `char *f1, char *f2` parameters are modeled as
+//! `Option<&[u8]>` since, unlike most other functions here, the
+//! original has no `FUNC_ATTR_NONNULL_*` attribute and explicitly
+//! null-checks both).
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -52,8 +58,7 @@
 //! restore, not pointer arithmetic that could otherwise land off a
 //! character boundary for a pathological input).
 //!
-//! Deferred: `same_directory` (needs `path_tail_with_sep`, not yet
-//! translated) and everything else requiring options, multibyte case
+//! Deferred: everything else requiring options, multibyte case
 //! folding, or subsystems not yet ported (wildcard expansion,
 //! `'suffixes'`/`'wildignore'`, etc.).
 
@@ -178,6 +183,26 @@ pub fn path_tail(fname: &[u8]) -> usize {
             tail = i + 1;
         }
         i += 1;
+    }
+    tail
+}
+
+/// Gets the offset of the tail of `fname`, including path separators
+/// (`path_tail_with_sep`).
+///
+/// Takes care of `"c:/"` and `"//"`. That means
+/// `path_tail_with_sep(b"dir///file.txt")` returns the offset of
+/// `"///file.txt"`.
+///
+/// @return the offset of the last path separator of `fname`, if there
+/// is any; `0` (i.e. `fname` itself) if it contains no path separator.
+#[must_use]
+pub fn path_tail_with_sep(fname: &[u8]) -> usize {
+    // Don't remove the '/' from "c:/file".
+    let past_head = get_past_head(fname);
+    let mut tail = path_tail(fname);
+    while tail > past_head && after_pathsep(fname, tail) {
+        tail -= 1;
     }
     tail
 }
@@ -855,6 +880,32 @@ pub unsafe fn pathcmp(p: &[u8], q: &[u8], maxlen: Option<usize>) -> i32 {
     1
 }
 
+/// True if file names `f1` and `f2` are in the same directory
+/// (`same_directory`). `f1` may be a short name, `f2` must be a full
+/// path.
+///
+/// `f1`/`f2` are `Option` rather than plain slices to faithfully model
+/// the original's own nullable `char *f1, char *f2` parameters (the
+/// original explicitly checks for `NULL` and returns `false` - unlike
+/// most other functions in this module, it has no `FUNC_ATTR_NONNULL_*`
+/// attribute at all).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`pathcmp`]).
+#[must_use]
+pub unsafe fn same_directory(f1: Option<&[u8]>, f2: Option<&[u8]>) -> bool {
+    let (Some(f1), Some(f2)) = (f1, f2) else {
+        return false; // safety check
+    };
+
+    let (ffname, _) = vim_full_name(f1, false);
+    let t1 = path_tail_with_sep(&ffname);
+    let t2 = path_tail_with_sep(f2);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    t1 == t2 && unsafe { pathcmp(&ffname, f2, Some(t1)) } == 0
+}
+
 /// Try to find a shortname by comparing the fullname with `dir_name`
 /// (`path_shorten_fname`).
 ///
@@ -1355,5 +1406,66 @@ mod tests {
         };
         let shortened = unsafe { path_try_shorten_fname(unrelated) };
         assert_eq!(shortened, unrelated);
+    }
+
+    #[test]
+    fn path_tail_with_sep_single_separator_includes_it() {
+        // "dir/file.txt": path_tail alone would return the offset of
+        // "file.txt" (4); path_tail_with_sep includes the separator
+        // itself, so it returns the offset of "/file.txt" (3).
+        assert_eq!(path_tail_with_sep(b"dir/file.txt"), 3);
+    }
+
+    #[test]
+    fn path_tail_with_sep_collapses_multiple_separators() {
+        // Matches this function's own doc example exactly:
+        // path_tail_with_sep("dir///file.txt") returns a pointer to
+        // "///file.txt" - the offset of the *first* of the three
+        // consecutive separators, not just the last one.
+        assert_eq!(path_tail_with_sep(b"dir///file.txt"), 3);
+    }
+
+    #[test]
+    fn path_tail_with_sep_no_separator_returns_zero() {
+        // "fname if it contains no path separator" - per this
+        // function's own doc comment.
+        assert_eq!(path_tail_with_sep(b"file.txt"), 0);
+    }
+
+    #[test]
+    fn same_directory_is_false_when_either_path_is_none() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert!(!unsafe { same_directory(None, Some(b"/a/b")) });
+        assert!(!unsafe { same_directory(Some(b"/a/b"), None) });
+        assert!(!unsafe { same_directory(None, None) });
+    }
+
+    #[test]
+    fn same_directory_true_for_two_files_in_the_same_directory() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _cwd_guard = crate::os::fs::cwd_test_lock();
+        let cwd = crate::os::fs::os_dirname().unwrap();
+
+        let mut f1 = cwd.clone();
+        assert!(append_path(&mut f1, b"a.txt", MAXPATHL as usize));
+        let mut f2 = cwd;
+        assert!(append_path(&mut f2, b"b.txt", MAXPATHL as usize));
+
+        assert!(unsafe { same_directory(Some(&f1), Some(&f2)) });
+    }
+
+    #[test]
+    fn same_directory_false_for_files_in_different_directories() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _cwd_guard = crate::os::fs::cwd_test_lock();
+        let cwd = crate::os::fs::os_dirname().unwrap();
+
+        let mut f1 = cwd.clone();
+        assert!(append_path(&mut f1, b"a.txt", MAXPATHL as usize));
+        let mut f2 = cwd;
+        assert!(append_path(&mut f2, b"subdir", MAXPATHL as usize));
+        assert!(append_path(&mut f2, b"b.txt", MAXPATHL as usize));
+
+        assert!(!unsafe { same_directory(Some(&f1), Some(&f2)) });
     }
 }
