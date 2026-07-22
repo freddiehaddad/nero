@@ -13,6 +13,7 @@ pub mod fs_defs;
 #[allow(clippy::module_inception)]
 pub mod os;
 pub mod os_defs;
+pub mod proc;
 pub mod stdpaths;
 pub mod time;
 pub mod time_defs;
