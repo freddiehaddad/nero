@@ -721,18 +721,45 @@ mod tests {
         assert_eq!(err, crate::errors::e_marknotset);
     }
 
+    /// Serializes every test that mutates `GLOBALS.curwin`/`curbuf`
+    /// (genuinely global, shared mutable state) via [`CurbufGuard`]/
+    /// [`MarkTestGuard`] below - Rust's default test runner executes
+    /// tests concurrently across threads, and without this, two such
+    /// tests running at once could interleave their `curwin`/`curbuf`
+    /// assignments, making one test's `checkpcmark()`/etc. call
+    /// silently operate on a *different* test's window/buffer.
+    ///
+    /// This is not a hypothetical: this exact race was caught for
+    /// real by running this crate's test suite natively on Linux (via
+    /// WSL) for the first time - a `checkpcmark` test failed
+    /// intermittently there (this dev machine's usual Windows-only
+    /// testing hadn't hit the race, but Linux's thread scheduling
+    /// surfaced it reliably), tracing back to `MarkTestGuard::set`
+    /// mutating `GLOBALS.curwin` with no synchronization at all. Uses
+    /// `PoisonError::into_inner` so one panicking test under the lock
+    /// can't permanently poison it for every later test - same pattern
+    /// as `crate::os::fs::cwd_test_lock`/`os::env`'s
+    /// `homedir_test_lock`.
+    fn globals_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// RAII guard restoring `GLOBALS.curbuf` on drop (including on test
     /// panic via unwinding), so a failed assertion never leaves a
-    /// dangling pointer behind for a later test to observe.
+    /// dangling pointer behind for a later test to observe. Holds
+    /// [`globals_test_lock`] for its entire lifetime.
     struct CurbufGuard {
         previous: *mut BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl CurbufGuard {
         fn set(new_curbuf: *mut BufT) -> Self {
+            let _lock = globals_test_lock();
             let previous = unsafe { GLOBALS.get_mut() }.curbuf;
             unsafe { GLOBALS.get_mut() }.curbuf = new_curbuf;
-            CurbufGuard { previous }
+            CurbufGuard { previous, _lock }
         }
     }
 
@@ -804,17 +831,20 @@ mod tests {
     /// `setpcmark`/`checkpcmark` (`curwin`, `curbuf`, `global_busy`,
     /// `listcmd_busy`, `cmdmod`) on drop, including on test panic via
     /// unwinding - broader version of [`CurbufGuard`] for tests that
-    /// exercise these two functions.
+    /// exercise these two functions. Holds [`globals_test_lock`] for
+    /// its entire lifetime (see that function's doc comment for why).
     struct MarkTestGuard {
         prev_curwin: *mut WinT,
         prev_curbuf: *mut BufT,
         prev_global_busy: i32,
         prev_listcmd_busy: bool,
         prev_cmdmod_flags: i32,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl MarkTestGuard {
         fn set(win: *mut WinT, buf: *mut BufT) -> Self {
+            let _lock = globals_test_lock();
             let globals = unsafe { GLOBALS.get_mut() };
             let guard = MarkTestGuard {
                 prev_curwin: globals.curwin,
@@ -822,6 +852,7 @@ mod tests {
                 prev_global_busy: globals.global_busy,
                 prev_listcmd_busy: globals.listcmd_busy,
                 prev_cmdmod_flags: globals.cmdmod.cmod_flags,
+                _lock,
             };
             globals.curwin = win;
             globals.curbuf = buf;

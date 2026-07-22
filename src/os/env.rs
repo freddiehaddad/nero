@@ -388,6 +388,21 @@ mod tests {
     /// let these tests race against each other.
     static HOMEDIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquires [`HOMEDIR_TEST_LOCK`], tolerating a poisoned lock (one
+    /// panicking test under the lock must not permanently break every
+    /// later test that needs it) - same reasoning and pattern as
+    /// `crate::os::fs::cwd_test_lock`. A real cross-platform test run
+    /// (this crate's own Linux build, via WSL) caught exactly this: an
+    /// unrelated pre-existing test bug (a Windows-only test missing
+    /// `#[cfg(windows)]`) failed and poisoned this same
+    /// `std::sync::Mutex`, cascading into an unrelated homedir test's
+    /// failure purely due to `.lock().unwrap()` not tolerating that.
+    fn homedir_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOMEDIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// RAII guard restoring a set of environment variables to their
     /// original values on drop (including on test panic via
     /// unwinding).
@@ -432,7 +447,7 @@ mod tests {
 
     #[test]
     fn init_homedir_uses_home_when_set() {
-        let _lock = HOMEDIR_TEST_LOCK.lock().unwrap();
+        let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[("HOME", Some("C:/some/home"))]);
         unsafe {
             init_homedir();
@@ -443,7 +458,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn init_homedir_falls_back_to_homedrive_homepath() {
-        let _lock = HOMEDIR_TEST_LOCK.lock().unwrap();
+        let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[
             ("HOME", None),
             ("HOMEDRIVE", Some("C:")),
@@ -458,7 +473,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn init_homedir_falls_back_to_c_drive_when_nothing_set() {
-        let _lock = HOMEDIR_TEST_LOCK.lock().unwrap();
+        let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[("HOME", None), ("HOMEDRIVE", None), ("HOMEPATH", None)]);
         unsafe {
             init_homedir();
@@ -467,8 +482,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn init_homedir_resolves_percent_indirect_reference() {
-        let _lock = HOMEDIR_TEST_LOCK.lock().unwrap();
+        let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[
             ("HOME", Some("%NERO_TEST_INDIRECT_VAR%")),
             ("NERO_TEST_INDIRECT_VAR", Some("C:/indirect/target")),
@@ -485,7 +501,7 @@ mod tests {
         // real environment, just checking the general shape of the
         // result rather than an exact value (which depends on who's
         // running the tests).
-        let _lock = HOMEDIR_TEST_LOCK.lock().unwrap();
+        let _lock = homedir_test_lock();
         unsafe {
             init_homedir();
             let home = os_homedir().expect("init_homedir should always set something");

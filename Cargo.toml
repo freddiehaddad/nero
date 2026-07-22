@@ -13,6 +13,23 @@ path = "src/lib.rs"
 # (src/nvim/macros_defs.h), which must respect the current C locale exactly
 # like the original.
 libc = "0.2"
+# Raw FFI bindings to the actual utf8proc C library (vendors and
+# statically compiles the real utf8proc source, v2.11.0 - not a
+# reimplementation), used by src/nvim/mbyte.c's grapheme-cluster/case-
+# folding/character-width functions, which call directly into
+# utf8proc_get_property/utf8proc_grapheme_break_stateful/
+# utf8proc_decompose_char/utf8proc_toupper/utf8proc_tolower/
+# utf8proc_charwidth in the original. Neovim itself vendors v2.11.3
+# (cmake.deps/deps.txt) - same major.minor, so this is a far more
+# faithful choice than a from-scratch Rust reimplementation
+# (unicode-width/unicode-normalization are a different project with
+# potentially different Unicode-version behavior). Raw (`-sys`)
+# bindings are used directly, matching this crate's existing use of
+# `libc` for direct system-API FFI, rather than a higher-level safe
+# wrapper crate that may not expose every field/function mbyte.c
+# itself uses (verified: the safe `utf8proc` crate's own docs say it
+# "does not (yet) wrap all the functionality" of the C library).
+utf8proc-sys = "0.1"
 
 [features]
 # Mirrors HAVE_WORKING_LIBINTL / ENABLE_LIBINTL from src/nvim/gettext_defs.h
