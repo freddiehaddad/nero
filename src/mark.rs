@@ -11,7 +11,11 @@
 //! `tag.c`'s `tagstack_clear_entry` (small enough to translate
 //! alongside its only real consumer rather than waiting on the rest
 //! of `tag.c`) and `mark_forget_file` (now tractable now that
-//! `tagstack_clear_entry` exists).
+//! `tagstack_clear_entry` exists); `fmarks_check_one`/
+//! `fmarks_check_names` (now tractable now that `path.c`'s
+//! `path_fnamecmp` exists - these two only need it, `namedfm`, and
+//! `GLOBALS.firstwin`/`w_next`, not `buflist_new()` or `TabpageT`'s
+//! window-list fields like the still-blocked `fname2fnum` does).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -27,15 +31,14 @@
 //!   (`search.c`/`textobject.c`).
 //! - `mark_view_restore`: needs `set_topline`/`hasFolding`/
 //!   `linetabsize_eol` (the display/fold subsystem).
-//! - `fname2fnum`/`fmarks_check_names`/`fmarks_check_one`: need path
-//!   resolution (`expand_env`/`path_shorten_fname` - the latter
-//!   re-checked this session and found to need `path_fnamencmp`,
-//!   which itself needs `mbyte.c`'s UTF-8 helpers - `mbyte.c` needs
-//!   its own FFI-vs-crate decision for `utf8proc`, not yet made),
+//! - `fname2fnum`: needs `expand_env` (`~/` expansion) and
 //!   `buflist_new()` (`buffer.c`, itself needing the eval engine's
-//!   `dict_T` - re-checked this session by reading the real function,
-//!   genuinely phase-5 material, not close), and `TabpageT`'s real
-//!   window-list fields (still an opaque placeholder).
+//!   `dict_T` and `apply_autocmds` - re-checked this session by reading
+//!   the real function, genuinely phase-5 material, not close) -
+//!   `path_shorten_fname`/`os_dirname` existing now isn't enough to
+//!   unblock this specific function as a whole (unlike
+//!   `fmarks_check_one`/`fmarks_check_names` above, which needed only
+//!   `path_fnamecmp`).
 //! - `fm_getname`/`mark_line`: need `ml_get()` (`memline.c` - `ml_open`
 //!   now exists, but `ml_get` itself needs `ml_find_line`'s real
 //!   B-tree traversal algorithm, deliberately not rushed - see
@@ -178,6 +181,71 @@ pub fn mark_forget_file(wp: &mut crate::buffer_defs::WinT, fnum: i32) {
             }
         }
         i -= 1;
+    }
+}
+
+/// Check one file mark for a name that matches `name` (the file name
+/// of `buf`). If it matches and doesn't already have a resolved buffer
+/// number, replaces the name with `buf`'s buffer number and frees the
+/// stored name (`fmarks_check_one`, `static` in the original - kept
+/// private here too).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'fileignorecase'`,
+/// transitively via [`crate::path::path_fnamecmp`]).
+unsafe fn fmarks_check_one(fm: &mut XfmarkT, name: &[u8], buf: &BufT) {
+    if fm.fmark.fnum != 0 {
+        return;
+    }
+    let Some(fname) = &fm.fname else {
+        return;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::path::path_fnamecmp(name, fname) } == 0 {
+        fm.fmark.fnum = buf.handle;
+        fm.fname = None;
+    }
+}
+
+/// Check all file marks for a name that matches the file name in
+/// `buf`. May replace the name with an fnum. Used for marks that come
+/// from the ShaDa file (`fmarks_check_names`).
+///
+/// The original's `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` always takes
+/// its `firstwin` branch at this specific call site (the macro's
+/// `(tp) == curtab ? firstwin : tp->tp_firstwin` condition compares
+/// `curtab` to itself), so `curtab`'s own not-yet-fully-translated
+/// window-list fields are never actually needed here - this walks
+/// `GLOBALS.firstwin`/`w_next` directly instead.
+///
+/// # Safety
+/// Same as `fmarks_check_one` (private). Additionally walks the real
+/// `GLOBALS.firstwin` linked list (via `w_next`) and dereferences each
+/// node - callers must ensure every live window in the list is a
+/// valid, properly initialized `WinT`, same requirement as any other
+/// `firstwin`/`w_next` traversal in this crate.
+pub unsafe fn fmarks_check_names(buf: &BufT) {
+    let Some(name) = buf.b_ffname.as_deref() else {
+        return;
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    for fm in namedfm.iter_mut() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { fmarks_check_one(fm, name, buf) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &mut *wp };
+        for i in 0..(w.w_jumplistlen as usize) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { fmarks_check_one(&mut w.w_jumplist[i], name, buf) };
+        }
+        wp = w.w_next;
     }
 }
 
@@ -805,6 +873,13 @@ mod tests {
 
     #[test]
     fn free_all_marks_clears_namedfm() {
+        // NAMEDFM is a shared GlobalCell, same UB risk as GLOBALS/
+        // OPTION_VARS if two tests touch it concurrently - acquire the
+        // same crate-wide lock (this test previously didn't, a gap
+        // found while adding fmarks_check_names' own tests below).
+        let _guard = globals_test_lock();
+        let prev = unsafe { NAMEDFM.get_mut() }.clone();
+
         {
             let namedfm = unsafe { NAMEDFM.get_mut() };
             namedfm[0].fmark.mark.lnum = 5;
@@ -812,6 +887,8 @@ mod tests {
         free_all_marks();
         let namedfm = unsafe { NAMEDFM.get_mut() };
         assert_eq!(namedfm[0].fmark.mark.lnum, 0);
+
+        *unsafe { NAMEDFM.get_mut() } = prev;
     }
 
     /// RAII guard restoring every `GLOBALS` field touched by
@@ -1057,5 +1134,149 @@ mod tests {
         let end_mark = unsafe { mark_get_visual(&buf, b'>') };
         assert_eq!(unsafe { &*end_mark }.mark.col, MAXCOL);
         assert_eq!(unsafe { &*end_mark }.mark.coladd, 0);
+    }
+
+    /// RAII guard restoring `GLOBALS.firstwin` on drop. Unlike
+    /// [`CurbufGuard`]/[`MarkTestGuard`], this does NOT acquire its own
+    /// copy of [`globals_test_lock`]: it's meant to be composed with
+    /// [`NamedfmGuard`] in the same test (both touching `NAMEDFM`-
+    /// adjacent state via `fmarks_check_names`), and the lock is a
+    /// plain, non-reentrant `Mutex` - acquiring it twice from the same
+    /// thread would deadlock. Callers must hold `globals_test_lock()`
+    /// for this guard's entire lifetime instead.
+    struct FirstwinGuard {
+        previous: *mut WinT,
+    }
+
+    impl FirstwinGuard {
+        fn set(new_firstwin: *mut WinT) -> Self {
+            let previous = unsafe { GLOBALS.get_mut() }.firstwin;
+            unsafe { GLOBALS.get_mut() }.firstwin = new_firstwin;
+            FirstwinGuard { previous }
+        }
+    }
+
+    impl Drop for FirstwinGuard {
+        fn drop(&mut self) {
+            unsafe { GLOBALS.get_mut() }.firstwin = self.previous;
+        }
+    }
+
+    /// RAII guard saving/restoring the whole `NAMEDFM` array around a
+    /// test. `NAMEDFM` is its own `GlobalCell`, subject to the exact
+    /// same cross-test UB risk as `GLOBALS`/`OPTION_VARS` if two tests
+    /// touch it concurrently without a shared lock (a gap found and
+    /// fixed on `free_all_marks_clears_namedfm` while adding these
+    /// tests). Like [`FirstwinGuard`], this does NOT acquire its own
+    /// lock (composability with `FirstwinGuard` in the same test) -
+    /// callers must hold `globals_test_lock()` for this guard's entire
+    /// lifetime.
+    struct NamedfmGuard {
+        previous: [XfmarkT; NGLOBALMARKS as usize],
+    }
+
+    impl NamedfmGuard {
+        fn acquire() -> Self {
+            let previous = unsafe { NAMEDFM.get_mut() }.clone();
+            NamedfmGuard { previous }
+        }
+    }
+
+    impl Drop for NamedfmGuard {
+        fn drop(&mut self) {
+            // `[XfmarkT; 36]` has no `Default` impl (the blanket array
+            // impl only covers up to 32 elements), so clone rather
+            // than `mem::take` here.
+            *unsafe { NAMEDFM.get_mut() } = self.previous.clone();
+        }
+    }
+
+    #[test]
+    fn fmarks_check_names_updates_matching_global_mark() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fname = Some(b"/foo/bar".to_vec());
+
+        let buf = BufT { handle: 42, b_ffname: Some(b"/foo/bar".to_vec()), ..Default::default() };
+
+        unsafe { fmarks_check_names(&buf) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.fnum, 42);
+        assert_eq!(namedfm[0].fname, None);
+    }
+
+    #[test]
+    fn fmarks_check_names_leaves_non_matching_mark_untouched() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fname = Some(b"/other/file".to_vec());
+
+        let buf = BufT { handle: 42, b_ffname: Some(b"/foo/bar".to_vec()), ..Default::default() };
+
+        unsafe { fmarks_check_names(&buf) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.fnum, 0);
+        assert_eq!(namedfm[0].fname, Some(b"/other/file".to_vec()));
+    }
+
+    #[test]
+    fn fmarks_check_names_skips_marks_that_already_have_a_fnum() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fname = Some(b"/foo/bar".to_vec());
+        namedfm[0].fmark.fnum = 7; // already resolved
+
+        let buf = BufT { handle: 42, b_ffname: Some(b"/foo/bar".to_vec()), ..Default::default() };
+
+        unsafe { fmarks_check_names(&buf) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        // Untouched: fnum != 0 short-circuits fmarks_check_one.
+        assert_eq!(namedfm[0].fmark.fnum, 7);
+        assert_eq!(namedfm[0].fname, Some(b"/foo/bar".to_vec()));
+    }
+
+    #[test]
+    fn fmarks_check_names_is_noop_when_buf_has_no_ffname() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fname = Some(b"/foo/bar".to_vec());
+
+        let buf = BufT { handle: 42, b_ffname: None, ..Default::default() };
+
+        unsafe { fmarks_check_names(&buf) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.fnum, 0);
+        assert_eq!(namedfm[0].fname, Some(b"/foo/bar".to_vec()));
+    }
+
+    #[test]
+    fn fmarks_check_names_updates_matching_window_jumplist_entry() {
+        let _lock = globals_test_lock();
+        let _namedfm_guard = NamedfmGuard::acquire();
+
+        let mut win = WinT { w_jumplistlen: 1, ..Default::default() };
+        win.w_jumplist[0] = XfmarkT::default();
+        win.w_jumplist[0].fname = Some(b"/foo/bar".to_vec());
+
+        let _firstwin_guard = FirstwinGuard::set(&mut win as *mut WinT);
+
+        let buf = BufT { handle: 99, b_ffname: Some(b"/foo/bar".to_vec()), ..Default::default() };
+
+        unsafe { fmarks_check_names(&buf) };
+
+        assert_eq!(win.w_jumplist[0].fmark.fnum, 99);
+        assert_eq!(win.w_jumplist[0].fname, None);
     }
 }
