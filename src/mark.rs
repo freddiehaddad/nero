@@ -21,7 +21,9 @@
 //! "different buffer" branch still needs `buflist_nr2name`,
 //! `buffer.c`, and returns `None` for that case); `mark_mb_adjustpos`
 //! (now tractable now that `memline.c`'s `ml_get_buf`/`ml_get_buf_len`
-//! and `mbyte.c`'s `utf_head_off` all exist).
+//! and `mbyte.c`'s `utf_head_off` all exist); `mark_view_restore` (now
+//! tractable now that `move.c`'s `set_topline`, `fold.c`'s
+//! `hasFolding`, and `plines.c`'s `linetabsize_eol` all exist).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -35,8 +37,6 @@
 //!   buffer-list lookup (`buflist_findnr`/`buflist_getfile`, still
 //!   deferred in `buffer.c`), window switching, or `findpar`/`findsent`
 //!   (`search.c`/`textobject.c`).
-//! - `mark_view_restore`: needs `set_topline`/`hasFolding`/
-//!   `linetabsize_eol` (the display/fold subsystem).
 //! - `fname2fnum`: needs `expand_env` (`~/` expansion) and
 //!   `buflist_new()` (`buffer.c`, itself needing the eval engine's
 //!   `dict_T` and `apply_autocmds` - re-checked this session by reading
@@ -256,6 +256,44 @@ pub fn mark_view_make(wp: &crate::buffer_defs::WinT, pos: PosT) -> FmarkvT {
         topline_offset: pos.lnum - wp.w_topline,
         skipcol: wp.w_skipcol,
     }
+}
+
+/// Restore the mark view. By remembering the offset between topline
+/// and mark lnum at the time of definition, this function restores
+/// the "view". Assumes the mark has been checked, is valid
+/// (`mark_view_restore`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+pub unsafe fn mark_view_restore(fm: Option<&FmarkT>) {
+    let Some(fm) = fm else { return };
+    if fm.view.topline_offset < 0 {
+        return;
+    }
+    let topline = fm.mark.lnum - fm.view.topline_offset;
+    // If the mark does not have a view, topline_offset is MAXLNUM,
+    // and this check can prevent restoring mark view in that case.
+    if topline < 1 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::set_topline(curwin, topline) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let no_folding = !unsafe { crate::fold::has_folding(&mut *curwin, topline) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_size = unsafe { crate::plines::linetabsize_eol(curwin, topline) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *curwin };
+    w.w_skipcol = if fm.view.skipcol > 0 && no_folding && fm.view.skipcol < line_size {
+        fm.view.skipcol
+    } else {
+        0
+    };
 }
 
 /// Search for the next named mark in the current file from a start
@@ -1633,6 +1671,105 @@ mod tests {
         // regardless of what ptr2cells might otherwise report for it.
         assert_eq!(pos.coladd, 1);
 
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_view_restore_noop_when_fm_is_none() {
+        let _guard = globals_test_lock();
+        unsafe { mark_view_restore(None) };
+        // No panic, no GLOBALS access attempted - nothing to assert
+        // beyond "this doesn't crash".
+    }
+
+    #[test]
+    fn mark_view_restore_noop_when_topline_offset_negative() {
+        let _guard = globals_test_lock();
+        let fm = FmarkT {
+            mark: PosT { lnum: 10, col: 0, coladd: 0 },
+            fnum: 0,
+            timestamp: 0,
+            view: FmarkvT { topline_offset: -1, skipcol: 0 },
+            additional_data: None,
+        };
+        unsafe { mark_view_restore(Some(&fm)) };
+        // Returns before touching GLOBALS.curwin at all - nothing to
+        // assert beyond "this doesn't crash".
+    }
+
+    #[test]
+    fn mark_view_restore_noop_when_mark_has_no_recorded_view() {
+        let _guard = globals_test_lock();
+        // INIT_FMARKV's default topline_offset is MAXLNUM, so any
+        // realistic mark.lnum makes `topline = lnum - MAXLNUM` deeply
+        // negative - the "topline < 1" guard should catch this.
+        let fm = FmarkT {
+            mark: PosT { lnum: 10, col: 0, coladd: 0 },
+            fnum: 0,
+            timestamp: 0,
+            view: FmarkvT::default(),
+            additional_data: None,
+        };
+        unsafe { mark_view_restore(Some(&fm)) };
+    }
+
+    #[test]
+    fn mark_view_restore_sets_topline_and_skipcol_within_bounds() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"hello world\0"); // 11 columns wide
+
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let prev_curwin = unsafe { GLOBALS.get_mut() }.curwin;
+        unsafe { GLOBALS.get_mut() }.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        let fm = FmarkT {
+            mark: PosT { lnum: 5, col: 0, coladd: 0 },
+            fnum: 0,
+            timestamp: 0,
+            view: FmarkvT { topline_offset: 4, skipcol: 5 }, // topline = 5 - 4 = 1
+            additional_data: None,
+        };
+        unsafe { mark_view_restore(Some(&fm)) };
+
+        assert_eq!(win.w_topline, 1);
+        assert_eq!(win.w_skipcol, 5); // 0 < 5 < linetabsize_eol(1) == 11
+
+        unsafe { GLOBALS.get_mut() }.curwin = prev_curwin;
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_view_restore_resets_skipcol_when_out_of_bounds() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"hello world\0"); // 11 columns wide
+
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let prev_curwin = unsafe { GLOBALS.get_mut() }.curwin;
+        unsafe { GLOBALS.get_mut() }.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        let fm = FmarkT {
+            mark: PosT { lnum: 5, col: 0, coladd: 0 },
+            fnum: 0,
+            timestamp: 0,
+            view: FmarkvT { topline_offset: 4, skipcol: 50 }, // 50 >= linetabsize_eol(1) == 11
+            additional_data: None,
+        };
+        unsafe { mark_view_restore(Some(&fm)) };
+
+        assert_eq!(win.w_topline, 1);
+        assert_eq!(win.w_skipcol, 0);
+
+        unsafe { GLOBALS.get_mut() }.curwin = prev_curwin;
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);

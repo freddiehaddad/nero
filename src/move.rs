@@ -31,6 +31,11 @@
 //! `set_empty_rows`/`win_check_anchored_floats` (redraw + floating-
 //! window machinery) - genuinely substantial, not a quick win.
 //!
+//! Also translated: `set_topline` (now that `fold.c`'s `has_folding`
+//! exists) - unblocked `mark.c`'s `mark_view_restore`. Omits the
+//! original's `redraw_later(wp, UPD_VALID)` call, matching the same
+//! established precedent as the rest of this file.
+//!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
 //! `validate_cursor`/`curs_rows`/`validate_cheight`/`validate_botline_win`,
@@ -358,6 +363,50 @@ pub unsafe fn invalidate_botline_win(wp: *mut WinT) {
 pub unsafe fn approximate_botline_win(wp: *mut WinT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { &mut *wp }.w_valid &= !i32::from(w_valid::VALID_BOTLINE);
+}
+
+/// Set `wp.w_topline` to `lnum` (`set_topline`).
+///
+/// Omits the original's `redraw_later(wp, UPD_VALID)` call - a pure
+/// redraw-scheduling side effect, matching this crate's established
+/// precedent (e.g. `set_valid_virtcol`). Relies on
+/// [`crate::fold::has_folding`]'s "no folds in this window" fast path
+/// (see that function's own doc) - correct for the common no-folds
+/// case, panicking otherwise.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+pub unsafe fn set_topline(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let prev_topline = w.w_topline;
+
+    // Go to first of folded lines. has_folding's own "no folds" fast
+    // path never rewrites `lnum` (matching the original's own
+    // behavior when hasFolding returns false), so `lnum` is used
+    // as-is below regardless of this call's result.
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::fold::has_folding(w, lnum) };
+
+    // Approximate the value of w_botline.
+    w.w_botline += lnum - w.w_topline;
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*w.w_buffer }.b_ml.ml_line_count;
+    if w.w_botline > line_count + 1 {
+        w.w_botline = line_count + 1;
+    }
+    w.w_topline = lnum;
+    w.w_topline_was_set = true;
+    if lnum != prev_topline {
+        // Keep the filler lines when the topline didn't change.
+        w.w_topfill = 0;
+    }
+    w.w_valid &= !(i32::from(w_valid::VALID_WROW)
+        | i32::from(w_valid::VALID_CROW)
+        | i32::from(w_valid::VALID_BOTLINE)
+        | i32::from(w_valid::VALID_TOPLINE));
+    // Don't set VALID_TOPLINE here, 'scrolloff' needs to be checked.
 }
 
 #[cfg(test)]
@@ -789,5 +838,65 @@ mod tests {
         unsafe { approximate_botline_win(&mut win as *mut WinT) };
 
         assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE_AP));
+    }
+
+    #[test]
+    fn set_topline_basic_change_updates_botline_and_resets_topfill() {
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 100;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_botline = 20;
+        win.w_topfill = 5;
+        win.w_valid = i32::from(w_valid::VALID_WROW)
+            | i32::from(w_valid::VALID_CROW)
+            | i32::from(w_valid::VALID_BOTLINE)
+            | i32::from(w_valid::VALID_TOPLINE)
+            | i32::from(w_valid::VALID_WCOL); // must survive
+
+        unsafe { set_topline(&mut win as *mut WinT, 10) };
+
+        assert_eq!(win.w_topline, 10);
+        assert_eq!(win.w_botline, 29); // 20 + (10 - 1)
+        assert_eq!(win.w_topfill, 0); // lnum changed
+        assert!(win.w_topline_was_set);
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_WCOL));
+    }
+
+    #[test]
+    fn set_topline_same_line_preserves_topfill() {
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 100;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 5;
+        win.w_botline = 20;
+        win.w_topfill = 3;
+
+        unsafe { set_topline(&mut win as *mut WinT, 5) };
+
+        assert_eq!(win.w_topline, 5);
+        assert_eq!(win.w_botline, 20); // 20 + (5 - 5)
+        assert_eq!(win.w_topfill, 3); // lnum unchanged -> filler lines kept
+    }
+
+    #[test]
+    fn set_topline_clamps_botline_to_line_count_plus_one() {
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 5;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_botline = 3;
+
+        unsafe { set_topline(&mut win as *mut WinT, 4) };
+
+        // 3 + (4 - 1) = 6, but clamped to line_count(5) + 1 = 6 exactly
+        // here - use a bigger jump to actually exercise the clamp.
+        assert_eq!(win.w_botline, 6);
+
+        win.w_topline = 4;
+        win.w_botline = 6;
+        unsafe { set_topline(&mut win as *mut WinT, 100) };
+        // 6 + (100 - 4) = 102, clamped down to 5 + 1 = 6.
+        assert_eq!(win.w_botline, 6);
     }
 }
