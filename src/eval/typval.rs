@@ -41,14 +41,21 @@
 //! variant needed" precedent - e.g. `hashtab.rs`'s `hash_find`/
 //! `hash_find_len`); `tv_dict_item_free` (the List/Dict/Blob/Partial-
 //! valued-item branches are `unimplemented!()` - see its own doc
-//! comment); `tv_dict_item_remove`; `tv_dict_alloc`/
+//! comment); `tv_dict_item_copy`; `tv_dict_item_remove`; `tv_dict_alloc`/
 //! `tv_dict_free_contents`/`tv_dict_free_dict`/`tv_dict_free`;
 //! `tv_dict_find`/`tv_dict_has_key`; `tv_dict_add` (omits the
 //! original's `tv_dict_wrong_func_name` g:/l: validation - needs
 //! `get_globvar_dict`/`get_funccal_local_ht`/`var_wrong_func_name`,
 //! none translated, and nothing in this crate can even construct a
 //! real global/local-funccall scope dict yet for that check to apply
-//! to).
+//! to); `tv_copy` (the `VAR_FUNC` branch omits the original's own
+//! `func_ref` refcount increment - needs a function-name registry,
+//! `eval/userfunc.c`'s `ufunc_T` table, not yet translated, though the
+//! function-name *string* itself is still copied correctly; the
+//! `VAR_PARTIAL` branch is `unimplemented!()` - needs `partial_T`'s
+//! real `pt_refcount` field, still an opaque placeholder); `tv_list_ref`
+//! (`eval/typval_defs.rs`'s own `list_T`/`listitem_T` companion,
+//! translated here since `tv_copy` is its first real caller).
 //!
 //! `gc_first_dict` (the original's file-static "list of all live
 //! dicts, for `:garbagecollect`" linked-list head) is translated as
@@ -65,11 +72,8 @@
 //! `LUA_NOREF` (the Lua host, phase 13, isn't started).
 //!
 //! # Deferred
-//! - `tv_dict_item_copy`: needs `tv_copy` (deep-copies a `TypvalT`,
-//!   including refcount increments for List/Dict/Blob/Partial), not
-//!   yet translated.
-//! - `tv_clear`/`tv_free`/`tv_copy` themselves: `tv_clear`'s *real*
-//!   behavior is implemented via a shared encode-traversal abstraction
+//! - `tv_clear`/`tv_free` themselves: `tv_clear`'s *real* behavior is
+//!   implemented via a shared encode-traversal abstraction
 //!   (`encode_vim_to_nothing`, `viml_encode.c` - reused for JSON/
 //!   msgpack encoding too, not just clearing) - a separate, substantial
 //!   subsystem of its own, not attempted here.
@@ -107,6 +111,93 @@ pub fn tv_dict_item_alloc(key: &[u8]) -> *mut DictitemT {
         di_flags: dict_item_flags::ALLOC,
         di_key,
     }))
+}
+
+/// Increase reference count for a given list. Does nothing for `NULL`
+/// lists (`tv_list_ref`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+pub unsafe fn tv_list_ref(l: *mut crate::eval::typval_defs::ListT) {
+    if l.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_refcount += 1 };
+}
+
+/// Copy typval from one location to another (`tv_copy`).
+///
+/// When needed, allocates a string or increases a reference count.
+/// Does not make a copy of a container, but copies its reference.
+///
+/// It is OK for `from` and `to` to point to the same location - this
+/// is used to make a copy later (matches the original's own note;
+/// this translation, cloning `from`'s value up front before writing
+/// `to`, naturally supports this too).
+///
+/// Two of the original's branches are not fully replicated:
+/// - `VAR_FUNC`: the function name string itself is copied correctly
+///   (via the `.clone()` below), but the original's own
+///   `func_ref(to->vval.v_string)` (incrementing the named function's
+///   `uf_refcount` via `find_func()`) is omitted - needs a function-
+///   name registry (`eval/userfunc.c`'s `ufunc_T` table), not yet
+///   translated.
+/// - `VAR_PARTIAL`: `unimplemented!()` - needs `partial_T`'s real
+///   `pt_refcount` field; `partial_T` is still an opaque placeholder
+///   (needs `ufunc_T` first).
+///
+/// # Safety
+/// If `from`'s value is `List`/`Dict`/`Blob`-typed with a non-null
+/// pointer, that pointer must be valid (matching every other function
+/// in this crate that touches those types).
+pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
+    to.v_lock = VarLockStatus::Unlocked;
+    to.value = from.value.clone();
+    match &to.value {
+        TypvalValue::Unknown => {
+            // semsg(_(e_intern2), "tv_copy(UNKNOWN)") omitted (message
+            // subsystem, phase 15) - this is an internal-error report
+            // for a case that should never legitimately occur.
+            debug_assert!(false, "tv_copy(UNKNOWN): matches the original's own internal-error report");
+        }
+        TypvalValue::Number(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::Bool(_)
+        | TypvalValue::Special(_)
+        | TypvalValue::String(_) => {
+            // Number/Float/Bool/Special: plain values, nothing extra
+            // to do. String: `.clone()` above already deep-copied the
+            // owned Vec<u8> bytes - matching the original's own
+            // `xstrdup`, just without a manual allocation call.
+        }
+        TypvalValue::Func(_) => {
+            // See this function's own doc comment for why func_ref()
+            // is omitted - the name string itself is already copied.
+        }
+        TypvalValue::Partial(_) => {
+            unimplemented!(
+                "tv_copy: VAR_PARTIAL refcount increment needs partial_T's real pt_refcount \
+                 field, not yet translated (partial_T is still an opaque placeholder)"
+            );
+        }
+        TypvalValue::Blob(blob) => {
+            if !blob.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (**blob).bv_refcount += 1 };
+            }
+        }
+        TypvalValue::List(list) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_ref(*list) };
+        }
+        TypvalValue::Dict(dict) => {
+            if !dict.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (**dict).dv_refcount += 1 };
+            }
+        }
+    }
 }
 
 /// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
@@ -158,6 +249,25 @@ pub unsafe fn tv_dict_item_free(item: *mut DictitemT) {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { (*item).di_tv = TypvalT::default() };
     }
+}
+
+/// Make a copy of a dictionary item (`tv_dict_item_copy`).
+///
+/// # Safety
+/// `di` must be a valid, non-null pointer to a live `DictitemT`.
+/// Forwards [`tv_copy`]'s own safety requirements for any List/Dict/
+/// Blob value `di` holds.
+#[must_use]
+pub unsafe fn tv_dict_item_copy(di: *mut DictitemT) -> *mut DictitemT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let key: &[u8] = unsafe { &(*di).di_key };
+    // `di_key` carries a trailing NUL; `tv_dict_item_alloc` appends
+    // its own, so strip it here to avoid double-NUL-terminating.
+    let key = &key[..key.len().saturating_sub(1)];
+    let new_di = tv_dict_item_alloc(key);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(&(*di).di_tv, &mut (*new_di).di_tv) };
+    new_di
 }
 
 /// Remove item from dictionary and free it (`tv_dict_item_remove`).
@@ -337,6 +447,28 @@ mod tests {
     use super::*;
     use crate::vim_defs::FAIL;
 
+    /// A minimal, otherwise-zeroed `ListT` for `tv_copy`/`tv_list_ref`
+    /// tests - `ListT` deliberately doesn't derive `Default` (its raw
+    /// pointer fields have real ownership semantics elsewhere), so
+    /// tests needing a standalone instance build one explicitly.
+    fn test_list() -> crate::eval::typval_defs::ListT {
+        crate::eval::typval_defs::ListT {
+            lv_first: std::ptr::null_mut(),
+            lv_last: std::ptr::null_mut(),
+            lv_watch: std::ptr::null_mut(),
+            lv_idx_item: std::ptr::null_mut(),
+            lv_copylist: std::ptr::null_mut(),
+            lv_used_next: std::ptr::null_mut(),
+            lv_used_prev: std::ptr::null_mut(),
+            lv_refcount: 0,
+            lv_len: 0,
+            lv_idx: 0,
+            lv_copy_id: 0,
+            lv_lock: VarLockStatus::Unlocked,
+            lua_table_ref: -1,
+        }
+    }
+
     #[test]
     fn tv_dict_item_alloc_copies_key_and_nul_terminates() {
         let item = tv_dict_item_alloc(b"hello");
@@ -493,6 +625,124 @@ mod tests {
             tv_dict_free(d3);
             tv_dict_free(d1);
             assert!((*GC_FIRST_DICT.get_mut()).is_null());
+        }
+    }
+
+    #[test]
+    fn tv_copy_number_resets_lock_and_copies_value() {
+        let from = TypvalT { v_lock: VarLockStatus::Locked, value: TypvalValue::Number(42) };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) };
+        assert_eq!(to.v_lock, VarLockStatus::Unlocked);
+        assert!(matches!(to.value, TypvalValue::Number(42)));
+    }
+
+    #[test]
+    fn tv_copy_string_deep_copies_the_bytes() {
+        let from = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(Some(b"hi".to_vec())) };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) };
+        // Mutate `to`'s string and confirm `from`'s own copy is
+        // unaffected - proving this is a real deep copy, not a shared
+        // reference (Rust's `Vec<u8>::clone()` already guarantees
+        // this; the assertion just makes the intent explicit).
+        if let TypvalValue::String(Some(s)) = &mut to.value {
+            s.push(b'!');
+        }
+        assert!(matches!(&from.value, TypvalValue::String(Some(s)) if s == b"hi"));
+        assert!(matches!(&to.value, TypvalValue::String(Some(s)) if s == b"hi!"));
+    }
+
+    #[test]
+    fn tv_copy_blob_increments_shared_refcount() {
+        let mut blob =
+            crate::eval::typval_defs::BlobT { bv_refcount: 5, ..Default::default() };
+        let from = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Blob(&mut blob as *mut crate::eval::typval_defs::BlobT),
+        };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) };
+        assert_eq!(blob.bv_refcount, 6);
+        // `to` shares the SAME blob pointer as `from` (a reference
+        // copy, not a container deep-copy) - matching the original's
+        // own documented "copies its reference" behavior.
+        assert!(matches!(to.value, TypvalValue::Blob(p) if std::ptr::eq(p, &blob)));
+    }
+
+    #[test]
+    fn tv_copy_blob_null_pointer_is_a_noop() {
+        let from = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(std::ptr::null_mut()) };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) }; // must not panic/segfault
+        assert!(matches!(to.value, TypvalValue::Blob(p) if p.is_null()));
+    }
+
+    #[test]
+    fn tv_copy_list_increments_shared_refcount() {
+        let mut list = test_list();
+        let from = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::List(&mut list as *mut crate::eval::typval_defs::ListT),
+        };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) };
+        assert_eq!(list.lv_refcount, 1);
+    }
+
+    #[test]
+    fn tv_copy_dict_increments_shared_refcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let from = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d) };
+            let mut to = TypvalT::default();
+            tv_copy(&from, &mut to);
+            assert_eq!((*d).dv_refcount, 1);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "VAR_PARTIAL refcount increment")]
+    fn tv_copy_partial_panics() {
+        let from = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(std::ptr::null_mut()),
+        };
+        let mut to = TypvalT::default();
+        unsafe { tv_copy(&from, &mut to) };
+    }
+
+    #[test]
+    fn tv_list_ref_null_is_noop() {
+        unsafe { tv_list_ref(std::ptr::null_mut()) }; // must not panic
+    }
+
+    #[test]
+    fn tv_list_ref_increments_refcount() {
+        let mut list = test_list();
+        unsafe { tv_list_ref(&mut list as *mut crate::eval::typval_defs::ListT) };
+        assert_eq!(list.lv_refcount, 1);
+    }
+
+    #[test]
+    fn tv_dict_item_copy_is_a_genuinely_separate_allocation() {
+        let original = tv_dict_item_alloc(b"count");
+        unsafe {
+            (*original).di_tv.value = TypvalValue::Number(99);
+
+            let copy = tv_dict_item_copy(original);
+            assert_ne!(original, copy);
+            assert_eq!((*copy).di_key, b"count\0");
+            assert!(matches!((*copy).di_tv.value, TypvalValue::Number(99)));
+
+            // Mutating the copy doesn't affect the original.
+            (*copy).di_tv.value = TypvalValue::Number(1);
+            assert!(matches!((*original).di_tv.value, TypvalValue::Number(99)));
+
+            tv_dict_item_free(original);
+            tv_dict_item_free(copy);
         }
     }
 }
