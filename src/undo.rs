@@ -18,7 +18,15 @@
 //! `clearpos`); `u_save_line_buf`/`u_save_line`/`u_saveline` (the "U"
 //! command's single-line save mechanism - now tractable now that
 //! `memline.c`'s `ml_get_buf` exists and `GLOBALS.curwin`/`WinT.
-//! w_buffer`/`w_cursor` are all already present).
+//! w_buffer`/`w_cursor` are all already present); `get_undolevel`/
+//! `u_get_headentry`/`u_getbot`/`u_sync` (re-examined: `u_get_headentry`/
+//! `u_getbot`'s own `iemsg()` calls are genuinely reachable "corrupted
+//! undo list"/"line missing" defensive checks, not internal-only
+//! invariants, but they fit the same `mf_write`/`ml_open`/`ml_find_line`
+//! policy already established elsewhere in this crate: the message
+//! *display* is skipped since `message.c`'s pipeline isn't tractable
+//! yet, while the exact same state/fallback behavior as the original is
+//! kept).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -57,7 +65,7 @@
 //! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
 //!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
 //!   `ex_*` functions).
-//! - `u_get_headentry`/`u_getbot`: need `iemsg()` (`message.c`).
+
 
 use crate::buffer_defs::BufT;
 use crate::pos_defs::LinenrT;
@@ -449,6 +457,108 @@ pub unsafe fn curbuf_is_changed() -> bool {
     let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { buf_is_changed(curbuf) }
+}
+
+/// Get the `'undolevels'` value for the current buffer (`get_undolevel`).
+///
+/// Touches `crate::option_vars::OPTION_VARS` for the global fallback.
+fn get_undolevel(buf: &BufT) -> crate::types_defs::OptInt {
+    if buf.b_p_ul == crate::option_vars::NO_LOCAL_UNDOLEVEL {
+        // SAFETY: OPTION_VARS is always initialized before any editor
+        // code runs, matching every other OPTION_VARS access in this
+        // crate.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul
+    } else {
+        buf.b_p_ul
+    }
+}
+
+/// Get the index (in place of the original's raw pointer - see
+/// `uh_entries`'s own doc comment) of the last added entry. If it's not
+/// valid, give an error message and return `None` (`u_get_headentry`).
+///
+/// The original's `iemsg(_(e_undo_list_corrupt))` call is omitted here
+/// (`message.c`'s display pipeline is still not tractable - see this
+/// module's own doc comment), matching the established
+/// `mf_write`/`ml_open`/`ml_find_line` policy: the *state*/return value
+/// stays exactly as faithful as the original's (`None`, matching its
+/// `NULL`), only the user-visible message text is skipped.
+fn u_get_headentry(buf: &BufT) -> Option<usize> {
+    if buf.b_u_newhead.is_null() {
+        return None;
+    }
+    // SAFETY: b_u_newhead was just checked non-null above, and every
+    // live UHeader pointer in this crate is a valid Box::into_raw
+    // allocation (see u_freeheader's own safety doc).
+    let uh = unsafe { &*buf.b_u_newhead };
+    // uh_entries.is_empty() stands in for the original's `uh_entry ==
+    // NULL`, matching the same uh_entries.first()-as-uh_entry
+    // convention already established in u_find_first_changed.
+    if uh.uh_entries.is_empty() {
+        return None;
+    }
+    Some(0)
+}
+
+/// Compute the line number of the previous `u_save()`'s `ue_bot`. Only
+/// called when `b_u_synced` is false (`u_getbot`).
+fn u_getbot(buf: &mut BufT) {
+    if u_get_headentry(buf).is_none() {
+        // check for corrupt undo list
+        return;
+    }
+
+    // SAFETY: u_get_headentry just confirmed buf.b_u_newhead is
+    // non-null and points at a live UHeader.
+    let uh = unsafe { &mut *buf.b_u_newhead };
+    if let Some(idx) = uh.uh_getbot_entry {
+        // The new ue_bot is computed from the number of lines that has
+        // been inserted (0 - deleted) since calling u_save. This is
+        // equal to the old line count subtracted from the current
+        // line count.
+        let ue_lcount = uh.uh_entries[idx].ue_lcount;
+        let ue_top = uh.uh_entries[idx].ue_top;
+        let ue_size = uh.uh_entries[idx].ue_array.len() as LinenrT;
+        let extra = buf.b_ml.ml_line_count - ue_lcount;
+        let mut ue_bot = ue_top + ue_size + 1 + extra;
+        if ue_bot < 1 || ue_bot > buf.b_ml.ml_line_count {
+            // iemsg(_(e_undo_line_missing)) omitted - see this
+            // function's own doc comment above. Assume all lines
+            // deleted, will get all the old lines back without
+            // deleting the current ones.
+            ue_bot = ue_top + 1;
+        }
+        uh.uh_entries[idx].ue_bot = ue_bot;
+
+        uh.uh_getbot_entry = None;
+    }
+
+    buf.b_u_synced = true;
+}
+
+/// Stop adding to the current entry list (`u_sync`).
+///
+/// @param force  if true, also sync when `no_u_sync` is set.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+pub unsafe fn u_sync(force: bool) {
+    // Skip it when already synced or syncing is disabled.
+    // SAFETY: forwarded from this function's own safety doc.
+    let no_u_sync = unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    if curbuf.b_u_synced || (!force && no_u_sync > 0) {
+        return;
+    }
+
+    if get_undolevel(curbuf) < 0 {
+        curbuf.b_u_synced = true; // no entries, nothing to do
+    } else {
+        u_getbot(curbuf); // compute ue_bot of previous u_save
+        curbuf.b_u_curhead = std::ptr::null_mut();
+    }
 }
 
 #[cfg(test)]
@@ -1031,5 +1141,257 @@ mod tests {
         assert_eq!(buf.b_u_line_colnr, 7);
         assert_eq!(buf.b_u_line_ptr, Some(b"two\0".to_vec()));
         close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_undolevel_uses_buffer_local_value_when_set() {
+        let buf = BufT { b_p_ul: 5, ..Default::default() };
+        assert_eq!(get_undolevel(&buf), 5);
+    }
+
+    #[test]
+    fn get_undolevel_falls_back_to_global_when_no_local_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf = BufT {
+            b_p_ul: crate::option_vars::NO_LOCAL_UNDOLEVEL,
+            ..Default::default()
+        };
+        let prev_p_ul = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = 42;
+
+        assert_eq!(get_undolevel(&buf), 42);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = prev_p_ul;
+    }
+
+    #[test]
+    fn u_get_headentry_none_when_newhead_is_null() {
+        let buf = BufT::default();
+        assert_eq!(u_get_headentry(&buf), None);
+    }
+
+    #[test]
+    fn u_get_headentry_none_when_entries_empty() {
+        let uhp = new_header(); // UHeader::default() has an empty uh_entries
+        let buf = BufT { b_u_newhead: uhp, ..Default::default() };
+        assert_eq!(u_get_headentry(&buf), None);
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+    }
+
+    #[test]
+    fn u_get_headentry_some_when_entries_present() {
+        let uhp = new_header();
+        unsafe {
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"one\0".to_vec()],
+            });
+        }
+        let buf = BufT { b_u_newhead: uhp, ..Default::default() };
+        assert_eq!(u_get_headentry(&buf), Some(0));
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+    }
+
+    #[test]
+    fn u_getbot_noop_when_no_getbot_entry_pending() {
+        let uhp = new_header();
+        unsafe {
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 0,
+                ue_array: vec![b"one\0".to_vec()],
+            });
+            // uh_getbot_entry left at its default None.
+        }
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_synced: false,
+            ..Default::default()
+        };
+
+        u_getbot(&mut buf);
+
+        // Still marked synced (the original always sets b_u_synced =
+        // true at the very end, regardless of whether uh_getbot_entry
+        // was set), but the entry itself is untouched.
+        assert!(buf.b_u_synced);
+        assert_eq!(unsafe { (&(*uhp).uh_entries)[0].ue_bot }, 0);
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+    }
+
+    #[test]
+    fn u_getbot_computes_bot_from_line_count_delta() {
+        let uhp = new_header();
+        unsafe {
+            // ue_top=0, ue_size (ue_array.len())=2, ue_lcount=3 (line
+            // count at the time u_save was called - i.e. the buffer
+            // already had a 3rd line beyond the 2 saved ones); the
+            // buffer has since gained one more line (now 4), so
+            // extra=4-3=1 and ue_bot = 0 + 2 + 1 + 1 = 4, which is
+            // exactly ml_line_count - in range.
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 3,
+                ue_array: vec![b"one\0".to_vec(), b"two\0".to_vec()],
+            });
+            (*uhp).uh_getbot_entry = Some(0);
+        }
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_synced: false,
+            ..Default::default()
+        };
+        buf.b_ml.ml_line_count = 4;
+
+        u_getbot(&mut buf);
+
+        assert_eq!(unsafe { (&(*uhp).uh_entries)[0].ue_bot }, 4);
+        assert_eq!(unsafe { (*uhp).uh_getbot_entry }, None);
+        assert!(buf.b_u_synced);
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+    }
+
+    #[test]
+    fn u_getbot_falls_back_when_computed_bot_out_of_range() {
+        let uhp = new_header();
+        unsafe {
+            // ue_top=0, ue_size=2, ue_lcount=2, and the buffer's line
+            // count has since dropped to 1 (extra = 1 - 2 = -1), giving
+            // ue_bot = 0 + 2 + 1 + (-1) = 2, which is > ml_line_count
+            // (1) - out of range, so the original's own defensive
+            // fallback (ue_bot = ue_top + 1) applies instead.
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 2,
+                ue_array: vec![b"one\0".to_vec(), b"two\0".to_vec()],
+            });
+            (*uhp).uh_getbot_entry = Some(0);
+        }
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_synced: false,
+            ..Default::default()
+        };
+        buf.b_ml.ml_line_count = 1;
+
+        u_getbot(&mut buf);
+
+        assert_eq!(unsafe { (&(*uhp).uh_entries)[0].ue_bot }, 1); // ue_top + 1
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
+    }
+
+    #[test]
+    fn u_sync_noop_when_already_synced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_u_synced: true, ..Default::default() };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        unsafe { u_sync(false) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        // b_u_curhead untouched (still null, not merely "still null
+        // because it started that way" - verified no code ran by
+        // constructing this test with b_u_synced already true).
+        assert!(buf.b_u_curhead.is_null());
+    }
+
+    #[test]
+    fn u_sync_noop_when_no_u_sync_set_and_not_forced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_u_synced: false, ..Default::default() };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let prev_no_u_sync = unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = 1;
+
+        unsafe { u_sync(false) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = prev_no_u_sync;
+        assert!(!buf.b_u_synced); // untouched - bailed out early
+    }
+
+    #[test]
+    fn u_sync_sets_synced_directly_when_undolevel_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_u_synced: false,
+            b_p_ul: -1, // undo disabled for this buffer
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let prev_no_u_sync = unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = 0;
+
+        unsafe { u_sync(false) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = prev_no_u_sync;
+        assert!(buf.b_u_synced);
+        assert!(buf.b_u_curhead.is_null()); // u_getbot's path never ran
+    }
+
+    #[test]
+    fn u_sync_calls_getbot_and_clears_curhead_when_undolevel_non_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        unsafe {
+            // ue_top=0, ue_size=1, ue_lcount=2 (>= ue_top+ue_size+1),
+            // ml_line_count unchanged at 2: extra=0, ue_bot =
+            // 0 + 1 + 1 + 0 = 2, exactly ml_line_count - in range.
+            (*uhp).uh_entries.push(UEntry {
+                ue_top: 0,
+                ue_bot: 0,
+                ue_lcount: 2,
+                ue_array: vec![b"one\0".to_vec()],
+            });
+            (*uhp).uh_getbot_entry = Some(0);
+        }
+        let mut buf = BufT {
+            b_u_synced: false,
+            b_p_ul: 1000, // undo enabled
+            b_u_newhead: uhp,
+            b_u_curhead: uhp, // deliberately non-null, to prove u_sync clears it
+            ..Default::default()
+        };
+        buf.b_ml.ml_line_count = 2;
+
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let prev_no_u_sync = unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = 0;
+
+        unsafe { u_sync(false) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.no_u_sync = prev_no_u_sync;
+
+        assert!(buf.b_u_synced);
+        assert!(buf.b_u_curhead.is_null());
+        // u_getbot really ran: ue_bot computed (0 + 1 + 1 + 0 = 2) and
+        // uh_getbot_entry consumed.
+        assert_eq!(unsafe { (&(*uhp).uh_entries)[0].ue_bot }, 2);
+        assert_eq!(unsafe { (*uhp).uh_getbot_entry }, None);
+
+        unsafe {
+            drop(Box::from_raw(uhp));
+        }
     }
 }
