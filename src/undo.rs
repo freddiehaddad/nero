@@ -24,8 +24,11 @@
 //!   state (have `sha256.rs`, but not wired to real file reads yet).
 //! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: need
 //!   `ml_get_buf`/`ml_replace` (`memline.c`).
-//! - `bufIsChanged`/`anyBufIsChanged`/`curbufIsChanged`: need
-//!   `bt_prompt`/`bt_dontwrite`/`file_ff_differs` (`buffer.c` helpers).
+//! - `bufIsChanged`/`anyBufIsChanged`/`curbufIsChanged`: `bt_prompt`/
+//!   `bt_dontwrite` now exist (`crate::buffer`), but `file_ff_differs`
+//!   (`change.c`) still needs `ml_get_buf` (`memline.c`) for one early-
+//!   return branch (`ignore_empty && BF_NEW && ml_line_count == 1`), so
+//!   these three remain blocked as a whole.
 //! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
 //!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
 //!   `ex_*` functions).
