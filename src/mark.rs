@@ -15,7 +15,11 @@
 //! `fmarks_check_names` (now tractable now that `path.c`'s
 //! `path_fnamecmp` exists - these two only need it, `namedfm`, and
 //! `GLOBALS.firstwin`/`w_next`, not `buflist_new()` or `TabpageT`'s
-//! window-list fields like the still-blocked `fname2fnum` does).
+//! window-list fields like the still-blocked `fname2fnum` does);
+//! `mark_line`/`fm_getname` (now tractable now that `memline.c`'s
+//! `ml_get` and `charset.c`'s `ptr2cells` both exist - `fm_getname`'s
+//! "different buffer" branch still needs `buflist_nr2name`,
+//! `buffer.c`, and returns `None` for that case).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -39,16 +43,13 @@
 //!   unblock this specific function as a whole (unlike
 //!   `fmarks_check_one`/`fmarks_check_names` above, which needed only
 //!   `path_fnamecmp`).
-//! - `fm_getname`/`mark_line`: need `ml_get()` (`memline.c` - `ml_open`
-//!   now exists, but `ml_get` itself needs `ml_find_line`'s real
-//!   B-tree traversal algorithm, deliberately not rushed - see
-//!   `memline.rs`'s own module doc comment).
 //! - `ex_marks`/`ex_delmarks`/`ex_jumps`/`ex_clearjumps`/`ex_changes`:
 //!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
 //!   (see `ex_cmds_defs.rs`'s own module doc).
 //! - `cleanup_jumplist`: needs `win_valid`/buffer-list validity checks.
-//! - `mark_mb_adjustpos`: needs `ml_get_buf()` (`memline.c`) and
-//!   `utf_head_off`/`utf_ptr2char`/`ptr2cells` (`mbyte.c`).
+//! - `mark_mb_adjustpos`: needs `ml_get_buf()` (now exists!) and
+//!   `utf_head_off` (`mbyte.c`, its own dedicated backward-scan pass,
+//!   deliberately not rushed - see `mbyte.rs`'s own module doc).
 //! - `add_mark`/`get_buf_local_marks`/`get_raw_global_mark`/
 //!   `get_global_marks`: need `list_T`'s real fields (the eval engine,
 //!   phase 5).
@@ -592,6 +593,75 @@ pub unsafe fn mark_get_visual(buf: &BufT, name: u8) -> *mut FmarkT {
         mark_ref.mark.coladd = 0;
     }
     mark
+}
+
+/// Return the line at mark `mp`, truncated to fit in the window. The
+/// returned string has been allocated (`mark_line`, `static` in the
+/// original - kept private here too).
+///
+/// The returned bytes include a trailing NUL byte, matching this
+/// crate's established `ml_get`-family convention (and the original's
+/// own NUL-terminated-C-string representation).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curbuf`/`Columns` and
+/// `crate::option_vars::OPTION_VARS` (transitively via
+/// `crate::mbyte::utfc_ptr2len`/`crate::charset::ptr2cells`) - the
+/// same requirements as every other function that touches global
+/// editor state.
+unsafe fn mark_line(mp: &PosT, lead_len: i32) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+    if mp.lnum == 0 || mp.lnum > curbuf.b_ml.ml_line_count {
+        let mut invalid = b"-invalid-".to_vec();
+        invalid.push(0);
+        return invalid;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let columns = unsafe { GLOBALS.get_mut() }.Columns;
+    debug_assert!(columns >= 0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(mp.lnum) };
+    let start = crate::charset::skipwhite(&line);
+    // Allow for up to 5 bytes per character.
+    let mut s = crate::strings::xstrnsave(&line[start..], (columns as usize) * 5);
+
+    // Truncate the line to fit it in the window.
+    let mut len = 0;
+    let mut p = 0usize;
+    while p < s.len() && s[p] != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        len += unsafe { crate::charset::ptr2cells(&s[p..]) };
+        if len >= columns - lead_len {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        p += unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) } as usize;
+    }
+    s.truncate(p);
+    s.push(0);
+    s
+}
+
+/// Returns the file name/line text for file mark `fmark` (`fm_getname`).
+///
+/// Deferred: the "different buffer" branch (`buflist_nr2name`,
+/// `buffer.c`, not yet translated - returns `None`) - only the
+/// current-buffer branch (`mark_line`, private) is translated.
+///
+/// # Safety
+/// Same as `mark_line` (private).
+#[must_use]
+pub unsafe fn fm_getname(fmark: &FmarkT, lead_len: i32) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf_fnum = unsafe { &*GLOBALS.get_mut().curbuf }.handle;
+    if fmark.fnum == curbuf_fnum {
+        // SAFETY: forwarded from this function's own safety doc.
+        return Some(unsafe { mark_line(&fmark.mark, lead_len) });
+    }
+    None // buflist_nr2name (buffer.c) not yet translated
 }
 
 #[cfg(test)]
@@ -1278,5 +1348,106 @@ mod tests {
 
         assert_eq!(win.w_jumplist[0].fmark.fnum, 99);
         assert_eq!(win.w_jumplist[0].fname, None);
+    }
+
+    /// Opens a fresh memline for `buf` and installs it as `curbuf` for
+    /// the duration of the returned guard, matching [`CurbufGuard`]'s
+    /// existing pattern. Callers must close `buf.b_ml.ml_mfp`
+    /// themselves after the guard is dropped (see call sites).
+    fn open_and_set_curbuf(buf: &mut BufT) -> CurbufGuard {
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        CurbufGuard::set(buf as *mut BufT)
+    }
+
+    #[test]
+    fn mark_line_returns_invalid_marker_for_lnum_zero() {
+        let mut buf = BufT::default();
+        let guard = open_and_set_curbuf(&mut buf);
+
+        let pos = PosT { lnum: 0, col: 0, coladd: 0 };
+        assert_eq!(unsafe { mark_line(&pos, 0) }, b"-invalid-\0".to_vec());
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_line_returns_invalid_marker_for_lnum_past_end() {
+        let mut buf = BufT::default();
+        let guard = open_and_set_curbuf(&mut buf);
+
+        let pos = PosT { lnum: 999, col: 0, coladd: 0 };
+        assert_eq!(unsafe { mark_line(&pos, 0) }, b"-invalid-\0".to_vec());
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_line_on_the_default_empty_line_returns_just_a_nul() {
+        let mut buf = BufT::default();
+        let guard = open_and_set_curbuf(&mut buf);
+        // ml_open's own single line is empty; Columns defaults to 0 in
+        // GLOBALS::default(), so set a realistic value for the
+        // truncation math to behave like a real session.
+        unsafe { GLOBALS.get_mut() }.Columns = 80;
+
+        let pos = PosT { lnum: 1, col: 0, coladd: 0 };
+        assert_eq!(unsafe { mark_line(&pos, 0) }, vec![0u8]);
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn fm_getname_current_buffer_matches_mark_line() {
+        let mut buf = BufT { handle: 7, ..Default::default() };
+        let guard = open_and_set_curbuf(&mut buf);
+        unsafe { GLOBALS.get_mut() }.Columns = 80;
+
+        let fmark = FmarkT {
+            mark: PosT { lnum: 1, col: 0, coladd: 0 },
+            fnum: 7,
+            timestamp: 0,
+            view: FmarkvT::default(),
+            additional_data: None,
+        };
+        assert_eq!(unsafe { fm_getname(&fmark, 0) }, Some(vec![0u8]));
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn fm_getname_different_buffer_returns_none() {
+        let mut buf = BufT { handle: 7, ..Default::default() };
+        let guard = open_and_set_curbuf(&mut buf);
+
+        let fmark = FmarkT {
+            mark: PosT { lnum: 1, col: 0, coladd: 0 },
+            fnum: 42, // a different buffer number
+            timestamp: 0,
+            view: FmarkvT::default(),
+            additional_data: None,
+        };
+        assert_eq!(unsafe { fm_getname(&fmark, 0) }, None);
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 }
