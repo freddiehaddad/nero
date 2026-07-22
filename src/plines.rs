@@ -43,10 +43,19 @@
 //! `CharsizeArg`/`CsType` are translated field-for-field/
 //! variant-for-variant in full.
 //!
-//! Deferred: `linesize_regular` (the whole-line-width counterpart of
-//! `charsize_regular`, straightforward to add now that `charsize_regular`
-//! itself exists - not yet attempted, purely for lack of a real caller
-//! yet), `getvcol`/`getvvcol`/`linetabsize*` (need `init_charsize_arg`'s
+//! Also translated: **`linesize_regular`**, the whole-line-width
+//! counterpart of `charsize_regular` - sums each character's
+//! `charsize_regular` width across a line (or up to a `len` byte
+//! limit), then, once the line's own bytes are exhausted, accounts for
+//! any inline virtual text attached exactly at the line's end (mirrors
+//! `charsize_fast`/`linesize_fast`'s existing split, but through the
+//! regular/virtual-text-aware path). The EOL virtual-text branch reuses
+//! `charsize_regular` itself (called on the trailing NUL byte) purely
+//! for its side effect of accumulating `cur_text_width_left`/`_right`
+//! into `csarg`, matching the original's own reuse of the same
+//! function for this purpose.
+//!
+//! Deferred: `getvcol`/`getvvcol`/`linetabsize*` (need `init_charsize_arg`'s
 //! own remaining gap: none currently known, worth a fresh look), and
 //! everything past the file's own "horizontal size" section (vertical
 //! size / fold-aware line-height calculations, needing `fold.c`).
@@ -449,6 +458,56 @@ pub unsafe fn charsize_regular(
     let tail = size - size_before_lbr;
 
     CharSize { width: size, head, tail }
+}
+
+/// Calculate virtual column until the given `len` (`linesize_regular`).
+///
+/// @param csarg    Argument to charsize functions.
+/// @param vcol_arg Starting virtual column.
+/// @param len      First byte of the end character, or `MAXCOL`.
+///
+/// @return virtual column before the character at `len`, or full size
+/// of the line if `len` is `MAXCOL`.
+///
+/// # Safety
+/// Same as [`charsize_regular`].
+#[must_use]
+pub unsafe fn linesize_regular(csarg: &mut CharsizeArg, vcol_arg: i32, len: ColnrT) -> i32 {
+    let line = csarg.line;
+    let mut vcol: i64 = i64::from(vcol_arg);
+    let mut vcol_arg = vcol_arg;
+
+    let mut ci = crate::mbyte::utf_ptr2str_char_info(line);
+    while (ci.pos as i32) < len && line.get(ci.pos).copied().unwrap_or(0) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let width = unsafe {
+            charsize_regular(csarg, &line[ci.pos..], ci.pos as i32, vcol_arg, ci.chr.value)
+        }
+        .width;
+        vcol += i64::from(width);
+        // SAFETY: forwarded from this function's own safety doc.
+        ci = unsafe { crate::mbyte::utfc_next(line, ci) };
+        if vcol > i64::from(MAXCOL) {
+            vcol_arg = MAXCOL;
+            break;
+        }
+        vcol_arg = vcol as i32;
+    }
+
+    // Check for inline virtual text after the end of the line.
+    if len == MAXCOL && csarg.virt_row >= 0 && line.get(ci.pos).copied().unwrap_or(0) == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let head = unsafe {
+            charsize_regular(csarg, &line[ci.pos..], ci.pos as i32, vcol_arg, ci.chr.value)
+        }
+        .head;
+        vcol += i64::from(csarg.cur_text_width_left)
+            + i64::from(csarg.cur_text_width_right)
+            + i64::from(head);
+        vcol_arg = if vcol > i64::from(MAXCOL) { MAXCOL } else { vcol as i32 };
+    }
+
+    vcol_arg
 }
 
 /// Return the number of cells the first char in `p` will take on the
@@ -930,6 +989,56 @@ mod tests {
         assert_eq!(cs.width, 6);
         assert_eq!(csarg.cur_text_width_left, 5); // not right-gravity -> left
         assert_eq!(csarg.cur_text_width_right, 0);
+    }
+
+    #[test]
+    fn linesize_regular_plain_ascii_line() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line = b"abc\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        assert_eq!(unsafe { linesize_regular(&mut csarg, 0, MAXCOL) }, 3);
+    }
+
+    #[test]
+    fn linesize_regular_respects_the_len_limit() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line = b"abc\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 0, line) };
+        // len=2 stops after 'a','b' only.
+        assert_eq!(unsafe { linesize_regular(&mut csarg, 0, 2) }, 2);
+    }
+
+    #[test]
+    fn linesize_regular_eol_virtual_text_added_after_line_end() {
+        let mut buf = BufT::default();
+        let decor_ext = crate::decoration_defs::DecorExt {
+            sh_idx: 0,
+            vt: Some(Box::new(crate::decoration_defs::DecorVirtText {
+                width: 4,
+                pos: crate::decoration_defs::VirtTextPos::Inline,
+                ..Default::default()
+            })),
+        };
+        let key = crate::marktree_defs::MtKey {
+            pos: crate::marktree_defs::MtPos::new(4, 3), // col=3 = NUL position of "abc\0"
+            ns: 0,
+            id: 1,
+            flags: crate::marktree::mt_flags(false, false, false, true)
+                | crate::marktree::MT_FLAG_DECOR_VIRT_TEXT_INLINE,
+            decor_data: crate::decoration_defs::DecorInlineData {
+                ext: std::mem::ManuallyDrop::new(decor_ext),
+            },
+        };
+        crate::marktree::marktree_put(&mut buf.b_marktree, key, -1, -1, false);
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+        let line = b"abc\0";
+        let (mut csarg, _) = unsafe { init_charsize_arg(&mut win as *mut WinT, 5, line) };
+        let vcol = unsafe { linesize_regular(&mut csarg, 0, MAXCOL) };
+        // "abc" = 3 cells + 4 cells of EOL virtual text = 7.
+        assert_eq!(vcol, 7);
     }
 
     #[test]
