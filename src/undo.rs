@@ -15,7 +15,10 @@
 //! (now tractable now that `memline.c`'s `ml_get_buf` exists - only
 //! needed `UHeader.uh_entries`/`ue_top`/`ue_bot`/`ue_array`, already
 //! present in `undo_defs.rs`, plus `mark_defs.rs`'s already-translated
-//! `clearpos`).
+//! `clearpos`); `u_save_line_buf`/`u_save_line`/`u_saveline` (the "U"
+//! command's single-line save mechanism - now tractable now that
+//! `memline.c`'s `ml_get_buf` exists and `GLOBALS.curwin`/`WinT.
+//! w_buffer`/`w_cursor` are all already present).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -23,10 +26,14 @@
 //!   debug-only `uh_magic`/`ue_magic` fields (no equivalent debug-build
 //!   concept established in this crate yet, same reasoning as
 //!   marktree.rs's deferred `mt_inspect*` debug functions).
-//! - `u_save*`/`u_undo*`/`u_redo*`/`undo_time`: need `autocmd.c`
-//!   triggers (`memline.c`'s write side, `ml_replace`/`ml_delete`/
-//!   `ml_append`, now exists, but these are still substantial
-//!   undertakings in their own right - not (re-)examined yet).
+//! - `u_save*` (the `u_save`/`u_savecommon`/`u_savesub`/`u_inssub`/
+//!   `u_savedel` family, i.e. the real "start a new undo save point"
+//!   entry points - distinct from the now-translated `u_save_line*`
+//!   line-copy helpers above)/`u_undo*`/`u_redo*`/`undo_time`: need
+//!   `autocmd.c` triggers (`memline.c`'s write side, `ml_replace`/
+//!   `ml_delete`/`ml_append`, now exists, but these are still
+//!   substantial undertakings in their own right - not (re-)examined
+//!   yet).
 //! - `u_compute_hash`/`u_get_undo_file_name`/`u_write_undo`/
 //!   `u_read_undo`/`serialize_*`/`unserialize_*`: undo-FILE
 //!   persistence. Re-checked after `os/fs.rs` gained real `os_open` -
@@ -39,9 +46,14 @@
 //!   (`u_get_undo_file_name`), and its own serialization format
 //!   (`serialize_header`/`serialize_uhp`/etc., not yet examined) -
 //!   still a substantial, separate undertaking.
-//! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: needed
-//!   `ml_replace` (`memline.c`'s write side) - now exists, worth a
-//!   fresh look, not yet (re-)examined this pass.
+//! - `u_undoline` (the "U" command's actual undo/redo-toggle logic,
+//!   distinct from the now-translated `u_saveline` save-side helper):
+//!   needs `u_savecommon` (the substantial real undo-save entry point,
+//!   see `u_save*` above), `extmark_splice_cols` (the extmark
+//!   subsystem, not yet translated), `changed_bytes` (`change.c`, not
+//!   yet translated beyond `file_ff_differs`), `check_cursor_col`
+//!   (`cursor.c`, not yet translated), and `beep_flush` (the
+//!   message/display subsystem).
 //! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
 //!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
 //!   `ex_*` functions).
@@ -255,6 +267,72 @@ pub fn u_clearline(buf: &mut BufT) {
     buf.b_u_line_lnum = 0;
 }
 
+/// Allocate memory and copy line `lnum` from `buf` into it
+/// (`u_save_line_buf`).
+///
+/// The original's separate allocation step (`xstrdup(ml_get_buf(...))`)
+/// is redundant here: [`crate::memline::ml_get_buf`] already returns a
+/// freshly-owned `Vec<u8>` (this crate's own established convention -
+/// see `memline.rs`'s own module doc comment for why - rather than the
+/// original's transient, cache-aliasing `char *`), so no separate copy
+/// is needed.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT`.
+#[must_use]
+pub unsafe fn u_save_line_buf(buf: &mut BufT, lnum: LinenrT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::ml_get_buf(buf, lnum) }
+}
+
+/// Allocate memory and copy `curbuf`'s line `lnum` into it
+/// (`u_save_line`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Also see [`u_save_line_buf`]'s own safety doc.
+#[must_use]
+pub unsafe fn u_save_line(lnum: LinenrT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { u_save_line_buf(curbuf, lnum) }
+}
+
+/// Save the line `lnum` for the "U" command (`u_saveline`, `static` in
+/// the original - kept private here too).
+///
+/// Its only real caller in the original, `u_undoline`, is deferred
+/// (needs `u_savecommon`/`extmark_splice_cols`/`changed_bytes`/
+/// `check_cursor_col`/`beep_flush` - see this module's own doc
+/// comment) - `#[allow(dead_code)]` until that lands, matching the
+/// precedent already established for `marktree.rs`'s `itr_eq`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`. Also see [`u_save_line_buf`]'s own safety doc.
+#[allow(dead_code)]
+unsafe fn u_saveline(buf: &mut BufT, lnum: LinenrT) {
+    if lnum == buf.b_u_line_lnum {
+        return; // line is already saved
+    }
+    if lnum < 1 || lnum > buf.b_ml.ml_line_count {
+        return; // should never happen
+    }
+    u_clearline(buf);
+    buf.b_u_line_lnum = lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*crate::globals::GLOBALS.get_mut().curwin };
+    if std::ptr::eq(curwin.w_buffer, buf) && curwin.w_cursor.lnum == lnum {
+        buf.b_u_line_colnr = curwin.w_cursor.col;
+    } else {
+        buf.b_u_line_colnr = 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    buf.b_u_line_ptr = Some(unsafe { u_save_line_buf(buf, lnum) });
+}
+
 /// After reloading a buffer which was saved for `'undoreload'`: find
 /// the first line that was changed and set the cursor there
 /// (`u_find_first_changed`).
@@ -376,6 +454,7 @@ pub unsafe fn curbuf_is_changed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pos_defs::PosT;
     use crate::undo_defs::UEntry;
 
     /// Allocates a new, `Box::into_raw`-owned `UHeader`, matching the
@@ -855,6 +934,102 @@ mod tests {
         unsafe {
             drop(Box::from_raw(uhp));
         }
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_save_line_buf_returns_the_exact_line_bytes() {
+        let mut buf = buf_with_two_lines();
+        assert_eq!(unsafe { u_save_line_buf(&mut buf, 1) }, b"one\0".to_vec());
+        assert_eq!(unsafe { u_save_line_buf(&mut buf, 2) }, b"two\0".to_vec());
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_save_line_matches_u_save_line_buf_via_curbuf() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        assert_eq!(unsafe { u_save_line(2) }, b"two\0".to_vec());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_saveline_is_noop_when_line_already_saved() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        buf.b_u_line_lnum = 1;
+        buf.b_u_line_ptr = Some(b"sentinel\0".to_vec());
+        buf.b_u_line_colnr = 42;
+
+        unsafe { u_saveline(&mut buf, 1) };
+
+        // unchanged: lnum matched buf.b_u_line_lnum, early return.
+        assert_eq!(buf.b_u_line_ptr, Some(b"sentinel\0".to_vec()));
+        assert_eq!(buf.b_u_line_colnr, 42);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_saveline_is_noop_for_out_of_range_lnum() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+
+        unsafe { u_saveline(&mut buf, 0) };
+        assert!(buf.b_u_line_ptr.is_none());
+        unsafe { u_saveline(&mut buf, 99) };
+        assert!(buf.b_u_line_ptr.is_none());
+
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_saveline_sets_colnr_to_zero_when_curwin_does_not_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        // w_buffer intentionally left null - does not match `buf`.
+        let mut win = crate::buffer_defs::WinT {
+            w_cursor: PosT { lnum: 2, col: 7, coladd: 0 },
+            ..Default::default()
+        };
+
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        unsafe { u_saveline(&mut buf, 2) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+
+        assert_eq!(buf.b_u_line_lnum, 2);
+        assert_eq!(buf.b_u_line_colnr, 0);
+        assert_eq!(buf.b_u_line_ptr, Some(b"two\0".to_vec()));
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_saveline_uses_cursor_col_when_curwin_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_two_lines();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 2, col: 7, coladd: 0 },
+            ..Default::default()
+        };
+
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        unsafe { u_saveline(&mut buf, 2) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+
+        assert_eq!(buf.b_u_line_lnum, 2);
+        assert_eq!(buf.b_u_line_colnr, 7);
+        assert_eq!(buf.b_u_line_ptr, Some(b"two\0".to_vec()));
         close_buf_with_memline(buf);
     }
 }
