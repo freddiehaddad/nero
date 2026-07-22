@@ -1,19 +1,16 @@
 //! Translated from `src/nvim/mbyte_defs.h` (partial).
 //!
 //! Translated: `MB_MAXBYTES`/`MB_MAXCHAR`, the `ENC_*` encoding-
-//! property flags, `UNICODE_INVALID`.
+//! property flags, `UNICODE_INVALID`, `GraphemeState`/
+//! `GRAPHEME_STATE_INIT` (now that the `utf8proc` FFI dependency this
+//! type is meaningless without has actually been added).
 //!
 //! Deferred (each needs a subsystem not yet reached in this pass):
 //! - `ConvFlags`/`vimconv_T`: needs a real `iconv_t` FFI/crate decision
 //!   (`iconv_defs.rs` already notes this - the real iconv binding is a
 //!   vendored third-party dependency, not yet reached via FFI).
-//! - `CharInfo`/`StrCharInfo`/`CharBoundsOff`/`GraphemeState`: not
-//!   needed by this pass's pure byte<->codepoint algorithms
-//!   (`utf_ptr2char`/`utf_ptr2len`/`utf_char2len`/`utf_char2bytes`);
-//!   `GraphemeState` in particular is only meaningful once
-//!   `utf8proc_grapheme_break_stateful` (the `utf8proc` FFI dependency)
-//!   is wired up - deferred to that follow-up pass rather than adding
-//!   an unused type now.
+//! - `CharInfo`/`StrCharInfo`/`CharBoundsOff`: not needed by any
+//!   translated caller yet.
 
 /// Maximum number of bytes in a multi-byte character. It can be one
 /// 32-bit character of up to 6 bytes, or one 16-bit character of up to
@@ -53,6 +50,15 @@ pub mod enc {
 
 /// `UNICODE_INVALID`.
 pub const UNICODE_INVALID: i32 = 0xFFFD;
+
+/// State threaded through repeated calls to `utf8proc_grapheme_break_stateful`
+/// (`GraphemeState`, `utf8proc_int32_t` in the original - matches
+/// `utf8proc-sys`'s own `utf8proc_int32_t = i32`).
+pub type GraphemeState = i32;
+
+/// Initial value for a fresh [`GraphemeState`], before the first call
+/// in a sequence (`GRAPHEME_STATE_INIT`, `mbyte.h`).
+pub const GRAPHEME_STATE_INIT: GraphemeState = 0;
 
 #[cfg(test)]
 mod tests {

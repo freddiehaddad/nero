@@ -13,6 +13,7 @@
 //! references instead of nullable pointers, `-> !` for noreturn).
 
 pub mod api;
+pub mod arabic;
 pub mod arglist_defs;
 pub mod ascii_defs;
 pub mod assert_defs;
