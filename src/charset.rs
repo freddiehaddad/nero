@@ -9,12 +9,14 @@
 //! `getdigits*` family, `vim_isblankline`, `hex2nr`, `hexhex2nr`,
 //! `vim_isprintc`, `char2cells`, `ptr2cells`; and now that `mbyte.c`'s
 //! `utfc_ptr2len` exists too: `vim_strsize`/`vim_strnsize` (screen-cell
-//! width of a whole string, counting TABs as two cells).
+//! width of a whole string, counting TABs as two cells); `byte2cells`
+//! (the single-byte sibling of `char2cells`); `nr2hex`/`transchar_hex`
+//! (hex-escape formatting for non-printable/illegal characters).
 //!
-//! `vim_isprintc`/`char2cells` need `g_chartab`, which isn't translated
-//! (needs `buf_T`/option parsing), but their *default* (pre-`'isprint'`-
-//! customization) values follow a simple, fixed rule directly verified
-//! against `buf_init_chartab`'s own global-reset branch: control
+//! `vim_isprintc`/`char2cells`/`byte2cells` need `g_chartab`, which isn't
+//! translated (needs `buf_T`/option parsing), but their *default* (pre-
+//! `'isprint'`-customization) values follow a simple, fixed rule directly
+//! verified against `buf_init_chartab`'s own global-reset branch: control
 //! characters unprintable/2-cells, printable ASCII and Latin-1
 //! printable/1-cell. This crate implements exactly that fixed rule
 //! rather than the general `g_chartab` machinery - correct for every
@@ -33,16 +35,22 @@
 //!   (`'iskeyword'`'s default already varies by `'encoding'`).
 //! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
 //!   `vim_isfilec` (hence the real `g_chartab`).
-//! - `byte2cells`: needs the real `g_chartab` directly (`g_chartab[b] &
-//!   CT_CELL_MASK`) - unlike `char2cells`/`ptr2cells`, its `>= 0x80`
-//!   case returns 0 unconditionally rather than delegating to
-//!   `utf_char2cells`, so there's no analogous fixed-default-rule
-//!   shortcut available for the `< 0x80` case either (it's meant to be
-//!   read consistently with the real table, not approximated).
+//! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
+//!   `transchar_nonprint`: need `curbuf`/`get_fileformat` integration, a
+//!   shared static scratch buffer (`transchar_charbuf`, matching this
+//!   crate's `POS_TO_MARK_SCRATCH`-style precedent), and the `IS_SPECIAL`/
+//!   `K_SECOND` special-key branch (`keycodes.h`, not yet translated) -
+//!   worth its own dedicated pass rather than folding in alongside
+//!   `transchar_hex` (self-contained, harvested now). Also note: the
+//!   original's `!chartab_initialized && ...` disjunct is a pure subset
+//!   of what `vim_isprintc` itself already covers for `c <= 0xFF` (and
+//!   `chartab_initialized` can never become `true` in this crate anyway,
+//!   since nothing sets it - `init_chartab`/`buf_init_chartab` aren't
+//!   translated) - when this family is eventually translated, the whole
+//!   condition should provably simplify to just `vim_isprintc(c)`, not a
+//!   two-part check.
 //! - `trans_characters`/`transstr`/`transstr_len`/`transstr_buf`/
-//!   `str_foldcase`/`transchar`* family: need `byte2cells` (above) and
-//!   `transchar_byte`/`transchar_hex` (not yet checked) - re-examine
-//!   once `byte2cells` itself is unblocked.
+//!   `str_foldcase` family: need the `transchar*` family above.
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -337,8 +345,40 @@ pub unsafe fn byte2cells(b: i32) -> i32 {
     }
 }
 
-/// Return number of display cells occupied by character at `p`
-/// (`ptr2cells`).
+/// Convert `n`'s low nibble to its lowercase hex digit character
+/// (`nr2hex`, `static inline` in the original - kept private here too).
+fn nr2hex(n: u32) -> u8 {
+    if (n & 0xf) <= 9 {
+        (n & 0xf) as u8 + b'0'
+    } else {
+        (n & 0xf) as u8 - 10 + b'a'
+    }
+}
+
+/// Convert a non-printable/illegal character to a hex string like
+/// `"<FFFF>"` (`transchar_hex`). Returns the formatted bytes including
+/// their own trailing NUL, matching this crate's usual
+/// `Vec<u8>`-owns-its-NUL convention for freshly-produced string
+/// outputs (e.g. `strings.rs`'s `vim_strup`).
+#[must_use]
+pub fn transchar_hex(c: i32) -> Vec<u8> {
+    let mut buf = vec![b'<'];
+    if c > 0xFF {
+        if c > 0xFFFF {
+            buf.push(nr2hex((c as u32) >> 20));
+            buf.push(nr2hex((c as u32) >> 16));
+        }
+        buf.push(nr2hex((c as u32) >> 12));
+        buf.push(nr2hex((c as u32) >> 8));
+    }
+    buf.push(nr2hex((c as u32) >> 4));
+    buf.push(nr2hex(c as u32));
+    buf.push(b'>');
+    buf.push(0);
+    buf
+}
+
+
 ///
 /// # Safety
 /// Touches `crate::option_vars::OPTION_VARS` (via
@@ -563,6 +603,26 @@ mod tests {
         let _guard = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { byte2cells(0x80) }, 0);
         assert_eq!(unsafe { byte2cells(0xff) }, 0);
+    }
+
+    #[test]
+    fn transchar_hex_two_digit_form_for_byte_values() {
+        assert_eq!(transchar_hex(0x41), b"<41>\0");
+    }
+
+    #[test]
+    fn transchar_hex_four_digit_form_above_0xff() {
+        assert_eq!(transchar_hex(0x1234), b"<1234>\0");
+    }
+
+    #[test]
+    fn transchar_hex_six_digit_form_above_0xffff() {
+        assert_eq!(transchar_hex(0x123456), b"<123456>\0");
+    }
+
+    #[test]
+    fn transchar_hex_zero_is_two_digits() {
+        assert_eq!(transchar_hex(0), b"<00>\0");
     }
 
     #[test]
