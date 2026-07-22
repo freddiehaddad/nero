@@ -5,7 +5,8 @@
 //! `GRAPHEME_STATE_INIT` (now that the `utf8proc` FFI dependency this
 //! type is meaningless without has actually been added), `CharInfo`
 //! (now that `mbyte.c`'s `utf_ptr2char_info` has a real caller in
-//! `strings.c`'s `mb_strup_buf`/`strcase_save`).
+//! `strings.c`'s `mb_strup_buf`/`strcase_save`), and `kInvalidByteCells`
+//! (from `mbyte.h`, needed by `plines.c`'s `charsize_nowrap`).
 //!
 //! Deferred (each needs a subsystem not yet reached in this pass):
 //! - `ConvFlags`/`vimconv_T`: needs a real `iconv_t` FFI/crate decision
@@ -34,6 +35,11 @@ pub struct CharInfo {
     pub value: i32,
     pub len: usize,
 }
+
+/// Number of display cells to use for an invalid/illegal byte
+/// (`kInvalidByteCells`, from `mbyte.h`) - used by `plines.c`'s
+/// screen-width calculations (e.g. `charsize_nowrap`).
+pub const K_INVALID_BYTE_CELLS: i32 = 4;
 
 /// Properties used in `enc_canon_table[]` (first three mutually
 /// exclusive) (`ENC_*`).
