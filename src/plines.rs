@@ -59,15 +59,30 @@
 //! (virtual-column lookups for a given buffer position - `cursor.c`'s
 //! `coladvance` family and the whole Visual-block-mode machinery's
 //! real dependency, now that `state.c`'s `virtual_active` exists) and
-//! the small `linetabsize*`/`win_linetabsize`/`win_charsize` wrapper
-//! family. `getvcol`'s three optional `colnr_T *` out-parameters
+//! the small `linetabsize*`/`win_linetabsize` wrapper family.
+//! `getvcol`'s three optional `colnr_T *` out-parameters
 //! (`start`/`cursor`/`end`) are modeled as `Option<&mut ColnrT>`,
 //! matching this crate's established convention for genuinely-nullable
 //! C out-parameters (e.g. `marktree.rs`'s `marktree_lookup`).
+//! `win_charsize` (`plines.h`'s dispatch inline) was investigated but
+//! NOT translated: it would need to derive `charsize_regular`'s `col`
+//! parameter (this crate's explicit-index replacement for the
+//! original's `cur - csarg->line` pointer subtraction) without any
+//! real caller to supply it - deferred until a real caller in
+//! `drawline.c`/`statusline.c` provides that context naturally.
 //!
-//! Deferred: everything past the file's own "horizontal size" section
-//! (vertical size / fold-aware line-height calculations, needing
-//! `fold.c`).
+//! This completes the file's own "horizontal size" section. Also
+//! translated from the "vertical size" section: **`plines_win_nofold`**
+//! (screen-line count for one physical line, ignoring folds/filler
+//! lines) - the only function there that doesn't need `fold.c`
+//! (`lineFolded`/`hasFoldingWin`) or `decoration.c`/`diff.c`
+//! (`decor_conceal_line`/`decor_virt_lines`/`diffopt_filler`/
+//! `diff_check_fill`, all reached via `win_get_fill`). Every other
+//! vertical-size function (`plines_win`, `plines_win_nofill`,
+//! `plines_win_col`, `plines_win_full`, `plines_m_win`,
+//! `plines_m_win_fill`, `win_text_height`, `win_may_fill`,
+//! `win_get_fill`) transitively needs at least one of those - deferred
+//! until `fold.c`/`decoration.c`/`diff.c` are reached.
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
@@ -1073,6 +1088,61 @@ pub unsafe fn getvcols(
     };
 }
 
+/// Get number of window lines physical line `lnum` will occupy in
+/// window `wp`. Does not care about folding, `'wrap'` or filler lines
+/// (`plines_win_nofold`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn plines_win_nofold(wp: *mut WinT, lnum: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { init_charsize_arg(wp, lnum, &s) };
+    if s.first().copied().unwrap_or(0) == 0 && csarg.virt_row < 0 {
+        return 1; // be quick for an empty line
+    }
+
+    let mut col: i64 = if cstype == CsType::Fast {
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { linesize_fast(&csarg, 0, MAXCOL) })
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { linesize_regular(&mut csarg, 0, MAXCOL) })
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wpref = unsafe { &mut *wp };
+    // If list mode is on, then the '$' at the end of the line may
+    // take up one extra column.
+    if wpref.w_onebuf_opt.wo_list != 0 && wpref.w_p_lcs_chars.eol != 0 {
+        col += 1;
+    }
+
+    // Add column offset for 'number', 'relativenumber' and 'foldcolumn'.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut width = wpref.w_view_width - unsafe { crate::r#move::win_col_off(wpref) };
+    if width <= 0 {
+        return 32000; // bigger than the number of screen lines
+    }
+    if col <= i64::from(width) {
+        return 1;
+    }
+    col -= i64::from(width);
+    // SAFETY: forwarded from this function's own safety doc.
+    width += unsafe { crate::r#move::win_col_off2(wpref) };
+    let lines: i64 = (col + i64::from(width - 1)) / i64::from(width) + 1;
+    if lines > 0 && lines <= i64::from(i32::MAX) {
+        lines as i32
+    } else {
+        i32::MAX
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1826,6 +1896,69 @@ mod tests {
             let mut buf = buf_with_line(b"abc\0");
             let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
             assert_eq!(linetabsize_eol(&mut win as *mut WinT, 1), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofold_empty_line_is_quick_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                ..Default::default()
+            };
+            assert_eq!(plines_win_nofold(&mut win as *mut WinT, 1), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofold_short_line_fits_on_one_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                ..Default::default()
+            };
+            assert_eq!(plines_win_nofold(&mut win as *mut WinT, 1), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofold_long_line_wraps_across_several_screen_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                ..Default::default()
+            };
+            // 25 cells at 10 cells/screen-line: 10 + 10 + 5 -> 3 lines.
+            assert_eq!(plines_win_nofold(&mut win as *mut WinT, 1), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofold_non_positive_width_returns_sentinel() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 0,
+                ..Default::default()
+            };
+            assert_eq!(plines_win_nofold(&mut win as *mut WinT, 1), 32000);
             close_buf(buf);
         }
     }
