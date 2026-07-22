@@ -49,9 +49,15 @@
 //!   it's a pure subset of what `vim_isprintc` itself already covers
 //!   for `c <= 0xFF`, and `chartab_initialized` can never become `true`
 //!   in this crate anyway (nothing sets it).
-//! - `trans_characters`/`transstr`/`transstr_len`/`transstr_buf`/
-//!   `str_foldcase` family: build on top of the `transchar*` family
-//!   above (now translated) - re-examine next.
+//! - `trans_characters`/`transstr_len`/`transstr_buf`/`str_foldcase`:
+//!   `transstr` itself is now translated (this pass) - see its own doc
+//!   comment for why `transstr_len` isn't (no real caller, superseded
+//!   by `Vec`'s dynamic growth) and why `transstr_buf`'s own
+//!   length-truncating variant is deferred separately (needed by
+//!   `drawline.c`/`statusline.c`, neither yet translated).
+//!   `trans_characters` (in-place, fixed-buffer-with-room-budget
+//!   mutation of a caller's own buffer) and `str_foldcase` remain
+//!   deferred - re-examine once a real caller of either surfaces.
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -486,6 +492,67 @@ pub unsafe fn transchar_byte(c: i32) -> Vec<u8> {
     unsafe { transchar_byte_buf(Some(curbuf), c) }
 }
 
+/// Copy `s` and replace special characters with printable ones
+/// (`transstr`). Works like `strtrans()`.
+///
+/// Unlike the original (which pre-computes the exact required length
+/// via `transstr_len` then writes into a freshly `xmalloc`-ed buffer
+/// of that size), this builds the result directly into a growing
+/// `Vec<u8>` - Rust has no need for the original's separate
+/// length-computing pre-pass, since `Vec` grows dynamically.
+/// `transstr_len` itself is therefore not translated as its own
+/// function (it had no external caller anyway - only `transstr`/
+/// `kv_transstr` ever called it in the original).
+///
+/// `transstr_buf`'s own distinct "truncate to fit a caller-provided
+/// max length" contract (used by `drawline.c`/`statusline.c`, neither
+/// yet translated) is deferred separately - this function only covers
+/// the unlimited-length case `transstr` itself always uses
+/// (`transstr_buf(s, -1, ...)` in the original).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`vim_isprintc`],
+/// [`crate::mbyte::utfc_ptr2len`], and [`transchar_byte`]'s own
+/// `curbuf` dependency).
+#[must_use]
+pub unsafe fn transstr(s: &[u8], untab: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < s.len() && s[pos] != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::mbyte::utfc_ptr2len(&s[pos..]) } as usize;
+        if l > 1 {
+            let c = crate::mbyte::utf_ptr2char(&s[pos..]);
+            if vim_isprintc(c) {
+                out.extend_from_slice(&s[pos..pos + l]);
+            } else {
+                let mut off = 0usize;
+                while off < l {
+                    let c2 = crate::mbyte::utf_ptr2char(&s[pos + off..]);
+                    let hex = transchar_hex(c2);
+                    // drop transchar_hex's own trailing NUL - transstr
+                    // appends exactly one, at the very end, below.
+                    out.extend_from_slice(&hex[..hex.len() - 1]);
+                    off += crate::mbyte::utf_ptr2len(&s[pos + off..]) as usize;
+                }
+            }
+            pos += l;
+        } else if s[pos] == crate::ascii_defs::TAB && !untab {
+            out.push(s[pos]);
+            pos += 1;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let tb = unsafe { transchar_byte(i32::from(s[pos])) };
+            // drop transchar_byte's own trailing NUL, same reason.
+            out.extend_from_slice(&tb[..tb.len() - 1]);
+            pos += 1;
+        }
+    }
+    out.push(0);
+    out
+}
+
 /// Return number of display cells occupied by character at `p`
 /// (`ptr2cells`).
 ///
@@ -554,6 +621,33 @@ pub unsafe fn vim_strnsize(s: &[u8], len: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Installs `new_curbuf` as `GLOBALS.curbuf` for the test's
+    /// duration, restoring the previous pointer on drop (including on
+    /// test panic via unwinding). Holds `global_state_test_lock` for
+    /// its entire lifetime, matching `mark.rs`'s own `CurbufGuard`
+    /// precedent (a plain `BufT` is enough here - unlike
+    /// `cursor.rs`'s `CursorTestGuard`, nothing in this file's tests
+    /// needs a real, `ml_open`-ed memline).
+    struct CurbufGuard {
+        previous: *mut crate::buffer_defs::BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut crate::buffer_defs::BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous, _lock }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
 
     #[test]
     fn skipwhite_skips_spaces_and_tabs() {
@@ -819,6 +913,64 @@ mod tests {
         assert_eq!(unsafe { transchar_byte_buf(None, 0x80) }, unsafe {
             transchar_nonprint(None, 0x80)
         });
+    }
+
+    #[test]
+    fn transstr_plain_printable_ascii_is_unchanged() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { transstr(b"hello\0", false) }, b"hello\0");
+    }
+
+    #[test]
+    fn transstr_tab_kept_as_is_when_not_untab() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { transstr(b"a\tb\0", false) }, b"a\tb\0");
+    }
+
+    #[test]
+    fn transstr_tab_translated_to_caret_i_when_untab() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        // TAB (0x09) as a control char: '^' + (0x09 ^ 0x40) = '^' + 'I'.
+        assert_eq!(unsafe { transstr(b"a\tb\0", true) }, b"a^Ib\0");
+    }
+
+    #[test]
+    fn transstr_control_char_becomes_caret_notation() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        // 0x01 -> '^' + (0x01 ^ 0x40) = '^' + 'A'.
+        assert_eq!(unsafe { transstr(b"a\x01b\0", false) }, b"a^Ab\0");
+    }
+
+    #[test]
+    fn transstr_printable_multibyte_char_is_unchanged() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        // "日" (U+65E5) is an ordinary printable CJK character -
+        // verified via vim_isprintc directly before writing this test.
+        let input = "a日b\0".as_bytes();
+        assert_eq!(unsafe { transstr(input, false) }, input);
+    }
+
+    #[test]
+    fn transstr_nonprintable_multibyte_char_becomes_hex_escape() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        // U+200B (ZERO WIDTH SPACE) is NOT printable (verified via
+        // vim_isprintc directly - matches its own existing test
+        // `vim_isprintc_delegates_to_utf_printable_at_and_above_0x100`).
+        let input = "a\u{200b}b\0".as_bytes();
+        assert_eq!(unsafe { transstr(input, false) }, b"a<200b>b\0");
+    }
+
+    #[test]
+    fn transstr_empty_string_is_just_the_nul() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { transstr(b"\0", false) }, b"\0");
     }
 
     #[test]
