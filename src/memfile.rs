@@ -10,7 +10,10 @@
 //! `crate::path::full_name_save`), `mf_read`, `mf_write`, `mf_close`,
 //! `mf_sync` (`memfile.h`'s `MFS_*` flags moved here alongside it -
 //! same "header content lives with its .c file's translation"
-//! convention already used for `mark.h`).
+//! convention already used for `mark.h`), `mf_set_dirty` (no current
+//! caller yet - `ml_open`/`ml_setname` in `memline.c` aren't
+//! translated - but it's a genuinely public, non-`static` function in
+//! the original, so it's translated now rather than waiting for one).
 //!
 //! `mf_read`/`mf_write`/`mf_close` each call `PERROR()`/`emsg()`
 //! (`message.c`) on their error paths purely as a side effect before
@@ -59,8 +62,6 @@
 //! - `mf_release_all`: calls `mf_close()` (done) but also iterates
 //!   `first_buffer`'s buffer list (`globals.h`) and `curbuf`/window
 //!   state not yet wired up to real multi-buffer support.
-//! - `mf_set_dirty`: only called from `ml_open`/`ml_setname`
-//!   (`memline.c`, not yet translated) - no caller yet.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
@@ -564,6 +565,26 @@ pub unsafe fn mf_sync(mfp: &mut MemfileT, flags: i32) -> i32 {
     unsafe { crate::globals::GLOBALS.get_mut() }.got_int |= got_int_save;
 
     status
+}
+
+/// Set dirty flag for all blocks in a memory file with a positive
+/// block number. These are blocks that need to be written to a newly
+/// created swapfile (`mf_set_dirty`).
+///
+/// # Safety
+/// Every `*mut BhdrT` reachable via `mfp.mf_hash` must be a valid
+/// pointer (allocated via `mf_alloc_bhdr`) - true for every block this
+/// crate allocates via `mf_alloc_bhdr`/`mf_new`.
+pub unsafe fn mf_set_dirty(mfp: &mut MemfileT) {
+    for (_, &hp) in mfp.mf_hash.iter() {
+        // SAFETY: caller contract (see function doc).
+        unsafe {
+            if (*hp).bh_bnum > 0 {
+                (*hp).bh_flags |= BH_DIRTY;
+            }
+        }
+    }
+    mfp.mf_dirty = MfdirtyT::Yes;
 }
 
 /// Close a memory file and optionally delete the associated file
@@ -1304,6 +1325,37 @@ mod tests {
             // untouched here.
             assert!(crate::globals::GLOBALS.get_mut().got_int);
             crate::globals::GLOBALS.get_mut().got_int = previous;
+        }
+    }
+
+    #[test]
+    fn mf_set_dirty_marks_only_positive_bnum_blocks() {
+        // mf_set_dirty's condition is `bh_bnum > 0` (strictly positive),
+        // so block 0 itself is excluded - allocate one extra block to
+        // get a bnum of 1, matching the original's exact condition.
+        let mut mfp = test_mfp();
+        unsafe {
+            let zero = mf_new(&mut mfp, false, 1); // bnum 0
+            let one = mf_new(&mut mfp, false, 1); // bnum 1
+            let neg = mf_new(&mut mfp, true, 1); // negative bnum
+            // Clear the BH_DIRTY that mf_new sets by default, to
+            // isolate mf_set_dirty's own effect.
+            (*zero).bh_flags &= !BH_DIRTY;
+            (*one).bh_flags &= !BH_DIRTY;
+            (*neg).bh_flags &= !BH_DIRTY;
+            mfp.mf_dirty = MfdirtyT::No;
+
+            mf_set_dirty(&mut mfp);
+
+            assert_eq!((*zero).bh_flags & BH_DIRTY, 0, "bnum 0 is not > 0, must stay untouched");
+            assert_eq!((*one).bh_flags & BH_DIRTY, BH_DIRTY);
+            assert_eq!((*neg).bh_flags & BH_DIRTY, 0, "negative bnum block must stay untouched");
+            assert_eq!(mfp.mf_dirty, MfdirtyT::Yes);
+
+            mf_free(&mut mfp, zero);
+            mf_free(&mut mfp, one);
+            mf_free(&mut mfp, neg);
+            drain_free_list(&mut mfp);
         }
     }
 
