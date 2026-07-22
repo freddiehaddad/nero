@@ -20,6 +20,7 @@ pub mod assert_defs;
 pub mod base64;
 pub mod buffer;
 pub mod buffer_defs;
+pub mod change;
 pub mod charset;
 pub mod decoration_defs;
 pub mod errors;

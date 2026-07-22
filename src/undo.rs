@@ -6,7 +6,12 @@
 //! for `UHeader.uh_entries: Vec<UEntry>`, so there is no standalone
 //! `u_freeentry` here), `u_clearall`, `u_blockfree`,
 //! `u_clearallandblockfree`, `u_unchanged`, `u_unch_branch`,
-//! `u_update_save_nr`, `u_clearline`.
+//! `u_update_save_nr`, `u_clearline`; `bufIsChanged`/`anyBufIsChanged`/
+//! `curbufIsChanged` (as `buf_is_changed`/`any_buf_is_changed`/
+//! `curbuf_is_changed` - adapted to snake_case, matching this crate's
+//! usual convention even though the originals are themselves
+//! camelCase) - now tractable now that `change.c`'s `file_ff_differs`
+//! exists (needed `memline.c`'s `ml_get_buf`).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -15,8 +20,9 @@
 //!   concept established in this crate yet, same reasoning as
 //!   marktree.rs's deferred `mt_inspect*` debug functions).
 //! - `u_save*`/`u_undo*`/`u_redo*`/`undo_time`: need `ml_replace`/
-//!   `ml_delete`/`ml_append` (`memline.c`, itself blocked on real file
-//!   I/O for its own core paths) and autocmd triggers (`autocmd.c`).
+//!   `ml_delete`/`ml_append` (`memline.c`'s write side, not yet
+//!   translated - the read side, `ml_get`/`ml_get_buf`/`ml_find_line`,
+//!   now exists) and autocmd triggers (`autocmd.c`).
 //! - `u_compute_hash`/`u_get_undo_file_name`/`u_write_undo`/
 //!   `u_read_undo`/`serialize_*`/`unserialize_*`: undo-FILE
 //!   persistence. Re-checked after `os/fs.rs` gained real `os_open` -
@@ -30,16 +36,15 @@
 //!   (`serialize_header`/`serialize_uhp`/etc., not yet examined) -
 //!   still a substantial, separate undertaking.
 //! - `u_saveline`/`u_save_line`/`u_save_line_buf`/`u_undoline`: need
-//!   `ml_get_buf`/`ml_replace` (`memline.c`).
-//! - `bufIsChanged`/`anyBufIsChanged`/`curbufIsChanged`: `bt_prompt`/
-//!   `bt_dontwrite` now exist (`crate::buffer`), but `file_ff_differs`
-//!   (`change.c`) still needs `ml_get_buf` (`memline.c`) for one early-
-//!   return branch (`ignore_empty && BF_NEW && ml_line_count == 1`), so
-//!   these three remain blocked as a whole.
+//!   `ml_replace` (`memline.c`'s write side, not yet translated).
 //! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
 //!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
 //!   `ex_*` functions).
-//! - `u_find_first_changed`: needs `ml_get_buf` (`memline.c`).
+//! - `u_find_first_changed`: needs `curbuf.b_u_newhead`/`b_u_curhead`'s
+//!   `uh_entries`/`ue_top`/`ue_bot`/`ue_array` (all already exist in
+//!   `undo_defs.rs`) plus `clearpos` (not yet checked) - genuinely
+//!   tractable-looking on a first read, but not yet attempted this
+//!   pass; re-visit directly rather than assuming still blocked.
 //! - `u_get_headentry`/`u_getbot`: need `iemsg()` (`message.c`).
 
 use crate::buffer_defs::BufT;
@@ -249,6 +254,67 @@ pub fn u_clearline(buf: &mut BufT) {
     buf.b_u_line_lnum = 0;
 }
 
+/// Check if the `'modified'` flag is set, or `'ff'` has changed (only
+/// need to check the first character, because it can only be `"dos"`,
+/// `"unix"` or `"mac"`). `"nofile"` and `"scratch"` type buffers are
+/// considered to always be unchanged. Prompt buffers ignore implicit
+/// modifications by default, but an explicit `:set modified` still
+/// makes them count as changed (`bufIsChanged`).
+///
+/// # Safety
+/// Same as `crate::change::file_ff_differs`.
+#[must_use]
+pub unsafe fn buf_is_changed(buf: &mut BufT) -> bool {
+    // In a "prompt" buffer we respect 'modified' if the user or a
+    // plugin explicitly set it.
+    if crate::buffer::bt_prompt(Some(buf)) {
+        buf.b_modified_was_set
+    } else {
+        !crate::buffer::bt_dontwrite(Some(buf))
+            && (buf.b_changed != 0
+                // SAFETY: forwarded from this function's own safety doc.
+                || unsafe { crate::change::file_ff_differs(buf, true) })
+    }
+}
+
+/// Return true if any buffer has changes. Also buffers that are not
+/// written (`anyBufIsChanged`).
+///
+/// # Safety
+/// Walks the real `GLOBALS.firstbuf`/`b_next` linked list and
+/// dereferences each node - callers must ensure every live buffer in
+/// the list is a valid, properly initialized `BufT` (same requirement
+/// as any other `firstbuf`/`b_next` traversal in this crate). Also see
+/// [`buf_is_changed`]'s own safety doc.
+#[must_use]
+pub unsafe fn any_buf_is_changed() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut bp = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+    while !bp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &mut *bp };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { buf_is_changed(b) } {
+            return true;
+        }
+        bp = b.b_next;
+    }
+    false
+}
+
+/// Return true if the current buffer has changed (`curbufIsChanged`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Also see [`buf_is_changed`]'s own safety doc.
+#[must_use]
+pub unsafe fn curbuf_is_changed() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_is_changed(curbuf) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +488,99 @@ mod tests {
         };
         u_clearline(&mut buf);
         assert_eq!(buf.b_u_line_lnum, 3);
+    }
+
+    #[test]
+    fn buf_is_changed_prompt_buffer_respects_modified_was_set() {
+        let mut buf = BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_modified_was_set: true,
+            b_changed: 0, // deliberately 0: prompt buffers ignore this
+            ..Default::default()
+        };
+        assert!(unsafe { buf_is_changed(&mut buf) });
+
+        buf.b_modified_was_set = false;
+        assert!(!unsafe { buf_is_changed(&mut buf) });
+    }
+
+    #[test]
+    fn buf_is_changed_dontwrite_buffer_is_never_changed() {
+        let mut buf = BufT {
+            b_p_bt: Some(b"nofile".to_vec()),
+            b_changed: 1, // even with b_changed set...
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            ..Default::default()
+        };
+        assert!(!unsafe { buf_is_changed(&mut buf) });
+    }
+
+    #[test]
+    fn buf_is_changed_normal_buffer_follows_b_changed() {
+        // BF_NEVERLOADED short-circuits file_ff_differs to false,
+        // avoiding the need for a real memline in this test.
+        let mut buf = BufT {
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            b_changed: 1,
+            ..Default::default()
+        };
+        assert!(unsafe { buf_is_changed(&mut buf) });
+
+        buf.b_changed = 0;
+        assert!(!unsafe { buf_is_changed(&mut buf) });
+    }
+
+    #[test]
+    fn curbuf_is_changed_matches_buf_is_changed_on_curbuf() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            b_changed: 1,
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        assert!(unsafe { curbuf_is_changed() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+    }
+
+    #[test]
+    fn any_buf_is_changed_walks_the_buffer_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf2 = BufT {
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            b_changed: 1,
+            ..Default::default()
+        };
+        let mut buf1 = BufT {
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            b_changed: 0,
+            b_next: &mut buf2 as *mut BufT,
+            ..Default::default()
+        };
+        let prev_firstbuf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = &mut buf1 as *mut BufT;
+
+        assert!(unsafe { any_buf_is_changed() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = prev_firstbuf;
+    }
+
+    #[test]
+    fn any_buf_is_changed_false_when_no_buffer_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = BufT {
+            b_flags: crate::buffer_defs::b_flags::BF_NEVERLOADED as i32,
+            b_changed: 0,
+            ..Default::default()
+        };
+        let prev_firstbuf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = &mut buf1 as *mut BufT;
+
+        assert!(!unsafe { any_buf_is_changed() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = prev_firstbuf;
     }
 }
