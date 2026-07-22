@@ -48,15 +48,22 @@
 //! `get_globvar_dict`/`get_funccal_local_ht`/`var_wrong_func_name`,
 //! none translated, and nothing in this crate can even construct a
 //! real global/local-funccall scope dict yet for that check to apply
-//! to).
+//! to), `tv_dict_add_list`/`_dict`/`_tv`/`_nr`/`_float`/`_bool`/`_str`
+//! (`_str_len`/`_allocated_str` collapsed into `tv_dict_add_str`,
+//! since Rust's `&[u8]` already carries its own length - see
+//! `tv_dict_add_str`'s own doc comment; `_func` is NOT translated,
+//! needs `ufunc_T`'s function-name registry).
 //!
 //! **List**: `tv_list_alloc`, `tv_list_item_alloc` (private, matching
 //! the original's own `static`), `tv_list_free_contents`/
 //! `tv_list_free_list`/`tv_list_free`/`tv_list_unref`/`tv_list_ref`,
-//! `tv_list_append`/`tv_list_append_tv`/`tv_list_append_owned_tv`,
-//! `tv_list_insert`/`tv_list_insert_tv`, `tv_list_drop_items`/
-//! `tv_list_remove_items`/`tv_list_item_remove`, `tv_list_watch_add`/
-//! `tv_list_watch_remove`/`tv_list_watch_fix`.
+//! `tv_list_append`/`tv_list_append_tv`/`tv_list_append_owned_tv`/
+//! `tv_list_append_list`/`tv_list_append_dict`/`tv_list_append_string`
+//! (`tv_list_append_allocated_string` collapsed in, same reasoning as
+//! `tv_dict_add_str`)/`tv_list_append_number`, `tv_list_insert`/
+//! `tv_list_insert_tv`, `tv_list_drop_items`/`tv_list_remove_items`/
+//! `tv_list_item_remove`, `tv_list_watch_add`/`tv_list_watch_remove`/
+//! `tv_list_watch_fix`.
 //!
 //! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`.
 //!
@@ -108,16 +115,16 @@
 //!   need to recurse further here since `tv_list_free_contents`/
 //!   `tv_dict_free_contents` themselves already do that recursion one
 //!   level at a time via the same helper).
+//! - `tv_dict_add_func` (needs `ufunc_T`'s function-name registry).
 //! - Every other `tv_dict_*`/`tv_list_*`/`tv_blob_*` function
-//!   (`tv_dict_get_string`, `tv_dict_add_list`/`_dict`/`_str`/`_nr`/
-//!   `_float`/`_allocated_str`, `tv_dict_extend`, `tv_list_copy`,
+//!   (`tv_dict_get_string`, `tv_dict_extend`, `tv_list_copy`,
 //!   `tv_list_concat`, blob byte-level accessors, iteration helpers,
 //!   etc.): straightforward to add once needed, layered on top of the
 //!   primitives here.
 
 use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
-use crate::vim_defs::OK;
+use crate::vim_defs::{FAIL, OK};
 
 /// `LUA_NOREF`: represents a missing Lua reference - `DictT`'s own
 /// `lua_table_ref` is always this value until the Lua host (phase 13)
@@ -526,6 +533,151 @@ pub unsafe fn tv_dict_add(d: &mut DictT, item: *mut DictitemT) -> i32 {
         d.dv_index.insert(key_ptr as usize, item);
     }
     rc
+}
+
+/// Add a list entry to a dictionary; `list`'s reference count is
+/// incremented on success (`tv_dict_add_list`).
+///
+/// Returns `OK`/`FAIL` (`FAIL` when `key` already exists - `list`'s
+/// ownership stays with the caller in that case, matching the
+/// original's "detach so `tv_dict_item_free()` does not unref it" own
+/// comment).
+///
+/// # Safety
+/// `list`, if non-null, must be a valid pointer to a live `ListT`.
+pub unsafe fn tv_dict_add_list(
+    d: &mut DictT,
+    key: &[u8],
+    list: *mut crate::eval::typval_defs::ListT,
+) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: `item` is still exclusively owned here.
+        unsafe { (*item).di_tv.value = TypvalValue::List(std::ptr::null_mut()) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_ref(list) };
+    OK
+}
+
+/// Add a dictionary entry to a dictionary; `dict`'s reference count is
+/// incremented on success (`tv_dict_add_dict`).
+///
+/// # Safety
+/// `dict`, if non-null, must be a valid pointer to a live `DictT`.
+pub unsafe fn tv_dict_add_dict(d: &mut DictT, key: &[u8], dict: *mut DictT) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: `item` is still exclusively owned here.
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(std::ptr::null_mut()) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    if !dict.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*dict).dv_refcount += 1 };
+    }
+    OK
+}
+
+/// Add a typval entry to a dictionary; `tv` is copied (see [`tv_copy`])
+/// (`tv_dict_add_tv`).
+///
+/// # Safety
+/// Forwards [`tv_copy`]'s own safety requirements for `tv`.
+pub unsafe fn tv_dict_add_tv(d: &mut DictT, key: &[u8], tv: &TypvalT) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict;
+    // forwarded from this function's own safety doc for `tv`.
+    unsafe { tv_copy(tv, &mut (*item).di_tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Add a number entry to a dictionary (`tv_dict_add_nr`).
+pub fn tv_dict_add_nr(d: &mut DictT, key: &[u8], nr: crate::eval::typval_defs::VarnumberT) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::Number(nr) };
+    // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: same as above.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Add a floating point number entry to a dictionary
+/// (`tv_dict_add_float`).
+pub fn tv_dict_add_float(d: &mut DictT, key: &[u8], nr: f64) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::Float(nr) };
+    // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: same as above.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Add a boolean entry to a dictionary (`tv_dict_add_bool`).
+pub fn tv_dict_add_bool(
+    d: &mut DictT,
+    key: &[u8],
+    val: crate::eval::typval_defs::BoolVarValue,
+) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::Bool(val) };
+    // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: same as above.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Add a string entry to a dictionary; always deep-copies `val` into a
+/// freshly owned `Vec<u8>` (`tv_dict_add_str`/`tv_dict_add_str_len`/
+/// `tv_dict_add_allocated_str` collapsed into one function - Rust's
+/// `&[u8]` already carries its own length, so the "how many bytes"
+/// question those three separate original variants existed to answer
+/// doesn't arise here, and there is no equivalent to the "adopt an
+/// already-allocated buffer without copying" optimization
+/// `tv_dict_add_allocated_str` provided, since every caller in this
+/// crate already owns a `Vec<u8>`/`&[u8]` it can simply clone or move).
+/// `None` stores an absent string, matching the original's
+/// `val == NULL` case.
+pub fn tv_dict_add_str(d: &mut DictT, key: &[u8], val: Option<&[u8]>) -> i32 {
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::String(val.map(<[u8]>::to_vec)) };
+    // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: same as above.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
 }
 
 /// Allocate a blob. Caller should take care of the reference count
@@ -957,6 +1109,80 @@ pub unsafe fn tv_list_append_owned_tv(
     unsafe { &mut (*li).li_tv as *mut TypvalT }
 }
 
+/// Append a list to a list; `itemlist`'s reference count is
+/// incremented (`tv_list_append_list`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`. `itemlist`,
+/// if non-null, must be a valid pointer to a live `ListT`.
+pub unsafe fn tv_list_append_list(
+    l: *mut crate::eval::typval_defs::ListT,
+    itemlist: *mut crate::eval::typval_defs::ListT,
+) {
+    let tv = TypvalT {
+        v_lock: VarLockStatus::Unlocked,
+        value: TypvalValue::List(itemlist),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append_owned_tv(l, tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_ref(itemlist) };
+}
+
+/// Append a dictionary to a list; `dict`'s reference count is
+/// incremented (`tv_list_append_dict`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`. `dict`, if
+/// non-null, must be a valid pointer to a live `DictT`.
+pub unsafe fn tv_list_append_dict(l: *mut crate::eval::typval_defs::ListT, dict: *mut DictT) {
+    let tv = TypvalT {
+        v_lock: VarLockStatus::Unlocked,
+        value: TypvalValue::Dict(dict),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append_owned_tv(l, tv) };
+    if !dict.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*dict).dv_refcount += 1 };
+    }
+}
+
+/// Make a copy of `str` and append it as an item to a list
+/// (`tv_list_append_string`/`tv_list_append_allocated_string` collapsed
+/// into one function - Rust's `&[u8]` already carries its own length,
+/// and every caller in this crate already owns a byte buffer it can
+/// simply clone rather than needing the original's "adopt an
+/// already-allocated buffer" optimization). `None` appends an absent
+/// string, matching the original's `str == NULL` case.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+pub unsafe fn tv_list_append_string(l: *mut crate::eval::typval_defs::ListT, s: Option<&[u8]>) {
+    let tv = TypvalT {
+        v_lock: VarLockStatus::Unlocked,
+        value: TypvalValue::String(s.map(<[u8]>::to_vec)),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append_owned_tv(l, tv) };
+}
+
+/// Append a number to a list (`tv_list_append_number`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+pub unsafe fn tv_list_append_number(
+    l: *mut crate::eval::typval_defs::ListT,
+    n: crate::eval::typval_defs::VarnumberT,
+) {
+    let tv = TypvalT {
+        v_lock: VarLockStatus::Unlocked,
+        value: TypvalValue::Number(n),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_append_owned_tv(l, tv) };
+}
+
 /// Insert a list item before `item` (or at the end, if `item` is
 /// null) (`tv_list_insert`).
 ///
@@ -1116,6 +1342,147 @@ mod tests {
             // avoid leaking it in this test.
             tv_dict_item_free(item2);
 
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_list_increments_refcount_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let list = tv_list_alloc(0);
+        unsafe {
+            assert_eq!((*list).lv_refcount, 0);
+            assert_eq!(tv_dict_add_list(&mut *d, b"pos", list), OK);
+            assert_eq!((*list).lv_refcount, 1);
+
+            let found = tv_dict_find(Some(&mut *d), b"pos").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::List(p) if p == list));
+
+            // Dropping the dict unrefs (not frees, since the list is
+            // still independently reachable via `list` here) the list
+            // once (1 -> 0), which frees it - don't touch `list` again
+            // after this.
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_list_duplicate_key_leaves_ownership_with_caller() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let list = tv_list_alloc(0);
+        unsafe {
+            let existing = tv_dict_item_alloc(b"k");
+            assert_eq!(tv_dict_add(&mut *d, existing), OK);
+
+            assert_eq!(tv_dict_add_list(&mut *d, b"k", list), FAIL);
+            // Refcount must NOT have been incremented - ownership
+            // stayed with the caller, matching the original's
+            // "detach so tv_dict_item_free() does not unref it".
+            assert_eq!((*list).lv_refcount, 0);
+
+            tv_dict_free(d);
+            tv_list_free(list);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_dict_increments_refcount_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let inner = tv_dict_alloc();
+        unsafe {
+            assert_eq!((*inner).dv_refcount, 0);
+            assert_eq!(tv_dict_add_dict(&mut *d, b"nested", inner), OK);
+            assert_eq!((*inner).dv_refcount, 1);
+
+            let found = tv_dict_find(Some(&mut *d), b"nested").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::Dict(p) if p == inner));
+
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_tv_copies_the_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let tv = number_tv(42);
+            assert_eq!(tv_dict_add_tv(&mut *d, b"answer", &tv), OK);
+            let found = tv_dict_find(Some(&mut *d), b"answer").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::Number(42)));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_nr_stores_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_nr(&mut *d, b"n", 7), OK);
+            let found = tv_dict_find(Some(&mut *d), b"n").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::Number(7)));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_float_stores_float() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_float(&mut *d, b"f", 3.5), OK);
+            let found = tv_dict_find(Some(&mut *d), b"f").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::Float(v) if v == 3.5));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_bool_stores_bool() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(
+                tv_dict_add_bool(&mut *d, b"b", crate::eval::typval_defs::BoolVarValue::True),
+                OK
+            );
+            let found = tv_dict_find(Some(&mut *d), b"b").unwrap();
+            assert!(matches!(
+                (*found).di_tv.value,
+                TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True)
+            ));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_str_stores_an_owned_copy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let mut src = b"hello".to_vec();
+            assert_eq!(tv_dict_add_str(&mut *d, b"s", Some(&src)), OK);
+            // Mutate the source afterwards to prove it was deep-copied,
+            // not aliased.
+            src[0] = b'X';
+            let found = tv_dict_find(Some(&mut *d), b"s").unwrap();
+            assert!(matches!(&(*found).di_tv.value, TypvalValue::String(Some(v)) if v == b"hello"));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_add_str_none_stores_absent_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_str(&mut *d, b"s", None), OK);
+            let found = tv_dict_find(Some(&mut *d), b"s").unwrap();
+            assert!(matches!(&(*found).di_tv.value, TypvalValue::String(None)));
             tv_dict_free(d);
         }
     }
@@ -1472,6 +1839,74 @@ mod tests {
             let stored = tv_list_append_owned_tv(l, tv);
             assert!(matches!(&(*stored).value, TypvalValue::String(Some(s)) if s == b"owned"));
             assert_eq!((*l).lv_len, 1);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_dict_increments_refcount_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!((*d).dv_refcount, 0);
+            tv_list_append_dict(l, d);
+            assert_eq!((*d).dv_refcount, 1);
+            assert_eq!((*l).lv_len, 1);
+            assert!(matches!((*(*l).lv_first).li_tv.value, TypvalValue::Dict(p) if p == d));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_list_increments_refcount_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        let inner = tv_list_alloc(0);
+        unsafe {
+            assert_eq!((*inner).lv_refcount, 0);
+            tv_list_append_list(l, inner);
+            assert_eq!((*inner).lv_refcount, 1);
+            assert_eq!((*l).lv_len, 1);
+            assert!(matches!((*(*l).lv_first).li_tv.value, TypvalValue::List(p) if p == inner));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_string_copies_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            let mut src = b"hi".to_vec();
+            tv_list_append_string(l, Some(&src));
+            src[0] = b'X';
+            assert!(matches!(&(*(*l).lv_first).li_tv.value, TypvalValue::String(Some(s)) if s == b"hi"));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_string_none_stores_absent_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_string(l, None);
+            assert!(matches!(&(*(*l).lv_first).li_tv.value, TypvalValue::String(None)));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_number_appends_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l, 10);
+            tv_list_append_number(l, 20);
+            assert_eq!((*l).lv_len, 2);
+            assert!(matches!((*(*l).lv_first).li_tv.value, TypvalValue::Number(10)));
+            assert!(matches!((*(*l).lv_last).li_tv.value, TypvalValue::Number(20)));
             tv_list_free(l);
         }
     }

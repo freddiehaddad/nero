@@ -23,7 +23,16 @@
 //! (now tractable now that `memline.c`'s `ml_get_buf`/`ml_get_buf_len`
 //! and `mbyte.c`'s `utf_head_off` all exist); `mark_view_restore` (now
 //! tractable now that `move.c`'s `set_topline`, `fold.c`'s
-//! `hasFolding`, and `plines.c`'s `linetabsize_eol` all exist).
+//! `hasFolding`, and `plines.c`'s `linetabsize_eol` all exist);
+//! `add_mark` (`static` in the original, kept private here too),
+//! `get_buf_local_marks`, `get_raw_global_mark`, `get_global_marks`
+//! (now tractable now that `eval/typval.rs`'s `list_T`/`dict_T` CRUD -
+//! `tv_dict_alloc`/`tv_list_alloc`/`tv_dict_add_str`/`tv_dict_add_list`/
+//! `tv_list_append_dict`/`tv_list_append_number` - all exist;
+//! `get_global_marks`'s own `namedfm[i].fmark.fnum != 0` branch still
+//! skips the entry, needing `buflist_nr2name` (`buffer.c`) - see that
+//! function's own doc comment for why this is currently unreachable
+//! anyway, not just narrow).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -49,9 +58,6 @@
 //!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
 //!   (see `ex_cmds_defs.rs`'s own module doc).
 //! - `cleanup_jumplist`: needs `win_valid`/buffer-list validity checks.
-//! - `add_mark`/`get_buf_local_marks`/`get_raw_global_mark`/
-//!   `get_global_marks`: need `list_T`'s real fields (the eval engine,
-//!   phase 5).
 
 use crate::buffer_defs::{BufT, TaggyT, WinT};
 use crate::ex_cmds_defs::cmod;
@@ -699,6 +705,161 @@ pub unsafe fn fm_getname(fmark: &FmarkT, lead_len: i32) -> Option<Vec<u8>> {
         return Some(unsafe { mark_line(&fmark.mark, lead_len) });
     }
     None // buflist_nr2name (buffer.c) not yet translated
+}
+
+/// Add information about mark `mname` to list `l` (`add_mark`,
+/// `static` in the original - kept private here too).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+unsafe fn add_mark(
+    l: *mut crate::eval::typval_defs::ListT,
+    mname: &[u8],
+    pos: PosT,
+    bufnr: i32,
+    fname: Option<&[u8]>,
+) -> i32 {
+    use crate::eval::typval::{tv_dict_add_list, tv_dict_add_str, tv_dict_alloc, tv_list_alloc, tv_list_append_dict, tv_list_append_number};
+    use crate::vim_defs::{FAIL, OK};
+
+    if pos.lnum <= 0 {
+        return OK;
+    }
+
+    let d = tv_dict_alloc();
+    // SAFETY: `l`/`d` are both valid, freshly-obtained live pointers
+    // (forwarded from this function's own safety doc for `l`;
+    // `tv_dict_alloc` never returns null).
+    unsafe { tv_list_append_dict(l, d) };
+
+    let lpos = tv_list_alloc(4);
+    // SAFETY: `lpos` was just allocated above, not yet shared.
+    unsafe {
+        tv_list_append_number(lpos, bufnr as crate::eval::typval_defs::VarnumberT);
+        tv_list_append_number(lpos, pos.lnum as crate::eval::typval_defs::VarnumberT);
+        tv_list_append_number(
+            lpos,
+            (if pos.col < MAXCOL { pos.col + 1 } else { MAXCOL }) as crate::eval::typval_defs::VarnumberT,
+        );
+        tv_list_append_number(lpos, pos.coladd as crate::eval::typval_defs::VarnumberT);
+    }
+
+    // SAFETY: `d` was just returned by `tv_dict_alloc` above, not yet
+    // shared beyond `l` (which only holds a refcounted reference).
+    unsafe {
+        if tv_dict_add_str(&mut *d, b"mark", Some(mname)) == FAIL
+            || tv_dict_add_list(&mut *d, b"pos", lpos) == FAIL
+            || (fname.is_some() && tv_dict_add_str(&mut *d, b"file", fname) == FAIL)
+        {
+            return FAIL;
+        }
+    }
+
+    OK
+}
+
+/// Get information about marks local to a buffer (`get_buf_local_marks`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`. Touches
+/// `GLOBALS.curwin`/`curbuf` (for the window-local `''` mark) - same
+/// requirement as every other function that touches a `GlobalCell`.
+pub unsafe fn get_buf_local_marks(buf: &BufT, l: *mut crate::eval::typval_defs::ListT) {
+    // Marks 'a' to 'z'
+    for i in 0..NMARKS {
+        let mname = [b'\'', b'a' + i as u8];
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { add_mark(l, &mname, buf.b_namedm[i as usize].mark, buf.handle, None) };
+    }
+
+    // Mark '' is a window local mark and not a buffer local mark.
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_pcmark = unsafe { &*globals.curwin }.w_pcmark;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf_handle = unsafe { &*globals.curbuf }.handle;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { add_mark(l, b"''", curwin_pcmark, curbuf_handle, None) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        add_mark(l, b"'\"", buf.b_last_cursor.mark, buf.handle, None);
+        add_mark(l, b"'[", buf.b_op_start, buf.handle, None);
+        add_mark(l, b"']", buf.b_op_end, buf.handle, None);
+        add_mark(l, b"'^", buf.b_last_insert.mark, buf.handle, None);
+        add_mark(l, b"'.", buf.b_last_change.mark, buf.handle, None);
+    }
+    if crate::buffer::bt_prompt(Some(buf)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { add_mark(l, b"':", buf.b_prompt_start.mark, buf.handle, None) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        add_mark(l, b"'<", buf.b_visual.vi_start, buf.handle, None);
+        add_mark(l, b"'>", buf.b_visual.vi_end, buf.handle, None);
+    }
+}
+
+/// Get a global mark. Note: mark might not have its `fnum` resolved
+/// (`get_raw_global_mark`).
+///
+/// # Safety
+/// Touches the `NAMEDFM` `GlobalCell` - same requirement as every
+/// other function that touches one.
+#[must_use]
+pub unsafe fn get_raw_global_mark(name: u8) -> XfmarkT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    namedfm[mark_global_index(name) as usize].clone()
+}
+
+/// Get information about global marks (`'A'` to `'Z'` and `'0'` to
+/// `'9'`) (`get_global_marks`).
+///
+/// # Deferred
+/// The original's `namedfm[i].fmark.fnum != 0` branch (resolving a
+/// mark whose file has already been assigned a live buffer number
+/// back to a file name) needs `buflist_nr2name` (`buffer.c`, not yet
+/// translated) - that entry is skipped entirely here rather than
+/// guessing at a name, matching the "return `None`"/"skip" precedent
+/// already used for [`fm_getname`]'s own "different buffer" branch.
+/// As things currently stand nothing translated in this crate can
+/// actually set a `namedfm` entry's `fnum` to nonzero yet either
+/// (`setmark`/`mark_set_global` themselves are still deferred, needing
+/// `buflist_findnr`) - so this branch is unreachable for now, not just
+/// narrow, but is kept faithfully in place (rather than omitted) since
+/// it will become reachable the moment mark-setting or ShaDa-loading
+/// can populate `fnum`.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`. Touches
+/// the `NAMEDFM` `GlobalCell` - same requirement as every other
+/// function that touches one.
+pub unsafe fn get_global_marks(l: *mut crate::eval::typval_defs::ListT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    for i in 0..(NMARKS + crate::mark_defs::EXTRA_MARKS) {
+        let entry = &namedfm[i as usize];
+        let name: &[u8] = if entry.fmark.fnum != 0 {
+            // Needs buffer.c's buflist_nr2name - not yet translated,
+            // and currently unreachable anyway (see this function's
+            // own doc comment).
+            continue;
+        } else if let Some(fname) = entry.fname.as_deref() {
+            fname
+        } else {
+            continue;
+        };
+        let letter = if i >= NMARKS {
+            b'0' + (i - NMARKS) as u8
+        } else {
+            b'A' + i as u8
+        };
+        let mname = [b'\'', letter];
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { add_mark(l, &mname, entry.fmark.mark, entry.fmark.fnum, Some(name)) };
+    }
 }
 
 /// Adjust position `lp` to point to the first byte of a multi-byte
@@ -1773,6 +1934,181 @@ mod tests {
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn add_mark_returns_ok_and_populates_dict_with_mark_pos_file() {
+        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval_defs::TypvalValue;
+
+        let l = tv_list_alloc(0);
+        let pos = PosT { lnum: 3, col: 4, coladd: 0 };
+        let rc = unsafe { add_mark(l, b"'a", pos, 7, Some(b"/tmp/foo")) };
+        assert_eq!(rc, crate::vim_defs::OK);
+
+        unsafe {
+            assert_eq!((*l).lv_len, 1);
+            let item = (*l).lv_first;
+            let d = match (*item).li_tv.value {
+                TypvalValue::Dict(d) => d,
+                _ => panic!("expected a dict"),
+            };
+
+            let mark_item = tv_dict_find(Some(&mut *d), b"mark").unwrap();
+            assert!(
+                matches!(&(*mark_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"'a")
+            );
+
+            let file_item = tv_dict_find(Some(&mut *d), b"file").unwrap();
+            assert!(
+                matches!(&(*file_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"/tmp/foo")
+            );
+
+            let pos_item = tv_dict_find(Some(&mut *d), b"pos").unwrap();
+            let lpos = match (*pos_item).di_tv.value {
+                TypvalValue::List(lp) => lp,
+                _ => panic!("expected a list"),
+            };
+            assert_eq!((*lpos).lv_len, 4);
+            let mut values = Vec::new();
+            let mut cur = (*lpos).lv_first;
+            while !cur.is_null() {
+                if let TypvalValue::Number(n) = (*cur).li_tv.value {
+                    values.push(n);
+                }
+                cur = (*cur).li_next;
+            }
+            assert_eq!(values, vec![7, 3, 5, 0]); // bufnr, lnum, col+1, coladd
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn add_mark_skips_marks_with_non_positive_lnum() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_free};
+
+        let l = tv_list_alloc(0);
+        let pos = PosT { lnum: 0, col: 0, coladd: 0 };
+        let rc = unsafe { add_mark(l, b"'a", pos, 1, None) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        unsafe {
+            assert_eq!((*l).lv_len, 0);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn add_mark_omits_file_key_when_fname_is_none() {
+        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval_defs::TypvalValue;
+
+        let l = tv_list_alloc(0);
+        let pos = PosT { lnum: 1, col: 0, coladd: 0 };
+        let rc = unsafe { add_mark(l, b"'a", pos, 1, None) };
+        assert_eq!(rc, crate::vim_defs::OK);
+        unsafe {
+            let item = (*l).lv_first;
+            let d = match (*item).li_tv.value {
+                TypvalValue::Dict(d) => d,
+                _ => panic!("expected a dict"),
+            };
+            assert!(tv_dict_find(Some(&mut *d), b"file").is_none());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn get_buf_local_marks_includes_only_marks_with_positive_lnum() {
+        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval_defs::TypvalValue;
+
+        let mut buf = BufT { handle: 5, ..Default::default() };
+        buf.b_namedm[0].mark = PosT { lnum: 3, col: 1, coladd: 0 }; // mark 'a'
+        buf.b_op_start = PosT { lnum: 7, col: 0, coladd: 0 };
+        // Everything else (b_last_cursor, b_op_end, b_last_insert,
+        // b_last_change, b_visual.vi_start/vi_end, w_pcmark) stays at
+        // lnum == 0 (the `Default` value) - add_mark's own
+        // `pos.lnum <= 0` early return correctly excludes those below,
+        // not a test gap.
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let l = tv_list_alloc(0);
+        unsafe { get_buf_local_marks(&buf, l) };
+
+        unsafe {
+            assert_eq!((*l).lv_len, 2);
+
+            let first = (*l).lv_first;
+            let d1 = match (*first).li_tv.value {
+                TypvalValue::Dict(d) => d,
+                _ => panic!("expected a dict"),
+            };
+            let mark1 = tv_dict_find(Some(&mut *d1), b"mark").unwrap();
+            assert!(matches!(&(*mark1).di_tv.value, TypvalValue::String(Some(s)) if s == b"'a"));
+
+            let second = (*first).li_next;
+            let d2 = match (*second).li_tv.value {
+                TypvalValue::Dict(d) => d,
+                _ => panic!("expected a dict"),
+            };
+            let mark2 = tv_dict_find(Some(&mut *d2), b"mark").unwrap();
+            assert!(matches!(&(*mark2).di_tv.value, TypvalValue::String(Some(s)) if s == b"'["));
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn get_raw_global_mark_returns_the_indexed_namedfm_entry() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[mark_global_index(b'B') as usize].fmark.mark.lnum = 99;
+
+        let got = unsafe { get_raw_global_mark(b'B') };
+        assert_eq!(got.fmark.mark.lnum, 99);
+    }
+
+    #[test]
+    fn get_global_marks_includes_resolved_fname_and_skips_nonzero_fnum() {
+        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval_defs::TypvalValue;
+
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        // Mark 'A' (index 0): unresolved fnum, has a stored fname ->
+        // included.
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fmark.mark = PosT { lnum: 4, col: 0, coladd: 0 };
+        namedfm[0].fname = Some(b"/tmp/a".to_vec());
+        // Mark 'B' (index 1): fnum already resolved -> skipped, needs
+        // buflist_nr2name (see get_global_marks's own doc comment).
+        namedfm[1] = XfmarkT::default();
+        namedfm[1].fmark.mark = PosT { lnum: 8, col: 0, coladd: 0 };
+        namedfm[1].fmark.fnum = 3;
+
+        let l = tv_list_alloc(0);
+        unsafe { get_global_marks(l) };
+
+        unsafe {
+            assert_eq!((*l).lv_len, 1);
+            let item = (*l).lv_first;
+            let d = match (*item).li_tv.value {
+                TypvalValue::Dict(d) => d,
+                _ => panic!("expected a dict"),
+            };
+            let mark_item = tv_dict_find(Some(&mut *d), b"mark").unwrap();
+            assert!(matches!(&(*mark_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"'A"));
+            let file_item = tv_dict_find(Some(&mut *d), b"file").unwrap();
+            assert!(
+                matches!(&(*file_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"/tmp/a")
+            );
+
+            tv_list_free(l);
         }
     }
 }
