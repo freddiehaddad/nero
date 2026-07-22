@@ -3,21 +3,38 @@
 //! `charset.c` is large (42KB) and most of it depends on `buf_T`/`g_chartab`
 //! (character-class tables built from the `'iskeyword'`/`'isident'`/
 //! `'isfname'`/`'isprint'` options - `option.c`, phase 4, and `buffer_defs.h`,
-//! phase 3) or multi-byte width calculation (`mbyte.c`, phase 7). Only the
-//! functions with no such dependency are translated in this pass: the
-//! `skip*` family, the `getdigits*` family, `vim_isblankline`, `hex2nr`,
-//! `hexhex2nr`.
+//! phase 3) or multi-byte width calculation (`mbyte.c`, phase 7). Translated
+//! in this pass (no such dependency, or only a documented default-table
+//! approximation of `g_chartab` - see below): the `skip*` family, the
+//! `getdigits*` family, `vim_isblankline`, `hex2nr`, `hexhex2nr`,
+//! `vim_isprintc`, `char2cells`, `ptr2cells`.
+//!
+//! `vim_isprintc`/`char2cells` need `g_chartab`, which isn't translated
+//! (needs `buf_T`/option parsing), but their *default* (pre-`'isprint'`-
+//! customization) values follow a simple, fixed rule directly verified
+//! against `buf_init_chartab`'s own global-reset branch: control
+//! characters unprintable/2-cells, printable ASCII and Latin-1
+//! printable/1-cell. This crate implements exactly that fixed rule
+//! rather than the general `g_chartab` machinery - correct for every
+//! real session that hasn't customized `'isprint'` (the common case),
+//! documented as a simplification on each function rather than
+//! pretending the general mechanism exists. `char2cells`'s special-key
+//! (`IS_SPECIAL`/negative `c`) branch is deferred separately (needs
+//! `keycodes.h`, no current caller passes such a value).
 //!
 //! Deferred (real forward dependencies):
 //! - `init_chartab`/`buf_init_chartab`/`check_isopt`: need `buf_T`
 //!   (`buffer_defs.h`) and option parsing (`option.c`).
-//! - `vim_isIDc`/`vim_iswordc`/`vim_iswordp`/`vim_isfilec`/`vim_isprintc`
-//!   families: need `g_chartab` (built by the above).
+//! - `vim_isIDc`/`vim_iswordc`/`vim_iswordp`/`vim_isfilec` families: need
+//!   the real `g_chartab` (built by the above) - unlike `vim_isprintc`
+//!   above, these don't have a simple fixed-default-rule shortcut
+//!   (`'iskeyword'`'s default already varies by `'encoding'`).
 //! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
-//!   `vim_isfilec` (hence `g_chartab`).
+//!   `vim_isfilec` (hence the real `g_chartab`).
 //! - `trans_characters`/`transstr`/`str_foldcase`/`transchar`* family,
-//!   `byte2cells`/`char2cells`/`ptr2cells`/`vim_strsize`/`vim_strnsize`:
-//!   need multi-byte width/encoding functions (`mbyte.c`).
+//!   `byte2cells`/`vim_strsize`/`vim_strnsize`: need more of `mbyte.c`
+//!   (`utf_head_off` in particular, deliberately not rushed - see
+//!   `mbyte.rs`'s own module doc).
 //! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
 //!   is substantial in its own right; deferred as a unit to translate
 //!   alongside the eval engine rather than piecemeal.
@@ -224,6 +241,82 @@ pub fn hexhex2nr(p: &[u8]) -> i32 {
     (hex2nr(p[0] as i32) << 4) + hex2nr(p[1] as i32)
 }
 
+/// Check that `c` is a printable character (`vim_isprintc`).
+///
+/// This uses `g_chartab`'s own DEFAULT initialization rule
+/// (`buf_init_chartab`'s unconditional, global-reset branch) rather
+/// than the real, possibly-`'isprint'`-customized `g_chartab` itself
+/// (not yet translated - needs `buf_T`/option parsing): control
+/// characters (0x00-0x1F, 0x7F-0x9F) are unprintable, printable ASCII
+/// (0x20-0x7E) and Latin-1 (0xA0-0xFF) are printable. This is exactly
+/// the behavior of any real session that hasn't customized
+/// `'isprint'` (a rare, non-default configuration), not a made-up
+/// approximation. For `c >= 0x100`, delegates to
+/// [`crate::mbyte::utf_printable`] (fully general, no option
+/// dependency at all).
+#[must_use]
+pub fn vim_isprintc(c: i32) -> bool {
+    if c <= 0 {
+        return false;
+    }
+    if c >= 0x100 {
+        return crate::mbyte::utf_printable(c);
+    }
+    (0x20..=0x7E).contains(&c) || c >= 0xA0
+}
+
+/// Return number of display cells occupied by character `c`
+/// (`char2cells`).
+///
+/// `c` can be a special key (negative number) in the original, in
+/// which case 3 or 4 is returned (via `IS_SPECIAL`/`K_SECOND`,
+/// `keycodes.h`, not yet translated) - deferred, documented gap: no
+/// caller in this crate yet passes an encoded special-key value here.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `c >= 0x80`, via
+/// [`crate::mbyte::utf_char2cells`]; and for `'display'`'s `"uhex"`
+/// flag on the control-character path).
+#[must_use]
+pub unsafe fn char2cells(c: i32) -> i32 {
+    if c >= 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::mbyte::utf_char2cells(c) };
+    }
+    if (0x20..=0x7E).contains(&c) {
+        return 1;
+    }
+    // g_chartab's own DEFAULT initialization rule for the remaining
+    // (control/DEL) range: 2 cells normally (displayed as e.g. "^I"),
+    // 4 if 'display' contains "uhex".
+    // SAFETY: forwarded from this function's own safety doc.
+    let dy_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
+    if dy_flags & crate::option_vars::opt_dy_flag::UHEX != 0 {
+        4
+    } else {
+        2
+    }
+}
+
+/// Return number of display cells occupied by character at `p`
+/// (`ptr2cells`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`crate::mbyte::utf_ptr2cells`]/[`char2cells`]).
+#[must_use]
+pub unsafe fn ptr2cells(p: &[u8]) -> i32 {
+    let Some(&b0) = p.first() else {
+        return 1;
+    };
+    if b0 >= 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::mbyte::utf_ptr2cells(p) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { char2cells(i32::from(b0)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +402,70 @@ mod tests {
         assert_eq!(hexhex2nr(b"1F"), 0x1F);
         assert_eq!(hexhex2nr(b"zz"), -1);
         assert_eq!(hexhex2nr(b"1"), -1); // too short
+    }
+
+    #[test]
+    fn vim_isprintc_matches_g_chartab_default_rule_below_0x100() {
+        assert!(!vim_isprintc(0)); // NUL
+        assert!(!vim_isprintc(-1));
+        assert!(!vim_isprintc(0x1f)); // control char
+        assert!(vim_isprintc(i32::from(b' '))); // start of printable ASCII
+        assert!(vim_isprintc(i32::from(b'~'))); // end of printable ASCII
+        assert!(!vim_isprintc(0x7f)); // DEL
+        assert!(!vim_isprintc(0x9f)); // still in the unprintable gap
+        assert!(vim_isprintc(0xa0)); // start of printable Latin-1
+        assert!(vim_isprintc(0xff)); // end of printable Latin-1
+    }
+
+    #[test]
+    fn vim_isprintc_delegates_to_utf_printable_at_and_above_0x100() {
+        assert!(vim_isprintc(0x0100)); // ordinary Latin Extended-A
+        assert!(!vim_isprintc(0x200b)); // in utf_printable's nonprint table
+    }
+
+    #[test]
+    fn char2cells_printable_ascii_is_one_and_control_is_two() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { char2cells(i32::from(b'a')) }, 1);
+        assert_eq!(unsafe { char2cells(0x01) }, 2); // control char, no uhex
+    }
+
+    #[test]
+    fn char2cells_control_char_is_four_with_uhex() {
+        let _guard = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.dy_flags;
+        opts.dy_flags = crate::option_vars::opt_dy_flag::UHEX;
+
+        assert_eq!(unsafe { char2cells(0x01) }, 4);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = prev;
+    }
+
+    #[test]
+    fn char2cells_delegates_to_utf_char2cells_above_0x80() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { char2cells(0x4e00) }, unsafe {
+            crate::mbyte::utf_char2cells(0x4e00)
+        });
+    }
+
+    #[test]
+    fn ptr2cells_ascii_matches_char2cells() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { ptr2cells(b"a") }, unsafe { char2cells(i32::from(b'a')) });
+    }
+
+    #[test]
+    fn ptr2cells_empty_slice_is_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { ptr2cells(b"") }, 1);
+    }
+
+    #[test]
+    fn ptr2cells_multibyte_matches_utf_ptr2cells() {
+        let _guard = crate::globals::global_state_test_lock();
+        let cjk = "一".as_bytes();
+        assert_eq!(unsafe { ptr2cells(cjk) }, unsafe { crate::mbyte::utf_ptr2cells(cjk) });
     }
 }

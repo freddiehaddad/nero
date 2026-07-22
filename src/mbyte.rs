@@ -9,14 +9,28 @@
 //! `Cargo.toml`'s own comment recording that decision):
 //! `utf_iscomposing_first`, `utf_composinglike`, `utf_iscomposing`,
 //! `utfc_ptr2len`, `utfc_ptr2len_len`, `utf_fold`, `mb_toupper`/
-//! `mb_tolower`/`mb_islower`/`mb_isupper`.
+//! `mb_tolower`/`mb_islower`/`mb_isupper`; character *display width*:
+//! `intable`/`utf_printable` (the portable, non-`__SSE2__` reference
+//! algorithm; the SSE2 intrinsics fast path is a pure optimization
+//! producing identical results, not translated), `cw_value` (always
+//! returns 0, since the real `cw_table` is populated only by the eval
+//! engine's `setcellwidths()`, not yet translated, matching every real
+//! session's default, unconfigured state exactly), `prop_is_emojilike`,
+//! `utf_char2cells`, `utf_ptr2cells` (needs `charset.c`'s
+//! `vim_isprintc`/`char2cells`, themselves needing a documented
+//! default-table approximation of `g_chartab`; see `charset.rs`'s own
+//! module doc for exactly what that means).
 //!
 //! `mbyte.c` as a whole (~3060 lines) is far larger than even this:
-//! character *display width* (`utf_char2cells`/`utf_ptr2cells`/
-//! `ptr2cells`) additionally needs `vim_isprintc` (`charset.c`) and a
-//! `'cellwidths'`-style per-character override table (`cw_value`) not
-//! yet examined; `utf_head_off` is a substantial standalone backward-
-//! scanning algorithm in its own right; encoding-name canonicalization
+//! `utf_head_off` is a substantial standalone backward-scanning
+//! algorithm in its own right (relies on scanning *before* a
+//! caller-supplied position down to a NUL-terminated buffer's start,
+//! a genuinely different shape from every other function translated so
+//! far - deserves its own dedicated pass, deliberately not rushed
+//! alongside this one, matching the precedent already set for
+//! `memline.c`'s B-tree traversal); `utf_ptr2cells_len` (bounded-length
+//! sibling of `utf_ptr2cells`, likely trivial once needed - not added
+//! speculatively without a real caller); encoding-name canonicalization
 //! and `iconv`-based conversion need the still-undecided `iconv` FFI
 //! (`iconv_defs.rs`). Each is its own follow-up, not bundled in here.
 //!
@@ -33,11 +47,10 @@
 //! change.
 //!
 //! Deferred (need another not-yet-decided subsystem):
-//! `utf_char2cells`/`utf_ptr2cells`/`ptr2cells` (character display
-//! width), `utf_head_off` (composing-character offset backscan),
+//! `utf_head_off` (composing-character offset backscan),
 //! `mb_stricmp` (`STRICMP`-adjacent bytewise fallback details not yet
-//! checked), and everything else in the file (encoding-name tables,
-//! `iconv` conversion, `show_utf8`, etc.).
+//! checked), `utf_ptr2cells_len`, and everything else in the file
+//! (encoding-name tables, `iconv` conversion, `show_utf8`, etc.).
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -780,6 +793,183 @@ pub fn mb_strnicmp(s1: &[u8], s2: &[u8], nn: usize) -> i32 {
     utf_strnicmp(s1, s2, nn, nn)
 }
 
+/// Return true if `c` (`>= 0x100`) is in `table`, a sorted list of
+/// non-overlapping `(first, last)` inclusive intervals (`intable`,
+/// `static` in the original - kept private here too).
+fn intable(table: &[(i32, i32)], c: i32) -> bool {
+    // first quick check for Latin1 etc. characters
+    if c < table[0].0 {
+        return false;
+    }
+
+    // binary search in table
+    let mut bot = 0usize;
+    let mut top = table.len();
+    loop {
+        let mid = (bot + top) / 2;
+        if table[mid].1 < c {
+            bot = mid + 1;
+        } else if table[mid].0 > c {
+            top = mid;
+        } else {
+            return true;
+        }
+        if top <= bot {
+            return false;
+        }
+    }
+}
+
+/// Return true for characters that can be displayed in a normal way.
+/// Only for characters of 0x100 and above! (`utf_printable`).
+///
+/// Translated from the portable (non-`__SSE2__`) reference
+/// implementation in the original - the `__SSE2__` intrinsics fast
+/// path is a pure performance optimization producing bit-for-bit
+/// identical results (same fixed interval table), not translated
+/// (this crate doesn't use platform SIMD intrinsics anywhere else
+/// either).
+#[must_use]
+pub fn utf_printable(c: i32) -> bool {
+    // Sorted list of non-overlapping intervals.
+    // 0xd800-0xdfff is reserved for UTF-16, actually illegal.
+    const NONPRINT: &[(i32, i32)] = &[
+        (0x070f, 0x070f),
+        (0x180b, 0x180e),
+        (0x200b, 0x200f),
+        (0x202a, 0x202e),
+        (0x2060, 0x206f),
+        (0xd800, 0xdfff),
+        (0xfeff, 0xfeff),
+        (0xfff9, 0xfffb),
+        (0xfffe, 0xffff),
+    ];
+    !intable(NONPRINT, c)
+}
+
+/// Check if `c` has a user-configured cell width via `'cellwidths'`
+/// (`cw_value`, `static` in the original - kept private here too).
+///
+/// Always returns 0 (no override): the original's `cw_table` is
+/// populated only by the eval engine's `setcellwidths()` VimL builtin
+/// (`f_setcellwidths`, `eval/funcs.c`, not yet translated) - this
+/// matches every real session's DEFAULT (nobody has called
+/// `setcellwidths()`) state exactly, not an approximation.
+fn cw_value(_c: i32) -> i32 {
+    0
+}
+
+/// `prop_is_emojilike` (`static` in the original - kept private here
+/// too).
+fn prop_is_emojilike(prop: &utf8proc_sys::utf8proc_property_t) -> bool {
+    prop.boundclass() == utf8proc_sys::utf8proc_boundclass_t::UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC.0
+        || prop.boundclass() == utf8proc_sys::utf8proc_boundclass_t::UTF8PROC_BOUNDCLASS_REGIONAL_INDICATOR.0
+}
+
+/// For UTF-8 character `c` return 2 for a double-width character, 1
+/// for others. Returns 4 or 6 for an unprintable character. Is only
+/// correct for characters >= 0x80. When `'ambiwidth'` is `"double"`,
+/// return 2 for a character with East Asian Width class
+/// A(mbiguous) (`utf_char2cells`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'ambiwidth'`/
+/// `'emoji'`).
+#[must_use]
+pub unsafe fn utf_char2cells(c: i32) -> i32 {
+    if c < 0x80 {
+        return 1;
+    }
+
+    if !crate::charset::vim_isprintc(c) {
+        // unprintable is displayed either as <xx> or <xxxx>
+        return if c > 0xFF { 6 } else { 4 };
+    }
+
+    let n = cw_value(c);
+    if n != 0 {
+        return n;
+    }
+
+    // SAFETY: utf8proc_get_property never returns null (documented
+    // utf8proc contract - it always returns a valid "default entry"
+    // even for out-of-range/invalid codepoints).
+    let prop = unsafe { &*utf8proc_sys::utf8proc_get_property(c) };
+
+    if prop.charwidth() == 2 {
+        return 2;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    if opts.p_ambw.as_deref().is_some_and(|s| s.first() == Some(&b'd')) && prop.ambiguous_width() != 0
+    {
+        return 2;
+    }
+
+    // Characters below 1F000 may be considered single width
+    // traditionally, making them double width causes problems.
+    if opts.p_emoji != 0 && c >= 0x1f000 && prop.ambiguous_width() == 0 && prop_is_emojilike(prop) {
+        return 2;
+    }
+
+    1
+}
+
+/// Return the number of display cells the character at `p` occupies.
+/// This doesn't take care of unprintable characters, use
+/// [`crate::charset::ptr2cells`] for that (`utf_ptr2cells`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`utf_char2cells`]
+/// and, on the ASCII-overlong-sequence path,
+/// [`crate::charset::char2cells`]).
+#[must_use]
+pub unsafe fn utf_ptr2cells(p: &[u8]) -> i32 {
+    let Some(&b0) = p.first() else {
+        return 1;
+    };
+    if b0 < 0x80 {
+        return 1;
+    }
+
+    let len = utf_ptr2len(p) as usize;
+    let c = utf_ptr2char(p);
+
+    // An illegal byte, or overlong-encoded NUL, is displayed as <xx>.
+    // (Equivalent to the original's utf_ptr2CharInfo_impl(...) <= 0
+    // check: that helper always yields a value <= 0 exactly when
+    // utf_ptr2len collapses to 1 (illegal/truncated) or the decoded
+    // codepoint is 0 - not translated separately since utf_ptr2len/
+    // utf_ptr2char already exist and utf_ptr2cells_len itself uses
+    // this same equivalent formulation in the original.)
+    if len == 1 || c == 0 {
+        return 4;
+    }
+
+    // If the char is ASCII it must be an overlong sequence.
+    if c < 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::charset::char2cells(c) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cells = unsafe { utf_char2cells(c) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_emoji = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_emoji;
+    if cells == 1 && p_emoji != 0 {
+        // SAFETY: utf8proc_get_property never returns null.
+        let prop = unsafe { &*utf8proc_sys::utf8proc_get_property(c) };
+        if prop_is_emojilike(prop) {
+            let c2 = if len < p.len() { utf_ptr2char(&p[len..]) } else { 0 };
+            if c2 == 0xFE0F {
+                return 2; // emoji presentation
+            }
+        }
+    }
+    cells
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1262,85 @@ mod tests {
     fn mb_strnicmp_matches_utf_strnicmp_with_same_bound() {
         assert_eq!(mb_strnicmp(b"FOO", b"foo", 3), 0);
         assert_eq!(mb_strnicmp(b"FOO", b"bar", 3), utf_strnicmp(b"FOO", b"bar", 3, 3));
+    }
+
+    #[test]
+    fn utf_printable_recognizes_the_nonprint_table_boundaries() {
+        // Inside the fixed nonprint intervals: unprintable.
+        assert!(!utf_printable(0x070f)); // single-value interval
+        assert!(!utf_printable(0x200b)); // ZERO WIDTH SPACE (start of range)
+        assert!(!utf_printable(0x200f)); // end of that range
+        assert!(!utf_printable(0xffff)); // end of the last range
+        // Outside every interval: printable.
+        assert!(utf_printable(0x0100)); // Ā, ordinary Latin Extended-A
+        assert!(utf_printable(0x4e00)); // 一, CJK
+        assert!(utf_printable(0x2059)); // just before the 0x2060 range starts
+    }
+
+    #[test]
+    fn utf_char2cells_ascii_is_always_one() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_char2cells(i32::from(b'A')) }, 1);
+    }
+
+    #[test]
+    fn utf_char2cells_wide_cjk_character_is_two() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_char2cells(0x4e00) }, 2); // 一, East Asian Wide
+    }
+
+    #[test]
+    fn utf_char2cells_ordinary_latin_is_one() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_char2cells(0xe9) }, 1); // é
+    }
+
+    #[test]
+    fn utf_char2cells_unprintable_nonprint_char_is_six_above_0xff() {
+        let _guard = option_vars_test_lock();
+        // U+200B is in utf_printable's nonprint table and > 0xFF.
+        assert_eq!(unsafe { utf_char2cells(0x200b) }, 6);
+    }
+
+    #[test]
+    fn utf_char2cells_ambiguous_width_follows_ambiwidth_option() {
+        let _guard = option_vars_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_ambw.clone();
+
+        // U+00A1 (INVERTED EXCLAMATION MARK) has East Asian Width
+        // "Ambiguous" - single width unless 'ambiwidth' is "double".
+        opts.p_ambw = Some(b"single".to_vec());
+        assert_eq!(unsafe { utf_char2cells(0xa1) }, 1);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ambw = Some(b"double".to_vec());
+        assert_eq!(unsafe { utf_char2cells(0xa1) }, 2);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ambw = prev;
+    }
+
+    #[test]
+    fn utf_ptr2cells_ascii_is_one() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_ptr2cells(b"A") }, 1);
+    }
+
+    #[test]
+    fn utf_ptr2cells_empty_slice_is_one() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_ptr2cells(b"") }, 1);
+    }
+
+    #[test]
+    fn utf_ptr2cells_illegal_lead_byte_is_four() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { utf_ptr2cells(&[0x80]) }, 4); // lone continuation byte
+    }
+
+    #[test]
+    fn utf_ptr2cells_matches_utf_char2cells_for_valid_multibyte() {
+        let _guard = option_vars_test_lock();
+        let cjk = "一".as_bytes(); // U+4E00
+        assert_eq!(unsafe { utf_ptr2cells(cjk) }, unsafe { utf_char2cells(0x4e00) });
     }
 }
