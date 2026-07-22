@@ -1673,6 +1673,84 @@ pub fn marktree_itr_get_ext(
     }
 }
 
+/// `marktree_itr_get_filter`: places `itr` at the first key at or
+/// after `(row, col)` (and before `(stop_row, stop_col)`) that matches
+/// `meta_filter`, or reports `false` (leaving `itr` invalid) if there
+/// is none.
+pub fn marktree_itr_get_filter(
+    b: &MarkTree,
+    row: i32,
+    col: i32,
+    stop_row: i32,
+    stop_col: i32,
+    meta_filter: MetaFilter<'_>,
+    itr: &mut MarkTreeIter,
+) -> bool {
+    if !meta_has(&b.meta_root, meta_filter) {
+        return false;
+    }
+    if !marktree_itr_get_ext(b, MtPos::new(row, col), itr, false, false, None, Some(meta_filter)) {
+        return false;
+    }
+
+    marktree_itr_check_filter(itr, stop_row, stop_col, meta_filter)
+}
+
+/// `meta_map`: maps each [`MetaIndex`] slot to the `MT_FLAG_*` bit a
+/// real key must have set to count as contributing to that meta kind
+/// (`meta_map`, `static const` in the original). Order matches
+/// [`crate::marktree_defs::MetaIndex`]'s own variant order exactly
+/// (`Inline`, `Lines`, `SignHl`, `SignText`, `ConcealLines`).
+const META_MAP: [u32; K_MT_META_COUNT] = [
+    MT_FLAG_DECOR_VIRT_TEXT_INLINE as u32,
+    MT_FLAG_DECOR_VIRT_LINES as u32,
+    MT_FLAG_DECOR_SIGNHL as u32,
+    MT_FLAG_DECOR_SIGNTEXT as u32,
+    MT_FLAG_DECOR_CONCEAL_LINES as u32,
+];
+
+/// `marktree_itr_check_filter`: after `itr` has been positioned by
+/// [`marktree_itr_get_ext`], skip forward (subtrees only, not
+/// individual keys - hence the outer loop) until a key actually
+/// matching `meta_filter` is found, or `stop_pos` is reached.
+fn marktree_itr_check_filter(
+    itr: &mut MarkTreeIter,
+    stop_row: i32,
+    stop_col: i32,
+    meta_filter: MetaFilter<'_>,
+) -> bool {
+    let stop_pos = MtPos::new(stop_row, stop_col);
+
+    let mut key_filter: u32 = 0;
+    for m in 0..K_MT_META_COUNT {
+        key_filter |= META_MAP[m] & meta_filter[m];
+    }
+
+    loop {
+        // SAFETY: itr.x is non-null here - either from this function's
+        // own caller contract (marktree_itr_get_filter only calls this
+        // after a successful marktree_itr_get_ext) or because
+        // marktree_itr_next_skip only ever returns true while leaving
+        // itr.x valid (it checks for null itself on entry and returns
+        // false immediately in that case).
+        if pos_leq(stop_pos, unsafe { marktree_itr_pos(itr) }) {
+            itr.x = std::ptr::null_mut();
+            return false;
+        }
+
+        // SAFETY: same as above.
+        let k = unsafe { rawkey(itr) };
+        if !mt_end(k) && (u32::from(k.flags) & key_filter) != 0 {
+            return true;
+        }
+
+        // this skips subtrees, but not keys, thus the outer loop
+        if !marktree_itr_next_skip(itr, false, false, None, Some(meta_filter)) {
+            return false;
+        }
+    }
+}
+
 /// `marktree_itr_first`: places `itr` at the very first key in the tree.
 pub fn marktree_itr_first(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
     if b.n_keys == 0 {
@@ -3804,6 +3882,86 @@ mod tests {
         // Querying past the last key finds nothing further.
         let mut itr3 = MarkTreeIter::default();
         assert!(!marktree_itr_get(&tree, 1000, 0, &mut itr3));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    /// Builds a `[MetaFilter]` selecting only [`MetaIndex::Inline`].
+    fn select_inline_filter() -> [u32; K_MT_META_COUNT] {
+        std::array::from_fn(|i| {
+            if i == MetaIndex::Inline as usize { crate::marktree_defs::MT_FILTER_SELECT } else { 0 }
+        })
+    }
+
+    #[test]
+    fn marktree_itr_get_filter_finds_first_matching_key_and_skips_others() {
+        let mut tree = MarkTree::default();
+        // Plain keys at rows 0, 10, 20; an inline-marked key at row 15.
+        marktree_put_test(&mut tree, 0, 1, 0, 0, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 2, 10, 0, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 3, 15, 0, false, -1, -1, false, true); // inline
+        marktree_put_test(&mut tree, 0, 4, 20, 0, false, -1, -1, false, false);
+        marktree_check(&tree);
+
+        let select_inline = select_inline_filter();
+        let mut itr = MarkTreeIter::default();
+        // Starting from row 0 (before the inline key), should skip the
+        // two plain keys at rows 0/10 and land on the inline one at
+        // row 15, well before the stop position at row 1000.
+        assert!(marktree_itr_get_filter(&tree, 0, 0, 1000, 0, &select_inline, &mut itr));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(15, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn marktree_itr_get_filter_respects_stop_position() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 1, 0, 0, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 2, 30, 0, false, -1, -1, false, true); // inline, past stop
+
+        marktree_check(&tree);
+
+        let select_inline = select_inline_filter();
+        let mut itr = MarkTreeIter::default();
+        // stop_row=20 is before the inline key at row 30 - nothing
+        // matching should be found before reaching the stop position.
+        assert!(!marktree_itr_get_filter(&tree, 0, 0, 20, 0, &select_inline, &mut itr));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn marktree_itr_get_filter_returns_false_when_tree_has_no_matching_meta_at_all() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 1, 0, 0, false, -1, -1, false, false);
+        marktree_put_test(&mut tree, 0, 2, 10, 0, false, -1, -1, false, false);
+        marktree_check(&tree);
+
+        // No key in this tree has MT_FLAG_DECOR_VIRT_TEXT_INLINE set at
+        // all, so meta_root's own Inline count is 0 - meta_has's
+        // early-exit check should reject this before even positioning
+        // the iterator.
+        let select_inline = select_inline_filter();
+        let mut itr = MarkTreeIter::default();
+        assert!(!marktree_itr_get_filter(&tree, 0, 0, 1000, 0, &select_inline, &mut itr));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn marktree_itr_get_filter_starting_position_can_be_after_the_first_match() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 1, 5, 0, false, -1, -1, false, true); // inline
+        marktree_put_test(&mut tree, 0, 2, 50, 0, false, -1, -1, false, true); // inline
+        marktree_check(&tree);
+
+        let select_inline = select_inline_filter();
+        let mut itr = MarkTreeIter::default();
+        // Starting the search at row 20 skips the first inline key (row
+        // 5, before the start) and lands on the second (row 50).
+        assert!(marktree_itr_get_filter(&tree, 20, 0, 1000, 0, &select_inline, &mut itr));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(50, 0));
 
         unsafe { marktree_clear(&mut tree) };
     }
