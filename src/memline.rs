@@ -25,7 +25,12 @@
 //! **`ml_flush_line`** now in full (both the in-place `memmove`-based
 //! rewrite and the delete-then-append fallback), and **`ml_delete_int`/
 //! `ml_delete_flags`/`ml_delete`/`ml_delete_buf`** now in full,
-//! including block-removal (see below).
+//! including block-removal (see below); and, from the very end of the
+//! original file (a separate, self-contained "cursor position
+//! movement" section unrelated to the B-tree itself): `inc`/`incl`/
+//! `dec`/`decl` (increment/decrement a `pos_T` across line boundaries -
+//! now tractable now that `mbyte.c`'s `utfc_ptr2len`/`utf_head_off`
+//! both exist).
 //!
 //! **`ZeroBlock`/`PointerBlock`/`DataBlock` are NOT translated as
 //! `#[repr(C)]` structs reinterpreting a raw byte buffer** (the
@@ -2262,6 +2267,116 @@ pub unsafe fn ml_get_pos_len(pos: &crate::pos_defs::PosT) -> crate::pos_defs::Co
     unsafe { ml_get_len(pos.lnum) - pos.col }
 }
 
+/// Increment the line pointer `lp` crossing line boundaries as
+/// necessary (`inc`).
+///
+/// @return 1 when going to the next line. 2 when moving forward onto
+/// a NUL at the end of the line. -1 when at the end of file. 0
+/// otherwise.
+///
+/// # Safety
+/// Same as [`ml_get`] (touches `curbuf` via `ml_get_pos`).
+pub unsafe fn inc(lp: &mut crate::pos_defs::PosT) -> i32 {
+    // when searching position may be set to end of a line
+    if lp.col != crate::pos_defs::MAXCOL {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { ml_get_pos(lp) };
+        if p[0] != 0 {
+            // still within line, move to next char (may be NUL)
+            // SAFETY: forwarded from this function's own safety doc.
+            let l = unsafe { crate::mbyte::utfc_ptr2len(&p) };
+            lp.col += l;
+            return if p[l as usize] != 0 { 0 } else { 2 };
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+    if lp.lnum != curbuf.b_ml.ml_line_count {
+        // there is a next line
+        lp.col = 0;
+        lp.lnum += 1;
+        lp.coladd = 0;
+        return 1;
+    }
+    -1
+}
+
+/// Same as [`inc`], but skip NUL at the end of non-empty lines (`incl`).
+///
+/// # Safety
+/// Same as [`inc`].
+pub unsafe fn incl(lp: &mut crate::pos_defs::PosT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut r = unsafe { inc(lp) };
+    if r >= 1 && lp.col != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        r = unsafe { inc(lp) };
+    }
+    r
+}
+
+/// Decrement the line pointer `lp` crossing line boundaries as
+/// necessary (`dec`).
+///
+/// @return 0 when still on the same line. 1 when moving to a prior
+/// line. -1 when at the start of file.
+///
+/// # Safety
+/// Same as [`ml_get`] (touches `curbuf` via `ml_get`/`ml_get_len`).
+/// Also touches `crate::option_vars::OPTION_VARS` (via
+/// `crate::mbyte::utf_head_off`).
+pub unsafe fn dec(lp: &mut crate::pos_defs::PosT) -> i32 {
+    lp.coladd = 0;
+    if lp.col == crate::pos_defs::MAXCOL {
+        // past end of line
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { ml_get(lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        lp.col = unsafe { ml_get_len(lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        lp.col -= unsafe { crate::mbyte::utf_head_off(&p, lp.col as usize) };
+        return 0;
+    }
+
+    if lp.col > 0 {
+        // still within line
+        lp.col -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { ml_get(lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        lp.col -= unsafe { crate::mbyte::utf_head_off(&p, lp.col as usize) };
+        return 0;
+    }
+    if lp.lnum > 1 {
+        // there is a prior line
+        lp.lnum -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { ml_get(lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        lp.col = unsafe { ml_get_len(lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        lp.col -= unsafe { crate::mbyte::utf_head_off(&p, lp.col as usize) };
+        return 1;
+    }
+
+    // at start of file
+    -1
+}
+
+/// Same as [`dec`], but skip NUL at the end of non-empty lines (`decl`).
+///
+/// # Safety
+/// Same as [`dec`].
+pub unsafe fn decl(lp: &mut crate::pos_defs::PosT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut r = unsafe { dec(lp) };
+    if r == 1 && lp.col != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        r = unsafe { dec(lp) };
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3028,5 +3143,184 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn inc_moves_within_a_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // "hello": col 0 -> 1 -> ... -> 4 all stay on the same line.
+            let mut pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+            assert_eq!(inc(&mut pos), 0);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn inc_moves_onto_nul_then_crosses_to_next_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // "hello" has 5 real chars (col 0..4); col 4 is the last
+            // real char ('o'), moving onto col 5 lands on the NUL.
+            let mut pos = crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 };
+            assert_eq!(inc(&mut pos), 2); // moved forward onto the NUL
+            assert_eq!(pos.col, 5);
+
+            // Incrementing again crosses to the next line.
+            assert_eq!(inc(&mut pos), 1);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn inc_returns_minus_one_at_end_of_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // "foo" (lnum 3) is the last line, 3 chars long.
+            let mut pos = crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 };
+            assert_eq!(inc(&mut pos), -1); // already on the NUL, no next line
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 }); // untouched
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn incl_skips_the_nul_directly_to_next_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // Same starting point as inc_moves_onto_nul_then_crosses_to_
+            // next_line, but incl() does both inc() calls in one step.
+            let mut pos = crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 };
+            assert_eq!(incl(&mut pos), 1);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn dec_moves_within_a_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            let mut pos = crate::pos_defs::PosT { lnum: 2, col: 3, coladd: 5 };
+            assert_eq!(dec(&mut pos), 0);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 2, coladd: 0 }); // coladd cleared
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn dec_crosses_to_previous_line_at_col_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // Crossing to the previous line lands at that line's own
+            // length/NUL position (matching the original's own `lp->col
+            // = ml_get_len(...)`), NOT its last real character - same
+            // "NUL position, not len-1" behavior as the MAXCOL case
+            // above. "hello" (lnum 1) is 5 chars, so this lands at col 5.
+            let mut pos = crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 };
+            assert_eq!(dec(&mut pos), 1);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn dec_returns_minus_one_at_start_of_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            let mut pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+            assert_eq!(dec(&mut pos), -1);
+            assert_eq!(pos.lnum, 1);
+            assert_eq!(pos.col, 0);
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn dec_handles_maxcol_past_end_of_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // MAXCOL means "past end of line" - dec() brings it back to
+            // exactly the line's own length (the NUL position, matching
+            // ml_get_len("foo") == 3 minus utf_head_off's 0-for-ASCII;
+            // NOT length-1 - this looks surprising at first, but matches
+            // the original's own `lp->col = ml_get_len(...)` exactly).
+            let mut pos = crate::pos_defs::PosT { lnum: 3, col: crate::pos_defs::MAXCOL, coladd: 0 };
+            assert_eq!(dec(&mut pos), 0);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn decl_skips_nul_when_crossing_to_a_previous_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            // Starting at "world"'s first char (lnum 2, col 0): a plain
+            // dec() would cross to "hello"'s own NUL position (col 5,
+            // matching dec_crosses_to_previous_line_at_col_zero above) -
+            // decl() notices that landing spot isn't col 0 and steps
+            // back once more, landing on 'o' (col 4) instead.
+            let mut pos = crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 };
+            assert_eq!(decl(&mut pos), 0);
+            assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 });
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+        close_test_memline(buf);
     }
 }

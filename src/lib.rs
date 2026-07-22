@@ -22,6 +22,7 @@ pub mod buffer;
 pub mod buffer_defs;
 pub mod change;
 pub mod charset;
+pub mod cursor;
 pub mod decoration_defs;
 pub mod errors;
 pub mod eval;
