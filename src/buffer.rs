@@ -12,8 +12,9 @@
 //! `bufref_valid`/`buf_valid` (+ its own `buf_free_count` private
 //! counter, `BUF_FREE_COUNT`), the `'buftype'`-testing predicate
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
-//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, and
-//! `buf_hide`.
+//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, `buf_hide`,
+//! and `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
+//! exists).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -26,7 +27,6 @@
 //!   management), and `autocmd.c`.
 //! - `set_buflisted`/`buf_contents_changed`/`wipe_buffer`: need
 //!   `apply_autocmds` (`autocmd.c`).
-//! - `buf_is_empty`: needs `ml_get_buf` (`memline.c`).
 //! - `buf_inc_changedtick`/`buf_set_changedtick`: need `b_vars`'s real
 //!   dict-watcher machinery (the eval engine, phase 5).
 //! - Everything else in this file (buffer-list management, window-
@@ -231,6 +231,17 @@ pub unsafe fn buf_hide(buf: &BufT) -> bool {
         || unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags & cmod::HIDE != 0
 }
 
+/// Return true if `buf` is empty: exactly one line, and that line is
+/// itself empty (`buf_is_empty`).
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT` (same requirement as `crate::memline::ml_get_buf`).
+#[must_use]
+pub unsafe fn buf_is_empty(buf: &mut BufT) -> bool {
+    buf.b_ml.ml_line_count == 1 && unsafe { crate::memline::ml_get_buf(buf, 1) }[0] == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +353,61 @@ mod tests {
             assert!(buf_hide(&b));
             b.b_p_bh = Some(b"unload".to_vec());
             assert!(!buf_hide(&b));
+        }
+    }
+
+    #[test]
+    fn buf_is_empty_true_for_freshly_opened_buffer() {
+        // ml_open touches shared GLOBALS.got_int internally via
+        // mf_sync - must hold the lock like every other GlobalCell-
+        // touching test.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+
+        assert!(unsafe { buf_is_empty(&mut buf) });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn buf_is_empty_false_when_line_has_content() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"x\0") },
+            crate::vim_defs::OK
+        );
+
+        assert!(!unsafe { buf_is_empty(&mut buf) });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn buf_is_empty_false_when_more_than_one_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"\0", 1, false) },
+            crate::vim_defs::OK
+        );
+
+        // Two empty lines: still not "empty" per buf_is_empty's own
+        // definition (exactly one line).
+        assert!(!unsafe { buf_is_empty(&mut buf) });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
         }
     }
 }
