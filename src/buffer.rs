@@ -14,9 +14,16 @@
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
 //! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, `buf_hide`,
 //! `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
-//! exists), and `buffer.h`'s `buf_meta_total` (a tiny `static inline`
+//! exists), `buffer.h`'s `buf_meta_total` (a tiny `static inline`
 //! header function, not from `buffer.c` itself - harvested for
-//! `drawscreen.c`'s `number_width`).
+//! `drawscreen.c`'s `number_width`); and now that `eval/typval_defs.rs`'s
+//! `TypvalT`/`ChangedtickDictItem` are real (not opaque placeholders),
+//! `buf_get_changedtick`/`buf_set_changedtick`/`buf_inc_changedtick`/
+//! `buf_init_changedtick` - each skips only the real dict-watcher
+//! notification/`b_vars` registration side effect specifically (needs
+//! `dict_T`, still deferred), keeping the underlying `b:changedtick`
+//! value itself fully correct for every other C-level accessor in this
+//! crate.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -29,8 +36,6 @@
 //!   management), and `autocmd.c`.
 //! - `set_buflisted`/`buf_contents_changed`/`wipe_buffer`: need
 //!   `apply_autocmds` (`autocmd.c`).
-//! - `buf_inc_changedtick`/`buf_set_changedtick`: need `b_vars`'s real
-//!   dict-watcher machinery (the eval engine, phase 5).
 //! - Everything else in this file (buffer-list management, window-
 //!   buffer association, `:buffer`/`:ls`/title-bar formatting, modeline
 //!   processing, etc.): each needs 2+ of the above, plus `tag.c`/
@@ -254,10 +259,122 @@ pub fn buf_meta_total(buf: &BufT, m: crate::marktree_defs::MetaIndex) -> u32 {
     buf.b_marktree.meta_root[m as usize]
 }
 
+/// Get `b:changedtick` value. Faster than querying `b:`
+/// (`buf_get_changedtick`, `buffer.h`'s own `static inline`).
+#[must_use]
+pub fn buf_get_changedtick(buf: &BufT) -> crate::eval::typval_defs::VarnumberT {
+    match buf.changedtick_di.di_tv.value {
+        crate::eval::typval_defs::TypvalValue::Number(n) => n,
+        // Not yet initialized via buf_init_changedtick - matches
+        // reading an all-zero union in the original, which would also
+        // read 0.
+        _ => 0,
+    }
+}
+
+/// Set `b:changedtick`, also checking `b:` for consistency in debug
+/// builds in the original (`buf_set_changedtick`).
+///
+/// # Deferred
+/// The original also notifies any dict watchers on `buf->b_vars` of
+/// the change (`tv_dict_watcher_notify`) - not done here, since
+/// `b_vars`'s real dict-watcher machinery needs the eval engine's
+/// `dict_T` (still an opaque placeholder - see
+/// `eval/typval_defs.rs`'s own module doc). The underlying value
+/// itself is still set correctly, and every other C-level accessor in
+/// this crate reads it directly (not through the dict), so this gap
+/// only affects Vimscript-visible `b:changedtick` watchers, not this
+/// crate's own internal bookkeeping.
+pub fn buf_set_changedtick(buf: &mut BufT, changedtick: crate::eval::typval_defs::VarnumberT) {
+    buf.changedtick_di.di_tv.value = crate::eval::typval_defs::TypvalValue::Number(changedtick);
+}
+
+/// Increment `b:changedtick` value. Also checks `b:` for consistency
+/// in debug builds in the original (`buf_inc_changedtick`).
+pub fn buf_inc_changedtick(buf: &mut BufT) {
+    buf_set_changedtick(buf, buf_get_changedtick(buf) + 1);
+}
+
+/// Initialize `buf.changedtick_di` (`buf_init_changedtick`,
+/// `static inline` in the original).
+///
+/// # Deferred
+/// The original also registers this item into `buf->b_vars` (via
+/// `tv_dict_add`) so Vimscript code can read `b:changedtick` through
+/// the dict lookup path - not done here, since `b_vars`'s real
+/// `dict_T` doesn't exist yet (see `eval/typval_defs.rs`'s own module
+/// doc). [`buf_get_changedtick`]/[`buf_set_changedtick`] (this crate's
+/// own C-level accessors) already read/write the real value directly,
+/// independent of this dict registration.
+pub fn buf_init_changedtick(buf: &mut BufT) {
+    buf.changedtick_di = crate::eval::typval_defs::ChangedtickDictItem {
+        di_flags: crate::eval::typval_defs::dict_item_flags::RO
+            | crate::eval::typval_defs::dict_item_flags::FIX,
+        di_tv: crate::eval::typval_defs::TypvalT {
+            v_lock: crate::eval::typval_defs::VarLockStatus::Fixed,
+            value: crate::eval::typval_defs::TypvalValue::Number(buf_get_changedtick(buf)),
+        },
+        di_key: b"changedtick".to_vec(),
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn buf_get_changedtick_defaults_to_zero_before_init() {
+        let buf = BufT::default();
+        assert_eq!(buf_get_changedtick(&buf), 0);
+    }
+
+    #[test]
+    fn buf_set_and_get_changedtick_roundtrip() {
+        let mut buf = BufT::default();
+        buf_set_changedtick(&mut buf, 5);
+        assert_eq!(buf_get_changedtick(&buf), 5);
+    }
+
+    #[test]
+    fn buf_inc_changedtick_increments_by_one() {
+        let mut buf = BufT::default();
+        buf_set_changedtick(&mut buf, 5);
+        buf_inc_changedtick(&mut buf);
+        assert_eq!(buf_get_changedtick(&buf), 6);
+    }
+
+    #[test]
+    fn buf_inc_changedtick_from_default_starts_at_one() {
+        let mut buf = BufT::default();
+        buf_inc_changedtick(&mut buf);
+        assert_eq!(buf_get_changedtick(&buf), 1);
+    }
+
+    #[test]
+    fn buf_init_changedtick_sets_flags_lock_and_key() {
+        let mut buf = BufT::default();
+        buf_init_changedtick(&mut buf);
+
+        assert_eq!(
+            buf.changedtick_di.di_flags,
+            crate::eval::typval_defs::dict_item_flags::RO
+                | crate::eval::typval_defs::dict_item_flags::FIX
+        );
+        assert_eq!(buf.changedtick_di.di_tv.v_lock, crate::eval::typval_defs::VarLockStatus::Fixed);
+        assert_eq!(buf.changedtick_di.di_key, b"changedtick");
+        // Starts at whatever buf_get_changedtick already reported (0
+        // for a fresh, never-set buffer).
+        assert_eq!(buf_get_changedtick(&buf), 0);
+    }
+
+    #[test]
+    fn buf_init_changedtick_preserves_a_prior_value() {
+        let mut buf = BufT::default();
+        buf_set_changedtick(&mut buf, 42);
+        buf_init_changedtick(&mut buf);
+        assert_eq!(buf_get_changedtick(&buf), 42);
+    }
 
     fn buf_with_bt(bt: &str) -> BufT {
         BufT {
