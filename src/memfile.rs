@@ -7,7 +7,10 @@
 //! translated as a `debug_assert!` instead - see `mf_put`'s own doc
 //! comment), `mf_free`, `mf_trans_add`, `mf_trans_del`, `mf_need_trans`,
 //! `mf_free_fnames`, `mf_fullname`, `mf_set_fnames` (via
-//! `crate::path::full_name_save`), `mf_read`, `mf_write`, `mf_close`.
+//! `crate::path::full_name_save`), `mf_read`, `mf_write`, `mf_close`,
+//! `mf_sync` (`memfile.h`'s `MFS_*` flags moved here alongside it -
+//! same "header content lives with its .c file's translation"
+//! convention already used for `mark.h`).
 //!
 //! `mf_read`/`mf_write`/`mf_close` each call `PERROR()`/`emsg()`
 //! (`message.c`) on their error paths purely as a side effect before
@@ -34,10 +37,19 @@
 //! `mf_close()` - Rust's ordinary `Drop` at the end of the function
 //! body plays the role of the original's explicit `xfree(mfp)`.
 //!
+//! `mf_sync` (translated) omits its interruptibility mechanism
+//! (`os_char_avail()`/`os_breakcheck()`, needing `os/input.c`/the event
+//! loop, phase 11): the original clears `got_int` at entry specifically
+//! so a *pre-existing* interrupt flag never aborts the sync early, and
+//! nothing else in this simplified version ever sets it back to `true`
+//! mid-sync (since `os_breakcheck()` itself is what would do that), so
+//! the final `if got_int { break; }` check can never trigger here and
+//! is correctly omitted rather than silently changed.
+//!
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
-//! - `mf_open`/`mf_open_file`/`mf_do_open`/`mf_sync`: need the
-//!   file-open flag translation and/or symlink-attack security checks
+//! - `mf_open`/`mf_open_file`/`mf_do_open`: need the file-open flag
+//!   translation and/or symlink-attack security checks
 //!   (`os_fileinfo_link`) not yet built.
 //! - `mf_close_file`: needs `ml_get_buf` (`memline.c`) for its
 //!   `getlines` branch.
@@ -47,11 +59,27 @@
 //! - `mf_release_all`: calls `mf_close()` (done) but also iterates
 //!   `first_buffer`'s buffer list (`globals.h`) and `curbuf`/window
 //!   state not yet wired up to real multi-buffer support.
+//! - `mf_set_dirty`: only called from `ml_open`/`ml_setname`
+//!   (`memline.c`, not yet translated) - no caller yet.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
 use crate::memory::{xfree, xmalloc};
 use crate::vim_defs::{FAIL, OK};
 use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Flags for [`mf_sync`] (`memfile.h`'s anonymous `enum`).
+pub mod mfs_flag {
+    /// Also sync blocks with negative numbers (`MFS_ALL`).
+    pub const ALL: i32 = 1;
+    /// Stop syncing when a character is available (`MFS_STOP`) - not
+    /// enforced by this crate's `mf_sync` yet, see the module doc
+    /// comment.
+    pub const STOP: i32 = 2;
+    /// Flush the file to disk (`MFS_FLUSH`).
+    pub const FLUSH: i32 = 4;
+    /// Only write block 0 (`MFS_ZERO`).
+    pub const ZERO: i32 = 8;
+}
 
 /// `mf_new_page_size`.
 pub fn mf_new_page_size(mfp: &mut MemfileT, new_size: u32) {
@@ -454,6 +482,88 @@ pub fn mf_trans_del(mfp: &mut MemfileT, old_nr: BlocknrT) -> BlocknrT {
     mfp.mf_trans.remove(&old_nr);
 
     new_bnum
+}
+
+/// Sync changed parts of a memfile to disk (`mf_sync`).
+///
+/// Sync from last to first (may reduce the probability of an
+/// inconsistent file). If a write fails, it is very likely caused by a
+/// full filesystem. Then we only try to write blocks within the
+/// existing file. If that also fails then we give up.
+///
+/// @param flags  See [`mfs_flag`].
+///
+/// @return `OK` on success, `FAIL` on failure.
+///
+/// # Safety
+/// Every `*mut BhdrT` reachable via `mfp.mf_hash` must be a valid
+/// pointer (allocated via `mf_alloc_bhdr`) - true for every block this
+/// crate allocates via `mf_alloc_bhdr`/`mf_new`.
+pub unsafe fn mf_sync(mfp: &mut MemfileT, flags: i32) -> i32 {
+    if mfp.mf_fd.is_none() {
+        // there is no file, nothing to do
+        mfp.mf_dirty = MfdirtyT::No;
+        return FAIL;
+    }
+
+    // Only a CTRL-C while writing will break us here, not one typed
+    // previously - see the module doc comment for why the original's
+    // os_char_avail()/os_breakcheck() interruptibility check (and the
+    // `if got_int { break; }` that depends on it) is correctly omitted
+    // rather than silently changed, given got_int is cleared here and
+    // this simplified version never sets it back to true mid-sync.
+    let got_int_save = unsafe { crate::globals::GLOBALS.get_mut() }.got_int;
+    unsafe { crate::globals::GLOBALS.get_mut() }.got_int = false;
+
+    let mut status = OK;
+    // note, "last" block is typically earlier in the hash list in the
+    // original; this crate's Map iteration order isn't guaranteed to
+    // match, but mf_sync's correctness doesn't depend on a specific
+    // order, only that every qualifying dirty block eventually gets
+    // written.
+    let bhdrs: Vec<*mut BhdrT> = mfp.mf_hash.iter().map(|(_, v)| *v).collect();
+    let hash_was_empty = bhdrs.is_empty();
+    'sync: for hp in bhdrs {
+        // SAFETY: caller contract (see function doc).
+        let (bh_bnum, bh_flags) = unsafe { ((*hp).bh_bnum, (*hp).bh_flags) };
+        if (flags & mfs_flag::ALL != 0 || bh_bnum >= 0)
+            && (bh_flags & BH_DIRTY != 0)
+            && (status == OK || (bh_bnum >= 0 && bh_bnum < mfp.mf_infile_count))
+        {
+            if flags & mfs_flag::ZERO != 0 && bh_bnum != 0 {
+                continue;
+            }
+            if unsafe { mf_write(mfp, hp) } == FAIL {
+                if status == FAIL {
+                    // double error: quit syncing
+                    break 'sync;
+                }
+                status = FAIL;
+            }
+        }
+    }
+
+    // If the whole list is flushed, the memfile is not dirty anymore.
+    // In case of an error, dirty flag is also set, to avoid trying all
+    // the time.
+    if hash_was_empty || status == FAIL {
+        mfp.mf_dirty = MfdirtyT::No;
+    }
+
+    if flags & mfs_flag::FLUSH != 0 {
+        // SAFETY: caller contract (see function doc).
+        if mfp
+            .mf_fd
+            .as_ref()
+            .is_some_and(|file| crate::os::fs::os_fsync(file) != 0)
+        {
+            status = FAIL;
+        }
+    }
+
+    unsafe { crate::globals::GLOBALS.get_mut() }.got_int |= got_int_save;
+
+    status
 }
 
 /// Close a memory file and optionally delete the associated file
@@ -1016,6 +1126,185 @@ mod tests {
             mf_close(mfp, false);
         }
         assert!(tmp.path.exists(), "mf_close(del_file=false) should keep the file");
+    }
+
+    #[test]
+    fn mf_sync_fails_and_clears_dirty_when_no_file() {
+        let mut mfp = test_mfp();
+        mfp.mf_dirty = MfdirtyT::Yes;
+        assert_eq!(unsafe { mf_sync(&mut mfp, 0) }, FAIL);
+        assert_eq!(mfp.mf_dirty, MfdirtyT::No);
+    }
+
+    #[test]
+    fn mf_sync_writes_only_positive_bnum_blocks_without_mfs_all() {
+        let tmp = TempFilePath::new("sync_positive_only");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+        unsafe {
+            let pos = mf_new(&mut mfp, false, 1); // bnum 0, BH_LOCKED|BH_DIRTY
+            let neg = mf_new(&mut mfp, true, 1); // negative bnum, BH_LOCKED|BH_DIRTY
+            // mf_put unlocks (mf_sync doesn't care about BH_LOCKED, but
+            // this matches realistic usage where blocks are unlocked
+            // before being considered for sync).
+            mf_put(&mut mfp, pos, true, false);
+            mf_put(&mut mfp, neg, true, false);
+
+            assert_eq!(mf_sync(&mut mfp, 0), OK); // no MFS_ALL
+            assert_eq!((*pos).bh_flags & BH_DIRTY, 0, "positive block should be synced");
+            assert_eq!(
+                (*neg).bh_flags & BH_DIRTY,
+                BH_DIRTY,
+                "negative block should NOT be synced without MFS_ALL"
+            );
+            assert_eq!(mfp.mf_infile_count, 1); // only the positive block written
+
+            mf_free(&mut mfp, pos);
+            mf_free(&mut mfp, neg);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_sync_with_mfs_all_writes_negative_bnum_blocks_too() {
+        let tmp = TempFilePath::new("sync_mfs_all");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+        unsafe {
+            let neg = mf_new(&mut mfp, true, 1);
+            mf_put(&mut mfp, neg, true, false);
+            assert!((*neg).bh_bnum < 0);
+
+            assert_eq!(mf_sync(&mut mfp, mfs_flag::ALL), OK);
+
+            // MFS_ALL should have caused mf_write -> mf_trans_add to
+            // assign it a real (non-negative) file position.
+            assert!((*neg).bh_bnum >= 0);
+            assert_eq!((*neg).bh_flags & BH_DIRTY, 0);
+
+            mf_free(&mut mfp, neg);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_sync_with_mfs_zero_only_writes_block_zero() {
+        let tmp = TempFilePath::new("sync_mfs_zero");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+        unsafe {
+            let b0 = mf_new(&mut mfp, false, 1); // bnum 0
+            let b1 = mf_new(&mut mfp, false, 1); // bnum 1
+            mf_put(&mut mfp, b0, true, false);
+            mf_put(&mut mfp, b1, true, false);
+
+            assert_eq!(mf_sync(&mut mfp, mfs_flag::ZERO), OK);
+            assert_eq!((*b0).bh_flags & BH_DIRTY, 0, "block 0 should be synced");
+            assert_eq!(
+                (*b1).bh_flags & BH_DIRTY,
+                BH_DIRTY,
+                "block 1 should NOT be synced under MFS_ZERO"
+            );
+
+            mf_free(&mut mfp, b0);
+            mf_free(&mut mfp, b1);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_sync_leaves_dirty_flag_unchanged_when_hash_nonempty_and_ok() {
+        // Verified against the real `map_foreach_value` macro expansion
+        // (src/nvim/map_defs.h): it assigns `hp` to each hash entry's
+        // value in turn, so after the loop `hp` holds the *last*
+        // iterated entry (not NULL) whenever the hash is non-empty -
+        // regardless of whether every write actually succeeded. So
+        // `if (hp == NULL || status == FAIL) mfp->mf_dirty = MF_DIRTY_NO;`
+        // really means "clear dirty only if the hash was empty, or on
+        // failure" - NOT "clear dirty when everything synced OK". A
+        // successful sync of a non-empty memfile leaves mf_dirty
+        // unchanged, however counterintuitive that looks next to this
+        // function's own "the memfile is not dirty anymore" comment.
+        let tmp = TempFilePath::new("sync_leaves_dirty");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            mf_dirty: MfdirtyT::Yes,
+            ..default_memfile()
+        };
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            mf_put(&mut mfp, hp, true, false);
+
+            assert_eq!(mf_sync(&mut mfp, mfs_flag::ALL), OK);
+            assert_eq!((*hp).bh_flags & BH_DIRTY, 0); // the block itself IS clean now
+            assert_eq!(mfp.mf_dirty, MfdirtyT::Yes); // but mf_dirty is untouched
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_sync_clears_dirty_flag_when_hash_is_empty() {
+        let tmp = TempFilePath::new("sync_empty_hash");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            mf_dirty: MfdirtyT::Yes,
+            ..default_memfile()
+        };
+        // No blocks at all: matches the original's `hp == NULL` case.
+        unsafe {
+            assert_eq!(mf_sync(&mut mfp, mfs_flag::ALL), OK);
+        }
+        assert_eq!(mfp.mf_dirty, MfdirtyT::No);
+    }
+
+    #[test]
+    fn mf_sync_with_mfs_flush_calls_fsync_successfully() {
+        let tmp = TempFilePath::new("sync_flush");
+        let mut mfp = MemfileT {
+            mf_page_size: 8,
+            mf_fd: Some(open_rw_truncate(&tmp.path)),
+            ..default_memfile()
+        };
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            mf_put(&mut mfp, hp, true, false);
+
+            assert_eq!(mf_sync(&mut mfp, mfs_flag::ALL | mfs_flag::FLUSH), OK);
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_sync_preserves_pre_existing_got_int() {
+        let mut mfp = test_mfp(); // no file -> early FAIL return
+        unsafe {
+            let globals = crate::globals::GLOBALS.get_mut();
+            let previous = globals.got_int;
+            globals.got_int = true;
+
+            assert_eq!(mf_sync(&mut mfp, 0), FAIL);
+
+            // Early-return path (no file) doesn't even reach the
+            // got_int save/restore dance, so got_int must be completely
+            // untouched here.
+            assert!(crate::globals::GLOBALS.get_mut().got_int);
+            crate::globals::GLOBALS.get_mut().got_int = previous;
+        }
     }
 
     #[test]

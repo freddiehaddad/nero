@@ -14,14 +14,14 @@
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
 //! `os_isrealdir`, `os_mkdir`, `os_rmdir`, `os_remove`, `os_rename`,
-//! `os_realpath`.
+//! `os_realpath`, `os_fsync`.
 //! Functions that in the original return a raw libuv error code
-//! (`os_chdir`/`os_mkdir`/`os_rmdir`/`os_remove`) are translated to
-//! return `0` on success and `-1` on any failure: this collapses
-//! libuv's specific per-error-cause codes (`UV_ENOENT`, `UV_EACCES`,
-//! etc.) into one generic failure value, since nothing consuming those
-//! specific codes is translated yet - revisit if/when a caller needs to
-//! distinguish failure causes.
+//! (`os_chdir`/`os_mkdir`/`os_rmdir`/`os_remove`/`os_fsync`) are
+//! translated to return `0` on success and `-1` on any failure: this
+//! collapses libuv's specific per-error-cause codes (`UV_ENOENT`,
+//! `UV_EACCES`, etc.) into one generic failure value, since nothing
+//! consuming those specific codes is translated yet - revisit if/when
+//! a caller needs to distinguish failure causes.
 //!
 //! Deferred (each needs either the `FileInfo`-vs-`std::fs::Metadata`
 //! representation decision, or real byte-level I/O, neither settled
@@ -31,8 +31,13 @@
 //!   compatibility; needs a real decision on how to model that
 //!   cross-platform rather than rushing it).
 //! - `os_open`/`os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/
-//!   `os_dup*`/`os_set_cloexec`/`os_copy`/`os_fsync`: real byte-level
-//!   file I/O.
+//!   `os_dup*`/`os_set_cloexec`/`os_copy`: real byte-level file I/O
+//!   with the raw-fd calling convention (`memfile.c`'s own
+//!   `mf_read`/`mf_write`/`mf_close`, which need this exact shape of
+//!   I/O, instead go directly through `std::io::{Read, Write, Seek}`
+//!   on `MemfileT.mf_fd: Option<std::fs::File>`, sidestepping the
+//!   need for these raw-fd wrappers entirely for that specific
+//!   caller).
 //! - `os_fileinfo*`/`os_fileid*`: need the `FileInfo` struct itself
 //!   (deferred in `fs_defs.rs`, needs the same mode-bits decision).
 //! - `os_exepath`/`os_can_exe`/`is_executable*`: executable-search
@@ -56,6 +61,20 @@
 
 use crate::vim_defs::{FAIL, OK};
 use std::path::Path;
+
+/// Force any buffered modifications to `file` to be written to disk
+/// (`os_fsync`).
+///
+/// @return `0` for success, `-1` for failure (see the module doc
+///         comment for why the original's specific negative libuv
+///         error code isn't preserved).
+pub fn os_fsync(file: &std::fs::File) -> i32 {
+    if file.sync_all().is_ok() {
+        0
+    } else {
+        -1
+    }
+}
 
 /// Changes the current directory to `path` (`os_chdir`).
 ///
@@ -292,6 +311,14 @@ mod tests {
     fn os_realpath_returns_none_for_missing_path() {
         let scratch = TempScratch::new("realpath_missing");
         assert_eq!(os_realpath(&scratch.path.join("does_not_exist")), None);
+    }
+
+    #[test]
+    fn os_fsync_succeeds_on_a_writable_file() {
+        let scratch = TempScratch::new("fsync");
+        let path = scratch.path.join("f.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        assert_eq!(os_fsync(&file), 0);
     }
 
     #[test]
