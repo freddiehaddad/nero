@@ -4,7 +4,8 @@
 //! external library - `utf8len_tab`/`utf8len_tab_zero`,
 //! `utf_byte2len`, `utf_ptr2len`, `utf_ptr2len_len`, `utf_ptr2char`,
 //! `utf_char2len`, `utf_char2bytes`, `utf_safe_read_char_adv`
-//! (`static`/private), `utf_strnicmp`, `mb_strnicmp` - plus, now that
+//! (`static`/private), `utf_strnicmp`, `mb_strnicmp`, `mb_stricmp`
+//! (trivial `mb_strnicmp(s1, s2, MAXCOL)` wrapper) - plus, now that
 //! the `utf8proc-sys` FFI dependency has actually been added (see
 //! `Cargo.toml`'s own comment recording that decision):
 //! `utf_iscomposing_first`, `utf_composinglike`, `utf_iscomposing`,
@@ -74,9 +75,8 @@
 //! change.
 //!
 //! Deferred (need another not-yet-decided subsystem):
-//! `mb_stricmp` (`STRICMP`-adjacent bytewise fallback details not yet
-//! checked), `utf_ptr2cells_len`, and everything else in the file
-//! (encoding-name tables, `iconv` conversion, `show_utf8`, etc.).
+//! `utf_ptr2cells_len`, and everything else in the file (encoding-name
+//! tables, `iconv` conversion, `show_utf8`, etc.).
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -846,6 +846,22 @@ pub fn mb_strnicmp(s1: &[u8], s2: &[u8], nn: usize) -> i32 {
     utf_strnicmp(s1, s2, nn, nn)
 }
 
+/// Compare strings case-insensitively, handling multi-byte characters
+/// (`mb_stricmp`).
+///
+/// We need to call this even when we aren't dealing with a multi-byte
+/// encoding because it takes care of all ASCII and non-ASCII encodings
+/// (including characters with umlauts in latin1, etc.), while a plain
+/// byte-wise case-insensitive compare only handles the system locale
+/// version, which often does not handle non-ASCII properly.
+///
+/// @return 0 if strings are equal, <0 if `s1` < `s2`, >0 if `s1` >
+/// `s2`.
+#[must_use]
+pub fn mb_stricmp(s1: &[u8], s2: &[u8]) -> i32 {
+    mb_strnicmp(s1, s2, crate::pos_defs::MAXCOL as usize)
+}
+
 /// Return true if `c` (`>= 0x100`) is in `table`, a sorted list of
 /// non-overlapping `(first, last)` inclusive intervals (`intable`,
 /// `static` in the original - kept private here too).
@@ -1586,6 +1602,15 @@ mod tests {
     fn mb_strnicmp_matches_utf_strnicmp_with_same_bound() {
         assert_eq!(mb_strnicmp(b"FOO", b"foo", 3), 0);
         assert_eq!(mb_strnicmp(b"FOO", b"bar", 3), utf_strnicmp(b"FOO", b"bar", 3, 3));
+    }
+
+    #[test]
+    fn mb_stricmp_is_case_insensitive_and_handles_non_ascii() {
+        assert_eq!(mb_stricmp(b"FOO", b"foo"), 0);
+        assert_ne!(mb_stricmp(b"FOO", b"bar"), 0);
+        // É (U+00C9) vs é (U+00E9): equal under case folding, same as
+        // utf_strnicmp/mb_strnicmp's own multi-byte handling.
+        assert_eq!(mb_stricmp("É".as_bytes(), "é".as_bytes()), 0);
     }
 
     #[test]
