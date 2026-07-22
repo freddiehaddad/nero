@@ -19,7 +19,9 @@
 //! `mark_line`/`fm_getname` (now tractable now that `memline.c`'s
 //! `ml_get` and `charset.c`'s `ptr2cells` both exist - `fm_getname`'s
 //! "different buffer" branch still needs `buflist_nr2name`,
-//! `buffer.c`, and returns `None` for that case).
+//! `buffer.c`, and returns `None` for that case); `mark_mb_adjustpos`
+//! (now tractable now that `memline.c`'s `ml_get_buf`/`ml_get_buf_len`
+//! and `mbyte.c`'s `utf_head_off` all exist).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -47,9 +49,6 @@
 //!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
 //!   (see `ex_cmds_defs.rs`'s own module doc).
 //! - `cleanup_jumplist`: needs `win_valid`/buffer-list validity checks.
-//! - `mark_mb_adjustpos`: needs `ml_get_buf()` (now exists!) and
-//!   `utf_head_off` (`mbyte.c`, its own dedicated backward-scan pass,
-//!   deliberately not rushed - see `mbyte.rs`'s own module doc).
 //! - `add_mark`/`get_buf_local_marks`/`get_raw_global_mark`/
 //!   `get_global_marks`: need `list_T`'s real fields (the eval engine,
 //!   phase 5).
@@ -664,6 +663,41 @@ pub unsafe fn fm_getname(fmark: &FmarkT, lead_len: i32) -> Option<Vec<u8>> {
     None // buflist_nr2name (buffer.c) not yet translated
 }
 
+/// Adjust position `lp` to point to the first byte of a multi-byte
+/// character in `buf`. If it points to a tail byte it is moved
+/// backwards to the head byte (`mark_mb_adjustpos`).
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT`. Also touches `crate::option_vars::OPTION_VARS`
+/// (transitively via [`crate::mbyte::utf_head_off`]/
+/// [`crate::charset::ptr2cells`]) - the same requirement as every
+/// other function that touches global editor state.
+pub unsafe fn mark_mb_adjustpos(buf: &mut BufT, lp: &mut PosT) {
+    if lp.col > 0 || lp.coladd > 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { crate::memline::ml_get_buf(buf, lp.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if p.first() == Some(&0) || unsafe { crate::memline::ml_get_buf_len(buf, lp.lnum) } < lp.col
+        {
+            lp.col = 0;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            lp.col -= unsafe { crate::mbyte::utf_head_off(&p, lp.col as usize) };
+        }
+        // Reset "coladd" when the cursor would be on the right half of
+        // a double-wide character.
+        if lp.coladd == 1
+            && p[lp.col as usize] != crate::ascii_defs::TAB
+            && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&p[lp.col as usize..]))
+            // SAFETY: forwarded from this function's own safety doc.
+            && unsafe { crate::charset::ptr2cells(&p[lp.col as usize..]) } > 1
+        {
+            lp.coladd = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1161,6 +1195,11 @@ mod tests {
 
     #[test]
     fn pos_to_mark_uses_scratch_slot_when_none() {
+        // POS_TO_MARK_SCRATCH is a shared GlobalCell - hold the
+        // crate-wide test lock so a concurrently-running test can't
+        // race on the same static (this test was genuinely flaky
+        // without it, caught via a 10x repeated-run flakiness check).
+        let _guard = globals_test_lock();
         let buf = BufT::default();
         let pos = PosT { lnum: 8, col: 2, coladd: 0 };
         let result = unsafe { pos_to_mark(&buf, None, pos) };
@@ -1170,6 +1209,10 @@ mod tests {
 
     #[test]
     fn mark_get_visual_picks_earlier_position_for_lt_mark() {
+        // See pos_to_mark_uses_scratch_slot_when_none's own comment:
+        // mark_get_visual writes through the same shared
+        // POS_TO_MARK_SCRATCH static via pos_to_mark.
+        let _guard = globals_test_lock();
         let mut buf = BufT::default();
         buf.b_visual.vi_start = PosT { lnum: 3, col: 0, coladd: 0 };
         buf.b_visual.vi_end = PosT { lnum: 8, col: 0, coladd: 0 };
@@ -1192,6 +1235,8 @@ mod tests {
 
     #[test]
     fn mark_get_visual_linewise_forces_col_extremes() {
+        // See pos_to_mark_uses_scratch_slot_when_none's own comment.
+        let _guard = globals_test_lock();
         let mut buf = BufT::default();
         buf.b_visual.vi_start = PosT { lnum: 3, col: 5, coladd: 2 };
         buf.b_visual.vi_end = PosT { lnum: 8, col: 5, coladd: 2 };
@@ -1445,6 +1490,139 @@ mod tests {
         assert_eq!(unsafe { fm_getname(&fmark, 0) }, None);
 
         drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// Opens a fresh memline for `buf` (no `curbuf` involved -
+    /// `mark_mb_adjustpos` takes `buf` directly) and replaces line 1
+    /// with `line`. Callers must close `buf.b_ml.ml_mfp` themselves.
+    fn buf_with_line(buf: &mut BufT, line: &[u8]) {
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::memline::ml_replace_buf_len(buf, 1, line) }, crate::vim_defs::OK);
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_is_noop_when_col_zero_and_coladd_at_most_one() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"hello\0");
+
+        let mut pos = PosT { lnum: 1, col: 0, coladd: 0 };
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos, PosT { lnum: 1, col: 0, coladd: 0 });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_walks_back_from_a_continuation_byte_to_the_head() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        // "日本\0" = [E6,97,A5, E6,9C,AC, 00] - two independent CJK
+        // characters (verified via utf_head_off's own tests: pointing
+        // into the 2nd character's continuation bytes walks back only
+        // to its own head, index 3).
+        buf_with_line(&mut buf, "日本\0".as_bytes());
+
+        let mut pos = PosT { lnum: 1, col: 4, coladd: 0 }; // 2nd byte of 本
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 3); // head byte of 本
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_resets_col_past_end_of_line() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"hi\0"); // length 2
+
+        let mut pos = PosT { lnum: 1, col: 10, coladd: 0 };
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_resets_col_on_an_empty_line() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        // ml_open's own default line is already empty (b"\0").
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+
+        let mut pos = PosT { lnum: 1, col: 1, coladd: 0 };
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_resets_coladd_on_the_right_half_of_a_double_wide_char() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        // "x一\0": U+4E00 (一) is East Asian Wide (2 cells) - verified
+        // both vim_isprintc(0x4e00) and ptr2cells (== 2) directly via a
+        // throwaway scratch probe before writing this test.
+        buf_with_line(&mut buf, "x一\0".as_bytes());
+
+        let mut pos = PosT { lnum: 1, col: 1, coladd: 1 }; // head byte of 一
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 1); // already at the head, no adjustment
+        assert_eq!(pos.coladd, 0); // reset: cursor was on its right half
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_leaves_coladd_alone_for_a_single_width_char() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"ab\0");
+
+        let mut pos = PosT { lnum: 1, col: 1, coladd: 1 }; // 'b', single-width
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 1);
+        assert_eq!(pos.coladd, 1); // ptr2cells('b') == 1, not reset
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_mb_adjustpos_never_resets_coladd_when_sitting_on_a_tab() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT::default();
+        buf_with_line(&mut buf, b"a\tb\0");
+
+        let mut pos = PosT { lnum: 1, col: 1, coladd: 1 }; // the TAB byte
+        unsafe { mark_mb_adjustpos(&mut buf, &mut pos) };
+        assert_eq!(pos.col, 1);
+        // TAB is explicitly excluded from the double-wide reset check,
+        // regardless of what ptr2cells might otherwise report for it.
+        assert_eq!(pos.coladd, 1);
+
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);

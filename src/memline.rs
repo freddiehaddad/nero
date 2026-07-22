@@ -1693,6 +1693,69 @@ pub unsafe fn ml_get_buf(buf: &mut BufT, lnum: LinenrT) -> Vec<u8> {
     unsafe { ml_get_buf_impl(buf, lnum, false) }
 }
 
+/// @return a pointer to position `pos` in `curbuf` (`ml_get_pos`).
+///
+/// # Safety
+/// Same as [`ml_get`]. Additionally, `pos.col` must be a valid byte
+/// offset within the line at `pos.lnum` (matching the original's own
+/// unchecked pointer arithmetic - out-of-range values are the
+/// caller's responsibility, same as every other position-taking
+/// function in this crate so far).
+#[must_use]
+pub unsafe fn ml_get_pos(pos: &crate::pos_defs::PosT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { ml_get(pos.lnum) };
+    line[pos.col as usize..].to_vec()
+}
+
+/// @return length (excluding the NUL) of the given line in `buf`
+/// (`ml_get_buf_len`).
+///
+/// # Safety
+/// Same as [`ml_get_buf`].
+#[must_use]
+pub unsafe fn ml_get_buf_len(buf: &mut BufT, lnum: LinenrT) -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { ml_get_buf(buf, lnum) };
+    if line.first() == Some(&0) {
+        return 0;
+    }
+    // ml_get_buf (via ml_get_buf_impl) always sets ml_line_textlen to
+    // match the just-returned line's own byte length (including its
+    // trailing NUL), so this mirrors the original's own
+    // `buf.b_ml.ml_line_textlen - 1` exactly, rather than just
+    // computing `line.len() - 1` directly - keeping the same
+    // "trust the cache" shape as the original, in case a future
+    // change to that cache's maintenance needs to stay in sync here
+    // too.
+    debug_assert!(buf.b_ml.ml_line_textlen > 0);
+    buf.b_ml.ml_line_textlen - 1
+}
+
+/// @return length (excluding the NUL) of the given line in `curbuf`
+/// (`ml_get_len`).
+///
+/// # Safety
+/// Same as [`ml_get`].
+#[must_use]
+pub unsafe fn ml_get_len(lnum: LinenrT) -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_get_buf_len(curbuf, lnum) }
+}
+
+/// @return length (excluding the NUL) of the text after position `pos`
+/// in `curbuf` (`ml_get_pos_len`).
+///
+/// # Safety
+/// Same as [`ml_get`].
+#[must_use]
+pub unsafe fn ml_get_pos_len(pos: &crate::pos_defs::PosT) -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_get_len(pos.lnum) - pos.col }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2083,6 +2146,47 @@ mod tests {
 
         let result = unsafe { ml_get(2) };
         assert_eq!(result, b"world\0".to_vec());
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_get_buf_len_excludes_the_trailing_nul() {
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            assert_eq!(ml_get_buf_len(&mut buf, 1), 5); // "hello"
+            assert_eq!(ml_get_buf_len(&mut buf, 2), 5); // "world"
+            assert_eq!(ml_get_buf_len(&mut buf, 3), 3); // "foo"
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_get_buf_len_is_zero_for_an_empty_line() {
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            assert_eq!(ml_get_buf_len(&mut buf, 1), 0);
+
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_get_len_and_ml_get_pos_len_via_curbuf() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        unsafe {
+            assert_eq!(ml_get_len(2), 5); // "world"
+            let pos = crate::pos_defs::PosT { lnum: 2, col: 2, coladd: 0 };
+            assert_eq!(ml_get_pos_len(&pos), 3); // "world"[2..] = "rld"
+            assert_eq!(ml_get_pos(&pos), b"rld\0".to_vec());
+        }
 
         unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
         close_test_memline(buf);
