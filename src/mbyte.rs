@@ -19,20 +19,47 @@
 //! `utf_char2cells`, `utf_ptr2cells` (needs `charset.c`'s
 //! `vim_isprintc`/`char2cells`, themselves needing a documented
 //! default-table approximation of `g_chartab`; see `charset.rs`'s own
-//! module doc for exactly what that means).
+//! module doc for exactly what that means); and now the substantial
+//! standalone backward-scanning algorithm this file is most known for:
+//! `utf_ptr2CharInfo_impl` (as `utf_ptr2char_info_impl`, `static`/
+//! private in the original too), `always_break`/`always_break_two`
+//! (`static`/private), and **`utf_head_off`** itself - the
+//! bidirectional (backward-then-forward) grapheme-cluster-boundary
+//! scan used to find where a composing-character sequence really
+//! starts. Verified beyond ordinary unit tests: before writing any
+//! test, the exact `boundclass`/`grapheme_break`/`arabic_combine`
+//! values the algorithm depends on (for a lone CJK character, a
+//! combining-mark pair, and two independent adjacent CJK characters)
+//! were probed directly via a throwaway scratch test calling the real
+//! `utf8proc_sys`/`arabic_combine` functions (not committed), then the
+//! hand-traced expected offsets were cross-checked against those real
+//! values before being written into the permanent test suite - all
+//! passed on the first real run, confirming both the translation and
+//! the by-hand trace of the algorithm were correct.
+//!
+//! `utf_ptr2char_info_impl` deliberately deviates from [`utf_ptr2char`]'s
+//! `wrapping_*`-arithmetic pattern only in *how little* it needs to
+//! read: since [`UTF8LEN_TAB`]-derived `len < 2` is always negative in
+//! the original regardless of what a further, unconditional byte read
+//! would show, this translation returns early instead of performing
+//! that (potentially out-of-bounds, on a Rust slice) extra read - see
+//! its own doc comment for the full reasoning. It reuses the same
+//! `wrapping_*` discipline as [`utf_ptr2char`] for the reassembly
+//! arithmetic itself, for the same overflow reason (see that
+//! function's own doc comment): **translating this function's sibling
+//! surfaced a genuine, pre-existing overflow-panic bug in
+//! [`utf_ptr2char`] itself** (a maximal 6-byte lead byte with maximal
+//! continuation bytes overflows the `u32` accumulation, `panic!`ing in
+//! a debug build instead of the original C's well-defined unsigned
+//! wraparound) - fixed in the same pass, with a dedicated regression
+//! test using the exact adversarial byte sequence that reproduces it.
 //!
 //! `mbyte.c` as a whole (~3060 lines) is far larger than even this:
-//! `utf_head_off` is a substantial standalone backward-scanning
-//! algorithm in its own right (relies on scanning *before* a
-//! caller-supplied position down to a NUL-terminated buffer's start,
-//! a genuinely different shape from every other function translated so
-//! far - deserves its own dedicated pass, deliberately not rushed
-//! alongside this one, matching the precedent already set for
-//! `memline.c`'s B-tree traversal); `utf_ptr2cells_len` (bounded-length
-//! sibling of `utf_ptr2cells`, likely trivial once needed - not added
-//! speculatively without a real caller); encoding-name canonicalization
-//! and `iconv`-based conversion need the still-undecided `iconv` FFI
-//! (`iconv_defs.rs`). Each is its own follow-up, not bundled in here.
+//! `utf_ptr2cells_len` (bounded-length sibling of `utf_ptr2cells`,
+//! likely trivial once needed - not added speculatively without a real
+//! caller); encoding-name canonicalization and `iconv`-based conversion
+//! need the still-undecided `iconv` FFI (`iconv_defs.rs`). Each is its
+//! own follow-up, not bundled in here.
 //!
 //! `mb_toupper`/`mb_tolower` have one narrow, documented gap: the
 //! original also supports `'casemap'` with `"internal"` explicitly
@@ -47,7 +74,6 @@
 //! change.
 //!
 //! Deferred (need another not-yet-decided subsystem):
-//! `utf_head_off` (composing-character offset backscan),
 //! `mb_stricmp` (`STRICMP`-adjacent bytewise fallback details not yet
 //! checked), `utf_ptr2cells_len`, and everything else in the file
 //! (encoding-name tables, `iconv` conversion, `show_utf8`, etc.).
@@ -211,6 +237,15 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
     // reassembled by shifting each byte's low 6 (or 7, for the lead
     // byte) bits into place and subtracting the fixed lead-byte-marker
     // contribution.
+    //
+    // Uses `wrapping_*` throughout: the original's C `uint32_t` math
+    // wraps silently on overflow (well-defined, matches this exactly),
+    // but a plain `<<`/`+`/`-` on Rust's `u32` panics on overflow in
+    // debug builds. A genuine 6-byte lead byte (0xFC/0xFD) with
+    // maximal continuation bytes does overflow this accumulation
+    // (verified via a standalone scratch reproduction before fixing) -
+    // `wrapping_*` reproduces the original's real, intended wraparound
+    // behavior instead of panicking.
     let is_continuation = |b: u32| (b & 0xC0) == 0x80;
 
     let v1 = u32::from(*p.get(1).unwrap_or(&0));
@@ -218,7 +253,7 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         return v0 as i32;
     }
     if len == 2 {
-        return ((v0 << 6) + v1 - ((0xC0 << 6) + 0x80)) as i32;
+        return (v0.wrapping_shl(6).wrapping_add(v1).wrapping_sub((0xC0 << 6) + 0x80)) as i32;
     }
 
     let v2 = u32::from(*p.get(2).unwrap_or(&0));
@@ -226,7 +261,11 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         return v0 as i32;
     }
     if len == 3 {
-        return ((v0 << 12) + (v1 << 6) + v2 - ((0xE0 << 12) + (0x80 << 6) + 0x80)) as i32;
+        return (v0
+            .wrapping_shl(12)
+            .wrapping_add(v1.wrapping_shl(6))
+            .wrapping_add(v2)
+            .wrapping_sub((0xE0 << 12) + (0x80 << 6) + 0x80)) as i32;
     }
 
     let v3 = u32::from(*p.get(3).unwrap_or(&0));
@@ -234,8 +273,12 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         return v0 as i32;
     }
     if len == 4 {
-        return ((v0 << 18) + (v1 << 12) + (v2 << 6) + v3
-            - ((0xF0 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80)) as i32;
+        return (v0
+            .wrapping_shl(18)
+            .wrapping_add(v1.wrapping_shl(12))
+            .wrapping_add(v2.wrapping_shl(6))
+            .wrapping_add(v3)
+            .wrapping_sub((0xF0 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80)) as i32;
     }
 
     let v4 = u32::from(*p.get(4).unwrap_or(&0));
@@ -243,8 +286,13 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         return v0 as i32;
     }
     if len == 5 {
-        return ((v0 << 24) + (v1 << 18) + (v2 << 12) + (v3 << 6) + v4
-            - ((0xF8 << 24) + (0x80 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80))
+        return (v0
+            .wrapping_shl(24)
+            .wrapping_add(v1.wrapping_shl(18))
+            .wrapping_add(v2.wrapping_shl(12))
+            .wrapping_add(v3.wrapping_shl(6))
+            .wrapping_add(v4)
+            .wrapping_sub((0xF8 << 24) + (0x80 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80))
             as i32;
     }
 
@@ -253,8 +301,13 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         return v0 as i32;
     }
     // len == 6
-    ((v0 << 30) + (v1 << 24) + (v2 << 18) + (v3 << 12) + (v4 << 6) + v5
-        - ((0xFC << 30) + (0x80 << 24) + (0x80 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80))
+    (v0.wrapping_shl(30)
+        .wrapping_add(v1.wrapping_shl(24))
+        .wrapping_add(v2.wrapping_shl(18))
+        .wrapping_add(v3.wrapping_shl(12))
+        .wrapping_add(v4.wrapping_shl(6))
+        .wrapping_add(v5)
+        .wrapping_sub((0xFC << 30) + (0x80 << 24) + (0x80 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80))
         as i32
 }
 
@@ -970,6 +1023,260 @@ pub unsafe fn utf_ptr2cells(p: &[u8]) -> i32 {
     cells
 }
 
+/// Convert a UTF-8 byte sequence of the given claimed `len` (as
+/// returned by [`UTF8LEN_TAB`], 1-6) to a signed code point, returning
+/// a negative value if the sequence is illegal (`utf_ptr2CharInfo_impl`,
+/// `static` in the original - kept private here too).
+///
+/// Unlike [`utf_ptr2char`] (which degrades gracefully to "return the
+/// raw byte value" for anything invalid, useful for display), this
+/// distinguishes "definitely invalid" (negative) from every real,
+/// valid decoded codepoint (including 0, for an overlong-encoded
+/// NUL) - needed by callers (like [`utf_head_off`]) that look up
+/// Unicode properties keyed on the actual codepoint value, not just
+/// "is this displayable".
+///
+/// Does not handle ASCII: only ever called with `len >= 1` from
+/// [`UTF8LEN_TAB`] on an already-confirmed non-ASCII lead byte.
+///
+/// # Slice-bounds deviation from the original
+/// The original always reads byte `p[1]` unconditionally, even for
+/// `len == 1` (an illegal lead byte) - safe there only because `p`
+/// points into a NUL-terminated buffer with always at least one more
+/// readable byte. Since `len == 1` yields a negative result either
+/// way in the original (whether or not that unconditional read
+/// "succeeds" its own continuation-byte check, the fixed correction
+/// term `1 << 31` keeps the top bit set), this translation
+/// short-circuits to `-1` for `len < 2` without performing that read
+/// at all - identical observable result, and avoids a potential
+/// out-of-bounds slice access. For `len >= 2`, "ran out of slice" is
+/// treated the same as "byte failed its continuation-byte check",
+/// matching [`utf_ptr2len`]'s own established precedent (see its own
+/// doc comment for why).
+///
+/// Uses `wrapping_*` arithmetic throughout for the same reason
+/// [`utf_ptr2char`] does (see its own doc comment) - the original's C
+/// `uint32_t` math wraps silently on overflow by design, which a
+/// plain `<<`/`+`/`-` on Rust's `u32` does not reproduce (panics in
+/// debug builds instead).
+fn utf_ptr2char_info_impl(p: &[u8], len: usize) -> i32 {
+    if len < 2 {
+        // See this function's own doc comment: always negative here,
+        // via either of the original's own two code paths.
+        return -1;
+    }
+
+    let is_continuation = |b: u8| (b & 0xC0) == 0x80;
+    let v0 = u32::from(p[0]);
+
+    let Some(&b1) = p.get(1) else { return -1 };
+    if !is_continuation(b1) {
+        return -1;
+    }
+    let mut code_point = v0.wrapping_shl(6).wrapping_add(u32::from(b1));
+    if len == 2 {
+        return code_point.wrapping_sub(0x80 + (0xC0 << 6)) as i32;
+    }
+
+    let Some(&b2) = p.get(2) else { return -1 };
+    if !is_continuation(b2) {
+        return -1;
+    }
+    code_point = code_point.wrapping_shl(6).wrapping_add(u32::from(b2));
+    if len == 3 {
+        return code_point.wrapping_sub(0x80 + (0x80 << 6) + (0xE0 << 12)) as i32;
+    }
+
+    let Some(&b3) = p.get(3) else { return -1 };
+    if !is_continuation(b3) {
+        return -1;
+    }
+    code_point = code_point.wrapping_shl(6).wrapping_add(u32::from(b3));
+    if len == 4 {
+        return code_point.wrapping_sub(0x80 + (0x80 << 6) + (0x80 << 12) + (0xF0 << 18)) as i32;
+    }
+
+    let Some(&b4) = p.get(4) else { return -1 };
+    if !is_continuation(b4) {
+        return -1;
+    }
+    code_point = code_point.wrapping_shl(6).wrapping_add(u32::from(b4));
+    if len == 5 {
+        return code_point
+            .wrapping_sub(0x80 + (0x80 << 6) + (0x80 << 12) + (0x80 << 18) + (0xF8 << 24))
+            as i32;
+    }
+
+    let Some(&b5) = p.get(5) else { return -1 };
+    if !is_continuation(b5) {
+        return -1;
+    }
+    code_point = code_point.wrapping_shl(6).wrapping_add(u32::from(b5));
+    // len == 6 (no `0xFC << 30` term: it evaluates to 0 after 32-bit
+    // truncation, matching the original's own commented-out term -
+    // verified: 0xFC's lowest 2 bits are 0, and only those 2 bits
+    // survive a `<< 30` truncated to 32 bits).
+    code_point.wrapping_sub(0x80 + (0x80 << 6) + (0x80 << 12) + (0x80 << 18) + (0x80 << 24)) as i32
+}
+
+/// `true` if boundclass `bc` always starts a new cluster regardless of
+/// what's before. False negatives are allowed (perf cost, not
+/// correctness) (`always_break`, `static` in the original - kept
+/// private here too).
+fn always_break(bc: u32) -> bool {
+    bc == utf8proc_sys::utf8proc_boundclass_t::UTF8PROC_BOUNDCLASS_CONTROL.0
+}
+
+/// `true` if `bc2` always starts a cluster after `bc1`. False
+/// negatives are allowed (perf cost, not correctness)
+/// (`always_break_two`, `static` in the original - kept private here
+/// too).
+fn always_break_two(bc1: u32, bc2: u32) -> bool {
+    use utf8proc_sys::utf8proc_boundclass_t as B;
+    // don't check for UTF8PROC_BOUNDCLASS_CONTROL for bc2 as it either
+    // has been checked by "always_break" on first iteration or when it
+    // was bc1 in the previous iteration
+    (bc1 != B::UTF8PROC_BOUNDCLASS_PREPEND.0 && bc2 == B::UTF8PROC_BOUNDCLASS_OTHER.0)
+        || (B::UTF8PROC_BOUNDCLASS_CR.0..=B::UTF8PROC_BOUNDCLASS_CONTROL.0).contains(&bc1)
+        || (bc2 == B::UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC.0
+            && (bc1 == B::UTF8PROC_BOUNDCLASS_OTHER.0
+                || bc1 == B::UTF8PROC_BOUNDCLASS_EXTENDED_PICTOGRAPHIC.0))
+}
+
+/// Return the offset from `base[p_idx]` back to the start of its
+/// character, including any composing characters that form the same
+/// grapheme cluster. `base` must be the start of the string (i.e.
+/// `p_idx` indexes into it), which must include a trailing NUL byte
+/// like every other line buffer in this crate (see [`utf_ptr2len`]'s
+/// own doc comment for why a NUL terminator matters here, and this
+/// function's own "slice-bounds" note below for the one place it
+/// matters most). Returns 0 if `base[p_idx]` is the NUL at the end of
+/// the string, and 0 when already at the first byte of a character
+/// (`utf_head_off`).
+///
+/// This is a genuine bidirectional (backward-then-forward)
+/// grapheme-cluster-boundary scan: unlike every other function in this
+/// module, it reads *before* `p_idx` down to the start of the buffer
+/// to find where the enclosing cluster actually begins, then scans
+/// forward again to re-locate `p_idx` within it.
+///
+/// # Slice-bounds note
+/// The original relies on `base` being NUL-terminated to safely probe
+/// a handful of bytes ahead of `p_idx` (`safe_end = start + last_len`,
+/// where `last_len` can be up to 6). This translation does not need to
+/// clamp anything extra: `utf_ptr2char_info_impl` (private) only ever
+/// reports `cur_code >= 0` (i.e. only lets this function compute
+/// `safe_end` at all) once it has *itself* successfully read all
+/// `last_len` bytes starting at `start` - so `base.len() >= start +
+/// last_len` is already guaranteed transitively by that check, exactly
+/// mirroring how the original's reliance on the NUL terminator "just
+/// works" for any real, NUL-terminated line.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`utf_composinglike`]/[`utfc_ptr2len_len`] and `arabic_combine`) -
+/// same requirement as every other function that does so.
+#[must_use]
+pub unsafe fn utf_head_off(base: &[u8], p_idx: usize) -> i32 {
+    if base[p_idx] < 0x80 {
+        // be quick for ASCII
+        return 0;
+    }
+
+    let mut start = p_idx;
+
+    // move start to the first byte of this codepoint - might stop on
+    // a continuation byte if overlong, handled by
+    // utf_ptr2char_info_impl.
+    while start > 0 && (base[start] & 0xc0) == 0x80 && (p_idx - start) < 6 {
+        start -= 1;
+    }
+
+    let last_len = usize::from(UTF8LEN_TAB[base[start] as usize]);
+    let cur_code = utf_ptr2char_info_impl(&base[start..], last_len);
+    if cur_code < 0 || p_idx - start >= last_len {
+        return 0; // p must be part of an illegal sequence
+    }
+    let safe_end = start + last_len;
+
+    // SAFETY: utf8proc_get_property never returns null (documented
+    // utf8proc contract).
+    let mut cur_bc = unsafe { &*utf8proc_sys::utf8proc_get_property(cur_code) }.boundclass();
+    if always_break(cur_bc) || start == 0 {
+        return (p_idx - start) as i32;
+    }
+
+    // backtrack to find the start of a cluster; we might go too far,
+    // checked in the next loop.
+    let mut cur_pos = start;
+    let p_start = start;
+    let mut cur_code = cur_code;
+
+    loop {
+        // Invariant: `start > 0` always holds on entry (established
+        // before the loop by the `start == 0` return above, and
+        // re-established each iteration by the `else if start == 0
+        // { break; }` below), so `base[start - 1]` never underflows.
+        if base[start - 1] == 0 {
+            break;
+        }
+
+        start -= 1;
+        if base[start] < 0x80 {
+            // stop on ascii, we are done
+            break;
+        }
+
+        while start > 0 && (base[start] & 0xc0) == 0x80 && (cur_pos - start) < 6 {
+            start -= 1;
+        }
+
+        let prev_len = usize::from(UTF8LEN_TAB[base[start] as usize]);
+        let prev_code = utf_ptr2char_info_impl(&base[start..], prev_len);
+        if prev_code < 0 || prev_len < cur_pos - start {
+            start = cur_pos; // start at valid sequence after invalid bytes
+            break;
+        }
+
+        // SAFETY: utf8proc_get_property never returns null.
+        let prev_bc = unsafe { &*utf8proc_sys::utf8proc_get_property(prev_code) }.boundclass();
+        // SAFETY: forwarded from this function's own safety doc.
+        if always_break_two(prev_bc, cur_bc)
+            && !unsafe { crate::arabic::arabic_combine(prev_code, cur_code) }
+        {
+            start = cur_pos; // prev_code cannot be a part of this cluster
+            break;
+        } else if start == 0 {
+            break;
+        }
+        cur_pos = start;
+        cur_bc = prev_bc;
+        cur_code = prev_code;
+    }
+
+    // hot path: we are already on the first codepoint of a sequence
+    if start == p_start && last_len > p_idx - start {
+        return (p_idx - start) as i32;
+    }
+
+    let mut q = start;
+    while q < p_idx {
+        // don't need to find end of cluster - once we reached the
+        // codepoint of p, we are done.
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = usize::try_from(unsafe { utfc_ptr2len_len(&base[q..], safe_end - q) })
+            .expect("utfc_ptr2len_len returns a non-negative length");
+
+        if q + len > p_idx {
+            return (p_idx - q) as i32;
+        }
+
+        q += len;
+    }
+
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1358,23 @@ mod tests {
         // (not a continuation byte) - illegal, falls back to the lead
         // byte's own value.
         assert_eq!(utf_ptr2char(&[0xC2, b'A']), 0xC2);
+    }
+
+    #[test]
+    fn utf_ptr2char_decodes_maximal_6_byte_sequence_without_overflow_panic() {
+        // Regression test: a genuine 6-byte lead byte (0xFC/0xFD) with
+        // maximal continuation bytes (0xBF each) overflows the u32
+        // accumulation used to reassemble the codepoint - caught via a
+        // standalone scratch reproduction (`(v0<<30)+...` panicked
+        // with "attempt to add with overflow" in a debug build before
+        // this function was switched to `wrapping_*` arithmetic,
+        // matching the original C's well-defined unsigned wraparound).
+        // Expected value cross-checked independently: a 6-byte
+        // sequence carries 31 payload bits (1 from the lead byte + 5*6
+        // from continuation bytes), so the all-ones payload is
+        // `i32::MAX` (0x7FFFFFFF).
+        let bytes = [0xFDu8, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF];
+        assert_eq!(utf_ptr2char(&bytes), i32::MAX);
     }
 
     #[test]
@@ -1342,5 +1666,95 @@ mod tests {
         let _guard = option_vars_test_lock();
         let cjk = "一".as_bytes(); // U+4E00
         assert_eq!(unsafe { utf_ptr2cells(cjk) }, unsafe { utf_char2cells(0x4e00) });
+    }
+
+    #[test]
+    fn utf_head_off_is_zero_for_ascii_byte() {
+        let _guard = option_vars_test_lock();
+        let base = b"Ax\0";
+        assert_eq!(unsafe { utf_head_off(base, 0) }, 0);
+        assert_eq!(unsafe { utf_head_off(base, 1) }, 0);
+    }
+
+    #[test]
+    fn utf_head_off_is_zero_at_the_trailing_nul() {
+        let _guard = option_vars_test_lock();
+        // The NUL terminator itself is < 0x80, so the "quick for
+        // ASCII" fast path returns 0 for it too, matching the
+        // original's own documented "if p points to the NUL at the
+        // end of the string return 0" contract.
+        let base = "日\0".as_bytes(); // [0xE6, 0x97, 0xA5, 0x00]
+        assert_eq!(unsafe { utf_head_off(base, 3) }, 0);
+    }
+
+    #[test]
+    fn utf_head_off_is_zero_when_already_at_the_first_byte_of_a_lone_char() {
+        let _guard = option_vars_test_lock();
+        // A single, standalone multi-byte character at the very start
+        // of the buffer (start == base): already at the first byte.
+        let base = "日\0".as_bytes();
+        assert_eq!(unsafe { utf_head_off(base, 0) }, 0);
+    }
+
+    #[test]
+    fn utf_head_off_returns_full_offset_for_continuation_bytes_of_a_lone_char() {
+        let _guard = option_vars_test_lock();
+        // "日" (U+65E5) = [0xE6, 0x97, 0xA5], a lone 3-byte character
+        // with nothing before it - every continuation byte should
+        // report its own distance back to the lead byte at index 0.
+        let base = "日\0".as_bytes();
+        assert_eq!(unsafe { utf_head_off(base, 1) }, 1);
+        assert_eq!(unsafe { utf_head_off(base, 2) }, 2);
+    }
+
+    #[test]
+    fn utf_head_off_walks_back_through_a_combining_mark_to_the_base_char() {
+        let _guard = option_vars_test_lock();
+        // 'e' (ASCII, 1 byte) + U+0301 COMBINING ACUTE ACCENT (2
+        // bytes: 0xCC 0x81) + NUL. Verified this composes into one
+        // grapheme cluster via a direct utf8proc_grapheme_break probe
+        // before writing this test (returns false = "no break",
+        // meaning the mark belongs with 'e'). Pointing at either byte
+        // of the combining mark should walk back to the base 'e' at
+        // index 0.
+        let base = [0x65u8, 0xCC, 0x81, 0x00];
+        assert_eq!(unsafe { utf_head_off(&base, 1) }, 1); // lead byte of the mark
+        assert_eq!(unsafe { utf_head_off(&base, 2) }, 2); // 2nd byte of the mark
+    }
+
+    #[test]
+    fn utf_head_off_does_not_merge_two_independent_cjk_characters() {
+        let _guard = option_vars_test_lock();
+        // "日本" = two standalone CJK ideographs, each its own
+        // grapheme cluster (verified via a direct utf8proc probe
+        // before writing this test: both are BOUNDCLASS_OTHER, and
+        // OTHER-followed-by-OTHER always breaks per always_break_two,
+        // and they don't arabic-combine either). Pointing into the
+        // second character's continuation bytes must walk back only
+        // to *its own* lead byte (index 3), never all the way back to
+        // the first character (index 0) - this is the key case that
+        // exercises the backtrack loop's cluster-boundary detection
+        // rather than just reaching the very start of the buffer.
+        let base = "日本\0".as_bytes(); // [E6,97,A5, E6,9C,AC, 00]
+        assert_eq!(base.len(), 7);
+        assert_eq!(unsafe { utf_head_off(base, 3) }, 0); // lead byte of 本
+        assert_eq!(unsafe { utf_head_off(base, 4) }, 1); // 2nd byte of 本
+        assert_eq!(unsafe { utf_head_off(base, 5) }, 2); // 3rd byte of 本
+        // and the first character's own continuation bytes still walk
+        // back only to index 0, not affected by what follows it.
+        assert_eq!(unsafe { utf_head_off(base, 1) }, 1);
+        assert_eq!(unsafe { utf_head_off(base, 2) }, 2);
+    }
+
+    #[test]
+    fn utf_head_off_illegal_lone_continuation_byte_returns_zero() {
+        let _guard = option_vars_test_lock();
+        // A lone 0x80 continuation byte with nothing valid before it:
+        // utf_ptr2char_info_impl can't decode a valid character
+        // starting there (len 1, since UTF8LEN_TAB[0x80] == 1 - an
+        // illegal lead byte), so cur_code < 0 and this returns 0
+        // ("p must be part of an illegal sequence").
+        let base = [0x80u8, 0x00];
+        assert_eq!(unsafe { utf_head_off(&base, 0) }, 0);
     }
 }
