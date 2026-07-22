@@ -2,19 +2,23 @@
 //!
 //! Translated: the pure in-memory block-allocation/free-list/hash-map
 //! bookkeeping - `mf_new_page_size`, `mf_alloc_bhdr`, `mf_free_bhdr`,
-//! `mf_ins_free`, `mf_rem_free`, `mf_new`, `mf_free`, `mf_trans_add`,
-//! `mf_trans_del`, `mf_need_trans`, `mf_free_fnames`, `mf_fullname`,
-//! `mf_set_fnames` (now tractable via `crate::path::full_name_save`).
+//! `mf_ins_free`, `mf_rem_free`, `mf_new`, `mf_put` (its internal-error
+//! `iemsg()` call on a "should never happen" invariant violation is
+//! translated as a `debug_assert!` instead - see `mf_put`'s own doc
+//! comment), `mf_free`, `mf_trans_add`, `mf_trans_del`, `mf_need_trans`,
+//! `mf_free_fnames`, `mf_fullname`, `mf_set_fnames` (via
+//! `crate::path::full_name_save`).
 //!
 //! Deferred (each needs real disk I/O or another not-yet-translated
 //! subsystem):
 //! - `mf_open`/`mf_open_file`/`mf_close`/`mf_close_file`/`mf_do_open`/
 //!   `mf_read`/`mf_write`/`mf_sync`: need real file I/O beyond what
-//!   `os/fs.rs` covers so far (byte-level read/write, `FileInfo`).
+//!   `os/fs.rs` covers so far (byte-level read/write/seek). Planned:
+//!   `MemfileT.mf_fd` should become `Option<std::fs::File>` (currently
+//!   `i32`, matching the C field 1:1) when these are translated - see
+//!   the session plan/stored memory for the reasoning.
 //! - `mf_get`: calls `mf_read()` on a cache miss, so can't be completed
 //!   without it.
-//! - `mf_put`: calls `iemsg()` (`message.c`, not yet translated) on its
-//!   "block was not locked" internal-error path.
 //! - `mf_release_all`: calls `mf_close()`.
 
 use crate::memfile_defs::{BhData, BhdrT, BlocknrT, MemfileT, MfdirtyT, BH_DIRTY, BH_LOCKED};
@@ -161,6 +165,40 @@ pub unsafe fn mf_new(mfp: &mut MemfileT, negative: bool, page_count: u32) -> *mu
     hp
 }
 
+/// Signal that block `hp` has been modified, updating dirty state and
+/// (if `infile`) translating its block number from negative to
+/// positive (`mf_put`).
+///
+/// The original also calls `iemsg()` when `hp.bh_flags` doesn't have
+/// `BH_LOCKED` set - an internal-consistency check for a "should never
+/// happen" caller bug, not a recoverable/user-facing error path (the
+/// function's own logic proceeds identically either way). Translated
+/// as a `debug_assert!` instead of deferring the whole function on
+/// `message.c`'s `iemsg()`: this matches Rust's own idiom for "this
+/// invariant must always hold; a violation is a real bug", the same
+/// intent as the original's internal-error message.
+///
+/// # Safety
+/// `hp` must be a valid `BhdrT` pointer.
+pub unsafe fn mf_put(mfp: &mut MemfileT, hp: *mut BhdrT, dirty: bool, infile: bool) {
+    // SAFETY: caller contract (see function doc).
+    let mut flags = unsafe { (*hp).bh_flags };
+
+    debug_assert!(flags & BH_LOCKED != 0, "block was not locked");
+    flags &= !BH_LOCKED;
+    if dirty {
+        flags |= BH_DIRTY;
+        if mfp.mf_dirty != MfdirtyT::YesNosync {
+            mfp.mf_dirty = MfdirtyT::Yes;
+        }
+    }
+    unsafe { (*hp).bh_flags = flags };
+    if infile {
+        // SAFETY: caller contract (see function doc).
+        unsafe { mf_trans_add(mfp, hp) }; // may translate negative in positive nr
+    }
+}
+
 /// Signal block as no longer used (may put it in the free list)
 /// (`mf_free`).
 ///
@@ -188,13 +226,6 @@ pub unsafe fn mf_free(mfp: &mut MemfileT, hp: *mut BhdrT) {
 
 /// # Safety
 /// `hp` must be a valid `BhdrT` pointer.
-///
-/// Currently only called from this file's own tests: its real callers,
-/// `mf_put()`/`mf_get()`, are both deferred (see the module doc
-/// comment), kept `#[allow(dead_code)]` rather than `pub`, matching the
-/// original's own `static` (file-private) linkage, so a normal
-/// (non-test) build doesn't warn about it having no caller yet.
-#[allow(dead_code)]
 unsafe fn mf_trans_add(mfp: &mut MemfileT, hp: *mut BhdrT) -> i32 {
     // SAFETY: caller contract (see function doc); all internal derefs
     // stay within this function's own borrow.
@@ -429,6 +460,77 @@ mod tests {
             // mf_close(), not yet translated). Drain it here so this
             // test doesn't leak the block past its own scope.
             assert!(!mfp.mf_free_first.is_null());
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_put_clears_locked_and_sets_dirty() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1); // starts BH_LOCKED | BH_DIRTY
+            (*hp).bh_flags &= !BH_DIRTY; // clear dirty to isolate mf_put's own effect
+            mfp.mf_dirty = MfdirtyT::No;
+
+            mf_put(&mut mfp, hp, true, false);
+
+            assert_eq!((*hp).bh_flags & BH_LOCKED, 0); // unlocked
+            assert_eq!((*hp).bh_flags & BH_DIRTY, BH_DIRTY); // dirty
+            assert_eq!(mfp.mf_dirty, MfdirtyT::Yes);
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_put_preserves_yes_nosync_dirty_state() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            mfp.mf_dirty = MfdirtyT::YesNosync;
+
+            mf_put(&mut mfp, hp, true, false);
+
+            // MF_DIRTY_YES_NOSYNC must not be downgraded to plain Yes.
+            assert_eq!(mfp.mf_dirty, MfdirtyT::YesNosync);
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_put_not_dirty_leaves_dirty_state_unchanged() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, false, 1);
+            mfp.mf_dirty = MfdirtyT::No;
+
+            mf_put(&mut mfp, hp, false, false);
+
+            assert_eq!(mfp.mf_dirty, MfdirtyT::No);
+            assert_eq!((*hp).bh_flags & BH_DIRTY, BH_DIRTY); // untouched from mf_new
+
+            mf_free(&mut mfp, hp);
+            drain_free_list(&mut mfp);
+        }
+    }
+
+    #[test]
+    fn mf_put_infile_translates_negative_block_number() {
+        let mut mfp = test_mfp();
+        unsafe {
+            let hp = mf_new(&mut mfp, true, 1); // negative bnum
+            assert!((*hp).bh_bnum < 0);
+
+            mf_put(&mut mfp, hp, true, true);
+
+            // infile=true should have run mf_trans_add, giving it a
+            // fresh non-negative number.
+            assert!((*hp).bh_bnum >= 0);
+
+            mf_free(&mut mfp, hp);
             drain_free_list(&mut mfp);
         }
     }
