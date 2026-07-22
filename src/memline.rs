@@ -15,15 +15,16 @@
 //! walk through pointer blocks to a data block, including
 //! negative-block-number translation mid-traversal), **`ml_get`/
 //! `ml_get_buf`/`ml_get_buf_mut`** (via `ml_get_buf_impl`, both
-//! `will_change` values), **`ml_append_int`/`ml_append_flush`/
+//! `will_change` values), `ml_get_buf_len`/`ml_get_len`/
+//! `ml_get_pos_len`/`ml_get_pos`, **`ml_append_int`/`ml_append_flush`/
 //! `ml_append_flags`/`ml_append`/`ml_append_buf`** (the "fits in the
 //! target data block" fast path only - see below), **`ml_replace_buf_len`
 //! /`ml_replace`** (also serving `ml_replace_len`/`ml_replace_buf`'s
 //! role, since a Rust byte slice already knows its own length), and
 //! **`ml_flush_line`** now in full (both the in-place `memmove`-based
-//! rewrite and the delete-then-append fallback), **`ml_delete_int`/
-//! `ml_delete_flags`/`ml_delete`/`ml_delete_buf`** (the "does not empty
-//! the data block" fast path only - see below).
+//! rewrite and the delete-then-append fallback), and **`ml_delete_int`/
+//! `ml_delete_flags`/`ml_delete`/`ml_delete_buf`** now in full,
+//! including the block-removal path (see below).
 //!
 //! **`ZeroBlock`/`PointerBlock`/`DataBlock` are NOT translated as
 //! `#[repr(C)]` structs reinterpreting a raw byte buffer** (the
@@ -86,23 +87,35 @@
 //! rather than translated as a `debug_assert!` (there is nothing to
 //! assert; the original itself never checks anything at that spot).
 //!
-//! **`ml_append_int`'s block-splitting path and `ml_delete_int`'s
-//! block-removal path are deliberately deferred** (each function's own
-//! doc comment has the exact details) - both are substantial,
-//! self-contained B+-tree-restructuring algorithms in their own right
-//! (creating/freeing data blocks, splitting/merging pointer blocks
-//! recursively up to the root, including a "block 1 becomes the new
-//! root" special case in the original), each deserving its own
-//! dedicated pass rather than being rushed alongside the other, more
-//! tractable pieces in this one. When the fast path doesn't apply,
-//! both functions return `FAIL` *cleanly*: each first undoes the
-//! pointer-block line-count adjustment `ml_find_line`'s own tree walk
-//! already committed for `ML_INSERT`/`ML_DELETE` (via
-//! `ml_lineadd(buf, -1)`/`ml_lineadd(buf, 1)` respectively - exactly
-//! what `ml_find_line`'s own `error_noblock` path does for the same
-//! action), so hitting this limitation never leaves an overstated or
-//! understated line count in the pointer blocks above, and never
-//! partially applies a change. Verified directly via a test
+//! **`ml_delete_int`'s block-removal path is now translated in full**:
+//! when deleting a line empties its data block, the block is freed and
+//! its entry removed from the parent pointer block; if that pointer
+//! block itself becomes empty, the same removal cascades one level
+//! further up, and so on toward the root. Verified with two tests
+//! against a real 2-data-block memline: removing the *last* pointer
+//! entry (no shift needed) and removing an *earlier* entry, forcing
+//! the following entry to shift down - both passed on the first real
+//! run. Not separately tested: a 3+-level tree where a pointer block's
+//! own removal cascades to its parent (the loop structure is a direct,
+//! line-by-line translation of the original's own upward walk, and
+//! `ml_lineadd` already exercises an analogous "walk the stack"
+//! pattern elsewhere, but a synthetic 3-level tree wasn't constructed
+//! to exercise this specific case directly - noted here rather than
+//! silently overclaiming full coverage).
+//!
+//! **`ml_append_int`'s block-splitting path is still deferred** (see
+//! its own doc comment) - creating a new data block and, recursively,
+//! splitting pointer blocks up to the root when they're also full,
+//! including a "block 1 becomes the new root" special case in the
+//! original - a substantial, self-contained undertaking deserving its
+//! own dedicated pass. When the fast path doesn't apply, it returns
+//! `FAIL` *cleanly*: it first undoes the pointer-block line-count
+//! adjustment `ml_find_line`'s own tree walk already committed for
+//! `ML_INSERT` (via `ml_lineadd(buf, -1)` - exactly what
+//! `ml_find_line`'s own `error_noblock` path does for the same
+//! action), so hitting this limitation never leaves an overstated line
+//! count in the pointer blocks above, and never partially applies a
+//! change. Verified directly via a test
 //! (`ml_append_int_not_enough_room_fails_without_corrupting_state`)
 //! using a deliberately tiny page size to force the fast path to miss.
 //!
@@ -155,7 +168,7 @@
 use crate::buffer_defs::BufT;
 use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
-use crate::memfile::{mf_get, mf_new, mf_open, mf_put, mf_sync, mf_trans_del};
+use crate::memfile::{mf_free, mf_get, mf_new, mf_open, mf_put, mf_sync, mf_trans_del};
 use crate::memfile_defs::{BhdrT, BlocknrT, MemfileT};
 use crate::memline_defs::{
     InfoptrT, ML_ALLOCATED, ML_CHNK_ADDLINE, ML_CHNK_DELLINE, ML_CHNK_UPDLINE, ML_EMPTY,
@@ -1191,18 +1204,6 @@ pub unsafe fn ml_replace_buf_len(buf: &mut BufT, lnum: LinenrT, line: &[u8]) -> 
 /// (omitted here - display-pipeline-bound, see this module's own doc
 /// comment; the state change, `ML_EMPTY`, is still applied).
 ///
-/// Only the "deleting this line does not empty its data block" path is
-/// translated. Deferred: the original's cascading pointer-block-entry
-/// removal (and, recursively, pointer block removal up to the root)
-/// when a data block's only remaining line is deleted - a substantial,
-/// separate undertaking (see this module's own doc comment, matching
-/// the same "not rushed" precedent as `ml_append_int`'s block-split
-/// path). When it would apply, this returns `FAIL` cleanly: it first
-/// undoes the pointer-block line-count decrements `ml_find_line`'s own
-/// tree walk already committed for `ML_DELETE` (via `ml_lineadd(buf,
-/// 1)`, exactly what `ml_find_line`'s own `error_noblock` path does
-/// for the same action), before touching anything else.
-///
 /// @return `FAIL`/`OK`.
 ///
 /// # Safety
@@ -1239,23 +1240,14 @@ unsafe fn ml_delete_int(buf: &mut BufT, lnum: LinenrT, flags: i32) -> i32 {
     }
 
     // SAFETY: forwarded from this function's own safety doc.
-    let hp = unsafe { ml_find_line(buf, lnum, ML_DELETE) };
+    let mut hp = unsafe { ml_find_line(buf, lnum, ML_DELETE) };
     if hp.is_null() {
         return FAIL;
     }
 
     // number of entries in the block before the delete
     let count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low + 2;
-    let idx = (lnum - buf.b_ml.ml_locked_low) as usize;
-
-    if count == 1 {
-        // Deleting this line would empty its data block - see this
-        // function's own doc comment for why this bails out here.
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { ml_lineadd(buf, 1) };
-        buf.b_ml.ml_stack_top = 0;
-        return FAIL;
-    }
+    let mut idx = (lnum - buf.b_ml.ml_locked_low) as usize;
 
     if buf.b_prev_line_count == 0 {
         buf.b_prev_line_count = buf.b_ml.ml_line_count;
@@ -1279,32 +1271,105 @@ unsafe fn ml_delete_int(buf: &mut BufT, lnum: LinenrT, flags: i32) -> i32 {
         &dp[line_start as usize..line_start as usize + line_size as usize],
         Some((line_size - 1) as usize),
     );
-    // SAFETY: hp is still valid; re-borrow after ml_add_deleted_len_buf
-    // (which only touched `buf`, not the block's own bytes).
-    let dp = unsafe { (*hp).bh_data.as_data_mut() };
 
-    // delete the text by moving the next lines forwards
-    let text_start = db_txt_start(dp);
-    dp.copy_within(
-        text_start as usize..line_start as usize,
-        text_start as usize + line_size as usize,
-    );
+    // SAFETY: forwarded from this function's own safety doc.
+    let mfp = unsafe { &mut *buf.b_ml.ml_mfp };
 
-    // delete the index by moving the next indexes backwards, adjusting
-    // for the text movement
-    for i in idx..count as usize - 1 {
-        let v = db_index(dp, i + 1) + line_size as u32;
-        set_db_index(dp, i, v);
+    // Special case: if there is only one line in the data block it
+    // becomes empty. Then we have to remove the entry, pointing to
+    // this data block, from the pointer block. If this pointer block
+    // also becomes empty, we go up another block, and so on, up to
+    // the root if necessary. The line counts in the pointer blocks
+    // have already been adjusted by ml_find_line().
+    if count == 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { mf_free(mfp, hp) }; // free the data block
+        buf.b_ml.ml_locked = std::ptr::null_mut();
+
+        let mut stack_idx = buf.b_ml.ml_stack_top - 1;
+        while stack_idx >= 0 {
+            buf.b_ml.ml_stack_top = 0; // stack is invalid when failing
+            let ip = buf.b_ml.ml_stack[stack_idx as usize];
+            idx = ip.ip_index as usize;
+            // SAFETY: forwarded from this function's own safety doc.
+            hp = unsafe { mf_get(mfp, ip.ip_bnum, 1) };
+            if hp.is_null() {
+                return FAIL;
+            }
+            // SAFETY: hp is a valid, just-locked block.
+            let pp = unsafe { (*hp).bh_data.as_data() };
+            if block_id(pp) != PTR_ID {
+                // (iemsg(E317: pointer block id wrong 4) omitted -
+                // display-pipeline-bound, see this module's own doc
+                // comment; the state change below still happens.)
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { mf_put(mfp, hp, false, false) };
+                return FAIL;
+            }
+            // SAFETY: hp is valid.
+            let pp_mut = unsafe { (*hp).bh_data.as_data_mut() };
+            let new_count = i32::from(pb_count(pp_mut)) - 1;
+            pointer_block_set_count(pp_mut, new_count as u16);
+            if new_count == 0 {
+                // the pointer block becomes empty!
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { mf_free(mfp, hp) };
+            } else {
+                if new_count as usize != idx {
+                    // move entries after the deleted one
+                    for i in idx..new_count as usize {
+                        let e = pb_pointer(pp_mut, i + 1);
+                        pointer_block_set_entry(pp_mut, i, e);
+                    }
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { mf_put(mfp, hp, true, false) };
+
+                buf.b_ml.ml_stack_top = stack_idx; // truncate stack
+                // fix line count for rest of blocks in the stack
+                if buf.b_ml.ml_locked_lineadd != 0 {
+                    let lineadd = buf.b_ml.ml_locked_lineadd;
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { ml_lineadd(buf, lineadd) };
+                    buf.b_ml.ml_stack[buf.b_ml.ml_stack_top as usize].ip_high += lineadd;
+                }
+                buf.b_ml.ml_stack_top += 1;
+
+                break;
+            }
+            stack_idx -= 1;
+        }
+        // (CHECK(stack_idx < 0, "deleted block 1?") is a no-op even in
+        // the real source - omitted, matching this crate's established
+        // policy for that macro.)
+    } else {
+        // delete the text by moving the next lines forwards
+        // SAFETY: hp is still valid; re-borrow after
+        // ml_add_deleted_len_buf (which only touched `buf`, not the
+        // block's own bytes).
+        let dp = unsafe { (*hp).bh_data.as_data_mut() };
+        let text_start = db_txt_start(dp);
+        dp.copy_within(
+            text_start as usize..line_start as usize,
+            text_start as usize + line_size as usize,
+        );
+
+        // delete the index by moving the next indexes backwards,
+        // adjusting for the text movement
+        for i in idx..count as usize - 1 {
+            let v = db_index(dp, i + 1) + line_size as u32;
+            set_db_index(dp, i, v);
+        }
+
+        let new_free = db_free(dp) + line_size as u32 + INDEX_SIZE;
+        set_db_free(dp, new_free);
+        set_db_txt_start(dp, text_start + line_size as u32);
+        let new_line_count = db_line_count(dp) - 1;
+        set_db_line_count(dp, new_line_count);
+
+        // mark the block dirty and make sure it is in the file (for recovery)
+        buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
     }
-
-    let new_free = db_free(dp) + line_size as u32 + INDEX_SIZE;
-    set_db_free(dp, new_free);
-    set_db_txt_start(dp, text_start + line_size as u32);
-    let new_line_count = db_line_count(dp) - 1;
-    set_db_line_count(dp, new_line_count);
-
-    // mark the block dirty and make sure it is in the file (for recovery)
-    buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
 
     ml_updatechunk(buf, lnum, line_size, ML_CHNK_DELLINE);
     OK
@@ -2095,6 +2160,80 @@ mod tests {
             let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp_owned, false);
         }
+    }
+
+    #[test]
+    fn ml_delete_removes_the_last_pointer_entry_when_its_block_empties() {
+        // Deleting "foo" (lnum 3) is the only line in data block 3
+        // (bnum 3), which is the LAST entry in the root pointer block
+        // - exercises the "no shift needed" branch (new_count == idx).
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let _guard = crate::globals::global_state_test_lock();
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_delete(3), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 2);
+            assert_eq!(ml_get(1), b"hello\0".to_vec());
+            assert_eq!(ml_get(2), b"world\0".to_vec());
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+
+            // Root pointer block should now have exactly 1 entry left
+            // (bnum 2, 2 lines) - bnum 3's data block was freed and
+            // its pointer entry removed.
+            let mfp = &mut *buf.b_ml.ml_mfp;
+            let root_hp = mf_get(mfp, 1, 1);
+            assert!(!root_hp.is_null());
+            let root_buf = (*root_hp).bh_data.as_data();
+            assert_eq!(pb_count(root_buf), 1);
+            let entry0 = pb_pointer(root_buf, 0);
+            assert_eq!(entry0.pe_bnum, 2);
+            assert_eq!(entry0.pe_line_count, 2);
+            mf_put(mfp, root_hp, false, false);
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_delete_shifts_later_pointer_entries_down_when_an_earlier_block_empties() {
+        // Delete "hello" (lnum 1, normal shrink: block 2 goes from 2
+        // lines to 1), then delete the new lnum 1 ("world", now the
+        // ONLY line in block 2) - this empties block 2, whose pointer
+        // entry is index 0 (NOT the last entry, since bnum 3/"foo"
+        // still occupies index 1) - exercises the "shift entries down"
+        // branch (new_count != idx).
+        let mut buf = build_three_line_two_block_memline();
+        unsafe {
+            let _guard = crate::globals::global_state_test_lock();
+            let prev_curbuf = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_delete(1), OK); // delete "hello"
+            assert_eq!(buf.b_ml.ml_line_count, 2);
+            assert_eq!(ml_get(1), b"world\0".to_vec());
+            assert_eq!(ml_get(2), b"foo\0".to_vec());
+
+            assert_eq!(ml_delete(1), OK); // delete "world" - empties block 2
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+            assert_eq!(ml_get(1), b"foo\0".to_vec());
+
+            GLOBALS.get_mut().curbuf = prev_curbuf;
+
+            // Root pointer block should now have exactly 1 entry,
+            // shifted down from index 1 to index 0 (bnum 3, 1 line).
+            let mfp = &mut *buf.b_ml.ml_mfp;
+            let root_hp = mf_get(mfp, 1, 1);
+            assert!(!root_hp.is_null());
+            let root_buf = (*root_hp).bh_data.as_data();
+            assert_eq!(pb_count(root_buf), 1);
+            let entry0 = pb_pointer(root_buf, 0);
+            assert_eq!(entry0.pe_bnum, 3);
+            assert_eq!(entry0.pe_line_count, 1);
+            mf_put(mfp, root_hp, false, false);
+        }
+        close_test_memline(buf);
     }
 
     #[test]
