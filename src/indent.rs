@@ -3,9 +3,15 @@
 //! `indent.c` (~2000 lines) is the auto-indent/`'shiftwidth'`/tab-stop
 //! computation file. Most of it needs real buffer-modification
 //! (`ml_replace`/`changed_bytes`) plus the C-indent (`indent_c.c`) and
-//! Lisp-indent engines. Only the one genuinely self-contained function
-//! needed by `plines.c`'s tab-width calculations is translated here:
-//! `tabstop_padding`.
+//! Lisp-indent engines.
+//!
+//! Translated: `tabstop_padding`, `indent_size_no_ts`/`indent_size_ts`
+//! (needed by `plines.c`'s tab-width calculations and by
+//! `get_breakindent_win` below); `get_breakindent_win` (needed
+//! `buffer.c`'s `buf_get_changedtick`, now tractable since
+//! `eval/typval_defs.rs`'s `TypvalT` is real - see that function's own
+//! doc comment for its one deliberate gap, `'breakindentopt'="list"`,
+//! which needs the real regex engine).
 //!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
@@ -23,8 +29,55 @@
 //!
 //! Deferred: everything else in the file.
 
+use crate::buffer_defs::WinT;
+use crate::globals::GlobalCell;
 use crate::pos_defs::ColnrT;
-use crate::types_defs::OptInt;
+use crate::types_defs::{HandleT, OptInt};
+
+/// File-static cache for [`get_breakindent_win`] (the original's own
+/// 10 `static` locals inside that function, bundled into one struct
+/// here matching this crate's established `GlobalCell`-backed-
+/// file-static convention, e.g. `buffer.rs`'s `TOP_FILE_NUM`).
+///
+/// `prev_vts` is compared by VALUE here (`Option<Vec<ColnrT>>`
+/// equality), not by the original's raw pointer identity check
+/// (`prev_vts != wp->w_buffer->b_p_vts_array`) - this crate's
+/// `b_p_vts_array` is an owned `Vec` with no stable cross-buffer/
+/// cross-mutation pointer identity to compare instead. This can only
+/// ever invalidate the cache in cases where pointer-identity
+/// comparison wouldn't have (never the reverse), which is safe for a
+/// performance-only cache: it costs an occasional extra recompute, it
+/// can never produce an incorrect cached value.
+#[derive(Default)]
+struct BreakindentCache {
+    /// cached indent value (`prev_indent`)
+    prev_indent: i32,
+    /// cached tabstop value (`prev_ts`)
+    prev_ts: OptInt,
+    /// cached vartabs values (`prev_vts`) - see this struct's own doc
+    /// comment for how this differs from the original's pointer check.
+    prev_vts: Option<Vec<ColnrT>>,
+    /// cached buffer number (`prev_fnum`)
+    prev_fnum: HandleT,
+    /// cached copy of "line" (`prev_line`)
+    prev_line: Vec<u8>,
+    /// changedtick of cached value (`prev_tick`)
+    prev_tick: crate::eval::typval_defs::VarnumberT,
+    /// cached list indent (`prev_list`)
+    prev_list: i32,
+    /// cached `w_p_briopt_list` value (`prev_listopt`)
+    prev_listopt: i32,
+    /// cached `no_ts` value (`prev_no_ts`)
+    prev_no_ts: bool,
+    /// cached `'display'` `"uhex"` value (`prev_dy_uhex`)
+    prev_dy_uhex: u32,
+    /// cached `'formatlistpat'` value (`prev_flp`)
+    prev_flp: Option<Vec<u8>>,
+}
+
+static BREAKINDENT_CACHE: std::sync::LazyLock<GlobalCell<BreakindentCache>> =
+    std::sync::LazyLock::new(|| GlobalCell::new(BreakindentCache::default()));
+
 
 /// Calculate the number of screen spaces a tab will occupy. If `vts`
 /// is set then the tab widths are taken from that slice, otherwise
@@ -170,9 +223,233 @@ pub fn indent_size_ts(ptr: &[u8], ts: OptInt, vts: Option<&[ColnrT]>) -> i32 {
     }
 }
 
+/// Return appropriate space number for `'breakindent'`, taking
+/// influencing parameters into account (`get_breakindent_win`). `wp`
+/// must be specified since it's not necessarily always the current
+/// window.
+///
+/// # Deferred
+/// The original also handles `'breakindentopt'` `"list"` (extra
+/// indent for numbered lists, detected via `'formatlistpat'` regex
+/// matching) when `w_briopt_list != 0 && w_briopt_vcol == 0` - this
+/// needs the real regex engine (`regexp.c`'s `vim_regcomp`/
+/// `vim_regexec`, not yet translated), a genuinely separate,
+/// substantial subsystem. Rather than silently producing a wrong
+/// indent value for this specific, discrete, opt-in configuration
+/// (the caller must explicitly set `'breakindentopt'` to include
+/// `"list"` - not a value reachable through ordinary use), this
+/// `unimplemented!()`s there instead - matching `window.rs`'s
+/// `win_fdccol_count` precedent for `'foldcolumn'=auto`. Every other
+/// case (the common, default configuration) is fully correct.
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+/// Touches the shared `BREAKINDENT_CACHE` global (file-static in the
+/// original) and `crate::option_vars::OPTION_VARS` (via
+/// `get_flp_value`/`get_showbreak_value`/`vim_strsize`, and
+/// transitively via `win_col_off`/`win_col_off2`).
+#[must_use]
+pub unsafe fn get_breakindent_win(wp: &mut WinT, line: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cache = unsafe { BREAKINDENT_CACHE.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*wp.w_buffer };
+
+    // window width minus window margin space, i.e. what rests for text
+    let eff_wwidth = wp.w_view_width
+        // SAFETY: forwarded from this function's own safety doc.
+        - unsafe { crate::r#move::win_col_off(wp) }
+        // SAFETY: forwarded from this function's own safety doc.
+        + unsafe { crate::r#move::win_col_off2(wp) };
+
+    // In list mode, if 'listchars' "tab" isn't set, a TAB is displayed as ^I.
+    let no_ts = wp.w_onebuf_opt.wo_list != 0 && wp.w_p_lcs_chars.tab1 == 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let dy_uhex = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags
+        & crate::option_vars::opt_dy_flag::UHEX;
+    let flp = crate::option::get_flp_value(buf);
+
+    // Used cached indent, unless
+    // - buffer changed, or
+    // - 'tabstop' changed, or
+    // - 'vartabstop' changed, or
+    // - buffer was changed, or
+    // - 'breakindentopt' "list" changed, or
+    // - 'list' or 'listchars' "tab" changed, or
+    // - 'display' "uhex" flag changed, or
+    // - 'formatlistpat' changed, or
+    // - line changed.
+    if cache.prev_fnum != buf.handle
+        || cache.prev_ts != buf.b_p_ts
+        || cache.prev_vts != buf.b_p_vts_array
+        || cache.prev_tick != crate::buffer::buf_get_changedtick(buf)
+        || cache.prev_listopt != wp.w_briopt_list
+        || cache.prev_no_ts != no_ts
+        || cache.prev_dy_uhex != dy_uhex
+        || cache.prev_flp.as_deref() != Some(flp.as_slice())
+        || cache.prev_line != line
+    {
+        cache.prev_fnum = buf.handle;
+        cache.prev_line = line.to_vec();
+        cache.prev_ts = buf.b_p_ts;
+        cache.prev_vts.clone_from(&buf.b_p_vts_array);
+        if wp.w_briopt_vcol == 0 {
+            cache.prev_indent = if no_ts {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { indent_size_no_ts(line) }
+            } else {
+                indent_size_ts(line, buf.b_p_ts, buf.b_p_vts_array.as_deref())
+            };
+        }
+        cache.prev_tick = crate::buffer::buf_get_changedtick(buf);
+        cache.prev_listopt = wp.w_briopt_list;
+        cache.prev_list = 0;
+        cache.prev_no_ts = no_ts;
+        cache.prev_dy_uhex = dy_uhex;
+        cache.prev_flp = Some(flp);
+
+        // add additional indent for numbered lists
+        if wp.w_briopt_list != 0 && wp.w_briopt_vcol == 0 {
+            unimplemented!(
+                "'breakindentopt'=list needs regexp.c's real vim_regcomp/vim_regexec, not yet translated"
+            );
+        }
+    }
+
+    let mut bri;
+    if wp.w_briopt_vcol != 0 {
+        // column value has priority
+        bri = wp.w_briopt_vcol;
+        cache.prev_list = 0;
+    } else {
+        bri = cache.prev_indent + wp.w_briopt_shift;
+    }
+
+    // Add offset for number column, if 'n' is in 'cpoptions'
+    // SAFETY: forwarded from this function's own safety doc.
+    bri += unsafe { crate::r#move::win_col_off2(wp) };
+
+    // add additional indent for numbered lists
+    if wp.w_briopt_list > 0 {
+        bri += cache.prev_list;
+    }
+
+    // indent minus the length of the showbreak string
+    if wp.w_briopt_sbr {
+        // SAFETY: forwarded from this function's own safety doc.
+        bri -= unsafe { crate::charset::vim_strsize(&crate::option::get_showbreak_value(wp)) };
+    }
+
+    // never indent past left window margin
+    if bri < 0 {
+        bri = 0;
+    } else if bri > eff_wwidth - wp.w_briopt_min {
+        // always leave at least bri_min characters on the left,
+        // if text width is sufficient
+        bri = (eff_wwidth - wp.w_briopt_min).max(0);
+    }
+
+    bri
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_defs::BufT;
+
+    #[test]
+    fn get_breakindent_win_plain_indent_no_options() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 101, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 80;
+        let line = b"    text\0"; // 4 leading spaces, ts=8: indent=4
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 4);
+    }
+
+    #[test]
+    fn get_breakindent_win_briopt_shift_adds_to_indent() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 102, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 80;
+        win.w_briopt_shift = 3;
+        let line = b"    text\0"; // indent=4
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 7); // 4 + 3
+    }
+
+    #[test]
+    fn get_breakindent_win_briopt_vcol_overrides_indent_and_resets_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 103, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 80;
+        win.w_briopt_vcol = 15;
+        let line = b"    text\0"; // indent would be 4, but vcol has priority
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 15);
+    }
+
+    #[test]
+    fn get_breakindent_win_caches_until_something_relevant_changes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 104, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 80;
+        let line = b"    text\0";
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 4);
+
+        // Corrupt the cached indent directly (kept well under the
+        // window-width clamp threshold so it isn't itself clamped
+        // away) - a second call with EVERYTHING unchanged should
+        // return this corrupted value via the cache, not recompute
+        // the real one (4).
+        unsafe { BREAKINDENT_CACHE.get_mut() }.prev_indent = 50;
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 50);
+
+        // Changing the line invalidates the cache and forces a
+        // genuine recompute.
+        let line2 = b"  text\0"; // 2 spaces
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line2) }, 2);
+    }
+
+    #[test]
+    fn get_breakindent_win_briopt_sbr_subtracts_showbreak_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 106, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 80;
+        win.w_briopt_sbr = true;
+        win.w_onebuf_opt.wo_sbr = Some(b">>".to_vec());
+        let line = b"    text\0"; // indent=4
+        // bri = 4 - vim_strsize(">>")(2 printable ASCII cells) = 2.
+        assert_eq!(unsafe { get_breakindent_win(&mut win, line) }, 2);
+    }
+
+    #[test]
+    fn get_breakindent_win_never_indents_past_left_window_margin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 107, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_view_width = 10;
+        win.w_briopt_min = 2;
+        let mut line = vec![b' '; 20];
+        line.extend_from_slice(b"text\0");
+        // indent=20; eff_wwidth=10 (no number/fold/sign/cpo-n columns);
+        // clamp to max(10 - 2, 0) = 8.
+        assert_eq!(unsafe { get_breakindent_win(&mut win, &line) }, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "vim_regcomp")]
+    fn get_breakindent_win_briopt_list_panics_needing_regex_engine() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 108, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_briopt_list = 1;
+        let line = b"1. text\0";
+        let _ = unsafe { get_breakindent_win(&mut win, line) };
+    }
 
     #[test]
     fn tabstop_padding_plain_tabstop_no_vts() {
