@@ -306,6 +306,37 @@ pub unsafe fn char2cells(c: i32) -> i32 {
     }
 }
 
+/// Return number of display cells occupied by byte `b`, treated as an
+/// isolated single byte rather than a full (possibly multi-byte)
+/// character (`byte2cells`). Returns `0` for any byte `>= 0x80` (a
+/// lone byte like that has no standalone cell width of its own in a
+/// UTF-8 stream - a real difference from [`char2cells`], which
+/// decodes a full character there instead). For `b < 0x80`, uses the
+/// same `g_chartab`-default-rule width as [`char2cells`] (see that
+/// function's own doc comment for the "fixed default rule, not the
+/// real `'isprint'`-customizable `g_chartab`" caveat, which applies
+/// identically here).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'display'`'s
+/// `"uhex"` flag on the control-character path, same as [`char2cells`]).
+#[must_use]
+pub unsafe fn byte2cells(b: i32) -> i32 {
+    if b >= 0x80 {
+        return 0;
+    }
+    if (0x20..=0x7E).contains(&b) {
+        return 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let dy_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
+    if dy_flags & crate::option_vars::opt_dy_flag::UHEX != 0 {
+        4
+    } else {
+        2
+    }
+}
+
 /// Return number of display cells occupied by character at `p`
 /// (`ptr2cells`).
 ///
@@ -502,6 +533,36 @@ mod tests {
         assert_eq!(unsafe { char2cells(0x4e00) }, unsafe {
             crate::mbyte::utf_char2cells(0x4e00)
         });
+    }
+
+    #[test]
+    fn byte2cells_printable_ascii_is_one_and_control_is_two() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { byte2cells(i32::from(b' ')) }, 1);
+        assert_eq!(unsafe { byte2cells(i32::from(b'a')) }, 1);
+        assert_eq!(unsafe { byte2cells(i32::from(crate::ascii_defs::TAB)) }, 2);
+    }
+
+    #[test]
+    fn byte2cells_control_char_is_four_with_uhex() {
+        let _guard = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.dy_flags;
+        opts.dy_flags = crate::option_vars::opt_dy_flag::UHEX;
+
+        assert_eq!(unsafe { byte2cells(0x01) }, 4);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = prev;
+    }
+
+    #[test]
+    fn byte2cells_any_byte_at_or_above_0x80_is_zero() {
+        // Unlike char2cells, byte2cells never decodes a full
+        // multibyte character - a lone byte >= 0x80 has no standalone
+        // cell width of its own.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { byte2cells(0x80) }, 0);
+        assert_eq!(unsafe { byte2cells(0xff) }, 0);
     }
 
     #[test]

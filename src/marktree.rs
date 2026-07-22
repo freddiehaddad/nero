@@ -1751,6 +1751,26 @@ fn marktree_itr_check_filter(
     }
 }
 
+/// `marktree_itr_next_filter`: advances `itr` to the next key matching
+/// `meta_filter` (before `(stop_row, stop_col)`), or reports `false`
+/// (leaving `itr` invalid) if there is none. `b` is unused in the
+/// original too (kept here only for public signature parity, matching
+/// [`marktree_itr_next`]'s own precedent).
+pub fn marktree_itr_next_filter(
+    b: &MarkTree,
+    itr: &mut MarkTreeIter,
+    stop_row: i32,
+    stop_col: i32,
+    meta_filter: MetaFilter<'_>,
+) -> bool {
+    let _ = b;
+    if !marktree_itr_next_skip(itr, false, false, None, Some(meta_filter)) {
+        return false;
+    }
+
+    marktree_itr_check_filter(itr, stop_row, stop_col, meta_filter)
+}
+
 /// `marktree_itr_first`: places `itr` at the very first key in the tree.
 pub fn marktree_itr_first(b: &MarkTree, itr: &mut MarkTreeIter) -> bool {
     if b.n_keys == 0 {
@@ -3962,6 +3982,30 @@ mod tests {
         // 5, before the start) and lands on the second (row 50).
         assert!(marktree_itr_get_filter(&tree, 20, 0, 1000, 0, &select_inline, &mut itr));
         assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(50, 0));
+
+        unsafe { marktree_clear(&mut tree) };
+    }
+
+    #[test]
+    fn marktree_itr_next_filter_advances_to_the_next_matching_key() {
+        let mut tree = MarkTree::default();
+        marktree_put_test(&mut tree, 0, 1, 5, 0, false, -1, -1, false, true); // inline
+        marktree_put_test(&mut tree, 0, 2, 10, 0, false, -1, -1, false, false); // plain
+        marktree_put_test(&mut tree, 0, 3, 20, 0, false, -1, -1, false, true); // inline
+        marktree_check(&tree);
+
+        let select_inline = select_inline_filter();
+        let mut itr = MarkTreeIter::default();
+        assert!(marktree_itr_get_filter(&tree, 0, 0, 1000, 0, &select_inline, &mut itr));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(5, 0));
+
+        // Advancing should skip the plain key at row 10 and land on
+        // the next inline-marked key at row 20.
+        assert!(marktree_itr_next_filter(&tree, &mut itr, 1000, 0, &select_inline));
+        assert_eq!(marktree_itr_current(&itr).pos, MtPos::new(20, 0));
+
+        // No further matching key before the stop position.
+        assert!(!marktree_itr_next_filter(&tree, &mut itr, 1000, 0, &select_inline));
 
         unsafe { marktree_clear(&mut tree) };
     }
