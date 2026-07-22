@@ -1,6 +1,6 @@
-//! Translated from `src/nvim/buffer_defs.h` (partial - `tabpage_S`, which
-//! needs `dict_T`'s real fields from the eval engine, is deliberately
-//! deferred rather than rushed).
+//! Translated from `src/nvim/buffer_defs.h` (now essentially complete -
+//! `tabpage_S` no longer needs to be deferred, now that `dict_T` has
+//! real fields).
 //!
 //! Translated: `bufref_T`, the `VALID_*`/`BF_*` bit-flag constants,
 //! `disptick_T`, `taggy_T`, `winopt_T`, `WinInfo` (`struct wininfo_S`),
@@ -12,14 +12,19 @@
 //! `DifflineChangeT`/`DifflineT`), the `SNAP_*` constants, `wline_T`,
 //! `struct file_buffer` (-> [`BufT`]) itself including its
 //! buffer-local-options block, `FR_LEAF`/`FR_ROW`/`FR_COL` and `struct
-//! frame_S` (-> [`FrameT`]), and now `struct window_S` (-> [`WinT`])
-//! itself.
+//! frame_S` (-> [`FrameT`]), `struct window_S` (-> [`WinT`]), and now
+//! `struct tabpage_S` (-> [`TabpageT`]) itself - a straightforward,
+//! field-for-field translation once `dict_T` existed for `tp_vars`
+//! (a raw pointer field, same treatment as `BufT.b_vars`/
+//! `WinT.w_vars`) and `ScopeDictDictItem` (already existed) for
+//! `tp_winvar`. Replaces the opaque placeholder that previously lived
+//! in `types_defs.rs`, same treatment `BufT`/`WinT` themselves
+//! received earlier.
 //!
 //! Deferred: `match_T`/`llpos_T`/`matchitem_T` (need `regmmatch_T`,
 //! `regexp_defs.h`, phase 7 - `matchitem_T`'s opaque placeholder,
 //! `crate::types_defs::MatchitemT`, is enough for `WinT.w_match_head`'s
-//! pointer field for now), and `tabpage_S` (needs `dict_T`'s real
-//! fields, the eval engine).
+//! pointer field for now).
 
 use crate::arglist_defs::AlistT;
 use crate::eval::typval_defs::{Callback, ChangedtickDictItem, DictT, ScopeDictDictItem, SctxT, VarnumberT};
@@ -1804,6 +1809,87 @@ impl Default for FrameT {
     }
 }
 
+/// Tab pages point to the top frame of each tab page (`struct
+/// tabpage_S`, typedef'd as `tabpage_T`).
+///
+/// Note: Most values are NOT valid for the current tab page! Use
+/// `curwin`/`firstwin`/etc. for that. `tp_topframe` is always valid
+/// and can be compared against `topframe` to find the current tab
+/// page.
+///
+/// Kept under the name `TabpageT`, replacing the opaque placeholder
+/// that previously lived in `types_defs.rs` - same treatment as
+/// `BufT`/`WinT` before it, now that `dict_T`'s real fields (needed
+/// for `tp_vars`) exist.
+pub struct TabpageT {
+    pub handle: crate::types_defs::HandleT,
+    /// next tabpage or `NULL` (`tp_next`).
+    pub tp_next: *mut TabpageT,
+    /// topframe for the windows (`tp_topframe`).
+    pub tp_topframe: *mut FrameT,
+    /// current window in this Tab page (`tp_curwin`).
+    pub tp_curwin: *mut WinT,
+    /// previous window in this Tab page (`tp_prevwin`).
+    pub tp_prevwin: *mut WinT,
+    /// first window in this Tab page (`tp_firstwin`).
+    pub tp_firstwin: *mut WinT,
+    /// last window in this Tab page (`tp_lastwin`).
+    pub tp_lastwin: *mut WinT,
+    /// `ROWS_AVAIL` when Tab page was left (`tp_old_Rows_avail`).
+    pub tp_old_rows_avail: i64,
+    /// Columns when Tab page was left, -1 when calling
+    /// `win_new_screen_cols()` postponed (`tp_old_Columns`).
+    pub tp_old_columns: i64,
+    /// value of `'cmdheight'` when frame size was set (`tp_ch_used`).
+    pub tp_ch_used: crate::types_defs::OptInt,
+    /// whether `TabClosedPre` was triggered (`tp_did_tabclosedpre`).
+    pub tp_did_tabclosedpre: bool,
+
+    pub tp_first_diff: *mut DiffT,
+    pub tp_diffbuf: [*mut BufT; DB_COUNT],
+    /// list of diffs is outdated (`tp_diff_invalid`).
+    pub tp_diff_invalid: i32,
+    /// update diffs before redrawing (`tp_diff_update`).
+    pub tp_diff_update: i32,
+    /// window layout snapshots (`tp_snapshot`).
+    pub tp_snapshot: [*mut FrameT; SNAP_COUNT],
+    /// Variable for `"t:"` Dict (`tp_winvar`).
+    pub tp_winvar: ScopeDictDictItem,
+    /// Internal variables, local to tab page (`tp_vars`).
+    pub tp_vars: *mut DictT,
+    /// Absolute path of local cwd or `NULL` (`tp_localdir`).
+    pub tp_localdir: Option<Vec<u8>>,
+    /// Previous directory (`tp_prevdir`).
+    pub tp_prevdir: Option<Vec<u8>>,
+}
+
+impl Default for TabpageT {
+    fn default() -> Self {
+        TabpageT {
+            handle: 0,
+            tp_next: std::ptr::null_mut(),
+            tp_topframe: std::ptr::null_mut(),
+            tp_curwin: std::ptr::null_mut(),
+            tp_prevwin: std::ptr::null_mut(),
+            tp_firstwin: std::ptr::null_mut(),
+            tp_lastwin: std::ptr::null_mut(),
+            tp_old_rows_avail: 0,
+            tp_old_columns: 0,
+            tp_ch_used: 0,
+            tp_did_tabclosedpre: false,
+            tp_first_diff: std::ptr::null_mut(),
+            tp_diffbuf: [std::ptr::null_mut(); DB_COUNT],
+            tp_diff_invalid: 0,
+            tp_diff_update: 0,
+            tp_snapshot: [std::ptr::null_mut(); SNAP_COUNT],
+            tp_winvar: ScopeDictDictItem::default(),
+            tp_vars: std::ptr::null_mut(),
+            tp_localdir: None,
+            tp_prevdir: None,
+        }
+    }
+}
+
 /// Structure which contains all information that belongs to a window
 /// (`struct window_S`, typedef'd as `win_T`).
 ///
@@ -2700,5 +2786,51 @@ mod tests {
         assert_eq!(win.w_config.height, 0);
         assert!(win.w_config.focusable);
         assert!(win.w_config.mouse);
+    }
+
+    #[test]
+    fn tabpage_default_has_null_pointers_and_zeroed_scalars() {
+        let tp = TabpageT::default();
+        assert_eq!(tp.handle, 0);
+        assert!(tp.tp_next.is_null());
+        assert!(tp.tp_topframe.is_null());
+        assert!(tp.tp_curwin.is_null());
+        assert!(tp.tp_prevwin.is_null());
+        assert!(tp.tp_firstwin.is_null());
+        assert!(tp.tp_lastwin.is_null());
+        assert_eq!(tp.tp_old_rows_avail, 0);
+        assert_eq!(tp.tp_old_columns, 0);
+        assert_eq!(tp.tp_ch_used, 0);
+        assert!(!tp.tp_did_tabclosedpre);
+        assert!(tp.tp_first_diff.is_null());
+        assert!(tp.tp_diffbuf.iter().all(|p| p.is_null()));
+        assert_eq!(tp.tp_diffbuf.len(), DB_COUNT);
+        assert_eq!(tp.tp_diff_invalid, 0);
+        assert_eq!(tp.tp_diff_update, 0);
+        assert!(tp.tp_snapshot.iter().all(|p| p.is_null()));
+        assert_eq!(tp.tp_snapshot.len(), SNAP_COUNT);
+        assert!(tp.tp_vars.is_null());
+        assert!(tp.tp_localdir.is_none());
+        assert!(tp.tp_prevdir.is_none());
+    }
+
+    #[test]
+    fn tabpage_winvar_defaults_match_scope_dict_dictitem_default() {
+        let tp = TabpageT::default();
+        assert_eq!(tp.tp_winvar.di_flags, 0);
+        assert!(tp.tp_winvar.di_key.is_empty());
+    }
+
+    #[test]
+    fn tabpage_can_be_linked_into_a_list_via_tp_next() {
+        let mut first = TabpageT::default();
+        let mut second = TabpageT::default();
+        first.handle = 1;
+        second.handle = 2;
+        first.tp_next = &mut second as *mut TabpageT;
+        // SAFETY: `second` outlives this read, both are stack locals in
+        // scope for the whole test body.
+        let next_handle = unsafe { (*first.tp_next).handle };
+        assert_eq!(next_handle, 2);
     }
 }

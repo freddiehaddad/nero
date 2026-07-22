@@ -96,8 +96,6 @@ pub const SIGN_WIDTH: i32 = 2;
 //   mapblock_T  -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
 //   matchitem_T -> struct matchitem,   src/nvim/buffer_defs.h   (phase 7,
 //                                      needs regmmatch_T)
-//   tabpage_T   -> struct tabpage_S,   src/nvim/buffer_defs.h   (phase 3,
-//                                      needs dict_T's real fields)
 //   ufunc_T     -> struct ufunc_S,     src/nvim/eval/userfunc.h (phase 5)
 //   AutoPatCmd  -> struct AutoPatCmd_S, src/nvim/autocmd_defs.h (phase 6)
 // (mapblock_T/qf_info_T/matchitem_T are actually forward-declared in their
@@ -114,7 +112,9 @@ pub const SIGN_WIDTH: i32 = 2;
 // same names, since `buf_T`/`win_T` - not `FileBuffer`/`Window` - are the
 // names actually used throughout the rest of the original codebase;
 // matches this crate's "prefer the real typedef name" convention, e.g.
-// `wininfo_S` -> `WinInfo`).
+// `wininfo_S` -> `WinInfo`). tabpage_T (struct tabpage_S) is likewise no
+// longer a placeholder: now that dict_T has real fields, it is translated
+// for real as `crate::buffer_defs::TabpageT`.
 
 /// Placeholder for `Loop` (`struct loop`) - see `src/nvim/event/loop.h` (phase 11).
 pub struct LoopT {
@@ -144,12 +144,6 @@ pub struct MapblockT {
 /// `src/nvim/buffer_defs.h` (phase 7: needs `regmmatch_T`, same blocker as
 /// `match_T`/`llpos_T`, which are deferred for the same reason).
 pub struct MatchitemT {
-    _private: (),
-}
-/// Placeholder for `tabpage_T` (`struct tabpage_S`) - see
-/// `src/nvim/buffer_defs.h` (phase 3: needs `dict_T`'s real fields for
-/// `tp_winvar`, the eval engine).
-pub struct TabpageT {
     _private: (),
 }
 /// Placeholder for `ufunc_T` (`struct ufunc_S`) - see

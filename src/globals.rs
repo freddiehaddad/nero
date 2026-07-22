@@ -44,7 +44,7 @@
 use std::cell::UnsafeCell;
 
 use crate::arglist_defs::AlistT;
-use crate::buffer_defs::{BufT, DisptickT, FrameT, WinT};
+use crate::buffer_defs::{BufT, DisptickT, FrameT, TabpageT, WinT};
 use crate::eval::typval_defs::SctxT;
 use crate::ex_cmds_defs::CmdmodT;
 use crate::ex_eval_defs::{ExceptT, MsglistT};
@@ -61,7 +61,7 @@ use crate::regexp_defs::OptmagicT;
 use crate::runtime_defs::EstackT;
 use crate::search_defs::SearchState;
 use crate::state_defs::mode;
-use crate::types_defs::{RegExtmatchT, TabpageT, TriState};
+use crate::types_defs::{RegExtmatchT, TriState};
 
 /// file I/O and sprintf buffer size (`IOSIZE`).
 pub const IOSIZE: usize = 1024 + 1;
