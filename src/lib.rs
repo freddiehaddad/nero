@@ -30,6 +30,7 @@ pub mod eval;
 pub mod ex_cmds_defs;
 pub mod ex_eval_defs;
 pub mod extmark_defs;
+pub mod fold;
 pub mod fold_defs;
 pub mod fuzzy;
 pub mod garray;

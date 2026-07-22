@@ -68,14 +68,6 @@
 //! precedent (`window.rs`'s `win_fdccol_count`, `indent.rs`'s
 //! `get_breakindent_win`).
 //!
-//! Deferred (each needs a not-yet-translated subsystem):
-//! - `set_leftcol`: needs `redraw_later`/`changed_cline_bef_curs`
-//!   (drawscreen.c's redraw-tracking side).
-//! - `check_cursor_lnum`/`get_cursor_rel_lnum`: need `fold.c`'s
-//!   `hasFolding`/`hasFoldingWin`/`hasAnyFolding`.
-//! - `check_cursor` (the `check_cursor_lnum` + `check_cursor_col`
-//!   combo): needs `check_cursor_lnum` (fold.c, above).
-//!
 //! **`check_cursor_col`** itself (unlike `check_cursor`, its combo
 //! caller) turned out to need NO fold.c dependency at all - re-read
 //! directly rather than assumed blocked alongside `check_cursor`/
@@ -90,9 +82,21 @@
 //! provably unreachable either - would otherwise panic in a debug
 //! build instead of silently producing a nonsensical-but-harmless
 //! value like the original's own C `int` arithmetic would.
+//!
+//! Also translated, now that `fold.rs`'s "no folds in this window"
+//! fast path exists: `check_cursor_lnum`, `check_cursor` (the
+//! `check_cursor_lnum` + `check_cursor_col` combo), and
+//! `get_cursor_rel_lnum`. Each defers to `fold::has_folding`/
+//! `fold::has_any_folding`'s own `unimplemented!()` for the "folding
+//! might genuinely be active" case (see `fold.rs`'s module doc) -
+//! correct and complete for the overwhelmingly common no-folds case,
+//! panicking (not silently wrong) otherwise.
+//!
+//! Deferred: `set_leftcol` (needs `redraw_later`/`changed_cline_bef_curs`,
+//! drawscreen.c's redraw-tracking side).
 
 use crate::buffer_defs::{BufT, WinT};
-use crate::pos_defs::{ColnrT, MAXCOL, PosT};
+use crate::pos_defs::{ColnrT, LinenrT, MAXCOL, PosT};
 
 /// Make sure `pos.lnum` and `pos.col` are valid in `buf`. This allows
 /// for the col to be on the NUL byte (`check_pos`).
@@ -716,6 +720,83 @@ pub unsafe fn getvpos(wp: *mut WinT, pos: &mut PosT, wcol: ColnrT) -> i32 {
     unsafe { coladvance2(wp, pos, false, is_virtual_active, wcol) }
 }
 
+/// Make sure `win.w_cursor.lnum` is valid (`check_cursor_lnum`).
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+pub unsafe fn check_cursor_lnum(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (buf_ptr, cursor_lnum) = unsafe {
+        let w = &*win;
+        (w.w_buffer, w.w_cursor.lnum)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*buf_ptr }.b_ml.ml_line_count;
+
+    if cursor_lnum > line_count {
+        // If there is a closed fold at the end of the file, put the
+        // cursor in its first line. Otherwise in the last line.
+        //
+        // NOTE: the original also writes the fold's first line into
+        // win->w_cursor.lnum via hasFolding's out-parameter when a
+        // fold IS found - not modeled since fold::has_folding's
+        // "folding might be active" path is `unimplemented!()` (see
+        // fold.rs's own module doc).
+        // SAFETY: forwarded from this function's own safety doc.
+        let wref = unsafe { &mut *win };
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { crate::fold::has_folding(wref, line_count) } {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *win }.w_cursor.lnum = line_count;
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*win }.w_cursor.lnum <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win }.w_cursor.lnum = 1;
+    }
+}
+
+/// Make sure `wp.w_cursor` is on a valid character (`check_cursor`).
+///
+/// # Safety
+/// Same as [`check_cursor_lnum`]/[`check_cursor_col`].
+pub unsafe fn check_cursor(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_cursor_lnum(wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_cursor_col(wp) };
+}
+
+/// Return `lnum`'s line-count distance from `wp.w_cursor.lnum`, fold-aware
+/// (`get_cursor_rel_lnum`).
+///
+/// Only the "no folding" fast path (`lnum == cursor ||
+/// !has_any_folding(wp)`) is translated - the fold-skipping loop,
+/// reached only when [`crate::fold::has_any_folding`] returns true, is
+/// `unimplemented!()` directly in this function (a separate case from
+/// `fold::has_folding`'s own internal panic, not reached here at all
+/// since this function never calls `has_folding`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn get_cursor_rel_lnum(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) -> LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wref = unsafe { &*wp };
+    let cursor = wref.w_cursor.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    if lnum == cursor || !unsafe { crate::fold::has_any_folding(wref) } {
+        return lnum - cursor;
+    }
+    unimplemented!(
+        "get_cursor_rel_lnum: the fold-skipping loop is not yet translated (only the \
+         \"hasAnyFolding() == false\" fast path is)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,6 +1291,100 @@ mod tests {
         assert_eq!(pos.col, 3);
         // The real cursor (win.w_cursor) is untouched.
         assert_eq!(win.w_cursor.col, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_lnum_clamps_to_last_line_when_too_high() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 99, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hi\0");
+
+        unsafe { check_cursor_lnum(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.lnum, 1); // only 1 line in this buffer
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_lnum_clamps_to_one_when_non_positive() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 0, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hi\0");
+
+        unsafe { check_cursor_lnum(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.lnum, 1);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_lnum_leaves_valid_lnum_untouched() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hi\0");
+
+        unsafe { check_cursor_lnum(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.lnum, 1);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_cursor_clamps_both_lnum_and_col() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 99, col: 99, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        unsafe { check_cursor(&mut win as *mut WinT) };
+        assert_eq!(win.w_cursor.lnum, 1); // only 1 line
+        assert_eq!(win.w_cursor.col, 4); // clamped to the last real char
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_cursor_rel_lnum_basic_distance_with_no_folds() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"one\0");
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 2, b"three\0", 6, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 3) }, 2);
+        assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 1) }, 0);
 
         drop(guard);
         close_buf_with_memline(buf);
