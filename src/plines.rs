@@ -40,8 +40,9 @@
 //!    any test.
 //! 3. `'linebreak'` word-wrap boundary detection (break at a blank
 //!    before a non-blank, scanning back to the last non-blank-after-
-//!    blank) - needs `vim_isbreak` (`charset.c`, not yet translated)
-//!    and `virt_text_cursor_off` (not yet checked).
+//!    blank) - needs `charset.c`'s `vim_isbreak` (now translated) and
+//!    `virt_text_cursor_off` (not yet checked).
+//!
 //! `getvcol`/`getvvcol`/`linetabsize*` need the above too - `getvcol`
 //! itself already calls `init_charsize_arg` unconditionally, even on
 //! the `kCharsizeFast` path, so it still needs `charsize_regular` to

@@ -11,7 +11,11 @@
 //! `utfc_ptr2len` exists too: `vim_strsize`/`vim_strnsize` (screen-cell
 //! width of a whole string, counting TABs as two cells); `byte2cells`
 //! (the single-byte sibling of `char2cells`); `nr2hex`/`transchar_hex`
-//! (hex-escape formatting for non-printable/illegal characters).
+//! (hex-escape formatting for non-printable/illegal characters);
+//! `charset.h`'s `vim_isbreak` (translated proactively for its real
+//! future caller, `plines.c`'s not-yet-translated `charsize_regular` -
+//! `charset.h` has no dedicated module of its own in this crate, same
+//! treatment as `buffer.h`'s `buf_meta_total` in `buffer.rs`).
 //!
 //! `vim_isprintc`/`char2cells`/`byte2cells` need `g_chartab`, which isn't
 //! translated (needs `buf_T`/option parsing), but their *default* (pre-
@@ -288,6 +292,29 @@ pub fn vim_isprintc(c: i32) -> bool {
         return crate::mbyte::utf_printable(c);
     }
     (0x20..=0x7E).contains(&c) || c >= 0xA0
+}
+
+/// Characters in the DEFAULT `'breakat'` value (`" \t!@*-+;:,./?"`) -
+/// see [`vim_isbreak`]'s own doc comment for why this is a fixed
+/// default-value table rather than the real, `'breakat'`-customizable
+/// `breakat_flags[256]` (needs `optionstr.c`'s `did_set_breakat`
+/// option-string parsing, not yet translated).
+const DEFAULT_BREAKAT: &[u8] = b" \t!@*-+;:,./?";
+
+/// Check if `c` is one of the characters in `'breakat'` (`vim_isbreak`).
+/// Used very often if `'linebreak'` is set. Only works for ASCII
+/// characters, matching the original's own documented limitation.
+///
+/// Uses the DEFAULT `'breakat'` value (`" \t!@*-+;:,./?"`) rather than
+/// the real, possibly-customized `breakat_flags[256]` table (needs
+/// `optionstr.c`'s `did_set_breakat`, not yet translated) - correct
+/// for every real session that hasn't customized `'breakat'` (the
+/// common case), documented as a simplification rather than pretending
+/// the general mechanism exists (matching [`vim_isprintc`]'s own
+/// precedent exactly).
+#[must_use]
+pub fn vim_isbreak(c: i32) -> bool {
+    u8::try_from(c).is_ok_and(|b| DEFAULT_BREAKAT.contains(&b))
 }
 
 /// Return number of display cells occupied by character `c`
@@ -816,6 +843,28 @@ mod tests {
     fn vim_isprintc_delegates_to_utf_printable_at_and_above_0x100() {
         assert!(vim_isprintc(0x0100)); // ordinary Latin Extended-A
         assert!(!vim_isprintc(0x200b)); // in utf_printable's nonprint table
+    }
+
+    #[test]
+    fn vim_isbreak_recognizes_every_default_breakat_character() {
+        for &b in DEFAULT_BREAKAT {
+            assert!(vim_isbreak(i32::from(b)), "expected {b:#x} to be a break character");
+        }
+    }
+
+    #[test]
+    fn vim_isbreak_rejects_ordinary_letters_and_digits() {
+        assert!(!vim_isbreak(i32::from(b'a')));
+        assert!(!vim_isbreak(i32::from(b'Z')));
+        assert!(!vim_isbreak(i32::from(b'5')));
+        assert!(!vim_isbreak(i32::from(b'_')));
+    }
+
+    #[test]
+    fn vim_isbreak_rejects_out_of_byte_range_values() {
+        assert!(!vim_isbreak(-1));
+        assert!(!vim_isbreak(256));
+        assert!(!vim_isbreak(i32::MAX));
     }
 
     #[test]
