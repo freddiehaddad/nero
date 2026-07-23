@@ -5,8 +5,8 @@
 //! from a pre-built copy of that generated file found in this
 //! checkout's own `build/src/nvim/auto/option_vars.generated.h`,
 //! matching this project's "translate the generator's output directly"
-//! convention for codegen-derived content, same as how
-//! `ex_cmds_defs.rs`'s deferred `cmdidx_T` will eventually be handled).
+//! convention for codegen-derived content, same technique later used
+//! for `ex_cmds_defs.rs`'s `cmdidx_T`).
 //!
 //! Translated: every one of the header's 337 `EXTERN`/`extern` global
 //! option-value variables (as a single [`OptionVars`] struct, mirroring
