@@ -206,6 +206,44 @@ pub fn get_flp_value(buf: &BufT) -> Vec<u8> {
     }
 }
 
+/// Get the value of `'equalprg'`, either the buffer-local one or the
+/// global one (`get_equalprg`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn get_equalprg() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    match curbuf.b_p_ep.as_deref() {
+        Some(ep) if !ep.is_empty() => ep.to_vec(),
+        _ => unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_ep
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
+/// Get the value of `'findfunc'`, either the buffer-local one or the
+/// global one (`get_findfunc`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn get_findfunc() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    match curbuf.b_p_ffu.as_deref() {
+        Some(ffu) if !ffu.is_empty() => ffu.to_vec(),
+        _ => unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_ffu
+            .clone()
+            .unwrap_or_default(),
+    }
+}
+
 /// Get the local or global value of `'virtualedit'` flags
 /// (`get_ve_flags`).
 #[must_use]
@@ -972,5 +1010,83 @@ mod tests {
         let mut wp = WinT::default();
         assert_eq!(fill_culopt_flags(None, &mut wp), crate::vim_defs::OK);
         assert_eq!(wp.w_p_culopt_flags, 0);
+    }
+
+    /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching `change.rs`/`buffer.rs`'s own identically-named
+    /// helper).
+    struct CurbufGuard {
+        previous: *mut BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn get_equalprg_prefers_non_empty_buffer_local() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ep.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ep = Some(b"global-ep".to_vec());
+
+        let mut buf_local = BufT { b_p_ep: Some(b"local-ep".to_vec()), ..Default::default() };
+        {
+            let _guard = CurbufGuard::set(&mut buf_local as *mut BufT);
+            assert_eq!(unsafe { get_equalprg() }, b"local-ep");
+        }
+
+        let mut buf_empty = BufT { b_p_ep: Some(Vec::new()), ..Default::default() };
+        {
+            let _guard = CurbufGuard::set(&mut buf_empty as *mut BufT);
+            assert_eq!(unsafe { get_equalprg() }, b"global-ep");
+        }
+
+        let mut buf_unset = BufT { b_p_ep: None, ..Default::default() };
+        {
+            let _guard = CurbufGuard::set(&mut buf_unset as *mut BufT);
+            assert_eq!(unsafe { get_equalprg() }, b"global-ep");
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ep = None;
+        let mut buf_both_unset = BufT::default();
+        {
+            let _guard = CurbufGuard::set(&mut buf_both_unset as *mut BufT);
+            assert_eq!(unsafe { get_equalprg() }, Vec::<u8>::new());
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ep = prev;
+    }
+
+    #[test]
+    fn get_findfunc_prefers_non_empty_buffer_local() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu = Some(b"GlobalFindFunc".to_vec());
+
+        let mut buf_local = BufT { b_p_ffu: Some(b"LocalFindFunc".to_vec()), ..Default::default() };
+        {
+            let _guard = CurbufGuard::set(&mut buf_local as *mut BufT);
+            assert_eq!(unsafe { get_findfunc() }, b"LocalFindFunc");
+        }
+
+        let mut buf_empty = BufT { b_p_ffu: Some(Vec::new()), ..Default::default() };
+        {
+            let _guard = CurbufGuard::set(&mut buf_empty as *mut BufT);
+            assert_eq!(unsafe { get_findfunc() }, b"GlobalFindFunc");
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu = prev;
     }
 }

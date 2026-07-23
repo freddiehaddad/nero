@@ -11,7 +11,10 @@
 //! `buffer.c`'s `buf_get_changedtick`, now tractable since
 //! `eval/typval_defs.rs`'s `TypvalT` is real - see that function's own
 //! doc comment for its one deliberate gap, `'breakindentopt'="list"`,
-//! which needs the real regex engine).
+//! which needs the real regex engine); `get_indent`/`get_indent_lnum`/
+//! `get_indent_buf` (thin wrappers around `indent_size_ts` - needed
+//! only `cursor.rs`'s `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/
+//! `ml_get_buf`, all already real).
 //!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
@@ -221,6 +224,50 @@ pub fn indent_size_ts(ptr: &[u8], ts: OptInt, vts: Option<&[ColnrT]>) -> i32 {
             return vcol;
         }
     }
+}
+
+/// Count the size (in window cells) of the indent in the current
+/// line (`get_indent`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` (forwarded from
+/// `crate::cursor::get_cursor_line_ptr`'s own safety doc).
+#[must_use]
+pub unsafe fn get_indent() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    indent_size_ts(&line, curbuf.b_p_ts, curbuf.b_p_vts_array.as_deref())
+}
+
+/// Count the size (in window cells) of the indent in line `lnum` of
+/// the current buffer (`get_indent_lnum`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (forwarded from `crate::memline::ml_get`'s own
+/// safety doc).
+#[must_use]
+pub unsafe fn get_indent_lnum(lnum: crate::pos_defs::LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    indent_size_ts(&line, curbuf.b_p_ts, curbuf.b_p_vts_array.as_deref())
+}
+
+/// Count the size (in window cells) of the indent in line `lnum` of
+/// buffer `buf` (`get_indent_buf`).
+///
+/// # Safety
+/// Same as `crate::memline::ml_get_buf`'s own safety doc.
+#[must_use]
+pub unsafe fn get_indent_buf(buf: &mut crate::buffer_defs::BufT, lnum: crate::pos_defs::LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    indent_size_ts(&line, buf.b_p_ts, buf.b_p_vts_array.as_deref())
 }
 
 /// Return appropriate space number for `'breakindent'`, taking
@@ -538,5 +585,113 @@ mod tests {
     #[test]
     fn indent_size_ts_vts_empty_slice_falls_back_to_fixed_ts() {
         assert_eq!(indent_size_ts(b"\tx\0", 8, Some(&[])), 8);
+    }
+
+    /// RAII guard installing `win`/`buf` as curwin/curbuf, restoring
+    /// the previous pointers on drop. Holds `global_state_test_lock`
+    /// for its entire lifetime, matching `cursor.rs`'s own
+    /// `CursorTestGuard` precedent (needed since `ml_open`, used to
+    /// build the test memline below, touches shared `GLOBALS.got_int`
+    /// internally).
+    struct CursorTestGuard {
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CursorTestGuard {
+        fn set(win: *mut WinT, buf: *mut BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CursorTestGuard { prev_curwin: globals.curwin, prev_curbuf: globals.curbuf, _lock };
+            globals.curwin = win;
+            globals.curbuf = buf;
+            guard
+        }
+    }
+
+    impl Drop for CursorTestGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curwin = self.prev_curwin;
+            globals.curbuf = self.prev_curbuf;
+        }
+    }
+
+    /// Installs `win`/`buf` as curwin/curbuf, then opens a fresh
+    /// memline for `buf` and replaces line 1 with `line` (matching
+    /// `cursor.rs`'s own `open_and_set_test_buf` precedent). Callers
+    /// must close `buf.b_ml.ml_mfp` themselves after the guard drops.
+    fn open_and_set_test_buf(win: &mut WinT, buf: &mut BufT, line: &[u8]) -> CursorTestGuard {
+        let guard = CursorTestGuard::set(win as *mut WinT, buf as *mut BufT);
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        guard
+    }
+
+    fn close_buf_with_memline(buf: BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn get_indent_counts_the_cursor_lines_indent() {
+        let mut buf = BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        win.w_cursor.lnum = 1;
+
+        assert_eq!(unsafe { get_indent() }, 4);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_indent_lnum_counts_a_specific_lines_indent() {
+        let mut buf = BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"\ttext\0");
+
+        assert_eq!(unsafe { get_indent_lnum(1) }, 8);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_indent_buf_counts_a_specific_buffers_line_indent() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_ts: 4, ..Default::default() };
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"  text\0") },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(unsafe { get_indent_buf(&mut buf, 1) }, 2);
+
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_indent_family_uses_variable_tabstops_when_set() {
+        let mut buf =
+            BufT { b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"\t\ttext\0");
+        win.w_cursor.lnum = 1;
+
+        // vts=[4, 8]: first tab lands at column 4, second at 4+8=12.
+        assert_eq!(unsafe { get_indent() }, 12);
+        assert_eq!(unsafe { get_indent_lnum(1) }, 12);
+
+        drop(guard);
+        close_buf_with_memline(buf);
     }
 }
