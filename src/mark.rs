@@ -32,7 +32,12 @@
 //! `get_global_marks`'s own `namedfm[i].fmark.fnum != 0` branch still
 //! skips the entry, needing `buflist_nr2name` (`buffer.c`) - see that
 //! function's own doc comment for why this is currently unreachable
-//! anyway, not just narrow).
+//! anyway, not just narrow); `ex_clearjumps` (now tractable now that
+//! `crate::ex_cmds_defs::ExargT` exists - the first `ex_*` command
+//! handler translated in this crate, re-checked directly against the
+//! real source rather than assumed blocked alongside its sibling
+//! `ex_*` functions below, which each have their OWN additional,
+//! separate blockers).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
@@ -54,9 +59,17 @@
 //!   unblock this specific function as a whole (unlike
 //!   `fmarks_check_one`/`fmarks_check_names` above, which needed only
 //!   `path_fnamecmp`).
-//! - `ex_marks`/`ex_delmarks`/`ex_jumps`/`ex_clearjumps`/`ex_changes`:
-//!   need `exarg_T`, blocked on the `ex_cmds.lua`-generated `cmdidx_T`
-//!   (see `ex_cmds_defs.rs`'s own module doc).
+//! - `ex_marks`: the real, current upstream source is just a thin
+//!   `nlua_call_excmd(...)` wrapper delegating to a Lua implementation
+//!   (`vim._core.marks`) - needs the Lua host (`lua/executor.c`, phase
+//!   13), not just `exarg_T`.
+//! - `ex_delmarks`: needs `do_markset_autocmd` (-> `apply_autocmds`,
+//!   `autocmd.c`), `emsg`/`semsg` (`message.c`'s display pipeline, not
+//!   tractable), and `buflist_findnr` (`buffer.c`) - `exarg_T` existing
+//!   isn't enough to unblock this one as a whole.
+//! - `ex_jumps`/`ex_changes`: need the real message-display pipeline
+//!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
+//!   tractable) and (`ex_jumps` specifically) `cleanup_jumplist`.
 //! - `cleanup_jumplist`: needs `win_valid`/buffer-list validity checks.
 
 use crate::buffer_defs::{BufT, TaggyT, WinT};
@@ -363,6 +376,25 @@ pub fn free_jumplist(wp: &mut crate::buffer_defs::WinT) {
         free_xfmark(std::mem::take(&mut wp.w_jumplist[i]));
     }
     wp.w_jumplistlen = 0;
+}
+
+/// `":clearjumps"`: clear the jumplist (`ex_clearjumps`). Now tractable
+/// now that `crate::ex_cmds_defs::ExargT` exists - the first `ex_*`
+/// command handler translated in this crate.
+///
+/// The original's own `curwin->w_jumplistlen = 0;` (right after calling
+/// `free_jumplist`, which already sets `w_jumplistlen` to 0 itself) is
+/// a genuine redundancy in the real source, not a translation artifact
+/// - preserved faithfully rather than silently "optimized away".
+///
+/// # Safety
+/// `GLOBALS.curwin` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn ex_clearjumps(_eap: &crate::ex_cmds_defs::ExargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *GLOBALS.get_mut().curwin };
+    free_jumplist(curwin);
+    curwin.w_jumplistlen = 0;
+    curwin.w_jumplistidx = 0;
 }
 
 /// `set_last_cursor`.
@@ -1029,6 +1061,29 @@ mod tests {
         };
         free_jumplist(&mut wp);
         assert_eq!(wp.w_jumplistlen, 0);
+    }
+
+    #[test]
+    fn ex_clearjumps_resets_jumplist_length_and_index() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 2,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[1].fmark.fnum = 2;
+        win.w_jumplist[2].fmark.fnum = 3;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_clearjumps(&eap) };
+
+        // SAFETY: the guard above set GLOBALS.curwin to `&mut win`,
+        // still alive here.
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        assert_eq!(curwin.w_jumplistlen, 0);
+        assert_eq!(curwin.w_jumplistidx, 0);
     }
 
     #[test]
