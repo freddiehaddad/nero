@@ -86,8 +86,9 @@
 //! its OWN struct shape (that complexity lives in `HIKEY2UF`'s pointer-
 //! arithmetic recovery from a *hashtable* keyed by `uf_name`, which is
 //! `eval/userfunc.c`'s `func_hashtab` - a file-static, not part of
-//! `ufunc_T` itself, and not yet translated; when it is, it will need
-//! its own `DictT.dv_index`-style side table). `uf_name`/`uf_namelen`
+//! `ufunc_T` itself; now translated too, as `eval/userfunc.rs`'s
+//! private `FuncHashtab`, with its own `DictT.dv_index`-style side
+//! table as predicted). `uf_name`/`uf_namelen`
 //! (the flexible array member) simply collapse into one owned
 //! `Vec<u8>`, matching `DictitemT.di_key`'s established treatment.
 //! `UfuncT.uf_scoped: *mut FunccallT` (and `PartialT.pt_func: *mut
@@ -389,15 +390,10 @@ pub struct PartialT {
 /// per-line `:profile` timing) collapse into 3 plain `Vec`s, matching
 /// this crate's usual "owned `Vec` instead of allocated-array" rule.
 ///
-/// `uf_scoped: *mut FunccallT` references [`FunccallT`], which remains
-/// its own opaque placeholder - `funccall_T`'s own real fields are a
-/// separate, larger undertaking (it embeds `dict_T`/`list_T` **by
-/// value**, not by pointer like every other use of those types in this
-/// crate, a new situation deserving its own careful design pass) - a
-/// raw pointer to an opaque/zero-sized placeholder type is still a
-/// perfectly well-formed Rust type, so `ufunc_T`'s own real fields
-/// don't need to wait for that, the same reasoning that already let
-/// `partial_T`'s real fields exist before `ufunc_T`'s did.
+/// `uf_scoped: *mut FunccallT` references [`FunccallT`], which now has
+/// its own real fields too (see this same file's own module doc and
+/// [`FunccallT`]'s doc comment below) - a raw pointer to it needs no
+/// further design of its own here.
 #[derive(Debug, Default)]
 pub struct UfuncT {
     /// variable nr of arguments (`uf_varargs`).
