@@ -382,14 +382,11 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
 /// though `partial_T`'s real home is `eval.c`, not `eval/typval.c`).
 ///
 /// # Deferred
-/// `func_ptr_unref`'s (and, transitively, `func_unref`'s) own "hit
-/// zero, not mid-call" branch (`func_clear_free`) is still
-/// `unimplemented!()` - see [`crate::eval::userfunc::func_ptr_unref`]'s
-/// own doc comment. `pt_argv`'s items are released one level via
-/// [`tv_clear_simple`] (matching this module's own established policy
-/// for container contents - not the original's fully recursive
-/// `tv_clear`, which itself is a separate, substantial
-/// `encode_vim_to_nothing`-based subsystem, not attempted here).
+/// `pt_argv`'s items are released one level via [`tv_clear_simple`]
+/// (matching this module's own established policy for container
+/// contents - not the original's fully recursive `tv_clear`, which
+/// itself is a separate, substantial `encode_vim_to_nothing`-based
+/// subsystem, not attempted here).
 ///
 /// # Safety
 /// `pt` must be a valid, non-null pointer previously allocated via

@@ -20,10 +20,13 @@
 //! `TypvalT`/`ChangedtickDictItem` are real (not opaque placeholders),
 //! `buf_get_changedtick`/`buf_set_changedtick`/`buf_inc_changedtick`/
 //! `buf_init_changedtick` - each skips only the real dict-watcher
-//! notification/`b_vars` registration side effect specifically (needs
-//! `dict_T`, still deferred), keeping the underlying `b:changedtick`
-//! value itself fully correct for every other C-level accessor in this
-//! crate.
+//! notification/`b_vars` registration side effect specifically (see
+//! `buf_set_changedtick`/`buf_init_changedtick`'s own doc comments for
+//! exactly what each still needs - `DictT`'s own `watchers` field and
+//! a sound `ChangedtickDictItem`-as-`dictitem_T` lookup mechanism,
+//! respectively, neither of which is simply "`dict_T` doesn't exist"
+//! anymore), keeping the underlying `b:changedtick` value itself fully
+//! correct for every other C-level accessor in this crate.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -277,13 +280,18 @@ pub fn buf_get_changedtick(buf: &BufT) -> crate::eval::typval_defs::VarnumberT {
 ///
 /// # Deferred
 /// The original also notifies any dict watchers on `buf->b_vars` of
-/// the change (`tv_dict_watcher_notify`) - not done here, since
-/// `b_vars`'s real dict-watcher machinery needs the eval engine's
-/// `dict_T` (still an opaque placeholder - see
-/// `eval/typval_defs.rs`'s own module doc). The underlying value
-/// itself is still set correctly, and every other C-level accessor in
-/// this crate reads it directly (not through the dict), so this gap
-/// only affects Vimscript-visible `b:changedtick` watchers, not this
+/// the change (`tv_dict_watcher_notify`) - not done here. `dict_T`
+/// itself is real now (as [`crate::eval::typval_defs::DictT`]), but
+/// its `watchers` field (a `QUEUE` of dict-key watchers set by user
+/// code, e.g. `dictwatcheradd()`) is still deferred - needs a `QUEUE`
+/// intrusive-linked-list translation first, see `DictT`'s own doc
+/// comment. `b_vars` itself is also always null in this crate so far
+/// (nothing allocates a real per-buffer dict yet - see
+/// [`buf_init_changedtick`]'s own doc comment for the further
+/// complication even once it is). The underlying value itself is
+/// still set correctly, and every other C-level accessor in this
+/// crate reads it directly (not through the dict), so this gap only
+/// affects Vimscript-visible `b:changedtick` watchers, not this
 /// crate's own internal bookkeeping.
 pub fn buf_set_changedtick(buf: &mut BufT, changedtick: crate::eval::typval_defs::VarnumberT) {
     buf.changedtick_di.di_tv.value = crate::eval::typval_defs::TypvalValue::Number(changedtick);
@@ -301,10 +309,23 @@ pub fn buf_inc_changedtick(buf: &mut BufT) {
 /// # Deferred
 /// The original also registers this item into `buf->b_vars` (via
 /// `tv_dict_add`) so Vimscript code can read `b:changedtick` through
-/// the dict lookup path - not done here, since `b_vars`'s real
-/// `dict_T` doesn't exist yet (see `eval/typval_defs.rs`'s own module
-/// doc). [`buf_get_changedtick`]/[`buf_set_changedtick`] (this crate's
-/// own C-level accessors) already read/write the real value directly,
+/// the dict lookup path - not done here. This needs more than just
+/// `dict_T` (real now, and `b_vars` is `*mut DictT` already - see
+/// `buffer_defs.rs`): the original casts `&buf->changedtick_di` (a
+/// `ChangedtickDictItem`, the fixed-key-size `TV_DICTITEM_STRUCT`
+/// instantiation) to a plain `dictitem_T *`, relying on their
+/// byte-identical C struct layout - a cast this crate's separate,
+/// unrelated `ChangedtickDictItem`/`DictitemT` Rust types cannot
+/// soundly replicate (and [`crate::eval::typval_defs::DictT`]'s own
+/// `dv_index` side table is typed `*mut DictitemT` specifically, not
+/// an untyped pointer, so it has nowhere to put a
+/// `*mut ChangedtickDictItem` even if the cast were sound). A real
+/// fix needs its own design pass (e.g. a shared trait, an untyped
+/// `dv_index` value, or a different lookup mechanism entirely) -
+/// deliberately not attempted here. `b_vars` is also always null in
+/// this crate so far, so there is nothing to insert into yet either.
+/// [`buf_get_changedtick`]/[`buf_set_changedtick`] (this crate's own
+/// C-level accessors) already read/write the real value directly,
 /// independent of this dict registration.
 pub fn buf_init_changedtick(buf: &mut BufT) {
     buf.changedtick_di = crate::eval::typval_defs::ChangedtickDictItem {
