@@ -26,7 +26,13 @@
 //! policy already established elsewhere in this crate: the message
 //! *display* is skipped since `message.c`'s pipeline isn't tractable
 //! yet, while the exact same state/fallback behavior as the original is
-//! kept).
+//! kept); `ex_undojoin` (now tractable now that
+//! `crate::ex_cmds_defs::ExargT` exists - its own
+//! `emsg("E790: undojoin is not allowed after undo")` is a real,
+//! reachable user error, not an internal-invariant check, but the
+//! message *display* is skipped the same way while the exact
+//! early-return control flow is kept, matching `u_get_headentry`/
+//! `u_getbot`'s own established treatment above).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -62,9 +68,10 @@
 //!   yet translated beyond `file_ff_differs`), `check_cursor_col`
 //!   (`cursor.c`, not yet translated), and `beep_flush` (the
 //!   message/display subsystem).
-//! - `ex_undolist`/`ex_undojoin`: need `exarg_T` (blocked on the
-//!   `ex_cmds.lua`-generated `cmdidx_T`, same blocker as `mark.c`'s
-//!   `ex_*` functions).
+//! - `ex_undolist`: needs the real message-display pipeline
+//!   (`msg_start`/`msg_puts_hl`/`msg_putchar`/`msg_end`/`msg`,
+//!   `message.c`, not tractable) - `exarg_T` existing isn't enough to
+//!   unblock this one, unlike its sibling `ex_undojoin` above.
 
 
 use crate::buffer_defs::BufT;
@@ -559,6 +566,40 @@ pub unsafe fn u_sync(force: bool) {
         u_getbot(curbuf); // compute ue_bot of previous u_save
         curbuf.b_u_curhead = std::ptr::null_mut();
     }
+}
+
+/// `":undojoin"`: join the next change with the previous undo entry,
+/// so they undo together (`ex_undojoin`). Now tractable now that
+/// `crate::ex_cmds_defs::ExargT` exists.
+///
+/// The original's `emsg(_("E790: undojoin is not allowed after undo"))`
+/// is a real, reachable user-facing error (not an internal-invariant
+/// check) - its message display is omitted (`message.c`'s display
+/// pipeline is still not tractable), but the identical control-flow
+/// effect (return without unsyncing) is kept exactly, matching this
+/// crate's established "skip the display, keep the state" policy.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+pub unsafe fn ex_undojoin(_eap: &crate::ex_cmds_defs::ExargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    if curbuf.b_u_newhead.is_null() {
+        return; // nothing changed before
+    }
+    if !curbuf.b_u_curhead.is_null() {
+        // emsg(_("E790: undojoin is not allowed after undo")) omitted -
+        // see this function's own doc comment.
+        return;
+    }
+    if !curbuf.b_u_synced {
+        return; // already unsynced
+    }
+    if get_undolevel(curbuf) < 0 {
+        return; // no entries, nothing to do
+    }
+    curbuf.b_u_synced = false; // Append next change to last entry
 }
 
 #[cfg(test)]
@@ -1397,5 +1438,105 @@ mod tests {
         unsafe {
             drop(Box::from_raw(uhp));
         }
+    }
+
+    #[test]
+    fn ex_undojoin_noop_when_no_prior_changes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_u_newhead: std::ptr::null_mut(), b_u_synced: true, ..Default::default() };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_undojoin(&eap) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(buf.b_u_synced); // untouched
+    }
+
+    #[test]
+    fn ex_undojoin_noop_when_curhead_non_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_curhead: uhp, // undo was performed
+            b_u_synced: true,
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_undojoin(&eap) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(buf.b_u_synced); // untouched - "E790" path, no state change
+        unsafe { drop(Box::from_raw(uhp)) };
+    }
+
+    #[test]
+    fn ex_undojoin_noop_when_already_unsynced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_curhead: std::ptr::null_mut(),
+            b_u_synced: false, // already unsynced
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_undojoin(&eap) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(!buf.b_u_synced); // still false - nothing to do
+        unsafe { drop(Box::from_raw(uhp)) };
+    }
+
+    #[test]
+    fn ex_undojoin_noop_when_undolevel_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_curhead: std::ptr::null_mut(),
+            b_u_synced: true,
+            b_p_ul: -1, // undo disabled for this buffer
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_undojoin(&eap) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(buf.b_u_synced); // untouched
+        unsafe { drop(Box::from_raw(uhp)) };
+    }
+
+    #[test]
+    fn ex_undojoin_unsyncs_when_all_conditions_met() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = BufT {
+            b_u_newhead: uhp,
+            b_u_curhead: std::ptr::null_mut(),
+            b_u_synced: true,
+            b_p_ul: 1000, // undo enabled
+            ..Default::default()
+        };
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        let eap = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_undojoin(&eap) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        assert!(!buf.b_u_synced); // flipped - next change joins the last entry
+        unsafe { drop(Box::from_raw(uhp)) };
     }
 }

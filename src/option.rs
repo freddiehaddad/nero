@@ -6,23 +6,24 @@
 //! generic `get_option_value`/`set_option_value` entry points, the
 //! `:set` command parser (`do_set`/`ex_set`), and most of the
 //! per-option getters all bottleneck through the huge generated
-//! `vimoption_T options[]` table (~8000 lines) and/or `exarg_T`
-//! (blocked on the `ex_cmds.lua`-generated `cmdidx_T`, same blocker as
-//! `mark.c`'s `ex_*` functions) - none of that is attempted here.
+//! `vimoption_T options[]` table (~8000 lines) - none of that is
+//! attempted here.
 //!
 //! Translated: `get_fileformat` (harvested first because it directly
-//! unblocks part of `memline.c`'s `ml_open`); and a batch of small,
-//! genuinely standalone option-value accessors that read already-
-//! translated `option_vars.rs`/`buffer_defs.rs`/`globals.rs` fields
-//! directly, without needing the options table at all: `magic_isset`,
-//! `shortmess`, `can_bs`, `get_bkc_flags`, `get_flp_value`,
-//! `get_ve_flags`, `get_showbreak_value`, `default_fileformat`,
-//! `csh_like_shell`, `fish_like_shell`, `get_scrolloff_value`,
-//! `get_scrolloffpad_value`, `get_sidescrolloff_value`, `valid_name`,
-//! `check_blending`. `can_bs`/`shortmess`/`valid_name` needed
-//! `strings.c`'s `vim_strchr` (also translated this pass - re-examined
-//! and found NOT actually blocked on `g_chartab`/`option.c` as an
-//! earlier note claimed, see `strings.rs`'s own module doc).
+//! unblocks part of `memline.c`'s `ml_open`); `get_fileformat_force`
+//! (now tractable now that `crate::ex_cmds_defs::ExargT` exists); and a
+//! batch of small, genuinely standalone option-value accessors that
+//! read already-translated `option_vars.rs`/`buffer_defs.rs`/
+//! `globals.rs` fields directly, without needing the options table at
+//! all: `magic_isset`, `shortmess`, `can_bs`, `get_bkc_flags`,
+//! `get_flp_value`, `get_ve_flags`, `get_showbreak_value`,
+//! `default_fileformat`, `csh_like_shell`, `fish_like_shell`,
+//! `get_scrolloff_value`, `get_scrolloffpad_value`,
+//! `get_sidescrolloff_value`, `valid_name`, `check_blending`.
+//! `can_bs`/`shortmess`/`valid_name` needed `strings.c`'s `vim_strchr`
+//! (also translated this pass - re-examined and found NOT actually
+//! blocked on `g_chartab`/`option.c` as an earlier note claimed, see
+//! `strings.rs`'s own module doc).
 //!
 //! **No Rust equivalent needed** (not "deferred" - genuinely
 //! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
@@ -49,17 +50,17 @@
 //! trailing NUL only invites bugs like direct content comparisons
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
-//! Deferred: everything else, including `get_fileformat_force` (needs
-//! `exarg_T`), `was_set_insecurely`/`insecure_flag` (`OptIndex` itself
-//! now exists in `option_defs.rs`, but these still need the real
-//! `options[]` table's own `.flags` field for their fallback case),
-//! `parse_winhl_opt` (needs the decoration/highlight-
-//! group subsystem: `nvim_create_namespace`/`get_decor_provider`/
-//! `syn_check_group`/`ns_hl_def`), and every function needing the real
-//! `options[]` table (`get_option_value`/`set_option_value`/
-//! `option_was_set`/`is_option_hidden`/`option_has_type`/
-//! `option_has_scope`/`get_winbuf_options`/`get_vimoption`/etc.) or
-//! `do_set`/`ex_set`'s command-line parsing.
+//! Deferred: everything else, including `was_set_insecurely`/
+//! `insecure_flag` (`OptIndex` itself now exists in `option_defs.rs`,
+//! but these still need the real `options[]` table's own `.flags`
+//! field for their fallback case), `parse_winhl_opt` (needs the
+//! decoration/highlight-group subsystem: `nvim_create_namespace`/
+//! `get_decor_provider`/`syn_check_group`/`ns_hl_def`), and every
+//! function needing the real `options[]` table
+//! (`get_option_value`/`set_option_value`/`option_was_set`/
+//! `is_option_hidden`/`option_has_type`/`option_has_scope`/
+//! `get_winbuf_options`/`get_vimoption`/etc.) or `do_set`/`ex_set`'s
+//! command-line parsing.
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
@@ -77,6 +78,36 @@ pub fn get_fileformat(buf: &BufT) -> i32 {
         .unwrap_or(0);
 
     if buf.b_p_bin != 0 || c == b'u' {
+        return EOL_UNIX;
+    }
+    if c == b'm' {
+        return EOL_MAC;
+    }
+    EOL_DOS
+}
+
+/// Like [`get_fileformat`], but override `'fileformat'` with the
+/// `++opt=val` argument's forced value, if given (`get_fileformat_force`).
+///
+/// `eap` can be `None` (matching the original's own "`eap` can be
+/// NULL!" doc comment) - now tractable now that
+/// `crate::ex_cmds_defs::ExargT` exists.
+#[must_use]
+pub fn get_fileformat_force(buf: &BufT, eap: Option<&crate::ex_cmds_defs::ExargT>) -> i32 {
+    let c: u8 = if eap.is_some_and(|e| e.force_ff != 0) {
+        eap.unwrap().force_ff
+    } else {
+        let forced_bin = match eap {
+            Some(e) if e.force_bin != 0 => e.force_bin == crate::ex_cmds_defs::FORCE_BIN,
+            _ => buf.b_p_bin != 0,
+        };
+        if forced_bin {
+            return EOL_UNIX;
+        }
+        buf.b_p_ff.as_deref().and_then(|s| s.first()).copied().unwrap_or(0)
+    };
+
+    if c == b'u' {
         return EOL_UNIX;
     }
     if c == b'm' {
@@ -353,6 +384,52 @@ mod tests {
     fn get_fileformat_empty_ff_defaults_to_dos() {
         let buf = BufT::default(); // b_p_ff is None
         assert_eq!(get_fileformat(&buf), EOL_DOS);
+    }
+
+    #[test]
+    fn get_fileformat_force_none_eap_matches_get_fileformat() {
+        let buf = buf_with_ff("mac", false);
+        assert_eq!(get_fileformat_force(&buf, None), EOL_MAC);
+        let bin_buf = buf_with_ff("dos", true);
+        assert_eq!(get_fileformat_force(&bin_buf, None), EOL_UNIX);
+    }
+
+    #[test]
+    fn get_fileformat_force_uses_force_ff_when_set() {
+        let buf = buf_with_ff("unix", false);
+        let eap = crate::ex_cmds_defs::ExargT { force_ff: b'm', ..Default::default() };
+        assert_eq!(get_fileformat_force(&buf, Some(&eap)), EOL_MAC);
+    }
+
+    #[test]
+    fn get_fileformat_force_bin_flag_forces_unix() {
+        let buf = buf_with_ff("mac", false);
+        let eap = crate::ex_cmds_defs::ExargT {
+            force_bin: crate::ex_cmds_defs::FORCE_BIN,
+            ..Default::default()
+        };
+        assert_eq!(get_fileformat_force(&buf, Some(&eap)), EOL_UNIX);
+    }
+
+    #[test]
+    fn get_fileformat_force_nobin_flag_overrides_buffer_binary() {
+        let buf = buf_with_ff("mac", true); // buffer itself is binary
+        let eap = crate::ex_cmds_defs::ExargT {
+            force_bin: crate::ex_cmds_defs::FORCE_NOBIN,
+            ..Default::default()
+        };
+        // force_bin != 0 (FORCE_NOBIN) takes the ternary's "true" branch
+        // in the original, comparing against FORCE_BIN specifically -
+        // FORCE_NOBIN != FORCE_BIN, so this does NOT force unix, and
+        // falls through to reading b_p_ff instead.
+        assert_eq!(get_fileformat_force(&buf, Some(&eap)), EOL_MAC);
+    }
+
+    #[test]
+    fn get_fileformat_force_falls_back_to_buf_bin_when_eap_force_bin_unset() {
+        let buf = buf_with_ff("mac", true); // buffer itself is binary
+        let eap = crate::ex_cmds_defs::ExargT::default(); // force_bin == 0
+        assert_eq!(get_fileformat_force(&buf, Some(&eap)), EOL_UNIX);
     }
 
     #[test]
