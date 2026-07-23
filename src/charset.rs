@@ -72,11 +72,9 @@
 //!   structured `if`/`else` prefix detection that computes "which
 //!   radix, how many prefix bytes to skip" before falling into one
 //!   shared parsing loop - the same observable control flow, restated
-//!   without `goto`.
-//! - `skipbin`/`skiptobin`: trivial once `ascii_isbdigit` exists (it
-//!   already does), but omitted from *this* pass purely to keep the batch
-//!   focused - trivial to add alongside `vim_str2nr` later since they
-//!   share the same "recognize bin/oct/hex numbers" theme.
+//!   without `goto`. `skipbin`/`skiptobin` (the `skip*` family's own
+//!   binary-digit members, trivial once `ascii_isbdigit` existed) are
+//!   translated alongside it too, completing that theme.
 //!
 //! The `skip*`/`getdigits*` functions below return `usize` byte offsets
 //! into the input slice (how far the "cursor" advanced) rather than a new
@@ -134,6 +132,15 @@ pub fn skiphex(q: &[u8]) -> usize {
     i
 }
 
+/// Skip over binary digits (`skipbin`).
+pub fn skipbin(q: &[u8]) -> usize {
+    let mut i = 0;
+    while i < q.len() && ascii_isbdigit(q[i] as i32) {
+        i += 1;
+    }
+    i
+}
+
 /// Skip to the next digit, or the end of the slice (`skiptodigit`).
 pub fn skiptodigit(q: &[u8]) -> usize {
     let mut i = 0;
@@ -147,6 +154,16 @@ pub fn skiptodigit(q: &[u8]) -> usize {
 pub fn skiptohex(q: &[u8]) -> usize {
     let mut i = 0;
     while i < q.len() && !ascii_isxdigit(q[i] as i32) {
+        i += 1;
+    }
+    i
+}
+
+/// Skip to the next binary character, or the end of the slice
+/// (`skiptobin`).
+pub fn skiptobin(q: &[u8]) -> usize {
+    let mut i = 0;
+    while i < q.len() && !ascii_isbdigit(q[i] as i32) {
         i += 1;
     }
     i
@@ -1027,6 +1044,14 @@ mod tests {
     fn skipdigits_and_skiphex() {
         assert_eq!(skipdigits(b"123abc"), 3);
         assert_eq!(skiphex(b"1a2B3xyz"), 5);
+    }
+
+    #[test]
+    fn skipbin_and_skiptobin() {
+        assert_eq!(skipbin(b"101102"), 5); // stops at the '2' (index 5)
+        assert_eq!(skipbin(b"abc"), 0);
+        assert_eq!(skiptobin(b"xyz101"), 3);
+        assert_eq!(skiptobin(b"xyz"), 3); // end of slice, no binary digit found
     }
 
     #[test]
