@@ -64,9 +64,15 @@
 //!   the same way as `transstr_buf`'s). `trans_characters` (in-place,
 //!   fixed-buffer-with-room-budget mutation of a caller's own buffer)
 //!   remains deferred - re-examine once a real caller surfaces.
-//! - `vim_str2nr`: produces `varnumber_T`/`uvarnumber_T` (eval, phase 5) and
-//!   is substantial in its own right; deferred as a unit to translate
-//!   alongside the eval engine rather than piecemeal.
+//! - `vim_str2nr` is now translated too, now that the eval engine's
+//!   `VarnumberT`/`UvarnumberT` exist - the goto-based state machine in
+//!   the original (converging hex/octal/binary/decimal prefix
+//!   detection onto one of 4 shared digit-accumulation blocks) becomes
+//!   a `Radix` enum (`base`/`is_digit`/`digit_value` per radix) plus
+//!   structured `if`/`else` prefix detection that computes "which
+//!   radix, how many prefix bytes to skip" before falling into one
+//!   shared parsing loop - the same observable control flow, restated
+//!   without `goto`.
 //! - `skipbin`/`skiptobin`: trivial once `ascii_isbdigit` exists (it
 //!   already does), but omitted from *this* pass purely to keep the batch
 //!   focused - trivial to add alongside `vim_str2nr` later since they
@@ -78,7 +84,8 @@
 //! arithmetic - this is the direct structural translation of "pointer
 //! advanced past X", not a behavior change.
 
-use crate::ascii_defs::{ascii_isdigit, ascii_iswhite, ascii_isxdigit};
+use crate::ascii_defs::{ascii_isbdigit, ascii_isdigit, ascii_isodigit, ascii_iswhite, ascii_isxdigit};
+use crate::eval::typval_defs::{UvarnumberT, VarnumberT, UVARNUMBER_MAX, VARNUMBER_MAX, VARNUMBER_MIN};
 
 /// Skip over whitespace (`skipwhite`). Returns the offset of the first
 /// non-whitespace byte (or `p.len()` if none).
@@ -268,6 +275,266 @@ pub fn hexhex2nr(p: &[u8]) -> i32 {
         return -1;
     }
     (hex2nr(p[0] as i32) << 4) + hex2nr(p[1] as i32)
+}
+
+/// Allow binary numbers (`STR2NR_BIN`).
+pub const STR2NR_BIN: i32 = 1 << 0;
+/// Allow octal numbers (`STR2NR_OCT`).
+pub const STR2NR_OCT: i32 = 1 << 1;
+/// Allow hexadecimal numbers (`STR2NR_HEX`).
+pub const STR2NR_HEX: i32 = 1 << 2;
+/// Octal with prefix `"0o"`: `0o777` (`STR2NR_OOCT`).
+pub const STR2NR_OOCT: i32 = 1 << 3;
+/// Ignore embedded single quotes (`STR2NR_QUOTE`).
+pub const STR2NR_QUOTE: i32 = 1 << 4;
+/// Always assume bin/oct/hex (`STR2NR_FORCE`).
+pub const STR2NR_FORCE: i32 = 1 << 7;
+/// Recognize all radixes (`STR2NR_ALL`).
+pub const STR2NR_ALL: i32 = STR2NR_BIN | STR2NR_OCT | STR2NR_HEX | STR2NR_OOCT;
+/// All radixes except plain (un-prefixed) octal (`STR2NR_NO_OCT`).
+pub const STR2NR_NO_OCT: i32 = STR2NR_BIN | STR2NR_HEX | STR2NR_OOCT;
+
+/// Which radix [`vim_str2nr`]'s shared digit-accumulation loop is
+/// currently parsing in - replaces the original's `goto
+/// vim_str2nr_bin`/`_oct`/`_dec`/`_hex` convergence onto one of 4
+/// near-identical `PARSE_NUMBER` macro expansions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Radix {
+    Bin,
+    Oct,
+    Dec,
+    Hex,
+}
+
+impl Radix {
+    fn base(self) -> UvarnumberT {
+        match self {
+            Radix::Bin => 2,
+            Radix::Oct => 8,
+            Radix::Dec => 10,
+            Radix::Hex => 16,
+        }
+    }
+
+    fn is_digit(self, c: u8) -> bool {
+        match self {
+            Radix::Bin => c == b'0' || c == b'1',
+            Radix::Oct => ascii_isodigit(c as i32),
+            Radix::Dec => ascii_isdigit(c as i32),
+            Radix::Hex => ascii_isxdigit(c as i32),
+        }
+    }
+
+    fn digit_value(self, c: u8) -> UvarnumberT {
+        match self {
+            Radix::Hex => hex2nr(c as i32) as UvarnumberT,
+            _ => UvarnumberT::from(c - b'0'),
+        }
+    }
+}
+
+/// Convert a string into a signed and/or unsigned number, taking care
+/// of hexadecimal, octal, and binary numbers. Accepts a `-` sign
+/// (`vim_str2nr`).
+///
+/// If `prep` is given, returns a flag indicating the type of number
+/// parsed: `0` decimal, `b'0'`/`b'O'`/`b'o'` octal, `b'B'`/`b'b'`
+/// binary, `b'X'`/`b'x'` hex. If `len` is given, the length of the
+/// number in bytes is returned. If `nptr` is given, the signed result
+/// is returned in it. If `unptr` is given, the unsigned result is
+/// returned in it. If `what` contains [`STR2NR_BIN`]/[`STR2NR_OCT`]/
+/// [`STR2NR_HEX`], recognize binary/octal/hex numbers respectively. If
+/// `what` contains [`STR2NR_FORCE`], always assume bin/oct/hex. If
+/// `what` contains [`STR2NR_QUOTE`], ignore embedded single quotes. If
+/// `maxlen > 0`, check at most `maxlen` bytes. If `strict` is `true`,
+/// check the number strictly: `len` (if given) is set to `0` and
+/// nothing else is written if it fails.
+///
+/// Unlike the original's raw, NUL-terminated `char *`, `start` is a
+/// bounded `&[u8]` slice - parsing also stops at `start.len()`
+/// regardless of `maxlen`, the direct structural equivalent of the
+/// original relying on its string's own NUL terminator to stop when
+/// `maxlen == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn vim_str2nr(
+    start: &[u8],
+    prep: Option<&mut i32>,
+    mut len: Option<&mut i32>,
+    what: i32,
+    nptr: Option<&mut VarnumberT>,
+    unptr: Option<&mut UvarnumberT>,
+    maxlen: i32,
+    strict: bool,
+    mut overflow: Option<&mut bool>,
+) {
+    let ended = |idx: usize| -> bool { (maxlen != 0 && idx as i32 >= maxlen) || idx >= start.len() };
+
+    if let Some(l) = len.as_deref_mut() {
+        *l = 0;
+    }
+
+    let negative = start.first() == Some(&b'-');
+    let mut idx = usize::from(negative);
+    let mut pre: i32 = 0;
+
+    let radix = if what & STR2NR_FORCE != 0 {
+        let masked = what & !(STR2NR_FORCE | STR2NR_QUOTE);
+        if masked == STR2NR_HEX {
+            if !ended(idx + 2)
+                && start[idx] == b'0'
+                && matches!(start[idx + 1], b'x' | b'X')
+                && ascii_isxdigit(start[idx + 2] as i32)
+            {
+                idx += 2;
+            }
+            Radix::Hex
+        } else if masked == STR2NR_BIN {
+            if !ended(idx + 2)
+                && start[idx] == b'0'
+                && matches!(start[idx + 1], b'b' | b'B')
+                && ascii_isbdigit(start[idx + 2] as i32)
+            {
+                idx += 2;
+            }
+            Radix::Bin
+        } else if masked == STR2NR_OCT || masked == STR2NR_OOCT || masked == (STR2NR_OCT | STR2NR_OOCT) {
+            if !ended(idx + 2)
+                && start[idx] == b'0'
+                && matches!(start[idx + 1], b'o' | b'O')
+                && ascii_isodigit(start[idx + 2] as i32)
+            {
+                idx += 2;
+            }
+            Radix::Oct
+        } else if masked == 0 {
+            Radix::Dec
+        } else {
+            unreachable!("vim_str2nr: invalid `what` bitmask for STR2NR_FORCE");
+        }
+    } else if what & (STR2NR_HEX | STR2NR_OCT | STR2NR_OOCT | STR2NR_BIN) != 0
+        && !ended(idx + 1)
+        && start[idx] == b'0'
+        && start[idx + 1] != b'8'
+        && start[idx + 1] != b'9'
+    {
+        pre = i32::from(start[idx + 1]);
+        if what & STR2NR_HEX != 0
+            && !ended(idx + 2)
+            && matches!(pre as u8, b'X' | b'x')
+            && ascii_isxdigit(start[idx + 2] as i32)
+        {
+            idx += 2;
+            Radix::Hex
+        } else if what & STR2NR_BIN != 0
+            && !ended(idx + 2)
+            && matches!(pre as u8, b'B' | b'b')
+            && ascii_isbdigit(start[idx + 2] as i32)
+        {
+            idx += 2;
+            Radix::Bin
+        } else if what & STR2NR_OOCT != 0
+            && !ended(idx + 2)
+            && matches!(pre as u8, b'O' | b'o')
+            && ascii_isodigit(start[idx + 2] as i32)
+        {
+            idx += 2;
+            Radix::Oct
+        } else {
+            // Detect old octal format: '0' followed by octal digits.
+            pre = 0;
+            if what & STR2NR_OCT == 0 || !ascii_isodigit(start[idx + 1] as i32) {
+                Radix::Dec
+            } else {
+                let mut i = 2;
+                let mut is_old_octal = true;
+                while !ended(idx + i) && ascii_isdigit(start[idx + i] as i32) {
+                    if start[idx + i] > b'7' {
+                        is_old_octal = false;
+                        break;
+                    }
+                    i += 1;
+                }
+                if is_old_octal {
+                    pre = i32::from(b'0');
+                    Radix::Oct
+                } else {
+                    Radix::Dec
+                }
+            }
+        }
+    } else {
+        Radix::Dec
+    };
+
+    // Shared digit-accumulation loop (the original's `PARSE_NUMBER`
+    // macro, expanded once per radix via `goto`).
+    let after_prefix = idx;
+    let base = radix.base();
+    let mut un: UvarnumberT = 0;
+    while !ended(idx) {
+        if what & STR2NR_QUOTE != 0 && idx > after_prefix && start[idx] == b'\'' {
+            idx += 1;
+            if !ended(idx) && radix.is_digit(start[idx]) {
+                continue;
+            }
+            idx -= 1;
+        }
+        if !radix.is_digit(start[idx]) {
+            break;
+        }
+        let digit = radix.digit_value(start[idx]);
+        if un < UVARNUMBER_MAX / base || (un == UVARNUMBER_MAX / base && (base != 10 || digit <= UVARNUMBER_MAX % 10))
+        {
+            un = base * un + digit;
+        } else {
+            un = UVARNUMBER_MAX;
+            if let Some(o) = overflow.as_deref_mut() {
+                *o = true;
+            }
+        }
+        idx += 1;
+    }
+
+    // Check for an alphanumeric character immediately following, that
+    // is most likely a typo.
+    if strict
+        && idx as i32 != maxlen
+        && !ended(idx)
+        && crate::macros_defs::ascii_isalnum(start[idx] as i32)
+    {
+        return;
+    }
+
+    if let Some(p) = prep {
+        *p = pre;
+    }
+    if let Some(l) = len {
+        *l = idx as i32;
+    }
+    if let Some(n) = nptr {
+        if negative {
+            // avoid overflow
+            if un > VARNUMBER_MAX as UvarnumberT {
+                *n = VARNUMBER_MIN;
+                if let Some(o) = overflow {
+                    *o = true;
+                }
+            } else {
+                *n = -(un as VarnumberT);
+            }
+        } else {
+            if un > VARNUMBER_MAX as UvarnumberT {
+                un = VARNUMBER_MAX as UvarnumberT;
+                if let Some(o) = overflow {
+                    *o = true;
+                }
+            }
+            *n = un as VarnumberT;
+        }
+    }
+    if let Some(u) = unptr {
+        *u = un;
+    }
 }
 
 /// Check that `c` is a printable character (`vim_isprintc`).
@@ -824,6 +1091,226 @@ mod tests {
         assert_eq!(hexhex2nr(b"1F"), 0x1F);
         assert_eq!(hexhex2nr(b"zz"), -1);
         assert_eq!(hexhex2nr(b"1"), -1); // too short
+    }
+
+    /// Convenience wrapper around [`vim_str2nr`] for tests: returns
+    /// `(signed value, unsigned value, prep byte, len consumed)`.
+    fn str2nr(s: &[u8], what: i32) -> (VarnumberT, UvarnumberT, i32, i32) {
+        let mut n: VarnumberT = 0;
+        let mut u: UvarnumberT = 0;
+        let mut prep: i32 = 0;
+        let mut len: i32 = 0;
+        vim_str2nr(s, Some(&mut prep), Some(&mut len), what, Some(&mut n), Some(&mut u), 0, false, None);
+        (n, u, prep, len)
+    }
+
+    #[test]
+    fn vim_str2nr_plain_decimal() {
+        assert_eq!(str2nr(b"123", STR2NR_ALL), (123, 123, 0, 3));
+    }
+
+    #[test]
+    fn vim_str2nr_negative_decimal() {
+        assert_eq!(str2nr(b"-123", STR2NR_ALL), (-123, 123, 0, 4));
+    }
+
+    #[test]
+    fn vim_str2nr_hex_lowercase_prefix() {
+        assert_eq!(str2nr(b"0x1A", STR2NR_ALL), (26, 26, i32::from(b'x'), 4));
+    }
+
+    #[test]
+    fn vim_str2nr_hex_uppercase_prefix() {
+        assert_eq!(str2nr(b"0X1a", STR2NR_ALL), (26, 26, i32::from(b'X'), 4));
+    }
+
+    #[test]
+    fn vim_str2nr_binary_prefix() {
+        assert_eq!(str2nr(b"0b101", STR2NR_ALL), (5, 5, i32::from(b'b'), 5));
+    }
+
+    #[test]
+    fn vim_str2nr_explicit_octal_prefix() {
+        assert_eq!(str2nr(b"0o17", STR2NR_ALL), (15, 15, i32::from(b'o'), 4));
+    }
+
+    #[test]
+    fn vim_str2nr_old_style_octal() {
+        // Leading '0' is itself included in the accumulated digits (it
+        // contributes 0 numerically) - len covers the whole "017".
+        assert_eq!(str2nr(b"017", STR2NR_ALL), (15, 15, i32::from(b'0'), 3));
+    }
+
+    #[test]
+    fn vim_str2nr_old_style_octal_with_invalid_digit_falls_back_to_decimal() {
+        // '8'/'9' are not valid octal digits - the original falls back
+        // to parsing the whole thing as decimal instead.
+        assert_eq!(str2nr(b"018", STR2NR_ALL), (18, 18, 0, 3));
+        assert_eq!(str2nr(b"019", STR2NR_ALL), (19, 19, 0, 3));
+    }
+
+    #[test]
+    fn vim_str2nr_only_recognizes_radixes_allowed_by_what() {
+        // Without STR2NR_HEX in `what`, "0x1A" is NOT recognized as hex
+        // - it stops at the first non-decimal-digit ('x'), consuming
+        // only the leading "0".
+        assert_eq!(str2nr(b"0x1A", STR2NR_OCT | STR2NR_BIN), (0, 0, 0, 1));
+    }
+
+    #[test]
+    fn vim_str2nr_force_hex_without_prefix() {
+        let mut n: VarnumberT = 0;
+        let mut prep: i32 = 0;
+        vim_str2nr(b"1A", Some(&mut prep), None, STR2NR_HEX | STR2NR_FORCE, Some(&mut n), None, 0, false, None);
+        assert_eq!(n, 0x1A);
+        // FORCE mode never touches `pre` at all in the original - it
+        // stays at its initial 0 regardless of the actual radix forced.
+        assert_eq!(prep, 0);
+    }
+
+    #[test]
+    fn vim_str2nr_force_bin_without_prefix() {
+        assert_eq!(str2nr(b"101", STR2NR_BIN | STR2NR_FORCE), (5, 5, 0, 3));
+    }
+
+    #[test]
+    fn vim_str2nr_force_dec() {
+        assert_eq!(str2nr(b"123", STR2NR_FORCE), (123, 123, 0, 3));
+    }
+
+    #[test]
+    fn vim_str2nr_force_still_skips_a_present_prefix() {
+        // FORCE mode still skips a matching "0x"/"0b"/"0o" prefix if
+        // one happens to be present, rather than parsing it literally.
+        assert_eq!(str2nr(b"0x1A", STR2NR_HEX | STR2NR_FORCE), (26, 26, 0, 4));
+    }
+
+    #[test]
+    fn vim_str2nr_quote_separated_digits() {
+        assert_eq!(str2nr(b"1'000'000", STR2NR_ALL | STR2NR_QUOTE), (1_000_000, 1_000_000, 0, 9));
+    }
+
+    #[test]
+    fn vim_str2nr_quote_not_recognized_without_the_flag() {
+        // Without STR2NR_QUOTE, the embedded quote ends the number.
+        assert_eq!(str2nr(b"1'000", STR2NR_ALL), (1, 1, 0, 1));
+    }
+
+    #[test]
+    fn vim_str2nr_maxlen_limits_how_much_is_parsed() {
+        let mut n: VarnumberT = 0;
+        let mut len: i32 = 0;
+        vim_str2nr(b"12345", None, Some(&mut len), STR2NR_ALL, Some(&mut n), None, 3, false, None);
+        assert_eq!(n, 123);
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn vim_str2nr_stops_at_trailing_garbage_when_not_strict() {
+        assert_eq!(str2nr(b"123abc", STR2NR_ALL), (123, 123, 0, 3));
+    }
+
+    #[test]
+    fn vim_str2nr_strict_fails_on_trailing_alnum() {
+        let mut n: VarnumberT = 123; // pre-set, must stay untouched on failure
+        let mut len: i32 = 99; // pre-set, must be reset to 0 on failure
+        vim_str2nr(b"123abc", None, Some(&mut len), STR2NR_ALL, Some(&mut n), None, 0, true, None);
+        assert_eq!(len, 0);
+        assert_eq!(n, 123); // untouched - function returned early
+    }
+
+    #[test]
+    fn vim_str2nr_strict_succeeds_when_maxlen_exactly_consumed() {
+        // Even in strict mode, trailing garbage BEYOND maxlen doesn't
+        // fail the parse, since idx == maxlen short-circuits the check.
+        let mut n: VarnumberT = 0;
+        let mut len: i32 = 0;
+        vim_str2nr(b"123abc", None, Some(&mut len), STR2NR_ALL, Some(&mut n), None, 3, true, None);
+        assert_eq!(n, 123);
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn vim_str2nr_strict_succeeds_with_no_trailing_chars_at_all() {
+        let mut n: VarnumberT = 0;
+        let mut len: i32 = 0;
+        vim_str2nr(b"123", None, Some(&mut len), STR2NR_ALL, Some(&mut n), None, 0, true, None);
+        assert_eq!(n, 123);
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn vim_str2nr_overflow_sets_flag_and_clamps() {
+        let mut n: VarnumberT = 0;
+        let mut u: UvarnumberT = 0;
+        let mut overflow = false;
+        // Larger than i64::MAX.
+        vim_str2nr(
+            b"99999999999999999999",
+            None,
+            None,
+            STR2NR_ALL,
+            Some(&mut n),
+            Some(&mut u),
+            0,
+            false,
+            Some(&mut overflow),
+        );
+        assert!(overflow);
+        assert_eq!(n, VARNUMBER_MAX);
+        // Genuine quirk of the original, faithfully preserved: when
+        // BOTH nptr and unptr are requested, the nptr branch's own
+        // `un = VARNUMBER_MAX` clamp reassigns the *shared* local `un`
+        // before `*unptr = un;` runs afterwards - so unptr "inherits"
+        // nptr's i64::MAX clamp here too, rather than reporting the
+        // true (larger) UVARNUMBER_MAX accumulated by the parsing loop
+        // itself. See vim_str2nr_overflow_unptr_only_sees_true_max
+        // below for the case without that interaction.
+        assert_eq!(u, VARNUMBER_MAX as UvarnumberT);
+    }
+
+    #[test]
+    fn vim_str2nr_overflow_unptr_only_sees_true_max() {
+        // Without also requesting nptr, unptr reports the parsing
+        // loop's own true accumulated-and-clamped UVARNUMBER_MAX,
+        // unaffected by the nptr-only clamping quirk above.
+        let mut u: UvarnumberT = 0;
+        let mut overflow = false;
+        vim_str2nr(
+            b"99999999999999999999",
+            None,
+            None,
+            STR2NR_ALL,
+            None,
+            Some(&mut u),
+            0,
+            false,
+            Some(&mut overflow),
+        );
+        assert!(overflow);
+        assert_eq!(u, UVARNUMBER_MAX);
+    }
+
+    #[test]
+    fn vim_str2nr_no_digits_at_all_leaves_zero() {
+        assert_eq!(str2nr(b"", STR2NR_ALL), (0, 0, 0, 0));
+        assert_eq!(str2nr(b"abc", STR2NR_ALL), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn vim_str2nr_lone_minus_sign_consumes_the_sign_but_parses_as_zero() {
+        // The '-' itself is consumed (idx advances past it) even
+        // though no digits follow - len reflects that 1-byte advance,
+        // matching the original's own unconditional `ptr++` for a
+        // leading '-' before any digit-parsing begins.
+        assert_eq!(str2nr(b"-", STR2NR_ALL), (0, 0, 0, 1));
+    }
+
+    #[test]
+    fn vim_str2nr_none_out_params_are_all_optional() {
+        // Every out-parameter can be omitted independently - this
+        // should not panic.
+        vim_str2nr(b"123", None, None, STR2NR_ALL, None, None, 0, false, None);
     }
 
     #[test]
