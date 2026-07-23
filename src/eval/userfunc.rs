@@ -40,19 +40,37 @@
 //! - this crate has no such shutdown-tracking state - so it's moot.
 //!
 //! `func_ptr_unref`'s "reference count hit zero, and the function
-//! isn't mid-call" branch (`func_clear_free`) is `unimplemented!()`:
-//! it still needs `funccal_unref` (needs `previous_funccal`'s
-//! file-static list + `fc_referenced`'s own reachability algorithm,
-//! neither translated - `funccall_T`'s real fields alone are not
-//! enough). Nothing translated so far can actually construct a real,
-//! positively-refcounted `UfuncT` yet (no function-definition
-//! machinery exists), so this branch is currently unreachable in
-//! practice, not just narrow - matching the "harvest the reachable
-//! core, defer the exact unreachable branch" pattern already used
-//! elsewhere in this crate (e.g. `mark.c`'s `get_global_marks`).
+//! isn't mid-call" branch now calls the real `func_clear_free`
+//! (`func_clear` + `func_free`).
+//!
+//! This needed several new pieces. `fc_flags` holds the `FC_*`
+//! bit-flags. `fc_referenced` is trivial - every field it reads
+//! already has real values. `previous_funccal` is a NEW file-static
+//! `GlobalCell<*mut FunccallT>`, mirroring `func_hashtab`'s own
+//! treatment - a bare pointer, not a hashtable, since
+//! `previous_funccal` is just a singly-linked list via `fc_caller`.
+//!
+//! `free_funccal`/`free_funccal_contents` needed the most care: the
+//! latter clears `fc_l_vars`/`fc_l_avars`'s hashtabs via
+//! [`crate::eval::typval::tv_dict_free_contents`] and
+//! `fc_l_varlist`'s items via
+//! [`crate::eval::typval::tv_list_free_contents`] - both already
+//! dispatch through `tv_clear_simple` per item, which this crate
+//! treats as a faithful substitute for the original's
+//! `encode_vim_to_nothing`-based `tv_clear`/`vars_clear_ext` for any
+//! well-formed, acyclic value (the same guarantee Vimscript's own
+//! reference-counted value model already provides).
+//!
+//! `func_clear_items` clears `uf_args`/`uf_def_args`/`uf_lines` via
+//! plain `GarrayT::ga_clear()` rather than the original's
+//! `ga_clear_strings`/`GA_DEEP_CLEAR_PTR` per-item `xfree` - correct
+//! given nothing in this crate currently populates those arrays with
+//! real heap-owned entries. Its `FC_LUAREF` branch is
+//! `unimplemented!()` since nothing can currently set that flag
+//! either, needing the Lua host (phase 13).
 
 use crate::ascii_defs::ascii_isdigit;
-use crate::eval::typval_defs::UfuncT;
+use crate::eval::typval_defs::{FunccallT, UfuncT};
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
 use crate::hashtab_defs::HashtabT;
@@ -234,6 +252,272 @@ pub fn func_unref(name: Option<&[u8]>) {
     unsafe { func_ptr_unref(fp) };
 }
 
+/// Function flags, values for `uf_flags` (`FC_*`, `eval/userfunc.h`).
+pub mod fc_flags {
+    /// abort function on error (`FC_ABORT`).
+    pub const ABORT: i32 = 0x01;
+    /// function accepts range (`FC_RANGE`).
+    pub const RANGE: i32 = 0x02;
+    /// Dict function, uses "self" (`FC_DICT`).
+    pub const DICT: i32 = 0x04;
+    /// closure, uses outer scope variables (`FC_CLOSURE`).
+    pub const CLOSURE: i32 = 0x08;
+    /// `:delfunction` used while `uf_refcount > 0` (`FC_DELETED`).
+    pub const DELETED: i32 = 0x10;
+    /// function redefined while `uf_refcount > 0` (`FC_REMOVED`).
+    pub const REMOVED: i32 = 0x20;
+    /// function defined in the sandbox (`FC_SANDBOX`).
+    pub const SANDBOX: i32 = 0x40;
+    /// no `a:` variables in lambda (`FC_NOARGS`).
+    pub const NOARGS: i32 = 0x200;
+    /// luaref callback (`FC_LUAREF`).
+    pub const LUAREF: i32 = 0x800;
+}
+
+/// Check whether funccall is still referenced outside (`fc_referenced`).
+///
+/// It is supposed to be referenced if either it is referenced itself
+/// or if `l:`, `a:`, or `a:000` are referenced, as all these are
+/// statically (by-value, in this crate) allocated within the funccall
+/// structure.
+#[must_use]
+fn fc_referenced(fc: &FunccallT) -> bool {
+    fc.fc_l_varlist.lv_refcount != crate::eval::typval_defs::DO_NOT_FREE_CNT
+        || fc.fc_l_vars.dv_refcount != crate::eval::typval_defs::DO_NOT_FREE_CNT
+        || fc.fc_l_avars.dv_refcount != crate::eval::typval_defs::DO_NOT_FREE_CNT
+        || fc.fc_refcount > 0
+}
+
+/// `previous_funccal`: file-static list of funccalls no longer current
+/// but still possibly referenced, linked via `fc_caller`. Kept as a
+/// bare `*mut FunccallT` (not a hashtable, unlike `FUNC_HASHTAB`) since
+/// the original itself is just a singly-linked list.
+static PREVIOUS_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
+    LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
+
+/// Free `fc` (`free_funccal`).
+///
+/// # Safety
+/// `fc` must be a valid, non-null pointer previously allocated via
+/// `Box::into_raw`. Every entry written into `fc.fc_ufuncs` must be
+/// either null or a valid pointer to a live `UfuncT` (matching this
+/// crate's own convention for populating it via
+/// `GarrayT::ga_append_item::<*mut UfuncT>`, mirroring the original's
+/// `((ufunc_T **)fc_ufuncs.ga_data)[...] = fp`); `fc.fc_func` must be
+/// either null or a valid pointer to a live `UfuncT`.
+unsafe fn free_funccal(fc: *mut FunccallT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fc_ref = unsafe { &mut *fc };
+    let count = fc_ref.fc_ufuncs.ga_len.max(0) as usize;
+    // SAFETY: forwarded from this function's own safety doc - every
+    // slot in `0..count` was written as a `*mut UfuncT`.
+    let base = fc_ref.fc_ufuncs.ga_data.as_mut_ptr() as *mut *mut UfuncT;
+    for i in 0..count {
+        // SAFETY: `i < count == ga_len`, in-bounds; forwarded from this
+        // function's own safety doc.
+        let fp = unsafe { *base.add(i) };
+        // When garbage collecting, a funccall_T may be freed before the
+        // function that references it - clear its uf_scoped field. The
+        // function may have been redefined and point to another
+        // funccal_T, don't clear it then.
+        if !fp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let scoped_matches = unsafe { (*fp).uf_scoped == fc };
+            if scoped_matches {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (*fp).uf_scoped = std::ptr::null_mut() };
+            }
+        }
+    }
+    fc_ref.fc_ufuncs.ga_clear();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { func_ptr_unref(fc_ref.fc_func) };
+    // SAFETY: forwarded from this function's own safety doc (`fc` was
+    // allocated via `Box::into_raw`).
+    drop(unsafe { Box::from_raw(fc) });
+}
+
+/// Free `fc` and what it contains (`free_funccal_contents`).
+///
+/// Can be called only when `fc` is kept beyond the period it was
+/// called, i.e. after `cleanup_function_call(fc)` (not translated -
+/// no real caller constructs a `FunccallT` this way yet).
+///
+/// # Safety
+/// Same as [`free_funccal`], plus every item in `fc.fc_l_vars`/
+/// `fc.fc_l_avars`/`fc.fc_l_varlist` must satisfy `tv_clear_simple`'s
+/// own safety contract (matching `tv_dict_free_contents`/
+/// `tv_list_free_contents`'s own requirements, since that's what this
+/// function calls on each embedded-by-value container).
+unsafe fn free_funccal_contents(fc: *mut FunccallT) {
+    // SAFETY: forwarded from this function's own safety doc. Unlike
+    // `tv_dict_free`, this only clears the hashtab's ITEMS (matching
+    // the original's `vars_clear`) - `fc_l_vars`/`fc_l_avars` are
+    // embedded by value in `FunccallT`, not separately heap-allocated,
+    // so the DictT struct itself must not be freed here.
+    unsafe { crate::eval::typval::tv_dict_free_contents(&mut (*fc).fc_l_vars) };
+    // SAFETY: same as above, for `fc_l_avars`.
+    unsafe { crate::eval::typval::tv_dict_free_contents(&mut (*fc).fc_l_avars) };
+    // SAFETY: same reasoning as above, for the by-value `fc_l_varlist`
+    // - `tv_list_free_contents` only clears items, doesn't free the
+    // `ListT` struct itself.
+    unsafe { crate::eval::typval::tv_list_free_contents(&mut (*fc).fc_l_varlist) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { free_funccal(fc) };
+}
+
+/// Unreference `fc`: decrement its reference count and free it once it
+/// becomes zero (`funccal_unref`). `fp` is detached from `fc`.
+///
+/// # Safety
+/// If `fc` is non-null, it must be a valid pointer to a live
+/// `FunccallT` satisfying [`free_funccal_contents`]'s own safety
+/// contract; `fp`, if non-null, must be a valid pointer to a live
+/// `UfuncT`.
+unsafe fn funccal_unref(fc: *mut FunccallT, fp: *mut UfuncT, force: bool) {
+    if fc.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*fc).fc_refcount -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    let should_free = if force {
+        (unsafe { (*fc).fc_refcount }) <= 0
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        !fc_referenced(unsafe { &*fc })
+    };
+    if should_free {
+        // Mirrors the original's `for (funccall_T **pfc = &previous_funccal;
+        // *pfc != NULL; pfc = &(*pfc)->fc_caller)` pointer-to-pointer walk:
+        // `link` always points at the `*mut FunccallT` SLOT that should be
+        // redirected if its target turns out to be `fc` (either
+        // `PREVIOUS_FUNCCAL` itself, or some node's own `fc_caller` field).
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut link: *mut *mut FunccallT = unsafe { PREVIOUS_FUNCCAL.get_mut() as *mut *mut FunccallT };
+        loop {
+            // SAFETY: `link` always points at a valid `*mut FunccallT` slot.
+            let node = unsafe { *link };
+            if node.is_null() {
+                break;
+            }
+            if node == fc {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { *link = (*fc).fc_caller };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { free_funccal_contents(fc) };
+                return;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            link = unsafe { &mut (*node).fc_caller as *mut *mut FunccallT };
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let count = unsafe { (*fc).fc_ufuncs.ga_len }.max(0) as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let base = unsafe { (*fc).fc_ufuncs.ga_data.as_mut_ptr() as *mut *mut UfuncT };
+    for i in 0..count {
+        // SAFETY: `i < count == ga_len`, in-bounds.
+        let slot = unsafe { base.add(i) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { *slot } == fp {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *slot = std::ptr::null_mut() };
+        }
+    }
+}
+
+/// Free all things that a function contains. Does not free the
+/// function itself; use [`func_free`] for that (`func_clear_items`).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer to a live `UfuncT`.
+unsafe fn func_clear_items(fp: *mut UfuncT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fp_ref = unsafe { &mut *fp };
+    // The original's `ga_clear_strings`/`GA_DEEP_CLEAR_PTR` also
+    // xfree()s each individual string entry - a no-op here, since
+    // nothing in this crate currently populates uf_args/uf_def_args/
+    // uf_lines with real heap-owned entries (no function-definition
+    // parser exists yet); `.ga_clear()` alone is exactly what
+    // ga_clear_strings degrades to when there's nothing to free.
+    fp_ref.uf_args.ga_clear();
+    fp_ref.uf_def_args.ga_clear();
+    fp_ref.uf_lines.ga_clear();
+
+    if fp_ref.uf_flags & fc_flags::LUAREF != 0 {
+        unimplemented!(
+            "func_clear_items: api_free_luaref needs the Lua host (phase 13), not yet \
+             translated - unreachable today since nothing can set FC_LUAREF yet"
+        );
+    }
+
+    fp_ref.uf_tml_count.clear();
+    fp_ref.uf_tml_total.clear();
+    fp_ref.uf_tml_self.clear();
+}
+
+/// Free all things that a function contains. Does not free the
+/// function itself; use [`func_free`] for that (`func_clear`).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer to a live `UfuncT` whose
+/// `uf_scoped`, if non-null, satisfies [`funccal_unref`]'s own safety
+/// contract.
+unsafe fn func_clear(fp: *mut UfuncT, force: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fp).uf_cleared } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*fp).uf_cleared = true };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { func_clear_items(fp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let scoped = unsafe { (*fp).uf_scoped };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { funccal_unref(scoped, fp, force) };
+}
+
+/// Free a function and remove it from the list of functions. Does not
+/// free what a function contains; call [`func_clear`] first
+/// (`func_free`).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer previously allocated via
+/// `Box::into_raw`.
+unsafe fn func_free(fp: *mut UfuncT) {
+    // Only remove it when not done already, otherwise we would remove
+    // a newer version of the function.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fp).uf_flags } & (fc_flags::DELETED | fc_flags::REMOVED) == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { func_remove(fp) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*fp).uf_name_exp = None };
+    // SAFETY: forwarded from this function's own safety doc (`fp` was
+    // allocated via `Box::into_raw`).
+    drop(unsafe { Box::from_raw(fp) });
+}
+
+/// Free all things that a function contains and free the function
+/// itself (`func_clear_free`).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer previously allocated via
+/// `Box::into_raw`, satisfying [`func_clear`]'s own safety contract.
+unsafe fn func_clear_free(fp: *mut UfuncT, force: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { func_clear(fp, force) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { func_free(fp) };
+}
+
 /// Count a reference to a function (`func_ptr_ref`).
 ///
 /// # Safety
@@ -249,13 +533,12 @@ pub unsafe fn func_ptr_ref(fp: *mut UfuncT) {
 /// when it becomes zero (and the function isn't mid-call)
 /// (`func_ptr_unref`).
 ///
-/// # Deferred
-/// The "reference count hit zero, and `uf_calls == 0`" branch
-/// (`func_clear_free`) is `unimplemented!()` - see this module's own
-/// doc comment for why.
-///
 /// # Safety
-/// `fp`, if non-null, must be a valid pointer to a live `UfuncT`.
+/// `fp`, if non-null, must be a valid pointer to a live `UfuncT`. If
+/// the reference count hits zero and `uf_calls == 0`, `fp` (and,
+/// transitively, `(*fp).uf_scoped` if non-null) must satisfy
+/// `func_clear_free`'s own safety contract - in particular, `fp`
+/// must have been allocated via `Box::into_raw`.
 pub unsafe fn func_ptr_unref(fp: *mut UfuncT) {
     if fp.is_null() {
         return;
@@ -266,11 +549,8 @@ pub unsafe fn func_ptr_unref(fp: *mut UfuncT) {
     if unsafe { (*fp).uf_refcount } <= 0 {
         // SAFETY: forwarded from this function's own safety doc.
         if unsafe { (*fp).uf_calls } == 0 {
-            unimplemented!(
-                "func_ptr_unref: func_clear_free needs funccal_unref (needs \
-                 previous_funccal's file-static list + fc_referenced's reachability \
-                 algorithm, neither translated) - see this module's own doc comment"
-            );
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { func_clear_free(fp, false) };
         }
         // Otherwise: still being called (`uf_calls != 0`) - freed
         // later when `uf_calls` becomes zero, matching the original's
@@ -319,10 +599,150 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "func_clear_free needs funccal_unref")]
-    fn func_ptr_unref_panics_when_hits_zero_and_not_being_called() {
-        let mut fp = UfuncT { uf_refcount: 1, uf_calls: 0, ..Default::default() };
-        unsafe { func_ptr_unref(&mut fp as *mut UfuncT) };
+    fn func_ptr_unref_frees_when_hits_zero_and_not_being_called() {
+        // uf_scoped defaults to null, so funccal_unref is a no-op;
+        // func_free's func_remove call still touches FUNC_HASHTAB
+        // (uf_name is empty here, a harmless miss), so this needs the
+        // shared lock + a clean table, matching every other test that
+        // exercises func_free's real body.
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let fp = Box::into_raw(Box::new(UfuncT { uf_refcount: 1, uf_calls: 0, ..Default::default() }));
+        // Refcount hits 0, not mid-call - the real func_clear_free
+        // chain runs to completion and frees fp. Nothing further to
+        // assert on fp after this - the absence of a crash/leak-
+        // sanitizer complaint is the check (matching this crate's own
+        // partial_unref_frees_and_clears_argv_at_zero_refcount
+        // precedent).
+        unsafe { func_ptr_unref(fp) };
+    }
+
+    #[test]
+    fn fc_referenced_true_for_a_freshly_zeroed_funccall() {
+        // A plain Default::default() FunccallT matches xcalloc, BEFORE
+        // create_funccal's own init_var_dict calls would mark the
+        // by-value scopes DO_NOT_FREE_CNT - so dv_refcount/lv_refcount
+        // are plain 0 here, which already differs from
+        // DO_NOT_FREE_CNT, making fc_referenced report true
+        // unconditionally in this state (faithfully - the original
+        // would too, for the same raw xcalloc'd struct).
+        let fc = FunccallT::default();
+        assert!(fc_referenced(&fc));
+    }
+
+    #[test]
+    fn fc_referenced_false_when_scopes_are_do_not_free_and_refcount_is_zero() {
+        let mut fc = FunccallT::default();
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_refcount = 0;
+        assert!(!fc_referenced(&fc));
+    }
+
+    #[test]
+    fn fc_referenced_true_when_fc_refcount_positive_even_with_do_not_free_scopes() {
+        let mut fc = FunccallT::default();
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_refcount = 3;
+        assert!(fc_referenced(&fc));
+    }
+
+    /// Builds a `FunccallT` whose `fc_ufuncs` contains exactly one
+    /// entry (`fp_ptr`), matching the pointer-array convention
+    /// `free_funccal`/`funccal_unref` expect.
+    fn funccall_with_one_ufunc_entry(fp_ptr: *mut UfuncT) -> FunccallT {
+        let mut fc = FunccallT::default();
+        fc.fc_ufuncs.ga_itemsize = std::mem::size_of::<*mut UfuncT>() as i32;
+        unsafe { fc.fc_ufuncs.ga_append_item::<*mut UfuncT>(fp_ptr) };
+        fc
+    }
+
+    #[test]
+    fn funccal_unref_null_fc_is_noop() {
+        let mut fp = UfuncT::default();
+        unsafe { funccal_unref(std::ptr::null_mut(), &mut fp as *mut UfuncT, false) };
+    }
+
+    #[test]
+    fn funccal_unref_nulls_matching_fc_ufuncs_entry_when_still_referenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fp = UfuncT::default();
+        let fp_ptr = &mut fp as *mut UfuncT;
+        let mut fc = funccall_with_one_ufunc_entry(fp_ptr);
+        fc.fc_refcount = 5; // decrements to 4, still > 0 - fc_referenced() is true
+        let fc_ptr = &mut fc as *mut FunccallT;
+        unsafe { funccal_unref(fc_ptr, fp_ptr, false) };
+        assert_eq!(fc.fc_refcount, 4);
+        let base = fc.fc_ufuncs.ga_data.as_ptr() as *const *mut UfuncT;
+        assert!(unsafe { *base }.is_null());
+    }
+
+    #[test]
+    fn funccal_unref_frees_and_unlinks_head_of_previous_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Reset PREVIOUS_FUNCCAL to a known-empty state - it's a
+        // shared GlobalCell like FUNC_HASHTAB, just with no func_init()
+        // -style public reset helper (nothing outside this module
+        // needs one yet).
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let mut fc = Box::new(FunccallT {
+            fc_refcount: 1, // decrements to 0
+            ..Default::default()
+        });
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        // Register fc as the current previous_funccal head - mirrors
+        // what a real (not yet translated) remove_funccal() caller
+        // would have done before funccal_unref ever runs.
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = fc_ptr };
+        // funccal_unref takes ownership (frees fc via Box::from_raw
+        // internally) - forget the Box here so Rust's own Drop
+        // doesn't also try to free it (would double-free).
+        std::mem::forget(fc);
+
+        unsafe { funccal_unref(fc_ptr, std::ptr::null_mut(), false) };
+
+        // fc_caller was null, so unlinking fc from the list-of-one
+        // leaves previous_funccal null again.
+        assert!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn funccal_unref_frees_and_unlinks_a_non_head_previous_funccal_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        // Build a 2-entry previous_funccal list: head -> target -> null.
+        let mut target = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        target.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        target.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        target.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let target_ptr = target.as_mut() as *mut FunccallT;
+        std::mem::forget(target);
+
+        let mut head = Box::new(FunccallT { fc_caller: target_ptr, ..Default::default() });
+        let head_ptr = head.as_mut() as *mut FunccallT;
+        // head itself must stay alive/inspectable after this test, so
+        // it is NOT forgotten - it was never handed to funccal_unref,
+        // only referenced via its own fc_caller field.
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = head_ptr };
+
+        unsafe { funccal_unref(target_ptr, std::ptr::null_mut(), false) };
+
+        // previous_funccal's head is unchanged; head's own fc_caller
+        // now skips over the freed target (was null, since target's
+        // own fc_caller was never set).
+        assert_eq!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }, head_ptr);
+        assert!(unsafe { (*head_ptr).fc_caller }.is_null());
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
     }
 
     // The following tests all touch the shared FUNC_HASHTAB GlobalCell -
