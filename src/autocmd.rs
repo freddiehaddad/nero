@@ -73,6 +73,21 @@ use std::sync::LazyLock;
 static AUTOCMDS: LazyLock<GlobalCell<[AutoCmdVec; NUM_EVENTS]>> =
     LazyLock::new(|| GlobalCell::new(std::array::from_fn(|_| Vec::new())));
 
+/// `autocmd_busy` (`autocmd.h`) - is `apply_autocmds()` busy? A real
+/// cross-file `EXTERN` global (unlike `AU_NEED_CLEAN`/
+/// `ACTIVE_APC_LIST`, which are file-static in the original), so
+/// `pub` here matching this crate's "each translated globals bag
+/// lives in the Rust module matching its own original header"
+/// convention (e.g. `mark.h`'s `namedfm` living in `mark.rs`).
+///
+/// Starts `false`; only ever set `true` inside
+/// [`apply_autocmds_group`]'s own real (still-`unimplemented!()`,
+/// never-reached-today) autocmd-execution body - so stays `false`
+/// forever in practice today, exactly like `AUTOCMDS` staying empty
+/// forever. This is what makes `change.c`'s `change_warning` (this
+/// crate's first real reader of this global) tractable today.
+pub static AUTOCMD_BUSY: GlobalCell<bool> = GlobalCell::new(false);
+
 /// `au_need_clean` - whether [`au_cleanup`] has real work to do.
 /// Starts `false`; only ever set by code inside [`aubuflocal_remove`]'s
 /// own (always zero-iteration today) loop, so stays `false` forever
@@ -295,15 +310,12 @@ pub unsafe fn aubuflocal_remove(buf: &BufT) {
 /// Cleanup autocommands that have been deleted. This is only done
 /// when not executing autocommands (`au_cleanup`).
 ///
-/// Always a real no-op today: `AU_NEED_CLEAN` starts `false` and is
-/// only ever set by code inside [`aubuflocal_remove`]'s own
-/// always-zero-iteration loop - see this module's own doc comment.
+/// Always a real no-op today: [`AUTOCMD_BUSY`] and `AU_NEED_CLEAN`
+/// both start `false`, and `AU_NEED_CLEAN` is only ever set by code
+/// inside [`aubuflocal_remove`]'s own always-zero-iteration loop - see
+/// this module's own doc comment.
 fn au_cleanup() {
-    // `autocmd_busy` is not modeled yet (not needed by anything
-    // reachable so far - see this module's own doc comment), so only
-    // `AU_NEED_CLEAN` gates this early return for now; the original
-    // ORs in `autocmd_busy` too.
-    if !unsafe { *AU_NEED_CLEAN.get_mut() } {
+    if unsafe { *AUTOCMD_BUSY.get_mut() } || !unsafe { *AU_NEED_CLEAN.get_mut() } {
         return;
     }
     unimplemented!(
@@ -413,8 +425,24 @@ mod tests {
     #[test]
     fn au_cleanup_is_a_noop_when_au_need_clean_is_false() {
         let _lock = crate::globals::global_state_test_lock();
+        unsafe { *AUTOCMD_BUSY.get_mut() = false };
         unsafe { *AU_NEED_CLEAN.get_mut() = false };
         au_cleanup(); // must not panic
+    }
+
+    #[test]
+    fn au_cleanup_is_a_noop_when_autocmd_busy_even_if_au_need_clean_is_true() {
+        // Not achievable via any real translated function yet (nothing
+        // can set AUTOCMD_BUSY true) - pokes it directly to prove
+        // au_cleanup's own `autocmd_busy || !au_need_clean` short-circuit
+        // is faithfully translated, independent of how AUTOCMD_BUSY
+        // eventually gets set.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *AUTOCMD_BUSY.get_mut() = true };
+        unsafe { *AU_NEED_CLEAN.get_mut() = true };
+        au_cleanup(); // must not panic (autocmd_busy short-circuits first)
+        unsafe { *AUTOCMD_BUSY.get_mut() = false };
+        unsafe { *AU_NEED_CLEAN.get_mut() = false };
     }
 
     #[test]
