@@ -270,7 +270,7 @@ pub struct OptexpandT {
     /// (`oe_regmatch`).
     pub oe_regmatch: *mut RegmatchT,
     /// The expansion context (`oe_xp`).
-    pub oe_xp: *mut crate::types_defs::ExpandT,
+    pub oe_xp: *mut crate::cmdexpand_defs::ExpandT,
     /// The full argument passed to `:set`. For example, if the user
     /// inputs `":set dip=icase,algorithm:my<Tab>"`, `oe_xp`'s own
     /// pattern will only have `"my"`, but this will contain the whole

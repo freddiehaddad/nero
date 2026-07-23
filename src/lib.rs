@@ -22,6 +22,7 @@ pub mod buffer;
 pub mod buffer_defs;
 pub mod change;
 pub mod charset;
+pub mod cmdexpand_defs;
 pub mod cursor;
 pub mod decoration_defs;
 pub mod drawscreen;

@@ -159,14 +159,6 @@ pub struct MatchitemT {
 pub struct AutoPatCmdT {
     _private: (),
 }
-/// Placeholder for `expand_T` (`struct expand`) - see
-/// `src/nvim/cmdexpand_defs.h` (phase 7). Needed by
-/// `option_defs.rs`'s `OptexpandT.oe_xp` (cmdline-completion context
-/// for expanding string-option values) - only ever referenced through
-/// a pointer there, so this opaque placeholder is enough for now.
-pub struct ExpandT {
-    _private: (),
-}
 /// Placeholder for `regmatch_T` (`struct regmatch`) - see
 /// `src/nvim/regexp_defs.h` (phase 7). Derives `Default` (a trivial
 /// zero-sized value for now) since `cmdmod_T.cmod_filter_regmatch`
