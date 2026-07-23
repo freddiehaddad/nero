@@ -19,7 +19,13 @@
 //! `get_flp_value`, `get_ve_flags`, `get_showbreak_value`,
 //! `default_fileformat`, `csh_like_shell`, `fish_like_shell`,
 //! `get_scrolloff_value`, `get_scrolloffpad_value`,
-//! `get_sidescrolloff_value`, `valid_name`, `check_blending`.
+//! `get_sidescrolloff_value`, `valid_name`, `check_blending`,
+//! `fill_culopt_flags` (parses `'cursorlineopt'`'s comma-separated
+//! flag list into `WinT.w_p_culopt_flags` - needed only
+//! `option_vars.rs`'s already-real `opt_culopt_flag` bit-flag module
+//! and `buffer_defs.rs`'s already-real `WinT.w_onebuf_opt.wo_culopt`;
+//! preserves a real, faithfully-replicated parsing quirk rather than
+//! "fixing" it - see its own doc comment).
 //! `can_bs`/`shortmess`/`valid_name` needed `strings.c`'s `vim_strchr`
 //! (also translated this pass - re-examined and found NOT actually
 //! blocked on `g_chartab`/`option.c` as an earlier note claimed, see
@@ -346,6 +352,67 @@ pub fn get_sidescrolloff_value(wp: &WinT) -> OptInt {
     } else {
         wp.w_onebuf_opt.wo_siso
     }
+}
+
+/// Parse `val` (or `wp.w_onebuf_opt.wo_culopt` when `val` is `None`) -
+/// `'cursorlineopt'`'s comma-separated flag list (`"line"`/`"both"`/
+/// `"number"`/`"screenline"`) - into `wp.w_p_culopt_flags`
+/// (`fill_culopt_flags`).
+///
+/// Returns `OK`/`FAIL`. Preserves a real, faithfully-replicated quirk
+/// rather than "fixing" it: an unrecognized token leaves the parse
+/// position unchanged, so if that position happens to already be `,`
+/// (e.g. a leading or doubled comma, `",line"`/`"line,,number"`), the
+/// original's own `*p != ',' && *p != NUL` guard does NOT reject it -
+/// it's silently skipped as an empty entry, exactly like this
+/// translation's `match` arm falling through to advance past a `,` at
+/// the SAME position no token was recognized at.
+#[must_use]
+pub fn fill_culopt_flags(val: Option<&[u8]>, wp: &mut WinT) -> i32 {
+    let owned;
+    let p: &[u8] = match val {
+        Some(v) => v,
+        None => {
+            owned = wp.w_onebuf_opt.wo_culopt.clone().unwrap_or_default();
+            &owned
+        }
+    };
+
+    let mut flags_new: u8 = 0;
+    let mut i = 0;
+    while i < p.len() {
+        // Note: Keep this in sync with `opt_culopt_values`.
+        if p[i..].starts_with(b"line") {
+            i += 4;
+            flags_new |= crate::option_vars::opt_culopt_flag::LINE as u8;
+        } else if p[i..].starts_with(b"both") {
+            i += 4;
+            flags_new |= (crate::option_vars::opt_culopt_flag::LINE
+                | crate::option_vars::opt_culopt_flag::NUMBER) as u8;
+        } else if p[i..].starts_with(b"number") {
+            i += 6;
+            flags_new |= crate::option_vars::opt_culopt_flag::NUMBER as u8;
+        } else if p[i..].starts_with(b"screenline") {
+            i += 10;
+            flags_new |= crate::option_vars::opt_culopt_flag::SCREENLINE as u8;
+        }
+
+        match p.get(i) {
+            Some(&b',') => i += 1,
+            Some(_) => return crate::vim_defs::FAIL,
+            None => {}
+        }
+    }
+
+    // Can't have both "line" and "screenline".
+    let line = crate::option_vars::opt_culopt_flag::LINE as u8;
+    let screenline = crate::option_vars::opt_culopt_flag::SCREENLINE as u8;
+    if flags_new & line != 0 && flags_new & screenline != 0 {
+        return crate::vim_defs::FAIL;
+    }
+    wp.w_p_culopt_flags = flags_new;
+
+    crate::vim_defs::OK
 }
 
 #[cfg(test)]
@@ -802,5 +869,108 @@ mod tests {
         let mut wp2 = WinT { w_floating: true, ..Default::default() };
         check_blending(&mut wp2);
         assert!(!wp2.w_grid_alloc.blending);
+    }
+
+    #[test]
+    fn fill_culopt_flags_parses_line() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"line"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, crate::option_vars::opt_culopt_flag::LINE as u8);
+    }
+
+    #[test]
+    fn fill_culopt_flags_parses_both_as_line_and_number() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"both"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(
+            wp.w_p_culopt_flags,
+            (crate::option_vars::opt_culopt_flag::LINE | crate::option_vars::opt_culopt_flag::NUMBER)
+                as u8
+        );
+    }
+
+    #[test]
+    fn fill_culopt_flags_parses_number() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"number"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, crate::option_vars::opt_culopt_flag::NUMBER as u8);
+    }
+
+    #[test]
+    fn fill_culopt_flags_parses_screenline() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"screenline"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, crate::option_vars::opt_culopt_flag::SCREENLINE as u8);
+    }
+
+    #[test]
+    fn fill_culopt_flags_parses_comma_separated_combination() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"number,line"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(
+            wp.w_p_culopt_flags,
+            (crate::option_vars::opt_culopt_flag::LINE | crate::option_vars::opt_culopt_flag::NUMBER)
+                as u8
+        );
+    }
+
+    #[test]
+    fn fill_culopt_flags_empty_string_gives_zero_flags() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b""), &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, 0);
+    }
+
+    #[test]
+    fn fill_culopt_flags_rejects_line_and_screenline_together() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"line,screenline"), &mut wp), crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn fill_culopt_flags_rejects_unrecognized_token() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"bogus"), &mut wp), crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn fill_culopt_flags_rejects_recognized_token_with_trailing_garbage() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"linex"), &mut wp), crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn fill_culopt_flags_silently_skips_a_leading_comma_real_quirk() {
+        // A real, faithfully-replicated quirk (not "fixed"): an
+        // unrecognized token at a position that's already ',' - such
+        // as a leading or doubled comma - is silently skipped as an
+        // empty entry rather than rejected. See this function's own
+        // doc comment.
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b",line"), &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, crate::option_vars::opt_culopt_flag::LINE as u8);
+
+        let mut wp2 = WinT::default();
+        assert_eq!(fill_culopt_flags(Some(b"line,,number"), &mut wp2), crate::vim_defs::OK);
+        assert_eq!(
+            wp2.w_p_culopt_flags,
+            (crate::option_vars::opt_culopt_flag::LINE | crate::option_vars::opt_culopt_flag::NUMBER)
+                as u8
+        );
+    }
+
+    #[test]
+    fn fill_culopt_flags_none_uses_windows_own_wo_culopt_value() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_culopt = Some(b"number".to_vec());
+        assert_eq!(fill_culopt_flags(None, &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, crate::option_vars::opt_culopt_flag::NUMBER as u8);
+    }
+
+    #[test]
+    fn fill_culopt_flags_none_with_unset_wo_culopt_defaults_to_empty() {
+        let mut wp = WinT::default();
+        assert_eq!(fill_culopt_flags(None, &mut wp), crate::vim_defs::OK);
+        assert_eq!(wp.w_p_culopt_flags, 0);
     }
 }
