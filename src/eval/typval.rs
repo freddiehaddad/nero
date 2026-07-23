@@ -197,18 +197,6 @@ pub unsafe fn tv_list_ref(l: *mut crate::eval::typval_defs::ListT) {
 /// this translation, cloning `from`'s value up front before writing
 /// `to`, naturally supports this too).
 ///
-/// Two of the original's branches are not fully replicated:
-/// - `VAR_FUNC`: the function name string itself is copied correctly
-///   (via the `.clone()` below), but the original's own
-///   `func_ref(to->vval.v_string)` (incrementing the named function's
-///   `uf_refcount` via `find_func()`) is omitted - needs a function-
-///   name registry (`eval/userfunc.c`'s `ufunc_T` table), not yet
-///   translated.
-/// - `VAR_PARTIAL`: the partial's own `pt_refcount` is now
-///   incremented for real (`partial_T`'s real fields exist), but
-///   nothing else about the copy is deep - matches the original
-///   exactly (a `partial_T` copy is always just a refcount bump).
-///
 /// # Safety
 /// If `from`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
 /// non-null pointer, that pointer must be valid (matching every other
@@ -233,9 +221,12 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
             // owned Vec<u8> bytes - matching the original's own
             // `xstrdup`, just without a manual allocation call.
         }
-        TypvalValue::Func(_) => {
-            // See this function's own doc comment for why func_ref()
-            // is omitted - the name string itself is already copied.
+        TypvalValue::Func(name) => {
+            // The name string itself is already deep-copied via
+            // `.clone()` above; `func_ref` additionally increments the
+            // named function's own `uf_refcount` (`find_func()`-backed
+            // lookup), matching the original's `func_ref(to->vval.v_string)`.
+            crate::eval::userfunc::func_ref(name.as_deref());
         }
         TypvalValue::Partial(p) => {
             if !p.is_null() {
@@ -336,10 +327,12 @@ pub fn tv_get_bool_chk(tv: &TypvalT, ret_error: Option<&mut bool>) -> crate::eva
 }
 
 
-/// [`partial_unref`] (see that function's own doc comment for its one
-/// remaining gap: releasing the referenced function's own refcount,
-/// which needs `ufunc_T`'s function-name registry, not yet
-/// translated).
+/// Release a value's contents one level deep - not the original's
+/// fully recursive `tv_clear` (a separate, substantial subsystem not
+/// attempted here), just enough to correctly release whatever a
+/// single `typval_T` itself directly owns/references. Used by
+/// [`tv_dict_item_free`]/[`partial_free`]'s own `pt_argv` release, and
+/// by [`partial_unref`] for `pt_dict`/`pt_func`.
 ///
 /// # Safety
 /// If `tv`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
@@ -363,14 +356,20 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { partial_unref(*p) };
         }
+        TypvalValue::Func(name) => {
+            // `case VAR_FUNC: func_unref(tv->vval.v_string); FALLTHROUGH;`
+            // in the original - the FALLTHROUGH into VAR_STRING's
+            // `xfree` needs no equivalent here, Rust's own ownership
+            // drops the owned `Vec<u8>` naturally.
+            crate::eval::userfunc::func_unref(name.as_deref());
+        }
         TypvalValue::Unknown
         | TypvalValue::Number(_)
         | TypvalValue::Float(_)
         | TypvalValue::Bool(_)
         | TypvalValue::Special(_)
-        | TypvalValue::String(_)
-        | TypvalValue::Func(_) => {
-            // Rust's own ownership drops String/Func's owned Vec<u8>
+        | TypvalValue::String(_) => {
+            // Rust's own ownership drops String's owned Vec<u8>
             // naturally - no manual xfree needed, unlike the original.
         }
     }
@@ -383,18 +382,14 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
 /// though `partial_T`'s real home is `eval.c`, not `eval/typval.c`).
 ///
 /// # Deferred
-/// The original's `func_unref(pt->pt_name)` (releasing a *named*
-/// function reference by string lookup) is omitted when `pt_name` is
-/// present - needs `find_func`/`func_name_refcount` (`func_hashtab`,
-/// `eval/userfunc.c`, not yet translated). When `pt_name` is absent,
-/// the original's `func_ptr_unref(pt->pt_func)` branch now calls the
-/// real [`crate::eval::userfunc::func_ptr_unref`] - see that
-/// function's own doc comment for its own remaining narrow gap.
-/// `pt_argv`'s items are released one level via [`tv_clear_simple`]
-/// (matching this module's own established policy for container
-/// contents - not the original's fully recursive `tv_clear`, which
-/// itself is a separate, substantial `encode_vim_to_nothing`-based
-/// subsystem, not attempted here).
+/// `func_ptr_unref`'s (and, transitively, `func_unref`'s) own "hit
+/// zero, not mid-call" branch (`func_clear_free`) is still
+/// `unimplemented!()` - see [`crate::eval::userfunc::func_ptr_unref`]'s
+/// own doc comment. `pt_argv`'s items are released one level via
+/// [`tv_clear_simple`] (matching this module's own established policy
+/// for container contents - not the original's fully recursive
+/// `tv_clear`, which itself is a separate, substantial
+/// `encode_vim_to_nothing`-based subsystem, not attempted here).
 ///
 /// # Safety
 /// `pt` must be a valid, non-null pointer previously allocated via
@@ -417,9 +412,9 @@ unsafe fn partial_free(pt: *mut PartialT) {
     if boxed.pt_name.is_none() {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { crate::eval::userfunc::func_ptr_unref(boxed.pt_func) };
+    } else {
+        crate::eval::userfunc::func_unref(boxed.pt_name.as_deref());
     }
-    // func_unref(pt_name) omitted when pt_name is present - see this
-    // function's own doc comment.
 }
 
 /// Unreference a partial: decrement the reference count and free it
@@ -826,6 +821,37 @@ pub fn tv_dict_add_str(d: &mut DictT, key: &[u8], val: Option<&[u8]>) -> i32 {
     let item = tv_dict_item_alloc(key);
     // SAFETY: `item` was just allocated above, not yet in any dict.
     unsafe { (*item).di_tv.value = TypvalValue::String(val.map(<[u8]>::to_vec)) };
+    // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
+    if unsafe { tv_dict_add(d, item) } == FAIL {
+        // SAFETY: same as above.
+        unsafe { tv_dict_item_free(item) };
+        return FAIL;
+    }
+    OK
+}
+
+/// Add a function entry to a dictionary (`tv_dict_add_func`).
+///
+/// `(*fp).uf_name` is expected to be NUL-terminated (matching
+/// `func_hashtab`'s own storage convention - see `eval/userfunc.rs`'s
+/// module doc); the trailing NUL is stripped before storing the name
+/// into the dict item's own `Func` value (which, like
+/// `TypvalValue::String`, carries no NUL of its own) and before
+/// calling `func_ref`.
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer to a live `UfuncT`.
+pub unsafe fn tv_dict_add_func(d: &mut DictT, key: &[u8], fp: *mut crate::eval::typval_defs::UfuncT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let raw_name: &[u8] = unsafe { &(*fp).uf_name };
+    let name = &raw_name[..raw_name.len().saturating_sub(1)];
+    let item = tv_dict_item_alloc(key);
+    // SAFETY: `item` was just allocated above, not yet in any dict.
+    unsafe { (*item).di_tv.value = TypvalValue::Func(Some(name.to_vec())) };
+    // Reference before tv_dict_add() so tv_dict_item_free()'s unref
+    // stays balanced on failure, matching the original's own comment
+    // exactly.
+    crate::eval::userfunc::func_ref(Some(name));
     // SAFETY: `item` is a freshly-allocated, not-yet-shared pointer.
     if unsafe { tv_dict_add(d, item) } == FAIL {
         // SAFETY: same as above.
@@ -1643,6 +1669,54 @@ mod tests {
     }
 
     #[test]
+    fn tv_dict_add_func_stores_nul_stripped_name_and_refs_a_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = crate::eval::typval_defs::UfuncT {
+            uf_name: b"77\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        };
+        let fp_ptr = &mut fp as *mut crate::eval::typval_defs::UfuncT;
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp_ptr) };
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_func(&mut *d, b"F", fp_ptr), OK);
+            let found = tv_dict_find(Some(&mut *d), b"F").unwrap();
+            // The stored name has no trailing NUL, unlike uf_name.
+            assert!(matches!(&(*found).di_tv.value, TypvalValue::Func(Some(v)) if v == b"77"));
+        }
+        // func_ref (called by tv_dict_add_func) found "77" is a
+        // numbered function and incremented its real refcount.
+        assert_eq!(fp.uf_refcount, 2);
+        unsafe { tv_dict_free(d) };
+        // Freeing the dict item runs tv_clear_simple on its Func
+        // value, calling func_unref and decrementing it back down.
+        assert_eq!(fp.uf_refcount, 1);
+    }
+
+    #[test]
+    fn tv_dict_add_func_with_ordinary_name_leaves_refcount_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = crate::eval::typval_defs::UfuncT {
+            uf_name: b"MyFunc\0".to_vec(),
+            uf_refcount: 1,
+            ..Default::default()
+        };
+        let fp_ptr = &mut fp as *mut crate::eval::typval_defs::UfuncT;
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_func(&mut *d, b"F", fp_ptr), OK);
+            tv_dict_free(d);
+        }
+        // "MyFunc" isn't refcounted by name at all (ordinary named
+        // functions live for the script's whole lifetime once
+        // defined) - func_ref/func_unref were both no-ops.
+        assert_eq!(fp.uf_refcount, 1);
+    }
+
+    #[test]
     fn tv_dict_find_returns_none_for_missing_key_and_none_dict() {
         let _lock = crate::globals::global_state_test_lock();
         let d = tv_dict_alloc();
@@ -2149,12 +2223,39 @@ mod tests {
             pt_func: &mut fp as *mut crate::eval::typval_defs::UfuncT,
             ..Default::default()
         }));
-        // pt_name is present - the original's func_unref(pt_name)
-        // branch would run instead of func_ptr_unref(pt_func), and
-        // that string-based lookup is still deferred (needs
-        // func_hashtab) - fp's own refcount must stay untouched here.
+        // pt_name is present ("MyFunc" - an ordinary named function,
+        // not a numbered function or lambda) - the real func_unref
+        // runs, but func_name_refcount("MyFunc") is false (only
+        // numbered functions/lambdas are refcounted by name), so it
+        // returns immediately without touching fp at all. fp's own
+        // refcount must stay untouched here - see the sibling test
+        // below for the case where func_unref DOES fire.
         unsafe { partial_unref(pt) };
         assert_eq!(fp.uf_refcount, 2);
+    }
+
+    #[test]
+    fn partial_unref_releases_by_name_when_pt_name_is_a_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 2,
+            uf_name: b"123\0".to_vec(),
+            ..Default::default()
+        };
+        let fp_ptr = &mut fp as *mut crate::eval::typval_defs::UfuncT;
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp_ptr) };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"123".to_vec()),
+            pt_func: std::ptr::null_mut(),
+            ..Default::default()
+        }));
+        // pt_name is present AND a numbered function ("123") - the
+        // real func_unref looks it up via find_func (registered above)
+        // and decrements ITS refcount for real (2 -> 1).
+        unsafe { partial_unref(pt) };
+        assert_eq!(fp.uf_refcount, 1);
     }
 
     #[test]

@@ -7,10 +7,7 @@
 //!
 //! Translated: `func_ptr_ref`/`func_ptr_unref` - the two `ufunc_T`
 //! reference-counting primitives that operate directly on a
-//! `ufunc_T*`, needing neither `func_hashtab` nor a function *name*
-//! (unlike their string-based siblings `func_ref`/`func_unref`, which
-//! both need `func_name_refcount` - not translated, needs more of the
-//! function-lookup-by-string machinery than `find_func` alone).
+//! `ufunc_T*`.
 //!
 //! Also translated: `func_hashtab` itself (the file-static registry of
 //! all named functions, keyed by `uf_name`), `func_init`,
@@ -21,6 +18,26 @@
 //! is an owned `Vec<u8>` here, not a true C flexible array member, so
 //! `HIKEY2UF`'s pointer-arithmetic recovery has no safe Rust
 //! equivalent).
+//!
+//! Also translated: `func_name_refcount`, `func_ref`/`func_unref` (the
+//! string-based siblings of `func_ptr_ref`/`func_ptr_unref` - only
+//! numbered functions (`"123"`) and lambdas (`"<lambda>42"`) are
+//! genuinely refcounted BY NAME; ordinary named functions aren't, so
+//! these are usually no-ops). Both `name` parameters are bare bytes
+//! with NO trailing NUL (matching `find_func`'s own convention, NOT
+//! `UfuncT.uf_name`'s NUL-terminated storage form - callers reading a
+//! name out of `uf_name` must strip the trailing NUL first, exactly
+//! like `eval/typval.rs`'s `tv_dict_item_remove` already does for the
+//! analogous `DictitemT.di_key` case). The original's
+//! `internal_error("func_ref()")`/`internal_error("func_unref()")` -
+//! reached only when a NUMBERED function reference has no backing
+//! `UfuncT`, a genuine "should never happen" condition - become
+//! `debug_assert!`s, matching this crate's established policy for
+//! internal invariant violations (e.g. `mf_put`). The original's
+//! further `EXITFREE`-build/`entered_free_all_mem`-shutdown carve-out
+//! (which downgrades `func_unref`'s case from an abort to a silent
+//! no-op specifically during process teardown) has no equivalent here
+//! - this crate has no such shutdown-tracking state - so it's moot.
 //!
 //! `func_ptr_unref`'s "reference count hit zero, and the function
 //! isn't mid-call" branch (`func_clear_free`) is `unimplemented!()`:
@@ -34,6 +51,7 @@
 //! core, defer the exact unreachable branch" pattern already used
 //! elsewhere in this crate (e.g. `mark.c`'s `get_global_marks`).
 
+use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::UfuncT;
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
@@ -161,6 +179,59 @@ pub unsafe fn func_remove(fp: *mut UfuncT) -> bool {
     table.ht.hash_remove(name);
     table.index.remove(&key_ptr);
     true
+}
+
+/// Whether a function name is genuinely refcounted BY NAME
+/// (`func_name_refcount`): numbered functions (`"123"`) and lambdas
+/// (`"<lambda>42"`) are; an ordinary named function's `ufunc_T` lives
+/// for the whole script's lifetime once defined, so it isn't.
+fn func_name_refcount(name: &[u8]) -> bool {
+    match name.first() {
+        Some(&b) => ascii_isdigit(b as i32) || (b == b'<' && name.get(1) == Some(&b'l')),
+        None => false,
+    }
+}
+
+/// Count a reference to a Function (`func_ref`) - the string-based
+/// sibling of [`func_ptr_ref`]. See this module's own doc comment for
+/// `name`'s expected bare-bytes form and the `debug_assert!`
+/// translation policy for the original's internal-error report.
+pub fn func_ref(name: Option<&[u8]>) {
+    let Some(name) = name else { return };
+    if !func_name_refcount(name) {
+        return;
+    }
+    let fp = find_func(name);
+    if !fp.is_null() {
+        // SAFETY: `find_func` only ever returns a pointer it looked up
+        // from `FUNC_HASHTAB`'s own table, or null.
+        unsafe { func_ptr_ref(fp) };
+    } else {
+        debug_assert!(
+            !ascii_isdigit(name[0] as i32),
+            "func_ref: numbered function not found - internal error (original: func_ref())"
+        );
+    }
+}
+
+/// Unreference a Function (`func_unref`) - the string-based sibling of
+/// [`func_ptr_unref`]. See this module's own doc comment for `name`'s
+/// expected bare-bytes form and the `debug_assert!` translation policy
+/// for the original's internal-error report.
+pub fn func_unref(name: Option<&[u8]>) {
+    let Some(name) = name else { return };
+    if !func_name_refcount(name) {
+        return;
+    }
+    let fp = find_func(name);
+    debug_assert!(
+        !(fp.is_null() && ascii_isdigit(name[0] as i32)),
+        "func_unref: numbered function not found - internal error (original: func_unref())"
+    );
+    // SAFETY: `fp` is either null (func_ptr_unref's own null check
+    // handles this, matching the original's own unconditional call)
+    // or a valid pointer just looked up from `FUNC_HASHTAB`'s table.
+    unsafe { func_ptr_unref(fp) };
 }
 
 /// Count a reference to a function (`func_ptr_ref`).
@@ -332,5 +403,86 @@ mod tests {
         let ht_ptr = func_tbl_get();
         assert!(!ht_ptr.is_null());
         assert_eq!(unsafe { (*ht_ptr).ht_used }, 1);
+    }
+
+    #[test]
+    fn func_name_refcount_true_for_numbered_and_lambda_names() {
+        assert!(func_name_refcount(b"123"));
+        assert!(func_name_refcount(b"<lambda>42"));
+    }
+
+    #[test]
+    fn func_name_refcount_false_for_ordinary_names_and_empty() {
+        assert!(!func_name_refcount(b"MyFunc"));
+        assert!(!func_name_refcount(b""));
+        // '<' alone, without a following 'l', doesn't count either.
+        assert!(!func_name_refcount(b"<SNR>1_Foo"));
+    }
+
+    #[test]
+    fn func_ref_none_is_noop() {
+        func_ref(None);
+    }
+
+    #[test]
+    fn func_ref_ordinary_name_is_noop_even_if_unregistered() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        // "MyFunc" isn't refcounted by name at all - must return
+        // immediately without ever calling find_func/debug_assert!.
+        func_ref(Some(b"MyFunc"));
+    }
+
+    #[test]
+    fn func_ref_increments_refcount_for_a_registered_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp = Box::new(UfuncT { uf_name: b"42\0".to_vec(), uf_refcount: 1, ..Default::default() });
+        let fp_ptr = fp.as_mut() as *mut UfuncT;
+        unsafe { func_hashtab_add(fp_ptr) };
+        func_ref(Some(b"42"));
+        assert_eq!(fp.uf_refcount, 2);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "func_ref: numbered function not found")]
+    fn func_ref_panics_for_unregistered_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        func_ref(Some(b"999"));
+    }
+
+    #[test]
+    fn func_unref_none_is_noop() {
+        func_unref(None);
+    }
+
+    #[test]
+    fn func_unref_ordinary_name_is_noop_even_if_unregistered() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        func_unref(Some(b"MyFunc"));
+    }
+
+    #[test]
+    fn func_unref_decrements_refcount_for_a_registered_lambda() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp =
+            Box::new(UfuncT { uf_name: b"<lambda>1\0".to_vec(), uf_refcount: 2, ..Default::default() });
+        let fp_ptr = fp.as_mut() as *mut UfuncT;
+        unsafe { func_hashtab_add(fp_ptr) };
+        func_unref(Some(b"<lambda>1"));
+        assert_eq!(fp.uf_refcount, 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "func_unref: numbered function not found")]
+    fn func_unref_panics_for_unregistered_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        func_unref(Some(b"999"));
     }
 }
