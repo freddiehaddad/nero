@@ -6,10 +6,10 @@
 //! by value (`scriptvar_T.sv_dict: dict_T`) - needs the eval engine's
 //! `typval_T` as a unit (phase 5), same blocker as `tabpage_S`.
 
-use crate::eval::typval_defs::SctxT;
+use crate::eval::typval_defs::{SctxT, UfuncT};
 use crate::ex_eval_defs::ExceptT;
 use crate::pos_defs::LinenrT;
-use crate::types_defs::{AutoPatCmdT, UfuncT};
+use crate::types_defs::AutoPatCmdT;
 
 /// Discriminant for [`EstackT::es_info`] (`etype_T`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

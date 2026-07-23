@@ -26,11 +26,15 @@
 //!
 //! Deferred (fields whose type is itself not yet translatable):
 //! `scriptvar_T`/`dict_T`-by-value fields don't appear directly in this
-//! header, but `tabpage_T`/`ufunc_T`/`AutoPatCmd`/`regmatch_T`/`Loop`
-//! pointers use this crate's existing opaque placeholders (see
-//! `types_defs.rs`) exactly as the original only ever references them
-//! through a pointer here too - nothing in `globals.h` itself embeds one
-//! of those by value, so no field had to be dropped.
+//! header. `tabpage_T`/`ufunc_T` are no longer opaque placeholders
+//! (translated for real as `crate::buffer_defs::TabpageT`/
+//! `crate::eval::typval_defs::UfuncT` respectively) - `first_tabpage`/
+//! `curtab`/`lastused_tabpage` below already use the real `TabpageT`.
+//! Any remaining `AutoPatCmd`/`regmatch_T`/`Loop` pointers would use
+//! this crate's existing opaque placeholders (see `types_defs.rs`)
+//! exactly as the original only ever references them through a pointer
+//! here too - nothing in `globals.h` itself embeds one of those by
+//! value, so no field had to be dropped.
 //!
 //! Every one of the original's 248 `EXTERN` declarations (246 plain
 //! variables plus the two anonymous-struct instances `g_stats`/

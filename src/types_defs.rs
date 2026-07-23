@@ -96,7 +96,6 @@ pub const SIGN_WIDTH: i32 = 2;
 //   mapblock_T  -> struct mapblock,    src/nvim/mapping_defs.h  (phase 7)
 //   matchitem_T -> struct matchitem,   src/nvim/buffer_defs.h   (phase 7,
 //                                      needs regmmatch_T)
-//   ufunc_T     -> struct ufunc_S,     src/nvim/eval/userfunc.h (phase 5)
 //   AutoPatCmd  -> struct AutoPatCmd_S, src/nvim/autocmd_defs.h (phase 6)
 // (mapblock_T/qf_info_T/matchitem_T are actually forward-declared in their
 // own headers, not types_defs.h itself, unlike the others above - but this
@@ -114,7 +113,15 @@ pub const SIGN_WIDTH: i32 = 2;
 // matches this crate's "prefer the real typedef name" convention, e.g.
 // `wininfo_S` -> `WinInfo`). tabpage_T (struct tabpage_S) is likewise no
 // longer a placeholder: now that dict_T has real fields, it is translated
-// for real as `crate::buffer_defs::TabpageT`.
+// for real as `crate::buffer_defs::TabpageT`. ufunc_T (struct ufunc_S) is
+// likewise no longer a placeholder: it has no flexible-array-member
+// complication of its own (unlike dictitem_T/its own uf_name field, which
+// is instead an owned Vec<u8> here, same treatment), and is translated for
+// real as `crate::eval::typval_defs::UfuncT` (its own home, alongside
+// `PartialT`/`DictT`/`ListT` - the rest of the eval engine's value types -
+// rather than here, since it is eval-engine-scoped, not a cross-cutting
+// type genuinely needed by unrelated subsystems the way the others above
+// still are).
 
 /// Placeholder for `Loop` (`struct loop`) - see `src/nvim/event/loop.h` (phase 11).
 pub struct LoopT {
@@ -144,11 +151,6 @@ pub struct MapblockT {
 /// `src/nvim/buffer_defs.h` (phase 7: needs `regmmatch_T`, same blocker as
 /// `match_T`/`llpos_T`, which are deferred for the same reason).
 pub struct MatchitemT {
-    _private: (),
-}
-/// Placeholder for `ufunc_T` (`struct ufunc_S`) - see
-/// `src/nvim/eval/userfunc.h` (phase 5).
-pub struct UfuncT {
     _private: (),
 }
 /// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see

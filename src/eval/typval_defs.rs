@@ -56,28 +56,32 @@
 //! (`tv_dict_alloc`, `tv_dict_find`, etc.) live in `eval/typval.rs`,
 //! translated from `eval/typval.c`.
 //!
-//! `ufunc_T`/`funccall_T`'s own real fields remain deferred - both
-//! need their own dedicated design pass for `ufunc_T.uf_name`'s C
-//! flexible-array-member (the same class of problem `dictitem_T`'s
-//! `di_key` already solved, likely via the same "owned `Vec<u8>` +
-//! side-table" technique), and `funccall_T` additionally embeds
-//! `dict_T`/`list_T` *by value* (not by pointer, unlike every other
-//! use of those types in this crate so far) - a new situation deserving
-//! its own careful design, not rushed alongside `partial_T` below.
-//! `ufunc_T` stays an opaque placeholder (same convention as
-//! `types_defs.rs`'s cross-cutting placeholder list) for exactly this
-//! reason.
+//! `ufunc_T` (as [`UfuncT`]) now has its real fields too - unlike
+//! `dictitem_T`'s `di_key`, `uf_name` needed no side-table design of
+//! its OWN struct shape (that complexity lives in `HIKEY2UF`'s pointer-
+//! arithmetic recovery from a *hashtable* keyed by `uf_name`, which is
+//! `eval/userfunc.c`'s `func_hashtab` - a file-static, not part of
+//! `ufunc_T` itself, and not yet translated; when it is, it will need
+//! its own `DictT.dv_index`-style side table). `uf_name`/`uf_namelen`
+//! (the flexible array member) simply collapse into one owned
+//! `Vec<u8>`, matching `DictitemT.di_key`'s established treatment.
+//! `funccall_T` (as [`FunccallT`]) remains its own opaque placeholder -
+//! it additionally embeds `dict_T`/`list_T` *by value* (not by pointer,
+//! unlike every other use of those types in this crate so far), a new
+//! situation deserving its own careful design pass, not rushed
+//! alongside `ufunc_T`. `UfuncT.uf_scoped: *mut FunccallT` (and
+//! `PartialT.pt_func: *mut UfuncT` below) reference their respective
+//! placeholder/real types directly - a raw pointer to an opaque/
+//! zero-sized placeholder type is still a perfectly well-formed Rust
+//! type, so neither struct's own real fields need to wait on the
+//! other's.
 //!
-//! `partial_T` (as [`PartialT`]), unlike `ufunc_T`, has NO flexible-
-//! array-member of its own and needed no design decision beyond the
-//! already-established conventions: `pt_func: *mut UfuncT` references
-//! `crate::types_defs::UfuncT`'s still-opaque placeholder directly (a
-//! raw pointer to an opaque/zero-sized type is a perfectly well-formed
-//! Rust type, so `partial_T`'s own fields don't need to wait on
-//! `ufunc_T`'s real ones), and `pt_argv` (the original's allocated
-//! `typval_T *` + `pt_argc` pair) collapses into a plain `Vec<TypvalT>`
-//! (its own `.len()` replacing `pt_argc`), matching this crate's usual
-//! "owned `Vec` instead of allocated-array-plus-count" convention. The
+//! `partial_T` (as [`PartialT`]) had NO flexible-array-member of its
+//! own and needed no design decision beyond the already-established
+//! conventions: `pt_argv` (the original's allocated `typval_T *` +
+//! `pt_argc` pair) collapses into a plain `Vec<TypvalT>` (its own
+//! `.len()` replacing `pt_argc`), matching this crate's usual "owned
+//! `Vec` instead of allocated-array-plus-count" convention. The
 //! allocation/refcounting *functions* (`partial_free`/`partial_unref`)
 //! live in `eval/typval.rs` alongside their sibling `tv_*_free`/`_unref`
 //! functions, even though `partial_T`'s real home in the original is
@@ -324,13 +328,6 @@ pub struct ListT {
 /// bound to some arguments and/or a `self` dict (`partial_S` /
 /// `partial_T`).
 ///
-/// `pt_func: *mut UfuncT` references `crate::types_defs::UfuncT`, which
-/// remains its own opaque placeholder (`ufunc_T`'s real fields need
-/// their own dedicated design pass for `uf_name`'s C flexible-array-
-/// member, the same class of problem `dictitem_T`'s `di_key` already
-/// solved - not yet undertaken) - a raw pointer to an opaque/
-/// zero-sized placeholder type is still a perfectly well-formed Rust
-/// type, so `partial_T`'s own real fields don't need to wait for that.
 /// `pt_argv` (the original's allocated `typval_T *`+`pt_argc` pair) is
 /// a plain `Vec<TypvalT>` here, matching this crate's usual "owned
 /// `Vec` instead of allocated-array-plus-count" convention - its own
@@ -345,7 +342,7 @@ pub struct PartialT {
     pub pt_name: Option<Vec<u8>>,
     /// Function pointer; when null, look up the function with
     /// `pt_name` instead (`pt_func`).
-    pub pt_func: *mut crate::types_defs::UfuncT,
+    pub pt_func: *mut UfuncT,
     /// `true` when this partial was created via `dict.member` in
     /// `handle_subscript()` (`pt_auto`).
     pub pt_auto: bool,
@@ -354,6 +351,111 @@ pub struct PartialT {
     pub pt_argv: Vec<TypvalT>,
     /// Dict for `self` (`pt_dict`).
     pub pt_dict: *mut DictT,
+}
+
+/// Structure to hold info for a user function (`ufunc_S` / `ufunc_T`).
+///
+/// `uf_name`/`uf_namelen` (the original's C flexible array member,
+/// `char uf_name[]`) collapse into one owned `Vec<u8>` here - same "no
+/// safe Rust equivalent for a C flexible array member" reasoning as
+/// `DictitemT.di_key`'s own doc comment (see `HIKEY2UF`'s
+/// `hi_key - offsetof(ufunc_T, uf_name)` pointer-arithmetic recovery,
+/// exactly analogous to `TV_DICT_HI2DI`) - `uf_name`'s own `.len()`
+/// replaces `uf_namelen`. `eval/userfunc.c`'s `func_hashtab` (a
+/// file-static `hashtab_T` of all named user functions, keyed by
+/// `uf_name`) will need its own side-table when that file is
+/// eventually translated, matching `DictT.dv_index`'s already-
+/// established precedent for the exact same problem.
+///
+/// `uf_tml_count`/`uf_tml_total`/`uf_tml_self` (the original's 3
+/// parallel allocated arrays, one entry per function line, for
+/// per-line `:profile` timing) collapse into 3 plain `Vec`s, matching
+/// this crate's usual "owned `Vec` instead of allocated-array" rule.
+///
+/// `uf_scoped: *mut FunccallT` references [`FunccallT`], which remains
+/// its own opaque placeholder - `funccall_T`'s own real fields are a
+/// separate, larger undertaking (it embeds `dict_T`/`list_T` **by
+/// value**, not by pointer like every other use of those types in this
+/// crate, a new situation deserving its own careful design pass) - a
+/// raw pointer to an opaque/zero-sized placeholder type is still a
+/// perfectly well-formed Rust type, so `ufunc_T`'s own real fields
+/// don't need to wait for that, the same reasoning that already let
+/// `partial_T`'s real fields exist before `ufunc_T`'s did.
+#[derive(Debug, Default)]
+pub struct UfuncT {
+    /// variable nr of arguments (`uf_varargs`).
+    pub uf_varargs: i32,
+    pub uf_flags: i32,
+    /// nr of active calls (`uf_calls`).
+    pub uf_calls: i32,
+    /// `func_clear()` was already called (`uf_cleared`).
+    pub uf_cleared: bool,
+    /// arguments, including optional arguments (`uf_args`).
+    pub uf_args: crate::garray_defs::GarrayT,
+    /// default argument expressions (`uf_def_args`).
+    pub uf_def_args: crate::garray_defs::GarrayT,
+    /// function lines (`uf_lines`).
+    pub uf_lines: crate::garray_defs::GarrayT,
+    /// `true` when func is being profiled (`uf_profiling`).
+    pub uf_profiling: i32,
+    pub uf_prof_initialized: i32,
+    /// lua callback, used if `uf_flags & FC_LUAREF` (`uf_luaref`).
+    pub uf_luaref: LuaRef,
+    // Profiling the function as a whole.
+    /// nr of calls (`uf_tm_count`).
+    pub uf_tm_count: i32,
+    /// time spent in function + children (`uf_tm_total`).
+    pub uf_tm_total: crate::types_defs::ProftimeT,
+    /// time spent in function itself (`uf_tm_self`).
+    pub uf_tm_self: crate::types_defs::ProftimeT,
+    /// time spent in children this call (`uf_tm_children`).
+    pub uf_tm_children: crate::types_defs::ProftimeT,
+    // Profiling the function per line.
+    /// nr of times each line was executed (`uf_tml_count`).
+    pub uf_tml_count: Vec<i32>,
+    /// time spent in each line + children (`uf_tml_total`).
+    pub uf_tml_total: Vec<crate::types_defs::ProftimeT>,
+    /// time spent in each line itself (`uf_tml_self`).
+    pub uf_tml_self: Vec<crate::types_defs::ProftimeT>,
+    /// start time for current line (`uf_tml_start`).
+    pub uf_tml_start: crate::types_defs::ProftimeT,
+    /// time spent in children for this line (`uf_tml_children`).
+    pub uf_tml_children: crate::types_defs::ProftimeT,
+    /// start wait time for current line (`uf_tml_wait`).
+    pub uf_tml_wait: crate::types_defs::ProftimeT,
+    /// index of line being timed; -1 if none (`uf_tml_idx`).
+    pub uf_tml_idx: i32,
+    /// line being timed was executed (`uf_tml_execed`).
+    pub uf_tml_execed: i32,
+    /// `SCTX` where function was defined, used for `s:` variables
+    /// (`uf_script_ctx`).
+    pub uf_script_ctx: SctxT,
+    /// reference count, see `func_name_refcount()` (`uf_refcount`).
+    pub uf_refcount: i32,
+    /// `l:` local variables for closure (`uf_scoped`).
+    pub uf_scoped: *mut FunccallT,
+    /// If `uf_name` starts with `SNR`, the name with `<SNR>` as a
+    /// string, otherwise `None` (`uf_name_exp`).
+    pub uf_name_exp: Option<Vec<u8>>,
+    /// Name of function - collapses the original's `uf_namelen` +
+    /// flexible array member `uf_name[]` into one owned `Vec<u8>` (see
+    /// this struct's own doc comment); can start with `<SNR>123_`
+    /// (`<SNR>` is `K_SPECIAL KS_EXTRA KE_SNR`) (`uf_name`).
+    pub uf_name: Vec<u8>,
+}
+
+/// Placeholder for `funccall_T` (`struct funccall_S`) - structure to
+/// hold info for a function that is currently being executed. Needs
+/// its own dedicated design pass: unlike every other use of `dict_T`/
+/// `list_T` in this crate (always behind a pointer, heap-allocated via
+/// `Box::into_raw`), `funccall_T` embeds `fc_l_vars`/`fc_l_avars:
+/// dict_T` and `fc_l_varlist: list_T` **by value** as sub-objects, plus
+/// a `MAX_FUNC_ARGS`-sized array of `listitem_T`/`TV_DICTITEM_STRUCT`
+/// fixed-size dict items for its `a:`/argument-list scope - a genuinely
+/// new situation (`eval/typval_defs.h`'s own `struct funccall_S`, see
+/// `eval/userfunc.h`).
+pub struct FunccallT {
+    _private: (),
 }
 
 /// Structure to hold info about a Blob (`blobvar_S` / `blob_T`).
@@ -689,6 +791,43 @@ mod tests {
         assert!(!pt.pt_auto);
         assert!(pt.pt_argv.is_empty());
         assert!(pt.pt_dict.is_null());
+    }
+
+    #[test]
+    fn ufunc_t_default_is_zeroed_with_null_pointers_and_empty_name() {
+        let uf = UfuncT::default();
+        assert_eq!(uf.uf_varargs, 0);
+        assert_eq!(uf.uf_flags, 0);
+        assert_eq!(uf.uf_calls, 0);
+        assert!(!uf.uf_cleared);
+        assert_eq!(uf.uf_args.ga_len, 0);
+        assert_eq!(uf.uf_def_args.ga_len, 0);
+        assert_eq!(uf.uf_lines.ga_len, 0);
+        assert_eq!(uf.uf_profiling, 0);
+        assert_eq!(uf.uf_luaref, 0);
+        assert_eq!(uf.uf_tm_count, 0);
+        assert!(uf.uf_tml_count.is_empty());
+        assert!(uf.uf_tml_total.is_empty());
+        assert!(uf.uf_tml_self.is_empty());
+        assert_eq!(uf.uf_tml_idx, 0);
+        assert_eq!(uf.uf_script_ctx, SctxT::default());
+        assert_eq!(uf.uf_refcount, 0);
+        assert!(uf.uf_scoped.is_null());
+        assert!(uf.uf_name_exp.is_none());
+        assert!(uf.uf_name.is_empty());
+    }
+
+    #[test]
+    fn ufunc_t_can_be_linked_via_uf_scoped_raw_pointer() {
+        // uf_scoped: *mut FunccallT is just a raw pointer to an opaque
+        // placeholder - confirm it's usable as an ordinary raw pointer
+        // (assigning/reading its null-ness) without needing FunccallT's
+        // real fields at all.
+        let mut uf = UfuncT { uf_name: b"MyFunc".to_vec(), ..Default::default() };
+        assert!(uf.uf_scoped.is_null());
+        uf.uf_scoped = std::ptr::null_mut();
+        assert!(uf.uf_scoped.is_null());
+        assert_eq!(uf.uf_name, b"MyFunc");
     }
 
     #[test]
