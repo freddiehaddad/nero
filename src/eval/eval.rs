@@ -136,19 +136,39 @@
 //!   directly. `bytes_consumed` is well-defined as `0` on `FAIL`,
 //!   matching the original's own "`*arg` only advances on success"
 //!   structure.
+//! - [`eval_lit_string`] (+ a private `find_lit_string_close_quote`
+//!   helper): parses a `'str''ing'` literal
+//!   (single-quoted, `''` reducing to a literal `'`). Deliberately
+//!   scans/copies at the byte level rather than replicating the
+//!   original's multi-byte-character-aware pointer walk - see its own
+//!   doc comment for why this is provably equivalent for well-formed
+//!   UTF-8 input (`'` can never appear as part of a multi-byte
+//!   sequence). Only the `interpolate = false` case is modeled
+//!   (`eval7`'s own only call site) - see its own doc comment.
 //!
 //! Deferred: everything else - the actual parser/lvalue/loop/call
 //! machinery is a separate, substantial undertaking of its own. In
 //! particular, `eval7` itself is not yet translated: it still needs
-//! `eval_string`/`eval_lit_string` (quoted string literals),
-//! `eval_list`/`eval_dict`/`eval_lit_dict` (list/dict literals),
-//! `get_lambda_tv` (lambda expressions), `eval_option` (needs the real
-//! `options[]` table, a separate MAJOR undertaking), `eval_env_var`/
-//! `eval_interp_string` (`$VAR`/interpolated strings), `get_reg_contents`
-//! (`@register`, needs `register.c`), `get_name_len`/`eval_func`/
-//! `eval_variable` (variable/function-name lookup, needs the funccal
-//! stack), and `handle_subscript` (`[...]`/`.`/`->`/`(...)` chaining) -
-//! before it can itself be translated even partially.
+//! `eval_string` (double-quoted string literals - genuinely more
+//! involved than `eval_lit_string` above: its `\x`/`\u`/`\U`/octal
+//! escapes are tractable already via `mbyte.rs`'s real
+//! `utf_char2bytes`, but its `\<C-W>`-style special-key escape needs
+//! `trans_special`/`find_special_key`, which need the ENTIRE
+//! `keycodes.c` subsystem - key-name tables, modifier parsing, a
+//! whole generated `keycode_names.generated.h` - a substantial,
+//! separate undertaking of its own, not a small add-on; deliberately
+//! not attempted partially here since `\<...>` escapes are common
+//! enough in real Vimscript that skipping them would be a real,
+//! user-visible gap, not a provably-unreachable-today one like this
+//! module's other deferrals), `eval_list`/`eval_dict`/`eval_lit_dict`
+//! (list/dict literals), `get_lambda_tv` (lambda expressions),
+//! `eval_option` (needs the real `options[]` table, a separate MAJOR
+//! undertaking), `eval_env_var`/`eval_interp_string` (`$VAR`/
+//! interpolated strings), `get_reg_contents` (`@register`, needs
+//! `register.c`), `get_name_len`/`eval_func`/`eval_variable`
+//! (variable/function-name lookup, needs the funccal stack), and
+//! `handle_subscript` (`[...]`/`.`/`->`/`(...)` chaining) - before it
+//! can itself be translated even partially.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
@@ -951,6 +971,84 @@ pub fn eval_number(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, want_string:
         }
         (crate::vim_defs::OK, len as usize)
     }
+}
+
+/// Scans `arg` (assumed to start at the opening `'`) for the byte
+/// offset of the closing, un-escaped `'`, treating `''` as an escaped
+/// literal quote - shared by both of [`eval_lit_string`]'s own passes
+/// (first: "is this a valid, closed literal string, and how long is
+/// it"; second, only when `evaluate`: "copy its content"). Returns
+/// `None` if no closing quote is found before the end of `arg`.
+fn find_lit_string_close_quote(arg: &[u8]) -> Option<usize> {
+    let mut p = 1;
+    loop {
+        match arg.get(p)? {
+            b'\'' => {
+                if arg.get(p + 1) != Some(&b'\'') {
+                    return Some(p);
+                }
+                p += 2;
+            }
+            _ => p += 1,
+        }
+    }
+}
+
+/// Allocate a variable for a `'str''ing'` constant (`eval_lit_string`).
+///
+/// Only the `interpolate = false` case (`eval7`'s own only call site)
+/// is translated - the original's `interpolate = true` branches
+/// (handling `{`/`}` for string interpolation) are dead code for that
+/// caller and aren't modeled here; a real caller needing
+/// `interpolate = true` would need `eval_interp_string`, not yet
+/// translated, anyway.
+///
+/// Scans/copies at the BYTE level (see `find_lit_string_close_quote`)
+/// rather than replicating the original's own multi-byte-character-
+/// aware `MB_PTR_ADV`/`mb_copy_char` walk: `'` (0x27) is a plain ASCII
+/// byte, and valid UTF-8 continuation/lead bytes are always `>= 0x80`,
+/// so a raw `'` byte can never appear as part of a multi-byte
+/// sequence - a byte-level scan finds the exact same quote positions,
+/// and a byte-level copy produces byte-identical output, as the
+/// original's character-aware walk would for any well-formed UTF-8
+/// input.
+///
+/// Returns the parse status (`OK`/`FAIL`) and the number of bytes of
+/// `arg` consumed (matching this module's own `eval_number`/
+/// `eval7_leader` "return updated position info" idiom); well-defined
+/// as `0` on `FAIL`.
+///
+/// # Deferred
+/// The real `semsg(_("E115: Missing quote: %s"), *arg)` call on the
+/// "no closing quote" error path is omitted - needs `message.c`'s
+/// display pipeline - while the identical `FAIL` status is kept,
+/// matching this crate's established "skip the display, keep the
+/// state" policy.
+#[must_use]
+pub fn eval_lit_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
+    let Some(close) = find_lit_string_close_quote(arg) else {
+        return (crate::vim_defs::FAIL, 0);
+    };
+
+    if !evaluate {
+        return (crate::vim_defs::OK, close + 1);
+    }
+
+    let mut s = Vec::with_capacity(close.saturating_sub(1));
+    let mut q = 1;
+    while q < close {
+        // Any `'` seen here (before reaching `close`, the position of
+        // the real closing quote) must be the first half of an
+        // escaped "''" pair - skip it, keeping only the second `'` as
+        // a literal character.
+        if arg[q] == b'\'' {
+            q += 1;
+        }
+        s.push(arg[q]);
+        q += 1;
+    }
+    rettv.value = TypvalValue::String(Some(s));
+    (crate::vim_defs::OK, close + 1)
 }
 
 #[cfg(test)]
@@ -1789,5 +1887,84 @@ mod tests {
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 6);
         assert!(matches!(tv.value, TypvalValue::Unknown));
+    }
+
+    #[test]
+    fn eval_lit_string_parses_simple_literal() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'hello'", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 7);
+        assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"hello"));
+    }
+
+    #[test]
+    fn eval_lit_string_reduces_escaped_quote_pair() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 8);
+        assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"ab'cd"));
+    }
+
+    #[test]
+    fn eval_lit_string_handles_multiple_escaped_quote_pairs() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"''''''", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 6);
+        assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"''"));
+    }
+
+    #[test]
+    fn eval_lit_string_empty_literal() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"''", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 2);
+        assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s.is_empty()));
+    }
+
+    #[test]
+    fn eval_lit_string_stops_at_first_unescaped_quote_leaving_trailer() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'abc' . 'def'", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 5);
+        assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"abc"));
+    }
+
+    #[test]
+    fn eval_lit_string_missing_closing_quote_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'abc", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::FAIL);
+        assert_eq!(len, 0);
+        assert!(matches!(tv.value, TypvalValue::Unknown));
+    }
+
+    #[test]
+    fn eval_lit_string_missing_closing_quote_after_escaped_pair_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'ab''", &mut tv, true);
+        assert_eq!(ret, crate::vim_defs::FAIL);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn eval_lit_string_evaluate_false_still_computes_length_but_not_value() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, false);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(len, 8);
+        assert!(matches!(tv.value, TypvalValue::Unknown));
+    }
+
+    #[test]
+    fn eval_lit_string_evaluate_false_on_unclosed_string_still_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, len) = eval_lit_string(b"'abc", &mut tv, false);
+        assert_eq!(ret, crate::vim_defs::FAIL);
+        assert_eq!(len, 0);
     }
 }
