@@ -25,8 +25,22 @@
 //! engine that calls them" pattern (e.g. `option_defs.rs`'s `OptIndex`
 //! before the real `options[]` engine).
 //!
+//! Also translated: `eval_addblob` - tractable once `eval/typval.rs`
+//! gained `tv_blob_len`/`tv_blob_set_ret` (`eval/typval.h`'s own
+//! `static inline` helpers, harvested alongside this function since it
+//! was their only caller). Like all the `eval_add*`/`eval_*div*`
+//! sibling functions in this file, it takes ALREADY-typed-and-evaluated
+//! operands - the caller (`eval5`, not yet translated) is responsible
+//! for checking both are `Blob`-typed before calling this; that
+//! precondition is documented, not re-checked here, matching the
+//! original's own lack of a runtime type check at this layer.
+//!
 //! Deferred: everything else - the actual parser/lvalue/loop/call
-//! machinery is a separate, substantial undertaking of its own.
+//! machinery is a separate, substantial undertaking of its own. The
+//! remaining "leaf" arithmetic helpers (`eval_addlist` needs
+//! `tv_list_concat`, not yet translated; `eval_concat_str`/
+//! `grow_string_tv`/`eval_addsub_number`/`eval_multdiv_number` are
+//! reasonable next candidates) are not yet examined in detail.
 
 use crate::eval::typval_defs::{VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
@@ -69,6 +83,65 @@ pub fn num_modulus(n1: VarnumberT, n2: VarnumberT) -> VarnumberT {
     } else {
         n1 % n2
     }
+}
+
+/// Concatenate blobs `tv1` and `tv2` and store the result in `tv1`
+/// (`eval_addblob`).
+///
+/// # Safety
+/// `tv1`/`tv2` must both be `TypvalValue::Blob`-typed (matching the
+/// original's own contract - the caller, Vimscript's `+` operator
+/// dispatch in `eval5`, not yet translated, is responsible for
+/// checking this BEFORE calling); any non-null blob pointer they hold
+/// must be valid.
+pub unsafe fn eval_addblob(
+    tv1: &mut crate::eval::typval_defs::TypvalT,
+    tv2: &crate::eval::typval_defs::TypvalT,
+) {
+    use crate::eval::typval::{tv_blob_alloc, tv_blob_len, tv_blob_set_ret};
+    use crate::eval::typval_defs::TypvalValue;
+
+    let TypvalValue::Blob(b1) = tv1.value else {
+        unreachable!("eval_addblob: tv1 must be Blob-typed (caller's own contract)")
+    };
+    let TypvalValue::Blob(b2) = tv2.value else {
+        unreachable!("eval_addblob: tv2 must be Blob-typed (caller's own contract)")
+    };
+    let b = tv_blob_alloc();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let len1 = unsafe { tv_blob_len(b1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len2 = unsafe { tv_blob_len(b2) };
+    let totallen = i64::from(len1) + i64::from(len2);
+
+    if (0..=i64::from(i32::MAX)).contains(&totallen) {
+        // SAFETY: `b` was just allocated via `tv_blob_alloc` above.
+        let blob = unsafe { &mut *b };
+        blob.bv_ga.ga_grow(totallen as i32);
+        if len1 > 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let b1_ref = unsafe { &*b1 };
+            let src1 = b1_ref.bv_ga.ga_data[..len1 as usize].to_vec();
+            blob.bv_ga.ga_data[..len1 as usize].copy_from_slice(&src1);
+        }
+        if len2 > 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let b2_ref = unsafe { &*b2 };
+            let src2 = b2_ref.bv_ga.ga_data[..len2 as usize].to_vec();
+            blob.bv_ga.ga_data[len1 as usize..(len1 + len2) as usize].copy_from_slice(&src2);
+        }
+        blob.bv_ga.ga_len = totallen as i32;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc - `b1` (if
+    // non-null) is a valid pointer to release; releasing it directly
+    // via `tv_blob_unref` rather than the crate's generic (and
+    // private) `tv_clear_simple` dispatcher, since `tv1` is already
+    // known to be `Blob`-typed from the pattern match above.
+    unsafe { crate::eval::typval::tv_blob_unref(b1) };
+    // SAFETY: `b` is a valid pointer just allocated above.
+    unsafe { tv_blob_set_ret(tv1, b) };
 }
 
 #[cfg(test)]
@@ -117,5 +190,84 @@ mod tests {
     fn num_modulus_by_zero_is_zero() {
         assert_eq!(num_modulus(5, 0), 0);
         assert_eq!(num_modulus(0, 0), 0);
+    }
+
+    #[test]
+    fn eval_addblob_concatenates_bytes_in_order() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+        use crate::eval::typval_defs::{TypvalT, TypvalValue};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        unsafe {
+            (*b1).bv_ga.ga_concat_len(b"hello");
+            (*b2).bv_ga.ga_concat_len(b" world");
+        }
+        let mut tv1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+
+        unsafe {
+            eval_addblob(&mut tv1, &tv2);
+            let TypvalValue::Blob(result) = tv1.value else {
+                panic!("expected a Blob-typed result");
+            };
+            let result_ref = &*result;
+            assert_eq!(result_ref.bv_ga.ga_len, 11);
+            assert_eq!(&result_ref.bv_ga.ga_data[..11], b"hello world");
+            assert_eq!(result_ref.bv_refcount, 1);
+            tv_blob_free(result);
+            // tv1's original b1 was released internally by eval_addblob
+            // (via tv_blob_unref, refcount 0 -> freed) - only b2 (read,
+            // never released here, matching the original's own
+            // asymmetric tv1-only tv_clear) needs manual cleanup.
+            tv_blob_free(b2);
+        }
+    }
+
+    #[test]
+    fn eval_addblob_with_one_empty_operand() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+        use crate::eval::typval_defs::{TypvalT, TypvalValue};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        unsafe {
+            (*b1).bv_ga.ga_concat_len(b"data");
+        }
+        let mut tv1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+
+        unsafe {
+            eval_addblob(&mut tv1, &tv2);
+            let TypvalValue::Blob(result) = tv1.value else {
+                panic!("expected a Blob-typed result");
+            };
+            let result_ref = &*result;
+            assert_eq!(result_ref.bv_ga.ga_len, 4);
+            assert_eq!(&result_ref.bv_ga.ga_data[..4], b"data");
+            tv_blob_free(result);
+            tv_blob_free(b2);
+        }
+    }
+
+    #[test]
+    fn eval_addblob_both_empty_gives_empty_result() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+        use crate::eval::typval_defs::{TypvalT, TypvalValue};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        let mut tv1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+
+        unsafe {
+            eval_addblob(&mut tv1, &tv2);
+            let TypvalValue::Blob(result) = tv1.value else {
+                panic!("expected a Blob-typed result");
+            };
+            assert_eq!((*result).bv_ga.ga_len, 0);
+            tv_blob_free(result);
+            tv_blob_free(b2);
+        }
     }
 }

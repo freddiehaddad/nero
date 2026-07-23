@@ -70,7 +70,9 @@
 //! `tv_list_item_remove`, `tv_list_watch_add`/`tv_list_watch_remove`/
 //! `tv_list_watch_fix`.
 //!
-//! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`.
+//! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`,
+//! `tv_blob_len`/`tv_blob_set_ret` (`eval/typval.h`'s own `static
+//! inline` helpers, harvested for `eval/eval.rs`'s `eval_addblob`).
 //!
 //! **Partial**: `partial_free`/`partial_unref` (`eval.c`, not
 //! `eval/typval.c` - kept here anyway alongside the sibling `tv_*_free`/
@@ -1088,6 +1090,35 @@ pub unsafe fn tv_blob_unref(b: *mut crate::eval::typval_defs::BlobT) {
     if unsafe { (*b).bv_refcount } <= 0 {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { tv_blob_free(b) };
+    }
+}
+
+/// Get the length of the data in the blob, in bytes (`tv_blob_len`,
+/// `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `b`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::BlobT`].
+#[must_use]
+pub unsafe fn tv_blob_len(b: *const crate::eval::typval_defs::BlobT) -> i32 {
+    if b.is_null() {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*b).bv_ga.ga_len }
+}
+
+/// Set the return value of `tv` to a blob (`tv_blob_set_ret`,
+/// `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `b`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::BlobT`].
+pub unsafe fn tv_blob_set_ret(tv: &mut TypvalT, b: *mut crate::eval::typval_defs::BlobT) {
+    tv.value = TypvalValue::Blob(b);
+    if !b.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*b).bv_refcount += 1 };
     }
 }
 
@@ -2557,6 +2588,43 @@ mod tests {
             assert_eq!((*b).bv_refcount, 1);
             tv_blob_free(b);
         }
+    }
+
+    #[test]
+    fn tv_blob_len_null_is_zero() {
+        assert_eq!(unsafe { tv_blob_len(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn tv_blob_len_reads_ga_len() {
+        let b = tv_blob_alloc();
+        unsafe {
+            (*b).bv_ga.ga_concat_len(b"abc");
+            assert_eq!(tv_blob_len(b), 3);
+            tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn tv_blob_set_ret_wires_value_and_increments_refcount() {
+        let b = tv_blob_alloc();
+        let mut tv = TypvalT::default();
+        unsafe {
+            tv_blob_set_ret(&mut tv, b);
+            assert_eq!((*b).bv_refcount, 1);
+            match tv.value {
+                TypvalValue::Blob(p) => assert_eq!(p, b),
+                _ => panic!("expected a Blob-typed value"),
+            }
+            tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn tv_blob_set_ret_null_is_safe() {
+        let mut tv = TypvalT::default();
+        unsafe { tv_blob_set_ret(&mut tv, std::ptr::null_mut()) };
+        assert!(matches!(tv.value, TypvalValue::Blob(p) if p.is_null()));
     }
 
     #[test]
