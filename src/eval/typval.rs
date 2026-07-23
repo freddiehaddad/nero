@@ -53,7 +53,11 @@
 //! since Rust's `&[u8]` already carries its own length - see
 //! `tv_dict_add_str`'s own doc comment), `tv_dict_add_func` (needs
 //! `(*fp).uf_name` NUL-terminated, matching `func_hashtab`'s own
-//! storage convention - see its own doc comment).
+//! storage convention - see its own doc comment), `tv_dict_get_string`/
+//! `tv_dict_get_string_chk` (collapsing the original's `_buf`/`save`
+//! variants the same way `tv_get_string_chk`'s own doc comment
+//! explains - tractable now that `tv_get_string`/`tv_get_string_chk`
+//! exist).
 //!
 //! **List**: `tv_list_alloc`, `tv_list_item_alloc` (private, matching
 //! the original's own `static`), `tv_list_free_contents`/
@@ -146,12 +150,10 @@
 //!   general `vim_snprintf` implementation, which remains its own
 //!   separate, substantial undertaking (see `strings.rs`'s own module
 //!   doc).
-//! - `tv_dict_get_string` (needs the now-real `tv_get_string` above,
-//!   but not yet examined itself) and every other `tv_dict_*`/
-//!   `tv_list_*`/`tv_blob_*` function (`tv_dict_extend`, `tv_list_copy`,
-//!   `tv_list_concat`, blob byte-level accessors, iteration helpers,
-//!   etc.): straightforward to add once needed, layered on top of the
-//!   primitives here.
+//! - Every other `tv_dict_*`/`tv_list_*`/`tv_blob_*` function
+//!   (`tv_dict_extend`, `tv_list_copy`, `tv_list_concat`, blob
+//!   byte-level accessors, iteration helpers, etc.): straightforward
+//!   to add once needed, layered on top of the primitives here.
 
 use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
@@ -794,6 +796,56 @@ pub fn tv_dict_find(d: Option<&mut DictT>, key: &[u8]) -> Option<*mut DictitemT>
 #[must_use]
 pub fn tv_dict_has_key(d: Option<&mut DictT>, key: &[u8]) -> bool {
     tv_dict_find(d, key).is_some()
+}
+
+/// Get a string item from a dictionary (`tv_dict_get_string`/
+/// `tv_dict_get_string_buf`).
+///
+/// Returns `None` if `key` does not exist; if it does, always returns
+/// `Some` (an empty `Vec` for a type-mismatched value, matching
+/// [`tv_get_string`]'s own "always produce a value, empty on error"
+/// behavior - contrast [`tv_dict_get_string_chk`], which can return
+/// `None` for a found-but-wrong-type value).
+///
+/// Collapses the original's `tv_dict_get_string`/
+/// `tv_dict_get_string_buf` pair into one function - same
+/// shared-static-buffer-is-moot reasoning as [`tv_get_string_chk`]'s
+/// own doc comment (the original's `save` parameter, controlling
+/// whether the returned pointer is `xstrdup`'d, is dropped for the
+/// same reason: every return here is already a freshly-owned `Vec`).
+///
+/// # Safety
+/// `di_tv`'s value, once found, must be safe to read - same contract
+/// every other `tv_dict_*` lookup in this module already places on
+/// `d`.
+#[must_use]
+pub unsafe fn tv_dict_get_string(d: Option<&mut DictT>, key: &[u8]) -> Option<Vec<u8>> {
+    let di = tv_dict_find(d, key)?;
+    // SAFETY: forwarded from this function's own safety doc.
+    Some(tv_get_string(unsafe { &(*di).di_tv }))
+}
+
+/// Get a string item from a dictionary, with a default for a missing
+/// key (`tv_dict_get_string_buf_chk`).
+///
+/// Returns `def` if `key` does not exist, `None` if it exists but has
+/// the wrong type, else the string value - matching the original
+/// exactly except for the same `_buf`/`save` collapsing
+/// [`tv_dict_get_string`]'s own doc comment explains.
+///
+/// # Safety
+/// Same as [`tv_dict_get_string`].
+#[must_use]
+pub unsafe fn tv_dict_get_string_chk(
+    d: Option<&mut DictT>,
+    key: &[u8],
+    def: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let Some(di) = tv_dict_find(d, key) else {
+        return def;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    tv_get_string_chk(unsafe { &(*di).di_tv })
 }
 
 /// Add item to dictionary (`tv_dict_add`).
@@ -1859,6 +1911,99 @@ mod tests {
         unsafe {
             assert_eq!(tv_dict_find(Some(&mut *d), b"absent"), None);
             assert_eq!(tv_dict_find(None, b"absent"), None);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_returns_none_for_missing_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_get_string(Some(&mut *d), b"absent"), None);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_returns_the_stored_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_str(&mut *d, b"greeting", Some(b"hello")), OK);
+            assert_eq!(
+                tv_dict_get_string(Some(&mut *d), b"greeting"),
+                Some(b"hello".to_vec())
+            );
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_stringifies_a_number_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_nr(&mut *d, b"count", 42), OK);
+            assert_eq!(tv_dict_get_string(Some(&mut *d), b"count"), Some(b"42".to_vec()));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_returns_empty_not_none_for_wrong_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_dict(&mut *d, b"nested", tv_dict_alloc()), OK);
+            // Found, but VAR_DICT can't stringify - tv_get_string's own
+            // "always Some, empty on error" behavior, NOT None (that's
+            // reserved for "key not found" here).
+            assert_eq!(tv_dict_get_string(Some(&mut *d), b"nested"), Some(Vec::new()));
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_chk_returns_def_for_missing_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(
+                tv_dict_get_string_chk(Some(&mut *d), b"absent", Some(b"fallback".to_vec())),
+                Some(b"fallback".to_vec())
+            );
+            assert_eq!(tv_dict_get_string_chk(Some(&mut *d), b"absent", None), None);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_chk_returns_none_for_wrong_type_even_with_def() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_dict(&mut *d, b"nested", tv_dict_alloc()), OK);
+            // Found, but wrong type - returns None (not `def`), matching
+            // the original's own tv_get_string_buf_chk error path.
+            assert_eq!(
+                tv_dict_get_string_chk(Some(&mut *d), b"nested", Some(b"fallback".to_vec())),
+                None
+            );
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_string_chk_returns_the_stored_string_when_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_add_str(&mut *d, b"greeting", Some(b"hi")), OK);
+            assert_eq!(
+                tv_dict_get_string_chk(Some(&mut *d), b"greeting", Some(b"fallback".to_vec())),
+                Some(b"hi".to_vec())
+            );
             tv_dict_free(d);
         }
     }
