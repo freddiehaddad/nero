@@ -75,6 +75,7 @@ pub mod plines;
 pub mod pos_defs;
 pub mod profile;
 pub mod regexp_defs;
+pub mod runtime;
 pub mod runtime_defs;
 pub mod search_defs;
 pub mod sha256;

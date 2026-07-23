@@ -12,9 +12,9 @@
 //! via `tv_dict_alloc`'s own `Box::into_raw`, regardless of whether the
 //! `DictT` happens to be independently heap-allocated or embedded
 //! inside another struct's own memory - the first small-scale proof of
-//! this, ahead of `funccall_T`'s own larger by-value `dict_T`/`list_T`
-//! embedding (still deferred, see `eval/typval_defs.rs`'s own module
-//! doc).
+//! this, since scaled up to `funccall_T`'s own larger by-value
+//! `dict_T`/`list_T` embedding (now also real, see
+//! `eval/typval_defs.rs`'s own module doc).
 //!
 //! `ScriptitemT.sn_vars: *mut ScriptvarT` and everything else about
 //! actually *constructing*/*looking up* a script item (`new_script_vars`,

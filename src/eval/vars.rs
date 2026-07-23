@@ -12,21 +12,34 @@
 //! for real). Needed only already-existing pieces: `HashtabT::hash_init`,
 //! `VarLockStatus`, `ScopeType`, `DO_NOT_FREE_CNT`, `dict_item_flags`.
 //!
+//! Also translated: `new_script_vars` - tractable now that
+//! `crate::runtime`'s `script_items`/`new_script_item` exist. Builds a
+//! fresh, zeroed `ScriptvarT` (matching the original's own
+//! `xcalloc(1, sizeof(scriptvar_T))`, NOT
+//! [`crate::eval::typval::tv_dict_alloc`], since a script-scope dict
+//! has `dv_refcount == DO_NOT_FREE_CNT` and is deliberately never
+//! linked into the `GC_FIRST_DICT` used-dicts list, matching the
+//! original exactly), calls [`init_var_dict`] on it, then wires the
+//! result into the script item at `id` via
+//! `crate::runtime::script_item`.
+//!
 //! The original's `QUEUE_INIT(&dict->watchers)` is omitted - `DictT`
 //! has no `watchers` field at all yet (needs a `QUEUE` intrusive-
 //! linked-list translation first, same accepted gap as documented on
 //! `DictT` itself in `eval/typval_defs.rs`).
 //!
-//! Deferred: `new_script_vars` (needs `script_items`, a growable
-//! registry of `ScriptitemT` indexed by script ID - not yet
-//! translated, `runtime.c`/`eval/vars.c`'s own global state) and
-//! everything else in this file (variable get/set/unlet, `:let`
-//! parsing, etc.).
+//! Deferred: everything else in this file (variable get/set/unlet,
+//! `:let` parsing, etc.).
 
 use crate::eval::typval_defs::{
-    dict_item_flags, DictT, ScopeDictDictItem, ScopeType, TypvalValue, VarLockStatus,
+    dict_item_flags, DictT, ScidT, ScopeDictDictItem, ScopeType, TypvalValue, VarLockStatus,
     DO_NOT_FREE_CNT,
 };
+use crate::runtime_defs::ScriptvarT;
+
+/// `-1`, matching `LuaRef`'s "no reference" convention already
+/// established (e.g. `eval/typval.rs`'s own private `LUA_NOREF`).
+const LUA_NOREF: crate::types_defs::LuaRef = -1;
 
 /// Initialize `dict` as a scope dict and set `dict_var` to point to it
 /// (`init_var_dict`).
@@ -50,6 +63,50 @@ pub fn init_var_dict(dict: &mut DictT, dict_var: &mut ScopeDictDictItem, scope: 
     dict_var.di_key = vec![0]; // empty NUL-terminated key, matching di_key[0] = NUL
     // QUEUE_INIT(&dict->watchers) omitted - see this module's own doc
     // comment.
+}
+
+/// Allocate a new hashtab for a sourced script. It will be used while
+/// sourcing this script and when executing functions defined in the
+/// script (`new_script_vars`).
+///
+/// # Panics
+/// Panics if `id` is out of range - see
+/// [`crate::runtime::script_item`]'s own doc comment. In practice this
+/// never happens: this function is only ever called by
+/// `crate::runtime::new_script_item` immediately after allocating the
+/// slot at `id`, exactly mirroring the original's own call site.
+pub fn new_script_vars(id: ScidT) {
+    let mut sv = Box::new(ScriptvarT {
+        sv_var: ScopeDictDictItem::default(),
+        // A fresh, zeroed DictT - matches the original's own
+        // xcalloc(1, sizeof(scriptvar_T)), NOT tv_dict_alloc: a
+        // script-scope dict has dv_refcount == DO_NOT_FREE_CNT (set
+        // below by init_var_dict) and must NOT be linked into the
+        // GC_FIRST_DICT used-dicts list (dv_used_next/dv_used_prev
+        // stay null), matching the original exactly - it lives for
+        // the whole session, never garbage collected via the normal
+        // refcount path.
+        sv_dict: DictT {
+            dv_lock: VarLockStatus::Unlocked,
+            dv_scope: ScopeType::NoScope,
+            dv_refcount: 0,
+            dv_copy_id: 0,
+            dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
+            dv_index: std::collections::HashMap::new(),
+            dv_copydict: std::ptr::null_mut(),
+            dv_used_next: std::ptr::null_mut(),
+            dv_used_prev: std::ptr::null_mut(),
+            lua_table_ref: LUA_NOREF,
+        },
+    });
+    init_var_dict(&mut sv.sv_dict, &mut sv.sv_var, ScopeType::Scope);
+    let sv_ptr = Box::into_raw(sv);
+    let item = crate::runtime::script_item(id);
+    // SAFETY: item is a valid pointer to a live ScriptitemT - forwarded
+    // from crate::runtime::script_item's own contract, guaranteed by
+    // this function's own doc comment above (id is always freshly
+    // allocated by runtime::new_script_item just before calling this).
+    unsafe { (*item).sn_vars = sv_ptr };
 }
 
 #[cfg(test)]
@@ -110,5 +167,46 @@ mod tests {
         init_var_dict(&mut dict, &mut dict_var, ScopeType::DefScope);
 
         assert_eq!(dict.dv_scope, ScopeType::DefScope);
+    }
+
+    // The following tests all touch crate::runtime's shared
+    // SCRIPT_ITEMS/LAST_CURRENT_SID GlobalCells (indirectly, through
+    // new_script_vars's own call to crate::runtime::script_item) -
+    // each acquires global_state_test_lock() for its whole body and
+    // resets crate::runtime's test-only state first, matching
+    // crate::runtime's own test conventions exactly.
+
+    #[test]
+    fn new_script_vars_wires_a_fresh_scope_dict_into_the_script_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, item) = crate::runtime::new_script_item(None);
+        // new_script_item already called new_script_vars(sid) once as
+        // part of allocating the slot - call it again directly to
+        // exercise this function's own behavior in isolation too
+        // (mirrors init_var_dict's own "call it again with different
+        // inputs" test style above).
+        new_script_vars(sid);
+        unsafe {
+            assert!(!(*item).sn_vars.is_null());
+            let sv = &*(*item).sn_vars;
+            assert_eq!(sv.sv_dict.dv_scope, ScopeType::Scope);
+            assert_eq!(sv.sv_dict.dv_refcount, DO_NOT_FREE_CNT);
+            assert_eq!(sv.sv_dict.dv_lock, VarLockStatus::Unlocked);
+            assert!(sv.sv_dict.dv_used_next.is_null());
+            assert!(sv.sv_dict.dv_used_prev.is_null());
+            match sv.sv_var.di_tv.value {
+                TypvalValue::Dict(p) => assert_eq!(p, &sv.sv_dict as *const DictT as *mut DictT),
+                _ => panic!("expected a Dict-typed value"),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_script_vars_panics_for_out_of_range_sid() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        new_script_vars(42);
     }
 }
