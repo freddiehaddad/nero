@@ -50,12 +50,30 @@
 //! "release whatever `tv1` used to hold" dispatch `tv_dict_item_free`/
 //! `partial_free` already use, not a type-specific `tv_*_unref` call.
 //!
+//! Also translated: `eval_addsub_number`/`eval_multdiv_number` (as
+//! [`eval_addsub_number`]/[`eval_multdiv_number`], each taking a small
+//! new `AddSubOp`/`MulDivOp` enum in place of the original's `int op`
+//! holding a literal ASCII operator character). These two sibling
+//! functions have genuinely different internal structures in the
+//! original despite similar purposes - `eval_addsub_number` clears
+//! `tv1` once at the very end (after fully processing both operands),
+//! while `eval_multdiv_number` clears `tv1` early and clears `tv2`
+//! itself unconditionally in the success path too (since its own
+//! caller, `eval6`, never does so, unlike `eval5`'s treatment of
+//! `eval_addsub_number`'s family) - each function's own doc comment
+//! preserves its own exact clearing contract precisely rather than
+//! forcing a shared shape. `eval_multdiv_number`'s float-division
+//! branch simplifies the original's elaborate manual zero/sign/NaN
+//! special-casing down to plain `f1 / f2`: that logic exists only to
+//! dodge an AddressSanitizer false-positive (the function itself is
+//! `FUNC_ATTR_NO_SANITIZE_UNDEFINED`), since IEEE 754 float division by
+//! zero is already well-defined (not UB) in both C and Rust, producing
+//! the identical result either way.
+//!
 //! Deferred: everything else - the actual parser/lvalue/loop/call
-//! machinery is a separate, substantial undertaking of its own. The
-//! remaining "leaf" arithmetic helpers (`eval_addlist` needs
-//! `tv_list_concat`, not yet translated; `eval_addsub_number`/
-//! `eval_multdiv_number` are reasonable next candidates) are not yet
-//! examined in detail.
+//! machinery is a separate, substantial undertaking of its own.
+//! `eval_addlist` (the only remaining sibling "leaf" function) needs
+//! `tv_list_concat`, not yet translated.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
@@ -203,6 +221,217 @@ pub unsafe fn eval_concat_str(tv1: &mut TypvalT, tv2: &TypvalT) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_clear_simple(tv1) };
     tv1.value = TypvalValue::String(Some(p));
+
+    true
+}
+
+/// The two operators [`eval_addsub_number`] handles (`op` in the
+/// original, an `int` holding the literal ASCII `'+'`/`'-'` - `eval5`,
+/// this function's only call site, never passes anything else).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddSubOp {
+    Add,
+    Sub,
+}
+
+/// Add or subtract numbers `tv1` and `tv2` and store the result in
+/// `tv1`. The numbers can be whole numbers or floats
+/// (`eval_addsub_number`).
+///
+/// Returns `false` on a type error (a `List`/`Dict`/`Blob`/`Partial`
+/// operand on either side, or anything else `tv_get_number_chk`
+/// rejects) - matches the original's `OK`/`FAIL`. Whole-number
+/// addition/subtraction uses `wrapping_add`/`wrapping_sub`, matching
+/// this crate's established convention for replicating the original's
+/// implicit-wrapping signed-integer-overflow C arithmetic (e.g.
+/// `cursor.rs`/`hashtab.rs`/`profile.rs`) rather than Rust's own
+/// panic-on-overflow-in-debug default.
+///
+/// # Safety
+/// If `tv1`/`tv2`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with
+/// a non-null pointer, that pointer must be valid - forwarded to
+/// `eval/typval.rs`'s `tv_clear_simple`, used to release both
+/// operands' old values (`tv1`'s unconditionally, once the result type
+/// is known; `tv2`'s only in the two error paths, matching the
+/// original's own `tv_clear(tv2)` placement exactly - the SUCCESS path
+/// leaves clearing `tv2` to the caller, `eval5`, not yet translated).
+pub unsafe fn eval_addsub_number(tv1: &mut TypvalT, tv2: &TypvalT, op: AddSubOp) -> bool {
+    use crate::eval::typval::{tv_clear_simple, tv_get_number_chk};
+
+    let tv1_is_float = matches!(tv1.value, TypvalValue::Float(_));
+    let tv2_is_float = matches!(tv2.value, TypvalValue::Float(_));
+
+    let mut f1 = 0.0;
+    let mut f2 = 0.0;
+    let mut n1: VarnumberT = 0;
+    let mut n2: VarnumberT = 0;
+
+    if let TypvalValue::Float(f) = tv1.value {
+        f1 = f;
+    } else {
+        let mut error = false;
+        n1 = tv_get_number_chk(tv1, Some(&mut error));
+        if error {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                tv_clear_simple(tv1);
+                tv_clear_simple(tv2);
+            }
+            return false;
+        }
+        if tv2_is_float {
+            f1 = n1 as f64;
+        }
+    }
+
+    if let TypvalValue::Float(f) = tv2.value {
+        f2 = f;
+    } else {
+        let mut error = false;
+        n2 = tv_get_number_chk(tv2, Some(&mut error));
+        if error {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                tv_clear_simple(tv1);
+                tv_clear_simple(tv2);
+            }
+            return false;
+        }
+        if tv1_is_float {
+            f2 = n2 as f64;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(tv1) };
+
+    // If there is a float on either side the result is a float.
+    if tv1_is_float || tv2_is_float {
+        let result = match op {
+            AddSubOp::Add => f1 + f2,
+            AddSubOp::Sub => f1 - f2,
+        };
+        tv1.value = TypvalValue::Float(result);
+    } else {
+        let result = match op {
+            AddSubOp::Add => n1.wrapping_add(n2),
+            AddSubOp::Sub => n1.wrapping_sub(n2),
+        };
+        tv1.value = TypvalValue::Number(result);
+    }
+
+    true
+}
+
+/// The three operators [`eval_multdiv_number`] handles (`op` in the
+/// original, an `int` holding the literal ASCII `'*'`/`'/'`/`'%'` -
+/// `eval6`, this function's only call site, never passes anything
+/// else).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MulDivOp {
+    Mul,
+    Div,
+    Mod,
+}
+
+/// Multiply, divide, or compute the modulo of numbers `tv1` and `tv2`
+/// and store the result in `tv1`. The numbers can be whole numbers or
+/// floats (`eval_multdiv_number`).
+///
+/// Returns `false` on a type error, or when `op` is [`MulDivOp::Mod`]
+/// and either operand is a `Float` (`%` has no float form - the
+/// original's own `emsg("E804: Cannot use '%' with Float")`, whose
+/// message display is skipped per this crate's established policy,
+/// while the `FAIL` return is kept exactly).
+///
+/// Float division by zero uses plain IEEE 754 `f64` division directly
+/// (`f1 / f2`), NOT the original's elaborate manual
+/// zero/sign/NaN-vs-Infinity special-casing: that logic exists only to
+/// dodge an AddressSanitizer false-positive on float division by zero
+/// (the function itself is marked `FUNC_ATTR_NO_SANITIZE_UNDEFINED`,
+/// and its own comment says exactly this - "Division by zero triggers
+/// error from AddressSanitizer") - float division by zero is
+/// well-defined by IEEE 754 (and therefore not UB in either C or
+/// Rust), producing the identical `NaN`/`+Infinity`/`-Infinity` result
+/// the manual special-casing computes by hand, for every sign/zero
+/// combination. Whole-number multiplication uses `wrapping_mul`,
+/// matching this crate's established overflow convention (see
+/// [`eval_addsub_number`]'s own doc comment); whole-number division
+/// and modulo reuse the already-real [`num_divide`]/[`num_modulus`].
+///
+/// # Safety
+/// If `tv1`/`tv2`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with
+/// a non-null pointer, that pointer must be valid - forwarded to
+/// `eval/typval.rs`'s `tv_clear_simple`. Unlike [`eval_addsub_number`],
+/// THIS function clears `tv2` itself in the success path too (matching
+/// the original exactly: `eval6`, this function's only caller, never
+/// clears `tv2` on its own, unlike `eval5`'s treatment of
+/// [`eval_addsub_number`]'s sibling functions).
+pub unsafe fn eval_multdiv_number(tv1: &mut TypvalT, tv2: &TypvalT, op: MulDivOp) -> bool {
+    use crate::eval::typval::{tv_clear_simple, tv_get_number_chk};
+
+    let mut use_float = matches!(tv1.value, TypvalValue::Float(_));
+    let mut f1 = 0.0;
+    let mut n1: VarnumberT = 0;
+    let mut error = false;
+
+    if let TypvalValue::Float(f) = tv1.value {
+        f1 = f;
+    } else {
+        n1 = tv_get_number_chk(tv1, Some(&mut error));
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(tv1) };
+    if error {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(tv2) };
+        return false;
+    }
+
+    let mut f2 = 0.0;
+    let mut n2: VarnumberT = 0;
+    if let TypvalValue::Float(f) = tv2.value {
+        if !use_float {
+            f1 = n1 as f64;
+            use_float = true;
+        }
+        f2 = f;
+    } else {
+        n2 = tv_get_number_chk(tv2, Some(&mut error));
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(tv2) };
+        if error {
+            return false;
+        }
+        if use_float {
+            f2 = n2 as f64;
+        }
+    }
+
+    // Compute the result. When either side is a float the result is a
+    // float.
+    if use_float {
+        let result = match op {
+            MulDivOp::Mul => f1 * f2,
+            // Well-defined by IEEE 754 in both C and Rust - see this
+            // function's own doc comment for why no manual
+            // zero/sign/NaN special-casing is needed here.
+            MulDivOp::Div => f1 / f2,
+            MulDivOp::Mod => {
+                // "%" with Float - emsg(...) skipped, see this
+                // function's own doc comment.
+                return false;
+            }
+        };
+        tv1.value = TypvalValue::Float(result);
+    } else {
+        let result = match op {
+            MulDivOp::Mul => n1.wrapping_mul(n2),
+            MulDivOp::Div => num_divide(n1, n2),
+            MulDivOp::Mod => num_modulus(n1, n2),
+        };
+        tv1.value = TypvalValue::Number(result);
+    }
 
     true
 }
@@ -413,5 +642,171 @@ mod tests {
             assert_eq!((*l).lv_refcount, 1);
             crate::eval::typval::tv_list_unref(l);
         }
+    }
+
+    fn number(n: VarnumberT) -> TypvalT {
+        TypvalT { value: TypvalValue::Number(n), ..Default::default() }
+    }
+
+    fn float(f: f64) -> TypvalT {
+        TypvalT { value: TypvalValue::Float(f), ..Default::default() }
+    }
+
+    #[test]
+    fn eval_addsub_number_adds_two_numbers() {
+        let mut tv1 = number(3);
+        let tv2 = number(4);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+        assert!(matches!(tv1.value, TypvalValue::Number(7)));
+    }
+
+    #[test]
+    fn eval_addsub_number_subtracts_two_numbers() {
+        let mut tv1 = number(10);
+        let tv2 = number(4);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Sub) });
+        assert!(matches!(tv1.value, TypvalValue::Number(6)));
+    }
+
+    #[test]
+    fn eval_addsub_number_number_plus_float_promotes_to_float() {
+        let mut tv1 = number(3);
+        let tv2 = float(0.5);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f == 3.5));
+    }
+
+    #[test]
+    fn eval_addsub_number_float_minus_number_promotes_to_float() {
+        let mut tv1 = float(3.5);
+        let tv2 = number(1);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Sub) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f == 2.5));
+    }
+
+    #[test]
+    fn eval_addsub_number_float_plus_float() {
+        let mut tv1 = float(1.5);
+        let tv2 = float(2.25);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f == 3.75));
+    }
+
+    #[test]
+    fn eval_addsub_number_wraps_on_overflow_like_the_original_c_arithmetic() {
+        let mut tv1 = number(VARNUMBER_MAX);
+        let tv2 = number(1);
+        assert!(unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+        assert!(matches!(tv1.value, TypvalValue::Number(n) if n == VARNUMBER_MIN));
+    }
+
+    #[test]
+    fn eval_addsub_number_type_error_on_tv1_releases_both_and_returns_false() {
+        let mut tv1 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let tv2 = number(1);
+        assert!(!unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+    }
+
+    #[test]
+    fn eval_addsub_number_type_error_on_tv2_returns_false() {
+        let mut tv1 = number(1);
+        let tv2 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        assert!(!unsafe { eval_addsub_number(&mut tv1, &tv2, AddSubOp::Add) });
+    }
+
+    #[test]
+    fn eval_multdiv_number_multiplies_two_numbers() {
+        let mut tv1 = number(6);
+        let tv2 = number(7);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
+        assert!(matches!(tv1.value, TypvalValue::Number(42)));
+    }
+
+    #[test]
+    fn eval_multdiv_number_divides_two_numbers() {
+        let mut tv1 = number(20);
+        let tv2 = number(4);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Div) });
+        assert!(matches!(tv1.value, TypvalValue::Number(5)));
+    }
+
+    #[test]
+    fn eval_multdiv_number_modulus_two_numbers() {
+        let mut tv1 = number(10);
+        let tv2 = number(3);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mod) });
+        assert!(matches!(tv1.value, TypvalValue::Number(1)));
+    }
+
+    #[test]
+    fn eval_multdiv_number_integer_division_by_zero_uses_num_divide_clamp() {
+        // Matches num_divide's own "similar to NaN" sentinel behavior,
+        // not a panic - whole-number division by zero is NOT the same
+        // code path as float division by zero in this function.
+        let mut tv1 = number(5);
+        let tv2 = number(0);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Div) });
+        assert!(matches!(tv1.value, TypvalValue::Number(n) if n == VARNUMBER_MAX));
+    }
+
+    #[test]
+    fn eval_multdiv_number_float_multiplication() {
+        let mut tv1 = float(1.5);
+        let tv2 = float(2.0);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f == 3.0));
+    }
+
+    #[test]
+    fn eval_multdiv_number_float_division_by_zero_gives_infinity_not_panic() {
+        let mut tv1 = float(1.0);
+        let tv2 = float(0.0);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Div) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f.is_infinite() && f > 0.0));
+    }
+
+    #[test]
+    fn eval_multdiv_number_float_division_by_zero_negative_numerator_gives_neg_infinity() {
+        let mut tv1 = float(-1.0);
+        let tv2 = float(0.0);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Div) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f.is_infinite() && f < 0.0));
+    }
+
+    #[test]
+    fn eval_multdiv_number_float_zero_division_by_zero_gives_nan() {
+        let mut tv1 = float(0.0);
+        let tv2 = float(0.0);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Div) });
+        assert!(matches!(tv1.value, TypvalValue::Float(f) if f.is_nan()));
+    }
+
+    #[test]
+    fn eval_multdiv_number_modulus_with_float_is_rejected() {
+        let mut tv1 = float(5.0);
+        let tv2 = number(2);
+        assert!(!unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mod) });
+    }
+
+    #[test]
+    fn eval_multdiv_number_wraps_on_overflow_like_the_original_c_arithmetic() {
+        let mut tv1 = number(VARNUMBER_MAX);
+        let tv2 = number(2);
+        assert!(unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
+        assert!(matches!(tv1.value, TypvalValue::Number(n) if n == VARNUMBER_MAX.wrapping_mul(2)));
+    }
+
+    #[test]
+    fn eval_multdiv_number_type_error_on_tv1_returns_false() {
+        let mut tv1 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let tv2 = number(1);
+        assert!(!unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
+    }
+
+    #[test]
+    fn eval_multdiv_number_type_error_on_tv2_returns_false() {
+        let mut tv1 = number(1);
+        let tv2 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        assert!(!unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
     }
 }
