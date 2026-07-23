@@ -128,6 +128,17 @@ pub const SIGN_WIDTH: i32 = 2;
 pub struct LoopT {
     _private: (),
 }
+/// Placeholder for `vimconv_T` (`struct` in `src/nvim/mbyte_defs.h`,
+/// character-encoding conversion state) - needed by `eval/typval.rs`'s
+/// `tv_list_copy`/`tv_dict_copy`'s `conv` parameter, only ever read by
+/// the `deep`-copy path (`var_item_copy`, `eval.c`, itself not yet
+/// translated - a separate, substantial recursive deep-copy engine),
+/// so an opaque placeholder is enough for now: the shallow-copy path
+/// (`deep == false`, the only one currently reachable) never
+/// dereferences `conv` at all, matching the original exactly.
+pub struct VimconvT {
+    _private: (),
+}
 /// Placeholder for `regprog_T` (`struct regprog`) - see `src/nvim/regexp_defs.h` (phase 7).
 pub struct RegprogT {
     _private: (),

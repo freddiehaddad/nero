@@ -201,6 +201,20 @@ pub unsafe fn tv_list_ref(l: *mut crate::eval::typval_defs::ListT) {
     unsafe { (*l).lv_refcount += 1 };
 }
 
+/// Get the number of items in a list, or `0` if `l` is null
+/// (`tv_list_len`, `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_len(l: *const crate::eval::typval_defs::ListT) -> i32 {
+    if l.is_null() {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_len }
+}
+
 /// Copy typval from one location to another (`tv_copy`).
 ///
 /// When needed, allocates a string or increases a reference count.
@@ -1199,6 +1213,20 @@ fn tv_list_item_alloc() -> *mut crate::eval::typval_defs::ListitemT {
     }))
 }
 
+/// Get the first item of a list, or `None` if `l` is null or empty
+/// (`tv_list_first`, `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_first(l: *const crate::eval::typval_defs::ListT) -> *mut crate::eval::typval_defs::ListitemT {
+    if l.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_first }
+}
+
 /// Advance watchers to the next item. Used just before removing an
 /// item from a list (`tv_list_watch_fix`).
 ///
@@ -1653,6 +1681,168 @@ pub unsafe fn tv_list_insert_tv(
     unsafe { tv_copy(tv, &mut (*ni).li_tv) };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_list_insert(l, ni, item) };
+}
+
+/// Make a copy of a list (`tv_list_copy`).
+///
+/// Returns a null pointer if `orig` is null, or on failure. The
+/// refcount of the new list is set to 1.
+///
+/// `conv` is accepted for signature fidelity with the original but is
+/// only ever read by the `deep`-copy path below (never dereferenced
+/// here, matching the original's own `deep == false` behavior
+/// exactly).
+///
+/// # Panics
+/// Panics if `deep` is `true` AND `orig` has at least one item to
+/// copy - the deep-copy path needs `eval.c`'s `var_item_copy` (a
+/// substantial recursive deep-copy engine handling conversion and
+/// cycle detection via `copy_id`), not yet translated. Nothing in
+/// this crate can currently request a deep copy (no `copy()`/
+/// `deepcopy()` Vimscript builtins exist yet), so this is unreachable
+/// in practice, not just narrow - matching this crate's established
+/// "harvest the reachable core" pattern. A deep copy of an EMPTY list
+/// does NOT panic, matching the original's own per-item (not
+/// upfront) `deep` check inside its copy loop.
+///
+/// # Safety
+/// `orig`, if non-null, must be a valid pointer to a live `ListT`,
+/// and every item reachable via its `lv_first`/`li_next` chain must
+/// have a valid `li_tv` (forwarded to [`tv_copy`]'s own contract, used
+/// for the shallow-copy path).
+pub unsafe fn tv_list_copy(
+    _conv: *const crate::types_defs::VimconvT,
+    orig: *mut crate::eval::typval_defs::ListT,
+    deep: bool,
+    copy_id: i32,
+) -> *mut crate::eval::typval_defs::ListT {
+    if orig.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let copy = tv_list_alloc(unsafe { tv_list_len(orig) } as isize);
+    // SAFETY: `copy` was just allocated above, a fresh pointer not
+    // shared with anything yet.
+    unsafe { tv_list_ref(copy) };
+    if copy_id != 0 {
+        // Do this before adding the items, because one of the items
+        // may refer back to this list.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*orig).lv_copy_id = copy_id;
+            (*orig).lv_copylist = copy;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { tv_list_first(orig) };
+    while !item.is_null() {
+        // SAFETY: GLOBALS is only ever accessed through this crate's
+        // established single-threaded-main-loop convention.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        let ni = tv_list_item_alloc();
+        if deep {
+            unimplemented!(
+                "tv_list_copy: deep copy needs eval.c's var_item_copy, not yet translated \
+                 - see this function's own doc comment"
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_copy(&(*item).li_tv, &mut (*ni).li_tv) };
+        // SAFETY: `copy`/`ni` are both valid, freshly-prepared pointers.
+        unsafe { tv_list_append(copy, ni) };
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+    }
+
+    copy
+}
+
+/// Extend list `l1` with list `l2`'s items, inserted before `bef` (or
+/// at the end, if `bef` is null) (`tv_list_extend`).
+///
+/// # Safety
+/// `l1` must be a valid, non-null pointer to a live `ListT`. `l2`, if
+/// non-null, must be a valid pointer to a live `ListT`. `bef`, if
+/// non-null, must be a valid pointer to an item actually present in
+/// `l1`.
+pub unsafe fn tv_list_extend(
+    l1: *mut crate::eval::typval_defs::ListT,
+    l2: *mut crate::eval::typval_defs::ListT,
+    bef: *mut crate::eval::typval_defs::ListitemT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut todo = unsafe { tv_list_len(l2) };
+
+    // NULL list is equivalent to an empty list: nothing to do.
+    if todo == 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let befbef = if bef.is_null() { std::ptr::null_mut() } else { unsafe { (*bef).li_prev } };
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved_next = if befbef.is_null() { std::ptr::null_mut() } else { unsafe { (*befbef).li_next } };
+
+    // We also quit the loop when we have inserted the original item
+    // count of the list, to avoid a hang when extending a list with
+    // itself.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { tv_list_first(l2) };
+    while !item.is_null() && todo > 0 {
+        todo -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_insert_tv(l1, &(*item).li_tv, bef) };
+        item = if item == befbef {
+            saved_next
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*item).li_next }
+        };
+    }
+}
+
+/// Concatenate lists into a new list (`tv_list_concat`).
+///
+/// Returns `false` on failure. `tv`'s value is always set to a
+/// `List`-typed value (a null list, if `l1`/`l2` are both null),
+/// matching the original's own `tv->v_type = VAR_LIST` assignment
+/// before its own possible early failure return.
+///
+/// # Safety
+/// `l1`/`l2`, if non-null, must be valid pointers to live `ListT`s,
+/// forwarded to [`tv_list_copy`]/[`tv_list_extend`]'s own contracts.
+pub unsafe fn tv_list_concat(
+    l1: *mut crate::eval::typval_defs::ListT,
+    l2: *mut crate::eval::typval_defs::ListT,
+    tv: &mut TypvalT,
+) -> bool {
+    tv.v_lock = VarLockStatus::Unlocked;
+
+    let l = if l1.is_null() && l2.is_null() {
+        std::ptr::null_mut()
+    } else if l1.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_copy(std::ptr::null(), l2, false, 0) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { tv_list_copy(std::ptr::null(), l1, false, 0) };
+        if !l.is_null() && !l2.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_extend(l, l2, std::ptr::null_mut()) };
+        }
+        l
+    };
+
+    if l.is_null() && !(l1.is_null() && l2.is_null()) {
+        return false;
+    }
+
+    tv.value = TypvalValue::List(l);
+    true
 }
 
 #[cfg(test)]
@@ -2936,6 +3126,240 @@ mod tests {
             assert!(matches!((*(*l).lv_last).li_tv.value, TypvalValue::Number(4)));
 
             tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_first_returns_none_for_null_and_empty_list() {
+        assert!(unsafe { tv_list_first(std::ptr::null()) }.is_null());
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(0);
+        unsafe {
+            assert!(tv_list_first(l).is_null());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_first_returns_lv_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l, &number_tv(9));
+            assert_eq!(tv_list_first(l), (*l).lv_first);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_len_null_is_zero() {
+        assert_eq!(unsafe { tv_list_len(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn tv_list_len_reads_lv_len() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_tv(l, &number_tv(1));
+            tv_list_append_tv(l, &number_tv(2));
+            assert_eq!(tv_list_len(l), 2);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_null_orig_is_null() {
+        assert!(unsafe { tv_list_copy(std::ptr::null(), std::ptr::null_mut(), false, 0) }.is_null());
+    }
+
+    #[test]
+    fn tv_list_copy_shallow_copies_items_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(3);
+        unsafe {
+            for n in [1, 2, 3] {
+                tv_list_append_tv(orig, &number_tv(n));
+            }
+            let copy = tv_list_copy(std::ptr::null(), orig, false, 0);
+            assert!(!copy.is_null());
+            assert_eq!((*copy).lv_len, 3);
+            assert_eq!((*copy).lv_refcount, 1);
+            let mut item = (*copy).lv_first;
+            for expected in [1, 2, 3] {
+                assert!(matches!((*item).li_tv.value, TypvalValue::Number(n) if n == expected));
+                item = (*item).li_next;
+            }
+            // The copy is a genuinely separate list, not an alias.
+            assert_ne!(copy, orig);
+            tv_list_free(orig);
+            tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_of_empty_list_is_empty_not_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(0);
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, false, 0);
+            assert!(!copy.is_null());
+            assert_eq!((*copy).lv_len, 0);
+            tv_list_free(orig);
+            tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_deep_of_empty_list_does_not_panic() {
+        // Matches the original's own per-item (not upfront) `deep`
+        // check inside its copy loop - an empty list never reaches
+        // the unimplemented!() branch.
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(0);
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, true, 0);
+            assert!(!copy.is_null());
+            assert_eq!((*copy).lv_len, 0);
+            tv_list_free(orig);
+            tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "deep copy needs eval.c's var_item_copy")]
+    fn tv_list_copy_deep_with_items_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(orig, &number_tv(1));
+            tv_list_copy(std::ptr::null(), orig, true, 0);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_honors_copy_id_bookkeeping() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(0);
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, false, 42);
+            assert_eq!((*orig).lv_copy_id, 42);
+            assert_eq!((*orig).lv_copylist, copy);
+            tv_list_free(orig);
+            tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_extend_appends_l2_items_to_l1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(2);
+        let l2 = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_tv(l1, &number_tv(1));
+            tv_list_append_tv(l1, &number_tv(2));
+            tv_list_append_tv(l2, &number_tv(3));
+            tv_list_append_tv(l2, &number_tv(4));
+
+            tv_list_extend(l1, l2, std::ptr::null_mut());
+
+            assert_eq!((*l1).lv_len, 4);
+            let mut item = (*l1).lv_first;
+            for expected in [1, 2, 3, 4] {
+                assert!(matches!((*item).li_tv.value, TypvalValue::Number(n) if n == expected));
+                item = (*item).li_next;
+            }
+            tv_list_free(l1);
+            tv_list_free(l2);
+        }
+    }
+
+    #[test]
+    fn tv_list_extend_with_null_l2_is_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l1, &number_tv(1));
+            tv_list_extend(l1, std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!((*l1).lv_len, 1);
+            tv_list_free(l1);
+        }
+    }
+
+    #[test]
+    fn tv_list_extend_before_a_specific_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(2);
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l1, &number_tv(1));
+            tv_list_append_tv(l1, &number_tv(3));
+            tv_list_append_tv(l2, &number_tv(2));
+            let item3 = (*l1).lv_last;
+
+            tv_list_extend(l1, l2, item3);
+
+            assert_eq!((*l1).lv_len, 3);
+            let item1 = (*l1).lv_first;
+            let item2 = (*item1).li_next;
+            assert!(matches!((*item2).li_tv.value, TypvalValue::Number(2)));
+            assert_eq!((*item2).li_next, item3);
+            tv_list_free(l1);
+            tv_list_free(l2);
+        }
+    }
+
+    #[test]
+    fn tv_list_concat_both_null_gives_null_list_but_ok() {
+        let mut tv = TypvalT::default();
+        let ok = unsafe { tv_list_concat(std::ptr::null_mut(), std::ptr::null_mut(), &mut tv) };
+        assert!(ok);
+        assert!(matches!(tv.value, TypvalValue::List(p) if p.is_null()));
+        assert_eq!(tv.v_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn tv_list_concat_l1_null_copies_l2() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l2, &number_tv(5));
+            let mut tv = TypvalT::default();
+            let ok = tv_list_concat(std::ptr::null_mut(), l2, &mut tv);
+            assert!(ok);
+            let TypvalValue::List(result) = tv.value else {
+                panic!("expected a List-typed result");
+            };
+            assert_eq!((*result).lv_len, 1);
+            assert_ne!(result, l2); // a genuine copy, not an alias
+            tv_list_free(l2);
+            tv_list_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_list_concat_both_non_null_appends_l2_after_a_copy_of_l1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(1);
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l1, &number_tv(1));
+            tv_list_append_tv(l2, &number_tv(2));
+            let mut tv = TypvalT::default();
+            let ok = tv_list_concat(l1, l2, &mut tv);
+            assert!(ok);
+            let TypvalValue::List(result) = tv.value else {
+                panic!("expected a List-typed result");
+            };
+            assert_eq!((*result).lv_len, 2);
+            assert_ne!(result, l1); // l1 itself is untouched, a fresh copy is made
+            assert!(matches!((*(*result).lv_first).li_tv.value, TypvalValue::Number(1)));
+            assert!(matches!((*(*result).lv_last).li_tv.value, TypvalValue::Number(2)));
+            // l1 itself still has only its own original item.
+            assert_eq!((*l1).lv_len, 1);
+            tv_list_free(l1);
+            tv_list_free(l2);
+            tv_list_free(result);
         }
     }
 

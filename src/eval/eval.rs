@@ -70,10 +70,25 @@
 //! zero is already well-defined (not UB) in both C and Rust, producing
 //! the identical result either way.
 //!
+//! Also translated: `eval_addlist` - the last "leaf" arithmetic
+//! function in this file, tractable once `eval/typval.rs` gained
+//! `tv_list_copy`/`tv_list_extend`/`tv_list_concat` (harvested
+//! specifically as this function's own dependency chain; needed a new
+//! opaque `crate::types_defs::VimconvT` placeholder for
+//! `tv_list_copy`'s `conv` parameter, which is only ever read by the
+//! not-yet-translated `deep`-copy path). Like `eval_addblob`, releases
+//! only `tv1`'s old list reference in the success path (via the
+//! now-real `tv_list_unref`, called directly since `tv1` is already
+//! known to be `List`-typed) - `tv2` is left for the caller (`eval5`);
+//! unlike `eval_addblob`, the error path (when `tv_list_concat` fails)
+//! releases BOTH operands, matching the original's own
+//! `tv_clear(tv1); tv_clear(tv2);` exactly.
+//!
+//! **`eval.c`'s entire "leaf" arithmetic family (functions needing no
+//! parser/lvalue machinery) is now complete.**
+//!
 //! Deferred: everything else - the actual parser/lvalue/loop/call
 //! machinery is a separate, substantial undertaking of its own.
-//! `eval_addlist` (the only remaining sibling "leaf" function) needs
-//! `tv_list_concat`, not yet translated.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
@@ -432,6 +447,51 @@ pub unsafe fn eval_multdiv_number(tv1: &mut TypvalT, tv2: &TypvalT, op: MulDivOp
         };
         tv1.value = TypvalValue::Number(result);
     }
+
+    true
+}
+
+/// Make a copy of list `tv1` and append list `tv2` (`eval_addlist`).
+///
+/// Returns `false` on failure (releasing both `tv1`/`tv2`, matching
+/// the original's own `tv_clear(tv1); tv_clear(tv2);` in that path
+/// exactly) - in practice always reachable-but-unexercised today,
+/// since `eval/typval.rs`'s `tv_list_concat`/`tv_list_copy` never
+/// actually fail for the `deep == false` path this crate can
+/// currently reach. On success, only `tv1`'s OLD list reference is
+/// released (via the now-real `tv_list_unref`, called directly since
+/// `tv1` is already known to be `List`-typed) - `tv2` is left for the
+/// caller (`eval5`, not yet translated), matching [`eval_addblob`]'s
+/// own asymmetric cleanup pattern.
+///
+/// # Safety
+/// `tv1`/`tv2` must both be `TypvalValue::List`-typed (matching the
+/// original's own contract - the caller, Vimscript's `+` operator
+/// dispatch in `eval5`, is responsible for checking this BEFORE
+/// calling); any non-null list pointer they hold must be valid.
+pub unsafe fn eval_addlist(tv1: &mut TypvalT, tv2: &TypvalT) -> bool {
+    use crate::eval::typval::{tv_list_concat, tv_list_unref};
+
+    let TypvalValue::List(l1) = tv1.value else {
+        unreachable!("eval_addlist: tv1 must be List-typed (caller's own contract)")
+    };
+    let TypvalValue::List(l2) = tv2.value else {
+        unreachable!("eval_addlist: tv2 must be List-typed (caller's own contract)")
+    };
+
+    let mut var3 = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { tv_list_concat(l1, l2, &mut var3) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            tv_list_unref(l1);
+            tv_list_unref(l2);
+        }
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_unref(l1) };
+    *tv1 = var3;
 
     true
 }
@@ -808,5 +868,82 @@ mod tests {
         let mut tv1 = number(1);
         let tv2 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
         assert!(!unsafe { eval_multdiv_number(&mut tv1, &tv2, MulDivOp::Mul) });
+    }
+
+    #[test]
+    fn eval_addlist_concatenates_lists_in_order() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_append_tv, tv_list_free};
+
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(1);
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l1, &number(1));
+            tv_list_append_tv(l2, &number(2));
+        }
+        let mut tv1 = TypvalT { value: TypvalValue::List(l1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::List(l2), ..Default::default() };
+
+        unsafe {
+            let ok = eval_addlist(&mut tv1, &tv2);
+            assert!(ok);
+            let TypvalValue::List(result) = tv1.value else {
+                panic!("expected a List-typed result");
+            };
+            assert_ne!(result, l1); // l1 itself was released, this is a fresh copy
+            assert_eq!((*result).lv_len, 2);
+            assert!(matches!((*(*result).lv_first).li_tv.value, TypvalValue::Number(1)));
+            assert!(matches!((*(*result).lv_last).li_tv.value, TypvalValue::Number(2)));
+            tv_list_free(l2);
+            tv_list_free(result);
+        }
+    }
+
+    #[test]
+    fn eval_addlist_releases_tv1s_old_list_reference() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_free};
+
+        let _lock = crate::globals::global_state_test_lock();
+        // l1 with refcount 2 - eval_addlist must release exactly one
+        // reference (the copy it internally makes is independent), so
+        // l1 survives with refcount 1 afterward, still safely
+        // dereferencable to confirm the release genuinely happened.
+        let l1 = tv_list_alloc(0);
+        unsafe { (*l1).lv_refcount = 2 };
+        let l2 = tv_list_alloc(0);
+        let mut tv1 = TypvalT { value: TypvalValue::List(l1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::List(l2), ..Default::default() };
+
+        unsafe {
+            assert!(eval_addlist(&mut tv1, &tv2));
+            assert_eq!((*l1).lv_refcount, 1);
+            let TypvalValue::List(result) = tv1.value else {
+                panic!("expected a List-typed result");
+            };
+            tv_list_free(l1);
+            tv_list_free(l2);
+            tv_list_free(result);
+        }
+    }
+
+    #[test]
+    fn eval_addlist_both_empty_gives_empty_result() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_free};
+
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(0);
+        let l2 = tv_list_alloc(0);
+        let mut tv1 = TypvalT { value: TypvalValue::List(l1), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::List(l2), ..Default::default() };
+
+        unsafe {
+            assert!(eval_addlist(&mut tv1, &tv2));
+            let TypvalValue::List(result) = tv1.value else {
+                panic!("expected a List-typed result");
+            };
+            assert_eq!((*result).lv_len, 0);
+            tv_list_free(l2);
+            tv_list_free(result);
+        }
     }
 }
