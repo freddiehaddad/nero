@@ -1,15 +1,30 @@
 //! Translated from `src/nvim/runtime_defs.h` (partial).
 //!
-//! Translated: `etype_T`, `estack_T`, `estack_arg_T`, `DoInRuntimepathCB`.
+//! Translated: `etype_T`, `estack_T`, `estack_arg_T`, `DoInRuntimepathCB`,
+//! and now `scriptvar_T`/`scriptitem_T` (as [`ScriptvarT`]/
+//! [`ScriptitemT`]) - tractable now that the eval engine's `dict_T`/
+//! `ScopeDictDictItem` both have real fields. `sv_dict: DictT` is
+//! embedded *by value* here, not behind a pointer like every other use
+//! of `DictT` in this crate so far - this works cleanly with the
+//! existing `tv_dict_*` API in `eval/typval.rs` (which already only
+//! ever takes a `*mut DictT`, never `Box<DictT>`), since `&mut
+//! sv.sv_dict as *mut DictT` is just as valid a pointer as one obtained
+//! via `tv_dict_alloc`'s own `Box::into_raw`, regardless of whether the
+//! `DictT` happens to be independently heap-allocated or embedded
+//! inside another struct's own memory - the first small-scale proof of
+//! this, ahead of `funccall_T`'s own larger by-value `dict_T`/`list_T`
+//! embedding (still deferred, see `eval/typval_defs.rs`'s own module
+//! doc).
 //!
-//! Deferred: `scriptvar_T`/`scriptitem_T` embed `dict_T`/`ScopeDictDictItem`
-//! by value (`scriptvar_T.sv_dict: dict_T`) - needs the eval engine's
-//! `typval_T` as a unit (phase 5), same blocker as `tabpage_S`.
+//! `ScriptitemT.sn_vars: *mut ScriptvarT` and everything else about
+//! actually *constructing*/*looking up* a script item (`new_script_vars`,
+//! `SCRIPT_ITEM`/`script_items` - a growable registry indexed by script
+//! ID) remain deferred - see `eval/vars.rs`'s own module doc.
 
-use crate::eval::typval_defs::{SctxT, UfuncT};
+use crate::eval::typval_defs::{DictT, ScopeDictDictItem, SctxT, UfuncT};
 use crate::ex_eval_defs::ExceptT;
 use crate::pos_defs::LinenrT;
-use crate::types_defs::AutoPatCmdT;
+use crate::types_defs::{AutoPatCmdT, ProftimeT};
 
 /// Discriminant for [`EstackT::es_info`] (`etype_T`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +108,66 @@ pub enum EstackArgT {
 /// `DoInRuntimepathCB`.
 pub type DoInRuntimepathCb = fn(i32, *mut *mut u8, bool, *mut std::ffi::c_void) -> bool;
 
+/// Holds the hashtab with variables local to each sourced script
+/// (`scriptvar_T`). See this module's own doc comment for the
+/// by-value `DictT` embedding rationale.
+///
+/// Derives neither `Debug` nor `Default`, matching `DictT`'s own
+/// convention (which derives neither either, embedded here by value) -
+/// a "proper" `ScriptvarT` needs `eval/vars.rs`'s `init_var_dict` to
+/// wire `sv_var` to point at `sv_dict`, the same reason `DictT` itself
+/// avoids a naive `Default::default()`/derived-`Clone` shorthand that
+/// could invite constructing one without that wiring.
+pub struct ScriptvarT {
+    /// Variable for `s:` scope (`sv_var`).
+    pub sv_var: ScopeDictDictItem,
+    /// `s:` variables themselves (`sv_dict`).
+    pub sv_dict: DictT,
+}
+
+/// Info about a sourced script (`scriptitem_T`).
+#[derive(Debug, Default)]
+pub struct ScriptitemT {
+    /// stores `s:` variables for this script (`sn_vars`).
+    pub sn_vars: *mut ScriptvarT,
+    /// script file name (`sn_name`).
+    pub sn_name: Option<Vec<u8>>,
+    /// `true` for a lua script (`sn_lua`).
+    pub sn_lua: bool,
+    /// `true` when script is/was profiled (`sn_prof_on`).
+    pub sn_prof_on: bool,
+    /// forceit: profile functions in this script (`sn_pr_force`).
+    pub sn_pr_force: bool,
+    /// time set when going into first child (`sn_pr_child`).
+    pub sn_pr_child: ProftimeT,
+    /// nesting for `sn_pr_child` (`sn_pr_nest`).
+    pub sn_pr_nest: i32,
+    // profiling the script as a whole.
+    /// nr of times sourced (`sn_pr_count`).
+    pub sn_pr_count: i32,
+    /// time spent in script + children (`sn_pr_total`).
+    pub sn_pr_total: ProftimeT,
+    /// time spent in script itself (`sn_pr_self`).
+    pub sn_pr_self: ProftimeT,
+    /// time at script start (`sn_pr_start`).
+    pub sn_pr_start: ProftimeT,
+    /// time in children after script start (`sn_pr_children`).
+    pub sn_pr_children: ProftimeT,
+    // profiling the script per line.
+    /// things stored for every line (`sn_prl_ga`).
+    pub sn_prl_ga: crate::garray_defs::GarrayT,
+    /// start time for current line (`sn_prl_start`).
+    pub sn_prl_start: ProftimeT,
+    /// time spent in children for this line (`sn_prl_children`).
+    pub sn_prl_children: ProftimeT,
+    /// wait start time for current line (`sn_prl_wait`).
+    pub sn_prl_wait: ProftimeT,
+    /// index of line being timed; -1 if none (`sn_prl_idx`).
+    pub sn_prl_idx: LinenrT,
+    /// line being timed was executed (`sn_prl_execed`).
+    pub sn_prl_execed: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +196,51 @@ mod tests {
     #[test]
     fn estack_arg_default_is_none() {
         assert_eq!(EstackArgT::default(), EstackArgT::None);
+    }
+
+    #[test]
+    fn scriptitem_default_is_zeroed_with_null_sn_vars() {
+        let si = ScriptitemT::default();
+        assert!(si.sn_vars.is_null());
+        assert!(si.sn_name.is_none());
+        assert!(!si.sn_lua);
+        assert!(!si.sn_prof_on);
+        assert_eq!(si.sn_pr_count, 0);
+        assert_eq!(si.sn_prl_ga.ga_len, 0);
+        assert_eq!(si.sn_prl_idx, 0);
+    }
+
+    #[test]
+    fn scriptvar_can_be_wired_via_init_var_dict_and_linked_from_scriptitem() {
+        let mut sv = ScriptvarT {
+            sv_var: ScopeDictDictItem::default(),
+            sv_dict: DictT {
+                dv_lock: crate::eval::typval_defs::VarLockStatus::Unlocked,
+                dv_scope: crate::eval::typval_defs::ScopeType::NoScope,
+                dv_refcount: 0,
+                dv_copy_id: 0,
+                dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
+                dv_index: std::collections::HashMap::new(),
+                dv_copydict: std::ptr::null_mut(),
+                dv_used_next: std::ptr::null_mut(),
+                dv_used_prev: std::ptr::null_mut(),
+                lua_table_ref: -1,
+            },
+        };
+        crate::eval::vars::init_var_dict(
+            &mut sv.sv_dict,
+            &mut sv.sv_var,
+            crate::eval::typval_defs::ScopeType::Scope,
+        );
+        assert_eq!(sv.sv_dict.dv_scope, crate::eval::typval_defs::ScopeType::Scope);
+
+        let mut si = ScriptitemT { sn_vars: &mut sv as *mut ScriptvarT, ..Default::default() };
+        assert!(!si.sn_vars.is_null());
+        // SAFETY: sv is still alive (a local, in scope for the whole
+        // test body), and si.sn_vars was just set to point at it.
+        unsafe {
+            assert_eq!((*si.sn_vars).sv_dict.dv_scope, crate::eval::typval_defs::ScopeType::Scope);
+        }
+        si.sn_vars = std::ptr::null_mut(); // avoid a dangling reference lingering
     }
 }

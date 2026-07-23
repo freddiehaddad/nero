@@ -4,3 +4,4 @@
 pub mod typval;
 pub mod typval_defs;
 pub mod userfunc;
+pub mod vars;
