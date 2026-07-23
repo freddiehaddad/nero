@@ -97,6 +97,7 @@ pub const SIGN_WIDTH: i32 = 2;
 //   matchitem_T -> struct matchitem,   src/nvim/buffer_defs.h   (phase 7,
 //                                      needs regmmatch_T)
 //   AutoPatCmd  -> struct AutoPatCmd_S, src/nvim/autocmd_defs.h (phase 6)
+//   expand_T    -> struct expand,      src/nvim/cmdexpand_defs.h (phase 7)
 // (mapblock_T/qf_info_T/matchitem_T are actually forward-declared in their
 // own headers, not types_defs.h itself, unlike the others above - but this
 // crate keeps all such opaque cross-cutting placeholders here regardless
@@ -156,6 +157,14 @@ pub struct MatchitemT {
 /// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see
 /// `src/nvim/autocmd_defs.h` (phase 6).
 pub struct AutoPatCmdT {
+    _private: (),
+}
+/// Placeholder for `expand_T` (`struct expand`) - see
+/// `src/nvim/cmdexpand_defs.h` (phase 7). Needed by
+/// `option_defs.rs`'s `OptexpandT.oe_xp` (cmdline-completion context
+/// for expanding string-option values) - only ever referenced through
+/// a pointer there, so this opaque placeholder is enough for now.
+pub struct ExpandT {
     _private: (),
 }
 /// Placeholder for `regmatch_T` (`struct regmatch`) - see

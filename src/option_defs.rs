@@ -11,16 +11,34 @@
 //! `WIN_OPT_IDX`/`TAB_OPT_IDX` lookup tables that map each local index
 //! back to its `OptIndex`.
 //!
-//! Deferred (real forward dependencies): `optset_T`/`opt_did_set_cb_T`
-//! (needs `sctx_T`, not yet translated), `optexpand_T`/`opt_expand_cb_T`
-//! (needs `regmatch_T` from `regexp_defs.h` and `expand_T` from
-//! `cmdexpand_defs.h`, neither translated), `vimoption_T` and the actual
-//! `options[]` table itself (needs all of the above, plus the
-//! machine-generated `options.generated.h`'s ~8000-line table content -
-//! a substantial, separate undertaking of its own, not started).
+//! Now also translated, now that `eval/typval_defs.rs`'s `SctxT` is
+//! real: `optset_T`/`opt_did_set_cb_T` (as [`OptsetT`]/`OptDidSetCbT`)
+//! and `optexpand_T`/`opt_expand_cb_T` (as [`OptexpandT`]/
+//! `OptExpandCbT`, using the already-existing opaque `RegmatchT` for
+//! `oe_regmatch` and a NEW opaque `ExpandT` placeholder for `oe_xp` -
+//! `cmdexpand_defs.h`'s real `expand_T`, itself a substantial cmdline-
+//! completion type not otherwise needed yet), and `vimoption_T`
+//! itself (as [`VimoptionT`]) - its `type: OptValType` field needed a
+//! small standalone [`OptValType`] enum reintroduced alongside `OptVal`
+//! (which unified the original's *tag+value* pair for actual option
+//! *values*, but `vimoption_T.type` is a bare tag describing what kind
+//! of value an option accepts, with no value attached - `OptVal` itself
+//! doesn't fit that use case).
+//!
+//! Deferred: the actual, populated `options[]` table itself (needs the
+//! machine-generated `options.generated.h`'s ~8000-line table content,
+//! each entry's `var`/`flags_var` pointing at a real
+//! `option_vars.rs`/`buffer_defs.rs`/`globals.rs` field - a real
+//! per-option address-resolution design question of its own - plus
+//! real `opt_did_set_cb`/`opt_expand_cb` callback functions, none of
+//! which exist yet) - a substantial, separate undertaking of its own,
+//! not started. `VimoptionT`'s own field *shape* needed none of that,
+//! matching the `OptIndex`-before-`options[]`-engine split already
+//! established this session for `ex_cmds_defs.rs`'s `CommandDefinition`.
 
 use crate::api::private::defs::NvimString;
-use crate::types_defs::{OptInt, TriState};
+use crate::eval::typval_defs::SctxT;
+use crate::types_defs::{OptInt, RegmatchT, TriState};
 
 /// Option flags (`OptFlags`). Kept as plain `u32` bit-flag constants (some
 /// of which are themselves combinations of others, e.g. `REDR_ALL`), not a
@@ -110,6 +128,26 @@ pub enum OptVal {
     String(NvimString),
 }
 
+/// Bare *type tag* for an option's accepted value kind, with no value
+/// attached (`OptValType`) - reintroduced standalone alongside
+/// [`OptVal`] specifically for [`VimoptionT`]'s own `type` field: an
+/// entry in the (still-deferred) `options[]` table describes what
+/// *kind* of value a given option accepts, independent of any
+/// particular value, so `OptVal`'s own tag-plus-value unification
+/// doesn't fit this use site the way it does for actual runtime option
+/// values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptValType {
+    /// (`kOptValTypeNil = -1`).
+    Nil = -1,
+    /// (`kOptValTypeBoolean`).
+    Boolean = 0,
+    /// (`kOptValTypeNumber`).
+    Number = 1,
+    /// (`kOptValTypeString`).
+    String = 2,
+}
+
 /// Scopes that an option can support (`OptScope`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -141,6 +179,168 @@ pub enum SetOpT {
     Removing,
 }
 
+/// Argument for the callback function ([`OptDidSetCbT`]) invoked after
+/// an option value is modified (`optset_T`).
+pub struct OptsetT {
+    /// Pointer to the option variable. The variable can be an `OptInt`
+    /// (numeric option), an `int` (boolean option) or a char pointer
+    /// (string option) in the original - kept as an untyped raw
+    /// pointer here too, matching the original's own `void *`
+    /// type-erasure exactly rather than inventing a more specific type
+    /// the header itself doesn't have (`os_varp`).
+    pub os_varp: *mut std::ffi::c_void,
+    pub os_idx: OptIndex,
+    pub os_flags: i32,
+    /// Old value of the option. Self-tagged (see [`OptVal`]'s own doc
+    /// comment) unlike the original's untagged `OptValData os_oldval`
+    /// (`os_oldval`).
+    pub os_oldval: OptVal,
+    /// New value of the option (`os_newval`).
+    pub os_newval: OptVal,
+    /// Option value was checked to be safe, no need to set
+    /// `kOptFlagInsecure`. Used for the `'keymap'`, `'filetype'` and
+    /// `'syntax'` options (`os_value_checked`).
+    pub os_value_checked: bool,
+    /// Option value changed. Used for the `'filetype'` and `'syntax'`
+    /// options (`os_value_changed`).
+    pub os_value_changed: bool,
+    /// Used by the `'isident'`, `'iskeyword'`, `'isprint'` and
+    /// `'isfname'` options: `true` if the character table was
+    /// modified while processing the option and needs to be restored
+    /// because of a failure (`os_restore_chartab`).
+    pub os_restore_chartab: bool,
+    /// If the value specified for an option is not valid and the
+    /// error message is parameterized, this buffer holds the error
+    /// message (`os_errbuf`).
+    pub os_errbuf: Option<Vec<u8>>,
+    /// length of the error buffer (`os_errbuflen`).
+    pub os_errbuflen: usize,
+    /// `*mut WinT`, untyped to match the original's own `void *`
+    /// (`os_win`).
+    pub os_win: *mut std::ffi::c_void,
+    /// `*mut BufT`, untyped to match the original's own `void *`
+    /// (`os_buf`).
+    pub os_buf: *mut std::ffi::c_void,
+}
+
+impl Default for OptsetT {
+    fn default() -> Self {
+        OptsetT {
+            os_varp: std::ptr::null_mut(),
+            os_idx: OptIndex::Invalid,
+            os_flags: 0,
+            os_oldval: OptVal::Nil,
+            os_newval: OptVal::Nil,
+            os_value_checked: false,
+            os_value_changed: false,
+            os_restore_chartab: false,
+            os_errbuf: None,
+            os_errbuflen: 0,
+            os_win: std::ptr::null_mut(),
+            os_buf: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Type for the callback function that is invoked after an option
+/// value is changed to validate and apply the new value
+/// (`opt_did_set_cb_T`).
+///
+/// Returns `None` if the option value is valid and successfully
+/// applied. Otherwise returns an error message.
+pub type OptDidSetCbT = fn(args: &mut OptsetT) -> Option<&'static [u8]>;
+
+/// Argument for the callback function ([`OptExpandCbT`]) invoked after
+/// a string option value is expanded for cmdline completion
+/// (`optexpand_T`).
+pub struct OptexpandT {
+    /// Pointer to the option variable. It's always a string in the
+    /// original - kept as an untyped raw pointer here too, matching
+    /// `OptsetT.os_varp`'s own reasoning (`oe_varp`).
+    pub oe_varp: *mut std::ffi::c_void,
+    pub oe_idx: OptIndex,
+    /// The original option value, escaped (`oe_opt_value`).
+    pub oe_opt_value: Option<Vec<u8>>,
+    /// `true` if using `set+=` instead of `set=` (`oe_append`).
+    pub oe_append: bool,
+    /// `true` if we would like to add the original option value as
+    /// the first choice (`oe_include_orig_val`).
+    pub oe_include_orig_val: bool,
+    /// Regex from the cmdline, for matching potential options against
+    /// (`oe_regmatch`).
+    pub oe_regmatch: *mut RegmatchT,
+    /// The expansion context (`oe_xp`).
+    pub oe_xp: *mut crate::types_defs::ExpandT,
+    /// The full argument passed to `:set`. For example, if the user
+    /// inputs `":set dip=icase,algorithm:my<Tab>"`, `oe_xp`'s own
+    /// pattern will only have `"my"`, but this will contain the whole
+    /// `"icase,algorithm:my"` (`oe_set_arg`).
+    pub oe_set_arg: Option<Vec<u8>>,
+}
+
+impl Default for OptexpandT {
+    fn default() -> Self {
+        OptexpandT {
+            oe_varp: std::ptr::null_mut(),
+            oe_idx: OptIndex::Invalid,
+            oe_opt_value: None,
+            oe_append: false,
+            oe_include_orig_val: false,
+            oe_regmatch: std::ptr::null_mut(),
+            oe_xp: std::ptr::null_mut(),
+            oe_set_arg: None,
+        }
+    }
+}
+
+/// Type for the callback function that is invoked when expanding
+/// possible string option values during cmdline completion
+/// (`opt_expand_cb_T`).
+///
+/// Returns `Some(matches)` if the expansion succeeded, `None`
+/// otherwise (collapsing the original's separate `int` return code +
+/// `numMatches`/`matches` out-parameters into one `Option`, matching
+/// this crate's usual preference for a single meaningful return value
+/// over a C-style status-code-plus-out-parameters pair).
+pub type OptExpandCbT = fn(args: &mut OptexpandT) -> Option<Vec<Vec<u8>>>;
+
+/// Structure for one entry of the (still-deferred, see this module's
+/// own doc comment) `options[]` table (`vimoption_T`).
+pub struct VimoptionT {
+    /// full option name (`fullname`).
+    pub fullname: &'static [u8],
+    /// permissible abbreviation (`shortname`).
+    pub shortname: &'static [u8],
+    /// see [`opt_flags`] (`flags`).
+    pub flags: u32,
+    /// option type (`type`).
+    pub r#type: OptValType,
+    /// option scope flags, see [`OptScope`] (`scope_flags`).
+    pub scope_flags: OptScopeFlags,
+    /// global option: pointer to variable; window-local option: null;
+    /// buffer-local option: global value. Untyped raw pointer,
+    /// matching the original's own `void *` (`var`).
+    pub var: *mut std::ffi::c_void,
+    pub flags_var: *mut u32,
+    /// index of option at every scope (`scope_idx`).
+    pub scope_idx: [isize; OPT_SCOPE_SIZE],
+    /// option is immutable, trying to set it will give an error
+    /// (`immutable`).
+    pub immutable: bool,
+    /// possible values for string options (`values`).
+    pub values: &'static [&'static [u8]],
+    /// callback function to invoke after an option is modified, to
+    /// validate and apply the new value (`opt_did_set_cb`).
+    pub opt_did_set_cb: Option<OptDidSetCbT>,
+    /// callback function to invoke when expanding possible values on
+    /// the cmdline; only useful for string options (`opt_expand_cb`).
+    pub opt_expand_cb: Option<OptExpandCbT>,
+    /// default value (`def_val`).
+    pub def_val: OptVal,
+    /// script in which the option was last set (`script_ctx`).
+    pub script_ctx: SctxT,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +362,87 @@ mod tests {
         assert_ne!(OptVal::Nil, OptVal::Number(0));
         assert_eq!(OptVal::Number(5), OptVal::Number(5));
         assert_ne!(OptVal::Boolean(TriState::True), OptVal::Boolean(TriState::False));
+    }
+
+    #[test]
+    fn opt_val_type_discriminants_match_c_enum() {
+        assert_eq!(OptValType::Nil as i32, -1);
+        assert_eq!(OptValType::Boolean as i32, 0);
+        assert_eq!(OptValType::Number as i32, 1);
+        assert_eq!(OptValType::String as i32, 2);
+    }
+
+    #[test]
+    fn optset_default_is_zeroed_with_nil_values_and_null_pointers() {
+        let os = OptsetT::default();
+        assert!(os.os_varp.is_null());
+        assert_eq!(os.os_idx, OptIndex::Invalid);
+        assert_eq!(os.os_flags, 0);
+        assert_eq!(os.os_oldval, OptVal::Nil);
+        assert_eq!(os.os_newval, OptVal::Nil);
+        assert!(!os.os_value_checked);
+        assert!(!os.os_value_changed);
+        assert!(!os.os_restore_chartab);
+        assert!(os.os_errbuf.is_none());
+        assert_eq!(os.os_errbuflen, 0);
+        assert!(os.os_win.is_null());
+        assert!(os.os_buf.is_null());
+    }
+
+    #[test]
+    fn optexpand_default_is_zeroed_with_null_pointers() {
+        let oe = OptexpandT::default();
+        assert!(oe.oe_varp.is_null());
+        assert_eq!(oe.oe_idx, OptIndex::Invalid);
+        assert!(oe.oe_opt_value.is_none());
+        assert!(!oe.oe_append);
+        assert!(!oe.oe_include_orig_val);
+        assert!(oe.oe_regmatch.is_null());
+        assert!(oe.oe_xp.is_null());
+        assert!(oe.oe_set_arg.is_none());
+    }
+
+    #[test]
+    fn opt_did_set_cb_t_can_be_stored_and_called() {
+        fn validator(_args: &mut OptsetT) -> Option<&'static [u8]> {
+            Some(b"E123: bad value")
+        }
+        let cb: OptDidSetCbT = validator;
+        let mut args = OptsetT::default();
+        assert_eq!(cb(&mut args), Some(b"E123: bad value".as_slice()));
+    }
+
+    #[test]
+    fn opt_expand_cb_t_can_be_stored_and_called() {
+        fn expander(_args: &mut OptexpandT) -> Option<Vec<Vec<u8>>> {
+            Some(vec![b"foo".to_vec(), b"bar".to_vec()])
+        }
+        let cb: OptExpandCbT = expander;
+        let mut args = OptexpandT::default();
+        assert_eq!(cb(&mut args), Some(vec![b"foo".to_vec(), b"bar".to_vec()]));
+    }
+
+    #[test]
+    fn vimoption_t_can_be_constructed_with_no_callbacks() {
+        let opt = VimoptionT {
+            fullname: b"aleph",
+            shortname: b"al",
+            flags: 0,
+            r#type: OptValType::Number,
+            scope_flags: 1 << (OptScope::Global as u8),
+            var: std::ptr::null_mut(),
+            flags_var: std::ptr::null_mut(),
+            scope_idx: [0; OPT_SCOPE_SIZE],
+            immutable: true,
+            values: &[],
+            opt_did_set_cb: None,
+            opt_expand_cb: None,
+            def_val: OptVal::Number(224),
+            script_ctx: SctxT::default(),
+        };
+        assert_eq!(opt.fullname, b"aleph");
+        assert_eq!(opt.def_val, OptVal::Number(224));
+        assert!(opt.opt_did_set_cb.is_none());
     }
 }
 
