@@ -67,20 +67,27 @@
 //!
 //! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`.
 //!
+//! **Partial**: `partial_free`/`partial_unref` (`eval.c`, not
+//! `eval/typval.c` - kept here anyway alongside the sibling `tv_*_free`/
+//! `_unref` functions, see their own doc comments for why). Releases
+//! `pt_dict` (via the real `tv_dict_unref`) and each `pt_argv` entry
+//! (via `tv_clear_simple`, one level); omits the original's
+//! `func_unref`/`func_ptr_unref` release of the referenced function's
+//! own refcount (needs `ufunc_T`'s function-name registry, not yet
+//! translated - same accepted gap as `tv_copy`'s `VAR_FUNC` branch).
+//!
 //! **Copy**: `tv_copy` (the `VAR_FUNC` branch omits the original's own
 //! `func_ref` refcount increment - needs a function-name registry,
 //! `eval/userfunc.c`'s `ufunc_T` table, not yet translated, though the
 //! function-name *string* itself is still copied correctly; the
-//! `VAR_PARTIAL` branch is `unimplemented!()` - needs `partial_T`'s
-//! real `pt_refcount` field, still an opaque placeholder pending
-//! `ufunc_T`).
+//! `VAR_PARTIAL` branch now increments the real `pt_refcount` field).
 //!
 //! A shared private `tv_clear_simple` helper (this crate's own,
 //! replacing the original's `tv_clear`'s simple-value branches - see
 //! "Deferred" below) is used by both `tv_dict_item_free` and every
 //! list-item-freeing function above to release a value's List/Dict/
-//! Blob reference (via the real `tv_list_unref`/`tv_dict_unref`/
-//! `tv_blob_unref` above) or panic narrowly on `VAR_PARTIAL` -
+//! Blob/Partial reference (via the real `tv_list_unref`/`tv_dict_unref`/
+//! `tv_blob_unref`/`partial_unref` above) -
 //! Number/String/Bool/Special/Float/Func/Unknown need no explicit
 //! release at all (Rust's own ownership drops their `Vec<u8>`/etc.
 //! automatically).
@@ -122,7 +129,7 @@
 //!   etc.): straightforward to add once needed, layered on top of the
 //!   primitives here.
 
-use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
+use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
 use crate::vim_defs::{FAIL, OK};
 
@@ -183,14 +190,15 @@ pub unsafe fn tv_list_ref(l: *mut crate::eval::typval_defs::ListT) {
 ///   `uf_refcount` via `find_func()`) is omitted - needs a function-
 ///   name registry (`eval/userfunc.c`'s `ufunc_T` table), not yet
 ///   translated.
-/// - `VAR_PARTIAL`: `unimplemented!()` - needs `partial_T`'s real
-///   `pt_refcount` field; `partial_T` is still an opaque placeholder
-///   (needs `ufunc_T` first).
+/// - `VAR_PARTIAL`: the partial's own `pt_refcount` is now
+///   incremented for real (`partial_T`'s real fields exist), but
+///   nothing else about the copy is deep - matches the original
+///   exactly (a `partial_T` copy is always just a refcount bump).
 ///
 /// # Safety
-/// If `from`'s value is `List`/`Dict`/`Blob`-typed with a non-null
-/// pointer, that pointer must be valid (matching every other function
-/// in this crate that touches those types).
+/// If `from`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
+/// non-null pointer, that pointer must be valid (matching every other
+/// function in this crate that touches those types).
 pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
     to.v_lock = VarLockStatus::Unlocked;
     to.value = from.value.clone();
@@ -215,11 +223,11 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
             // See this function's own doc comment for why func_ref()
             // is omitted - the name string itself is already copied.
         }
-        TypvalValue::Partial(_) => {
-            unimplemented!(
-                "tv_copy: VAR_PARTIAL refcount increment needs partial_T's real pt_refcount \
-                 field, not yet translated (partial_T is still an opaque placeholder)"
-            );
+        TypvalValue::Partial(p) => {
+            if !p.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (**p).pt_refcount += 1 };
+            }
         }
         TypvalValue::Blob(blob) => {
             if !blob.is_null() {
@@ -243,17 +251,19 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
 /// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
 ///
 /// Shared "clear a typval's value, releasing what it owns/references"
-/// core used by [`tv_dict_item_free`] and (once list_T support exists)
-/// list item freeing too - the original's `tv_clear`, minus its
-/// String/Number/etc. no-op branches (Rust's own ownership already
-/// handles those - see this module's own doc comment) and minus its
-/// `VAR_PARTIAL` branch (`unimplemented!()` - needs `partial_T`'s real
-/// `pt_refcount` field, still an opaque placeholder).
+/// core used by [`tv_dict_item_free`] and every list-item-freeing
+/// function - the original's `tv_clear`, minus its String/Number/etc.
+/// no-op branches (Rust's own ownership already handles those - see
+/// this module's own doc comment). `VAR_PARTIAL` now calls the real
+/// [`partial_unref`] (see that function's own doc comment for its one
+/// remaining gap: releasing the referenced function's own refcount,
+/// which needs `ufunc_T`'s function-name registry, not yet
+/// translated).
 ///
 /// # Safety
-/// If `tv`'s value is `List`/`Dict`/`Blob`-typed with a non-null
-/// pointer, that pointer must be valid (matching every other function
-/// in this crate that touches those types).
+/// If `tv`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
+/// non-null pointer, that pointer must be valid (matching every other
+/// function in this crate that touches those types).
 unsafe fn tv_clear_simple(tv: &TypvalT) {
     match &tv.value {
         TypvalValue::List(l) => {
@@ -268,11 +278,9 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { tv_blob_unref(*b) };
         }
-        TypvalValue::Partial(_) => {
-            unimplemented!(
-                "tv_clear: VAR_PARTIAL refcount decrement needs partial_T's real pt_refcount \
-                 field, not yet translated (partial_T is still an opaque placeholder)"
-            );
+        TypvalValue::Partial(p) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { partial_unref(*p) };
         }
         TypvalValue::Unknown
         | TypvalValue::Number(_)
@@ -284,6 +292,65 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
             // Rust's own ownership drops String/Func's owned Vec<u8>
             // naturally - no manual xfree needed, unlike the original.
         }
+    }
+}
+
+/// Free a partial, releasing everything it owns (`partial_free`,
+/// `eval.c` - kept here alongside this module's other `tv_*_unref`/
+/// `_free` functions since it's small, self-contained, and exactly
+/// analogous in shape to [`tv_dict_free`]/[`tv_list_free`], even
+/// though `partial_T`'s real home is `eval.c`, not `eval/typval.c`).
+///
+/// # Deferred
+/// The original's `func_unref(pt->pt_name)`/`func_ptr_unref(pt->pt_func)`
+/// (releasing the referenced user-defined function's own reference
+/// count) is omitted - needs a function-name/pointer registry
+/// (`ufunc_T`'s real fields + `eval/userfunc.c`, not yet translated),
+/// matching the same accepted gap as `tv_copy`'s `VAR_FUNC` branch.
+/// `pt_argv`'s items are released one level via [`tv_clear_simple`]
+/// (matching this module's own established policy for container
+/// contents - not the original's fully recursive `tv_clear`, which
+/// itself is a separate, substantial `encode_vim_to_nothing`-based
+/// subsystem, not attempted here).
+///
+/// # Safety
+/// `pt` must be a valid, non-null pointer previously allocated via
+/// `Box::into_raw` (nothing in this crate currently allocates a real
+/// `PartialT` this way yet - every current use is a hand-built value
+/// in a test - but this matches the ownership convention every other
+/// heap-allocated type in this module already uses). If
+/// `(*pt).pt_dict` is non-null, it must be a valid pointer to a live
+/// `DictT`.
+unsafe fn partial_free(pt: *mut PartialT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let boxed = unsafe { Box::from_raw(pt) };
+    for argv in &boxed.pt_argv {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(argv) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_dict_unref(boxed.pt_dict) };
+    // func_unref(pt_name)/func_ptr_unref(pt_func) omitted - see this
+    // function's own doc comment.
+}
+
+/// Unreference a partial: decrement the reference count and free it
+/// once it reaches zero (`partial_unref`, `eval.c`).
+///
+/// # Safety
+/// Same as `partial_free` (this module's own private helper) whenever
+/// `pt` is non-null; a null `pt` is always a safe no-op (matching the
+/// original).
+pub unsafe fn partial_unref(pt: *mut PartialT) {
+    if pt.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*pt).pt_refcount -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*pt).pt_refcount } <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { partial_free(pt) };
     }
 }
 
@@ -1555,14 +1622,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "VAR_PARTIAL refcount decrement")]
-    fn tv_dict_item_free_panics_on_partial_valued_item() {
+    fn tv_dict_item_free_null_partial_is_a_safe_noop() {
+        // partial_unref(NULL) is always a safe no-op, matching the
+        // original - no longer panics now that partial_T has real
+        // fields (see partial_unref's own doc comment).
         let mut item = DictitemT {
             di_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Partial(std::ptr::null_mut()) },
             di_flags: 0,
             di_key: b"x\0".to_vec(),
         };
         unsafe { tv_dict_item_free(&mut item as *mut DictitemT) };
+    }
+
+    #[test]
+    fn tv_dict_item_free_decrements_partial_refcount_instead_of_panicking() {
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 2,
+            ..Default::default()
+        }));
+        let mut item = DictitemT {
+            di_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Partial(pt) },
+            di_flags: 0,
+            di_key: b"x\0".to_vec(),
+        };
+        unsafe {
+            tv_dict_item_free(&mut item as *mut DictitemT);
+            assert_eq!((*pt).pt_refcount, 1);
+            // Still refcount 1 - not freed yet, safe to free directly.
+            drop(Box::from_raw(pt));
+        }
     }
 
     #[test]
@@ -1668,14 +1756,38 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "VAR_PARTIAL refcount increment")]
-    fn tv_copy_partial_panics() {
+    fn tv_copy_partial_null_is_a_safe_noop() {
+        // A null partial is always safe to copy (no refcount touched),
+        // matching the original - no longer panics now that partial_T
+        // has real fields (see tv_copy's own doc comment).
         let from = TypvalT {
             v_lock: VarLockStatus::Unlocked,
             value: TypvalValue::Partial(std::ptr::null_mut()),
         };
         let mut to = TypvalT::default();
         unsafe { tv_copy(&from, &mut to) };
+        assert!(matches!(to.value, TypvalValue::Partial(p) if p.is_null()));
+    }
+
+    #[test]
+    fn tv_copy_partial_increments_refcount() {
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        }));
+        unsafe {
+            let from = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Partial(pt) };
+            let mut to = TypvalT::default();
+            tv_copy(&from, &mut to);
+            assert_eq!((*pt).pt_refcount, 2);
+            assert!(matches!(to.value, TypvalValue::Partial(p) if p == pt));
+
+            // Clean up both references directly (no real allocator/
+            // partial_unref-based teardown exercised here - this test
+            // is only checking the refcount arithmetic).
+            (*pt).pt_refcount = 0;
+            drop(Box::from_raw(pt));
+        }
     }
 
     #[test]
@@ -1751,6 +1863,60 @@ mod tests {
             assert_eq!((*b).bv_refcount, 1);
             tv_blob_free(b);
         }
+    }
+
+    #[test]
+    fn partial_unref_null_is_noop() {
+        unsafe { partial_unref(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn partial_unref_decrements_without_freeing_when_still_referenced() {
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 2,
+            ..Default::default()
+        }));
+        unsafe {
+            partial_unref(pt);
+            assert_eq!((*pt).pt_refcount, 1);
+            // Still referenced - free directly rather than double-unref.
+            drop(Box::from_raw(pt));
+        }
+    }
+
+    #[test]
+    fn partial_unref_frees_and_releases_dict_at_zero_refcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!((*d).dv_refcount, 0);
+            (*d).dv_refcount = 1;
+
+            let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+                pt_refcount: 1,
+                pt_dict: d,
+                ..Default::default()
+            }));
+            // Refcount hits 0 here - partial_free runs, which unrefs
+            // `d` (1 -> 0), freeing it too. Don't touch `pt`/`d` again
+            // after this.
+            partial_unref(pt);
+        }
+    }
+
+    #[test]
+    fn partial_unref_frees_and_clears_argv_at_zero_refcount() {
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_argv: vec![number_tv(1), number_tv(2)],
+            ..Default::default()
+        }));
+        // Refcount hits 0 - partial_free runs, clearing each pt_argv
+        // entry via tv_clear_simple (a no-op release for plain
+        // Numbers, but still exercises the loop) and freeing `pt`
+        // itself. Nothing further to assert on `pt` after this - the
+        // absence of a crash/leak-sanitizer complaint is the check.
+        unsafe { partial_unref(pt) };
     }
 
     #[test]

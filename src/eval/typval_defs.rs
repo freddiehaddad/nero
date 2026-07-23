@@ -56,12 +56,32 @@
 //! (`tv_dict_alloc`, `tv_dict_find`, etc.) live in `eval/typval.rs`,
 //! translated from `eval/typval.c`.
 //!
-//! `ufunc_T`/`funccall_T`/`partial_T`'s own real fields remain
-//! deferred - `partial_T` needs `ufunc_T` (for `pt_func`), itself a
-//! separate, substantial piece of the eval engine's user-defined-
-//! function machinery. `partial_T` stays an opaque placeholder (same
-//! convention as `types_defs.rs`'s cross-cutting placeholder list) for
-//! exactly this reason.
+//! `ufunc_T`/`funccall_T`'s own real fields remain deferred - both
+//! need their own dedicated design pass for `ufunc_T.uf_name`'s C
+//! flexible-array-member (the same class of problem `dictitem_T`'s
+//! `di_key` already solved, likely via the same "owned `Vec<u8>` +
+//! side-table" technique), and `funccall_T` additionally embeds
+//! `dict_T`/`list_T` *by value* (not by pointer, unlike every other
+//! use of those types in this crate so far) - a new situation deserving
+//! its own careful design, not rushed alongside `partial_T` below.
+//! `ufunc_T` stays an opaque placeholder (same convention as
+//! `types_defs.rs`'s cross-cutting placeholder list) for exactly this
+//! reason.
+//!
+//! `partial_T` (as [`PartialT`]), unlike `ufunc_T`, has NO flexible-
+//! array-member of its own and needed no design decision beyond the
+//! already-established conventions: `pt_func: *mut UfuncT` references
+//! `crate::types_defs::UfuncT`'s still-opaque placeholder directly (a
+//! raw pointer to an opaque/zero-sized type is a perfectly well-formed
+//! Rust type, so `partial_T`'s own fields don't need to wait on
+//! `ufunc_T`'s real ones), and `pt_argv` (the original's allocated
+//! `typval_T *` + `pt_argc` pair) collapses into a plain `Vec<TypvalT>`
+//! (its own `.len()` replacing `pt_argc`), matching this crate's usual
+//! "owned `Vec` instead of allocated-array-plus-count" convention. The
+//! allocation/refcounting *functions* (`partial_free`/`partial_unref`)
+//! live in `eval/typval.rs` alongside their sibling `tv_*_free`/`_unref`
+//! functions, even though `partial_T`'s real home in the original is
+//! `eval.c`, not `eval/typval.c` (see that module's own doc comment).
 
 use crate::pos_defs::LinenrT;
 use crate::types_defs::LuaRef;
@@ -300,12 +320,40 @@ pub struct ListT {
     pub lua_table_ref: LuaRef,
 }
 
-/// Placeholder for `partial_T` (`struct partial_S`) - a Vimscript partial
-/// (a function reference bound to some arguments/a dict `self`). Needs
-/// `ufunc_T` (for `pt_func`), deferred to the eval engine as a unit
-/// (phase 5).
+/// Structure representing a Vimscript "partial" - a function reference
+/// bound to some arguments and/or a `self` dict (`partial_S` /
+/// `partial_T`).
+///
+/// `pt_func: *mut UfuncT` references `crate::types_defs::UfuncT`, which
+/// remains its own opaque placeholder (`ufunc_T`'s real fields need
+/// their own dedicated design pass for `uf_name`'s C flexible-array-
+/// member, the same class of problem `dictitem_T`'s `di_key` already
+/// solved - not yet undertaken) - a raw pointer to an opaque/
+/// zero-sized placeholder type is still a perfectly well-formed Rust
+/// type, so `partial_T`'s own real fields don't need to wait for that.
+/// `pt_argv` (the original's allocated `typval_T *`+`pt_argc` pair) is
+/// a plain `Vec<TypvalT>` here, matching this crate's usual "owned
+/// `Vec` instead of allocated-array-plus-count" convention - its own
+/// `.len()` replaces `pt_argc`.
+#[derive(Debug, Default)]
 pub struct PartialT {
-    _private: (),
+    /// Reference count (`pt_refcount`).
+    pub pt_refcount: i32,
+    pub pt_copy_id: i32,
+    /// Function name; when absent use `pt_func`'s name instead
+    /// (`pt_name`).
+    pub pt_name: Option<Vec<u8>>,
+    /// Function pointer; when null, look up the function with
+    /// `pt_name` instead (`pt_func`).
+    pub pt_func: *mut crate::types_defs::UfuncT,
+    /// `true` when this partial was created via `dict.member` in
+    /// `handle_subscript()` (`pt_auto`).
+    pub pt_auto: bool,
+    /// Arguments (`pt_argv`/`pt_argc` collapsed into one `Vec` - see
+    /// this struct's own doc comment).
+    pub pt_argv: Vec<TypvalT>,
+    /// Dict for `self` (`pt_dict`).
+    pub pt_dict: *mut DictT,
 }
 
 /// Structure to hold info about a Blob (`blobvar_S` / `blob_T`).
@@ -629,6 +677,18 @@ mod tests {
         assert_eq!(blob.bv_ga.ga_len, 0);
         assert_eq!(blob.bv_refcount, 0);
         assert_eq!(blob.bv_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn partial_t_default_is_zeroed_with_null_pointers() {
+        let pt = PartialT::default();
+        assert_eq!(pt.pt_refcount, 0);
+        assert_eq!(pt.pt_copy_id, 0);
+        assert!(pt.pt_name.is_none());
+        assert!(pt.pt_func.is_null());
+        assert!(!pt.pt_auto);
+        assert!(pt.pt_argv.is_empty());
+        assert!(pt.pt_dict.is_null());
     }
 
     #[test]
