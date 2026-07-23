@@ -81,6 +81,10 @@
 //! `crate::eval::userfunc::func_ref`; the `VAR_PARTIAL` branch
 //! increments the real `pt_refcount` field).
 //!
+//! **String conversion**: `tv_get_string`/`tv_get_string_chk` (the
+//! original's `_buf`/`_buf_chk` variants aren't translated separately -
+//! see [`tv_get_string_chk`]'s own doc comment for why).
+//!
 //! A shared private `tv_clear_simple` helper (this crate's own,
 //! replacing the original's `tv_clear`'s simple-value branches - see
 //! "Deferred" below) is used by both `tv_dict_item_free` and every
@@ -127,18 +131,24 @@
 //!   acyclic value (the only kind Vimscript's reference-counted value
 //!   model can produce).
 //! - `tv_get_lnum` (needs `var2fpos`/`curwin`, `window.c`, for its
-//!   "special string like `.`/`$`" fallback branch) and
-//!   `tv_get_string`/`tv_get_string_buf`/`tv_get_string_chk` (need a
-//!   shared static conversion buffer plus `tv_dict_get_string`/number-
-//!   to-string formatting, not yet examined) remain deferred -
+//!   "special string like `.`/`$`" fallback branch) remains deferred.
 //!   `tv_get_number`/`tv_get_number_chk`/`tv_get_bool`/`tv_get_bool_chk`
 //!   are translated now that `charset.c`'s `vim_str2nr` exists (the
 //!   only real blocker for `VAR_STRING`'s branch); their own
 //!   `emsg`/`semsg` calls for wrong-type values are omitted (message
 //!   display, not tractable), while the error-flag/return-value
-//!   behavior is kept exactly.
-//! - Every other `tv_dict_*`/`tv_list_*`/`tv_blob_*` function
-//!   (`tv_dict_get_string`, `tv_dict_extend`, `tv_list_copy`,
+//!   behavior is kept exactly. `tv_get_string`/`tv_get_string_chk` are
+//!   now translated too (collapsing the original's 4-function
+//!   `_buf`/`_buf_chk` family down to 2 - see
+//!   [`tv_get_string_chk`]'s own doc comment for why), using a new,
+//!   narrow `fmt_g` helper (verified against 68 real glibc `printf`
+//!   reference outputs) for `VAR_FLOAT`'s `%g`-formatted case - NOT a
+//!   general `vim_snprintf` implementation, which remains its own
+//!   separate, substantial undertaking (see `strings.rs`'s own module
+//!   doc).
+//! - `tv_dict_get_string` (needs the now-real `tv_get_string` above,
+//!   but not yet examined itself) and every other `tv_dict_*`/
+//!   `tv_list_*`/`tv_blob_*` function (`tv_dict_extend`, `tv_list_copy`,
 //!   `tv_list_concat`, blob byte-level accessors, iteration helpers,
 //!   etc.): straightforward to add once needed, layered on top of the
 //!   primitives here.
@@ -324,6 +334,135 @@ pub fn tv_get_bool(tv: &TypvalT) -> crate::eval::typval_defs::VarnumberT {
 #[must_use]
 pub fn tv_get_bool_chk(tv: &TypvalT, ret_error: Option<&mut bool>) -> crate::eval::typval_defs::VarnumberT {
     tv_get_number_chk(tv, ret_error)
+}
+
+/// Get the string value of a "stringish" Vimscript object
+/// (`tv_get_string_chk`).
+///
+/// Returns `None` on error (`Func`/`Partial`/`List`/`Dict`/`Blob`/
+/// `Unknown` - a `Funcref` is deliberately NOT stringified to its
+/// name here, matching the original's own `str_errors`-driven
+/// `emsg`/`NULL` for that exact case too). The `emsg(_(str_errors[...]))`
+/// call itself is omitted - see this module's own "skip the display,
+/// keep the state" policy (e.g. `tv_get_number_chk`'s own doc comment).
+///
+/// Collapses the original's 4-function family
+/// (`tv_get_string_chk`/`tv_get_string`/`tv_get_string_buf`/
+/// `tv_get_string_buf_chk`) down to 2: the original's `_buf`/`_buf_chk`
+/// variants exist purely so the caller can supply their OWN buffer
+/// instead of relying on a shared `static char mybuf[NUMBUFLEN]` (whose
+/// own doc comment warns it "may be used only once, next call ...
+/// may reuse it") - a Rust translation returning a freshly-owned
+/// `Vec<u8>` on every call has no such shared-buffer hazard to work
+/// around in the first place, so the `_buf` variants would be
+/// identical to their non-`_buf` counterparts if translated verbatim;
+/// omitted as pure duplication.
+#[must_use]
+pub fn tv_get_string_chk(tv: &TypvalT) -> Option<Vec<u8>> {
+    match &tv.value {
+        TypvalValue::Number(n) => Some(n.to_string().into_bytes()),
+        TypvalValue::Float(f) => Some(fmt_g(*f)),
+        TypvalValue::String(s) => Some(s.clone().unwrap_or_default()),
+        TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True) => Some(b"v:true".to_vec()),
+        TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::False) => Some(b"v:false".to_vec()),
+        TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null) => Some(b"v:null".to_vec()),
+        TypvalValue::Partial(_)
+        | TypvalValue::Func(_)
+        | TypvalValue::List(_)
+        | TypvalValue::Dict(_)
+        | TypvalValue::Blob(_)
+        | TypvalValue::Unknown => None,
+    }
+}
+
+/// Get the string value of a "stringish" Vimscript object, never
+/// returning `None` (`tv_get_string`) - empty bytes instead, on the
+/// same errors [`tv_get_string_chk`] itself returns `None` for. See
+/// [`tv_get_string_chk`]'s own doc comment for why the original's
+/// `_buf` variants aren't translated separately.
+#[must_use]
+pub fn tv_get_string(tv: &TypvalT) -> Vec<u8> {
+    tv_get_string_chk(tv).unwrap_or_default()
+}
+
+/// Formats `value` matching C's `printf("%g", value)` with the
+/// default precision of 6 significant digits - the ONLY precision
+/// `typval.c` itself ever uses (`vim_snprintf(buf, NUMBUFLEN, "%g",
+/// tv->vval.v_float)` inside the original's `tv_get_string_buf_chk`).
+/// A narrow, purpose-built helper for that one call site, NOT a
+/// generic `%g`/`vim_snprintf` implementation - the real, fully
+/// general `vim_snprintf` (positional `$`-style arguments, arbitrary
+/// precision/width/flags) remains its own separate, substantial
+/// undertaking, see `strings.rs`'s own module doc.
+///
+/// Algorithm (matching the C standard's own `%g` specification):
+/// round `value` to 6 significant digits via scientific notation
+/// FIRST, and determine its decimal exponent X from that ALREADY-
+/// ROUNDED value, not the original one (e.g. `9999999.0` rounds to
+/// `1.00000e7`, giving X=7, not 6 - this changes which of the two
+/// styles below is used, and was verified against real glibc `printf`
+/// output: `9999999.0` prints as `"1e+07"`, not `"1e+06"` or
+/// `"9999999"`). Then:
+/// - if `-4 <= X < 6`: fixed-point notation with `6 - 1 - X` digits
+///   after the decimal point, then strip trailing zeros (and a
+///   trailing `.` if no fractional digits remain).
+/// - otherwise: scientific notation with 5 digits after the decimal
+///   point in the mantissa, strip trailing zeros from the mantissa
+///   (and a trailing `.` if none remain), and format the exponent as
+///   `e+NN`/`e-NN` (at least 2 digits, matching glibc).
+///
+/// Verified against 68 real `gcc`/glibc `printf("%g", ...)` reference
+/// outputs before being added here, including the trickiest cases:
+/// exact halfway-rounding ties whose true binary value is actually
+/// just below or above the apparent decimal boundary (e.g. the
+/// literal `1.999995` prints as `"1.99999"`, not `"2"`, because its
+/// nearest `f64` is very slightly less than the exact decimal
+/// `1.999995`), and exponent-carry-on-rounding (`9999999.0` above).
+fn fmt_g(value: f64) -> Vec<u8> {
+    if value == 0.0 {
+        // Preserve the sign of zero, matching glibc (`-0.0` -> `"-0"`).
+        return if value.is_sign_negative() { b"-0".to_vec() } else { b"0".to_vec() };
+    }
+    if value.is_nan() {
+        return b"nan".to_vec();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { b"-inf".to_vec() } else { b"inf".to_vec() };
+    }
+
+    const PRECISION: i32 = 6;
+    // Round to PRECISION significant digits via scientific notation
+    // first, so the exponent used for the fixed-vs-scientific decision
+    // below reflects the ROUNDED value, matching glibc exactly (see
+    // this function's own doc comment).
+    let sci = format!("{value:.*e}", (PRECISION - 1) as usize);
+    let (mantissa, exp_str) = sci.split_once('e').expect("Rust's {:e} format always includes 'e'");
+    let exponent: i32 = exp_str.parse().expect("Rust's {:e} exponent is always a valid integer");
+
+    if (-4..PRECISION).contains(&exponent) {
+        let decimals = (PRECISION - 1 - exponent).max(0) as usize;
+        let fixed = format!("{value:.decimals$}");
+        strip_trailing_zeros(&fixed)
+    } else {
+        let mut out = strip_trailing_zeros(mantissa);
+        out.push(b'e');
+        out.push(if exponent >= 0 { b'+' } else { b'-' });
+        out.extend(format!("{:02}", exponent.abs()).into_bytes());
+        out
+    }
+}
+
+/// Strips trailing zeros from a formatted decimal number's fractional
+/// part (and the trailing `.` itself, if no fractional digits remain),
+/// e.g. `"1.50000"` -> `"1.5"`, `"100.000"` -> `"100"`. Only used by
+/// [`fmt_g`], matching `%g`'s own "unlike `%f`/`%e`, strip trailing
+/// zeros" behavior (the C `#` flag, if given, would disable this -
+/// never given at [`fmt_g`]'s one call site, so not modeled).
+fn strip_trailing_zeros(s: &str) -> Vec<u8> {
+    if !s.contains('.') {
+        return s.as_bytes().to_vec();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').as_bytes().to_vec()
 }
 
 
@@ -1952,6 +2091,142 @@ mod tests {
         let mut error = false;
         assert_eq!(tv_get_bool_chk(&tv, Some(&mut error)), 0);
         assert!(error);
+    }
+
+    #[test]
+    fn tv_get_string_chk_number_formats_as_decimal() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(-42) };
+        assert_eq!(tv_get_string_chk(&tv), Some(b"-42".to_vec()));
+    }
+
+    #[test]
+    fn tv_get_string_chk_string_returns_its_own_bytes() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(b"hello".to_vec())),
+        };
+        assert_eq!(tv_get_string_chk(&tv), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn tv_get_string_chk_none_string_is_empty_not_none() {
+        // Matches the original: VAR_STRING with a NULL v_string
+        // returns "" (empty), NOT an error/NULL - only the
+        // Func/Partial/List/Dict/Blob/Unknown branches return None.
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) };
+        assert_eq!(tv_get_string_chk(&tv), Some(Vec::new()));
+    }
+
+    #[test]
+    fn tv_get_string_chk_bool_and_special() {
+        let t = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+        };
+        let f = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::False),
+        };
+        let null = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+        };
+        assert_eq!(tv_get_string_chk(&t), Some(b"v:true".to_vec()));
+        assert_eq!(tv_get_string_chk(&f), Some(b"v:false".to_vec()));
+        assert_eq!(tv_get_string_chk(&null), Some(b"v:null".to_vec()));
+    }
+
+    #[test]
+    fn tv_get_string_chk_float_uses_g_formatting() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.5) };
+        assert_eq!(tv_get_string_chk(&tv), Some(b"1.5".to_vec()));
+    }
+
+    #[test]
+    fn tv_get_string_chk_wrong_type_family_all_none() {
+        for value in [
+            TypvalValue::Func(None),
+            TypvalValue::Partial(std::ptr::null_mut()),
+            TypvalValue::List(std::ptr::null_mut()),
+            TypvalValue::Dict(std::ptr::null_mut()),
+            TypvalValue::Blob(std::ptr::null_mut()),
+            TypvalValue::Unknown,
+        ] {
+            let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value };
+            assert_eq!(tv_get_string_chk(&tv), None, "expected None for {tv:?}");
+        }
+    }
+
+    #[test]
+    fn tv_get_string_returns_empty_vec_instead_of_none_on_error() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) };
+        assert_eq!(tv_get_string(&tv), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn tv_get_string_matches_chk_on_success() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(7) };
+        assert_eq!(tv_get_string(&tv), tv_get_string_chk(&tv).unwrap());
+    }
+
+    /// `fmt_g` test vectors, cross-checked against real `gcc`/glibc
+    /// `printf("%g", ...)` output (see this function's own doc
+    /// comment) - covers zero/signed-zero, NaN/Infinity, the
+    /// fixed-vs-scientific boundary in both directions, exponent-carry
+    /// on rounding (`9999999.0` -> `"1e+07"`, not `"9999999"`), and an
+    /// exact-tie-that-isn't-really-a-tie case (`1.999995` -> `"1.99999"`,
+    /// since its true `f64` value is very slightly below the decimal
+    /// midpoint).
+    #[test]
+    #[allow(clippy::approx_constant)] // intentional many-digit rounding test value, not meant to represent math::PI
+    fn fmt_g_matches_glibc_reference_outputs() {
+        let cases: &[(f64, &[u8])] = &[
+            (0.0, b"0"),
+            (-0.0, b"-0"),
+            (1.0, b"1"),
+            (1.5, b"1.5"),
+            (100.0, b"100"),
+            (123456.0, b"123456"),
+            (1234567.0, b"1.23457e+06"),
+            (0.0001, b"0.0001"),
+            (0.00001, b"1e-05"),
+            (1_000_000.0, b"1e+06"),
+            (3.14159265358979, b"3.14159"),
+            (-2.5, b"-2.5"),
+            (1e20, b"1e+20"),
+            (1e-20, b"1e-20"),
+            (123.456, b"123.456"),
+            (0.1, b"0.1"),
+            (10.0, b"10"),
+            (1e300, b"1e+300"),
+            (1e-300, b"1e-300"),
+            (999999.0, b"999999"),
+            (9999999.0, b"1e+07"),
+            (0.00009999, b"9.999e-05"),
+            (-1234567.0, b"-1.23457e+06"),
+            (-999999.5, b"-1e+06"),
+            (1.999995, b"1.99999"),
+            (1.9999995, b"2"),
+            (5555555.0, b"5.55556e+06"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(fmt_g(*value), *expected, "fmt_g({value:?})");
+        }
+    }
+
+    #[test]
+    fn fmt_g_nan_and_infinity() {
+        assert_eq!(fmt_g(f64::NAN), b"nan");
+        assert_eq!(fmt_g(f64::INFINITY), b"inf");
+        assert_eq!(fmt_g(f64::NEG_INFINITY), b"-inf");
+    }
+
+    #[test]
+    fn strip_trailing_zeros_removes_fractional_zeros_and_dot() {
+        assert_eq!(strip_trailing_zeros("1.50000"), b"1.5");
+        assert_eq!(strip_trailing_zeros("100.000"), b"100");
+        assert_eq!(strip_trailing_zeros("123456"), b"123456");
+        assert_eq!(strip_trailing_zeros("0.000"), b"0");
     }
 
     #[test]
