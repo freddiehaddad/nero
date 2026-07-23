@@ -56,7 +56,32 @@
 //! (`tv_dict_alloc`, `tv_dict_find`, etc.) live in `eval/typval.rs`,
 //! translated from `eval/typval.c`.
 //!
-//! `ufunc_T` (as [`UfuncT`]) now has its real fields too - unlike
+//! `funccall_T` (as [`FunccallT`]) now has its real fields too, proven
+//! tractable at small scale first via `runtime_defs.rs`'s `ScriptvarT`
+//! (which embeds a single `DictT` by value): `fc_l_vars`/`fc_l_avars:
+//! DictT` and `fc_l_varlist: ListT` are embedded *by value* here too
+//! (not by pointer, unlike every other use of those types in this
+//! crate outside `ScriptvarT`) - this works cleanly with the existing
+//! `tv_dict_*`/`tv_list_*` APIs (always just `*mut DictT`/`*mut ListT`,
+//! never `Box<...>`), for the exact same reason `ScriptvarT` already
+//! established. `fc_fixvar: [DictitemT; FIXVAR_CNT]` collapses the
+//! original's `TV_DICTITEM_STRUCT(VAR_SHORT_LEN + 1)` fixed-size
+//! instantiation into plain `DictitemT`s (already `Vec<u8>`-keyed
+//! regardless of any particular size parameter, so the size parameter
+//! itself carries no information a Rust translation needs to keep).
+//! `FunccallT` derives neither `Debug` nor `Default` (matching
+//! `DictT`/`ListT`'s own convention, embedded here by value) - a
+//! manual `Default` impl is provided instead, zero-initializing every
+//! field, faithfully matching the original's own `create_funccal`
+//! (`xcalloc(1, sizeof(funccall_T))`, i.e. a real, meaningful "freshly
+//! allocated, not yet further set up" state, only later populated
+//! field-by-field elsewhere - unlike `DictT`/`ListT` themselves, which
+//! need their own dedicated allocator functions for real GC-list
+//! bookkeeping that a naive zero/`Default` value would skip).
+//! `fc_caller`/`fc_func`/`fc_rettv`/etc. (raw pointers to other
+//! already-real types) need no further design of their own.
+//!
+//! `ufunc_T` (as [`UfuncT`]) has its real fields too - unlike
 //! `dictitem_T`'s `di_key`, `uf_name` needed no side-table design of
 //! its OWN struct shape (that complexity lives in `HIKEY2UF`'s pointer-
 //! arithmetic recovery from a *hashtable* keyed by `uf_name`, which is
@@ -65,16 +90,8 @@
 //! its own `DictT.dv_index`-style side table). `uf_name`/`uf_namelen`
 //! (the flexible array member) simply collapse into one owned
 //! `Vec<u8>`, matching `DictitemT.di_key`'s established treatment.
-//! `funccall_T` (as [`FunccallT`]) remains its own opaque placeholder -
-//! it additionally embeds `dict_T`/`list_T` *by value* (not by pointer,
-//! unlike every other use of those types in this crate so far), a new
-//! situation deserving its own careful design pass, not rushed
-//! alongside `ufunc_T`. `UfuncT.uf_scoped: *mut FunccallT` (and
-//! `PartialT.pt_func: *mut UfuncT` below) reference their respective
-//! placeholder/real types directly - a raw pointer to an opaque/
-//! zero-sized placeholder type is still a perfectly well-formed Rust
-//! type, so neither struct's own real fields need to wait on the
-//! other's.
+//! `UfuncT.uf_scoped: *mut FunccallT` (and `PartialT.pt_func: *mut
+//! UfuncT` below) reference their respective real types directly.
 //!
 //! `partial_T` (as [`PartialT`]) had NO flexible-array-member of its
 //! own and needed no design decision beyond the already-established
@@ -444,18 +461,132 @@ pub struct UfuncT {
     pub uf_name: Vec<u8>,
 }
 
-/// Placeholder for `funccall_T` (`struct funccall_S`) - structure to
-/// hold info for a function that is currently being executed. Needs
-/// its own dedicated design pass: unlike every other use of `dict_T`/
-/// `list_T` in this crate (always behind a pointer, heap-allocated via
-/// `Box::into_raw`), `funccall_T` embeds `fc_l_vars`/`fc_l_avars:
-/// dict_T` and `fc_l_varlist: list_T` **by value** as sub-objects, plus
-/// a `MAX_FUNC_ARGS`-sized array of `listitem_T`/`TV_DICTITEM_STRUCT`
-/// fixed-size dict items for its `a:`/argument-list scope - a genuinely
-/// new situation (`eval/typval_defs.h`'s own `struct funccall_S`, see
-/// `eval/userfunc.h`).
+/// Structure to hold info for a function that is currently being
+/// executed (`struct funccall_S` / `funccall_T`).
+///
+/// See this module's own doc comment for the by-value `dict_T`/
+/// `list_T` embedding rationale and the manual `Default` impl's
+/// reasoning.
 pub struct FunccallT {
-    _private: (),
+    /// Function being called (`fc_func`).
+    pub fc_func: *mut UfuncT,
+    /// Next line to be executed (`fc_linenr`).
+    pub fc_linenr: i32,
+    /// `":return"` used (`fc_returned`).
+    pub fc_returned: i32,
+    /// Fixed variables for arguments - collapses the original's
+    /// `TV_DICTITEM_STRUCT(VAR_SHORT_LEN + 1)` fixed-size
+    /// instantiation into plain `DictitemT`s (`fc_fixvar`).
+    pub fc_fixvar: [DictitemT; FIXVAR_CNT],
+    /// `l:` local function variables (`fc_l_vars`).
+    pub fc_l_vars: DictT,
+    /// Variable for `l:` scope (`fc_l_vars_var`).
+    pub fc_l_vars_var: ScopeDictDictItem,
+    /// `a:` argument variables (`fc_l_avars`).
+    pub fc_l_avars: DictT,
+    /// Variable for `a:` scope (`fc_l_avars_var`).
+    pub fc_l_avars_var: ScopeDictDictItem,
+    /// List for `a:000` (`fc_l_varlist`).
+    pub fc_l_varlist: ListT,
+    /// List items for `a:000` (`fc_l_listitems`).
+    pub fc_l_listitems: [ListitemT; MAX_FUNC_ARGS],
+    /// Return value (`fc_rettv`).
+    pub fc_rettv: *mut TypvalT,
+    /// Next line with breakpoint or zero (`fc_breakpoint`).
+    pub fc_breakpoint: LinenrT,
+    /// `"debug_tick"` when breakpoint was set (`fc_dbg_tick`).
+    pub fc_dbg_tick: i32,
+    /// Top nesting level of executed function (`fc_level`).
+    pub fc_level: i32,
+    /// Functions to be called on return (`fc_defer`).
+    pub fc_defer: crate::garray_defs::GarrayT,
+    /// Time spent in a child (`fc_prof_child`).
+    pub fc_prof_child: crate::types_defs::ProftimeT,
+    /// Calling function or null; or next funccal in the list pointed
+    /// to by `previous_funccal` (`fc_caller`).
+    pub fc_caller: *mut FunccallT,
+    /// Number of user functions that reference this funccall
+    /// (`fc_refcount`).
+    pub fc_refcount: i32,
+    /// `CopyID` used for garbage collection (`fc_copy_id`).
+    pub fc_copy_id: i32,
+    /// List of `ufunc_T*` which keep a reference to `fc_func`
+    /// (`fc_ufuncs`).
+    pub fc_ufuncs: crate::garray_defs::GarrayT,
+}
+
+impl Default for FunccallT {
+    /// Zero-initializes every field, faithfully matching the
+    /// original's own `create_funccal` (`xcalloc(1,
+    /// sizeof(funccall_T))`) - see this struct's own doc comment.
+    fn default() -> Self {
+        FunccallT {
+            fc_func: std::ptr::null_mut(),
+            fc_linenr: 0,
+            fc_returned: 0,
+            fc_fixvar: std::array::from_fn(|_| DictitemT {
+                di_tv: TypvalT::default(),
+                di_flags: 0,
+                di_key: Vec::new(),
+            }),
+            fc_l_vars: DictT {
+                dv_lock: VarLockStatus::Unlocked,
+                dv_scope: ScopeType::NoScope,
+                dv_refcount: 0,
+                dv_copy_id: 0,
+                dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
+                dv_index: std::collections::HashMap::new(),
+                dv_copydict: std::ptr::null_mut(),
+                dv_used_next: std::ptr::null_mut(),
+                dv_used_prev: std::ptr::null_mut(),
+                lua_table_ref: -1,
+            },
+            fc_l_vars_var: ScopeDictDictItem::default(),
+            fc_l_avars: DictT {
+                dv_lock: VarLockStatus::Unlocked,
+                dv_scope: ScopeType::NoScope,
+                dv_refcount: 0,
+                dv_copy_id: 0,
+                dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
+                dv_index: std::collections::HashMap::new(),
+                dv_copydict: std::ptr::null_mut(),
+                dv_used_next: std::ptr::null_mut(),
+                dv_used_prev: std::ptr::null_mut(),
+                lua_table_ref: -1,
+            },
+            fc_l_avars_var: ScopeDictDictItem::default(),
+            fc_l_varlist: ListT {
+                lv_first: std::ptr::null_mut(),
+                lv_last: std::ptr::null_mut(),
+                lv_watch: std::ptr::null_mut(),
+                lv_idx_item: std::ptr::null_mut(),
+                lv_copylist: std::ptr::null_mut(),
+                lv_used_next: std::ptr::null_mut(),
+                lv_used_prev: std::ptr::null_mut(),
+                lv_refcount: 0,
+                lv_len: 0,
+                lv_idx: 0,
+                lv_copy_id: 0,
+                lv_lock: VarLockStatus::Unlocked,
+                lua_table_ref: -1,
+            },
+            fc_l_listitems: std::array::from_fn(|_| ListitemT {
+                li_next: std::ptr::null_mut(),
+                li_prev: std::ptr::null_mut(),
+                li_tv: TypvalT::default(),
+            }),
+            fc_rettv: std::ptr::null_mut(),
+            fc_breakpoint: 0,
+            fc_dbg_tick: 0,
+            fc_level: 0,
+            fc_defer: crate::garray_defs::GarrayT::default(),
+            fc_prof_child: 0,
+            fc_caller: std::ptr::null_mut(),
+            fc_refcount: 0,
+            fc_copy_id: 0,
+            fc_ufuncs: crate::garray_defs::GarrayT::default(),
+        }
+    }
 }
 
 /// Structure to hold info about a Blob (`blobvar_S` / `blob_T`).
@@ -819,15 +950,74 @@ mod tests {
 
     #[test]
     fn ufunc_t_can_be_linked_via_uf_scoped_raw_pointer() {
-        // uf_scoped: *mut FunccallT is just a raw pointer to an opaque
-        // placeholder - confirm it's usable as an ordinary raw pointer
-        // (assigning/reading its null-ness) without needing FunccallT's
-        // real fields at all.
         let mut uf = UfuncT { uf_name: b"MyFunc".to_vec(), ..Default::default() };
         assert!(uf.uf_scoped.is_null());
         uf.uf_scoped = std::ptr::null_mut();
         assert!(uf.uf_scoped.is_null());
         assert_eq!(uf.uf_name, b"MyFunc");
+    }
+
+    #[test]
+    fn funccall_t_default_is_zeroed_with_null_pointers_and_empty_containers() {
+        let mut fc = FunccallT::default();
+        assert!(fc.fc_func.is_null());
+        assert_eq!(fc.fc_linenr, 0);
+        assert_eq!(fc.fc_returned, 0);
+        assert_eq!(fc.fc_fixvar.len(), FIXVAR_CNT);
+        for item in &fc.fc_fixvar {
+            assert!(matches!(item.di_tv.value, TypvalValue::Unknown));
+            assert!(item.di_key.is_empty());
+        }
+        assert_eq!(fc.fc_l_vars.dv_refcount, 0);
+        assert!(fc.fc_l_vars.dv_hashtab.hash_find(b"missing").hi_key.is_null());
+        assert_eq!(fc.fc_l_avars.dv_refcount, 0);
+        assert_eq!(fc.fc_l_varlist.lv_len, 0);
+        assert!(fc.fc_l_varlist.lv_first.is_null());
+        assert_eq!(fc.fc_l_listitems.len(), MAX_FUNC_ARGS);
+        for item in &fc.fc_l_listitems {
+            assert!(item.li_next.is_null());
+            assert!(matches!(item.li_tv.value, TypvalValue::Unknown));
+        }
+        assert!(fc.fc_rettv.is_null());
+        assert_eq!(fc.fc_breakpoint, 0);
+        assert_eq!(fc.fc_level, 0);
+        assert_eq!(fc.fc_defer.ga_len, 0);
+        assert_eq!(fc.fc_prof_child, 0);
+        assert!(fc.fc_caller.is_null());
+        assert_eq!(fc.fc_refcount, 0);
+        assert_eq!(fc.fc_copy_id, 0);
+        assert_eq!(fc.fc_ufuncs.ga_len, 0);
+    }
+
+    #[test]
+    fn funccall_t_l_vars_dict_is_usable_through_the_real_tv_dict_api() {
+        // Confirm the by-value-embedded fc_l_vars works through the
+        // existing tv_dict_* raw-pointer API exactly like a
+        // Box::into_raw-allocated DictT would - the same proof
+        // ScriptvarT already established for a single DictT, now
+        // checked for FunccallT's own embedded dicts too.
+        let mut fc = FunccallT::default();
+        let d = &mut fc.fc_l_vars as *mut DictT;
+        unsafe {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+            (*item).di_tv.value = TypvalValue::Number(42);
+            assert_eq!(crate::eval::typval::tv_dict_add(&mut *d, item), crate::vim_defs::OK);
+            let found = crate::eval::typval::tv_dict_find(Some(&mut *d), b"x").unwrap();
+            assert!(matches!((*found).di_tv.value, TypvalValue::Number(42)));
+            crate::eval::typval::tv_dict_free_contents(d);
+        }
+    }
+
+    #[test]
+    fn funccall_t_caller_can_be_linked_into_a_chain() {
+        let mut inner = FunccallT::default();
+        let mut outer = FunccallT { fc_caller: &mut inner as *mut FunccallT, ..Default::default() };
+        assert!(!outer.fc_caller.is_null());
+        // SAFETY: inner outlives this read, both are stack locals in
+        // scope for the whole test body.
+        let caller_linenr = unsafe { (*outer.fc_caller).fc_linenr };
+        assert_eq!(caller_linenr, 0);
+        outer.fc_caller = std::ptr::null_mut(); // avoid a dangling reference lingering
     }
 
     #[test]
