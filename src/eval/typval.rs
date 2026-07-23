@@ -71,10 +71,13 @@
 //! `eval/typval.c` - kept here anyway alongside the sibling `tv_*_free`/
 //! `_unref` functions, see their own doc comments for why). Releases
 //! `pt_dict` (via the real `tv_dict_unref`) and each `pt_argv` entry
-//! (via `tv_clear_simple`, one level); omits the original's
-//! `func_unref`/`func_ptr_unref` release of the referenced function's
-//! own refcount (needs `ufunc_T`'s function-name registry, not yet
-//! translated - same accepted gap as `tv_copy`'s `VAR_FUNC` branch).
+//! (via `tv_clear_simple`, one level); when `pt_name` is absent, now
+//! calls the real `crate::eval::userfunc::func_ptr_unref` to release
+//! `pt_func`'s own refcount too (its own narrow remaining gap is
+//! documented on that function itself); when `pt_name` is present, the
+//! original's `func_unref(pt_name)` (string-based lookup) is still
+//! omitted - needs `ufunc_T`'s function-name registry (`func_hashtab`,
+//! `eval/userfunc.c`), not yet translated.
 //!
 //! **Copy**: `tv_copy` (the `VAR_FUNC` branch omits the original's own
 //! `func_ref` refcount increment - needs a function-name registry,
@@ -302,11 +305,13 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
 /// though `partial_T`'s real home is `eval.c`, not `eval/typval.c`).
 ///
 /// # Deferred
-/// The original's `func_unref(pt->pt_name)`/`func_ptr_unref(pt->pt_func)`
-/// (releasing the referenced user-defined function's own reference
-/// count) is omitted - needs a function-name/pointer registry
-/// (`ufunc_T`'s real fields + `eval/userfunc.c`, not yet translated),
-/// matching the same accepted gap as `tv_copy`'s `VAR_FUNC` branch.
+/// The original's `func_unref(pt->pt_name)` (releasing a *named*
+/// function reference by string lookup) is omitted when `pt_name` is
+/// present - needs `find_func`/`func_name_refcount` (`func_hashtab`,
+/// `eval/userfunc.c`, not yet translated). When `pt_name` is absent,
+/// the original's `func_ptr_unref(pt->pt_func)` branch now calls the
+/// real [`crate::eval::userfunc::func_ptr_unref`] - see that
+/// function's own doc comment for its own remaining narrow gap.
 /// `pt_argv`'s items are released one level via [`tv_clear_simple`]
 /// (matching this module's own established policy for container
 /// contents - not the original's fully recursive `tv_clear`, which
@@ -320,7 +325,8 @@ unsafe fn tv_clear_simple(tv: &TypvalT) {
 /// in a test - but this matches the ownership convention every other
 /// heap-allocated type in this module already uses). If
 /// `(*pt).pt_dict` is non-null, it must be a valid pointer to a live
-/// `DictT`.
+/// `DictT`; if `(*pt).pt_func` is non-null (and `pt_name` is absent),
+/// it must be a valid pointer to a live `UfuncT`.
 unsafe fn partial_free(pt: *mut PartialT) {
     // SAFETY: forwarded from this function's own safety doc.
     let boxed = unsafe { Box::from_raw(pt) };
@@ -330,7 +336,11 @@ unsafe fn partial_free(pt: *mut PartialT) {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_dict_unref(boxed.pt_dict) };
-    // func_unref(pt_name)/func_ptr_unref(pt_func) omitted - see this
+    if boxed.pt_name.is_none() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::userfunc::func_ptr_unref(boxed.pt_func) };
+    }
+    // func_unref(pt_name) omitted when pt_name is present - see this
     // function's own doc comment.
 }
 
@@ -1917,6 +1927,41 @@ mod tests {
         // itself. Nothing further to assert on `pt` after this - the
         // absence of a crash/leak-sanitizer complaint is the check.
         unsafe { partial_unref(pt) };
+    }
+
+    #[test]
+    fn partial_unref_releases_pt_func_refcount_when_pt_name_absent() {
+        let mut fp = crate::eval::typval_defs::UfuncT { uf_refcount: 2, ..Default::default() };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_name: None,
+            pt_func: &mut fp as *mut crate::eval::typval_defs::UfuncT,
+            ..Default::default()
+        }));
+        // Refcount hits 0 here - partial_free runs, which calls the
+        // real func_ptr_unref on pt_func (since pt_name is absent),
+        // decrementing fp's own refcount (2 -> 1, still referenced,
+        // so func_ptr_unref's own unimplemented!() branch is never
+        // reached).
+        unsafe { partial_unref(pt) };
+        assert_eq!(fp.uf_refcount, 1);
+    }
+
+    #[test]
+    fn partial_unref_skips_pt_func_release_when_pt_name_present() {
+        let mut fp = crate::eval::typval_defs::UfuncT { uf_refcount: 2, ..Default::default() };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"MyFunc".to_vec()),
+            pt_func: &mut fp as *mut crate::eval::typval_defs::UfuncT,
+            ..Default::default()
+        }));
+        // pt_name is present - the original's func_unref(pt_name)
+        // branch would run instead of func_ptr_unref(pt_func), and
+        // that string-based lookup is still deferred (needs
+        // func_hashtab) - fp's own refcount must stay untouched here.
+        unsafe { partial_unref(pt) };
+        assert_eq!(fp.uf_refcount, 2);
     }
 
     #[test]
