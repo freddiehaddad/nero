@@ -1,6 +1,6 @@
 //! Translated from `src/nvim/eval/typval.c` (tractable core: the
 //! `dict_T`/`list_T`/`blob_T` alloc/free/refcount/insertion primitives,
-//! plus `tv_copy`).
+//! `tv_copy`, and `tv_get_number`/`tv_get_bool`).
 //!
 //! `typval.c` (~4000 lines) is the core of the Vimscript value system:
 //! `typval_T`/`list_T`/`dict_T`/`blob_T` construction, (de)serialization
@@ -126,6 +126,17 @@
 //!   `tv_dict_free_contents` themselves already do that recursion one
 //!   level at a time via the same helper).
 //! - `tv_dict_add_func` (needs `ufunc_T`'s function-name registry).
+//! - `tv_get_lnum` (needs `var2fpos`/`curwin`, `window.c`, for its
+//!   "special string like `.`/`$`" fallback branch) and
+//!   `tv_get_string`/`tv_get_string_buf`/`tv_get_string_chk` (need a
+//!   shared static conversion buffer plus `tv_dict_get_string`/number-
+//!   to-string formatting, not yet examined) remain deferred -
+//!   `tv_get_number`/`tv_get_number_chk`/`tv_get_bool`/`tv_get_bool_chk`
+//!   are translated now that `charset.c`'s `vim_str2nr` exists (the
+//!   only real blocker for `VAR_STRING`'s branch); their own
+//!   `emsg`/`semsg` calls for wrong-type values are omitted (message
+//!   display, not tractable), while the error-flag/return-value
+//!   behavior is kept exactly.
 //! - Every other `tv_dict_*`/`tv_list_*`/`tv_blob_*` function
 //!   (`tv_dict_get_string`, `tv_dict_extend`, `tv_list_copy`,
 //!   `tv_list_concat`, blob byte-level accessors, iteration helpers,
@@ -251,13 +262,80 @@ pub unsafe fn tv_copy(from: &TypvalT, to: &mut TypvalT) {
     }
 }
 
-/// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
+/// Get the number value of a Vimscript object (`tv_get_number_chk`).
 ///
-/// Shared "clear a typval's value, releasing what it owns/references"
-/// core used by [`tv_dict_item_free`] and every list-item-freeing
-/// function - the original's `tv_clear`, minus its String/Number/etc.
-/// no-op branches (Rust's own ownership already handles those - see
-/// this module's own doc comment). `VAR_PARTIAL` now calls the real
+/// Returns `vim_str2nr()`'s output for `VAR_STRING` objects, the value
+/// itself for `VAR_NUMBER`, `1`/`0` for `VAR_BOOL`, `0` for
+/// `VAR_SPECIAL`, or `-1` (`ret_error` is `None`) / `0` (`ret_error` is
+/// `Some`) for every other type (also writing `true` to `*ret_error`
+/// in that `Some` case).
+///
+/// The original's own `emsg(_(num_errors[tv->v_type]))`/
+/// `semsg(_(e_intern2), "tv_get_number(UNKNOWN)")` calls (real,
+/// reachable user/internal-error messages) are omitted - needs
+/// `message.c`'s display pipeline, not tractable - while the identical
+/// error-flag/return-value behavior is kept exactly, matching this
+/// crate's established "skip the display, keep the state" policy
+/// (e.g. `undo.rs`'s `u_get_headentry`/`ex_undojoin`).
+#[must_use]
+pub fn tv_get_number_chk(tv: &TypvalT, ret_error: Option<&mut bool>) -> crate::eval::typval_defs::VarnumberT {
+    match &tv.value {
+        TypvalValue::Func(_)
+        | TypvalValue::Partial(_)
+        | TypvalValue::List(_)
+        | TypvalValue::Dict(_)
+        | TypvalValue::Blob(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::Unknown => {
+            // emsg(_(num_errors[tv->v_type])) / semsg(...) omitted -
+            // see this function's own doc comment.
+            match ret_error {
+                Some(e) => {
+                    *e = true;
+                    0
+                }
+                None => -1,
+            }
+        }
+        TypvalValue::Number(n) => *n,
+        TypvalValue::String(s) => {
+            let mut n: crate::eval::typval_defs::VarnumberT = 0;
+            if let Some(s) = s {
+                crate::charset::vim_str2nr(s, None, None, crate::charset::STR2NR_ALL, Some(&mut n), None, 0, false, None);
+            }
+            n
+        }
+        TypvalValue::Bool(b) => i64::from(*b == crate::eval::typval_defs::BoolVarValue::True),
+        TypvalValue::Special(_) => 0,
+    }
+}
+
+/// Get the number value of a Vimscript object, without an error-flag
+/// out-parameter (`tv_get_number`).
+#[must_use]
+pub fn tv_get_number(tv: &TypvalT) -> crate::eval::typval_defs::VarnumberT {
+    let mut error = false;
+    tv_get_number_chk(tv, Some(&mut error))
+}
+
+/// Get the number value of a Vimscript object, interpreted as a
+/// boolean (`tv_get_bool`) - literally the same computation as
+/// [`tv_get_number_chk`] in the original (not a separate `bool`
+/// return type: Vimscript's `varnumber_T` doubles as its boolean
+/// representation).
+#[must_use]
+pub fn tv_get_bool(tv: &TypvalT) -> crate::eval::typval_defs::VarnumberT {
+    tv_get_number_chk(tv, None)
+}
+
+/// Get the number value of a Vimscript object, interpreted as a
+/// boolean, with an error-flag out-parameter (`tv_get_bool_chk`).
+#[must_use]
+pub fn tv_get_bool_chk(tv: &TypvalT, ret_error: Option<&mut bool>) -> crate::eval::typval_defs::VarnumberT {
+    tv_get_number_chk(tv, ret_error)
+}
+
+
 /// [`partial_unref`] (see that function's own doc comment for its one
 /// remaining gap: releasing the referenced function's own refcount,
 /// which needs `ufunc_T`'s function-name registry, not yet
@@ -1688,6 +1766,121 @@ mod tests {
             tv_dict_free(d1);
             assert!((*GC_FIRST_DICT.get_mut()).is_null());
         }
+    }
+
+    #[test]
+    fn tv_get_number_returns_number_directly() {
+        let tv = number_tv(42);
+        assert_eq!(tv_get_number(&tv), 42);
+    }
+
+    #[test]
+    fn tv_get_number_chk_parses_numeric_string() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(b"123".to_vec())),
+        };
+        let mut error = false;
+        assert_eq!(tv_get_number_chk(&tv, Some(&mut error)), 123);
+        assert!(!error);
+    }
+
+    #[test]
+    fn tv_get_number_chk_parses_negative_numeric_string() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(b"-7".to_vec())),
+        };
+        assert_eq!(tv_get_number(&tv), -7);
+    }
+
+    #[test]
+    fn tv_get_number_chk_none_string_is_zero() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) };
+        assert_eq!(tv_get_number(&tv), 0);
+    }
+
+    #[test]
+    fn tv_get_number_chk_non_numeric_string_parses_as_zero() {
+        // vim_str2nr finds no leading digits - "0, no advance", not an
+        // error at this layer (matches the original: no emsg happens
+        // for VAR_STRING, regardless of content).
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(b"abc".to_vec())),
+        };
+        let mut error = false;
+        assert_eq!(tv_get_number_chk(&tv, Some(&mut error)), 0);
+        assert!(!error);
+    }
+
+    #[test]
+    fn tv_get_number_chk_bool_true_and_false() {
+        let t = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+        };
+        let f = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::False),
+        };
+        assert_eq!(tv_get_number(&t), 1);
+        assert_eq!(tv_get_number(&f), 0);
+    }
+
+    #[test]
+    fn tv_get_number_chk_special_is_zero() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+        };
+        assert_eq!(tv_get_number(&tv), 0);
+    }
+
+    #[test]
+    fn tv_get_number_chk_wrong_type_sets_error_and_returns_zero_with_ret_error() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) };
+        let mut error = false;
+        assert_eq!(tv_get_number_chk(&tv, Some(&mut error)), 0);
+        assert!(error);
+    }
+
+    #[test]
+    fn tv_get_number_chk_wrong_type_returns_minus_one_without_ret_error() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) };
+        assert_eq!(tv_get_number_chk(&tv, None), -1);
+    }
+
+    #[test]
+    fn tv_get_number_wrong_type_family_all_error() {
+        for value in [
+            TypvalValue::Func(None),
+            TypvalValue::Partial(std::ptr::null_mut()),
+            TypvalValue::List(std::ptr::null_mut()),
+            TypvalValue::Dict(std::ptr::null_mut()),
+            TypvalValue::Blob(std::ptr::null_mut()),
+            TypvalValue::Float(1.5),
+            TypvalValue::Unknown,
+        ] {
+            let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value };
+            let mut error = false;
+            assert_eq!(tv_get_number_chk(&tv, Some(&mut error)), 0);
+            assert!(error, "expected an error flag for this value");
+        }
+    }
+
+    #[test]
+    fn tv_get_bool_is_same_computation_as_tv_get_number() {
+        let tv = number_tv(7);
+        assert_eq!(tv_get_bool(&tv), tv_get_number(&tv));
+    }
+
+    #[test]
+    fn tv_get_bool_chk_forwards_error_flag() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) };
+        let mut error = false;
+        assert_eq!(tv_get_bool_chk(&tv, Some(&mut error)), 0);
+        assert!(error);
     }
 
     #[test]
