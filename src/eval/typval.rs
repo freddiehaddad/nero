@@ -51,8 +51,9 @@
 //! to), `tv_dict_add_list`/`_dict`/`_tv`/`_nr`/`_float`/`_bool`/`_str`
 //! (`_str_len`/`_allocated_str` collapsed into `tv_dict_add_str`,
 //! since Rust's `&[u8]` already carries its own length - see
-//! `tv_dict_add_str`'s own doc comment; `_func` is NOT translated,
-//! needs `ufunc_T`'s function-name registry).
+//! `tv_dict_add_str`'s own doc comment), `tv_dict_add_func` (needs
+//! `(*fp).uf_name` NUL-terminated, matching `func_hashtab`'s own
+//! storage convention - see its own doc comment).
 //!
 //! **List**: `tv_list_alloc`, `tv_list_item_alloc` (private, matching
 //! the original's own `static`), `tv_list_free_contents`/
@@ -71,19 +72,14 @@
 //! `eval/typval.c` - kept here anyway alongside the sibling `tv_*_free`/
 //! `_unref` functions, see their own doc comments for why). Releases
 //! `pt_dict` (via the real `tv_dict_unref`) and each `pt_argv` entry
-//! (via `tv_clear_simple`, one level); when `pt_name` is absent, now
-//! calls the real `crate::eval::userfunc::func_ptr_unref` to release
-//! `pt_func`'s own refcount too (its own narrow remaining gap is
-//! documented on that function itself); when `pt_name` is present, the
-//! original's `func_unref(pt_name)` (string-based lookup) is still
-//! omitted - needs `ufunc_T`'s function-name registry (`func_hashtab`,
-//! `eval/userfunc.c`), not yet translated.
+//! (via `tv_clear_simple`, one level); calls the real
+//! `crate::eval::userfunc::func_ptr_unref`/`func_unref` to release
+//! `pt_func`'s own refcount, whether `pt_name` is absent or present
+//! respectively.
 //!
-//! **Copy**: `tv_copy` (the `VAR_FUNC` branch omits the original's own
-//! `func_ref` refcount increment - needs a function-name registry,
-//! `eval/userfunc.c`'s `ufunc_T` table, not yet translated, though the
-//! function-name *string* itself is still copied correctly; the
-//! `VAR_PARTIAL` branch now increments the real `pt_refcount` field).
+//! **Copy**: `tv_copy` (the `VAR_FUNC` branch calls the real
+//! `crate::eval::userfunc::func_ref`; the `VAR_PARTIAL` branch
+//! increments the real `pt_refcount` field).
 //!
 //! A shared private `tv_clear_simple` helper (this crate's own,
 //! replacing the original's `tv_clear`'s simple-value branches - see
@@ -124,8 +120,12 @@
 //!   decremented and they're freed at zero, but freeing one doesn't
 //!   need to recurse further here since `tv_list_free_contents`/
 //!   `tv_dict_free_contents` themselves already do that recursion one
-//!   level at a time via the same helper).
-//! - `tv_dict_add_func` (needs `ufunc_T`'s function-name registry).
+//!   level at a time via the same helper). This same reasoning is also
+//!   used by `eval/userfunc.rs`'s `free_funccal_contents` in place of
+//!   the original's `tv_clear`-calling `vars_clear`/`TV_LIST_ITER`
+//!   loop, treated as a faithful substitute for any well-formed,
+//!   acyclic value (the only kind Vimscript's reference-counted value
+//!   model can produce).
 //! - `tv_get_lnum` (needs `var2fpos`/`curwin`, `window.c`, for its
 //!   "special string like `.`/`$`" fallback branch) and
 //!   `tv_get_string`/`tv_get_string_buf`/`tv_get_string_chk` (need a
