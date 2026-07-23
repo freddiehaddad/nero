@@ -26,7 +26,9 @@
 //! a sound `ChangedtickDictItem`-as-`dictitem_T` lookup mechanism,
 //! respectively, neither of which is simply "`dict_T` doesn't exist"
 //! anymore), keeping the underlying `b:changedtick` value itself fully
-//! correct for every other C-level accessor in this crate.
+//! correct for every other C-level accessor in this crate. `set_buflisted`
+//! (now tractable now that `autocmd.c`'s `apply_autocmds` is real - see
+//! `crate::autocmd`'s own module doc).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -37,8 +39,13 @@
 //!   `buf_freeall`/`free_buffer`/`buflist_new`/`buflist_getfile`/
 //!   `buflist_findnr`/etc.: need real file I/O, `ctx_switch` (window
 //!   management), and `autocmd.c`.
-//! - `set_buflisted`/`buf_contents_changed`/`wipe_buffer`: need
-//!   `apply_autocmds` (`autocmd.c`).
+//! - `buf_contents_changed`/`wipe_buffer`: need `buflist_new`,
+//!   `ctx_switch` (the real switch, not just `ctx_restore`'s bypass
+//!   path), `block_autocmds`/`unblock_autocmds`, `readfile`, and
+//!   `close_buffer` - `apply_autocmds` alone isn't enough to unblock
+//!   these two (re-verified directly against the real source, not
+//!   assumed from the old blanket note grouping them with
+//!   `set_buflisted`).
 //! - Everything else in this file (buffer-list management, window-
 //!   buffer association, `:buffer`/`:ls`/title-bar formatting, modeline
 //!   processing, etc.): each needs 2+ of the above, plus `tag.c`/
@@ -339,6 +346,34 @@ pub fn buf_init_changedtick(buf: &mut BufT) {
     };
 }
 
+/// Set `'buflisted'` for `curbuf` to `on` and trigger autocommands if
+/// it changed (`set_buflisted`).
+///
+/// Now tractable now that `autocmd.c`'s `apply_autocmds` is real (see
+/// `crate::autocmd`'s own module doc) - currently always a real no-op
+/// beyond the `b_p_bl` flip itself, since `AUTOCMDS` is always empty
+/// today.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+pub unsafe fn set_buflisted(on: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    let on = i32::from(on);
+    if on == curbuf.b_p_bl {
+        return;
+    }
+
+    curbuf.b_p_bl = on;
+    let event = if on != 0 {
+        crate::autocmd_defs::EventT::BufAdd
+    } else {
+        crate::autocmd_defs::EventT::BufDelete
+    };
+    let _ = crate::autocmd::apply_autocmds(event, None, None, false, Some(&*curbuf));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +594,60 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching `change.rs`'s own identically-named helper).
+    struct CurbufGuard {
+        previous: *mut BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn set_buflisted_is_a_noop_when_value_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_bl: 1, ..Default::default() };
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        unsafe { set_buflisted(true) };
+
+        assert_eq!(buf.b_p_bl, 1);
+    }
+
+    #[test]
+    fn set_buflisted_flips_off_to_on() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_bl: 0, ..Default::default() };
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        unsafe { set_buflisted(true) };
+
+        assert_eq!(buf.b_p_bl, 1);
+    }
+
+    #[test]
+    fn set_buflisted_flips_on_to_off() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_bl: 1, ..Default::default() };
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        unsafe { set_buflisted(false) };
+
+        assert_eq!(buf.b_p_bl, 0);
     }
 }
