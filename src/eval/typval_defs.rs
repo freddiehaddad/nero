@@ -704,8 +704,8 @@ pub const UVARNUMBER_MAX: UvarnumberT = u64::MAX;
 pub const DO_NOT_FREE_CNT: i32 = i32::MAX / 2;
 
 /// Additional values for `tv_list_alloc()`'s `len` argument
-/// (`ListLenSpecials`; `tv_list_alloc` itself is not yet translated -
-/// needs `list_T`).
+/// (`ListLenSpecials`; `tv_list_alloc` itself is now translated, in
+/// `eval/typval.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListLenSpecials {
     /// List length is not known in advance - there's neither a way to

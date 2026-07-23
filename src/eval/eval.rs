@@ -35,14 +35,29 @@
 //! precondition is documented, not re-checked here, matching the
 //! original's own lack of a runtime type check at this layer.
 //!
+//! Also translated: `grow_string_tv`/`eval_concat_str`. `grow_string_tv`
+//! is the original's manual `xrealloc`-in-place performance
+//! optimization to avoid a separate allocate+copy+free when growing a
+//! Vimscript string - Rust's own `Vec<u8>::extend_from_slice` already
+//! provides this transparently, so this translation is a thin,
+//! faithful wrapper rather than a manual realloc, but is still its OWN
+//! function (not inlined into `eval_concat_str`) since the original
+//! has a SECOND real caller, `eval/executor.c` (not yet translated).
+//! `eval_concat_str` needed `eval/typval.rs`'s `tv_clear_simple`
+//! widened from private to `pub(crate)` - unlike `eval_addblob`, it
+//! doesn't statically know tv1's type ahead of time (only tv2 is
+//! constrained to be stringifiable), so it needs the same generic
+//! "release whatever `tv1` used to hold" dispatch `tv_dict_item_free`/
+//! `partial_free` already use, not a type-specific `tv_*_unref` call.
+//!
 //! Deferred: everything else - the actual parser/lvalue/loop/call
 //! machinery is a separate, substantial undertaking of its own. The
 //! remaining "leaf" arithmetic helpers (`eval_addlist` needs
-//! `tv_list_concat`, not yet translated; `eval_concat_str`/
-//! `grow_string_tv`/`eval_addsub_number`/`eval_multdiv_number` are
-//! reasonable next candidates) are not yet examined in detail.
+//! `tv_list_concat`, not yet translated; `eval_addsub_number`/
+//! `eval_multdiv_number` are reasonable next candidates) are not yet
+//! examined in detail.
 
-use crate::eval::typval_defs::{VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
+use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
 /// "n1" divided by "n2", taking care of dividing by zero
 /// (`num_divide`).
@@ -94,12 +109,8 @@ pub fn num_modulus(n1: VarnumberT, n2: VarnumberT) -> VarnumberT {
 /// dispatch in `eval5`, not yet translated, is responsible for
 /// checking this BEFORE calling); any non-null blob pointer they hold
 /// must be valid.
-pub unsafe fn eval_addblob(
-    tv1: &mut crate::eval::typval_defs::TypvalT,
-    tv2: &crate::eval::typval_defs::TypvalT,
-) {
+pub unsafe fn eval_addblob(tv1: &mut TypvalT, tv2: &TypvalT) {
     use crate::eval::typval::{tv_blob_alloc, tv_blob_len, tv_blob_set_ret};
-    use crate::eval::typval_defs::TypvalValue;
 
     let TypvalValue::Blob(b1) = tv1.value else {
         unreachable!("eval_addblob: tv1 must be Blob-typed (caller's own contract)")
@@ -136,12 +147,64 @@ pub unsafe fn eval_addblob(
 
     // SAFETY: forwarded from this function's own safety doc - `b1` (if
     // non-null) is a valid pointer to release; releasing it directly
-    // via `tv_blob_unref` rather than the crate's generic (and
-    // private) `tv_clear_simple` dispatcher, since `tv1` is already
-    // known to be `Blob`-typed from the pattern match above.
+    // via `tv_blob_unref` rather than the crate's generic
+    // `tv_clear_simple` dispatcher, since `tv1` is already known to be
+    // `Blob`-typed from the pattern match above (contrast
+    // `eval_concat_str` below, which genuinely needs the generic
+    // dispatcher since it doesn't know tv1's type ahead of time).
     unsafe { crate::eval::typval::tv_blob_unref(b1) };
     // SAFETY: `b` is a valid pointer just allocated above.
     unsafe { tv_blob_set_ret(tv1, b) };
+}
+
+/// Append `s2` to the string in `tv1` (`grow_string_tv`).
+///
+/// Returns `true` if `tv1` was grown in place, `false` otherwise
+/// (`tv1` isn't `String`-typed, or its value is `None`) - matches the
+/// original's `OK`/`FAIL` exactly. See this module's own doc comment
+/// for why this stays its own function rather than being inlined into
+/// [`eval_concat_str`].
+pub fn grow_string_tv(tv1: &mut TypvalT, s2: &[u8]) -> bool {
+    let TypvalValue::String(Some(s1)) = &mut tv1.value else {
+        return false;
+    };
+    s1.extend_from_slice(s2);
+    true
+}
+
+/// Concatenate strings `tv1` and `tv2` and store the result in `tv1`
+/// (`eval_concat_str`).
+///
+/// Returns `false` if `tv2` cannot be stringified (a type error) -
+/// `tv1` is assumed already stringifiable (the caller, Vimscript's
+/// `.`/`..` operator dispatch in `eval5`, not yet translated, only
+/// calls this after confirming that), matching the original's own
+/// "s1 already checked" comment.
+///
+/// # Safety
+/// If `tv1`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
+/// non-null pointer, that pointer must be valid - forwarded to
+/// `eval/typval.rs`'s `tv_clear_simple`'s own contract, used here to
+/// release `tv1`'s old value when it can't be grown in place.
+pub unsafe fn eval_concat_str(tv1: &mut TypvalT, tv2: &TypvalT) -> bool {
+    use crate::eval::typval::{tv_clear_simple, tv_get_string, tv_get_string_chk};
+
+    let s1 = tv_get_string(tv1);
+    let Some(s2) = tv_get_string_chk(tv2) else {
+        return false;
+    };
+
+    // When possible, grow the existing string in place to avoid alloc/free.
+    if grow_string_tv(tv1, &s2) {
+        return true;
+    }
+
+    let p = crate::strings::concat_str(&s1, &s2);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(tv1) };
+    tv1.value = TypvalValue::String(Some(p));
+
+    true
 }
 
 #[cfg(test)]
@@ -195,7 +258,6 @@ mod tests {
     #[test]
     fn eval_addblob_concatenates_bytes_in_order() {
         use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
-        use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
         let b1 = tv_blob_alloc();
         let b2 = tv_blob_alloc();
@@ -227,7 +289,6 @@ mod tests {
     #[test]
     fn eval_addblob_with_one_empty_operand() {
         use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
-        use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
         let b1 = tv_blob_alloc();
         let b2 = tv_blob_alloc();
@@ -253,7 +314,6 @@ mod tests {
     #[test]
     fn eval_addblob_both_empty_gives_empty_result() {
         use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
-        use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
         let b1 = tv_blob_alloc();
         let b2 = tv_blob_alloc();
@@ -268,6 +328,90 @@ mod tests {
             assert_eq!((*result).bv_ga.ga_len, 0);
             tv_blob_free(result);
             tv_blob_free(b2);
+        }
+    }
+
+    #[test]
+    fn grow_string_tv_appends_in_place() {
+        let mut tv1 = TypvalT { value: TypvalValue::String(Some(b"hello".to_vec())), ..Default::default() };
+        assert!(grow_string_tv(&mut tv1, b" world"));
+        assert!(matches!(&tv1.value, TypvalValue::String(Some(s)) if s == b"hello world"));
+    }
+
+    #[test]
+    fn grow_string_tv_fails_for_non_string() {
+        let mut tv1 = TypvalT { value: TypvalValue::Number(42), ..Default::default() };
+        assert!(!grow_string_tv(&mut tv1, b"abc"));
+        // Unchanged on failure.
+        assert!(matches!(tv1.value, TypvalValue::Number(42)));
+    }
+
+    #[test]
+    fn grow_string_tv_fails_for_none_string() {
+        let mut tv1 = TypvalT { value: TypvalValue::String(None), ..Default::default() };
+        assert!(!grow_string_tv(&mut tv1, b"abc"));
+    }
+
+    #[test]
+    fn eval_concat_str_grows_tv1_in_place_when_both_are_strings() {
+        let mut tv1 = TypvalT { value: TypvalValue::String(Some(b"foo".to_vec())), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::String(Some(b"bar".to_vec())), ..Default::default() };
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(ok);
+        assert!(matches!(&tv1.value, TypvalValue::String(Some(s)) if s == b"foobar"));
+    }
+
+    #[test]
+    fn eval_concat_str_stringifies_a_non_string_tv1() {
+        // tv1 is Number-typed - can't grow in place, so falls back to
+        // concat_str + a fresh String-typed value.
+        let mut tv1 = TypvalT { value: TypvalValue::Number(7), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::String(Some(b"up".to_vec())), ..Default::default() };
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(ok);
+        assert!(matches!(&tv1.value, TypvalValue::String(Some(s)) if s == b"7up"));
+    }
+
+    #[test]
+    fn eval_concat_str_stringifies_a_float_tv2() {
+        let mut tv1 = TypvalT { value: TypvalValue::String(Some(b"pi=".to_vec())), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::Float(1.5), ..Default::default() };
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(ok);
+        assert!(matches!(&tv1.value, TypvalValue::String(Some(s)) if s == b"pi=1.5"));
+    }
+
+    #[test]
+    fn eval_concat_str_returns_false_when_tv2_is_unstringifiable() {
+        let mut tv1 = TypvalT { value: TypvalValue::String(Some(b"foo".to_vec())), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn eval_concat_str_releases_tv1s_old_list_when_it_cannot_grow_in_place() {
+        use crate::eval::typval::tv_list_alloc;
+
+        // tv1 starts as a List with refcount 2 - eval_concat_str must
+        // release one reference (via tv_clear_simple's generic
+        // dispatch, since it doesn't know tv1's type ahead of time)
+        // before overwriting tv1 with the concatenated string. Using
+        // refcount 2 (not 1) so the list survives the release and can
+        // still be safely dereferenced afterward to confirm the
+        // decrement actually happened, rather than being silently
+        // skipped.
+        let l = tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::Unknown as isize);
+        unsafe { (*l).lv_refcount = 2 };
+        let mut tv1 = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::String(Some(b"str".to_vec())), ..Default::default() };
+
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(ok);
+        assert!(matches!(&tv1.value, TypvalValue::String(Some(s)) if s == b"str"));
+        unsafe {
+            assert_eq!((*l).lv_refcount, 1);
+            crate::eval::typval::tv_list_unref(l);
         }
     }
 }

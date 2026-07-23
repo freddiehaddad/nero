@@ -477,11 +477,21 @@ fn strip_trailing_zeros(s: &str) -> Vec<u8> {
 /// [`tv_dict_item_free`]/[`partial_free`]'s own `pt_argv` release, and
 /// by [`partial_unref`] for `pt_dict`/`pt_func`.
 ///
+/// `pub(crate)` (not fully private) so `eval/eval.rs`'s
+/// `eval_concat_str` can reuse it too, for the same "release whatever
+/// `tv1` used to hold before overwriting it with a freshly-computed
+/// result" need `tv_dict_item_free`/`partial_free` already have -
+/// unlike `eval_addblob`, which already statically knows its operand
+/// is `Blob`-typed and so can call `tv_blob_unref` directly,
+/// `eval_concat_str` may see tv1 holding ANY type (only tv2 is
+/// constrained to be stringifiable), so it genuinely needs this
+/// generic dispatch.
+///
 /// # Safety
 /// If `tv`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
 /// non-null pointer, that pointer must be valid (matching every other
 /// function in this crate that touches those types).
-unsafe fn tv_clear_simple(tv: &TypvalT) {
+pub(crate) unsafe fn tv_clear_simple(tv: &TypvalT) {
     match &tv.value {
         TypvalValue::List(l) => {
             // SAFETY: forwarded from this function's own safety doc.
