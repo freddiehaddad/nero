@@ -115,6 +115,18 @@
 //! (validates a call's argument count against `fp`'s own arity),
 //! plus a new [`FnameTransError`] enum (`eval/userfunc.h`'s small,
 //! 9-variant `FnameTransError`).
+//!
+//! Also translated: `save_funccal`/`restore_funccal`/
+//! `get_current_funccal`/`set_current_funccal` - a save/restore stack
+//! for `CURRENT_FUNCCAL`, used when a totally different execution
+//! context (autocommands, `:source`) needs to run with a temporarily
+//! empty current funccall. New [`FuncCalEntryT`] (`funccal_entry_T`,
+//! note the single "l" - a real, deliberate upstream spelling
+//! distinction from `funccall_T`, preserved exactly) and a new
+//! `FUNCCAL_STACK` file-static. `restore_funccal`'s
+//! `iemsg("INTERNAL: ...")` on an empty stack becomes a
+//! `debug_assert!`, matching this crate's established internal-
+//! invariant-violation policy.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -464,6 +476,83 @@ static PREVIOUS_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
 /// being executed, or null when not inside any user function.
 static CURRENT_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
     LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
+
+/// A save/restore point for `CURRENT_FUNCCAL` (`funccal_entry_T`,
+/// spelled with a single "l" like `current_funccal`/`funccal_stack`
+/// themselves, unlike `funccall_T`/`FunccallT` - a real, deliberate
+/// upstream spelling distinction, preserved here).
+///
+/// `top_funccal` is `*mut FunccallT` here (the original's `void
+/// *top_funccal` is only untyped due to header include-order
+/// constraints - it always actually holds a `funccall_T*`).
+///
+/// Caller-allocated, matching the original's own convention (a real
+/// call site typically stack-allocates one of these before calling
+/// [`save_funccal`]).
+#[derive(Debug, Default)]
+pub struct FuncCalEntryT {
+    pub top_funccal: *mut FunccallT,
+    pub next: *mut FuncCalEntryT,
+}
+
+/// `funccal_stack`: file-static singly-linked stack of
+/// [`FuncCalEntryT`]s pushed by [`save_funccal`]/popped by
+/// [`restore_funccal`].
+static FUNCCAL_STACK: LazyLock<GlobalCell<*mut FuncCalEntryT>> =
+    LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
+
+/// Save the current function call pointer, and set it to `None` -
+/// used when executing autocommands and for ":source" (`save_funccal`).
+///
+/// # Safety
+/// `entry` must be a valid, non-null pointer to storage that outlives
+/// its later removal from the stack via [`restore_funccal`].
+pub unsafe fn save_funccal(entry: *mut FuncCalEntryT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*entry).top_funccal = *CURRENT_FUNCCAL.get_mut();
+        (*entry).next = *FUNCCAL_STACK.get_mut();
+        *FUNCCAL_STACK.get_mut() = entry;
+        *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut();
+    }
+}
+
+/// Restore `CURRENT_FUNCCAL` from the top of `funccal_stack`
+/// (`restore_funccal`).
+///
+/// The original's `iemsg("INTERNAL: restore_funccal()")` - reached
+/// only when called without a matching, still-pending
+/// [`save_funccal`], a genuine "should never happen" caller-contract
+/// violation - becomes a `debug_assert!`, matching this crate's
+/// established policy for internal invariant violations (e.g.
+/// `mf_put`).
+pub fn restore_funccal() {
+    // SAFETY: only reads/writes the file-static FUNCCAL_STACK/
+    // CURRENT_FUNCCAL cells; any non-null top was previously pushed by
+    // save_funccal, per this crate's own standing invariant for these
+    // two cells (matching PREVIOUS_FUNCCAL/CURRENT_FUNCCAL elsewhere
+    // in this file).
+    let top = unsafe { *FUNCCAL_STACK.get_mut() };
+    debug_assert!(!top.is_null(), "INTERNAL: restore_funccal()");
+    if !top.is_null() {
+        unsafe {
+            *CURRENT_FUNCCAL.get_mut() = (*top).top_funccal;
+            *FUNCCAL_STACK.get_mut() = (*top).next;
+        }
+    }
+}
+
+/// The currently active funccall, or null if none (`get_current_funccal`).
+#[must_use]
+pub fn get_current_funccal() -> *mut FunccallT {
+    unsafe { *CURRENT_FUNCCAL.get_mut() }
+}
+
+/// Set the currently active funccall directly, bypassing the
+/// `funccal_stack` save/restore mechanism (`set_current_funccal`).
+pub fn set_current_funccal(fc: *mut FunccallT) {
+    unsafe { *CURRENT_FUNCCAL.get_mut() = fc };
+}
 
 /// Free `fc` (`free_funccal`).
 ///
@@ -1815,6 +1904,101 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(check_user_func_argcount(&fp, 10), FnameTransError::Unknown);
+    }
+
+    // ---- save_funccal / restore_funccal / get_current_funccal / --------
+    // ---- set_current_funccal --------------------------------------------
+
+    #[test]
+    fn save_and_restore_funccal_round_trips_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let mut entry = FuncCalEntryT::default();
+        unsafe { save_funccal(&mut entry as *mut FuncCalEntryT) };
+
+        // save_funccal clears CURRENT_FUNCCAL and remembers the old one.
+        assert!(get_current_funccal().is_null());
+        assert_eq!(entry.top_funccal, fc_ptr);
+
+        restore_funccal();
+        assert_eq!(get_current_funccal(), fc_ptr);
+        assert!(unsafe { *FUNCCAL_STACK.get_mut() }.is_null());
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn save_funccal_stacks_nested_entries_in_lifo_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+
+        let mut outer_fc = Box::new(FunccallT::default());
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = outer_fc_ptr };
+
+        let mut outer_entry = FuncCalEntryT::default();
+        unsafe { save_funccal(&mut outer_entry as *mut FuncCalEntryT) };
+        assert!(get_current_funccal().is_null());
+
+        // A second save (e.g. a nested autocommand) with nothing
+        // current in between - top_funccal captures null here.
+        let mut inner_entry = FuncCalEntryT::default();
+        unsafe { save_funccal(&mut inner_entry as *mut FuncCalEntryT) };
+        assert!(inner_entry.top_funccal.is_null());
+
+        restore_funccal(); // pops inner_entry
+        assert!(get_current_funccal().is_null());
+
+        restore_funccal(); // pops outer_entry
+        assert_eq!(get_current_funccal(), outer_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn restore_funccal_on_empty_stack_is_a_harmless_noop_in_release() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+        // Matches the original's own "iemsg + do nothing else" path -
+        // this crate skips the message display but must not corrupt
+        // CURRENT_FUNCCAL. Only reachable in --release, where
+        // debug_assert! compiles out entirely (see the dedicated
+        // panic test for the debug-build behavior).
+        restore_funccal();
+        assert!(get_current_funccal().is_null());
+    }
+
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore)]
+    #[should_panic(expected = "INTERNAL: restore_funccal()")]
+    fn restore_funccal_on_empty_stack_panics_in_debug_builds() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+        restore_funccal();
+    }
+
+    #[test]
+    fn get_and_set_current_funccal_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert!(get_current_funccal().is_null());
+
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        set_current_funccal(fc_ptr);
+        assert_eq!(get_current_funccal(), fc_ptr);
+
+        set_current_funccal(std::ptr::null_mut());
+        assert!(get_current_funccal().is_null());
     }
 
     #[test]
