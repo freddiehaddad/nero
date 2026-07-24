@@ -81,6 +81,17 @@
 //! `func_has_ended` (the last needing a new `aborted_in_try` in
 //! `crate::ex_eval`, itself trivial - just reads the already-real
 //! `GLOBALS.force_abort`).
+//!
+//! Also translated: `func_is_global`/`cat_func_name`/
+//! `printable_func_name`/`function_list_modified` - small name-
+//! formatting/hash-table-change-detection helpers. `cat_func_name`
+//! returns a freshly-owned, never-truncated `Vec<u8>` rather than
+//! writing into a caller-provided fixed-size buffer (see its own doc
+//! comment for how it handles `uf_name`'s trailing-NUL ambiguity).
+//! `function_list_modified` and `cat_func_name` are both translated
+//! ahead of their real callers (`:function` listing code, none of
+//! which is translated yet), matching this crate's established
+//! precedent for small, self-contained, no-design-freedom functions.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{FunccallT, TypvalT, UfuncT};
@@ -210,6 +221,69 @@ pub unsafe fn func_remove(fp: *mut UfuncT) -> bool {
     table.ht.hash_remove(name);
     table.index.remove(&key_ptr);
     true
+}
+
+/// `keycodes.h`'s `K_SPECIAL` (0x80) - the lead byte marking an
+/// internally-encoded special key, also used as the first byte of a
+/// script-local function's encoded `<SNR>` name prefix. Defined
+/// locally here (no `keycodes.rs` exists yet) since `func_is_global`
+/// is currently this crate's only real dependency on it.
+const K_SPECIAL: u8 = 0x80;
+
+/// Returns `true` if `ufunc` is a global function (`func_is_global`).
+fn func_is_global(ufunc: &UfuncT) -> bool {
+    ufunc.uf_name.first() != Some(&K_SPECIAL)
+}
+
+/// Copy the function name of `fp`, taking care of script-local
+/// function names (`cat_func_name`).
+///
+/// Unlike the original (writes into a caller-provided fixed-size
+/// `buf`/`bufsize`, truncating the result if it doesn't fit), returns
+/// a freshly-owned, never-truncated `Vec<u8>` - Rust's own `Vec` has
+/// no such fixed-size constraint to work around. A single trailing
+/// NUL byte on `fp.uf_name` (present once a function has been added
+/// to the hash table via [`func_hashtab_add`], per its own documented
+/// precondition) is stripped first if present, since a NUL can never
+/// be a function name's own meaningful last byte.
+#[must_use]
+pub fn cat_func_name(fp: &UfuncT) -> Vec<u8> {
+    let name = fp.uf_name.as_slice();
+    let clean = match name.last() {
+        Some(0) => &name[..name.len() - 1],
+        _ => name,
+    };
+    if !func_is_global(fp) && clean.len() > 3 {
+        let mut result = b"<SNR>".to_vec();
+        result.extend_from_slice(&clean[3..]);
+        result
+    } else {
+        clean.to_vec()
+    }
+}
+
+/// Returns `fp`'s "print name": `uf_name_exp` if set (populated when
+/// `uf_name` itself starts with the internally-encoded `<SNR>`
+/// prefix), otherwise `uf_name` verbatim (`printable_func_name`).
+#[must_use]
+pub fn printable_func_name(fp: &UfuncT) -> Vec<u8> {
+    fp.uf_name_exp.clone().unwrap_or_else(|| fp.uf_name.clone())
+}
+
+/// When `prev_ht_changed` does not equal the function hash table's own
+/// current change counter, give an error (skipped - message display,
+/// not tractable) and return `true`; otherwise return `false`
+/// (`function_list_modified`).
+///
+/// Used by `:function` listing code (not yet translated) to detect a
+/// callback deleting/redefining functions mid-listing. Translated
+/// ahead of that real caller since it is small, self-contained, and
+/// mechanically correct with no design freedom to get wrong, matching
+/// this crate's established precedent for such functions.
+#[must_use]
+pub fn function_list_modified(prev_ht_changed: i32) -> bool {
+    let table = unsafe { FUNC_HASHTAB.get_mut() };
+    prev_ht_changed != table.ht.ht_changed
 }
 
 /// Whether a function name is genuinely refcounted BY NAME
@@ -1228,6 +1302,87 @@ mod tests {
         let ht_ptr = func_tbl_get();
         assert!(!ht_ptr.is_null());
         assert_eq!(unsafe { (*ht_ptr).ht_used }, 1);
+    }
+
+    #[test]
+    fn func_is_global_true_for_ordinary_name() {
+        let fp = UfuncT { uf_name: b"MyFunc\0".to_vec(), ..Default::default() };
+        assert!(func_is_global(&fp));
+    }
+
+    #[test]
+    fn func_is_global_false_for_script_local_name() {
+        // <SNR> is encoded as K_SPECIAL KS_EXTRA KE_SNR - only the
+        // leading K_SPECIAL byte (0x80) matters to func_is_global.
+        let fp = UfuncT { uf_name: vec![0x80, 0x00, 0x00, b'1', b'_', b'F', b'o', b'o', 0], ..Default::default() };
+        assert!(!func_is_global(&fp));
+    }
+
+    #[test]
+    fn cat_func_name_global_name_passes_through() {
+        let fp = UfuncT { uf_name: b"MyFunc\0".to_vec(), ..Default::default() };
+        assert_eq!(cat_func_name(&fp), b"MyFunc");
+    }
+
+    #[test]
+    fn cat_func_name_script_local_name_gets_snr_prefix() {
+        // K_SPECIAL, then 2 more encoding bytes, then "1_Foo" - matches
+        // the original's own "uf_name + 3" skip.
+        let fp = UfuncT { uf_name: vec![0x80, 0x00, 0x00, b'1', b'_', b'F', b'o', b'o', 0], ..Default::default() };
+        assert_eq!(cat_func_name(&fp), b"<SNR>1_Foo");
+    }
+
+    #[test]
+    fn cat_func_name_short_script_local_name_falls_back_to_raw() {
+        // uflen (here: clean-name length) <= 3, so the "!func_is_global
+        // && uflen > 3" branch is skipped - falls through to the plain
+        // "%s" formatting of the whole (still K_SPECIAL-prefixed) name,
+        // exactly matching the original's own else-branch.
+        let fp = UfuncT { uf_name: vec![0x80, 0x00, 0x00, 0], ..Default::default() };
+        assert_eq!(cat_func_name(&fp), vec![0x80, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn cat_func_name_without_trailing_nul_is_handled() {
+        // An unregistered UfuncT (never passed through
+        // func_hashtab_add) may not have a trailing NUL yet - must not
+        // be treated as if the last real byte were a terminator.
+        let fp = UfuncT { uf_name: b"MyFunc".to_vec(), ..Default::default() };
+        assert_eq!(cat_func_name(&fp), b"MyFunc");
+    }
+
+    #[test]
+    fn printable_func_name_uses_uf_name_exp_when_set() {
+        let fp = UfuncT {
+            uf_name: vec![0x80, 0x00, 0x00, b'1', b'_', b'F', b'o', b'o', 0],
+            uf_name_exp: Some(b"<SNR>1_Foo".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(printable_func_name(&fp), b"<SNR>1_Foo");
+    }
+
+    #[test]
+    fn printable_func_name_falls_back_to_uf_name_when_unset() {
+        let fp = UfuncT { uf_name: b"MyFunc\0".to_vec(), uf_name_exp: None, ..Default::default() };
+        assert_eq!(printable_func_name(&fp), b"MyFunc\0");
+    }
+
+    #[test]
+    fn function_list_modified_false_when_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let prev = unsafe { (*func_tbl_get()).ht_changed };
+        assert!(!function_list_modified(prev));
+    }
+
+    #[test]
+    fn function_list_modified_true_after_a_real_hashtab_change() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let prev = unsafe { (*func_tbl_get()).ht_changed };
+        let mut fp = Box::new(UfuncT { uf_name: b"Changed\0".to_vec(), ..Default::default() });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+        assert!(function_list_modified(prev));
     }
 
     #[test]
