@@ -7,7 +7,7 @@
 //! subsystem, and message display, not attempted here.
 //!
 //! Translated: the small "last character search" (`f`/`F`/`t`/`T`)
-//! file-static state and its five simple accessors -
+//! file-static state and its six simple accessors - `last_csearch`/
 //! `last_csearch_forward`/`last_csearch_until`/`set_last_csearch`/
 //! `set_csearch_direction`/`set_csearch_until`. The original's
 //! `lastc`/`lastcdir`/`last_t_cmd`/`lastc_bytes`/`lastc_bytelen`
@@ -17,7 +17,11 @@
 //! `uint8_t[2]` in the original) is mirrored here as a single `u8`:
 //! `lastc[1]` is always left at its initial `NUL` and never read or
 //! written anywhere in the real source - only `lastc[0]` (via
-//! `*lastc`) is ever touched.
+//! `*lastc`) is ever touched. `set_last_csearch` preserves a genuine
+//! upstream quirk: bytes beyond the newly-written `len` are NOT
+//! re-cleared (matching the original's own `memcpy`-only-writes-`len`-
+//! bytes behavior) unless `len == 0` - see that function's own doc
+//! comment.
 //!
 //! Also translated: `linewhite` (needed only `charset.c`'s
 //! `skipwhite` and `memline.c`'s `ml_get`, both already real).
@@ -73,6 +77,19 @@ impl Default for LastCsearch {
 static LAST_CSEARCH: std::sync::LazyLock<crate::globals::GlobalCell<LastCsearch>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(LastCsearch::default()));
 
+/// @return the raw bytes of the last searched-for character
+/// (`last_csearch`).
+///
+/// Returns the full internal buffer (`bytes[..bytelen]` is the
+/// meaningful portion - see [`set_last_csearch`]'s own doc comment for
+/// why bytes beyond `bytelen` may be stale leftovers from an earlier,
+/// longer call, exactly matching the original's own behavior).
+#[must_use]
+pub fn last_csearch() -> [u8; MAX_SCHAR_SIZE + 1] {
+    // SAFETY: see [`last_csearch_forward`].
+    unsafe { LAST_CSEARCH.get_mut() }.bytes
+}
+
 /// @return `true` if the last character search direction was forward
 /// (`last_csearch_forward`).
 #[must_use]
@@ -94,6 +111,18 @@ pub fn last_csearch_until() -> bool {
 /// Remember character `c` (and its raw bytes `s[..len]`, when
 /// multi-byte) for the last character search (`set_last_csearch`).
 ///
+/// Only overwrites the first `len` bytes of the internal buffer when
+/// `len != 0` (matching the original's own `memcpy(lastc_bytes, s,
+/// len)`, which never touches bytes beyond `len`) - any bytes left
+/// over from a PREVIOUS, longer call are deliberately NOT re-cleared
+/// here. This is a faithfully-replicated quirk, not an oversight: the
+/// original only fully clears the buffer (`CLEAR_FIELD`) on the
+/// `len == 0` path. Every real reader is expected to only ever look at
+/// `bytes[..bytelen]` (mirroring `bytelen`'s own role as the length
+/// tag), so this is unobservable in practice - matches this crate's
+/// "preserve the quirk, don't silently fix it" policy (e.g.
+/// `eval/eval.rs`'s `string2float` `"inf"`-shortcut quirk).
+///
 /// # Panics
 /// If `len` is negative, exceeds `s.len()`, or exceeds `bytes`' own
 /// capacity (`MAX_SCHAR_SIZE + 1`) - the original would silently
@@ -109,10 +138,11 @@ pub fn set_last_csearch(c: i32, s: &[u8], len: i32) {
     // Matches the original's own `(uint8_t)c` truncating cast exactly.
     state.lastc = c as u8;
     state.bytelen = len;
-    state.bytes = [0; MAX_SCHAR_SIZE + 1];
     if len != 0 {
         let len = usize::try_from(len).expect("set_last_csearch: len must not be negative");
         state.bytes[..len].copy_from_slice(&s[..len]);
+    } else {
+        state.bytes = [0; MAX_SCHAR_SIZE + 1];
     }
 }
 
@@ -184,6 +214,11 @@ mod tests {
     #[test]
     fn set_last_csearch_plain_ascii_single_byte() {
         let _lock = crate::globals::global_state_test_lock();
+        // Start from a known-cleared state (order-independent of
+        // whatever other tests left behind) before checking bytes
+        // beyond len - see set_last_csearch_retains_stale_trailing_bytes
+        // for why bytes[1..] isn't always zero after a plain call.
+        set_last_csearch(0, b"", 0);
         set_last_csearch(i32::from(b'x'), b"x", 1);
         // SAFETY: forwarded from the module's own GlobalCell convention.
         let state = unsafe { LAST_CSEARCH.get_mut() };
@@ -203,6 +238,24 @@ mod tests {
         let state = unsafe { LAST_CSEARCH.get_mut() };
         assert_eq!(state.bytelen, 2);
         assert_eq!(&state.bytes[..2], bytes);
+    }
+
+    #[test]
+    fn set_last_csearch_retains_stale_trailing_bytes() {
+        // Faithfully-replicated upstream quirk: a shorter call does NOT
+        // re-clear bytes beyond its own len - only `memcpy`'s own `len`
+        // bytes are overwritten, matching the original exactly (see
+        // set_last_csearch's own doc comment).
+        let _lock = crate::globals::global_state_test_lock();
+        let long = "é".as_bytes(); // 2 bytes: 0xC3 0xA9
+        set_last_csearch(i32::from(long[0]), long, 2);
+        set_last_csearch(i32::from(b'x'), b"x", 1);
+        // SAFETY: forwarded from the module's own GlobalCell convention.
+        let state = unsafe { LAST_CSEARCH.get_mut() };
+        assert_eq!(state.bytelen, 1);
+        assert_eq!(state.bytes[0], b'x');
+        // Byte 1 still holds 0xA9 from the earlier, longer call.
+        assert_eq!(state.bytes[1], long[1]);
     }
 
     #[test]
@@ -280,5 +333,16 @@ mod tests {
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
         close_test_buf(buf);
+    }
+
+    #[test]
+    fn last_csearch_returns_the_full_internal_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_last_csearch(0, b"", 0); // known-cleared starting state
+        set_last_csearch(i32::from(b'z'), b"z", 1);
+        let bytes = last_csearch();
+        assert_eq!(bytes.len(), MAX_SCHAR_SIZE + 1);
+        assert_eq!(bytes[0], b'z');
+        assert!(bytes[1..].iter().all(|&b| b == 0));
     }
 }
