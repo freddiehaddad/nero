@@ -13,9 +13,10 @@
 //! (the single-byte sibling of `char2cells`); `nr2hex`/`transchar_hex`
 //! (hex-escape formatting for non-printable/illegal characters);
 //! `charset.h`'s `vim_isbreak` (translated proactively for its real
-//! future caller, `plines.c`'s not-yet-translated `charsize_regular` -
-//! `charset.h` has no dedicated module of its own in this crate, same
-//! treatment as `buffer.h`'s `buf_meta_total` in `buffer.rs`).
+//! caller, `plines.c`'s `charsize_regular` - since translated, and
+//! `plines.c` itself is now fully complete; `charset.h` has no
+//! dedicated module of its own in this crate, same treatment as
+//! `buffer.h`'s `buf_meta_total` in `buffer.rs`).
 //!
 //! `vim_isprintc`/`char2cells`/`byte2cells` need `g_chartab`, which isn't
 //! translated (needs `buf_T`/option parsing), but their *default* (pre-

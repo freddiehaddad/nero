@@ -8,9 +8,10 @@
 //! may be "orphaned" if all window(s) it was scoped to are destroyed,
 //! but stays tracked here so it's never mistaken for global scope) and
 //! `ns_in_win` (checks whether a namespace is visible in a given
-//! window - needed by `plines.c`'s `charsize_regular`/`decoration.c`,
-//! neither yet translated, but this is a small, genuinely
-//! self-contained piece worth harvesting now).
+//! window - needed by `plines.c`'s `charsize_regular`/`decoration.c`'s
+//! `decor_conceal_line`/`decor_virt_lines`, all since translated - this
+//! was a small, genuinely self-contained piece worth harvesting ahead
+//! of its callers at the time).
 //!
 //! Deferred: `namespace_ids` (the name -> id `Map<String, int>`) and
 //! `next_namespace_id` - both only needed by `nvim_create_namespace`
