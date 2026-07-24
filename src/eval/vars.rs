@@ -145,6 +145,18 @@
 //! deliberately NOT started - confirmed via direct reading of their
 //! real bodies, not assumed.
 //!
+//! Also translated: `garbage_collect_globvars`/`garbage_collect_scriptvars`,
+//! both now real, thin wrappers around `eval/eval.rs`'s own
+//! `set_ref_in_ht`, now that it exists (see that module's own doc
+//! comment for the full GC mark-phase family this belongs to).
+//! `garbage_collect_scriptvars` needed one small new
+//! `crate::runtime::script_item_count` accessor (`script_items.ga_len`
+//! in the original) alongside the already-real `script_item`.
+//! `garbage_collect_vimvars` remains untranslated - it needs a real
+//! `vimvardict`/`get_vimvar_dict` wrapping `VIMVARS` in an actual
+//! `DictT` (not yet built; `VIMVARS` is still a bare `Vec<Vimvar>`),
+//! part of the larger `evalvars_init` effort already deferred above.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
@@ -783,6 +795,51 @@ pub fn del_menutrans_vars() {
     }
 }
 
+/// Mark all lists/dicts referenced through the global (`g:`) scope
+/// with `copy_id` (`garbage_collect_globvars`).
+///
+/// # Safety
+/// Every item transitively reachable from `GLOBVARDICT` must be
+/// valid, satisfying [`crate::eval::eval::set_ref_in_ht`]'s own safety
+/// contract.
+#[must_use]
+pub unsafe fn garbage_collect_globvars(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::set_ref_in_ht(GLOBVARDICT.get_mut() as *mut DictT, copy_id, std::ptr::null_mut()) }
+}
+
+/// Mark all lists/dicts referenced through every registered script's
+/// own `s:` scope with `copy_id` (`garbage_collect_scriptvars`).
+///
+/// # Safety
+/// Every item transitively reachable from every registered script's
+/// own `s:` scope dict must be valid.
+#[must_use]
+pub unsafe fn garbage_collect_scriptvars(copy_id: i32) -> bool {
+    let mut abort = false;
+    for i in 1..=crate::runtime::script_item_count() {
+        let item = crate::runtime::script_item(i);
+        if item.is_null() {
+            continue;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let sv = unsafe { (*item).sn_vars };
+        if sv.is_null() {
+            continue;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        abort = abort
+            || unsafe {
+                crate::eval::eval::set_ref_in_ht(
+                    &mut (*sv).sv_dict as *mut DictT,
+                    copy_id,
+                    std::ptr::null_mut(),
+                )
+            };
+    }
+    abort
+}
+
 /// Get the name of `v:` variable `idx`, without the `v:` prefix
 /// (`get_vim_var_name`).
 #[must_use]
@@ -1402,6 +1459,59 @@ mod globvardict_tests {
 
         assert_eq!(unsafe { (*d).dv_index.len() }, 1);
         reset_globvardict();
+    }
+
+    #[test]
+    fn garbage_collect_globvars_marks_a_nested_dict_reachable_from_g() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globvardict();
+        let d = get_globvar_dict();
+        let nested = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nested");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(nested) };
+        unsafe { tv_dict_add(&mut *d, item) };
+
+        let aborted = unsafe { garbage_collect_globvars(13) };
+
+        assert!(!aborted);
+        assert_eq!(unsafe { (*nested).dv_copy_id }, 13);
+
+        reset_globvardict();
+    }
+
+    #[test]
+    fn garbage_collect_globvars_false_when_globvardict_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globvardict();
+        assert!(!unsafe { garbage_collect_globvars(1) });
+    }
+
+    #[test]
+    fn garbage_collect_scriptvars_false_when_no_scripts_registered() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        assert!(!unsafe { garbage_collect_scriptvars(1) });
+    }
+
+    #[test]
+    fn garbage_collect_scriptvars_marks_a_nested_dict_reachable_from_a_scripts_own_s_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        let item_ptr = crate::runtime::script_item(sid);
+        let sv = unsafe { (*item_ptr).sn_vars };
+
+        let nested = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nested");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(nested) };
+        unsafe { tv_dict_add(&mut (*sv).sv_dict, item) };
+
+        let aborted = unsafe { garbage_collect_scriptvars(9) };
+
+        assert!(!aborted);
+        assert_eq!(unsafe { (*nested).dv_copy_id }, 9);
+
+        crate::runtime::tests_reset_for_test();
     }
 }
 

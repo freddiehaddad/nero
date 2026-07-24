@@ -110,6 +110,15 @@ pub fn new_script_item(name: Option<Vec<u8>>) -> (ScidT, *mut ScriptitemT) {
     (sid, si)
 }
 
+/// The number of script items created so far via [`new_script_item`]
+/// (`script_items.ga_len`) - the highest valid `id` [`script_item`]
+/// will accept.
+#[must_use]
+pub fn script_item_count() -> ScidT {
+    // SAFETY: forwarded from script_item's own reasoning.
+    unsafe { SCRIPT_ITEMS.get_mut() }.len() as ScidT
+}
+
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
 /// each test (in this module, or `eval::vars`'s own tests exercising
 /// [`new_script_item`]/`new_script_vars` together) starts from a clean
@@ -188,5 +197,22 @@ mod tests {
         tests_reset_for_test();
         new_script_item(None);
         let _ = script_item(99);
+    }
+
+    #[test]
+    fn script_item_count_zero_when_none_registered() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        assert_eq!(script_item_count(), 0);
+    }
+
+    #[test]
+    fn script_item_count_matches_the_number_created() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        new_script_item(None);
+        new_script_item(None);
+        new_script_item(None);
+        assert_eq!(script_item_count(), 3);
     }
 }
