@@ -716,6 +716,28 @@ pub fn tv_dict_alloc() -> *mut DictT {
     d
 }
 
+/// Set all existing keys in `dict` as read-only. Does not protect
+/// against adding new keys to the dictionary
+/// (`tv_dict_set_keys_readonly`).
+///
+/// Unlike the original (which locks `dv_hashtab`, walks it via
+/// `HASHTAB_ITER` + `TV_DICT_HI2DI`), `dv_index` already gives a
+/// direct list of every live item - no hashtab traversal/locking
+/// needed at all, matching `tv_dict_free_contents`'s own established
+/// `dv_index`-based iteration precedent.
+///
+/// # Safety
+/// `dict` must be a valid, non-null pointer to a live `DictT` whose
+/// every `dv_index` entry is a valid, live `DictitemT` pointer.
+pub unsafe fn tv_dict_set_keys_readonly(dict: *mut DictT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut DictitemT> = unsafe { &*dict }.dv_index.values().copied().collect();
+    for item in items {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*item).di_flags |= dict_item_flags::RO | dict_item_flags::FIX };
+    }
+}
+
 /// Free items contained in a dictionary (`tv_dict_free_contents`).
 ///
 /// # Safety
@@ -2272,6 +2294,37 @@ mod tests {
             assert!(!tv_dict_has_key(Some(&mut *d), b"a"));
 
             tv_dict_free_dict(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_set_keys_readonly_marks_every_existing_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            for key in [b"a".as_slice(), b"b".as_slice()] {
+                let item = tv_dict_item_alloc(key);
+                assert_eq!(tv_dict_add(&mut *d, item), OK);
+            }
+            // Both items start with only DI_FLAGS_ALLOC set (from
+            // tv_dict_item_alloc's own separately-allocated key), not
+            // yet RO/FIX.
+            for item in (*d).dv_index.values() {
+                assert_eq!((**item).di_flags, dict_item_flags::ALLOC);
+            }
+
+            tv_dict_set_keys_readonly(d);
+
+            // RO|FIX are ADDED on top of the pre-existing ALLOC flag
+            // (matches the original's own `|=`, not an overwrite).
+            for item in (*d).dv_index.values() {
+                assert_eq!(
+                    (**item).di_flags,
+                    dict_item_flags::ALLOC | dict_item_flags::RO | dict_item_flags::FIX
+                );
+            }
+
+            tv_dict_free(d);
         }
     }
 

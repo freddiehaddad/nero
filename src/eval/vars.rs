@@ -28,12 +28,71 @@
 //! linked-list translation first, same accepted gap as documented on
 //! `DictT` itself in `eval/typval_defs.rs`).
 //!
+//! Also translated: the `v:` special-variable storage layer -
+//! `eval_defs.h`'s `VimVarIndex` enum (embedded here directly, since
+//! `eval_defs.h` has no dedicated `_defs.rs` module of its own - same
+//! treatment as `charset.h`'s `vim_isbreak` in `charset.rs`) plus
+//! `vars.c`'s own `vimvars[]` table (as `VIMVARS`) and its accessors:
+//! `get_vim_var_tv`/`get_vim_var_name`/`get_vim_var_nr`/
+//! `get_vim_var_list`/`get_vim_var_dict`/`get_vim_var_str`/
+//! `get_vim_var_partial`/`set_vim_var_tv`/`set_vim_var_type`/
+//! `set_vim_var_nr`/`set_vim_var_bool`/`set_vim_var_special`/
+//! `set_vim_var_string`/`set_vim_var_list`/`set_vim_var_dict`/
+//! `set_vim_var_partial`/`set_vim_var_char`/`set_reg_var`. This was
+//! investigated specifically to unblock `search.c`'s
+//! `set_vv_searchforward` (a repeatedly-cited blocker this session) -
+//! turned out to be a real, self-contained subsystem once actually
+//! examined, much like `plines.c`'s "always-real-fast-path" unlock.
+//!
+//! `VIMVARS`' 108 entries are mechanically transcribed from the
+//! original's own static initializer (`VV(idx, name, type, flags)`
+//! macro expansions) - **indexed by [`VimVarIndex`]'s enum order, NOT
+//! the table's own textual order**: the original uses C99 designated
+//! initializers (`[idx] = {...}`), and at least one pair
+//! (`VV_TERMREQUEST`/`VV_TERMRESPONSE`) is declared in a DIFFERENT
+//! order in the table than in the enum - verified by cross-referencing
+//! every single name between the enum and the table programmatically
+//! (both lists contain exactly the same 108 names, zero missing/extra/
+//! duplicated) before transcribing, not just assumed from visual
+//! inspection. Each entry's own `tv` matches EXACTLY what the
+//! original's macro produces BEFORE `evalvars_init()` ever runs (a
+//! zero-valued `vval` of the entry's declared type - `Number(0)`,
+//! `String(None)`, a null `List`/`Dict`/`Blob`/`Partial` pointer,
+//! `Bool(BoolVarValue::False)`, or `Special(SpecialVarValue::Null)`).
+//!
+//! `evalvars_init` itself (which overrides several entries with real
+//! startup values - `v:count1`/`v:hlsearch`/`v:searchforward` all
+//! become `1`, `v:true` becomes `Bool(True)`, `v:errors` gets a real
+//! empty list, etc. - and wires every entry into the real `v:` scope
+//! dict via `hash_add`) is NOT yet translated: it needs `hash_add`
+//! wired to a live `v:` scope `DictT` (not just the bare array here),
+//! `tv_dict_alloc_lock`/`tv_list_set_lock` (not yet translated),
+//! msgpack-type introspection (`msgpack_type_names`/
+//! `eval_msgpack_type_lists`), and a Lua partial callback for `v:lua` -
+//! each a genuinely separate undertaking from this table + its
+//! accessors, left for a dedicated future pass. Until it lands, every
+//! `VIMVARS` entry reads as its bare static-initializer default, NOT
+//! its real runtime value - documented per-function below where this
+//! matters.
+//!
+//! `set_vim_var_type`/`set_vim_var_nr`/`set_vim_var_partial` preserve
+//! the original's own peculiar "doesn't set the type" contract (a raw
+//! C union write that only makes sense given the caller already knows
+//! the slot's real type) as a documented panic-on-mismatch instead: verified
+//! every real call site in the original only ever targets an
+//! already-correctly-typed slot (e.g. `set_vim_var_type` is ALWAYS
+//! immediately followed by `set_vim_var_nr` in every real caller,
+//! always passing `VAR_NUMBER`), so this is a faithful "must only be
+//! called on a slot of this type" contract, not a narrowing - matching
+//! this crate's established `get_op_type` precedent for such
+//! caller-contract violations.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
-//! `:let` parsing, etc.).
+//! `:let` parsing, `evalvars_init`, etc.).
 
 use crate::eval::typval_defs::{
-    dict_item_flags, DictT, ScidT, ScopeDictDictItem, ScopeType, TypvalValue, VarLockStatus,
-    DO_NOT_FREE_CNT,
+    dict_item_flags, BoolVarValue, DictT, ScidT, ScopeDictDictItem, ScopeType, SpecialVarValue,
+    TypvalT, TypvalValue, VarLockStatus, VarType, VarnumberT, DO_NOT_FREE_CNT,
 };
 use crate::runtime_defs::ScriptvarT;
 
@@ -109,9 +168,1061 @@ pub fn new_script_vars(id: ScidT) {
     unsafe { (*item).sn_vars = sv_ptr };
 }
 
+
+/// Flags for `struct vimvar`'s own `vv_flags` field (`VV_COMPAT`/
+/// `VV_RO`/`VV_RO_SBX`).
+pub mod vv_flag {
+    /// compatible, also used without the `"v:"` prefix (`VV_COMPAT`).
+    pub const COMPAT: u8 = 1;
+    /// read-only (`VV_RO`).
+    pub const RO: u8 = 2;
+    /// read-only in the sandbox (`VV_RO_SBX`).
+    pub const RO_SBX: u8 = 4;
+}
+
+/// Defines for Vim variables (`VimVarIndex`, from `eval_defs.h`).
+/// Mechanically transcribed from the header's own
+/// `enum { VV_COUNT, VV_COUNT1, ... }` (108 values, in file order -
+/// the enum's own declaration order, which the header assigns no
+/// explicit numbers to, so each variant's discriminant here is simply
+/// its position). Order is load-bearing: see this module's own doc
+/// comment for how `VIMVARS` is indexed by this exact enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum VimVarIndex {
+    /// `v:count` (VV_COUNT).
+    Count = 0,
+    /// `v:count1` (VV_COUNT1).
+    Count1 = 1,
+    /// `v:prevcount` (VV_PREVCOUNT).
+    Prevcount = 2,
+    /// `v:errmsg` (VV_ERRMSG).
+    Errmsg = 3,
+    /// `v:warningmsg` (VV_WARNINGMSG).
+    Warningmsg = 4,
+    /// `v:statusmsg` (VV_STATUSMSG).
+    Statusmsg = 5,
+    /// `v:shell_error` (VV_SHELL_ERROR).
+    ShellError = 6,
+    /// `v:this_session` (VV_THIS_SESSION).
+    ThisSession = 7,
+    /// `v:version` (VV_VERSION).
+    Version = 8,
+    /// `v:lnum` (VV_LNUM).
+    Lnum = 9,
+    /// `v:termrequest` (VV_TERMREQUEST).
+    Termrequest = 10,
+    /// `v:termresponse` (VV_TERMRESPONSE).
+    Termresponse = 11,
+    /// `v:fname` (VV_FNAME).
+    Fname = 12,
+    /// `v:lang` (VV_LANG).
+    Lang = 13,
+    /// `v:lc_time` (VV_LC_TIME).
+    LcTime = 14,
+    /// `v:ctype` (VV_CTYPE).
+    Ctype = 15,
+    /// `v:charconvert_from` (VV_CC_FROM).
+    CcFrom = 16,
+    /// `v:charconvert_to` (VV_CC_TO).
+    CcTo = 17,
+    /// `v:fname_in` (VV_FNAME_IN).
+    FnameIn = 18,
+    /// `v:fname_out` (VV_FNAME_OUT).
+    FnameOut = 19,
+    /// `v:fname_new` (VV_FNAME_NEW).
+    FnameNew = 20,
+    /// `v:fname_diff` (VV_FNAME_DIFF).
+    FnameDiff = 21,
+    /// `v:cmdarg` (VV_CMDARG).
+    Cmdarg = 22,
+    /// `v:foldstart` (VV_FOLDSTART).
+    Foldstart = 23,
+    /// `v:foldend` (VV_FOLDEND).
+    Foldend = 24,
+    /// `v:folddashes` (VV_FOLDDASHES).
+    Folddashes = 25,
+    /// `v:foldlevel` (VV_FOLDLEVEL).
+    Foldlevel = 26,
+    /// `v:progname` (VV_PROGNAME).
+    Progname = 27,
+    /// `v:servername` (VV_SEND_SERVER).
+    SendServer = 28,
+    /// `v:dying` (VV_DYING).
+    Dying = 29,
+    /// `v:exception` (VV_EXCEPTION).
+    Exception = 30,
+    /// `v:throwpoint` (VV_THROWPOINT).
+    Throwpoint = 31,
+    /// `v:register` (VV_REG).
+    Reg = 32,
+    /// `v:cmdbang` (VV_CMDBANG).
+    Cmdbang = 33,
+    /// `v:insertmode` (VV_INSERTMODE).
+    Insertmode = 34,
+    /// `v:val` (VV_VAL).
+    Val = 35,
+    /// `v:key` (VV_KEY).
+    Key = 36,
+    /// `v:profiling` (VV_PROFILING).
+    Profiling = 37,
+    /// `v:fcs_reason` (VV_FCS_REASON).
+    FcsReason = 38,
+    /// `v:fcs_choice` (VV_FCS_CHOICE).
+    FcsChoice = 39,
+    /// `v:beval_bufnr` (VV_BEVAL_BUFNR).
+    BevalBufnr = 40,
+    /// `v:beval_winnr` (VV_BEVAL_WINNR).
+    BevalWinnr = 41,
+    /// `v:beval_winid` (VV_BEVAL_WINID).
+    BevalWinid = 42,
+    /// `v:beval_lnum` (VV_BEVAL_LNUM).
+    BevalLnum = 43,
+    /// `v:beval_col` (VV_BEVAL_COL).
+    BevalCol = 44,
+    /// `v:beval_text` (VV_BEVAL_TEXT).
+    BevalText = 45,
+    /// `v:scrollstart` (VV_SCROLLSTART).
+    Scrollstart = 46,
+    /// `v:swapname` (VV_SWAPNAME).
+    Swapname = 47,
+    /// `v:swapchoice` (VV_SWAPCHOICE).
+    Swapchoice = 48,
+    /// `v:swapcommand` (VV_SWAPCOMMAND).
+    Swapcommand = 49,
+    /// `v:char` (VV_CHAR).
+    Char = 50,
+    /// `v:mouse_win` (VV_MOUSE_WIN).
+    MouseWin = 51,
+    /// `v:mouse_winid` (VV_MOUSE_WINID).
+    MouseWinid = 52,
+    /// `v:mouse_lnum` (VV_MOUSE_LNUM).
+    MouseLnum = 53,
+    /// `v:mouse_col` (VV_MOUSE_COL).
+    MouseCol = 54,
+    /// `v:operator` (VV_OP).
+    Op = 55,
+    /// `v:searchforward` (VV_SEARCHFORWARD).
+    Searchforward = 56,
+    /// `v:hlsearch` (VV_HLSEARCH).
+    Hlsearch = 57,
+    /// `v:oldfiles` (VV_OLDFILES).
+    Oldfiles = 58,
+    /// `v:windowid` (VV_WINDOWID).
+    Windowid = 59,
+    /// `v:progpath` (VV_PROGPATH).
+    Progpath = 60,
+    /// `v:completed_item` (VV_COMPLETED_ITEM).
+    CompletedItem = 61,
+    /// `v:option_new` (VV_OPTION_NEW).
+    OptionNew = 62,
+    /// `v:option_old` (VV_OPTION_OLD).
+    OptionOld = 63,
+    /// `v:option_oldlocal` (VV_OPTION_OLDLOCAL).
+    OptionOldlocal = 64,
+    /// `v:option_oldglobal` (VV_OPTION_OLDGLOBAL).
+    OptionOldglobal = 65,
+    /// `v:option_command` (VV_OPTION_COMMAND).
+    OptionCommand = 66,
+    /// `v:option_type` (VV_OPTION_TYPE).
+    OptionType = 67,
+    /// `v:errors` (VV_ERRORS).
+    Errors = 68,
+    /// `v:false` (VV_FALSE).
+    False = 69,
+    /// `v:true` (VV_TRUE).
+    True = 70,
+    /// `v:null` (VV_NULL).
+    Null = 71,
+    /// `v:numbermax` (VV_NUMBERMAX).
+    Numbermax = 72,
+    /// `v:numbermin` (VV_NUMBERMIN).
+    Numbermin = 73,
+    /// `v:numbersize` (VV_NUMBERSIZE).
+    Numbersize = 74,
+    /// `v:vim_did_enter` (VV_VIM_DID_ENTER).
+    VimDidEnter = 75,
+    /// `v:testing` (VV_TESTING).
+    Testing = 76,
+    /// `v:t_number` (VV_TYPE_NUMBER).
+    TypeNumber = 77,
+    /// `v:t_string` (VV_TYPE_STRING).
+    TypeString = 78,
+    /// `v:t_func` (VV_TYPE_FUNC).
+    TypeFunc = 79,
+    /// `v:t_list` (VV_TYPE_LIST).
+    TypeList = 80,
+    /// `v:t_dict` (VV_TYPE_DICT).
+    TypeDict = 81,
+    /// `v:t_float` (VV_TYPE_FLOAT).
+    TypeFloat = 82,
+    /// `v:t_bool` (VV_TYPE_BOOL).
+    TypeBool = 83,
+    /// `v:t_blob` (VV_TYPE_BLOB).
+    TypeBlob = 84,
+    /// `v:event` (VV_EVENT).
+    Event = 85,
+    /// `v:versionlong` (VV_VERSIONLONG).
+    Versionlong = 86,
+    /// `v:echospace` (VV_ECHOSPACE).
+    Echospace = 87,
+    /// `v:argf` (VV_ARGF).
+    Argf = 88,
+    /// `v:argv` (VV_ARGV).
+    Argv = 89,
+    /// `v:collate` (VV_COLLATE).
+    Collate = 90,
+    /// `v:exiting` (VV_EXITING).
+    Exiting = 91,
+    /// `v:maxcol` (VV_MAXCOL).
+    Maxcol = 92,
+    /// `v:stacktrace` (VV_STACKTRACE).
+    Stacktrace = 93,
+    /// `v:vim_did_init` (VV_VIM_DID_INIT).
+    VimDidInit = 94,
+    /// `v:stderr` (VV_STDERR).
+    Stderr = 95,
+    /// `v:msgpack_types` (VV_MSGPACK_TYPES).
+    MsgpackTypes = 96,
+    /// `v:_null_string` (VV__NULL_STRING).
+    NullString = 97,
+    /// `v:_null_list` (VV__NULL_LIST).
+    NullList = 98,
+    /// `v:_null_dict` (VV__NULL_DICT).
+    NullDict = 99,
+    /// `v:_null_blob` (VV__NULL_BLOB).
+    NullBlob = 100,
+    /// `v:lua` (VV_LUA).
+    Lua = 101,
+    /// `v:relnum` (VV_RELNUM).
+    Relnum = 102,
+    /// `v:virtnum` (VV_VIRTNUM).
+    Virtnum = 103,
+    /// `v:starttime` (VV_STARTTIME).
+    Starttime = 104,
+    /// `v:exitreason` (VV_EXITREASON).
+    Exitreason = 105,
+    /// `v:useractive` (VV_USERACTIVE).
+    Useractive = 106,
+    /// `v:startreason` (VV_STARTREASON).
+    Startreason = 107,
+}
+
+/// One entry of the `v:` variable table (`struct vimvar` - `vv_name`/
+/// `vv_flags`/`vv_di.di_tv` only; `vv_di`'s own `di_flags`/`di_key`
+/// fields are populated at runtime by `evalvars_init`, not yet
+/// translated, so aren't modeled as separate fields here - see
+/// [`get_vim_var_name`] for how `di_key`'s role, looking up a
+/// variable's own name, is served directly by `name` instead).
+struct Vimvar {
+    /// Name of the variable, without `v:` (`vv_name`).
+    name: &'static str,
+    /// Flags: some combination of [`vv_flag::COMPAT`]/
+    /// [`vv_flag::RO`]/[`vv_flag::RO_SBX`] (`vv_flags`).
+    #[allow(dead_code)] // not yet read by any translated function - evalvars_init (not yet translated) is the original's only reader
+    flags: u8,
+    /// Value and lock status (`vv_di.di_tv`).
+    tv: TypvalT,
+}
+
+/// The `v:` variable table (`vimvars[]`). See this module's own doc
+/// comment for the full explanation of this table's construction,
+/// indexing, and relationship to the NOT-yet-translated
+/// `evalvars_init`.
+static VIMVARS: std::sync::LazyLock<crate::globals::GlobalCell<Vec<Vimvar>>> =
+    std::sync::LazyLock::new(|| {
+        crate::globals::GlobalCell::new(vec![
+    // VV_COUNT
+    Vimvar { name: "count", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_COUNT1
+    Vimvar { name: "count1", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_PREVCOUNT
+    Vimvar { name: "prevcount", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_ERRMSG
+    Vimvar { name: "errmsg", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_WARNINGMSG
+    Vimvar { name: "warningmsg", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_STATUSMSG
+    Vimvar { name: "statusmsg", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SHELL_ERROR
+    Vimvar { name: "shell_error", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_THIS_SESSION
+    Vimvar { name: "this_session", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_VERSION
+    Vimvar { name: "version", flags: vv_flag::COMPAT | vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_LNUM
+    Vimvar { name: "lnum", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TERMREQUEST
+    Vimvar { name: "termrequest", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_TERMRESPONSE
+    Vimvar { name: "termresponse", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FNAME
+    Vimvar { name: "fname", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_LANG
+    Vimvar { name: "lang", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_LC_TIME
+    Vimvar { name: "lc_time", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CTYPE
+    Vimvar { name: "ctype", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CC_FROM
+    Vimvar { name: "charconvert_from", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CC_TO
+    Vimvar { name: "charconvert_to", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FNAME_IN
+    Vimvar { name: "fname_in", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FNAME_OUT
+    Vimvar { name: "fname_out", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FNAME_NEW
+    Vimvar { name: "fname_new", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FNAME_DIFF
+    Vimvar { name: "fname_diff", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CMDARG
+    Vimvar { name: "cmdarg", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FOLDSTART
+    Vimvar { name: "foldstart", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_FOLDEND
+    Vimvar { name: "foldend", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_FOLDDASHES
+    Vimvar { name: "folddashes", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FOLDLEVEL
+    Vimvar { name: "foldlevel", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_PROGNAME
+    Vimvar { name: "progname", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SEND_SERVER
+    Vimvar { name: "servername", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_DYING
+    Vimvar { name: "dying", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_EXCEPTION
+    Vimvar { name: "exception", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_THROWPOINT
+    Vimvar { name: "throwpoint", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_REG
+    Vimvar { name: "register", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CMDBANG
+    Vimvar { name: "cmdbang", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_INSERTMODE
+    Vimvar { name: "insertmode", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_VAL
+    Vimvar { name: "val", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Unknown } },
+    // VV_KEY
+    Vimvar { name: "key", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Unknown } },
+    // VV_PROFILING
+    Vimvar { name: "profiling", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_FCS_REASON
+    Vimvar { name: "fcs_reason", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_FCS_CHOICE
+    Vimvar { name: "fcs_choice", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_BEVAL_BUFNR
+    Vimvar { name: "beval_bufnr", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_BEVAL_WINNR
+    Vimvar { name: "beval_winnr", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_BEVAL_WINID
+    Vimvar { name: "beval_winid", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_BEVAL_LNUM
+    Vimvar { name: "beval_lnum", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_BEVAL_COL
+    Vimvar { name: "beval_col", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_BEVAL_TEXT
+    Vimvar { name: "beval_text", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SCROLLSTART
+    Vimvar { name: "scrollstart", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SWAPNAME
+    Vimvar { name: "swapname", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SWAPCHOICE
+    Vimvar { name: "swapchoice", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SWAPCOMMAND
+    Vimvar { name: "swapcommand", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_CHAR
+    Vimvar { name: "char", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_MOUSE_WIN
+    Vimvar { name: "mouse_win", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_MOUSE_WINID
+    Vimvar { name: "mouse_winid", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_MOUSE_LNUM
+    Vimvar { name: "mouse_lnum", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_MOUSE_COL
+    Vimvar { name: "mouse_col", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_OP
+    Vimvar { name: "operator", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_SEARCHFORWARD
+    Vimvar { name: "searchforward", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_HLSEARCH
+    Vimvar { name: "hlsearch", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_OLDFILES
+    Vimvar { name: "oldfiles", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV_WINDOWID
+    Vimvar { name: "windowid", flags: vv_flag::RO_SBX, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_PROGPATH
+    Vimvar { name: "progpath", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_COMPLETED_ITEM
+    Vimvar { name: "completed_item", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) } },
+    // VV_OPTION_NEW
+    Vimvar { name: "option_new", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_OPTION_OLD
+    Vimvar { name: "option_old", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_OPTION_OLDLOCAL
+    Vimvar { name: "option_oldlocal", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_OPTION_OLDGLOBAL
+    Vimvar { name: "option_oldglobal", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_OPTION_COMMAND
+    Vimvar { name: "option_command", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_OPTION_TYPE
+    Vimvar { name: "option_type", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_ERRORS
+    Vimvar { name: "errors", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV_FALSE
+    Vimvar { name: "false", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Bool(BoolVarValue::False) } },
+    // VV_TRUE
+    Vimvar { name: "true", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Bool(BoolVarValue::False) } },
+    // VV_NULL
+    Vimvar { name: "null", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Special(SpecialVarValue::Null) } },
+    // VV_NUMBERMAX
+    Vimvar { name: "numbermax", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_NUMBERMIN
+    Vimvar { name: "numbermin", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_NUMBERSIZE
+    Vimvar { name: "numbersize", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_VIM_DID_ENTER
+    Vimvar { name: "vim_did_enter", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TESTING
+    Vimvar { name: "testing", flags: 0, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_NUMBER
+    Vimvar { name: "t_number", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_STRING
+    Vimvar { name: "t_string", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_FUNC
+    Vimvar { name: "t_func", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_LIST
+    Vimvar { name: "t_list", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_DICT
+    Vimvar { name: "t_dict", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_FLOAT
+    Vimvar { name: "t_float", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_BOOL
+    Vimvar { name: "t_bool", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_TYPE_BLOB
+    Vimvar { name: "t_blob", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_EVENT
+    Vimvar { name: "event", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) } },
+    // VV_VERSIONLONG
+    Vimvar { name: "versionlong", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_ECHOSPACE
+    Vimvar { name: "echospace", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_ARGF
+    Vimvar { name: "argf", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV_ARGV
+    Vimvar { name: "argv", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV_COLLATE
+    Vimvar { name: "collate", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_EXITING
+    Vimvar { name: "exiting", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_MAXCOL
+    Vimvar { name: "maxcol", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_STACKTRACE
+    Vimvar { name: "stacktrace", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV_VIM_DID_INIT
+    Vimvar { name: "vim_did_init", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_STDERR
+    Vimvar { name: "stderr", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_MSGPACK_TYPES
+    Vimvar { name: "msgpack_types", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) } },
+    // VV__NULL_STRING
+    Vimvar { name: "_null_string", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV__NULL_LIST
+    Vimvar { name: "_null_list", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) } },
+    // VV__NULL_DICT
+    Vimvar { name: "_null_dict", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) } },
+    // VV__NULL_BLOB
+    Vimvar { name: "_null_blob", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(std::ptr::null_mut()) } },
+    // VV_LUA
+    Vimvar { name: "lua", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Partial(std::ptr::null_mut()) } },
+    // VV_RELNUM
+    Vimvar { name: "relnum", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_VIRTNUM
+    Vimvar { name: "virtnum", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_STARTTIME
+    Vimvar { name: "starttime", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_EXITREASON
+    Vimvar { name: "exitreason", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+    // VV_USERACTIVE
+    Vimvar { name: "useractive", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(0) } },
+    // VV_STARTREASON
+    Vimvar { name: "startreason", flags: vv_flag::RO, tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) } },
+        ])
+    });
+
+/// Get the name of `v:` variable `idx`, without the `v:` prefix
+/// (`get_vim_var_name`).
+#[must_use]
+pub fn get_vim_var_name(idx: VimVarIndex) -> &'static str {
+    // SAFETY: VIMVARS is only ever read/written through this module's
+    // own functions, none of which hold a live reference across
+    // another call into this same cell.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].name
+}
+
+/// Get a raw pointer to `v:` variable `idx`'s own `typval_T`
+/// (`get_vim_var_tv`).
+///
+/// # Safety
+/// The returned pointer stays valid as long as `VIMVARS` itself
+/// (the whole program's lifetime, in practice): its backing `Vec` is
+/// populated once, with a fixed 108 entries, and never resized
+/// afterward by any function in this module, so indexing into it can
+/// never be invalidated by reallocation. Callers must still not
+/// retain the returned pointer across any call that could conflict
+/// with this crate's usual `GlobalCell` aliasing rule (no two live
+/// mutable accesses to the same cell at once).
+#[must_use]
+pub unsafe fn get_vim_var_tv(idx: VimVarIndex) -> *mut TypvalT {
+    // SAFETY: forwarded from this function's own safety doc.
+    std::ptr::addr_of_mut!(unsafe { &mut *VIMVARS.get_mut() }[idx as usize].tv)
+}
+
+/// Get number `v:` variable `idx`'s value (`get_vim_var_nr`).
+///
+/// # Panics
+/// If `idx`'s value isn't [`TypvalValue::Number`] - the original does
+/// a raw, unchecked union read here (`tv->vval.v_number`) with no type
+/// check at all; every real caller only ever calls this on an
+/// already-Number-typed slot (see this module's own doc comment), so
+/// this is a faithful "must only be called on a Number-typed slot"
+/// caller contract, not a narrowing.
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+#[must_use]
+pub unsafe fn get_vim_var_nr(idx: VimVarIndex) -> VarnumberT {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { &*get_vim_var_tv(idx) }.value {
+        TypvalValue::Number(n) => n,
+        ref other => panic!(
+            "get_vim_var_nr: v:{} is not Number-typed (found {other:?})",
+            get_vim_var_name(idx)
+        ),
+    }
+}
+
+/// Get List `v:` variable `idx`'s value. Caller must take care of the
+/// reference count when needed (`get_vim_var_list`).
+///
+/// # Panics
+/// Same contract as [`get_vim_var_nr`], for [`TypvalValue::List`].
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+#[must_use]
+pub unsafe fn get_vim_var_list(idx: VimVarIndex) -> *mut crate::eval::typval_defs::ListT {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { &*get_vim_var_tv(idx) }.value {
+        TypvalValue::List(l) => l,
+        ref other => panic!(
+            "get_vim_var_list: v:{} is not List-typed (found {other:?})",
+            get_vim_var_name(idx)
+        ),
+    }
+}
+
+/// Get Dictionary `v:` variable `idx`'s value. Caller must take care
+/// of the reference count when needed (`get_vim_var_dict`).
+///
+/// # Panics
+/// Same contract as [`get_vim_var_nr`], for [`TypvalValue::Dict`].
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+#[must_use]
+pub unsafe fn get_vim_var_dict(idx: VimVarIndex) -> *mut DictT {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { &*get_vim_var_tv(idx) }.value {
+        TypvalValue::Dict(d) => d,
+        ref other => panic!(
+            "get_vim_var_dict: v:{} is not Dict-typed (found {other:?})",
+            get_vim_var_name(idx)
+        ),
+    }
+}
+
+/// Get string `v:` variable `idx`'s value. If the string variable has
+/// never been set, returns an empty string (`get_vim_var_str`).
+///
+/// Unlike [`get_vim_var_nr`]/[`get_vim_var_list`]/[`get_vim_var_dict`],
+/// this can never panic: the original's own `tv_get_string` already
+/// gracefully stringifies every possible `v_type` (numbers, floats,
+/// bools, etc.), matching [`crate::eval::typval::tv_get_string`]
+/// exactly - no caller-contract issue to preserve here.
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+#[must_use]
+pub unsafe fn get_vim_var_str(idx: VimVarIndex) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::eval::typval::tv_get_string(unsafe { &*get_vim_var_tv(idx) })
+}
+
+/// Get Partial `v:` variable `idx`'s value. Caller must take care of
+/// the reference count when needed (`get_vim_var_partial`).
+///
+/// # Panics
+/// Same contract as [`get_vim_var_nr`], for [`TypvalValue::Partial`].
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+#[must_use]
+pub unsafe fn get_vim_var_partial(idx: VimVarIndex) -> *mut crate::eval::typval_defs::PartialT {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { &*get_vim_var_tv(idx) }.value {
+        TypvalValue::Partial(p) => p,
+        ref other => panic!(
+            "get_vim_var_partial: v:{} is not Partial-typed (found {other:?})",
+            get_vim_var_name(idx)
+        ),
+    }
+}
+
+/// Set `v:` variable `idx`'s value to a copy of `tv` (`set_vim_var_tv`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`]. If `tv`'s value is
+/// `List`/`Dict`/`Blob`/`Partial`-typed with a non-null pointer, that
+/// pointer must be valid.
+pub unsafe fn set_vim_var_tv(idx: VimVarIndex, tv: TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv = tv;
+}
+
+/// Set the type of `v:` variable `idx` to `ty`, WITHOUT changing its
+/// value (`set_vim_var_type`).
+///
+/// # Panics
+/// If `ty` isn't [`VarType::Number`] - see this module's own doc
+/// comment for why every real caller only ever passes `VAR_NUMBER`
+/// here (always immediately followed by [`set_vim_var_nr`]).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_type(idx: VimVarIndex, ty: VarType) {
+    assert_eq!(
+        ty,
+        VarType::Number,
+        "set_vim_var_type: only VarType::Number is ever used by any real caller"
+    );
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Number(0);
+}
+
+/// Set number `v:` variable `idx` to `val`. Does not change the type -
+/// see [`set_vim_var_type`] for that (`set_vim_var_nr`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_nr(idx: VimVarIndex, val: VarnumberT) {
+    // SAFETY: forwarded from this function's own safety doc. Directly
+    // overwriting to Number(val) both releases whatever the slot
+    // previously held (Rust's own Drop, matching tv_clear's effect)
+    // and sets the new value - faithful to every real caller, which
+    // only ever targets an already-Number-typed slot (see this
+    // module's own doc comment).
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Number(val);
+}
+
+/// Set boolean `v:` variable `idx` to `val` (`set_vim_var_bool`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_bool(idx: VimVarIndex, val: BoolVarValue) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Bool(val);
+}
+
+/// Set special `v:` variable `idx` to `val` (`set_vim_var_special`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_special(idx: VimVarIndex, val: SpecialVarValue) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Special(val);
+}
+
+/// Set string `v:` variable `idx` to a copy of `val`
+/// (`set_vim_var_string`).
+///
+/// `val: None` matches the original's own `val == NULL` case
+/// (`tv->vval.v_string = NULL`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_string(idx: VimVarIndex, val: Option<&[u8]>) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::String(val.map(<[u8]>::to_vec));
+}
+
+/// Set list `v:` variable `idx` to `val`. Reference count will be
+/// incremented (`set_vim_var_list`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`]. `val`, if non-null, must be a valid
+/// pointer to a live [`crate::eval::typval_defs::ListT`].
+pub unsafe fn set_vim_var_list(idx: VimVarIndex, val: *mut crate::eval::typval_defs::ListT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::List(val);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_ref(val) };
+}
+
+/// Set Dictionary `v:` variable `idx` to `val`. Reference count will
+/// be incremented. Also keys of the dictionary will be made read-only
+/// (`set_vim_var_dict`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`]. `val`, if non-null, must be a valid
+/// pointer to a live [`DictT`].
+pub unsafe fn set_vim_var_dict(idx: VimVarIndex, val: *mut DictT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Dict(val);
+    if val.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*val).dv_refcount += 1;
+        crate::eval::typval::tv_dict_set_keys_readonly(val);
+    }
+}
+
+/// Set Partial `v:` variable `idx` to `val`. Does not change the type
+/// - see [`set_vim_var_type`] for that (`set_vim_var_partial`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`]. `val`, if non-null, must be a valid
+/// pointer to a live [`crate::eval::typval_defs::PartialT`].
+pub unsafe fn set_vim_var_partial(idx: VimVarIndex, val: *mut crate::eval::typval_defs::PartialT) {
+    // SAFETY: forwarded from this function's own safety doc. Faithful
+    // for the same reason as set_vim_var_nr - every real caller only
+    // ever targets VV_LUA, already Partial-typed (see this module's
+    // own doc comment).
+    let vimvars = unsafe { VIMVARS.get_mut() };
+    vimvars[idx as usize].tv.value = TypvalValue::Partial(val);
+}
+
+/// Set `v:char` to character `c` (`set_vim_var_char`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vim_var_char(c: i32) {
+    let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+    let buflen = crate::mbyte::utf_char2bytes(c, &mut buf);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        set_vim_var_string(VimVarIndex::Char, Some(&buf[..buflen as usize]));
+    }
+}
+
+/// Set `v:register` if needed (`set_reg_var`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_reg_var(c: i32) {
+    let regname: u8 = if c == 0 || c == i32::from(b' ') { b'"' } else { c as u8 };
+    // Avoid free/alloc when the value is already right.
+    // SAFETY: forwarded from this function's own safety doc.
+    let tv = unsafe { &*get_vim_var_tv(VimVarIndex::Reg) };
+    let already_right = matches!(&tv.value, TypvalValue::String(Some(s)) if s.first() == Some(&regname));
+    if !already_right {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_vim_var_string(VimVarIndex::Reg, Some(&[regname])) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vimvars_table_has_exactly_108_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        assert_eq!(unsafe { VIMVARS.get_mut() }.len(), 108);
+    }
+
+    #[test]
+    fn vimvars_table_spot_check_names_and_types_including_the_reordered_pair() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(get_vim_var_name(VimVarIndex::Count), "count");
+        assert_eq!(get_vim_var_name(VimVarIndex::Startreason), "startreason");
+        // VV_TERMREQUEST/VV_TERMRESPONSE: declared in one order in the
+        // enum but the OPPOSITE order in the table's own file text -
+        // confirms indexing follows the enum, not file order (see
+        // this module's own doc comment).
+        assert_eq!(get_vim_var_name(VimVarIndex::Termrequest), "termrequest");
+        assert_eq!(get_vim_var_name(VimVarIndex::Termresponse), "termresponse");
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        unsafe {
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Val)).value.var_type(), VarType::Unknown);
+            assert_eq!((*get_vim_var_tv(VimVarIndex::False)).value.var_type(), VarType::Bool);
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Null)).value.var_type(), VarType::Special);
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Lua)).value.var_type(), VarType::Partial);
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Oldfiles)).value.var_type(), VarType::List);
+            assert_eq!(
+                (*get_vim_var_tv(VimVarIndex::CompletedItem)).value.var_type(),
+                VarType::Dict
+            );
+        }
+    }
+
+    #[test]
+    fn get_vim_var_nr_default_is_zero_for_a_number_typed_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::ShellError) }, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not Number-typed")]
+    fn get_vim_var_nr_panics_on_a_non_number_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        let _ = unsafe { get_vim_var_nr(VimVarIndex::Errmsg) };
+    }
+
+    #[test]
+    fn get_vim_var_str_default_is_empty_for_an_unset_string_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        assert_eq!(unsafe { get_vim_var_str(VimVarIndex::Warningmsg) }, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn set_vim_var_nr_and_get_vim_var_nr_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention.
+        unsafe {
+            set_vim_var_nr(VimVarIndex::Cmdbang, 42);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Cmdbang), 42);
+            // Reset: VIMVARS is shared, process-wide state - leave it
+            // as found so no other test observes this mutation.
+            set_vim_var_nr(VimVarIndex::Cmdbang, 0);
+        }
+    }
+
+    #[test]
+    fn set_vim_var_type_number_then_set_vim_var_nr_matches_vv_key_vv_val_usage() {
+        // Mirrors the real eval/funcs.c usage pattern for VV_KEY/VV_VAL:
+        // starts VAR_UNKNOWN, set_vim_var_type(..., VAR_NUMBER) then
+        // set_vim_var_nr(...) turns it into a real Number.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Val)).value.var_type(), VarType::Unknown);
+            set_vim_var_type(VimVarIndex::Val, VarType::Number);
+            set_vim_var_nr(VimVarIndex::Val, 7);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Val), 7);
+            // Reset: VIMVARS is shared, process-wide state - restore
+            // Val's own true static-initializer default (Unknown) so
+            // no other test (e.g. the spot-check test) observes this
+            // permanent type change.
+            set_vim_var_tv(VimVarIndex::Val, TypvalT::default());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "only VarType::Number")]
+    fn set_vim_var_type_panics_for_non_number_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from get_vim_var_tv's own established
+        // GlobalCell convention. Panics before ever writing to Key's
+        // slot (set_vim_var_type's own assert runs first), so no
+        // cross-test state leakage here despite the panic.
+        unsafe { set_vim_var_type(VimVarIndex::Key, VarType::String) };
+    }
+
+    #[test]
+    fn set_vim_var_bool_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_bool(VimVarIndex::False, BoolVarValue::True);
+            assert!(matches!(
+                (*get_vim_var_tv(VimVarIndex::False)).value,
+                TypvalValue::Bool(BoolVarValue::True)
+            ));
+            // Reset: VIMVARS is shared, process-wide state - restore
+            // False's own true static-initializer default.
+            set_vim_var_bool(VimVarIndex::False, BoolVarValue::False);
+        }
+    }
+
+    #[test]
+    fn set_vim_var_special_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_special(VimVarIndex::FcsChoice, SpecialVarValue::Null);
+            assert!(matches!(
+                (*get_vim_var_tv(VimVarIndex::FcsChoice)).value,
+                TypvalValue::Special(SpecialVarValue::Null)
+            ));
+            // Reset: VIMVARS is shared, process-wide state - restore
+            // FcsChoice's own true static-initializer default
+            // (String(None), NOT TypvalT::default()'s Unknown - the
+            // vimvars table declares each slot's own DIFFERENT default
+            // type, so a blanket Default::default() would be wrong
+            // here; see VIMVARS' own construction for the real value).
+            set_vim_var_tv(
+                VimVarIndex::FcsChoice,
+                TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) },
+            );
+        }
+    }
+
+    #[test]
+    fn set_vim_var_string_and_get_vim_var_str_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_string(VimVarIndex::Progname, Some(b"nero"));
+            assert_eq!(get_vim_var_str(VimVarIndex::Progname), b"nero");
+            // Reset: VIMVARS is shared, process-wide state.
+            set_vim_var_string(VimVarIndex::Progname, None);
+        }
+    }
+
+    #[test]
+    fn set_vim_var_string_none_clears_to_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_string(VimVarIndex::Progpath, Some(b"x"));
+            set_vim_var_string(VimVarIndex::Progpath, None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Progpath), Vec::<u8>::new());
+        }
+    }
+
+    #[test]
+    fn set_vim_var_list_increments_refcount_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let l = crate::eval::typval::tv_list_alloc(0);
+            assert_eq!((*l).lv_refcount, 0);
+            set_vim_var_list(VimVarIndex::Oldfiles, l);
+            assert_eq!((*l).lv_refcount, 1);
+            assert_eq!(get_vim_var_list(VimVarIndex::Oldfiles), l);
+            crate::eval::typval::tv_list_unref(l);
+            // Reset: VIMVARS is shared, process-wide state - tv_list_unref
+            // just freed `l`, so Oldfiles' slot is now a DANGLING
+            // pointer; restore its own true static-initializer default
+            // (a null List, NOT TypvalT::default()'s Unknown - see
+            // set_vim_var_special_roundtrip's own comment above on why
+            // a blanket Default::default() would be wrong here) so no
+            // other test/future feature can ever read that freed
+            // memory.
+            set_vim_var_tv(
+                VimVarIndex::Oldfiles,
+                TypvalT {
+                    v_lock: VarLockStatus::Unlocked,
+                    value: TypvalValue::List(std::ptr::null_mut()),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn set_vim_var_dict_increments_refcount_locks_keys_and_stores_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let d = crate::eval::typval::tv_dict_alloc();
+            let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+            assert_eq!(crate::eval::typval::tv_dict_add(&mut *d, item), crate::vim_defs::OK);
+            assert_eq!((*d).dv_refcount, 0);
+
+            set_vim_var_dict(VimVarIndex::CompletedItem, d);
+
+            assert_eq!((*d).dv_refcount, 1);
+            assert_eq!(get_vim_var_dict(VimVarIndex::CompletedItem), d);
+            // Keys made read-only (DI_FLAGS_RO|DI_FLAGS_FIX), on top of
+            // tv_dict_item_alloc's own pre-existing DI_FLAGS_ALLOC.
+            assert_eq!(
+                (*item).di_flags,
+                dict_item_flags::ALLOC | dict_item_flags::RO | dict_item_flags::FIX
+            );
+
+            crate::eval::typval::tv_dict_unref(d);
+            // Reset: VIMVARS is shared, process-wide state -
+            // tv_dict_unref just freed `d`, so CompletedItem's slot is
+            // now a DANGLING pointer; restore its own true
+            // static-initializer default (a null Dict, NOT
+            // TypvalT::default()'s Unknown - see
+            // set_vim_var_special_roundtrip's own comment above),
+            // matching set_vim_var_list's own established reset
+            // precedent above.
+            set_vim_var_tv(
+                VimVarIndex::CompletedItem,
+                TypvalT {
+                    v_lock: VarLockStatus::Unlocked,
+                    value: TypvalValue::Dict(std::ptr::null_mut()),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn set_vim_var_dict_null_is_a_safe_noop_after_storing() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_dict(VimVarIndex::Event, std::ptr::null_mut());
+            assert!(get_vim_var_dict(VimVarIndex::Event).is_null());
+        }
+    }
+
+    #[test]
+    fn set_vim_var_partial_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut p = crate::eval::typval_defs::PartialT::default();
+            set_vim_var_partial(VimVarIndex::Lua, &mut p as *mut _);
+            assert_eq!(get_vim_var_partial(VimVarIndex::Lua), &mut p as *mut _);
+            set_vim_var_partial(VimVarIndex::Lua, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn set_vim_var_char_stores_the_encoded_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_vim_var_char(i32::from(b'q'));
+            assert_eq!(get_vim_var_str(VimVarIndex::Char), b"q");
+        }
+    }
+
+    #[test]
+    fn set_reg_var_stores_quote_for_zero_or_space() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_reg_var(0);
+            assert_eq!(get_vim_var_str(VimVarIndex::Reg), b"\"");
+            set_reg_var(i32::from(b' '));
+            assert_eq!(get_vim_var_str(VimVarIndex::Reg), b"\"");
+        }
+    }
+
+    #[test]
+    fn set_reg_var_stores_the_given_register_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            set_reg_var(i32::from(b'a'));
+            assert_eq!(get_vim_var_str(VimVarIndex::Reg), b"a");
+        }
+    }
 
     #[test]
     fn init_var_dict_wires_dict_var_to_point_at_dict() {
