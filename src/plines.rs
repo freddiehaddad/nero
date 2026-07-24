@@ -77,12 +77,45 @@
 //! lines) - the only function there that doesn't need `fold.c`
 //! (`lineFolded`/`hasFoldingWin`) or `decoration.c`/`diff.c`
 //! (`decor_conceal_line`/`decor_virt_lines`/`diffopt_filler`/
-//! `diff_check_fill`, all reached via `win_get_fill`). Every other
-//! vertical-size function (`plines_win`, `plines_win_nofill`,
-//! `plines_win_col`, `plines_win_full`, `plines_m_win`,
-//! `plines_m_win_fill`, `win_text_height`, `win_may_fill`,
-//! `win_get_fill`) transitively needs at least one of those - deferred
-//! until `fold.c`/`decoration.c`/`diff.c` are reached.
+//! `diff_check_fill`, all reached via `win_get_fill`).
+//!
+//! Also translated, once `fold.c`'s `lineFolded`/`hasFolding` (as
+//! [`crate::fold::line_folded`]/[`crate::fold::has_folding`]),
+//! `decoration.c`'s `decor_conceal_line`/`decor_virt_lines`, and
+//! `diff.c`'s `diffopt_filler`/`diff_check_fill` all became real
+//! (each via ITS OWN real, always-taken early-return path - see each
+//! module's own doc comment for exactly which "nothing can currently
+//! do X" condition makes this true today): [`win_may_fill`]/
+//! [`win_get_fill`]/[`plines_win_nofill`]/[`plines_win`]/
+//! [`plines_win_full`]/[`plines_m_win`]/[`plines_m_win_fill`]. Every
+//! one of these composes only real, already-tractable pieces - no new
+//! `unimplemented!()` gap was introduced by adding them (their
+//! dependencies' OWN unreachable branches are exactly as documented in
+//! `fold.rs`/`decoration.rs`/`diff.rs`). [`plines_win_full`]/
+//! [`plines_m_win`]'s own `nextp`/`firstp` out-parameters are never
+//! written on the reachable "no folds" fast path (matching
+//! `has_folding_win`'s own behavior there exactly) - `plines_m_win`'s
+//! own loop increment (`first = next + 1`) is thus simply `first += 1`
+//! in practice today, since `next` always still equals its own
+//! initial value (`first`, from before the call).
+//!
+//! Deferred: `plines_win_col` - unlike its siblings above, this one
+//! does NOT need the fold-tree search at all; it needs `win_charsize`
+//! (this file's own dispatch inline, itself investigated and NOT
+//! translated earlier for lack of a real caller - see this module's
+//! own note above about `win_charsize`) plus `State`/`MODE_NORMAL`
+//! (not yet translated) for its own TAB-at-wrap-boundary column-
+//! adjustment special case - now that `plines_win_col` itself is a
+//! real, reachable caller, `win_charsize` is worth revisiting in a
+//! future session. `win_text_height` needs `hasFoldingWin`'s FULL
+//! fold-tree search (not just its "no folds" fast path) to compute a
+//! real nested-fold-aware partial-line-height calculation, genuinely
+//! reachable only once fold-creation itself is translated - also
+//! substantially more involved (10+ intertwined locals, overflow-
+//! sensitive arithmetic) than anything else in this file's vertical-
+//! size section, deliberately not attempted without dedicated,
+//! careful hand-tracing time (matching this file's own established
+//! `charsize_regular` precedent for algorithmically-tricky functions).
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
@@ -1143,6 +1176,190 @@ pub unsafe fn plines_win_nofold(wp: *mut WinT, lnum: LinenrT) -> i32 {
     }
 }
 
+/// Check if there may be filler lines anywhere in window `wp`
+/// (`win_may_fill`).
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+#[must_use]
+pub unsafe fn win_may_fill(wp: &WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*wp.w_buffer };
+    (wp.w_onebuf_opt.wo_diff != 0 && crate::diff::diffopt_filler())
+        || crate::buffer::buf_meta_total(buf, crate::marktree_defs::MetaIndex::Lines) != 0
+}
+
+/// Return the number of filler lines above `lnum` (`win_get_fill`).
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+#[must_use]
+pub unsafe fn win_get_fill(wp: &WinT, lnum: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let virt_lines = unsafe { crate::decoration::decor_virt_lines(wp, lnum - 1, lnum, None, None, true) };
+    // SAFETY: forwarded from this function's own safety doc.
+    virt_lines + unsafe { crate::diff::diff_check_fill(wp, lnum) }
+}
+
+/// Return the number of window lines occupied by buffer line `lnum`.
+/// Does not include filler lines (`plines_win_nofill`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn plines_win_nofill(wp: *mut WinT, lnum: LinenrT, limit_winheight: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wref = unsafe { &mut *wp };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::decoration::decor_conceal_line(wref, lnum - 1, false) } {
+        return 0;
+    }
+
+    if wref.w_onebuf_opt.wo_wrap == 0 {
+        return 1;
+    }
+
+    if wref.w_view_width == 0 {
+        return 1;
+    }
+
+    // Folded lines are handled just like an empty line.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::fold::line_folded(wref, lnum) } {
+        return 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lines = unsafe { plines_win_nofold(wp, lnum) };
+    if limit_winheight && lines > wref.w_view_height {
+        return wref.w_view_height;
+    }
+    lines
+}
+
+/// Return the number of window lines occupied by buffer line `lnum`.
+/// Includes any filler lines (`plines_win`).
+///
+/// # Safety
+/// Same as [`plines_win_nofill`].
+#[must_use]
+pub unsafe fn plines_win(wp: *mut WinT, lnum: LinenrT, limit_winheight: bool) -> i32 {
+    // Check for filler lines above this buffer line.
+    // SAFETY: forwarded from this function's own safety doc.
+    let nofill = unsafe { plines_win_nofill(wp, lnum, limit_winheight) };
+    // SAFETY: forwarded from this function's own safety doc.
+    nofill + unsafe { win_get_fill(&*wp, lnum) }
+}
+
+/// Get the number of screen lines buffer line `lnum` will take in
+/// window `wp`. This takes care of both folds and topfill.
+///
+/// XXX: Because of topfill, this only makes sense when `lnum >=
+/// wp.w_topline` (`plines_win_full`).
+///
+/// `nextp`: if not `None`, would be set to the last line of a fold -
+/// never written here, matching [`crate::fold::has_folding_win`]'s
+/// own "no folds" fast path (the only one reachable today), which
+/// never touches its own `firstp`/`lastp` out-parameters either.
+/// `foldedp`: if not `None`, set to whether `lnum` is on a fold -
+/// always `false` today, for the same reason. `cache`: accepted for
+/// signature fidelity, forwarded to `has_folding`, genuinely unused by
+/// its own fast path.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn plines_win_full(
+    wp: *mut WinT,
+    lnum: LinenrT,
+    _nextp: Option<&mut LinenrT>,
+    foldedp: Option<&mut bool>,
+    _cache: bool,
+    limit_winheight: bool,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wref = unsafe { &mut *wp };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let folded = unsafe { crate::fold::has_folding(wref, lnum, None, None) };
+    if let Some(f) = foldedp {
+        *f = folded;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let filler_lines =
+        if lnum == wref.w_topline { wref.w_topfill } else { unsafe { win_get_fill(wref, lnum) } };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::decoration::decor_conceal_line(wref, lnum - 1, false) } {
+        return filler_lines;
+    }
+
+    let text_lines =
+        if folded { 1 } else { unsafe { plines_win_nofill(wp, lnum, limit_winheight) } };
+    text_lines + filler_lines
+}
+
+/// Return number of window lines a physical line range will occupy in
+/// window `wp`. Takes into account folding, `'wrap'`, topfill and
+/// filler lines beyond the end of the buffer.
+///
+/// XXX: Because of topfill, this only makes sense when `first >=
+/// wp.w_topline` (`plines_m_win`).
+///
+/// # Safety
+/// Same as [`plines_win_full`].
+#[must_use]
+pub unsafe fn plines_m_win(wp: *mut WinT, first: LinenrT, last: LinenrT, max: i32) -> i32 {
+    let mut count = 0;
+    let mut first = first;
+    while first <= last && count < max {
+        // has_folding_win's own "no folds" fast path never rewrites
+        // `nextp` (see plines_win_full's own doc comment), so `next`
+        // stays equal to its initial value `first` below - matching
+        // the original's own local `linenr_T next = first;` exactly.
+        // SAFETY: forwarded from this function's own safety doc.
+        count += unsafe { plines_win_full(wp, first, None, None, false, false) };
+        first += 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*(*wp).w_buffer }.b_ml.ml_line_count;
+    if first == line_count + 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        count += unsafe { win_get_fill(&*wp, first) };
+    }
+    max.min(count)
+}
+
+/// Return total number of physical and filler lines in a physical
+/// line range. Doesn't treat a fold as a single line or consider a
+/// wrapped line multiple lines, unlike [`plines_m_win`]. Mainly used
+/// for calculating scrolling offsets (`plines_m_win_fill`).
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+#[must_use]
+pub unsafe fn plines_m_win_fill(wp: &WinT, first: LinenrT, last: LinenrT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut count =
+        last - first + 1 + unsafe { crate::decoration::decor_virt_lines(wp, first - 1, last, None, None, false) };
+
+    if crate::diff::diffopt_filler() {
+        for lnum in first..=last {
+            // Note: this also considers folds (no filler lines inside
+            // folds).
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = unsafe { crate::diff::diff_check_fill(wp, lnum) };
+            count += n.max(0);
+        }
+    }
+
+    count.max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1961,5 +2178,284 @@ mod tests {
             assert_eq!(plines_win_nofold(&mut win as *mut WinT, 1), 32000);
             close_buf(buf);
         }
+    }
+
+    #[test]
+    fn win_may_fill_false_when_no_diff_mode_and_no_virt_lines_meta() {
+        let mut buf = BufT::default();
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        assert!(!unsafe { win_may_fill(&win) });
+    }
+
+    #[test]
+    fn win_may_fill_true_when_virt_lines_meta_present() {
+        let mut buf = BufT::default();
+        buf.b_marktree.meta_root[crate::marktree_defs::MetaIndex::Lines as usize] = 1;
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        assert!(unsafe { win_may_fill(&win) });
+    }
+
+    #[test]
+    fn win_may_fill_true_when_diff_mode_and_filler_enabled() {
+        // diffopt_filler() is true by default (see diff.rs's own
+        // tests), so a window with 'diff' set should report true too.
+        // Must hold the lock: DIFF_FLAGS is shared GlobalCell state
+        // other tests (in diff.rs) temporarily mutate.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(unsafe { win_may_fill(&win) });
+    }
+
+    /// Points `GLOBALS.curtab` at `tp` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching `diff.rs`'s own identically-named helper - `curtab`
+    /// must be non-null for `win_get_fill`/`diff_check_fill`'s own
+    /// `curtab` read to be sound).
+    struct CurtabGuard {
+        previous: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl CurtabGuard {
+        fn set(new_curtab: *mut crate::buffer_defs::TabpageT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = new_curtab;
+            CurtabGuard { previous }
+        }
+    }
+
+    impl Drop for CurtabGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = self.previous;
+        }
+    }
+
+    #[test]
+    fn win_get_fill_zero_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        assert_eq!(unsafe { win_get_fill(&win, 1) }, 0);
+    }
+
+    #[test]
+    fn plines_win_nofill_no_wrap_returns_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 0, ..Default::default() },
+                ..Default::default()
+            };
+            assert_eq!(plines_win_nofill(&mut win as *mut WinT, 1, false), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofill_zero_width_returns_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 0,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            assert_eq!(plines_win_nofill(&mut win as *mut WinT, 1, false), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofill_delegates_to_plines_win_nofold_when_wrapping() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // Matches plines_win_nofold's own 3-line result for this
+            // exact line/width combination.
+            assert_eq!(plines_win_nofill(&mut win as *mut WinT, 1, false), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_nofill_limit_winheight_clamps_the_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_view_height: 2,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // Would be 3 lines unclamped; limit_winheight clamps to
+            // w_view_height (2).
+            assert_eq!(plines_win_nofill(&mut win as *mut WinT, 1, true), 2);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_matches_plines_win_nofill_when_no_filler() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // win_get_fill is always 0 today (see this module's own
+            // win_get_fill_zero_by_default test), so plines_win should
+            // equal plines_win_nofill exactly.
+            assert_eq!(plines_win(&mut win as *mut WinT, 1, false), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_full_matches_plines_win_nofill_when_not_topline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_topline: 5, // lnum (1) != w_topline, so win_get_fill applies (always 0)
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut folded = true; // pre-set, must be overwritten to false
+            assert_eq!(
+                plines_win_full(&mut win as *mut WinT, 1, None, Some(&mut folded), false, false),
+                1
+            );
+            assert!(!folded);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_full_uses_w_topfill_when_lnum_is_topline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_topline: 1,
+                w_topfill: 3, // lnum (1) == w_topline, so w_topfill is used directly
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // 1 text line + 3 filler lines from w_topfill.
+            assert_eq!(plines_win_full(&mut win as *mut WinT, 1, None, None, false, false), 4);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_m_win_sums_full_line_heights_across_a_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = BufT::default();
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            assert_eq!(crate::memline::ml_replace_buf_len(&mut buf, 1, b"a\0"), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"b\0", 2, false),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 2, b"c\0", 2, false),
+                crate::vim_defs::OK
+            );
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // 3 one-line entries, each occupying 1 screen line.
+            assert_eq!(plines_m_win(&mut win as *mut WinT, 1, 3, 100), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_m_win_clamps_to_max() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = BufT::default();
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            assert_eq!(crate::memline::ml_replace_buf_len(&mut buf, 1, b"a\0"), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"b\0", 2, false),
+                crate::vim_defs::OK
+            );
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            assert_eq!(plines_m_win(&mut win as *mut WinT, 1, 2, 1), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_m_win_fill_counts_the_line_range_plus_filler() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        // No virt lines, no diff filler today - just last - first + 1.
+        assert_eq!(unsafe { plines_m_win_fill(&win, 3, 7) }, 5);
+    }
+
+    #[test]
+    fn plines_m_win_fill_single_line_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        assert_eq!(unsafe { plines_m_win_fill(&win, 4, 4) }, 1);
     }
 }

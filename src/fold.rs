@@ -10,8 +10,9 @@
 //! `'foldmethod'` string-prefix checks), `hasAnyFolding` (`terminal`/
 //! `'foldenable'`/`foldmethodIsManual`/`w_folds`-emptiness check), and
 //! the "there are no folds to find" fast path of `checkupdate`/
-//! `hasFoldingWin`/`hasFolding` - covering the overwhelmingly common
-//! case (a window that has never had any fold created). Each of these
+//! `hasFoldingWin`/`hasFolding`/`fold_info`/`lineFolded` (as
+//! [`line_folded`]) - covering the overwhelmingly common case (a
+//! window that has never had any fold created). Each of these
 //! functions' OWN real fold-tree-searching logic (reached only when
 //! `hasAnyFolding`/`w_foldinvalid` indicate folds might genuinely
 //! exist) is `unimplemented!()`, matching this crate's established
@@ -21,11 +22,19 @@
 //! branch) - genuinely reachable only by a session that has actually
 //! created a fold, which nothing in this crate can currently do
 //! (fold-creation itself needs `foldUpdate`/`setManualFold`/etc., none
-//! translated).
+//! translated). `has_folding_win`/`has_folding` carry their full,
+//! real signatures (`firstp`/`lastp`/`cache`/`infop`, as
+//! `Option<&mut _>` out-parameters) even though the fast path
+//! translated here never touches `firstp`/`lastp` (matching the
+//! original's own behavior on this exact path) - kept for forward-
+//! compatibility with the real fold-tree search once it exists,
+//! avoiding a future signature change; `fold_info`/`line_folded` are
+//! this widened signature's first real consumers.
 //!
 //! This precisely unblocks `cursor.c`'s `check_cursor_lnum`/
 //! `check_cursor` (the `check_cursor_lnum` + `check_cursor_col` combo)
-//! for the common no-folds case.
+//! for the common no-folds case, and (via [`line_folded`])
+//! `plines.c`'s `plines_win_nofill`.
 //!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, level computation,
@@ -85,15 +94,34 @@ pub fn checkupdate(wp: &mut WinT) {
 /// Only the "no folds in this window" fast path is translated (see
 /// this module's own doc comment) - the real fold-tree search,
 /// reached only when [`has_any_folding`] is true, is
-/// `unimplemented!()`.
+/// `unimplemented!()`. On this fast path, `firstp`/`lastp` are left
+/// untouched (matching the original's own behavior: they're only ever
+/// written on the "a fold WAS found" path) and `infop`'s `fi_level` is
+/// set to `0` (matching the original's own `if (infop != NULL) {
+/// infop->fi_level = 0; }` on this exact path) - every other
+/// `FoldinfoT` field is left at whatever `infop` already held, again
+/// matching the original (which writes only `fi_level` here). `cache`
+/// is accepted for signature fidelity but genuinely unused: the
+/// original doesn't read it until after the `hasAnyFolding` check
+/// either.
 ///
 /// # Safety
 /// `win.w_buffer` must be a valid, non-null pointer to a live `BufT`.
-pub unsafe fn has_folding_win(win: &mut WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
+pub unsafe fn has_folding_win(
+    win: &mut WinT,
+    _lnum: crate::pos_defs::LinenrT,
+    _firstp: Option<&mut crate::pos_defs::LinenrT>,
+    _lastp: Option<&mut crate::pos_defs::LinenrT>,
+    _cache: bool,
+    infop: Option<&mut crate::fold_defs::FoldinfoT>,
+) -> bool {
     checkupdate(win);
 
     // SAFETY: forwarded from this function's own safety doc.
     if !unsafe { has_any_folding(win) } {
+        if let Some(info) = infop {
+            info.fi_level = 0;
+        }
         return false;
     }
     unimplemented!(
@@ -105,14 +133,57 @@ pub unsafe fn has_folding_win(win: &mut WinT, _lnum: crate::pos_defs::LinenrT) -
 /// When returning true, `firstp`/`lastp` would be set to the first and
 /// last lnum of the sequence of folded lines - not modeled here since
 /// only the "no folds" (`false`-returning) fast path is translated
-/// (`hasFolding`).
+/// (`hasFolding`). On this fast path, `firstp`/`lastp` are left
+/// untouched - see [`has_folding_win`]'s own doc comment.
 ///
 /// # Safety
 /// Same as [`has_folding_win`].
 #[must_use]
-pub unsafe fn has_folding(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> bool {
+pub unsafe fn has_folding(
+    win: &mut WinT,
+    lnum: crate::pos_defs::LinenrT,
+    firstp: Option<&mut crate::pos_defs::LinenrT>,
+    lastp: Option<&mut crate::pos_defs::LinenrT>,
+) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { has_folding_win(win, lnum) }
+    unsafe { has_folding_win(win, lnum, firstp, lastp, true, None) }
+}
+
+/// Count the number of lines that are folded at line number `lnum`.
+/// Normally `lnum` is the first line of a possible fold, and the
+/// returned number is the number of lines in the fold. Doesn't use
+/// caching from the displayed window (`fold_info`).
+///
+/// Only the "no folds in this window" fast path is reachable today
+/// (see [`has_folding_win`]'s own doc comment) - always returns
+/// `FoldinfoT { fi_lines: 0, .. }` in practice, matching the
+/// original's own `else { info.fi_lines = 0; }` branch.
+///
+/// # Safety
+/// Same as [`has_folding_win`].
+#[must_use]
+pub unsafe fn fold_info(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> crate::fold_defs::FoldinfoT {
+    let mut info = crate::fold_defs::FoldinfoT::default();
+    let mut last: crate::pos_defs::LinenrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let folded = unsafe { has_folding_win(win, lnum, None, Some(&mut last), false, None) };
+    info.fi_lines = if folded { last - lnum + 1 } else { 0 };
+    info
+}
+
+/// Low level function to check if a line is folded. Doesn't use any
+/// caching (`lineFolded`).
+///
+/// Only the "no folds in this window" fast path is reachable today
+/// (see [`has_folding_win`]'s own doc comment) - always returns
+/// `false` in practice.
+///
+/// # Safety
+/// Same as [`has_folding_win`].
+#[must_use]
+pub unsafe fn line_folded(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_info(win, lnum) }.fi_lines != 0
 }
 
 #[cfg(test)]
@@ -181,8 +252,31 @@ mod tests {
             w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fen: 0, ..Default::default() },
             ..Default::default()
         };
-        assert!(!unsafe { has_folding_win(&mut win, 1) });
-        assert!(!unsafe { has_folding(&mut win, 1) });
+        assert!(!unsafe { has_folding_win(&mut win, 1, None, None, true, None) });
+        assert!(!unsafe { has_folding(&mut win, 1, None, None) });
+    }
+
+    #[test]
+    fn has_folding_win_leaves_firstp_lastp_untouched_and_sets_infop_level_zero() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fen: 0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut first: crate::pos_defs::LinenrT = 111;
+        let mut last: crate::pos_defs::LinenrT = 222;
+        let mut info = crate::fold_defs::FoldinfoT { fi_level: 99, ..Default::default() };
+        let folded = unsafe {
+            has_folding_win(&mut win, 1, Some(&mut first), Some(&mut last), true, Some(&mut info))
+        };
+        assert!(!folded);
+        // firstp/lastp untouched on this fast path.
+        assert_eq!(first, 111);
+        assert_eq!(last, 222);
+        // infop's fi_level IS set to 0 on this fast path (matching the
+        // original's own behavior); other fields untouched.
+        assert_eq!(info.fi_level, 0);
     }
 
     #[test]
@@ -198,6 +292,28 @@ mod tests {
             },
             ..Default::default()
         };
-        let _ = unsafe { has_folding_win(&mut win, 1) };
+        let _ = unsafe { has_folding_win(&mut win, 1, None, None, true, None) };
+    }
+
+    #[test]
+    fn fold_info_no_folds_gives_zero_fi_lines() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fen: 0, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(unsafe { fold_info(&mut win, 5) }.fi_lines, 0);
+    }
+
+    #[test]
+    fn line_folded_false_when_no_folds() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fen: 0, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!unsafe { line_folded(&mut win, 5) });
     }
 }

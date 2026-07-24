@@ -738,17 +738,18 @@ pub unsafe fn check_cursor_lnum(win: *mut WinT) {
         // If there is a closed fold at the end of the file, put the
         // cursor in its first line. Otherwise in the last line.
         //
-        // NOTE: the original also writes the fold's first line into
-        // win->w_cursor.lnum via hasFolding's out-parameter when a
-        // fold IS found - not modeled since fold::has_folding's
-        // "folding might be active" path is `unimplemented!()` (see
-        // fold.rs's own module doc).
+        // The original passes `&win->w_cursor.lnum` as `firstp` here,
+        // but that's only ever written on the "a fold WAS found" path
+        // - `unimplemented!()` today (see fold.rs's own module doc) -
+        // so `None` is equivalent in practice; using it directly would
+        // also alias `wref` with a mutable borrow of its own field,
+        // which Rust's borrow checker (correctly) rejects even though
+        // C's pointer aliasing allows it.
         // SAFETY: forwarded from this function's own safety doc.
         let wref = unsafe { &mut *win };
         // SAFETY: forwarded from this function's own safety doc.
-        if !unsafe { crate::fold::has_folding(wref, line_count) } {
-            // SAFETY: forwarded from this function's own safety doc.
-            unsafe { &mut *win }.w_cursor.lnum = line_count;
+        if !unsafe { crate::fold::has_folding(wref, line_count, None, None) } {
+            wref.w_cursor.lnum = line_count;
         }
     }
     // SAFETY: forwarded from this function's own safety doc.

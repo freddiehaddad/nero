@@ -382,12 +382,19 @@ pub unsafe fn set_topline(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) {
     let w = unsafe { &mut *wp };
     let prev_topline = w.w_topline;
 
-    // Go to first of folded lines. has_folding's own "no folds" fast
-    // path never rewrites `lnum` (matching the original's own
-    // behavior when hasFolding returns false), so `lnum` is used
-    // as-is below regardless of this call's result.
+    // Go to first of folded lines. `lnum` is a plain local (matching
+    // the original's own `linenr_T lnum` by-value parameter), so
+    // `&mut lnum` can be passed as `firstp` without aliasing `w` -
+    // unlike some other call sites where the original passes a
+    // pointer to a STRUCT FIELD instead (see e.g. cursor.rs's
+    // check_cursor_lnum, which can't do this due to Rust's borrow
+    // checker). has_folding's own "no folds" fast path never rewrites
+    // `firstp` though (matching the original's own behavior when
+    // hasFolding returns false), so `lnum` is used as-is below
+    // regardless of this call's result either way.
+    let mut lnum = lnum;
     // SAFETY: forwarded from this function's own safety doc.
-    let _ = unsafe { crate::fold::has_folding(w, lnum) };
+    let _ = unsafe { crate::fold::has_folding(w, lnum, Some(&mut lnum), None) };
 
     // Approximate the value of w_botline.
     w.w_botline += lnum - w.w_topline;

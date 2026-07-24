@@ -303,7 +303,7 @@ pub unsafe fn mark_view_restore(fm: Option<&FmarkT>) {
     unsafe { crate::r#move::set_topline(curwin, topline) };
 
     // SAFETY: forwarded from this function's own safety doc.
-    let no_folding = !unsafe { crate::fold::has_folding(&mut *curwin, topline) };
+    let no_folding = !unsafe { crate::fold::has_folding(&mut *curwin, topline, None, None) };
     // SAFETY: forwarded from this function's own safety doc.
     let line_size = unsafe { crate::plines::linetabsize_eol(curwin, topline) };
     // SAFETY: forwarded from this function's own safety doc.
