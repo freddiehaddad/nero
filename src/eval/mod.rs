@@ -9,6 +9,7 @@
 // clippy, but is a deliberate, correctly-named exception.
 #[allow(clippy::module_inception)]
 pub mod eval;
+pub mod executor;
 pub mod typval;
 pub mod typval_defs;
 pub mod userfunc;

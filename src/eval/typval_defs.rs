@@ -119,7 +119,7 @@ use crate::types_defs::LuaRef;
 /// orthogonal to which variant is active (any variant can be locked or
 /// not), so folding it into the enum itself would needlessly duplicate
 /// a `v_lock` field onto every single variant.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TypvalT {
     /// Variable lock status (`v_lock`).
     pub v_lock: VarLockStatus,
@@ -139,7 +139,7 @@ impl TypvalT {
 
 /// The tagged payload of a [`TypvalT`] (`typval_T.v_type` combined
 /// with `typval_T.vval`, the union member the tag selects).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum TypvalValue {
     /// Unknown (unspecified) value (`VAR_UNKNOWN`).
     #[default]
