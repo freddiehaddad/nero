@@ -111,12 +111,29 @@
 //! parameters only ever feed the omitted `semsg()` message text, never
 //! affecting the returned bool.
 //!
+//! Also translated: `unref_var_dict` (layered directly on the
+//! already-real `tv_dict_unref`) and `vars_clear`/`vars_clear_ext`
+//! (frees every item in a scope dict's hashtable, optionally clearing
+//! each item's value first). Both take `&mut DictT`/`*mut DictT`
+//! rather than the original's bare `hashtab_T*` - every real caller
+//! (`buffer.c`'s `b_vars`, `window.c`'s `w_vars`/`t_vars`,
+//! `eval/userfunc.c`'s `fc_l_vars`/`fc_l_avars`, this file's own
+//! script-vars) only ever passes `&owning_dict.dv_hashtab`, and this
+//! crate's `DictT.dv_index` side table (substituting for the
+//! original's `TV_DICT_HI2DI` pointer-arithmetic recovery) needs the
+//! owning `DictT` itself, not just its bare hashtable, to look items
+//! back up - see each function's own doc comment for the full
+//! reasoning. `vars_clear_ext`'s core loop mirrors
+//! `tv_dict_free_contents`'s own already-established `dv_index`-driven
+//! iteration (`eval/typval.rs`), conditionally skipping the
+//! `tv_clear_simple` step per `free_val`.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
 use crate::eval::typval_defs::{
-    dict_item_flags, BoolVarValue, DictT, ScidT, ScopeDictDictItem, ScopeType, SpecialVarValue,
-    TypvalT, TypvalValue, VarLockStatus, VarType, VarnumberT, DO_NOT_FREE_CNT,
+    dict_item_flags, BoolVarValue, DictT, DictitemT, ScidT, ScopeDictDictItem, ScopeType,
+    SpecialVarValue, TypvalT, TypvalValue, VarLockStatus, VarType, VarnumberT, DO_NOT_FREE_CNT,
 };
 use crate::runtime_defs::ScriptvarT;
 
@@ -1041,6 +1058,107 @@ pub fn var_check_fixed(flags: u8) -> bool {
     flags & dict_item_flags::FIX != 0
 }
 
+/// Now that `dict` needs to be freed if no one else is using it, go
+/// back to normal reference counting and unref it (`unref_var_dict`).
+///
+/// # Safety
+/// `dict` must be a valid, non-null pointer satisfying
+/// [`crate::eval::typval::tv_dict_unref`]'s own safety contract
+/// (matching the original's own unchecked dereference - every real
+/// caller passes an always-allocated `b_vars`/`w_vars`/`tp_vars`).
+pub unsafe fn unref_var_dict(dict: *mut DictT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*dict).dv_refcount -= DO_NOT_FREE_CNT - 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_dict_unref(dict) };
+}
+
+/// Like [`vars_clear`], but only free each item's value if
+/// `free_val` (`vars_clear_ext`).
+///
+/// Takes `&mut DictT` rather than the original's bare `&mut
+/// hashtab_T`: every real caller only ever passes
+/// `&owning_dict.dv_hashtab` (`buffer.c`'s `b_vars`, `window.c`'s
+/// `w_vars`/`t_vars`, `eval/userfunc.c`'s `fc_l_vars`/`fc_l_avars`,
+/// this file's own script-vars) - this crate's `DictT.dv_index` side
+/// table (the substitute for the original's `TV_DICT_HI2DI` pointer-
+/// arithmetic recovery, see `DictitemT`'s own doc comment) needs the
+/// OWNING `DictT`, not just its bare hashtable, to look items back up.
+///
+/// # Safety
+/// Every item in `d.dv_index` must be a valid, non-null pointer
+/// freeable via a plain `Box::from_raw` when `DI_FLAGS_ALLOC` is set
+/// (matching [`crate::eval::typval::tv_dict_item_free`]'s own
+/// analogous contract), and its `di_tv` must be safe to clear via
+/// `tv_clear_simple` when `free_val` is `true`.
+pub unsafe fn vars_clear_ext(d: &mut DictT, free_val: bool) {
+    // Unlike the original (locks dv_hashtab, walks it via
+    // HASHTAB_ITER + TV_DICT_HI2DI), dv_index already gives a direct
+    // list of every live item - no hashtab traversal/locking needed,
+    // matching tv_dict_free_contents's own established precedent.
+    let items: Vec<*mut DictitemT> = d.dv_index.values().copied().collect();
+    for item in items {
+        if free_val {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_clear_simple(&(*item).di_tv) };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let flags = unsafe { (*item).di_flags };
+        if flags & dict_item_flags::ALLOC != 0 {
+            if !free_val {
+                // free_val=false means the value must be left
+                // completely untouched here - some other code has
+                // already taken over its ownership (e.g. moved a
+                // List/Dict/Blob/Partial pointer elsewhere without
+                // releasing this reference). Box::from_raw's own
+                // implicit drop below would otherwise ALSO drop
+                // di_tv automatically (Rust's normal field-drop,
+                // unlike the original's plain `xfree(v)`, which only
+                // frees `v`'s own memory block and never touches
+                // whatever `v->di_tv` itself references) - forget the
+                // old value first so it is genuinely left alone,
+                // matching the original's free_val=false contract
+                // exactly.
+                // SAFETY: forwarded from this function's own safety doc.
+                let old = unsafe { std::mem::take(&mut (*item).di_tv) };
+                std::mem::forget(old);
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            drop(unsafe { Box::from_raw(item) });
+        } else if free_val {
+            // Not separately allocated (embedded elsewhere, e.g. a
+            // ScopeDictDictItem) and staying alive - after
+            // tv_clear_simple above released any pointer-based ref,
+            // explicitly reset di_tv to a clean Default, exactly
+            // mirroring tv_dict_item_free's own already-established
+            // non-ALLOC branch: the assignment's implicit drop of the
+            // OLD di_tv releases any owned String/Vec bytes
+            // tv_clear_simple itself intentionally leaves for Rust's
+            // normal drop to handle.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*item).di_tv = TypvalT::default() };
+        }
+        // Non-ALLOC + free_val=false: nothing happens to this item at
+        // all, matching the original exactly (neither tv_clear nor
+        // xfree runs).
+    }
+    d.dv_index.clear();
+    d.dv_hashtab = crate::hashtab_defs::HashtabT::hash_init();
+}
+
+/// Clean up a list of internal variables: frees all allocated
+/// variables and the value they contain, and clears `d`'s own
+/// hashtab (`vars_clear`). See [`vars_clear_ext`]'s own doc comment
+/// for why this takes `&mut DictT` rather than the original's bare
+/// `&mut hashtab_T`.
+///
+/// # Safety
+/// Same as [`vars_clear_ext`].
+pub unsafe fn vars_clear(d: &mut DictT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { vars_clear_ext(d, true) };
+}
+
 #[cfg(test)]
 mod set_vcount_and_valid_varname_tests {
     use super::*;
@@ -1131,6 +1249,115 @@ mod set_vcount_and_valid_varname_tests {
         assert!(var_check_fixed(dict_item_flags::FIX));
         assert!(!var_check_fixed(dict_item_flags::LOCK));
         assert!(!var_check_fixed(0));
+    }
+}
+
+#[cfg(test)]
+mod unref_var_dict_and_vars_clear_tests {
+    use super::*;
+    use crate::eval::typval::{tv_dict_add, tv_dict_alloc, tv_dict_free, tv_dict_item_alloc, tv_list_alloc, tv_list_ref};
+
+    #[test]
+    fn unref_var_dict_frees_when_transitioning_from_do_not_free_cnt_to_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe { (*d).dv_refcount = DO_NOT_FREE_CNT };
+        // Refcount lands at exactly 0 after the transition + real
+        // unref - the real free path runs to completion. Nothing
+        // further to assert on `d` after this - the absence of a
+        // crash is the check (matching this crate's own
+        // func_ptr_unref_frees_when_hits_zero_and_not_being_called
+        // precedent).
+        unsafe { unref_var_dict(d) };
+    }
+
+    #[test]
+    fn unref_var_dict_survives_when_still_referenced_elsewhere() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        // One extra reference beyond the DO_NOT_FREE_CNT sentinel -
+        // simulates something else also holding a real reference.
+        unsafe { (*d).dv_refcount = DO_NOT_FREE_CNT + 1 };
+        unsafe { unref_var_dict(d) };
+        assert_eq!(unsafe { (*d).dv_refcount }, 1);
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn vars_clear_ext_true_frees_allocated_items_and_empties_the_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let item = tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(42) };
+        unsafe { tv_dict_add(&mut *d, item) };
+
+        unsafe { vars_clear_ext(&mut *d, true) };
+
+        assert_eq!(unsafe { (*d).dv_index.len() }, 0);
+        assert_eq!(unsafe { (*d).dv_hashtab.ht_used }, 0);
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn vars_clear_ext_true_releases_a_list_reference_the_item_holds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let list = tv_list_alloc(0);
+        unsafe { tv_list_ref(list) }; // matches a real List-typed di_tv's own +1 ref
+        let item = tv_dict_item_alloc(b"l");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { tv_dict_add(&mut *d, item) };
+        assert_eq!(unsafe { (*list).lv_refcount }, 1);
+
+        unsafe { vars_clear_ext(&mut *d, true) };
+
+        // The list's own reference was released - refcount dropped to
+        // 0, freeing it. Nothing further to assert on `list` itself -
+        // matches this crate's own established "absence of a crash is
+        // the check" precedent for a hits-zero-and-frees path.
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn vars_clear_ext_false_does_not_release_a_list_reference_the_item_holds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let list = tv_list_alloc(0);
+        unsafe { tv_list_ref(list) };
+        unsafe { tv_list_ref(list) }; // a 2nd ref this test itself owns, to keep `list` alive
+        let item = tv_dict_item_alloc(b"l");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { tv_dict_add(&mut *d, item) };
+        assert_eq!(unsafe { (*list).lv_refcount }, 2);
+
+        unsafe { vars_clear_ext(&mut *d, false) };
+
+        // free_val=false: the list reference the item held is left
+        // completely untouched (not released) - refcount is
+        // unchanged, this test's own extra ref is still valid.
+        assert_eq!(unsafe { (*list).lv_refcount }, 2);
+        assert_eq!(unsafe { (*d).dv_index.len() }, 0);
+
+        // Release both remaining refs directly to clean up.
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn vars_clear_delegates_to_vars_clear_ext_with_free_val_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let list = tv_list_alloc(0);
+        unsafe { tv_list_ref(list) };
+        let item = tv_dict_item_alloc(b"l");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { tv_dict_add(&mut *d, item) };
+
+        unsafe { vars_clear(&mut *d) };
+
+        assert_eq!(unsafe { (*d).dv_index.len() }, 0);
+        unsafe { tv_dict_free(d) };
     }
 }
 
