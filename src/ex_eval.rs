@@ -1,14 +1,15 @@
 //! Translated from `src/nvim/ex_eval.c` (tractable core only).
 //!
 //! `ex_eval.c` (~2000 lines) implements `:try`/`:catch`/`:finally`/
-//! `:throw` exception handling for Ex commands. Only the two small,
-//! self-contained predicate functions needed by
-//! [`crate::autocmd::apply_autocmds_retval`] (their first real
-//! caller) are translated here: [`aborting`] and [`should_abort`].
-//! Both need only already-existing `GLOBALS` fields
-//! (`did_emsg`/`force_abort`/`got_int`/`did_throw`/`trylevel`/
+//! `:throw` exception handling for Ex commands. Only 3 small,
+//! self-contained predicate functions are translated here:
+//! [`aborting`]/[`should_abort`] (needed by
+//! [`crate::autocmd::apply_autocmds_retval`], their first real
+//! caller) and [`aborted_in_try`] (needed by `eval/userfunc.c`'s
+//! `func_has_ended`). All 3 need only already-existing `GLOBALS`
+//! fields (`did_emsg`/`force_abort`/`got_int`/`did_throw`/`trylevel`/
 //! `emsg_silent`) - no `:try`/`:catch` parsing or exception-stack
-//! machinery is needed for either.
+//! machinery is needed for any of them.
 //!
 //! Deferred: everything else in this file (the actual `:try`/`:catch`/
 //! `:throw` command handlers, `cstack_T` exception-stack management,
@@ -32,6 +33,17 @@ pub fn aborting() -> bool {
 pub fn should_abort(retcode: i32) -> bool {
     let g = unsafe { crate::globals::GLOBALS.get_mut() };
     (retcode == FAIL && g.trylevel != 0 && g.emsg_silent == 0) || aborting()
+}
+
+/// Returns `true` if searching for `:finally` clauses is necessary,
+/// after an error (`aborted_in_try`).
+///
+/// This function is only called after an error. In this case,
+/// `force_abort` determines whether searching for finally clauses is
+/// necessary.
+#[must_use]
+pub fn aborted_in_try() -> bool {
+    unsafe { crate::globals::GLOBALS.get_mut() }.force_abort
 }
 
 #[cfg(test)]
@@ -171,5 +183,14 @@ mod tests {
         let _guard = AbortStateGuard::new();
         unsafe { GLOBALS.get_mut() }.got_int = true;
         assert!(should_abort(OK));
+    }
+
+    #[test]
+    fn aborted_in_try_reflects_force_abort() {
+        let _lock = global_state_test_lock();
+        let _guard = AbortStateGuard::new();
+        assert!(!aborted_in_try());
+        unsafe { GLOBALS.get_mut() }.force_abort = true;
+        assert!(aborted_in_try());
     }
 }

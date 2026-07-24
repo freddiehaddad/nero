@@ -68,9 +68,22 @@
 //! real heap-owned entries. Its `FC_LUAREF` branch is
 //! `unimplemented!()` since nothing can currently set that flag
 //! either, needing the Lua host (phase 13).
+//!
+//! Also translated (found via a full function-name diff of this file
+//! against the real C source, the same methodology that mined
+//! `eval/typval.c` out over several previous sessions): a new
+//! `CURRENT_FUNCCAL` file-static (mirroring `PREVIOUS_FUNCCAL`'s own
+//! design) plus `create_funccal`/`remove_funccal`/
+//! `current_func_returned`/`can_free_funccal`/`free_unref_funccal`
+//! (the funccall-lifecycle family built around it), and the small
+//! `funccall_T *cookie`-based debugger-hook accessors `func_name`/
+//! `func_breakpoint`/`func_dbg_tick`/`func_level`/`func_has_abort`/
+//! `func_has_ended` (the last needing a new `aborted_in_try` in
+//! `crate::ex_eval`, itself trivial - just reads the already-real
+//! `GLOBALS.force_abort`).
 
 use crate::ascii_defs::ascii_isdigit;
-use crate::eval::typval_defs::{FunccallT, UfuncT};
+use crate::eval::typval_defs::{FunccallT, TypvalT, UfuncT};
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
 use crate::hashtab_defs::HashtabT;
@@ -295,6 +308,11 @@ fn fc_referenced(fc: &FunccallT) -> bool {
 static PREVIOUS_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
     LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
 
+/// `current_funccal`: file-static pointer to the funccall currently
+/// being executed, or null when not inside any user function.
+static CURRENT_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
+    LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
+
 /// Free `fc` (`free_funccal`).
 ///
 /// # Safety
@@ -427,6 +445,190 @@ unsafe fn funccal_unref(fc: *mut FunccallT, fp: *mut UfuncT, force: bool) {
             unsafe { *slot = std::ptr::null_mut() };
         }
     }
+}
+
+/// Allocate a `FunccallT`, link it into `current_funccal`, and fill in
+/// `fp`/`rettv` (`create_funccal`).
+///
+/// Must be followed by one call to [`remove_funccal`] or
+/// `cleanup_function_call` (not yet translated).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer to a live `UfuncT`.
+#[must_use]
+pub unsafe fn create_funccal(fp: *mut UfuncT, rettv: *mut TypvalT) -> *mut FunccallT {
+    let fc = Box::into_raw(Box::new(FunccallT::default()));
+    // SAFETY: `fc` was just allocated above, not yet reachable from
+    // anywhere else.
+    unsafe {
+        (*fc).fc_caller = *CURRENT_FUNCCAL.get_mut();
+        *CURRENT_FUNCCAL.get_mut() = fc;
+        (*fc).fc_func = fp;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { func_ptr_ref(fp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*fc).fc_rettv = rettv };
+    fc
+}
+
+/// Restore `current_funccal` to its caller, freeing the funccall that
+/// was current (`remove_funccal`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS`-independent: `CURRENT_FUNCCAL` must
+/// currently be non-null (matching the original's own unchecked
+/// dereference), and the current funccall must satisfy
+/// `free_funccal`'s own safety contract.
+pub unsafe fn remove_funccal() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fc = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = (*fc).fc_caller };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { free_funccal(fc) };
+}
+
+/// Returns `true` when a function was ended by a `":return"` command
+/// (`current_func_returned`).
+///
+/// # Safety
+/// `CURRENT_FUNCCAL` must currently be non-null (matching the
+/// original's own unchecked dereference of `current_funccal`).
+#[must_use]
+pub unsafe fn current_func_returned() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*(*CURRENT_FUNCCAL.get_mut())).fc_returned != 0 }
+}
+
+/// Returns `true` if `fc` may be freed: nothing (`l:`, `a:`, `a:000`,
+/// or `fc` itself) still references it as of `copy_id`
+/// (`can_free_funccal`).
+///
+/// # Safety
+/// `fc` must be a valid, non-null pointer to a live `FunccallT`.
+#[must_use]
+unsafe fn can_free_funccal(fc: *const FunccallT, copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fc = unsafe { &*fc };
+    fc.fc_l_varlist.lv_copy_id != copy_id
+        && fc.fc_l_vars.dv_copy_id != copy_id
+        && fc.fc_l_avars.dv_copy_id != copy_id
+        && fc.fc_copy_id != copy_id
+}
+
+/// Free all `previous_funccal` entries no longer referenced as of
+/// `copy_id` (`free_unref_funccal`). The `testing` parameter is the
+/// original's own (unused by this crate's translation, since it only
+/// gates a debug-build-only extra check not modeled here).
+///
+/// # Safety
+/// Every entry reachable from `PREVIOUS_FUNCCAL`'s own `fc_caller`
+/// chain must be a valid, live `FunccallT` satisfying
+/// `free_funccal_contents`'s own safety contract.
+#[must_use]
+pub unsafe fn free_unref_funccal(copy_id: i32, _testing: i32) -> bool {
+    let mut did_free = false;
+
+    // Mirrors the original's `for (funccall_T **pfc = &previous_funccal;
+    // *pfc != NULL;)` pointer-to-pointer walk - see funccal_unref's own
+    // comment for why `link` is modeled this way.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut link: *mut *mut FunccallT = unsafe { PREVIOUS_FUNCCAL.get_mut() as *mut *mut FunccallT };
+    loop {
+        // SAFETY: `link` always points at a valid `*mut FunccallT` slot.
+        let node = unsafe { *link };
+        if node.is_null() {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { can_free_funccal(node, copy_id) } {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *link = (*node).fc_caller };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { free_funccal_contents(node) };
+            did_free = true;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            link = unsafe { &mut (*node).fc_caller as *mut *mut FunccallT };
+        }
+    }
+
+    did_free
+}
+
+/// @return the name of the executed function for a funccall cookie
+/// (`func_name`).
+///
+/// # Safety
+/// `cookie` must be a valid, non-null pointer to a live `FunccallT`
+/// whose own `fc_func`, if non-null, points at a live `UfuncT`.
+#[must_use]
+pub unsafe fn func_name(cookie: *const FunccallT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*(*cookie).fc_func }.uf_name.clone()
+}
+
+/// @return the address holding the next breakpoint line for a
+/// funccall cookie (`func_breakpoint`).
+///
+/// # Safety
+/// `cookie` must be a valid, non-null pointer to a live `FunccallT`.
+#[must_use]
+pub unsafe fn func_breakpoint(cookie: *mut FunccallT) -> *mut crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut (*cookie).fc_breakpoint as *mut _ }
+}
+
+/// @return the address holding the debug tick for a funccall cookie
+/// (`func_dbg_tick`).
+///
+/// # Safety
+/// `cookie` must be a valid, non-null pointer to a live `FunccallT`.
+#[must_use]
+pub unsafe fn func_dbg_tick(cookie: *mut FunccallT) -> *mut i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut (*cookie).fc_dbg_tick as *mut _ }
+}
+
+/// @return the nesting level for a funccall cookie (`func_level`).
+///
+/// # Safety
+/// `cookie` must be a valid, non-null pointer to a live `FunccallT`.
+#[must_use]
+pub unsafe fn func_level(cookie: *const FunccallT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*cookie }.fc_level
+}
+
+/// @return true if `cookie` indicates a function which `"abort"`s on
+/// errors (`func_has_abort`).
+///
+/// # Safety
+/// `cookie` must be a valid, non-null pointer to a live `FunccallT`
+/// whose own `fc_func`, if non-null, points at a live `UfuncT`.
+#[must_use]
+pub unsafe fn func_has_abort(cookie: *const FunccallT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*(*cookie).fc_func }.uf_flags & fc_flags::ABORT != 0
+}
+
+/// @return true if the currently active function should be ended,
+/// because a return was encountered or an error occurred. Used inside
+/// a `":while"` (`func_has_ended`).
+///
+/// # Safety
+/// Same as [`func_has_abort`].
+#[must_use]
+pub unsafe fn func_has_ended(cookie: *const FunccallT) -> bool {
+    // Ignore the "abort" flag if the abortion behavior has been
+    // changed due to an error inside a try conditional.
+    // SAFETY: forwarded from this function's own safety doc.
+    let has_abort = unsafe { func_has_abort(cookie) };
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    (has_abort && g.did_emsg != 0 && !crate::ex_eval::aborted_in_try())
+        // SAFETY: forwarded from this function's own safety doc.
+        || unsafe { &*cookie }.fc_returned != 0
 }
 
 /// Free all things that a function contains. Does not free the
@@ -743,6 +945,209 @@ mod tests {
         assert!(unsafe { (*head_ptr).fc_caller }.is_null());
 
         unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    // ---- create_funccal / remove_funccal / current_func_returned -------
+
+    #[test]
+    fn create_funccal_links_into_current_funccal_and_refs_fp() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let mut fp = UfuncT { uf_refcount: 1, ..Default::default() };
+        let mut rettv = TypvalT::default();
+
+        let fc = unsafe { create_funccal(&mut fp as *mut UfuncT, &mut rettv as *mut TypvalT) };
+
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, fc);
+        assert!(unsafe { (*fc).fc_caller }.is_null()); // was the first/only funccall
+        assert_eq!(unsafe { (*fc).fc_func }, &mut fp as *mut UfuncT);
+        assert_eq!(unsafe { (*fc).fc_rettv }, &mut rettv as *mut TypvalT);
+        assert_eq!(fp.uf_refcount, 2); // func_ptr_ref incremented it
+
+        // Clean up: mirrors remove_funccal's own body without calling
+        // free_funccal (which would try to free the stack-allocated fp
+        // via func_ptr_unref - fp here isn't heap-allocated).
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        fp.uf_refcount -= 1;
+        unsafe { drop(Box::from_raw(fc)) };
+    }
+
+    #[test]
+    fn remove_funccal_restores_caller_and_frees() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let fp = Box::into_raw(Box::new(UfuncT { uf_refcount: 1, ..Default::default() }));
+        let mut rettv = TypvalT::default();
+
+        let outer = unsafe { create_funccal(fp, &mut rettv as *mut TypvalT) };
+        let inner = unsafe { create_funccal(fp, &mut rettv as *mut TypvalT) };
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner);
+        assert_eq!(unsafe { (*inner).fc_caller }, outer);
+
+        unsafe { remove_funccal() }; // frees inner, restores outer as current
+
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, outer);
+
+        unsafe { remove_funccal() }; // frees outer
+        assert!(unsafe { *CURRENT_FUNCCAL.get_mut() }.is_null());
+
+        // fp's refcount round-tripped back to 1 (2 refs added, 2
+        // released) - free it directly since func_ptr_unref would need
+        // FUNC_HASHTAB wiring this test doesn't set up.
+        unsafe { assert_eq!((*fp).uf_refcount, 1) };
+        unsafe { drop(Box::from_raw(fp)) };
+    }
+
+    #[test]
+    fn current_func_returned_reflects_fc_returned() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let mut fp = UfuncT { uf_refcount: 1, ..Default::default() };
+        let mut rettv = TypvalT::default();
+        let fc = unsafe { create_funccal(&mut fp as *mut UfuncT, &mut rettv as *mut TypvalT) };
+
+        assert!(!unsafe { current_func_returned() });
+        unsafe { (*fc).fc_returned = 1 };
+        assert!(unsafe { current_func_returned() });
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        fp.uf_refcount -= 1;
+        unsafe { drop(Box::from_raw(fc)) };
+    }
+
+    // ---- can_free_funccal / free_unref_funccal --------------------------
+
+    #[test]
+    fn can_free_funccal_true_when_no_scope_matches_copy_id() {
+        let fc = FunccallT { fc_copy_id: 1, ..Default::default() };
+        assert!(unsafe { can_free_funccal(&fc as *const FunccallT, 5) });
+    }
+
+    #[test]
+    fn can_free_funccal_false_when_any_scope_matches_copy_id() {
+        let mut fc = FunccallT { fc_copy_id: 5, ..Default::default() };
+        assert!(!unsafe { can_free_funccal(&fc as *const FunccallT, 5) });
+
+        fc.fc_copy_id = 1;
+        fc.fc_l_vars.dv_copy_id = 5;
+        assert!(!unsafe { can_free_funccal(&fc as *const FunccallT, 5) });
+
+        fc.fc_l_vars.dv_copy_id = 1;
+        fc.fc_l_avars.dv_copy_id = 5;
+        assert!(!unsafe { can_free_funccal(&fc as *const FunccallT, 5) });
+
+        fc.fc_l_avars.dv_copy_id = 1;
+        fc.fc_l_varlist.lv_copy_id = 5;
+        assert!(!unsafe { can_free_funccal(&fc as *const FunccallT, 5) });
+    }
+
+    #[test]
+    fn free_unref_funccal_frees_eligible_and_keeps_ineligible_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        // freeable: copy_id doesn't match anywhere.
+        let mut freeable = Box::new(FunccallT { fc_copy_id: 1, ..Default::default() });
+        freeable.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        freeable.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        freeable.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let freeable_ptr = freeable.as_mut() as *mut FunccallT;
+        std::mem::forget(freeable); // ownership passes to free_unref_funccal
+
+        // kept: fc_copy_id matches, so can_free_funccal is false.
+        let mut kept = Box::new(FunccallT { fc_copy_id: 5, fc_caller: freeable_ptr, ..Default::default() });
+        let kept_ptr = kept.as_mut() as *mut FunccallT;
+        // kept stays alive/inspectable, so it is NOT forgotten.
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = kept_ptr };
+
+        let did_free = unsafe { free_unref_funccal(5, 0) };
+
+        assert!(did_free);
+        assert_eq!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }, kept_ptr); // head kept
+        assert!(unsafe { (*kept_ptr).fc_caller }.is_null()); // freeable unlinked
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn free_unref_funccal_false_when_nothing_freed() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert!(!unsafe { free_unref_funccal(1, 0) });
+    }
+
+    // ---- funccall-cookie debugger-hook accessors -------------------------
+
+    #[test]
+    fn func_name_reads_fc_func_uf_name() {
+        let mut fp = UfuncT { uf_name: b"MyFunc".to_vec(), ..Default::default() };
+        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() };
+        assert_eq!(unsafe { func_name(&fc as *const FunccallT) }, b"MyFunc".to_vec());
+    }
+
+    #[test]
+    fn func_breakpoint_dbg_tick_and_level_read_and_write_through() {
+        let mut fc = FunccallT { fc_breakpoint: 7, fc_dbg_tick: 3, fc_level: 2, ..Default::default() };
+        unsafe {
+            assert_eq!(*func_breakpoint(&mut fc as *mut FunccallT), 7);
+            assert_eq!(*func_dbg_tick(&mut fc as *mut FunccallT), 3);
+            assert_eq!(func_level(&fc as *const FunccallT), 2);
+
+            *func_breakpoint(&mut fc as *mut FunccallT) = 42;
+            *func_dbg_tick(&mut fc as *mut FunccallT) = 99;
+        }
+        assert_eq!(fc.fc_breakpoint, 42);
+        assert_eq!(fc.fc_dbg_tick, 99);
+    }
+
+    #[test]
+    fn func_has_abort_reflects_uf_flags() {
+        let mut fp = UfuncT { uf_flags: fc_flags::ABORT, ..Default::default() };
+        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() };
+        assert!(unsafe { func_has_abort(&fc as *const FunccallT) });
+
+        fp.uf_flags = fc_flags::RANGE;
+        assert!(!unsafe { func_has_abort(&fc as *const FunccallT) });
+    }
+
+    #[test]
+    fn func_has_ended_true_when_fc_returned() {
+        let mut fp = UfuncT::default();
+        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, fc_returned: 1, ..Default::default() };
+        assert!(unsafe { func_has_ended(&fc as *const FunccallT) });
+    }
+
+    #[test]
+    fn func_has_ended_true_when_abort_flag_and_did_emsg_and_not_aborted_in_try() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved_did_emsg = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+        let saved_force_abort = unsafe { crate::globals::GLOBALS.get_mut() }.force_abort;
+        unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.force_abort = false;
+
+        let mut fp = UfuncT { uf_flags: fc_flags::ABORT, ..Default::default() };
+        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() };
+        assert!(unsafe { func_has_ended(&fc as *const FunccallT) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg = saved_did_emsg;
+        unsafe { crate::globals::GLOBALS.get_mut() }.force_abort = saved_force_abort;
+    }
+
+    #[test]
+    fn func_has_ended_false_when_aborted_in_try_suppresses_the_abort_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved_did_emsg = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+        let saved_force_abort = unsafe { crate::globals::GLOBALS.get_mut() }.force_abort;
+        unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.force_abort = true; // aborted_in_try() -> true
+
+        let mut fp = UfuncT { uf_flags: fc_flags::ABORT, ..Default::default() };
+        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() };
+        assert!(!unsafe { func_has_ended(&fc as *const FunccallT) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg = saved_did_emsg;
+        unsafe { crate::globals::GLOBALS.get_mut() }.force_abort = saved_force_abort;
     }
 
     // The following tests all touch the shared FUNC_HASHTAB GlobalCell -
