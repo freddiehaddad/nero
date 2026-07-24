@@ -107,6 +107,14 @@
 //! shared-layout reinterpret-cast this crate's distinct
 //! `ScopeDictDictItem`/`DictitemT` types don't support, and don't need
 //! to, since nothing calls these two yet).
+//!
+//! Also translated: `builtin_function` (whether a name looks like a
+//! builtin, not a user-defined, function name - collapses the
+//! original's `len == -1`-sentinel `strchr`/`memchr` dual path into
+//! one already-bounded slice scan) and `check_user_func_argcount`
+//! (validates a call's argument count against `fp`'s own arity),
+//! plus a new [`FnameTransError`] enum (`eval/userfunc.h`'s small,
+//! 9-variant `FnameTransError`).
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -302,6 +310,58 @@ pub fn printable_func_name(fp: &UfuncT) -> Vec<u8> {
 pub fn function_list_modified(prev_ht_changed: i32) -> bool {
     let table = unsafe { FUNC_HASHTAB.get_mut() };
     prev_ht_changed != table.ht.ht_changed
+}
+
+/// Whether `name` could be a builtin function name: starts with a
+/// lower-case letter and doesn't contain `':'` at index 1 or the
+/// autoload separator (`'#'`, `AUTOLOAD_CHAR`) anywhere
+/// (`builtin_function`).
+///
+/// Unlike the original (a `len == -1` sentinel selecting between
+/// `strchr`'s whole-NUL-terminated-string scan and `memchr`'s
+/// `len`-bounded scan), `name` is a plain, already-bounded byte slice,
+/// with the caller responsible for slicing it to the relevant length
+/// first, matching this crate's usual "a slice already carries its
+/// own bounds" simplification (e.g. `path_fnamencmp`/`vim_strnsize`).
+#[must_use]
+pub fn builtin_function(name: &[u8]) -> bool {
+    let Some(&first) = name.first() else { return false };
+    if !crate::macros_defs::ascii_islower(first as i32) || name.get(1) == Some(&b':') {
+        return false;
+    }
+    !name.contains(&b'#')
+}
+
+/// Errors for when calling a function (`FnameTransError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FnameTransError {
+    Unknown = 0,
+    TooMany = 1,
+    TooFew = 2,
+    Script = 3,
+    Dict = 4,
+    None = 5,
+    Other = 6,
+    Deleted = 7,
+    /// Function cannot be used as a method (`FCERR_NOTMETHOD`).
+    NotMethod = 8,
+}
+
+/// Check the argument count for user function `fp`
+/// (`check_user_func_argcount`).
+///
+/// @return [`FnameTransError::Unknown`] if OK, [`FnameTransError::TooFew`]
+/// or [`FnameTransError::TooMany`] otherwise.
+#[must_use]
+pub fn check_user_func_argcount(fp: &UfuncT, argcount: i32) -> FnameTransError {
+    let regular_args = fp.uf_args.ga_len;
+    if argcount < regular_args - fp.uf_def_args.ga_len {
+        FnameTransError::TooFew
+    } else if fp.uf_varargs == 0 && argcount > regular_args {
+        FnameTransError::TooMany
+    } else {
+        FnameTransError::Unknown
+    }
 }
 
 /// Whether a function name is genuinely refcounted BY NAME
@@ -1680,6 +1740,81 @@ mod tests {
         let mut fp = Box::new(UfuncT { uf_name: b"Changed\0".to_vec(), ..Default::default() });
         unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
         assert!(function_list_modified(prev));
+    }
+
+    #[test]
+    fn builtin_function_true_for_ordinary_lowercase_name() {
+        assert!(builtin_function(b"len"));
+    }
+
+    #[test]
+    fn builtin_function_false_for_empty_name() {
+        assert!(!builtin_function(b""));
+    }
+
+    #[test]
+    fn builtin_function_false_for_uppercase_first_letter() {
+        assert!(!builtin_function(b"Len"));
+    }
+
+    #[test]
+    fn builtin_function_false_for_script_local_colon_form() {
+        // name[1] == ':' - e.g. a Lua-style "s:Foo" prefix character.
+        assert!(!builtin_function(b"s:Foo"));
+    }
+
+    #[test]
+    fn builtin_function_false_when_containing_autoload_separator() {
+        assert!(!builtin_function(b"foo#bar"));
+    }
+
+    #[test]
+    fn builtin_function_single_char_name_is_fine() {
+        // name[1] doesn't exist (matches the original's own read of a
+        // C string's NUL terminator, which is never ':').
+        assert!(builtin_function(b"x"));
+    }
+
+    #[test]
+    fn check_user_func_argcount_unknown_when_within_arity() {
+        let fp = UfuncT {
+            uf_args: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+            uf_def_args: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        // regular_args=3, def_args=1 -> minimum required = 2.
+        assert_eq!(check_user_func_argcount(&fp, 2), FnameTransError::Unknown);
+        assert_eq!(check_user_func_argcount(&fp, 3), FnameTransError::Unknown);
+    }
+
+    #[test]
+    fn check_user_func_argcount_toofew_below_minimum() {
+        let fp = UfuncT {
+            uf_args: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+            uf_def_args: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(check_user_func_argcount(&fp, 1), FnameTransError::TooFew);
+    }
+
+    #[test]
+    fn check_user_func_argcount_toomany_without_varargs() {
+        let fp = UfuncT {
+            uf_args: crate::garray_defs::GarrayT { ga_len: 2, ..Default::default() },
+            uf_varargs: 0,
+            ..Default::default()
+        };
+        assert_eq!(check_user_func_argcount(&fp, 3), FnameTransError::TooMany);
+    }
+
+    #[test]
+    fn check_user_func_argcount_extra_args_ok_with_varargs() {
+        let fp = UfuncT {
+            uf_args: crate::garray_defs::GarrayT { ga_len: 2, ..Default::default() },
+            uf_varargs: 1,
+            ..Default::default()
+        };
+        assert_eq!(check_user_func_argcount(&fp, 10), FnameTransError::Unknown);
     }
 
     #[test]
