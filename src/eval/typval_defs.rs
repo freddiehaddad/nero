@@ -342,6 +342,31 @@ pub struct ListT {
     pub lua_table_ref: LuaRef,
 }
 
+/// Explicit stack node used while garbage-collecting hashtabs, to
+/// avoid recursion on deeply-nested structures (`ht_stack_T`).
+///
+/// `ht` is `*mut DictT` here, not the original's bare `*mut
+/// hashtab_T` - matching `vars_clear_ext`'s own already-established
+/// precedent (`eval/vars.rs`) for the exact same reason: this crate's
+/// `DictT.dv_index` side table (substituting for the original's
+/// `TV_DICT_HI2DI` pointer-arithmetic recovery) needs the owning
+/// `DictT`, not just its bare hashtable, to look items back up. See
+/// `set_ref_in_ht`'s own doc comment (`eval/eval.rs`) for the function
+/// that walks this stack.
+pub struct HtStackT {
+    pub ht: *mut DictT,
+    pub prev: *mut HtStackT,
+}
+
+/// Explicit stack node used while garbage-collecting lists, to avoid
+/// recursion on deeply-nested structures (`list_stack_T`). See
+/// `set_ref_in_list_items`'s own doc comment (`eval/eval.rs`) for the
+/// function that walks this stack.
+pub struct ListStackT {
+    pub list: *mut ListT,
+    pub prev: *mut ListStackT,
+}
+
 /// Structure representing a Vimscript "partial" - a function reference
 /// bound to some arguments and/or a `self` dict (`partial_S` /
 /// `partial_T`).

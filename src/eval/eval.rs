@@ -170,6 +170,25 @@
 //! (variable/function-name lookup, needs the funccal stack), and
 //! `handle_subscript` (`[...]`/`.`/`->`/`(...)` chaining) - before it
 //! can itself be translated even partially.
+//!
+//! Also translated: the GC mark-phase's `set_ref_in_ht`/
+//! `set_ref_in_list_items`/`set_ref_in_item_dict`/
+//! `set_ref_in_item_list`/`set_ref_in_item_partial`/`set_ref_in_item`
+//! family (there is no separate `eval/gc.c` - this logic lives
+//! directly in `eval.c`). Marks every list/dict/partial/named-function
+//! transitively reachable from a value with a `copy_id`, using an
+//! explicit worklist ([`crate::eval::typval_defs::HtStackT`]/
+//! [`crate::eval::typval_defs::ListStackT`], allocated via
+//! `Box::into_raw`/`Box::from_raw`) instead of recursion, to avoid
+//! stack overflow on deeply-nested structures - verified directly via
+//! a dedicated test walking 20,000 levels of dict-in-dict nesting.
+//! `set_ref_in_ht`/`set_ref_in_item_dict` take `*mut DictT` rather than
+//! the original's bare `*mut hashtab_T`, matching `vars_clear_ext`'s
+//! own already-established precedent (`eval/vars.rs`) for the exact
+//! same `dv_index`-vs-`TV_DICT_HI2DI` reason. The original's
+//! `QUEUE_FOREACH` dict-watcher notification inside
+//! `set_ref_in_item_dict` is omitted - `DictT` has no `watchers` field
+//! yet (the same accepted gap already documented on `DictT` itself).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 
@@ -422,6 +441,287 @@ pub unsafe fn func_equal(tv1: &TypvalT, tv2: &TypvalT, ic: bool) -> bool {
     }
 
     true
+}
+
+/// Mark all lists/dicts referenced through every item in `d` with
+/// `copy_id`, using an explicit worklist instead of recursion, to
+/// avoid stack overflow on deeply-nested structures (`set_ref_in_ht`).
+///
+/// Takes `*mut DictT` rather than the original's bare `*mut
+/// hashtab_T` - see [`crate::eval::typval_defs::HtStackT`]'s own doc
+/// comment for why (the same reason already established for
+/// `vars_clear_ext` in `eval/vars.rs`).
+///
+/// # Safety
+/// `d` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::DictT`], and every item transitively
+/// reachable from it (through nested lists/dicts/partials) must be
+/// valid. `list_stack`, if non-null, must point to a valid `*mut
+/// ListStackT` slot.
+pub unsafe fn set_ref_in_ht(
+    d: *mut crate::eval::typval_defs::DictT,
+    copy_id: i32,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    use crate::eval::typval_defs::{DictitemT, HtStackT};
+
+    let mut abort = false;
+    let mut ht_stack: *mut HtStackT = std::ptr::null_mut();
+    let mut cur_d = d;
+
+    loop {
+        if !abort {
+            // SAFETY: forwarded from this function's own safety doc.
+            let items: Vec<*mut DictitemT> = unsafe { (*cur_d).dv_index.values().copied().collect() };
+            for item in items {
+                if abort {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                abort = unsafe {
+                    set_ref_in_item(&mut (*item).di_tv, copy_id, &mut ht_stack, list_stack)
+                };
+            }
+        }
+
+        if ht_stack.is_null() {
+            break;
+        }
+
+        // SAFETY: `ht_stack` is a live node previously pushed by
+        // `set_ref_in_item_dict`, forwarded from this function's own
+        // safety doc.
+        cur_d = unsafe { (*ht_stack).ht };
+        let tempitem = ht_stack;
+        // SAFETY: forwarded from this function's own safety doc.
+        ht_stack = unsafe { (*tempitem).prev };
+        // SAFETY: `tempitem` was allocated via `Box::into_raw` by
+        // `set_ref_in_item_dict`.
+        drop(unsafe { Box::from_raw(tempitem) });
+    }
+
+    abort
+}
+
+/// Mark all lists/dicts referenced through every item in `l` with
+/// `copy_id`, using an explicit worklist instead of recursion
+/// (`set_ref_in_list_items`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::ListT`], and every item transitively
+/// reachable from it must be valid. `ht_stack`, if non-null, must
+/// point to a valid `*mut HtStackT` slot.
+pub unsafe fn set_ref_in_list_items(
+    l: *mut crate::eval::typval_defs::ListT,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+) -> bool {
+    use crate::eval::typval_defs::ListStackT;
+
+    let mut abort = false;
+    let mut list_stack: *mut ListStackT = std::ptr::null_mut();
+    let mut cur_l = l;
+
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut cur_item = unsafe { (*cur_l).lv_first };
+        while !cur_item.is_null() {
+            if abort {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            abort = unsafe {
+                set_ref_in_item(&mut (*cur_item).li_tv, copy_id, ht_stack, &mut list_stack)
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            cur_item = unsafe { (*cur_item).li_next };
+        }
+
+        if list_stack.is_null() {
+            break;
+        }
+
+        // SAFETY: `list_stack` is a live node previously pushed by
+        // `set_ref_in_item_list`, forwarded from this function's own
+        // safety doc.
+        cur_l = unsafe { (*list_stack).list };
+        let tempitem = list_stack;
+        // SAFETY: forwarded from this function's own safety doc.
+        list_stack = unsafe { (*tempitem).prev };
+        // SAFETY: `tempitem` was allocated via `Box::into_raw` by
+        // `set_ref_in_item_list`.
+        drop(unsafe { Box::from_raw(tempitem) });
+    }
+
+    abort
+}
+
+/// Mark the dict `dd` with `copy_id` (`set_ref_in_item_dict`). Also
+/// see [`set_ref_in_item`].
+///
+/// The original's `QUEUE_FOREACH(w, &dd->watchers, ...)` dict-watcher
+/// notification is omitted - `DictT` has no `watchers` field at all
+/// yet (needs a `QUEUE` intrusive-linked-list translation first, the
+/// same accepted gap already documented on `DictT` itself in
+/// `eval/typval_defs.rs`).
+///
+/// # Safety
+/// `dd`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::DictT`]. `ht_stack`, if non-null, must
+/// point to a valid `*mut HtStackT` slot; `list_stack`, if non-null,
+/// must point to a valid `*mut ListStackT` slot.
+unsafe fn set_ref_in_item_dict(
+    dd: *mut crate::eval::typval_defs::DictT,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    use crate::eval::typval_defs::HtStackT;
+
+    if dd.is_null() || unsafe { (*dd).dv_copy_id } == copy_id {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*dd).dv_copy_id = copy_id };
+    if ht_stack.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { set_ref_in_ht(dd, copy_id, list_stack) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let newitem = Box::into_raw(Box::new(HtStackT { ht: dd, prev: unsafe { *ht_stack } }));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *ht_stack = newitem };
+
+    false
+}
+
+/// Mark the list `ll` with `copy_id` (`set_ref_in_item_list`). Also
+/// see [`set_ref_in_item`].
+///
+/// # Safety
+/// `ll`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::ListT`]. `ht_stack`/`list_stack`, if
+/// non-null, must point to valid slots.
+unsafe fn set_ref_in_item_list(
+    ll: *mut crate::eval::typval_defs::ListT,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    use crate::eval::typval_defs::ListStackT;
+
+    if ll.is_null() || unsafe { (*ll).lv_copy_id } == copy_id {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*ll).lv_copy_id = copy_id };
+    if list_stack.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { set_ref_in_list_items(ll, copy_id, ht_stack) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let newitem = Box::into_raw(Box::new(ListStackT { list: ll, prev: unsafe { *list_stack } }));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *list_stack = newitem };
+
+    false
+}
+
+/// Mark the partial `pt` with `copy_id` (`set_ref_in_item_partial`).
+/// Also see [`set_ref_in_item`].
+///
+/// # Safety
+/// `pt`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::PartialT`] whose own `pt_func`, if
+/// non-null, points at a live `UfuncT`, and whose `pt_dict`, if
+/// non-null, points at a live `DictT`. `ht_stack`/`list_stack`, if
+/// non-null, must point to valid slots.
+unsafe fn set_ref_in_item_partial(
+    pt: *mut crate::eval::typval_defs::PartialT,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    if pt.is_null() || unsafe { (*pt).pt_copy_id } == copy_id {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*pt).pt_copy_id = copy_id };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut abort = unsafe {
+        crate::eval::userfunc::set_ref_in_func((*pt).pt_name.as_deref(), (*pt).pt_func, copy_id)
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let pt_dict = unsafe { (*pt).pt_dict };
+    if !pt_dict.is_null() {
+        let mut dtv = TypvalT { value: TypvalValue::Dict(pt_dict), ..Default::default() };
+        // SAFETY: forwarded from this function's own safety doc.
+        abort = abort || unsafe { set_ref_in_item(&mut dtv, copy_id, ht_stack, list_stack) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let pt_argv = unsafe { &mut (*pt).pt_argv };
+    for arg in pt_argv.iter_mut() {
+        // SAFETY: forwarded from this function's own safety doc.
+        abort = abort || unsafe { set_ref_in_item(arg, copy_id, ht_stack, list_stack) };
+    }
+
+    abort
+}
+
+/// Mark all lists/dicts referenced through `tv` with `copy_id`
+/// (`set_ref_in_item`).
+///
+/// # Safety
+/// If `tv`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
+/// non-null pointer, that pointer (and everything transitively
+/// reachable from it) must be valid. `ht_stack`/`list_stack`, if
+/// non-null, must point to valid slots.
+pub unsafe fn set_ref_in_item(
+    tv: &mut TypvalT,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    match &tv.value {
+        TypvalValue::Dict(d) => {
+            let d = *d;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_ref_in_item_dict(d, copy_id, ht_stack, list_stack) }
+        }
+        TypvalValue::List(l) => {
+            let l = *l;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_ref_in_item_list(l, copy_id, ht_stack, list_stack) }
+        }
+        TypvalValue::Func(name) => {
+            let name = name.clone();
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::eval::userfunc::set_ref_in_func(name.as_deref(), std::ptr::null_mut(), copy_id)
+            }
+        }
+        TypvalValue::Partial(p) => {
+            let p = *p;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_ref_in_item_partial(p, copy_id, ht_stack, list_stack) }
+        }
+        TypvalValue::Unknown
+        | TypvalValue::Bool(_)
+        | TypvalValue::Special(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::Number(_)
+        | TypvalValue::String(_)
+        | TypvalValue::Blob(_) => false,
+    }
 }
 
 /// The two operators [`eval_addsub_number`] handles (`op` in the
@@ -2259,5 +2559,147 @@ mod tests {
         };
         assert!(unsafe { func_equal(&tv1, &tv2, false) });
         assert!(!unsafe { func_equal(&tv1, &tv3, false) });
+    }
+
+    // ---- set_ref_in_item / set_ref_in_ht / set_ref_in_list_items --------
+
+    #[test]
+    fn set_ref_in_item_plain_values_are_always_a_noop() {
+        let mut tv = TypvalT { value: TypvalValue::Number(42), ..Default::default() };
+        assert!(!unsafe { set_ref_in_item(&mut tv, 1, std::ptr::null_mut(), std::ptr::null_mut()) });
+        let mut tv = TypvalT { value: TypvalValue::String(Some(b"x".to_vec())), ..Default::default() };
+        assert!(!unsafe { set_ref_in_item(&mut tv, 1, std::ptr::null_mut(), std::ptr::null_mut()) });
+    }
+
+    #[test]
+    fn set_ref_in_item_dict_null_is_a_noop() {
+        let mut tv = TypvalT {
+            value: TypvalValue::Dict(std::ptr::null_mut()),
+            ..Default::default()
+        };
+        assert!(!unsafe { set_ref_in_item(&mut tv, 1, std::ptr::null_mut(), std::ptr::null_mut()) });
+    }
+
+    #[test]
+    fn set_ref_in_ht_marks_a_nested_dict_but_not_itself() {
+        let _lock = crate::globals::global_state_test_lock();
+        // set_ref_in_ht(d, ...) marks dicts/lists FOUND AS VALUES of
+        // d's own items (matching set_ref_in_item_dict, which is what
+        // actually sets dv_copy_id) - it never marks `d` itself, only
+        // whatever `d`'s items reference.
+        let nested = crate::eval::typval::tv_dict_alloc();
+        let d = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(nested) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *d, item) };
+
+        let aborted = unsafe { set_ref_in_ht(d, 7, std::ptr::null_mut()) };
+        assert!(!aborted);
+        assert_eq!(unsafe { (*nested).dv_copy_id }, 7);
+        assert_eq!(unsafe { (*d).dv_copy_id }, 0);
+
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_ref_in_ht_returns_false_for_a_dict_with_only_plain_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = crate::eval::typval::tv_dict_alloc();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *d, item) };
+
+        let aborted = unsafe { set_ref_in_ht(d, 7, std::ptr::null_mut()) };
+        assert!(!aborted);
+
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_ref_in_ht_short_circuits_a_dict_reached_twice_from_the_same_parent() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A "diamond": parent has 2 items both referencing the SAME
+        // child dict - proves the dv_copy_id-based short-circuit
+        // check works (without needing a genuine reference cycle,
+        // which this crate's plain refcounting can't safely free yet
+        // - that needs the sweep phase, not yet built).
+        let child = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*child).dv_refcount = 2 }; // 2 items will reference it
+
+        let parent = crate::eval::typval::tv_dict_alloc();
+        let item_a = crate::eval::typval::tv_dict_item_alloc(b"a");
+        unsafe { (*item_a).di_tv.value = TypvalValue::Dict(child) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *parent, item_a) };
+        let item_b = crate::eval::typval::tv_dict_item_alloc(b"b");
+        unsafe { (*item_b).di_tv.value = TypvalValue::Dict(child) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *parent, item_b) };
+
+        let aborted = unsafe { set_ref_in_ht(parent, 3, std::ptr::null_mut()) };
+        assert!(!aborted);
+        assert_eq!(unsafe { (*child).dv_copy_id }, 3);
+
+        unsafe { crate::eval::typval::tv_dict_free(parent) };
+    }
+
+    #[test]
+    fn set_ref_in_ht_worklist_handles_deep_linear_nesting_without_stack_overflow() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A long, non-cyclic chain (dict[N] contains dict[N-1] contains
+        // ... contains dict[0]) - proves the explicit worklist
+        // (ht_stack) avoids recursion-depth-proportional stack usage,
+        // the whole reason set_ref_in_ht/set_ref_in_item_dict exist in
+        // this worklist shape rather than a naive recursive walk.
+        const DEPTH: usize = 20_000;
+        let mut chain: Vec<*mut crate::eval::typval_defs::DictT> = Vec::with_capacity(DEPTH + 1);
+        let mut current = crate::eval::typval::tv_dict_alloc();
+        chain.push(current);
+        for _ in 0..DEPTH {
+            let outer = crate::eval::typval::tv_dict_alloc();
+            let item = crate::eval::typval::tv_dict_item_alloc(b"inner");
+            unsafe { (*item).di_tv.value = TypvalValue::Dict(current) };
+            unsafe { crate::eval::typval::tv_dict_add(&mut *outer, item) };
+            current = outer;
+            chain.push(current);
+        }
+
+        let aborted = unsafe { set_ref_in_ht(current, 99, std::ptr::null_mut()) };
+        assert!(!aborted);
+
+        // Free every dict shell/item directly and iteratively, rather
+        // than via a single tv_dict_free(current) call - that would
+        // otherwise cascade recursively through
+        // tv_dict_unref -> tv_dict_free at each nested level, a
+        // PRE-EXISTING characteristic of this crate's plain
+        // refcounting-based free (unrelated to this new
+        // set_ref_in_ht/set_ref_in_item_dict code, which is itself
+        // genuinely worklist-based, not recursive) that would itself
+        // stack-overflow at this depth if left to cascade on its own.
+        for d in chain {
+            let items: Vec<_> = unsafe { (*d).dv_index.values().copied().collect() };
+            for item in items {
+                drop(unsafe { Box::from_raw(item) });
+            }
+            unsafe { crate::eval::typval::tv_dict_free_dict(d) };
+        }
+    }
+
+    #[test]
+    fn set_ref_in_list_items_marks_a_fresh_lists_nested_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let inner_dict = crate::eval::typval::tv_dict_alloc();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_ref(list) };
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                list,
+                TypvalT { value: TypvalValue::Dict(inner_dict), ..Default::default() },
+            )
+        };
+
+        let aborted = unsafe { set_ref_in_list_items(list, 5, std::ptr::null_mut()) };
+        assert!(!aborted);
+        assert_eq!(unsafe { (*inner_dict).dv_copy_id }, 5);
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 }

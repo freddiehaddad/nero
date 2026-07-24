@@ -189,6 +189,26 @@
 //! `set_ref_in_func`/`make_partial`, neither of which inspects
 //! `error`) or genuinely needs the signal (`get_func_arity`, not yet
 //! translated).
+//!
+//! Also translated (completing the GC mark-phase family alongside
+//! `eval/eval.rs`'s `set_ref_in_ht`/`set_ref_in_item`/etc.):
+//! `set_ref_in_func` (marks a function-by-name-or-pointer's own
+//! closure-scope chain; documented, faithfully-inherited assumption
+//! that this chain can never cycle back on itself - see its own doc
+//! comment), `set_ref_in_funccal` (marks one funccall's own `l:`/`a:`/
+//! `a:000` scopes and its function), `set_ref_in_call_stack` (walks
+//! both the live `CURRENT_FUNCCAL`/`fc_caller` chain and every
+//! `FUNCCAL_STACK` entry's own chain), `set_ref_in_previous_funccal`
+//! (marks `PREVIOUS_FUNCCAL`'s own chain with `copy_id + 1`, a
+//! distinct mark used to spot closures that only became unreachable
+//! since the previous collection), `set_ref_in_functions` (walks
+//! `FUNC_HASHTAB`'s own side index directly, matching
+//! `vars_clear_ext`'s established `dv_index`-driven-iteration
+//! precedent), and `set_ref_in_func_args` (new `FUNCARGS` file-static
+//! `Vec<*mut TypvalT>` in place of the original's bare `garray_T`,
+//! since nothing pre-existing constrains its representation the way
+//! `fc_ufuncs` already did for `register_closure` - always empty until
+//! `call_user_func`, not yet translated, exists to populate it).
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -1015,6 +1035,247 @@ unsafe fn register_closure(fp: *mut UfuncT) {
     }
 }
 
+/// Mark all lists/dicts referenced through the function named `name`
+/// (or `fp_in` directly, if given) with `copy_id` (`set_ref_in_func`).
+///
+/// Like the original, assumes the `uf_scoped`/`fc_func` closure-scope
+/// chain this walks can never cycle back on itself - a real closure's
+/// `uf_scoped` always points at an already-existing, currently
+/// executing ENCLOSING funccall, which by construction can't (even
+/// transitively) require this same function to already be executing.
+/// `set_ref_in_funccal`'s own `fc_copy_id` check only prevents
+/// re-descending into the SAME funccall's own contents repeatedly - it
+/// does not, and (matching the original) is not meant to, bound this
+/// function's own outer loop if that invariant is ever violated.
+///
+/// # Safety
+/// `fp_in`, if non-null, must be a valid pointer to a live `UfuncT`
+/// whose own closure-scope chain (each node's `fc_func`, then THAT
+/// function's own `uf_scoped`) is valid throughout, and every
+/// `FunccallT` reached along the way satisfies `set_ref_in_funccal`'s
+/// own safety contract.
+#[must_use]
+pub unsafe fn set_ref_in_func(name: Option<&[u8]>, fp_in: *mut UfuncT, copy_id: i32) -> bool {
+    if name.is_none() && fp_in.is_null() {
+        return false;
+    }
+
+    let fp = if fp_in.is_null() {
+        match name.map(crate::eval::userfunc::fname_trans_sid) {
+            Some(Ok(fname)) => find_func(&fname),
+            _ => std::ptr::null_mut(),
+        }
+    } else {
+        fp_in
+    };
+
+    let mut abort = false;
+    if !fp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut fc = unsafe { (*fp).uf_scoped };
+        while !fc.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            abort = abort || unsafe { set_ref_in_funccal(fc, copy_id) };
+            // SAFETY: forwarded from this function's own safety doc -
+            // matches the original's own `fc = fc->fc_func->uf_scoped`
+            // (walking through nested closures, NOT `fc_caller`'s call
+            // stack).
+            fc = unsafe { (*(*fc).fc_func).uf_scoped };
+        }
+    }
+    abort
+}
+
+/// Mark all lists/dicts referenced through `fc`'s own local/argument
+/// scopes and its function with `copy_id` (`set_ref_in_funccal`).
+///
+/// # Safety
+/// `fc` must be a valid, non-null pointer to a live `FunccallT` whose
+/// `fc_func`, if non-null, satisfies [`set_ref_in_func`]'s own safety
+/// contract.
+unsafe fn set_ref_in_funccal(fc: *mut FunccallT, copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fc).fc_copy_id } != copy_id {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*fc).fc_copy_id = copy_id };
+        // Deliberately evaluates all four (not short-circuiting after
+        // the first `true`), exactly matching the original's own `||`
+        // chain, which - being plain C `bool` expressions with no
+        // early `return` inside the chain itself - always evaluates
+        // every operand too.
+        // SAFETY: forwarded from this function's own safety doc.
+        let a = unsafe {
+            crate::eval::eval::set_ref_in_ht(&mut (*fc).fc_l_vars, copy_id, std::ptr::null_mut())
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe {
+            crate::eval::eval::set_ref_in_ht(&mut (*fc).fc_l_avars, copy_id, std::ptr::null_mut())
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe {
+            crate::eval::eval::set_ref_in_list_items(
+                &mut (*fc).fc_l_varlist,
+                copy_id,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let d = unsafe { set_ref_in_func(None, (*fc).fc_func, copy_id) };
+        if a || b || c || d {
+            return true;
+        }
+    }
+    false
+}
+
+/// Mark all lists/dicts referenced through every local variable and
+/// argument in the whole call stack (both the live `fc_caller` chain
+/// and every funccall saved on `FUNCCAL_STACK`) with `copy_id`
+/// (`set_ref_in_call_stack`).
+///
+/// # Safety
+/// Every `FunccallT` reachable from `CURRENT_FUNCCAL`'s own
+/// `fc_caller` chain, and from every `FuncCalEntryT.top_funccal`'s own
+/// `fc_caller` chain on `FUNCCAL_STACK`, must satisfy
+/// `set_ref_in_funccal`'s own safety contract.
+#[must_use]
+pub unsafe fn set_ref_in_call_stack(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut fc = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    while !fc.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { set_ref_in_funccal(fc, copy_id) } {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        fc = unsafe { (*fc).fc_caller };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut entry = unsafe { *FUNCCAL_STACK.get_mut() };
+    while !entry.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut fc = unsafe { (*entry).top_funccal };
+        while !fc.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { set_ref_in_funccal(fc, copy_id) } {
+                return true;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            fc = unsafe { (*fc).fc_caller };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        entry = unsafe { (*entry).next };
+    }
+
+    false
+}
+
+/// Mark all lists/dicts referenced through every funccall saved on
+/// `PREVIOUS_FUNCCAL` (walking its own `fc_caller` chain) with
+/// `copy_id + 1` - a distinct mark from the main GC pass, used to spot
+/// closures that only became unreachable since the previous collection
+/// (`set_ref_in_previous_funccal`).
+///
+/// # Safety
+/// Every `FunccallT` reachable from `PREVIOUS_FUNCCAL`'s own
+/// `fc_caller` chain must be valid.
+#[must_use]
+pub unsafe fn set_ref_in_previous_funccal(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut fc = unsafe { *PREVIOUS_FUNCCAL.get_mut() };
+    while !fc.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*fc).fc_copy_id = copy_id + 1 };
+        // SAFETY: forwarded from this function's own safety doc.
+        let a = unsafe {
+            crate::eval::eval::set_ref_in_ht(&mut (*fc).fc_l_vars, copy_id + 1, std::ptr::null_mut())
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe {
+            crate::eval::eval::set_ref_in_ht(&mut (*fc).fc_l_avars, copy_id + 1, std::ptr::null_mut())
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe {
+            crate::eval::eval::set_ref_in_list_items(
+                &mut (*fc).fc_l_varlist,
+                copy_id + 1,
+                std::ptr::null_mut(),
+            )
+        };
+        if a || b || c {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        fc = unsafe { (*fc).fc_caller };
+    }
+    false
+}
+
+/// Mark all lists/dicts referenced through every function available by
+/// name with `copy_id` (`set_ref_in_functions`).
+///
+/// Iterates `FUNC_HASHTAB`'s own side index directly rather than the
+/// original's raw hashtable walk, matching `vars_clear_ext`'s own
+/// established `dv_index`-driven-iteration precedent for the exact
+/// same reason.
+///
+/// # Safety
+/// Every `UfuncT` registered in `FUNC_HASHTAB` must satisfy
+/// [`set_ref_in_func`]'s own safety contract.
+#[must_use]
+pub unsafe fn set_ref_in_functions(copy_id: i32) -> bool {
+    // SAFETY: only reads the file-static FUNC_HASHTAB's own index.
+    let funcs: Vec<*mut UfuncT> = unsafe { FUNC_HASHTAB.get_mut() }.index.values().copied().collect();
+    for fp in funcs {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let name = unsafe { &(*fp).uf_name };
+        if !func_name_refcount(name) {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { set_ref_in_func(None, fp, copy_id) } {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The current chain of `typval_T*` arguments belonging to every
+/// nested `call_user_func` invocation currently in progress
+/// (`funcargs`) - a new `GlobalCell`-backed `Vec` here (rather than
+/// the original's bare `garray_T`), since nothing pre-existing
+/// constrains its representation the way `fc_ufuncs` already did for
+/// [`register_closure`]. Always empty until `call_user_func` (not yet
+/// translated) exists to populate it.
+static FUNCARGS: LazyLock<GlobalCell<Vec<*mut TypvalT>>> = LazyLock::new(|| GlobalCell::new(Vec::new()));
+
+/// Mark all lists/dicts referenced through every function argument
+/// currently being evaluated with `copy_id` (`set_ref_in_func_args`).
+///
+/// Always a no-op today - `FUNCARGS` is never populated until
+/// `call_user_func` (not yet translated) exists.
+///
+/// # Safety
+/// Every pointer in `FUNCARGS` must be a valid, non-null `*mut
+/// TypvalT`, satisfying [`crate::eval::eval::set_ref_in_item`]'s own
+/// safety contract.
+#[must_use]
+pub unsafe fn set_ref_in_func_args(copy_id: i32) -> bool {
+    // SAFETY: only reads the file-static FUNCARGS.
+    let args: Vec<*mut TypvalT> = unsafe { FUNCARGS.get_mut() }.clone();
+    for arg in args {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::eval::set_ref_in_item(&mut *arg, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) } {
+            return true;
+        }
+    }
+    false
+}
+
 /// Allocate a `FunccallT`, link it into `current_funccal`, and fill in
 /// `fp`/`rettv` (`create_funccal`).
 ///
@@ -1759,6 +2020,148 @@ mod tests {
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
         unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    // ---- set_ref_in_func / set_ref_in_funccal / set_ref_in_call_stack ---
+    // ---- set_ref_in_functions / set_ref_in_func_args ---------------------
+    // ---- set_ref_in_previous_funccal --------------------------------------
+
+    #[test]
+    fn set_ref_in_func_none_name_and_null_fp_is_a_noop() {
+        assert!(!unsafe { set_ref_in_func(None, std::ptr::null_mut(), 1) });
+    }
+
+    #[test]
+    fn set_ref_in_func_unknown_name_finds_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        assert!(!unsafe { set_ref_in_func(Some(b"NoSuchFunc"), std::ptr::null_mut(), 1) });
+    }
+
+    #[test]
+    fn set_ref_in_func_marks_a_scoped_funccal_given_fp_directly() {
+        let _lock = crate::globals::global_state_test_lock();
+        // owner_fp is the function CURRENTLY EXECUTING as `fc` (fc's
+        // own fc_func) - a distinct function from `fp` (the closure
+        // being marked, itself scoped to `fc`). Using a separate
+        // owner_fp with its own uf_scoped left null terminates
+        // set_ref_in_func's own uf_scoped-chain walk normally; using
+        // `fp` itself here would construct an uf_scoped/fc_func cycle
+        // that can never arise from real Vimscript execution (a
+        // function can't be scoped to a funccall that requires that
+        // same function to already be executing) and that neither the
+        // original nor this translation is designed to terminate on.
+        let mut owner_fp = UfuncT::default();
+        let mut fc = Box::new(FunccallT {
+            fc_refcount: 1,
+            fc_func: &mut owner_fp as *mut UfuncT,
+            ..Default::default()
+        });
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+
+        let mut fp = UfuncT { uf_scoped: fc_ptr, ..Default::default() };
+
+        let aborted = unsafe { set_ref_in_func(None, &mut fp as *mut UfuncT, 11) };
+        assert!(!aborted);
+        assert_eq!(fc.fc_copy_id, 11);
+    }
+
+    #[test]
+    fn set_ref_in_funccal_short_circuits_when_already_marked_with_same_copy_id() {
+        let mut fc = FunccallT { fc_copy_id: 5, ..Default::default() };
+        // Already marked with copy_id 5 - must return false without
+        // re-descending (which would otherwise dereference fc_func,
+        // still null here, and crash).
+        assert!(!unsafe { set_ref_in_funccal(&mut fc as *mut FunccallT, 5) });
+    }
+
+    #[test]
+    fn set_ref_in_call_stack_false_with_no_current_funccal_or_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+        assert!(!unsafe { set_ref_in_call_stack(1) });
+    }
+
+    #[test]
+    fn set_ref_in_call_stack_marks_current_funccal_and_its_caller() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+
+        let mut caller = Box::new(FunccallT::default());
+        let caller_ptr = caller.as_mut() as *mut FunccallT;
+        let mut current = Box::new(FunccallT { fc_caller: caller_ptr, ..Default::default() });
+        let current_ptr = current.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = current_ptr };
+
+        let aborted = unsafe { set_ref_in_call_stack(21) };
+        assert!(!aborted);
+        assert_eq!(current.fc_copy_id, 21);
+        assert_eq!(caller.fc_copy_id, 21);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn set_ref_in_call_stack_walks_the_funccal_stacks_saved_entries_too() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let mut saved = Box::new(FunccallT::default());
+        let saved_ptr = saved.as_mut() as *mut FunccallT;
+        let mut entry = FuncCalEntryT { top_funccal: saved_ptr, next: std::ptr::null_mut() };
+        unsafe { *FUNCCAL_STACK.get_mut() = &mut entry as *mut FuncCalEntryT };
+
+        let aborted = unsafe { set_ref_in_call_stack(33) };
+        assert!(!aborted);
+        assert_eq!(saved.fc_copy_id, 33);
+
+        unsafe { *FUNCCAL_STACK.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn set_ref_in_previous_funccal_marks_with_copy_id_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = fc_ptr };
+
+        let aborted = unsafe { set_ref_in_previous_funccal(7) };
+        assert!(!aborted);
+        assert_eq!(fc.fc_copy_id, 8); // copy_id + 1, not copy_id itself
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn set_ref_in_functions_false_for_an_empty_hashtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        assert!(!unsafe { set_ref_in_functions(1) });
+    }
+
+    #[test]
+    fn set_ref_in_functions_skips_names_refcounted_by_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        // A numbered ("123") function name is refcounted BY NAME
+        // (func_name_refcount) - set_ref_in_functions explicitly skips
+        // these, matching the original's own check.
+        let mut fp = Box::new(UfuncT { uf_name: b"123\0".to_vec(), ..Default::default() });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+        assert!(!unsafe { set_ref_in_functions(1) });
+    }
+
+    #[test]
+    fn set_ref_in_func_args_is_a_noop_when_funcargs_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { FUNCARGS.get_mut() }.clear();
+        assert!(!unsafe { set_ref_in_func_args(1) });
     }
 
     // ---- cleanup_function_call ------------------------------------------
