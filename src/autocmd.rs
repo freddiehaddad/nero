@@ -53,6 +53,16 @@
 //! already-existing `GLOBALS` fields (`did_emsg`/`force_abort`/
 //! `got_int`/`did_throw`/`trylevel`/`emsg_silent`).
 //!
+//! Also translated: `block_autocmds`/`unblock_autocmds`/
+//! `is_autocmd_blocked` (a simple depth-counter, self-contained aside
+//! from `unblock_autocmds`'s own "trigger the deferred termresponse
+//! autocmd now" branch, which is `unimplemented!()` - nothing
+//! currently translated can ever set `TERMRESPONSE_CHANGED` true,
+//! since that needs real terminal I/O detecting a termcap response
+//! (`tui/*.c`, not yet translated) - provably unreachable today,
+//! matching the same "narrow, provably-unreachable branch" precedent
+//! used elsewhere in this crate).
+//!
 //! Deferred: everything else - `apply_autocmds_group`'s real
 //! autocmd-matching-and-execution body (needs pattern matching,
 //! `exec_autocmds`, script/function invocation via the not-yet-started
@@ -100,10 +110,69 @@ static AU_NEED_CLEAN: GlobalCell<bool> = GlobalCell::new(false);
 /// original's own file-static.
 static ACTIVE_APC_LIST: GlobalCell<*mut AutoPatCmd> = GlobalCell::new(std::ptr::null_mut());
 
+/// `autocmd_blocked` - depth counter for [`block_autocmds`]/
+/// [`unblock_autocmds`].
+static AUTOCMD_BLOCKED: GlobalCell<i32> = GlobalCell::new(0);
+
+/// `termresponse_changed` - whether `v:termresponse` was set while
+/// autocommands were blocked. Always `false` today: nothing currently
+/// translated can detect/set a real terminal response (needs
+/// `tui/*.c`'s terminal I/O, not yet translated) - matching the
+/// original's own file-static.
+static TERMRESPONSE_CHANGED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// `termresponse_chan_id` - channel that sent the pending terminal
+/// response, paired with [`TERMRESPONSE_CHANGED`].
+static TERMRESPONSE_CHAN_ID: GlobalCell<u64> = GlobalCell::new(0);
+
 /// Return `true` if `event` autocommand is defined (`has_event`).
 #[must_use]
 pub fn has_event(event: EventT) -> bool {
     !(unsafe { AUTOCMDS.get_mut() })[event as usize].is_empty()
+}
+
+/// Block executing autocommands until [`unblock_autocmds`] is called
+/// the same number of times (`block_autocmds`).
+pub fn block_autocmds() {
+    // Detect if v:termresponse is set while blocked.
+    if !is_autocmd_blocked() {
+        unsafe { *TERMRESPONSE_CHANGED.get_mut() = false };
+        unsafe { *TERMRESPONSE_CHAN_ID.get_mut() = 0 };
+    }
+    unsafe { *AUTOCMD_BLOCKED.get_mut() += 1 };
+}
+
+/// Undo the effect of [`block_autocmds`] (`unblock_autocmds`).
+///
+/// The original's "trigger the deferred termresponse autocmd now"
+/// branch (reached only when `v:termresponse` was set while blocked)
+/// is `unimplemented!()` here: nothing currently translated can ever
+/// set `TERMRESPONSE_CHANGED` true (needs real terminal I/O
+/// detecting a termcap response, `tui/*.c`, not yet translated) - this
+/// branch is therefore provably unreachable today, matching the
+/// established "narrow, provably-unreachable branch" precedent (e.g.
+/// `func_clear_items`'s `FC_LUAREF` arm).
+pub fn unblock_autocmds() {
+    unsafe { *AUTOCMD_BLOCKED.get_mut() -= 1 };
+
+    // When v:termresponse was set while autocommands were blocked,
+    // trigger the autocommands now.
+    if !is_autocmd_blocked()
+        && unsafe { *TERMRESPONSE_CHANGED.get_mut() }
+        && has_event(EventT::TermResponse)
+    {
+        unimplemented!(
+            "unblock_autocmds's deferred termresponse-autocmd trigger: unreachable today, \
+             nothing can set TERMRESPONSE_CHANGED true without real terminal I/O (tui/*.c)"
+        );
+    }
+}
+
+/// Return `true` if autocommands are currently blocked
+/// (`is_autocmd_blocked`).
+#[must_use]
+pub fn is_autocmd_blocked() -> bool {
+    unsafe { *AUTOCMD_BLOCKED.get_mut() != 0 }
 }
 
 /// Execute autocommands for `event` and file name `fname`
@@ -468,5 +537,70 @@ mod tests {
         // Clean up so other tests sharing this GlobalCell see an empty
         // state again.
         (unsafe { AUTOCMDS.get_mut() })[EventT::BufEnter as usize].clear();
+    }
+
+    #[test]
+    fn is_autocmd_blocked_false_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!is_autocmd_blocked());
+    }
+
+    #[test]
+    fn block_then_unblock_autocmds_is_balanced() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!is_autocmd_blocked());
+        block_autocmds();
+        assert!(is_autocmd_blocked());
+        unblock_autocmds();
+        assert!(!is_autocmd_blocked());
+    }
+
+    #[test]
+    fn block_autocmds_nests_correctly() {
+        let _lock = crate::globals::global_state_test_lock();
+        block_autocmds();
+        block_autocmds();
+        assert!(is_autocmd_blocked());
+        unblock_autocmds();
+        assert!(is_autocmd_blocked()); // still blocked - one level remains
+        unblock_autocmds();
+        assert!(!is_autocmd_blocked());
+    }
+
+    #[test]
+    fn block_autocmds_resets_termresponse_state_only_on_the_outermost_block() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Poke TERMRESPONSE_CHANGED/CHAN_ID directly (nothing real can
+        // set these yet) to verify block_autocmds's own "only reset on
+        // the outermost call" guard - matches the original's own
+        // `if (!is_autocmd_blocked())` check preceding the increment.
+        unsafe { *TERMRESPONSE_CHANGED.get_mut() = true };
+        unsafe { *TERMRESPONSE_CHAN_ID.get_mut() = 42 };
+
+        block_autocmds(); // outermost: resets both to false/0
+        assert!(!unsafe { *TERMRESPONSE_CHANGED.get_mut() });
+        assert_eq!(unsafe { *TERMRESPONSE_CHAN_ID.get_mut() }, 0);
+
+        // Simulate re-detecting a response while still blocked (nested
+        // call must NOT reset it again).
+        unsafe { *TERMRESPONSE_CHANGED.get_mut() = true };
+        block_autocmds();
+        assert!(unsafe { *TERMRESPONSE_CHANGED.get_mut() }); // untouched - not outermost
+
+        unblock_autocmds();
+        // Still blocked (1 level remains) - is_autocmd_blocked() is
+        // true, so the deferred-trigger branch's own guard condition
+        // isn't even reached yet.
+        assert!(is_autocmd_blocked());
+
+        // Reset TERMRESPONSE_CHANGED back to false before the final
+        // unblock_autocmds() call, else its own deferred-trigger branch
+        // (has_event(TermResponse) is also always false today, so the
+        // full condition is still false either way, but keep this
+        // explicit for clarity and to avoid ever exercising the
+        // unimplemented!() branch even by accident).
+        unsafe { *TERMRESPONSE_CHANGED.get_mut() = false };
+        unblock_autocmds();
+        assert!(!is_autocmd_blocked());
     }
 }
