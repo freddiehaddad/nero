@@ -64,12 +64,10 @@
 //! (`start`/`cursor`/`end`) are modeled as `Option<&mut ColnrT>`,
 //! matching this crate's established convention for genuinely-nullable
 //! C out-parameters (e.g. `marktree.rs`'s `marktree_lookup`).
-//! `win_charsize` (`plines.h`'s dispatch inline) was investigated but
-//! NOT translated: it would need to derive `charsize_regular`'s `col`
-//! parameter (this crate's explicit-index replacement for the
-//! original's `cur - csarg->line` pointer subtraction) without any
-//! real caller to supply it - deferred until a real caller in
-//! `drawline.c`/`statusline.c` provides that context naturally.
+//! **`win_charsize`** (`plines.h`'s dispatch inline) is now translated
+//! too: re-examined once `plines_win_col` (below) became a real
+//! caller able to supply `charsize_regular`'s explicit `col` byte-
+//! offset parameter, which is all that was blocking it.
 //!
 //! This completes the file's own "horizontal size" section. Also
 //! translated from the "vertical size" section: **`plines_win_nofold`**
@@ -99,23 +97,24 @@
 //! in practice today, since `next` always still equals its own
 //! initial value (`first`, from before the call).
 //!
-//! Deferred: `plines_win_col` - unlike its siblings above, this one
-//! does NOT need the fold-tree search at all; it needs `win_charsize`
-//! (this file's own dispatch inline, itself investigated and NOT
-//! translated earlier for lack of a real caller - see this module's
-//! own note above about `win_charsize`) plus `State`/`MODE_NORMAL`
-//! (not yet translated) for its own TAB-at-wrap-boundary column-
-//! adjustment special case - now that `plines_win_col` itself is a
-//! real, reachable caller, `win_charsize` is worth revisiting in a
-//! future session. `win_text_height` needs `hasFoldingWin`'s FULL
-//! fold-tree search (not just its "no folds" fast path) to compute a
-//! real nested-fold-aware partial-line-height calculation, genuinely
+//! Deferred: `win_text_height` needs `hasFoldingWin`'s FULL fold-tree
+//! search (not just its "no folds" fast path) to compute a real
+//! nested-fold-aware partial-line-height calculation, genuinely
 //! reachable only once fold-creation itself is translated - also
 //! substantially more involved (10+ intertwined locals, overflow-
 //! sensitive arithmetic) than anything else in this file's vertical-
 //! size section, deliberately not attempted without dedicated,
 //! careful hand-tracing time (matching this file's own established
 //! `charsize_regular` precedent for algorithmically-tricky functions).
+//!
+//! Also translated: **`plines_win_col`** (like `plines_win`, but
+//! reports physical screen lines only up to a given column) - the
+//! real, reachable caller that unblocked `win_charsize` above. Needed
+//! `GLOBALS.State`/`state_defs::mode::NORMAL` (both already existed -
+//! an earlier version of this module doc wrongly assumed `State`
+//! wasn't yet translated; re-verified directly against
+//! `globals.rs`/`state_defs.rs` before writing this function, not
+//! assumed from the stale note).
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
@@ -640,9 +639,9 @@ pub struct CharSize {
 /// [`init_charsize_arg`] for inline virtual text) is now a real,
 /// populated field - `init_charsize_arg` itself is translated (needed
 /// `marktree.c`'s `marktree_itr_get_filter`, translated alongside
-/// since this was its only real caller). `charsize_regular`/
-/// `linesize_regular` (which would actually READ `iter`'s virtual-text
-/// state) remain deferred - see this module's own doc comment.
+/// since this was its only real caller). [`charsize_regular`]/
+/// [`linesize_regular`] (which actually READ `iter`'s virtual-text
+/// state) are translated too - see this module's own doc comment.
 #[derive(Debug, Default)]
 pub struct CharsizeArg<'a> {
     pub win: *mut WinT,
@@ -785,6 +784,47 @@ pub unsafe fn linesize_fast(csarg: &CharsizeArg, vcol_arg: i32, len: ColnrT) -> 
     }
 
     vcol_arg
+}
+
+/// Get the number of cells taken up on the screen by the given
+/// character at `vcol` (`win_charsize`, `plines.h`'s dispatch inline).
+/// `csarg.cur_text_width_left`/`csarg.cur_text_width_right` are set to
+/// the extra size for inline virtual text (only by the
+/// [`charsize_regular`] path).
+///
+/// When `csarg.max_head_vcol` is positive, only count in `head` the
+/// size of `'showbreak'`/`'breakindent'` before `csarg.max_head_vcol`.
+/// When `csarg.max_head_vcol` is negative, only count in `head` the
+/// size of `'showbreak'`/`'breakindent'` before where the cursor
+/// should be placed.
+///
+/// `col` is the byte offset of `ptr` within `csarg.line`, needed only
+/// by the [`charsize_regular`] path - see that function's own doc for
+/// why this crate needs an explicit parameter here the original
+/// doesn't (the original derives it via `ptr - csarg->line` pointer
+/// subtraction, which has no equivalent for a Rust slice). Ignored
+/// when `cstype` is [`CsType::Fast`], matching [`charsize_fast`]
+/// (which never needs it either).
+///
+/// # Safety
+/// Same as [`charsize_regular`]/[`charsize_fast`], whichever `cstype`
+/// selects.
+#[must_use]
+pub unsafe fn win_charsize(
+    cstype: CsType,
+    vcol: ColnrT,
+    ptr: &[u8],
+    col: ColnrT,
+    chr: i32,
+    csarg: &mut CharsizeArg,
+) -> CharSize {
+    if cstype == CsType::Fast {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { charsize_fast(csarg, ptr, vcol, chr) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { charsize_regular(csarg, ptr, col, vcol, chr) }
+    }
 }
 
 /// Like [`linetabsize_col`] but for a given window/line instead of
@@ -1358,6 +1398,119 @@ pub unsafe fn plines_m_win_fill(wp: &WinT, first: LinenrT, last: LinenrT) -> i32
     }
 
     count.max(0)
+}
+
+/// Like [`plines_win`], but only reports the number of physical
+/// screen lines used from the start of the line to the given column
+/// number (`plines_win_col`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn plines_win_col(wp: *mut WinT, lnum: LinenrT, column: std::os::raw::c_long) -> i32 {
+    // Check for filler lines above this buffer line.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lines = unsafe { win_get_fill(&*wp, lnum) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*wp }.w_onebuf_opt.wo_wrap == 0 {
+        return lines + 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*wp }.w_view_width == 0 {
+        return lines + 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { init_charsize_arg(wp, lnum, &line) };
+
+    let mut vcol: ColnrT = 0;
+    let mut ci = crate::mbyte::utf_ptr2str_char_info(&line);
+    let mut column = column;
+    if cstype == CsType::Fast {
+        let use_tabstop = csarg.use_tabstop;
+        // SAFETY: forwarded from this function's own safety doc.
+        let wpref = unsafe { &mut *wp };
+        loop {
+            if line.get(ci.pos).copied().unwrap_or(0) == 0 {
+                break;
+            }
+            column -= 1;
+            if column < 0 {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            vcol += unsafe {
+                charsize_fast_impl(wpref, &line[ci.pos..], use_tabstop, vcol, ci.chr.value)
+            }
+            .width;
+            // SAFETY: forwarded from this function's own safety doc.
+            ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+        }
+    } else {
+        loop {
+            if line.get(ci.pos).copied().unwrap_or(0) == 0 {
+                break;
+            }
+            column -= 1;
+            if column < 0 {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            vcol += unsafe {
+                charsize_regular(&mut csarg, &line[ci.pos..], ci.pos as i32, vcol, ci.chr.value)
+            }
+            .width;
+            // SAFETY: forwarded from this function's own safety doc.
+            ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+        }
+    }
+
+    // If current char is a TAB, and the TAB is not displayed as ^I,
+    // and we're not in MODE_INSERT state, then col must be adjusted so
+    // that it represents the last screen position of the TAB. This
+    // only fixes an error when the TAB wraps from one screen line to
+    // the next (when 'columns' is not a multiple of 'ts').
+    let mut col = vcol;
+    // SAFETY: reading a plain `i32` field - the `unsafe` requirement is
+    // only for consistency with this crate's established
+    // `GlobalCell::get_mut` convention (matching
+    // `virt_text_cursor_off`'s own identical access above).
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    if ci.chr.value == i32::from(TAB)
+        && (state & crate::state_defs::mode::NORMAL != 0)
+        && csarg.use_tabstop
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        col += unsafe {
+            win_charsize(cstype, col, &line[ci.pos..], ci.pos as i32, ci.chr.value, &mut csarg)
+        }
+        .width
+            - 1;
+    }
+
+    // Add column offset for 'number', 'relativenumber', 'foldcolumn', etc.
+    // SAFETY: forwarded from this function's own safety doc.
+    let wpref = unsafe { &mut *wp };
+    // SAFETY: forwarded from this function's own safety doc.
+    let width = wpref.w_view_width - unsafe { crate::r#move::win_col_off(wpref) };
+    if width <= 0 {
+        return 9999;
+    }
+
+    lines += 1;
+    if col > width {
+        // SAFETY: forwarded from this function's own safety doc.
+        lines += (col - width) / (width + unsafe { crate::r#move::win_col_off2(wpref) }) + 1;
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -2457,5 +2610,168 @@ mod tests {
         let mut buf = BufT::default();
         let win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
         assert_eq!(unsafe { plines_m_win_fill(&win, 4, 4) }, 1);
+    }
+
+    #[test]
+    fn win_charsize_fast_matches_charsize_fast_directly() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line = b"ab\0";
+        let mut csarg = CharsizeArg { win: &mut win as *mut WinT, line, ..Default::default() };
+        let direct = unsafe { charsize_fast(&csarg, &line[1..], 1, i32::from(b'b')) };
+        let via_dispatch =
+            unsafe { win_charsize(CsType::Fast, 1, &line[1..], 1, i32::from(b'b'), &mut csarg) };
+        assert_eq!(via_dispatch, direct);
+        assert_eq!(via_dispatch.width, 1);
+    }
+
+    #[test]
+    fn win_charsize_regular_matches_charsize_regular_directly() {
+        // Force the Regular path the same way charsize_regular's own
+        // tests do: no marktree virtual text, but nothing else needed
+        // here since charsize_regular itself handles the plain-ASCII
+        // case identically regardless of 'linebreak'/'breakindent'.
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let line = b"ab\0";
+        let mut csarg1 = CharsizeArg { win: &mut win as *mut WinT, line, ..Default::default() };
+        let direct = unsafe { charsize_regular(&mut csarg1, &line[1..], 1, 1, i32::from(b'b')) };
+
+        let mut win2 = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let mut csarg2 = CharsizeArg { win: &mut win2 as *mut WinT, line, ..Default::default() };
+        let via_dispatch = unsafe {
+            win_charsize(CsType::Regular, 1, &line[1..], 1, i32::from(b'b'), &mut csarg2)
+        };
+        assert_eq!(via_dispatch, direct);
+        assert_eq!(via_dispatch.width, 1);
+    }
+
+    #[test]
+    fn plines_win_col_no_wrap_returns_fill_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_view_width: 10,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 0, ..Default::default() },
+            ..Default::default()
+        };
+        // No diff filler today (win_get_fill_zero_by_default), so this
+        // is exactly 0 + 1.
+        assert_eq!(unsafe { plines_win_col(&mut win as *mut WinT, 1, 100) }, 1);
+    }
+
+    #[test]
+    fn plines_win_col_zero_width_returns_fill_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_view_width: 0,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(unsafe { plines_win_col(&mut win as *mut WinT, 1, 100) }, 1);
+    }
+
+    #[test]
+    fn plines_win_col_zero_column_never_advances() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // column == 0: the loop's own `--column >= 0` check fails
+            // immediately (matching C's short-circuit `&&`), so vcol
+            // stays 0 and this still fits on 1 screen line.
+            assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 0), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_col_short_line_full_column_fits_on_one_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // column (100) well past the line's own length - the loop
+            // stops at the line's trailing NUL either way.
+            assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 100), 1);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_col_partial_column_reports_fewer_lines_than_the_full_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            // Full 25-char line wraps to 3 screen lines (matches
+            // plines_win_nofold_long_line_wraps_across_several_screen_lines).
+            assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 25), 3);
+            // Only the first 15 columns: 15 cells at 10 cells/screen-line
+            // -> 10 + 5 -> 2 screen lines, genuinely fewer than the
+            // full-line result above - proves `column` really limits
+            // how much of the line is counted, not just an alias for
+            // "the whole line".
+            assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 15), 2);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn plines_win_col_tab_at_column_zero_adjusts_for_last_screen_position() {
+        // Hand-traced: line is a single TAB. column=0 leaves `ci`
+        // pointing at the (unconsumed) TAB, so the post-loop
+        // TAB-at-wrap-boundary special case fires: win_charsize's Fast
+        // dispatch computes tabstop_padding(0, 0, None) == 8 (b_p_ts
+        // defaults to 0, which tabstop_padding itself falls back to 8
+        // for - see indent.rs's own tabstop_padding_default_ts_when_zero
+        // test), so col becomes 0 + (8 - 1) = 7. With w_view_width=5
+        // and no number/foldcolumn/sign columns (win_col_off == 0),
+        // width=5: col(7) > width(5), so lines = 1 (fill+1) +
+        // (7-5)/(5+0) + 1 = 1 + 0 + 1 = 2.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"\t\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 5,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 0), 2);
+            close_buf(buf);
+        }
     }
 }
