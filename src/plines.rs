@@ -97,16 +97,6 @@
 //! in practice today, since `next` always still equals its own
 //! initial value (`first`, from before the call).
 //!
-//! Deferred: `win_text_height` needs `hasFoldingWin`'s FULL fold-tree
-//! search (not just its "no folds" fast path) to compute a real
-//! nested-fold-aware partial-line-height calculation, genuinely
-//! reachable only once fold-creation itself is translated - also
-//! substantially more involved (10+ intertwined locals, overflow-
-//! sensitive arithmetic) than anything else in this file's vertical-
-//! size section, deliberately not attempted without dedicated,
-//! careful hand-tracing time (matching this file's own established
-//! `charsize_regular` precedent for algorithmically-tricky functions).
-//!
 //! Also translated: **`plines_win_col`** (like `plines_win`, but
 //! reports physical screen lines only up to a given column) - the
 //! real, reachable caller that unblocked `win_charsize` above. Needed
@@ -115,6 +105,29 @@
 //! wasn't yet translated; re-verified directly against
 //! `globals.rs`/`state_defs.rs` before writing this function, not
 //! assumed from the stale note).
+//!
+//! **`plines.c` is now translated in full - `win_text_height` (this
+//! file's last remaining function) is done too.** A prior version of
+//! this doc claimed it "needs `hasFoldingWin`'s FULL fold-tree
+//! search" - re-verified directly against the real source and found
+//! this was a mistaken assumption: the function actually calls the
+//! SIMPLER `hasFolding` (just `hasFoldingWin(win, lnum, firstp, lastp,
+//! true, NULL)`, already translated as [`crate::fold::has_folding`]),
+//! whose always-taken "no folds" fast path never writes its own
+//! `firstp`/`lastp` out-parameters. Since the caller re-initializes
+//! its own "next" local to the current line immediately before every
+//! call, this reduces to a plain per-line loop with no fold-skipping -
+//! a faithful, complete substitute for the general algorithm on every
+//! input this crate can currently construct, not a narrowed
+//! approximation (same reasoning already established for
+//! `plines_win_full`/`plines_m_win`). The remaining arithmetic (10+
+//! intertwined locals, `int64_t`-widened overflow-sensitive
+//! calculations for `start_vcol`/`end_vcol`'s "round down"/"round up
+//! to full screen lines" semantics and the final max-driven
+//! `end_vcol` trim) was hand-traced against 5 concrete scenarios
+//! before writing any tests - all 5 passed on the first real run,
+//! good evidence the by-hand derivation and the translation were both
+//! correct, not just mutually consistent.
 
 use crate::ascii_defs::TAB;
 use crate::buffer_defs::WinT;
@@ -1513,6 +1526,150 @@ pub unsafe fn plines_win_col(wp: *mut WinT, lnum: LinenrT, column: std::os::raw:
     lines
 }
 
+/// Get the number of screen lines a range of text will take in window
+/// `wp` (`win_text_height`).
+///
+/// - `start_lnum`: starting line number, 1-based inclusive.
+/// - `start_vcol`: `>= 0`: starting virtual column index on
+///   `start_lnum`, 0-based inclusive, rounded down to full screen
+///   lines. `< 0`: count a full `start_lnum`, including filler lines
+///   above.
+/// - `end_lnum`: ending line number, 1-based inclusive. Set to the
+///   last line for which the height is calculated (smaller if `max`
+///   is reached).
+/// - `end_vcol`: `>= 0`: ending virtual column index on `end_lnum`,
+///   0-based exclusive, rounded up to full screen lines. `< 0`: count
+///   a full `end_lnum`, not including filler lines below. Set to the
+///   number of columns in `end_lnum` to reach `max`.
+/// - `fill`: if not `None`, set to the number of filler lines in the
+///   range.
+/// - `max`: don't calculate the height for lines beyond the line
+///   where `max` height is reached.
+///
+/// Was previously deferred citing "needs `hasFoldingWin`'s FULL
+/// fold-tree search" - re-verified directly against the real source
+/// and found this was based on a mistaken assumption: this function
+/// calls the SIMPLER `hasFolding` (not `hasFoldingWin` directly),
+/// which is just `hasFoldingWin(win, lnum, firstp, lastp, true,
+/// NULL)` - already fully translated as
+/// [`crate::fold::has_folding`], whose own always-taken "no folds"
+/// fast path never writes its own `firstp`/`lastp` out-parameters
+/// (matching the original's own behavior on that exact path). Since
+/// `lnum_next` is always re-initialized to `lnum` immediately before
+/// each `hasFolding` call, and the call never modifies either, this
+/// reduces to a plain per-line loop over `start_lnum..=*end_lnum` with
+/// no fold-skipping - a faithful, complete substitute for the general
+/// algorithm on every input this crate can currently construct (no
+/// fold can exist), not a narrowed approximation. Every other
+/// dependency (`win_col_off`/`win_col_off2`, `plines_win_nofill`,
+/// `win_get_fill`, `linetabsize_eol`) was already translated too.
+///
+/// Each `&mut *wp`/`&*wp` reference here is created fresh immediately
+/// before its one use and never held across a call to another
+/// `wp`-based function (which itself re-derives its own reference from
+/// the same raw pointer internally) - matching the aliasing discipline
+/// already established by [`plines_win_full`]'s own `wref` handling.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn win_text_height(
+    wp: *mut WinT,
+    start_lnum: LinenrT,
+    start_vcol: i64,
+    end_lnum: &mut LinenrT,
+    end_vcol: &mut i64,
+    fill: Option<&mut i64>,
+    max: i64,
+) -> i64 {
+    let (width1, width2) = {
+        // SAFETY: forwarded from this function's own safety doc. Used
+        // only within this block.
+        let wpref = unsafe { &mut *wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let w1 = wpref.w_view_width - unsafe { crate::r#move::win_col_off(wpref) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let w2 = w1 + unsafe { crate::r#move::win_col_off2(wpref) };
+        (w1.max(0), w2.max(0))
+    };
+
+    let mut height_sum_fill: i64 = 0;
+    let mut height_cur_nofill: i64 = 0;
+    let mut height_sum_nofill: i64 = 0;
+    let mut lnum = start_lnum;
+    let mut cur_lnum = lnum;
+    let mut cur_folded = false;
+
+    if start_vcol >= 0 {
+        let mut lnum_next = lnum;
+        // SAFETY: forwarded from this function's own safety doc.
+        cur_folded = unsafe {
+            crate::fold::has_folding(&mut *wp, lnum, Some(&mut lnum), Some(&mut lnum_next))
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        height_cur_nofill = i64::from(unsafe { plines_win_nofill(wp, lnum, false) });
+        height_sum_nofill += height_cur_nofill;
+        let row_off: i64 = if start_vcol < i64::from(width1) || width2 <= 0 {
+            0
+        } else {
+            1 + (start_vcol - i64::from(width1)) / i64::from(width2)
+        };
+        height_sum_nofill -= row_off.min(height_cur_nofill);
+        lnum = lnum_next + 1;
+    }
+
+    while lnum <= *end_lnum && height_sum_nofill + height_sum_fill < max {
+        let mut lnum_next = lnum;
+        // SAFETY: forwarded from this function's own safety doc.
+        cur_folded = unsafe {
+            crate::fold::has_folding(&mut *wp, lnum, Some(&mut lnum), Some(&mut lnum_next))
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        height_sum_fill += i64::from(unsafe { win_get_fill(&*wp, lnum) });
+        // SAFETY: forwarded from this function's own safety doc.
+        height_cur_nofill = i64::from(unsafe { plines_win_nofill(wp, lnum, false) });
+        height_sum_nofill += height_cur_nofill;
+        cur_lnum = lnum;
+        lnum = lnum_next + 1;
+    }
+
+    let mut vcol_end = *end_vcol;
+    let use_vcol = vcol_end >= 0 && lnum > *end_lnum;
+    if use_vcol {
+        height_sum_nofill -= height_cur_nofill;
+        let row_off: i64 = if vcol_end == 0 {
+            0
+        } else if vcol_end <= i64::from(width1) || width2 <= 0 {
+            1
+        } else {
+            1 + (vcol_end - i64::from(width1) + i64::from(width2) - 1) / i64::from(width2)
+        };
+        height_sum_nofill += row_off.min(height_cur_nofill);
+    }
+
+    if cur_folded {
+        vcol_end = 0;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let linesize = i64::from(unsafe { linetabsize_eol(wp, cur_lnum) });
+        vcol_end = (if use_vcol { vcol_end } else { i64::MAX }).min(linesize);
+    }
+
+    let overflow = height_sum_nofill + height_sum_fill - max;
+    if overflow > 0 && width2 > 0 && vcol_end > i64::from(width2) {
+        vcol_end -= (vcol_end - i64::from(width1)) % i64::from(width2)
+            + (overflow - 1) * i64::from(width2);
+    }
+
+    *end_lnum = cur_lnum;
+    *end_vcol = vcol_end;
+    if let Some(f) = fill {
+        *f = height_sum_fill;
+    }
+    height_sum_fill + height_sum_nofill
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2771,6 +2928,244 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 0), 2);
+            close_buf(buf);
+        }
+    }
+
+    /// Opens `buf` (via [`buf_with_line`]) with `first_line` as line 1,
+    /// then appends each of `rest` in order (matching
+    /// `memline.rs`'s own `ml_append_replace_delete_full_roundtrip`
+    /// test's construction pattern). Same locking/cleanup obligations
+    /// as `buf_with_line`.
+    unsafe fn buf_with_lines(first_line: &[u8], rest: &[&[u8]]) -> BufT {
+        let mut buf = unsafe { buf_with_line(first_line) };
+        for (after, line) in (1..).zip(rest.iter()) {
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_append_buf(&mut buf, after, line, line.len() as i32, false)
+                },
+                crate::vim_defs::OK
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn win_text_height_full_range_no_vcol_restriction() {
+        // 3 lines of "hello" (5 cells each), width1 = width2 = 10 (no
+        // number/foldcolumn/sign columns, no 'n' in cpoptions): each
+        // line fits on exactly 1 screen row, no filler. Hand-traced:
+        // returns 3, end_lnum stays 3 (never hit max), end_vcol becomes
+        // 5 (linetabsize_eol of the last counted line, "hello").
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[b"hello\0", b"hello\0"]);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 3;
+            let mut end_vcol: i64 = -1;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                -1,
+                &mut end_lnum,
+                &mut end_vcol,
+                None,
+                i64::MAX,
+            );
+            assert_eq!(height, 3);
+            assert_eq!(end_lnum, 3);
+            assert_eq!(end_vcol, 5);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn win_text_height_max_stops_early() {
+        // Same 3-line buffer as above, but max=2: the loop stops after
+        // 2 lines (2 + 0 < 2 is false on the would-be 3rd iteration's
+        // check), so end_lnum becomes 2, not 3.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[b"hello\0", b"hello\0"]);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 3;
+            let mut end_vcol: i64 = -1;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                -1,
+                &mut end_lnum,
+                &mut end_vcol,
+                None,
+                2,
+            );
+            assert_eq!(height, 2);
+            assert_eq!(end_lnum, 2);
+            assert_eq!(end_vcol, 5);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn win_text_height_start_vcol_rounds_down_to_full_screen_lines() {
+        // A single 25-'a' line at width 10/row takes 3 rows (cols
+        // 0-9/10-19/20-24). start_vcol=15 falls in row 1 (cols
+        // 10-19) - "rounded down to full screen lines" means row 0 is
+        // skipped entirely (row_off=1), leaving 2 rows (rows 1 and 2).
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 1;
+            let mut end_vcol: i64 = -1;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                15,
+                &mut end_lnum,
+                &mut end_vcol,
+                None,
+                i64::MAX,
+            );
+            assert_eq!(height, 2);
+            assert_eq!(end_lnum, 1);
+            assert_eq!(end_vcol, 25);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn win_text_height_end_vcol_rounds_up_to_full_screen_lines() {
+        // Same 25-'a' line. end_vcol=20 (0-based exclusive) needs rows
+        // 0 and 1 (cols 0-9, 10-19) to reach column 20 - row_off=2,
+        // "rounded up to full screen lines".
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_line(&line);
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 1;
+            let mut end_vcol: i64 = 20;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                -1,
+                &mut end_lnum,
+                &mut end_vcol,
+                None,
+                i64::MAX,
+            );
+            assert_eq!(height, 2);
+            assert_eq!(end_lnum, 1);
+            assert_eq!(end_vcol, 20);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn win_text_height_overflow_trims_end_vcol_to_reach_exactly_max() {
+        // 5 lines of 25 'a's each (3 rows/line at width 10), max=5:
+        // the loop stops once it's counted line 1 (3 rows) + line 2 (3
+        // rows) = 6 >= max(5), so height_sum_nofill=6 overshoots max
+        // by 1 (overflow=1). end_vcol is trimmed down from line 2's
+        // full 25 to 20 - exactly the point within line 2 where the
+        // running total would hit max(5): 3 (line 1) + 2 rows of line
+        // 2 (cols 0-19) = 5.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut line = vec![b'a'; 25];
+            line.push(0);
+            let mut buf = buf_with_lines(
+                &line,
+                &[line.as_slice(), line.as_slice(), line.as_slice(), line.as_slice()],
+            );
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 5;
+            let mut end_vcol: i64 = -1;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                -1,
+                &mut end_lnum,
+                &mut end_vcol,
+                None,
+                5,
+            );
+            assert_eq!(height, 6);
+            assert_eq!(end_lnum, 2);
+            assert_eq!(end_vcol, 20);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn win_text_height_fill_out_param_reports_filler_lines() {
+        // No diff mode/virtual lines today, so fill is always 0 -
+        // still worth asserting explicitly since it's a genuinely
+        // separate out-parameter from the main return value.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        unsafe {
+            let mut buf = buf_with_line(b"hello\0");
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_view_width: 10,
+                w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+                ..Default::default()
+            };
+            let mut end_lnum: LinenrT = 1;
+            let mut end_vcol: i64 = -1;
+            let mut fill: i64 = -1;
+            let height = win_text_height(
+                &mut win as *mut WinT,
+                1,
+                -1,
+                &mut end_lnum,
+                &mut end_vcol,
+                Some(&mut fill),
+                i64::MAX,
+            );
+            assert_eq!(height, 1);
+            assert_eq!(fill, 0);
             close_buf(buf);
         }
     }
