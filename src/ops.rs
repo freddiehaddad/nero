@@ -15,6 +15,12 @@
 //! these need any not-yet-translated subsystem - just the table
 //! itself.
 //!
+//! Also translated: [`reset_lbr`]/[`restore_lbr`] (temporarily
+//! disable/restore `'linebreak'` around an operation, e.g. `"gw"`,
+//! that needs plain-width column arithmetic - only touch `curwin`'s
+//! own plain fields) and [`clear_oparg`] (a `CLEAR_POINTER` one-liner
+//! now that `normal_defs.rs`'s `OpargT` exists).
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -162,6 +168,59 @@ pub fn get_extra_op_char(optype: OpType) -> u8 {
     OPCHARS[optype as usize].1
 }
 
+/// Set `curwin.w_p_lbr` (`'linebreak'`) to `false` and take care of
+/// side effects (`reset_lbr`).
+///
+/// @return `true` if `'linebreak'` was set (and thus actually reset).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+pub unsafe fn reset_lbr() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
+    if curwin.w_onebuf_opt.wo_lbr == 0 {
+        return false;
+    }
+    // changing 'linebreak' may require w_virtcol to be updated
+    curwin.w_onebuf_opt.wo_lbr = 0;
+    curwin.w_valid &= !(i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+        | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+        | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL));
+    true
+}
+
+/// Restore `curwin.w_p_lbr` (`'linebreak'`) and take care of side
+/// effects (`restore_lbr`).
+///
+/// # Safety
+/// Same as [`reset_lbr`].
+pub unsafe fn restore_lbr(lbr_saved: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
+    if curwin.w_onebuf_opt.wo_lbr != 0 || !lbr_saved {
+        return;
+    }
+
+    // changing 'linebreak' may require w_virtcol to be updated
+    curwin.w_onebuf_opt.wo_lbr = 1;
+    curwin.w_valid &= !(i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+        | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+        | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL));
+}
+
+/// Clear all fields of `oap` back to their zero/default values
+/// (`clear_oparg`, `CLEAR_POINTER(oap)` in the original).
+///
+/// `OpargT::default()` is a genuine byte-for-byte equivalent of
+/// zeroing the whole struct: every field is a plain scalar/`Copy`
+/// type, and [`crate::normal_defs::MotionType`]'s own `Default`
+/// (`CharWise`) is verified to be the C enum's own `0` variant (see
+/// `normal_defs.rs`'s own test asserting this).
+pub fn clear_oparg(oap: &mut crate::normal_defs::OpargT) {
+    *oap = crate::normal_defs::OpargT::default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +312,144 @@ mod tests {
     fn opchars_and_op_type_order_have_matching_lengths() {
         assert_eq!(OPCHARS.len(), OP_TYPE_ORDER.len());
         assert_eq!(OPCHARS.len(), 30);
+    }
+
+    /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime.
+    struct CurwinGuard {
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl CurwinGuard {
+        fn set(new_curwin: *mut crate::buffer_defs::WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = new_curwin;
+            CurwinGuard { previous }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+        }
+    }
+
+    #[test]
+    fn reset_lbr_false_and_untouched_when_linebreak_not_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+                | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL),
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_lbr = 0;
+        let _guard = CurwinGuard::set(&mut win as *mut crate::buffer_defs::WinT);
+
+        assert!(!unsafe { reset_lbr() });
+        assert_eq!(win.w_onebuf_opt.wo_lbr, 0);
+        // w_valid untouched - the early return happens before it's read.
+        assert_eq!(
+            win.w_valid,
+            i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+                | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL)
+        );
+    }
+
+    #[test]
+    fn reset_lbr_true_clears_linebreak_and_valid_bits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+                | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_BOTLINE), // must survive
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_lbr = 1;
+        let _guard = CurwinGuard::set(&mut win as *mut crate::buffer_defs::WinT);
+
+        assert!(unsafe { reset_lbr() });
+        assert_eq!(win.w_onebuf_opt.wo_lbr, 0);
+        assert_eq!(win.w_valid, i32::from(crate::buffer_defs::w_valid::VALID_BOTLINE));
+    }
+
+    #[test]
+    fn restore_lbr_noop_when_not_saved() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_lbr = 0;
+        let _guard = CurwinGuard::set(&mut win as *mut crate::buffer_defs::WinT);
+
+        unsafe { restore_lbr(false) };
+        assert_eq!(win.w_onebuf_opt.wo_lbr, 0); // untouched
+    }
+
+    #[test]
+    fn restore_lbr_noop_when_linebreak_already_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_WROW), // must survive
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_lbr = 1;
+        let _guard = CurwinGuard::set(&mut win as *mut crate::buffer_defs::WinT);
+
+        unsafe { restore_lbr(true) };
+        assert_eq!(win.w_onebuf_opt.wo_lbr, 1);
+        assert_eq!(win.w_valid, i32::from(crate::buffer_defs::w_valid::VALID_WROW));
+    }
+
+    #[test]
+    fn restore_lbr_sets_linebreak_and_clears_valid_bits_when_saved() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_WROW)
+                | i32::from(crate::buffer_defs::w_valid::VALID_WCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL)
+                | i32::from(crate::buffer_defs::w_valid::VALID_BOTLINE), // must survive
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_lbr = 0;
+        let _guard = CurwinGuard::set(&mut win as *mut crate::buffer_defs::WinT);
+
+        unsafe { restore_lbr(true) };
+        assert_eq!(win.w_onebuf_opt.wo_lbr, 1);
+        assert_eq!(win.w_valid, i32::from(crate::buffer_defs::w_valid::VALID_BOTLINE));
+    }
+
+    #[test]
+    fn clear_oparg_zeroes_every_field() {
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: 5,
+            regname: i32::from(b'a'),
+            motion_type: crate::normal_defs::MotionType::LineWise,
+            motion_force: i32::from(b'V'),
+            use_reg_one: true,
+            inclusive: true,
+            end_adjusted: true,
+            restore_cursor: true,
+            line_count: 42,
+            empty: true,
+            is_visual: true,
+            start_vcol: 3,
+            end_vcol: 7,
+            prev_opcount: 2,
+            prev_count0: 9,
+            excl_tr_ws: true,
+            ..Default::default()
+        };
+        clear_oparg(&mut oap);
+        assert_eq!(oap.op_type, 0);
+        assert_eq!(oap.regname, 0);
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::CharWise);
+        assert!(!oap.use_reg_one);
+        assert!(!oap.inclusive);
+        assert!(!oap.is_visual);
+        assert_eq!(oap.line_count, 0);
+        assert_eq!(oap.prev_opcount, 0);
+        assert!(!oap.excl_tr_ws);
     }
 }
