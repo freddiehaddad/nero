@@ -87,6 +87,20 @@
 //! this crate's established `get_op_type` precedent for such
 //! caller-contract violations.
 //!
+//! Also translated (found via a full function-name diff of this file
+//! against the real C source, the same methodology used to mine
+//! `eval/typval.c`/`eval/userfunc.c` over previous sessions):
+//! `set_vcount` (sets `v:count`/`v:count1`/`v:prevcount`, layered
+//! directly on the already-real `get_vim_var_nr`/`set_vim_var_nr`) and
+//! `valid_varname` (checks every character of a candidate variable
+//! name - needed `eval.c`'s own small, self-contained
+//! `eval_isnamec`/`eval_isnamec1`, added to `eval/eval.rs` alongside;
+//! neither has any `g_chartab`/options-engine dependency, unlike the
+//! superficially similar `vim_isIDc`). `valid_varname`'s own
+//! `semsg(_(e_illvar), varname)` on the first invalid character is
+//! omitted (message display, not tractable yet) - the boolean result
+//! itself is kept exactly.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
@@ -940,6 +954,100 @@ pub unsafe fn set_reg_var(c: i32) {
     if !already_right {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { set_vim_var_string(VimVarIndex::Reg, Some(&[regname])) };
+    }
+}
+
+/// Set `v:count`/`v:count1`, and (if `set_prevcount`) `v:prevcount`
+/// from the current `v:count` (`set_vcount`).
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_vcount(count: VarnumberT, count1: VarnumberT, set_prevcount: bool) {
+    if set_prevcount {
+        // SAFETY: forwarded from this function's own safety doc.
+        let prev = unsafe { get_vim_var_nr(VimVarIndex::Count) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_vim_var_nr(VimVarIndex::Prevcount, prev) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vim_var_nr(VimVarIndex::Count, count) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vim_var_nr(VimVarIndex::Count1, count1) };
+}
+
+/// Whether `varname` is a valid variable name: every character is
+/// either a name character (`eval_isnamec1`, plus digits after the
+/// first position, plus the autoload separator), matching the
+/// original's own per-character scan (`valid_varname`).
+///
+/// The original's `semsg(_(e_illvar), varname)` on the first invalid
+/// character is omitted (message display, not tractable yet) - the
+/// boolean result itself is kept exactly.
+#[must_use]
+pub fn valid_varname(varname: &[u8]) -> bool {
+    for (i, &b) in varname.iter().enumerate() {
+        if !crate::eval::eval::eval_isnamec1(b as i32)
+            && (i == 0 || !crate::ascii_defs::ascii_isdigit(b as i32))
+            && b != crate::eval::eval::AUTOLOAD_CHAR
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod set_vcount_and_valid_varname_tests {
+    use super::*;
+
+    #[test]
+    fn set_vcount_sets_count_and_count1_without_prevcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { set_vim_var_nr(VimVarIndex::Prevcount, 0) };
+        unsafe { set_vcount(5, 6, false) };
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count) }, 5);
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count1) }, 6);
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Prevcount) }, 0);
+    }
+
+    #[test]
+    fn set_vcount_copies_old_count_into_prevcount_when_requested() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { set_vim_var_nr(VimVarIndex::Count, 3) };
+        unsafe { set_vcount(7, 8, true) };
+        // prevcount picks up the OLD v:count (3), not the new one (7).
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Prevcount) }, 3);
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count) }, 7);
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count1) }, 8);
+    }
+
+    #[test]
+    fn valid_varname_empty_is_true() {
+        assert!(valid_varname(b""));
+    }
+
+    #[test]
+    fn valid_varname_plain_identifier_is_true() {
+        assert!(valid_varname(b"foo"));
+        assert!(valid_varname(b"_foo"));
+        assert!(valid_varname(b"foo123"));
+    }
+
+    #[test]
+    fn valid_varname_digit_at_start_is_false() {
+        assert!(!valid_varname(b"123foo"));
+    }
+
+    #[test]
+    fn valid_varname_autoload_char_allowed_anywhere_including_start() {
+        assert!(valid_varname(b"foo#bar"));
+        assert!(valid_varname(b"#foo"));
+    }
+
+    #[test]
+    fn valid_varname_rejects_other_punctuation() {
+        assert!(!valid_varname(b"foo-bar"));
+        assert!(!valid_varname(b"foo bar"));
     }
 }
 

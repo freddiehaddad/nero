@@ -1155,6 +1155,29 @@ pub fn eval_lit_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32,
     (crate::vim_defs::OK, close + 1)
 }
 
+/// `eval.h`'s `AUTOLOAD_CHAR` (`'#'`) - the separator marking an
+/// autoload-style function/variable name. `pub(crate)` since more than
+/// one module (`eval/vars.rs`'s `valid_varname`) needs the same real
+/// constant.
+pub(crate) const AUTOLOAD_CHAR: u8 = b'#';
+
+/// Whether character `c` can be used in a variable or function name
+/// (`eval_isnamec`).
+#[must_use]
+pub fn eval_isnamec(c: i32) -> bool {
+    crate::macros_defs::ascii_isalnum(c)
+        || c == i32::from(b'_')
+        || c == i32::from(b':')
+        || c == i32::from(AUTOLOAD_CHAR)
+}
+
+/// Whether character `c` can be used as the FIRST character in a
+/// variable or function name, excluding `'{'`/`'}'` (`eval_isnamec1`).
+#[must_use]
+pub fn eval_isnamec1(c: i32) -> bool {
+    crate::macros_defs::ascii_isalpha(c) || c == i32::from(b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2071,6 +2094,37 @@ mod tests {
         let (ret, len) = eval_lit_string(b"'abc", &mut tv, false);
         assert_eq!(ret, crate::vim_defs::FAIL);
         assert_eq!(len, 0);
+    }
+
+    // ---- eval_isnamec / eval_isnamec1 --------------------------------
+
+    #[test]
+    fn eval_isnamec1_true_for_letters_and_underscore() {
+        assert!(eval_isnamec1(i32::from(b'a')));
+        assert!(eval_isnamec1(i32::from(b'Z')));
+        assert!(eval_isnamec1(i32::from(b'_')));
+    }
+
+    #[test]
+    fn eval_isnamec1_false_for_digits_colon_and_autoload_char() {
+        assert!(!eval_isnamec1(i32::from(b'0')));
+        assert!(!eval_isnamec1(i32::from(b':')));
+        assert!(!eval_isnamec1(i32::from(b'#')));
+    }
+
+    #[test]
+    fn eval_isnamec_true_for_alnum_underscore_colon_and_autoload_char() {
+        assert!(eval_isnamec(i32::from(b'a')));
+        assert!(eval_isnamec(i32::from(b'9')));
+        assert!(eval_isnamec(i32::from(b'_')));
+        assert!(eval_isnamec(i32::from(b':')));
+        assert!(eval_isnamec(i32::from(b'#')));
+    }
+
+    #[test]
+    fn eval_isnamec_false_for_other_punctuation() {
+        assert!(!eval_isnamec(i32::from(b'-')));
+        assert!(!eval_isnamec(i32::from(b' ')));
     }
 
     // ---- partial_name -----------------------------------------------
