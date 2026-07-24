@@ -105,6 +105,64 @@ pub unsafe fn win_col_off2(wp: &mut WinT) -> i32 {
     0
 }
 
+/// Get the number of screen lines skipped by `wp.w_skipcol`
+/// (`adjust_plines_for_skipcol`).
+///
+/// # Safety
+/// Same as [`win_col_off`]/[`win_col_off2`].
+unsafe fn adjust_plines_for_skipcol(wp: &mut WinT) -> i32 {
+    if wp.w_skipcol == 0 {
+        return 0;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let width = wp.w_view_width - unsafe { win_col_off(wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w2 = width + unsafe { win_col_off2(wp) };
+    if wp.w_skipcol >= width && w2 > 0 {
+        return (wp.w_skipcol - width) / w2 + 1;
+    }
+
+    0
+}
+
+/// Return how many lines `lnum` will take on the screen, taking into
+/// account whether it is the first line, whether `w_skipcol` is
+/// non-zero, and limiting to the window height
+/// (`plines_correct_topline`).
+///
+/// The inner [`crate::plines::plines_win_full`] call always passes
+/// `cache: true, limit_winheight: false` regardless of this
+/// function's own `limit_winheight` parameter, matching the original
+/// exactly - the window-height clamp is applied once, at the very end
+/// of this function itself, not threaded through to the inner call.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn plines_correct_topline(
+    wp: *mut WinT,
+    lnum: crate::pos_defs::LinenrT,
+    nextp: Option<&mut crate::pos_defs::LinenrT>,
+    limit_winheight: bool,
+    foldedp: Option<&mut bool>,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut n =
+        unsafe { crate::plines::plines_win_full(wp, lnum, nextp, foldedp, true, false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let wpref = unsafe { &mut *wp };
+    if lnum == wpref.w_topline {
+        // SAFETY: forwarded from this function's own safety doc.
+        n -= unsafe { adjust_plines_for_skipcol(wpref) };
+    }
+    if limit_winheight && n > wpref.w_view_height {
+        return wpref.w_view_height;
+    }
+    n
+}
+
 /// Set `wp.w_virtcol`/`w_valid`'s `VALID_VIRTCOL` bit for virtual
 /// column `vcol` (`set_valid_virtcol`).
 ///
@@ -425,6 +483,31 @@ mod tests {
         WinT { w_buffer: buf, ..Default::default() }
     }
 
+    /// Points `GLOBALS.curtab` at `tp` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching `plines.rs`'s/`diff.rs`'s own identically-named
+    /// helper - `curtab` must be non-null for `win_get_fill`/
+    /// `diff_check_fill`'s own `curtab` read to be sound, reached
+    /// whenever `lnum != wp.w_topline`).
+    struct CurtabGuard {
+        previous: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl CurtabGuard {
+        fn set(new_curtab: *mut crate::buffer_defs::TabpageT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = new_curtab;
+            CurtabGuard { previous }
+        }
+    }
+
+    impl Drop for CurtabGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = self.previous;
+        }
+    }
+
     #[test]
     fn win_col_off_zero_when_nothing_enabled() {
         let mut buf = BufT::default();
@@ -489,6 +572,125 @@ mod tests {
         assert_eq!(unsafe { win_col_off2(&mut win) }, 2); // number_width(1) + stc_empty(1)
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = prev;
+    }
+
+    #[test]
+    fn adjust_plines_for_skipcol_zero_skipcol_returns_zero() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        win.w_skipcol = 0;
+        assert_eq!(unsafe { adjust_plines_for_skipcol(&mut win) }, 0);
+    }
+
+    #[test]
+    fn adjust_plines_for_skipcol_computes_lines_skipped() {
+        // width = 20 - win_col_off(0) = 20; w2 = 20 + win_col_off2(0) = 20.
+        // skipcol(45) >= width(20): (45-20)/20 + 1 = 25/20 + 1 = 1+1 = 2.
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        win.w_skipcol = 45;
+        assert_eq!(unsafe { adjust_plines_for_skipcol(&mut win) }, 2);
+    }
+
+    #[test]
+    fn adjust_plines_for_skipcol_below_width_returns_zero() {
+        // skipcol(10) < width(20): the `w_skipcol >= width` guard fails,
+        // so this returns 0 even though skipcol is nonzero.
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        win.w_skipcol = 10;
+        assert_eq!(unsafe { adjust_plines_for_skipcol(&mut win) }, 0);
+    }
+
+    #[test]
+    fn plines_correct_topline_no_wrap_single_line_no_skipcol() {
+        // wo_wrap=0 makes plines_win_full's inner plines_win_nofill hit
+        // its own fast "1 line" path (no memline access needed) - the
+        // baseline case: no filler (lnum == w_topline but w_topfill=0),
+        // no skipcol adjustment (w_skipcol=0).
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_view_width = 20;
+        assert_eq!(
+            unsafe { plines_correct_topline(&mut win as *mut WinT, 1, None, false, None) },
+            1
+        );
+    }
+
+    #[test]
+    fn plines_correct_topline_subtracts_skipcol_lines_only_at_topline() {
+        // w_skipcol=25 -> adjust_plines_for_skipcol returns 1 (see
+        // adjust_plines_for_skipcol_computes_lines_skipped's own
+        // derivation pattern: (25-20)/20 + 1 = 0+1 = 1). Only subtracted
+        // when lnum == w_topline.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 5;
+        win.w_view_width = 20;
+        win.w_skipcol = 25;
+
+        // At the topline: base 1 line, minus 1 skipcol-adjustment line.
+        assert_eq!(
+            unsafe { plines_correct_topline(&mut win as *mut WinT, 5, None, false, None) },
+            0
+        );
+
+        // Not at the topline: skipcol adjustment never applies. This
+        // path calls win_get_fill (unlike the "at topline" path, which
+        // reads w_topfill directly) - needs GLOBALS.curtab set up
+        // (CurtabGuard above), caught by a real null-pointer-deref
+        // crash the first time this test was run without it.
+        assert_eq!(
+            unsafe { plines_correct_topline(&mut win as *mut WinT, 6, None, false, None) },
+            1
+        );
+    }
+
+    #[test]
+    fn plines_correct_topline_limit_winheight_clamps_result() {
+        // At the topline with w_topfill=10 (added as filler on top of
+        // the base 1 text line): unclamped n = 11. limit_winheight
+        // clamps to w_view_height (3).
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_topfill = 10;
+        win.w_view_width = 20;
+        win.w_view_height = 3;
+
+        assert_eq!(
+            unsafe { plines_correct_topline(&mut win as *mut WinT, 1, None, true, None) },
+            3
+        );
+        // Without the clamp, the unclamped value (11) comes through.
+        assert_eq!(
+            unsafe { plines_correct_topline(&mut win as *mut WinT, 1, None, false, None) },
+            11
+        );
+    }
+
+    #[test]
+    fn plines_correct_topline_forwards_foldedp_out_param() {
+        // has_folding's own "no folds" fast path always reports false -
+        // foldedp should reflect that (matches plines_win_full's own
+        // already-established foldedp-forwarding test precedent).
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_view_width = 20;
+        let mut folded = true; // deliberately wrong initial value
+        unsafe {
+            let _ =
+                plines_correct_topline(&mut win as *mut WinT, 1, None, false, Some(&mut folded));
+        }
+        assert!(!folded);
     }
 
     #[test]
