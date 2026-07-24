@@ -159,6 +159,18 @@
 //! `FunccallT.fc_defer`'s current bare `GarrayT` type, and ultimately
 //! the same `call_func` dispatch machinery most of this file's
 //! remaining functions need.
+//!
+//! Also translated: `register_closure` - registers a `ufunc_T` (a
+//! lambda/closure) as scoped to the current funccall, unreffing
+//! whatever it was previously scoped to first via the already-real
+//! `funccal_unref`. Has a genuine, explicitly-documented precondition:
+//! `CURRENT_FUNCCAL.fc_ufuncs` must already be `ga_init`'d with
+//! `itemsize == size_of::<*mut UfuncT>()`, matching `call_user_func`'s
+//! own real setup step (not yet translated) - `create_funccal` alone
+//! faithfully leaves `fc_ufuncs` at its bare zero-initialized state,
+//! exactly like the original's own `create_funccal`/`call_user_func`
+//! split, so tests exercising `register_closure` must set this up
+//! explicitly first.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -866,11 +878,51 @@ unsafe fn funccal_unref(fc: *mut FunccallT, fp: *mut UfuncT, force: bool) {
     }
 }
 
+/// Register `fp` as using the current funccal as its scope, for
+/// closures (`register_closure`).
+///
+/// # Safety
+/// `fp` must be a valid, non-null pointer to a live `UfuncT` whose
+/// `uf_scoped`, if non-null, satisfies [`funccal_unref`]'s own safety
+/// contract. `CURRENT_FUNCCAL` must currently be non-null, with its
+/// own `fc_ufuncs` already initialized via `GarrayT::ga_init` using
+/// `itemsize == size_of::<*mut UfuncT>()` (matching `call_user_func`'s
+/// own real setup - not yet translated - which always runs this
+/// `ga_init` step before any code path that could reach
+/// `register_closure`; `create_funccal` alone deliberately leaves
+/// `fc_ufuncs` at its bare zero-initialized state, faithfully matching
+/// the original's own `create_funccal`/`call_user_func` split).
+#[allow(dead_code)] // no real translated caller yet (get_lambda_tv/closure-flagged user-function definitions, neither translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
+unsafe fn register_closure(fp: *mut UfuncT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*fp).uf_scoped } == current {
+        // no change
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_scoped = unsafe { (*fp).uf_scoped };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { funccal_unref(old_scoped, fp, false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*fp).uf_scoped = current;
+        (*current).fc_refcount += 1;
+        (*current).fc_ufuncs.ga_grow(1);
+        let base = (*current).fc_ufuncs.ga_data.as_mut_ptr() as *mut *mut UfuncT;
+        let idx = (*current).fc_ufuncs.ga_len;
+        *base.add(idx as usize) = fp;
+        (*current).fc_ufuncs.ga_len += 1;
+    }
+}
+
 /// Allocate a `FunccallT`, link it into `current_funccal`, and fill in
 /// `fp`/`rettv` (`create_funccal`).
 ///
 /// Must be followed by one call to [`remove_funccal`] or
-/// `cleanup_function_call` (not yet translated).
+/// `cleanup_function_call` (private - not reachable from outside this
+/// module).
 ///
 /// # Safety
 /// `fp` must be a valid, non-null pointer to a live `UfuncT`.
@@ -1524,6 +1576,90 @@ mod tests {
         assert_eq!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }, head_ptr);
         assert!(unsafe { (*head_ptr).fc_caller }.is_null());
 
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    // ---- register_closure ------------------------------------------------
+
+    #[test]
+    fn register_closure_is_a_noop_when_already_scoped_to_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let mut fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let mut fp = UfuncT { uf_scoped: fc_ptr, ..Default::default() };
+
+        unsafe { register_closure(&mut fp as *mut UfuncT) };
+
+        // No change: fc_refcount/fc_ufuncs untouched.
+        assert_eq!(unsafe { (*fc_ptr).fc_refcount }, 1);
+        assert_eq!(unsafe { (*fc_ptr).fc_ufuncs.ga_len }, 0);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn register_closure_links_fp_into_current_funccal_and_bumps_refcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let mut fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        // Matches call_user_func's own real setup (not yet translated)
+        // - see register_closure's own safety doc for why this is a
+        // real, stated precondition here.
+        fc.fc_ufuncs.ga_init(std::mem::size_of::<*mut UfuncT>() as i32, 1);
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let mut fp = UfuncT::default(); // uf_scoped starts null
+
+        unsafe { register_closure(&mut fp as *mut UfuncT) };
+
+        assert_eq!(fp.uf_scoped, fc_ptr);
+        assert_eq!(unsafe { (*fc_ptr).fc_refcount }, 2);
+        assert_eq!(unsafe { (*fc_ptr).fc_ufuncs.ga_len }, 1);
+        let base = unsafe { (*fc_ptr).fc_ufuncs.ga_data.as_ptr() as *const *mut UfuncT };
+        assert_eq!(unsafe { *base }, &mut fp as *mut UfuncT);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn register_closure_unrefs_the_previous_scope_before_switching() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        // old_fc: a distinct, already-current-elsewhere funccal that fp
+        // used to be scoped to; refcount 1 so funccal_unref's own
+        // "hits zero, not referenced, and present on previous_funccal"
+        // path frees it outright once register_closure unrefs it.
+        let mut old_fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        old_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        old_fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        old_fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let old_fc_ptr = old_fc.as_mut() as *mut FunccallT;
+        std::mem::forget(old_fc); // funccal_unref frees it below.
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = old_fc_ptr };
+
+        let mut new_fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        new_fc.fc_ufuncs.ga_init(std::mem::size_of::<*mut UfuncT>() as i32, 1);
+        let new_fc_ptr = new_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = new_fc_ptr };
+
+        let mut fp = UfuncT { uf_scoped: old_fc_ptr, ..Default::default() };
+
+        unsafe { register_closure(&mut fp as *mut UfuncT) };
+
+        // old_fc was unreferenced (refcount hit 0, unreferenced) and
+        // freed, unlinking it from previous_funccal.
+        assert!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }.is_null());
+        // fp is now scoped to new_fc instead.
+        assert_eq!(fp.uf_scoped, new_fc_ptr);
+        assert_eq!(unsafe { (*new_fc_ptr).fc_refcount }, 2);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
         unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
     }
 
