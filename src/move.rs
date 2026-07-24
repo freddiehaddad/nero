@@ -26,15 +26,38 @@
 //!
 //! `validate_botline_win` (which would otherwise be a trivial one-line
 //! wrapper) was investigated and NOT translated: its real work,
-//! `comp_botline`, needs `plines_correct_topline` (fold-aware,
-//! `fold.c`'s real tree search), `redraw_for_cursorline`/
-//! `set_empty_rows`/`win_check_anchored_floats` (redraw + floating-
-//! window machinery) - genuinely substantial, not a quick win.
+//! `comp_botline`, needs `redraw_for_cursorline`/`set_empty_rows`/
+//! `win_check_anchored_floats` (redraw + floating-window machinery) -
+//! genuinely substantial, not a quick win, even now that
+//! `plines_correct_topline` (`comp_botline`'s own inner per-line call)
+//! exists.
 //!
 //! Also translated: `set_topline` (now that `fold.c`'s `has_folding`
 //! exists) - unblocked `mark.c`'s `mark_view_restore`. Omits the
 //! original's `redraw_later(wp, UPD_VALID)` call, matching the same
 //! established precedent as the rest of this file.
+//!
+//! Also translated: `adjust_plines_for_skipcol`/`plines_correct_topline`
+//! (found via a re-scan of `move.c` once `plines.c` was fully
+//! complete; needed only `w_skipcol` plus `win_col_off`/`win_col_off2`/
+//! `plines_win_full`, all already real) - unblocked `cursor.c`'s
+//! `set_leftcol`.
+//!
+//! Also translated: **`sms_marker_overlap`/`skipcol_from_plines`/
+//! `reset_skipcol`/`use_scrolloffpad`/`scrolloffpad_eof_pressure`** -
+//! five small, self-contained functions sitting near the top of
+//! `move.c`, each needing only pieces that already exist
+//! (`win_col_off`/`win_col_off2`, `get_showbreak_value`,
+//! `get_scrolloff_value`/`get_scrolloffpad_value`, or plain fields).
+//! `skipcol_from_plines`/`scrolloffpad_eof_pressure` have no real
+//! translated caller yet (`update_topline`/`curs_columns`/
+//! `scroll_cursor_top`, their only real callers, all still need the
+//! redraw pipeline) - marked `#[allow(dead_code)]` until one lands,
+//! matching `undo.rs`'s/`marktree.rs`'s established precedent for
+//! translating a small, simple, mechanically-correct piece ahead of
+//! its real caller. `reset_skipcol` omits the original's trailing
+//! `redraw_later(wp, UPD_SOME_VALID)` call, matching this file's own
+//! established policy.
 //!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
@@ -161,6 +184,112 @@ pub unsafe fn plines_correct_topline(
         return wpref.w_view_height;
     }
     n
+}
+
+/// Return the number of columns overlapping with the `'listchars'`
+/// `"precedes"` marker at the left edge of the window, given `extra2`
+/// (the difference between [`win_col_off`]/[`win_col_off2`], or `-1`
+/// to have this function compute it) (`sms_marker_overlap`).
+///
+/// # Safety
+/// Same as [`win_col_off`]/[`win_col_off2`].
+pub unsafe fn sms_marker_overlap(wp: &mut WinT, extra2_arg: i32) -> i32 {
+    let extra2 = if extra2_arg == -1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { win_col_off(wp) - win_col_off2(wp) }
+    } else {
+        extra2_arg
+    };
+    // There is no marker overlap when in showbreak mode, thus no need
+    // to account for it. See wlv_put_linebuf().
+    if !crate::option::get_showbreak_value(wp).is_empty() {
+        return 0;
+    }
+
+    // Overlap when 'list' and 'listchars' "precedes" are set is 1.
+    if wp.w_onebuf_opt.wo_list != 0 && wp.w_p_lcs_chars.prec != 0 {
+        return 1;
+    }
+
+    if extra2 > 3 {
+        0
+    } else {
+        3 - extra2
+    }
+}
+
+/// Calculate the `w_skipcol` offset for window `wp` given how many
+/// physical lines we want to scroll down (`skipcol_from_plines`).
+///
+/// # Safety
+/// Same as [`win_col_off`]/[`win_col_off2`].
+#[allow(dead_code)] // no real translated caller yet (update_topline, its only caller, needs the redraw pipeline)
+unsafe fn skipcol_from_plines(wp: &mut WinT, plines_off: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let width1 = wp.w_view_width - unsafe { win_col_off(wp) };
+
+    let mut skipcol = 0;
+    if plines_off > 0 {
+        skipcol += width1;
+    }
+    if plines_off > 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        skipcol += (width1 + unsafe { win_col_off2(wp) }) * (plines_off - 1);
+    }
+    skipcol
+}
+
+/// Set `wp.w_skipcol` to zero (`reset_skipcol`).
+///
+/// Omits the original's trailing `redraw_later(wp, UPD_SOME_VALID)`
+/// call - a pure redraw-scheduling side effect, matching the
+/// established "skip the deferred-subsystem side effect, keep the
+/// state correct" policy (e.g. [`set_valid_virtcol`] below).
+pub fn reset_skipcol(wp: &mut WinT) {
+    if wp.w_skipcol == 0 {
+        return;
+    }
+    wp.w_skipcol = 0;
+}
+
+/// Return `true` when `'scrolloffpad'` may augment `'scrolloff'` -
+/// only applies to automatic cursor-visibility correction. For now
+/// `'scrolloffpad'` is treated as boolean: `0` disables, `> 0` enables
+/// (`use_scrolloffpad`).
+///
+/// # Safety
+/// Same as [`crate::option::get_scrolloff_value`]/
+/// [`crate::option::get_scrolloffpad_value`].
+unsafe fn use_scrolloffpad(wp: &WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::option::get_scrolloff_value(wp) > 0 && crate::option::get_scrolloffpad_value(wp) > 0
+    }
+}
+
+/// Return `true` when there are not enough real buffer lines below
+/// `lnum` to satisfy the requested `so` context
+/// (`scrolloffpad_eof_pressure`).
+///
+/// # Safety
+/// `wp.w_buffer` must be a valid, non-null pointer to a live `BufT`.
+/// Same as [`use_scrolloffpad`].
+#[must_use]
+#[allow(dead_code)] // no real translated caller yet (update_topline/curs_columns, both needing the redraw pipeline)
+unsafe fn scrolloffpad_eof_pressure(
+    wp: &WinT,
+    lnum: crate::pos_defs::LinenrT,
+    so: crate::types_defs::OptInt,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { use_scrolloffpad(wp) } || so <= 0 {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*wp.w_buffer }.b_ml.ml_line_count;
+    // Use subtraction to avoid signed overflow in "lnum + so".
+    i64::from(lnum) > i64::from(line_count) - so
 }
 
 /// Set `wp.w_virtcol`/`w_valid`'s `VALID_VIRTCOL` bit for virtual
@@ -1107,5 +1236,187 @@ mod tests {
         unsafe { set_topline(&mut win as *mut WinT, 100) };
         // 6 + (100 - 4) = 102, clamped down to 5 + 1 = 6.
         assert_eq!(win.w_botline, 6);
+    }
+
+    #[test]
+    fn sms_marker_overlap_zero_in_showbreak_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_sbr = Some(b">>".to_vec());
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, -1) }, 0);
+    }
+
+    #[test]
+    fn sms_marker_overlap_one_when_list_and_precedes_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_list = 1;
+        win.w_p_lcs_chars.prec = u32::from(b'<');
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, -1) }, 1);
+    }
+
+    #[test]
+    fn sms_marker_overlap_uses_extra2_directly_when_given() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        // No showbreak, no list+precedes - falls through to the
+        // extra2-based formula.
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, 5) }, 0); // > 3
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, 1) }, 2); // 3 - 1
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, 3) }, 0); // 3 - 3
+    }
+
+    #[test]
+    fn sms_marker_overlap_computes_extra2_from_win_col_off_when_negative_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        // No number/foldcolumn/sign/cpo 'n' - win_col_off == win_col_off2 == 0,
+        // so extra2 = 0 - 0 = 0, giving 3 - 0 = 3.
+        assert_eq!(unsafe { sms_marker_overlap(&mut win, -1) }, 3);
+    }
+
+    #[test]
+    fn skipcol_from_plines_zero_offset_is_zero() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        assert_eq!(unsafe { skipcol_from_plines(&mut win, 0) }, 0);
+    }
+
+    #[test]
+    fn skipcol_from_plines_one_offset_is_width1() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        // width1 = 20 - win_col_off(0) = 20.
+        assert_eq!(unsafe { skipcol_from_plines(&mut win, 1) }, 20);
+    }
+
+    #[test]
+    fn skipcol_from_plines_multiple_offset_adds_width2_per_extra_line() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 20;
+        // width1 = 20, width2 = width1 + win_col_off2(0) = 20.
+        // skipcol = width1(20) + width2(20) * (3 - 1) = 20 + 40 = 60.
+        assert_eq!(unsafe { skipcol_from_plines(&mut win, 3) }, 60);
+    }
+
+    #[test]
+    fn reset_skipcol_zero_is_a_noop() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_skipcol = 0;
+        reset_skipcol(&mut win);
+        assert_eq!(win.w_skipcol, 0);
+    }
+
+    #[test]
+    fn reset_skipcol_nonzero_is_cleared() {
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_skipcol = 42;
+        reset_skipcol(&mut win);
+        assert_eq!(win.w_skipcol, 0);
+    }
+
+    #[test]
+    fn use_scrolloffpad_false_when_scrolloff_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 0;
+        win.w_onebuf_opt.wo_sop = 3;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { use_scrolloffpad(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn use_scrolloffpad_false_when_scrolloffpad_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 5;
+        win.w_onebuf_opt.wo_sop = 0;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { use_scrolloffpad(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn use_scrolloffpad_true_when_both_positive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 5;
+        win.w_onebuf_opt.wo_sop = 3;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(unsafe { use_scrolloffpad(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn scrolloffpad_eof_pressure_false_when_use_scrolloffpad_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 10;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 0; // use_scrolloffpad() false
+        win.w_onebuf_opt.wo_sop = 3;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn scrolloffpad_eof_pressure_false_when_so_not_positive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 10;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 5;
+        win.w_onebuf_opt.wo_sop = 3;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 0) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn scrolloffpad_eof_pressure_true_near_end_of_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { ..Default::default() };
+        buf.b_ml.ml_line_count = 10;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 5;
+        win.w_onebuf_opt.wo_sop = 3;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        // lnum(9) > line_count(10) - so(2) = 8 -> true.
+        assert!(unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
+        // lnum(8) > line_count(10) - so(2) = 8 -> false (not strictly greater).
+        assert!(!unsafe { scrolloffpad_eof_pressure(&win, 8, 2) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 }
