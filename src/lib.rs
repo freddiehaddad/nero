@@ -74,6 +74,8 @@ pub mod normal_defs;
 pub mod option;
 pub mod option_defs;
 pub mod option_vars;
+pub mod ops;
+pub mod ops_defs;
 pub mod os;
 pub mod path;
 pub mod plines;
