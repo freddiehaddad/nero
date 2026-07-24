@@ -127,6 +127,29 @@
 //! `iemsg("INTERNAL: ...")` on an empty stack becomes a
 //! `debug_assert!`, matching this crate's established internal-
 //! invariant-violation policy.
+//!
+//! Also translated: the previously-missing `get_funccal_args_ht` (its
+//! own module-doc mention from an earlier pass never actually made it
+//! into real code - caught and fixed by a fresh full function-name
+//! diff re-scan) and `cleanup_function_call` - the real function-call
+//! epilogue: frees `fc` outright if nothing keeps it alive, or else
+//! bumps the reference count of any escaping `a:`/`l:` value (via the
+//! already-real `tv_copy`) and links `fc` onto `PREVIOUS_FUNCCAL` for
+//! later garbage collection. `free_funccal_contents`'s own doc comment
+//! had already anticipated this exact function by name as its real
+//! precondition, well before it was written. The original's own
+//! `tv_copy(&di->di_tv, &di->di_tv)` self-copy idiom (explicitly
+//! documented as supported by `tv_copy` itself) is translated as
+//! clone-then-`tv_copy` instead of a literal simultaneous `&`/`&mut`
+//! aliasing of the same memory - Rust's aliasing rules don't permit
+//! the latter, unlike C, even though the net effect is identical. A
+//! new `CLEANUP_FUNCTION_CALL_MADE_COPY` file-static mirrors the
+//! original's own function-local `static int made_copy`. The
+//! GC-nudge threshold (`4096 * 1024 / sizeof(*fc)`) keeps the same
+//! formula but necessarily yields a different concrete number here,
+//! since `size_of::<FunccallT>()` has a structurally different Rust
+//! layout than the real C `funccall_T` - a heuristic memory-pressure
+//! trip point, not a correctness-affecting value.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -597,11 +620,141 @@ unsafe fn free_funccal(fc: *mut FunccallT) {
     drop(unsafe { Box::from_raw(fc) });
 }
 
+/// Recursion-free "have we made lots of copies lately" counter for
+/// [`cleanup_function_call`] - matches the original's own function-
+/// local `static int made_copy`.
+#[allow(dead_code)] // no real translated caller yet (cleanup_function_call's own only real caller, call_user_func, isn't translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
+static CLEANUP_FUNCTION_CALL_MADE_COPY: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Clean up after a function call: free `fc` if nothing keeps it
+/// alive, or else bump the reference count of any `a:`/`l:` value
+/// that's escaping (e.g. returned as `a:000`, assigned to a global, or
+/// captured by a closure) and link `fc` onto `PREVIOUS_FUNCCAL` for
+/// later garbage collection (`cleanup_function_call`).
+///
+/// # Safety
+/// `fc` must be a valid, non-null pointer to a live `FunccallT` whose
+/// `fc_l_avars`/`fc_l_varlist` items, if any escape (kept when
+/// `free_fc` ends up `false`), satisfy [`crate::eval::typval::tv_copy`]'s
+/// own safety contract; if `fc` ends up freed, it must satisfy
+/// [`free_funccal`]'s own safety contract.
+#[allow(dead_code)] // no real translated caller yet (call_user_func, its only real caller, isn't translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
+unsafe fn cleanup_function_call(fc: *mut FunccallT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fc_ref = unsafe { &mut *fc };
+    let may_free_fc = fc_ref.fc_refcount <= 0;
+    let mut free_fc = true;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ref.fc_caller };
+
+    // Free all l: variables if not referred.
+    if may_free_fc && fc_ref.fc_l_vars.dv_refcount == crate::eval::typval_defs::DO_NOT_FREE_CNT {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::vars::vars_clear(&mut fc_ref.fc_l_vars) };
+    } else {
+        free_fc = false;
+    }
+
+    // If the a:000 list and the l: and a: dicts are not referenced and
+    // there is no closure using it, we can free the funccall_T and
+    // what's in it.
+    if may_free_fc && fc_ref.fc_l_avars.dv_refcount == crate::eval::typval_defs::DO_NOT_FREE_CNT {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::vars::vars_clear_ext(&mut fc_ref.fc_l_avars, false) };
+    } else {
+        free_fc = false;
+
+        // Make a copy of the a: variables, since we didn't do that
+        // above. Bumps any List/Dict/Blob/Partial value's own
+        // reference count (or deep-clones an owned String) via
+        // tv_copy - matching the original's own `tv_copy(&di->di_tv,
+        // &di->di_tv)` self-copy idiom, but routed through a fresh
+        // `old` clone first: Rust's aliasing rules don't allow a live
+        // `&TypvalT` and `&mut TypvalT` to the SAME location
+        // simultaneously (unlike C), even though the original's own
+        // doc comment on `tv_copy` explicitly allows `from`/`to` to
+        // coincide. Cloning first, then calling `tv_copy(&old, &mut
+        // real)`, achieves the exact same net effect (the "from" value
+        // tv_copy reads is byte-for-byte identical to what a true
+        // self-copy would have read) with no actual memory aliasing.
+        let items: Vec<*mut DictitemT> = fc_ref.fc_l_avars.dv_index.values().copied().collect();
+        for item in items {
+            // SAFETY: item is a live DictitemT from fc_l_avars's own
+            // dv_index.
+            let old = unsafe { (*item).di_tv.clone() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_copy(&old, &mut (*item).di_tv) };
+        }
+    }
+
+    if may_free_fc && fc_ref.fc_l_varlist.lv_refcount == crate::eval::typval_defs::DO_NOT_FREE_CNT {
+        fc_ref.fc_l_varlist.lv_first = std::ptr::null_mut();
+    } else {
+        free_fc = false;
+
+        // Make a copy of the a:000 items, since we didn't do that
+        // above - see the fc_l_avars loop above for why this clones
+        // first rather than literally self-copying.
+        let mut cur = fc_ref.fc_l_varlist.lv_first;
+        while !cur.is_null() {
+            // SAFETY: cur walks fc_l_varlist's own real lv_first/
+            // li_next chain.
+            let old = unsafe { (*cur).li_tv.clone() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_copy(&old, &mut (*cur).li_tv) };
+            // SAFETY: forwarded from this function's own safety doc.
+            cur = unsafe { (*cur).li_next };
+        }
+    }
+
+    if free_fc {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { free_funccal(fc) };
+    } else {
+        // "fc" is still in use. This can happen when returning
+        // "a:000", assigning "l:" to a global variable or defining a
+        // closure. Link "fc" in the list for garbage collection later.
+        // SAFETY: forwarded from this function's own safety doc.
+        fc_ref.fc_caller = unsafe { *PREVIOUS_FUNCCAL.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = fc };
+
+        // SAFETY: only touches this module's own file-static cell.
+        let made_copy = unsafe { CLEANUP_FUNCTION_CALL_MADE_COPY.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        if g.want_garbage_collect {
+            // If garbage collector is ready, clear count.
+            *made_copy = 0;
+        } else {
+            *made_copy += 1;
+            // The original computes this threshold from
+            // `sizeof(*fc)` (the real C `funccall_T`'s own byte size)
+            // - `FunccallT`'s Rust layout is structurally different
+            // (owned `Vec`s/`HashMap`s instead of raw C arrays/
+            // pointers), so `size_of::<FunccallT>()` gives a genuinely
+            // different byte count here. This only changes the exact
+            // trip point of a "we've made a lot of copies, worth ~4
+            // Mbyte, nudge the GC" heuristic - not a correctness-
+            // affecting value - so the same formula is kept as-is
+            // rather than hand-picking a different constant.
+            let threshold = (4096 * 1024) / std::mem::size_of::<FunccallT>() as i32;
+            if *made_copy >= threshold {
+                *made_copy = 0;
+                g.want_garbage_collect = true;
+            }
+        }
+    }
+}
+
 /// Free `fc` and what it contains (`free_funccal_contents`).
 ///
 /// Can be called only when `fc` is kept beyond the period it was
-/// called, i.e. after `cleanup_function_call(fc)` (not translated -
-/// no real caller constructs a `FunccallT` this way yet).
+/// called, i.e. after [`cleanup_function_call`] (its real caller,
+/// `call_user_func`, isn't translated yet, so nothing currently
+/// constructs a `FunccallT` this way in practice).
 ///
 /// # Safety
 /// Same as [`free_funccal`], plus every item in `fc.fc_l_vars`/
@@ -927,6 +1080,19 @@ pub fn get_funccal_args_var() -> *mut ScopeDictDictItem {
     // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
     // get_funccal's own safety precondition.
     unsafe { &mut (*get_funccal()).fc_l_avars_var as *mut ScopeDictDictItem }
+}
+
+/// @return the hashtable used for arguments in the current funccal, or
+/// null if there is no current funccal (`get_funccal_args_ht`).
+#[must_use]
+pub fn get_funccal_args_ht() -> *mut HashtabT {
+    let d = get_funccal_args_dict();
+    if d.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: get_funccal_args_dict only ever returns null or a
+    // pointer to a live DictT's own fc_l_avars field.
+    unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
 }
 
 /// Add a number variable `name` to dict `dp` with value `nr`
@@ -1336,6 +1502,161 @@ mod tests {
         unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
     }
 
+    // ---- cleanup_function_call ------------------------------------------
+
+    #[test]
+    fn cleanup_function_call_frees_fc_when_fully_unreferenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        let mut caller = Box::new(FunccallT::default());
+        let caller_ptr = caller.as_mut() as *mut FunccallT;
+
+        let mut fc = Box::new(FunccallT { fc_refcount: 0, fc_caller: caller_ptr, ..Default::default() });
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_avars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        fc.fc_l_varlist.lv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        std::mem::forget(fc); // cleanup_function_call frees it below.
+
+        unsafe { cleanup_function_call(fc_ptr) };
+
+        // current_funccal restored to fc's own (real) caller - not left
+        // pointing at the now-freed fc.
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, caller_ptr);
+        // fc was fully freeable, so it must NOT have been linked onto
+        // previous_funccal.
+        assert!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }.is_null());
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn cleanup_function_call_keeps_fc_alive_when_still_referenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        // fc_refcount > 0 - may_free_fc is false, so every branch below
+        // takes its "still in use" path regardless of the individual
+        // dv_refcount/lv_refcount values.
+        let fc = Box::into_raw(Box::new(FunccallT { fc_refcount: 1, ..Default::default() }));
+
+        unsafe { cleanup_function_call(fc) };
+
+        // Linked onto previous_funccal for later GC, not freed.
+        assert_eq!(unsafe { *PREVIOUS_FUNCCAL.get_mut() }, fc);
+        assert!(unsafe { (*fc).fc_caller }.is_null()); // was the only entry
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { drop(Box::from_raw(fc)) };
+    }
+
+    #[test]
+    fn cleanup_function_call_bumps_an_escaping_avars_lists_own_refcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(list) };
+        assert_eq!(unsafe { (*list).lv_refcount }, 1);
+
+        let mut fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        let item = crate::eval::typval::tv_dict_item_alloc(b"1");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut fc.fc_l_avars, item) };
+        let fc_ptr = Box::into_raw(fc);
+
+        unsafe { cleanup_function_call(fc_ptr) };
+
+        // The escaping a: dict's own List value had its reference count
+        // bumped by tv_copy - it is no longer solely owned by fc alone.
+        assert_eq!(unsafe { (*list).lv_refcount }, 2);
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+        unsafe { drop(Box::from_raw(fc_ptr)) };
+    }
+
+    #[test]
+    fn cleanup_function_call_bumps_an_escaping_varlist_items_own_list_refcount() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let inner_list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(inner_list) };
+        assert_eq!(unsafe { (*inner_list).lv_refcount }, 1);
+
+        let mut fc = Box::new(FunccallT { fc_refcount: 1, ..Default::default() });
+        let mut li = Box::new(crate::eval::typval_defs::ListitemT {
+            li_next: std::ptr::null_mut(),
+            li_prev: std::ptr::null_mut(),
+            li_tv: TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(inner_list) },
+        });
+        let li_ptr = li.as_mut() as *mut _;
+        std::mem::forget(li);
+        fc.fc_l_varlist.lv_first = li_ptr;
+        fc.fc_l_varlist.lv_last = li_ptr;
+        fc.fc_l_varlist.lv_len = 1;
+        let fc_ptr = Box::into_raw(fc);
+
+        unsafe { cleanup_function_call(fc_ptr) };
+
+        assert_eq!(unsafe { (*inner_list).lv_refcount }, 2);
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::eval::typval::tv_list_unref(inner_list) };
+        unsafe { crate::eval::typval::tv_list_unref(inner_list) };
+        unsafe { drop(Box::from_raw(li_ptr)) };
+        unsafe { drop(Box::from_raw(fc_ptr)) };
+    }
+
+    #[test]
+    fn cleanup_function_call_triggers_garbage_collect_once_made_copy_threshold_hit() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.want_garbage_collect = false;
+
+        let threshold = (4096 * 1024) / std::mem::size_of::<FunccallT>() as i32;
+        *unsafe { CLEANUP_FUNCTION_CALL_MADE_COPY.get_mut() } = threshold - 1;
+
+        let fc = Box::into_raw(Box::new(FunccallT { fc_refcount: 1, ..Default::default() }));
+        unsafe { cleanup_function_call(fc) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.want_garbage_collect);
+        assert_eq!(*unsafe { CLEANUP_FUNCTION_CALL_MADE_COPY.get_mut() }, 0);
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.want_garbage_collect = false;
+        unsafe { drop(Box::from_raw(fc)) };
+    }
+
+    #[test]
+    fn cleanup_function_call_resets_made_copy_when_garbage_collect_already_wanted() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.want_garbage_collect = true;
+        *unsafe { CLEANUP_FUNCTION_CALL_MADE_COPY.get_mut() } = 5;
+
+        let fc = Box::into_raw(Box::new(FunccallT { fc_refcount: 1, ..Default::default() }));
+        unsafe { cleanup_function_call(fc) };
+
+        assert_eq!(*unsafe { CLEANUP_FUNCTION_CALL_MADE_COPY.get_mut() }, 0);
+
+        unsafe { *PREVIOUS_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.want_garbage_collect = false;
+        unsafe { drop(Box::from_raw(fc)) };
+    }
+
     // ---- create_funccal / remove_funccal / current_func_returned -------
 
     #[test]
@@ -1488,18 +1809,19 @@ mod tests {
     }
 
     #[test]
-    fn get_funccal_args_dict_and_var_null_without_a_current_funccal() {
+    fn get_funccal_args_dict_and_ht_and_var_null_without_a_current_funccal() {
         let _lock = crate::globals::global_state_test_lock();
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
         assert!(get_funccal_args_dict().is_null());
+        assert!(get_funccal_args_ht().is_null());
         assert!(get_funccal_args_var().is_null());
     }
 
     #[test]
-    fn get_funccal_args_dict_and_var_point_at_the_real_fields() {
+    fn get_funccal_args_dict_and_ht_and_var_point_at_the_real_fields() {
         let _lock = crate::globals::global_state_test_lock();
         let mut fc = Box::new(FunccallT::default());
-        // The original gates get_funccal_args_dict/_var on
+        // The original gates get_funccal_args_dict/_ht/_var on
         // fc_l_vars's own refcount, not fc_l_avars's - preserved here.
         fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
         let fc_ptr = fc.as_mut() as *mut FunccallT;
@@ -1507,6 +1829,9 @@ mod tests {
 
         let d = get_funccal_args_dict();
         assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_avars as *mut DictT });
+
+        let ht = get_funccal_args_ht();
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
 
         let v = get_funccal_args_var();
         assert_eq!(v, unsafe { &mut (*fc_ptr).fc_l_avars_var as *mut ScopeDictDictItem });
