@@ -150,6 +150,15 @@
 //! since `size_of::<FunccallT>()` has a structurally different Rust
 //! layout than the real C `funccall_T` - a heuristic memory-pressure
 //! trip point, not a correctness-affecting value.
+//!
+//! Also translated: `can_add_defer` (whether currently inside a
+//! function call - layered directly on the already-real
+//! `get_current_funccal`). `add_defer`/`handle_defer_one`/
+//! `invoke_all_defer` (`:defer`'s own storage/invocation) are NOT
+//! translated - they need a new `DeferT` struct plus a change to
+//! `FunccallT.fc_defer`'s current bare `GarrayT` type, and ultimately
+//! the same `call_func` dispatch machinery most of this file's
+//! remaining functions need.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -575,6 +584,22 @@ pub fn get_current_funccal() -> *mut FunccallT {
 /// `funccal_stack` save/restore mechanism (`set_current_funccal`).
 pub fn set_current_funccal(fc: *mut FunccallT) {
     unsafe { *CURRENT_FUNCCAL.get_mut() = fc };
+}
+
+/// Whether currently inside a function call (`can_add_defer`).
+///
+/// The original's `semsg(_(e_str_not_inside_function), "defer")` on
+/// `false` is omitted (message display, not tractable yet) - the
+/// boolean result itself is kept exactly. `add_defer`/
+/// `handle_defer_one`/`invoke_all_defer` (`:defer`'s own storage and
+/// invocation) are NOT translated here - they need a new `DeferT`
+/// struct plus a change to `FunccallT.fc_defer`'s current bare
+/// `GarrayT` type, and ultimately the same function-call dispatch
+/// machinery (`call_func`) most of this file's remaining functions
+/// need, so are left as part of that larger, separate undertaking.
+#[must_use]
+pub fn can_add_defer() -> bool {
+    !get_current_funccal().is_null()
 }
 
 /// Free `fc` (`free_funccal`).
@@ -2324,6 +2349,22 @@ mod tests {
 
         set_current_funccal(std::ptr::null_mut());
         assert!(get_current_funccal().is_null());
+    }
+
+    #[test]
+    fn can_add_defer_false_without_a_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_current_funccal(std::ptr::null_mut());
+        assert!(!can_add_defer());
+    }
+
+    #[test]
+    fn can_add_defer_true_with_a_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default());
+        set_current_funccal(fc.as_mut() as *mut FunccallT);
+        assert!(can_add_defer());
+        set_current_funccal(std::ptr::null_mut());
     }
 
     #[test]
