@@ -1231,6 +1231,19 @@ pub fn tv_dict_has_key(d: Option<&mut DictT>, key: &[u8]) -> bool {
     tv_dict_find(d, key).is_some()
 }
 
+/// Get the number of items in a dictionary, or `0` if `d` is null
+/// (`tv_dict_len`, `eval/typval.h`'s own `static inline`).
+///
+/// Uses [`DictT::dv_index`]'s own length rather than the original's
+/// `dv_hashtab.ht_used` - both are always kept in exact sync (see
+/// `dv_index`'s own doc comment), and `dv_index` is already this
+/// crate's established "source of truth" for a dict's live items
+/// (e.g. [`tv_dict_free_contents`]'s own usage above).
+#[must_use]
+pub fn tv_dict_len(d: Option<&DictT>) -> i32 {
+    d.map_or(0, |d| d.dv_index.len() as i32)
+}
+
 /// Get a string item from a dictionary (`tv_dict_get_string`/
 /// `tv_dict_get_string_buf`).
 ///
@@ -1537,6 +1550,19 @@ pub unsafe fn tv_blob_len(b: *const crate::eval::typval_defs::BlobT) -> i32 {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { (*b).bv_ga.ga_len }
+}
+
+/// Get one byte from a blob (`tv_blob_get`, `eval/typval.h`'s own
+/// `static inline`).
+///
+/// # Safety
+/// `b` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::BlobT`], and `idx` must be in bounds
+/// (`< tv_blob_len(b)`).
+#[must_use]
+pub unsafe fn tv_blob_get(b: *const crate::eval::typval_defs::BlobT, idx: i32) -> u8 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (&(*b).bv_ga.ga_data)[idx as usize] }
 }
 
 /// Set the return value of `tv` to a blob (`tv_blob_set_ret`,
@@ -2250,6 +2276,248 @@ pub unsafe fn tv_list_concat(
 
     tv.value = TypvalValue::List(l);
     true
+}
+
+// Comparison:
+
+/// Return true if `tv` holds a function reference, `Func` or
+/// `Partial` (`tv_is_func`, `eval/typval.h`'s own `static inline`).
+#[must_use]
+pub fn tv_is_func(tv: &TypvalT) -> bool {
+    matches!(tv.value, TypvalValue::Func(_) | TypvalValue::Partial(_))
+}
+
+/// Recursion depth limit for [`tv_equal`] - reduced each time hit, to
+/// avoid endless work on deeply-linked (not necessarily cyclic)
+/// structures (`tv_equal_recurse_limit`).
+static TV_EQUAL_RECURSE_LIMIT: GlobalCell<i32> = GlobalCell::new(1000);
+
+/// Recursion depth counter shared across the whole mutually-recursive
+/// `tv_equal`/`tv_list_equal`/`tv_dict_equal`/`func_equal` family -
+/// matches the original's own function-local `static int
+/// recursive_cnt` inside `tv_equal` (translated as a module-level
+/// `GlobalCell`, since that C idiom has no direct Rust equivalent
+/// usable the same way from ordinary safe-looking call sites).
+static TV_EQUAL_RECURSIVE_CNT: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Check whether two lists are equal (`tv_list_equal`).
+///
+/// # Safety
+/// `l1`/`l2`, if non-null, must be valid pointers to live
+/// [`crate::eval::typval_defs::ListT`]s whose every item's `li_tv`
+/// satisfies [`tv_equal`]'s own safety contract.
+#[must_use]
+pub unsafe fn tv_list_equal(
+    l1: *const crate::eval::typval_defs::ListT,
+    l2: *const crate::eval::typval_defs::ListT,
+    ic: bool,
+) -> bool {
+    if l1 == l2 {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_list_len(l1) } != unsafe { tv_list_len(l2) } {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_list_len(l1) } == 0 {
+        // empty and NULL list are considered equal
+        return true;
+    }
+    if l1.is_null() || l2.is_null() {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item1 = unsafe { tv_list_first(l1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item2 = unsafe { tv_list_first(l2) };
+    while !item1.is_null() && !item2.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { tv_equal(&(*item1).li_tv, &(*item2).li_tv, ic) } {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            item1 = (*item1).li_next;
+            item2 = (*item2).li_next;
+        }
+    }
+    true
+}
+
+/// Check whether two dictionaries are equal (`tv_dict_equal`).
+///
+/// # Safety
+/// `d1`/`d2`, if non-null, must be valid pointers to live
+/// [`DictT`]s whose every item's `di_tv` satisfies [`tv_equal`]'s own
+/// safety contract.
+#[must_use]
+pub unsafe fn tv_dict_equal(d1: *mut DictT, d2: *mut DictT, ic: bool) -> bool {
+    if d1 == d2 {
+        return true;
+    }
+    if tv_dict_len(unsafe { d1.as_ref() }) != tv_dict_len(unsafe { d2.as_ref() }) {
+        return false;
+    }
+    if tv_dict_len(unsafe { d1.as_ref() }) == 0 {
+        // empty and NULL dicts are considered equal
+        return true;
+    }
+    if d1.is_null() || d2.is_null() {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut DictitemT> = unsafe { (*d1).dv_index.values().copied().collect() };
+    for di1 in items {
+        // SAFETY: forwarded from this function's own safety doc. di_key
+        // always carries a trailing NUL terminator (matching hi_key's
+        // C-string contract - see tv_dict_item_alloc's own doc
+        // comment), which tv_dict_find's own key parameter does NOT
+        // expect (it takes the "clean" logical name) - strip it here.
+        let di_key = unsafe { &(*di1).di_key };
+        let key = di_key[..di_key.len() - 1].to_vec();
+        // SAFETY: forwarded from this function's own safety doc.
+        let Some(di2) = tv_dict_find(unsafe { d2.as_mut() }, &key) else {
+            return false;
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { tv_equal(&(*di1).di_tv, &(*di2).di_tv, ic) } {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check whether two blobs are equal (`tv_blob_equal`).
+///
+/// # Safety
+/// `b1`/`b2`, if non-null, must be valid pointers to live
+/// [`crate::eval::typval_defs::BlobT`]s.
+#[must_use]
+pub unsafe fn tv_blob_equal(
+    b1: *const crate::eval::typval_defs::BlobT,
+    b2: *const crate::eval::typval_defs::BlobT,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len1 = unsafe { tv_blob_len(b1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len2 = unsafe { tv_blob_len(b2) };
+
+    // empty and NULL are considered the same
+    if len1 == 0 && len2 == 0 {
+        return true;
+    }
+    if b1 == b2 {
+        return true;
+    }
+    if len1 != len2 {
+        return false;
+    }
+
+    for i in 0..len1 {
+        // SAFETY: forwarded from this function's own safety doc; i is
+        // in [0, len1) and len1 == tv_blob_len(b1)/(b2), so both
+        // accesses are in bounds.
+        if unsafe { tv_blob_get(b1, i) } != unsafe { tv_blob_get(b2, i) } {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare two Vimscript values. Like `"=="`, but strings and numbers
+/// are different, as well as floats and numbers (`tv_equal`).
+///
+/// Too-deeply-nested structures may be considered equal even if they
+/// are not (matches the original's own documented caveat).
+///
+/// # Safety
+/// If `tv1`/`tv2`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with
+/// a non-null pointer, that pointer must be a valid, live
+/// `ListT`/`DictT`/`BlobT`/`PartialT`, recursively satisfying this
+/// same contract for every value it (in)directly contains.
+pub unsafe fn tv_equal(tv1: &TypvalT, tv2: &TypvalT, ic: bool) -> bool {
+    if !(tv_is_func(tv1) && tv_is_func(tv2)) && tv1.value.var_type() != tv2.value.var_type() {
+        return false;
+    }
+
+    // Catch lists and dicts that have an endless loop by limiting
+    // recursiveness to a limit. We guess they are equal then.
+    // SAFETY: TV_EQUAL_RECURSIVE_CNT/TV_EQUAL_RECURSE_LIMIT are
+    // private, crate-internal GlobalCells only ever touched by this
+    // mutually-recursive function family.
+    let recursive_cnt = unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() };
+    if recursive_cnt == 0 {
+        unsafe { *TV_EQUAL_RECURSE_LIMIT.get_mut() = 1000 };
+    }
+    if recursive_cnt >= unsafe { *TV_EQUAL_RECURSE_LIMIT.get_mut() } {
+        unsafe { *TV_EQUAL_RECURSE_LIMIT.get_mut() -= 1 };
+        return true;
+    }
+
+    match &tv1.value {
+        TypvalValue::List(l1) => {
+            let TypvalValue::List(l2) = &tv2.value else { unreachable!() };
+            let (l1, l2) = (*l1, *l2);
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() += 1 };
+            // SAFETY: forwarded from this function's own safety doc.
+            let r = unsafe { tv_list_equal(l1, l2, ic) };
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() -= 1 };
+            r
+        }
+        TypvalValue::Dict(d1) => {
+            let TypvalValue::Dict(d2) = &tv2.value else { unreachable!() };
+            let (d1, d2) = (*d1, *d2);
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() += 1 };
+            // SAFETY: forwarded from this function's own safety doc.
+            let r = unsafe { tv_dict_equal(d1, d2, ic) };
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() -= 1 };
+            r
+        }
+        TypvalValue::Partial(_) | TypvalValue::Func(_) => {
+            let tv1_null_partial = matches!(&tv1.value, TypvalValue::Partial(p) if p.is_null());
+            let tv2_null_partial = matches!(&tv2.value, TypvalValue::Partial(p) if p.is_null());
+            if tv1_null_partial || tv2_null_partial {
+                return false;
+            }
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() += 1 };
+            // SAFETY: forwarded from this function's own safety doc.
+            let r = unsafe { crate::eval::eval::func_equal(tv1, tv2, ic) };
+            unsafe { *TV_EQUAL_RECURSIVE_CNT.get_mut() -= 1 };
+            r
+        }
+        TypvalValue::Blob(b1) => {
+            let TypvalValue::Blob(b2) = &tv2.value else { unreachable!() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_blob_equal(*b1, *b2) }
+        }
+        TypvalValue::Number(n1) => {
+            let TypvalValue::Number(n2) = &tv2.value else { unreachable!() };
+            n1 == n2
+        }
+        TypvalValue::Float(f1) => {
+            let TypvalValue::Float(f2) = &tv2.value else { unreachable!() };
+            f1 == f2
+        }
+        TypvalValue::String(_) => {
+            let s1 = tv_get_string(tv1);
+            let s2 = tv_get_string(tv2);
+            crate::mbyte::mb_strcmp_ic(ic, &s1, &s2) == 0
+        }
+        TypvalValue::Bool(b1) => {
+            let TypvalValue::Bool(b2) = &tv2.value else { unreachable!() };
+            b1 == b2
+        }
+        TypvalValue::Special(s1) => {
+            let TypvalValue::Special(s2) = &tv2.value else { unreachable!() };
+            s1 == s2
+        }
+        // VAR_UNKNOWN can be the result of an invalid expression,
+        // let's say it does not equal anything, not even self.
+        TypvalValue::Unknown => false,
+    }
 }
 
 #[cfg(test)]
@@ -4198,5 +4466,352 @@ mod tests {
         assert_eq!(tv_check_for_list_or_blob_arg(&args, 0), OK);
         assert_eq!(tv_check_for_list_or_blob_arg(&args, 1), OK);
         assert_eq!(tv_check_for_list_or_blob_arg(&args, 2), FAIL);
+    }
+
+    // ---- tv_is_func / tv_dict_len / tv_blob_get -------------------------
+
+    #[test]
+    fn tv_is_func_true_for_func_and_partial_only() {
+        assert!(tv_is_func(&TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Func(None) }));
+        assert!(tv_is_func(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(std::ptr::null_mut())
+        }));
+        assert!(!tv_is_func(&number_tv(1)));
+        assert!(!tv_is_func(&string_tv(b"x")));
+    }
+
+    #[test]
+    fn tv_dict_len_null_is_zero() {
+        assert_eq!(tv_dict_len(None), 0);
+    }
+
+    #[test]
+    fn tv_dict_len_counts_real_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_len(d.as_ref()), 0);
+            tv_dict_add_nr(&mut *d, b"a", 1);
+            tv_dict_add_nr(&mut *d, b"b", 2);
+            assert_eq!(tv_dict_len(d.as_ref()), 2);
+            tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn tv_blob_get_reads_the_right_byte() {
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        b.bv_ga.ga_data = vec![10, 20, 30];
+        b.bv_ga.ga_len = 3;
+        unsafe {
+            assert_eq!(tv_blob_get(&b as *const _, 0), 10);
+            assert_eq!(tv_blob_get(&b as *const _, 2), 30);
+        }
+    }
+
+    // ---- tv_list_equal ---------------------------------------------------
+
+    #[test]
+    fn tv_list_equal_null_and_empty_are_equal() {
+        let l = tv_list_alloc(0);
+        unsafe {
+            assert!(tv_list_equal(std::ptr::null(), std::ptr::null(), false));
+            assert!(tv_list_equal(l, std::ptr::null(), false));
+            assert!(tv_list_equal(std::ptr::null(), l, false));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_equal_same_pointer_is_equal() {
+        let l = tv_list_alloc(1);
+        unsafe {
+            assert!(tv_list_equal(l, l, false));
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_equal_compares_items_in_order() {
+        let l1 = tv_list_alloc(2);
+        let l2 = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l1, 1);
+            tv_list_append_number(l1, 2);
+            tv_list_append_number(l2, 1);
+            tv_list_append_number(l2, 2);
+            assert!(tv_list_equal(l1, l2, false));
+
+            tv_list_free(l1);
+            tv_list_free(l2);
+        }
+    }
+
+    #[test]
+    fn tv_list_equal_false_for_different_length_or_content() {
+        let l1 = tv_list_alloc(2);
+        let l2 = tv_list_alloc(1);
+        let l3 = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l1, 1);
+            tv_list_append_number(l1, 2);
+            tv_list_append_number(l2, 1);
+            tv_list_append_number(l3, 1);
+            tv_list_append_number(l3, 99);
+
+            assert!(!tv_list_equal(l1, l2, false)); // different length
+            assert!(!tv_list_equal(l1, l3, false)); // different content
+
+            tv_list_free(l1);
+            tv_list_free(l2);
+            tv_list_free(l3);
+        }
+    }
+
+    // ---- tv_dict_equal ---------------------------------------------------
+
+    #[test]
+    fn tv_dict_equal_null_and_empty_are_equal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert!(tv_dict_equal(std::ptr::null_mut(), std::ptr::null_mut(), false));
+            assert!(tv_dict_equal(d, std::ptr::null_mut(), false));
+            assert!(tv_dict_equal(std::ptr::null_mut(), d, false));
+            tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_equal_compares_keys_and_values_regardless_of_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = tv_dict_alloc();
+        let d2 = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d1, b"a", 1);
+            tv_dict_add_nr(&mut *d1, b"b", 2);
+            // Insert in the opposite order - dicts are unordered.
+            tv_dict_add_nr(&mut *d2, b"b", 2);
+            tv_dict_add_nr(&mut *d2, b"a", 1);
+
+            assert!(tv_dict_equal(d1, d2, false));
+
+            tv_dict_unref(d1);
+            tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn tv_dict_equal_false_for_different_keys_or_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = tv_dict_alloc();
+        let d2 = tv_dict_alloc();
+        let d3 = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d1, b"a", 1);
+            tv_dict_add_nr(&mut *d2, b"a", 2); // different value
+            tv_dict_add_nr(&mut *d3, b"c", 1); // different key
+
+            assert!(!tv_dict_equal(d1, d2, false));
+            assert!(!tv_dict_equal(d1, d3, false));
+
+            tv_dict_unref(d1);
+            tv_dict_unref(d2);
+            tv_dict_unref(d3);
+        }
+    }
+
+    // ---- tv_blob_equal ---------------------------------------------------
+
+    #[test]
+    fn tv_blob_equal_null_and_empty_are_equal() {
+        let empty = crate::eval::typval_defs::BlobT::default();
+        unsafe {
+            assert!(tv_blob_equal(std::ptr::null(), std::ptr::null()));
+            assert!(tv_blob_equal(&empty as *const _, std::ptr::null()));
+        }
+    }
+
+    #[test]
+    fn tv_blob_equal_compares_content() {
+        let mut b1 = crate::eval::typval_defs::BlobT::default();
+        b1.bv_ga.ga_data = vec![1, 2, 3];
+        b1.bv_ga.ga_len = 3;
+        let mut b2 = crate::eval::typval_defs::BlobT::default();
+        b2.bv_ga.ga_data = vec![1, 2, 3];
+        b2.bv_ga.ga_len = 3;
+        let mut b3 = crate::eval::typval_defs::BlobT::default();
+        b3.bv_ga.ga_data = vec![1, 2, 9];
+        b3.bv_ga.ga_len = 3;
+
+        unsafe {
+            assert!(tv_blob_equal(&b1 as *const _, &b2 as *const _));
+            assert!(!tv_blob_equal(&b1 as *const _, &b3 as *const _));
+        }
+    }
+
+    // ---- tv_equal ---------------------------------------------------------
+
+    #[test]
+    fn tv_equal_number_string_and_float_are_mutually_distinct_types() {
+        unsafe {
+            assert!(!tv_equal(&number_tv(1), &string_tv(b"1"), false));
+            assert!(!tv_equal(
+                &number_tv(1),
+                &TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.0) },
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn tv_equal_number_compares_value() {
+        unsafe {
+            assert!(tv_equal(&number_tv(5), &number_tv(5), false));
+            assert!(!tv_equal(&number_tv(5), &number_tv(6), false));
+        }
+    }
+
+    #[test]
+    fn tv_equal_string_respects_ignorecase_flag() {
+        unsafe {
+            assert!(!tv_equal(&string_tv(b"FOO"), &string_tv(b"foo"), false));
+            assert!(tv_equal(&string_tv(b"FOO"), &string_tv(b"foo"), true));
+        }
+    }
+
+    #[test]
+    fn tv_equal_float_and_bool_and_special_compare_value() {
+        let f1 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.5) };
+        let f2 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.5) };
+        let f3 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(2.5) };
+        let bool_true = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+        };
+        let special = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+        };
+        unsafe {
+            assert!(tv_equal(&f1, &f2, false));
+            assert!(!tv_equal(&f1, &f3, false));
+            assert!(tv_equal(&bool_true, &bool_true.clone(), false));
+            assert!(tv_equal(&special, &special.clone(), false));
+        }
+    }
+
+    #[test]
+    fn tv_equal_unknown_never_equals_anything_not_even_self() {
+        let u = unknown_tv();
+        assert!(!unsafe { tv_equal(&u, &u, false) });
+    }
+
+    #[test]
+    fn tv_equal_list_delegates_to_tv_list_equal() {
+        let l1 = tv_list_alloc(1);
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(l1, 42);
+            tv_list_append_number(l2, 42);
+            let tv1 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(l1) };
+            let tv2 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(l2) };
+            assert!(tv_equal(&tv1, &tv2, false));
+
+            tv_list_append_number(l2, 99);
+            assert!(!tv_equal(&tv1, &tv2, false));
+
+            tv_list_free(l1);
+            tv_list_free(l2);
+        }
+    }
+
+    #[test]
+    fn tv_equal_dict_delegates_to_tv_dict_equal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = tv_dict_alloc();
+        let d2 = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d1, b"a", 1);
+            tv_dict_add_nr(&mut *d2, b"a", 1);
+            let tv1 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d1) };
+            let tv2 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d2) };
+            assert!(tv_equal(&tv1, &tv2, false));
+
+            tv_dict_add_nr(&mut *d2, b"b", 2);
+            assert!(!tv_equal(&tv1, &tv2, false));
+
+            tv_dict_unref(d1);
+            tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn tv_equal_blob_delegates_to_tv_blob_equal() {
+        let mut b1 = crate::eval::typval_defs::BlobT::default();
+        b1.bv_ga.ga_data = vec![1, 2];
+        b1.bv_ga.ga_len = 2;
+        let mut b2 = crate::eval::typval_defs::BlobT::default();
+        b2.bv_ga.ga_data = vec![1, 2];
+        b2.bv_ga.ga_len = 2;
+        let tv1 =
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(&mut b1 as *mut _) };
+        let tv2 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(&mut b2 as *mut _) };
+        assert!(unsafe { tv_equal(&tv1, &tv2, false) });
+    }
+
+    #[test]
+    fn tv_equal_func_and_partial_can_cross_compare() {
+        // A VAR_FUNC and a VAR_PARTIAL (with no dict/args, matching a
+        // plain function reference) ARE allowed to compare equal when
+        // their names match - matches the original's own
+        // `tv_is_func(*tv1) && tv_is_func(*tv2)` bypass of the
+        // strict-type-match check.
+        let func_tv =
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Func(Some(b"Foo".to_vec())) };
+        let mut partial = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"Foo".to_vec()),
+            ..Default::default()
+        };
+        let partial_tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(&mut partial as *mut _),
+        };
+        assert!(unsafe { tv_equal(&func_tv, &partial_tv, false) });
+    }
+
+    #[test]
+    fn tv_equal_null_partial_never_equals_anything() {
+        let p1 = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(std::ptr::null_mut()),
+        };
+        let p2 = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(std::ptr::null_mut()),
+        };
+        assert!(!unsafe { tv_equal(&p1, &p2, false) });
+    }
+
+    #[test]
+    fn tv_equal_recursion_limit_treats_very_deep_nesting_as_equal() {
+        // Not practical to build 1000+ levels of real nested lists for
+        // a unit test - directly exercise the recursion-limit guard
+        // instead, proving it fires and self-resets afterward.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            *TV_EQUAL_RECURSIVE_CNT.get_mut() = 5;
+            *TV_EQUAL_RECURSE_LIMIT.get_mut() = 5;
+        }
+        // recursive_cnt(5) >= limit(5): guessed equal, limit decremented.
+        assert!(unsafe { tv_equal(&number_tv(1), &number_tv(2), false) });
+        assert_eq!(unsafe { *TV_EQUAL_RECURSE_LIMIT.get_mut() }, 4);
+
+        // Reset shared state for other tests.
+        unsafe {
+            *TV_EQUAL_RECURSIVE_CNT.get_mut() = 0;
+            *TV_EQUAL_RECURSE_LIMIT.get_mut() = 1000;
+        }
     }
 }

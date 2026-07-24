@@ -42,7 +42,8 @@
 //! provides this transparently, so this translation is a thin,
 //! faithful wrapper rather than a manual realloc, but is still its OWN
 //! function (not inlined into `eval_concat_str`) since the original
-//! has a SECOND real caller, `eval/executor.c` (not yet translated).
+//! has a SECOND real caller, `eval/executor.c`'s own `tv_op_string`
+//! (now translated, see `eval/executor.rs`).
 //! `eval_concat_str` needed `eval/typval.rs`'s `tv_clear_simple`
 //! widened from private to `pub(crate)` - unlike `eval_addblob`, it
 //! doesn't statically know tv1's type ahead of time (only tv2 is
@@ -316,6 +317,109 @@ pub unsafe fn eval_concat_str(tv1: &mut TypvalT, tv2: &TypvalT) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { tv_clear_simple(tv1) };
     tv1.value = TypvalValue::String(Some(p));
+
+    true
+}
+
+/// Return `pt`'s own name if set, else its underlying function's name,
+/// or `None` for a null `pt` (`partial_name`).
+///
+/// # Safety
+/// `pt`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::PartialT`] whose own `pt_func`, if
+/// non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::UfuncT`].
+#[must_use]
+pub unsafe fn partial_name(pt: *const crate::eval::typval_defs::PartialT) -> Option<Vec<u8>> {
+    if pt.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let pt = unsafe { &*pt };
+    if let Some(name) = &pt.pt_name {
+        return Some(name.clone());
+    }
+    if !pt.pt_func.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        return Some(unsafe { &*pt.pt_func }.uf_name.clone());
+    }
+    None
+}
+
+/// Compare two `Func`/`Partial` values for equality (`func_equal`).
+///
+/// # Safety
+/// If `tv1`/`tv2`'s value is `Partial`-typed with a non-null pointer,
+/// that pointer must be a valid, live
+/// [`crate::eval::typval_defs::PartialT`] (see [`partial_name`]'s own
+/// safety doc); its own `pt_dict`, if non-null, must be a valid, live
+/// [`crate::eval::typval_defs::DictT`], recursively satisfying
+/// `tv_dict_equal`'s own safety contract; every entry of `pt_argv`
+/// must satisfy `tv_equal`'s own safety contract.
+#[must_use]
+pub unsafe fn func_equal(tv1: &TypvalT, tv2: &TypvalT, ic: bool) -> bool {
+    use crate::eval::typval::{tv_dict_equal, tv_equal};
+    use crate::eval::typval_defs::PartialT;
+
+    // empty and NULL function name considered the same
+    let partial_of = |tv: &TypvalT| -> *const PartialT {
+        match &tv.value {
+            TypvalValue::Partial(p) => *p,
+            _ => std::ptr::null(),
+        }
+    };
+    let name_of = |tv: &TypvalT, p: *const PartialT| -> Option<Vec<u8>> {
+        match &tv.value {
+            TypvalValue::Func(name) => name.clone(),
+            // SAFETY: forwarded from this function's own safety doc.
+            _ => unsafe { partial_name(p) },
+        }
+    };
+
+    let p1 = partial_of(tv1);
+    let p2 = partial_of(tv2);
+    let s1 = name_of(tv1, p1).filter(|s| !s.is_empty());
+    let s2 = name_of(tv2, p2).filter(|s| !s.is_empty());
+    match (&s1, &s2) {
+        (None, None) => {}
+        (None, Some(_)) | (Some(_), None) => return false,
+        (Some(a), Some(b)) => {
+            if a != b {
+                return false;
+            }
+        }
+    }
+
+    // empty dict and NULL dict is different
+    // SAFETY: forwarded from this function's own safety doc.
+    let d1 = if p1.is_null() { std::ptr::null_mut() } else { unsafe { (*p1).pt_dict } };
+    // SAFETY: forwarded from this function's own safety doc.
+    let d2 = if p2.is_null() { std::ptr::null_mut() } else { unsafe { (*p2).pt_dict } };
+    if d1.is_null() || d2.is_null() {
+        if d1 != d2 {
+            return false;
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { tv_dict_equal(d1, d2, ic) } {
+            return false;
+        }
+    }
+
+    // empty list and no list considered the same
+    // SAFETY: forwarded from this function's own safety doc.
+    let argv1: &[TypvalT] = if p1.is_null() { &[] } else { unsafe { &(*p1).pt_argv } };
+    // SAFETY: forwarded from this function's own safety doc.
+    let argv2: &[TypvalT] = if p2.is_null() { &[] } else { unsafe { &(*p2).pt_argv } };
+    if argv1.len() != argv2.len() {
+        return false;
+    }
+    for (a1, a2) in argv1.iter().zip(argv2.iter()) {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { tv_equal(a1, a2, ic) } {
+            return false;
+        }
+    }
 
     true
 }
@@ -1054,6 +1158,7 @@ pub fn eval_lit_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval::typval_defs::VarLockStatus;
 
     #[test]
     fn num_divide_ordinary_case() {
@@ -1966,5 +2071,139 @@ mod tests {
         let (ret, len) = eval_lit_string(b"'abc", &mut tv, false);
         assert_eq!(ret, crate::vim_defs::FAIL);
         assert_eq!(len, 0);
+    }
+
+    // ---- partial_name -----------------------------------------------
+
+    #[test]
+    fn partial_name_null_is_none() {
+        assert_eq!(unsafe { partial_name(std::ptr::null()) }, None);
+    }
+
+    #[test]
+    fn partial_name_uses_pt_name_when_set() {
+        let pt = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"MyFunc".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { partial_name(&pt as *const _) }, Some(b"MyFunc".to_vec()));
+    }
+
+    #[test]
+    fn partial_name_falls_back_to_pt_func_uf_name() {
+        let mut uf = crate::eval::typval_defs::UfuncT { uf_name: b"Underlying".to_vec(), ..Default::default() };
+        let pt = crate::eval::typval_defs::PartialT {
+            pt_name: None,
+            pt_func: &mut uf as *mut _,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { partial_name(&pt as *const _) }, Some(b"Underlying".to_vec()));
+    }
+
+    #[test]
+    fn partial_name_none_when_neither_name_nor_func_set() {
+        let pt = crate::eval::typval_defs::PartialT::default();
+        assert_eq!(unsafe { partial_name(&pt as *const _) }, None);
+    }
+
+    // ---- func_equal ---------------------------------------------------
+
+    fn func_tv(name: &[u8]) -> TypvalT {
+        TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Func(Some(name.to_vec())) }
+    }
+
+    #[test]
+    fn func_equal_true_for_same_name() {
+        assert!(unsafe { func_equal(&func_tv(b"Foo"), &func_tv(b"Foo"), false) });
+    }
+
+    #[test]
+    fn func_equal_false_for_different_names() {
+        assert!(!unsafe { func_equal(&func_tv(b"Foo"), &func_tv(b"Bar"), false) });
+    }
+
+    #[test]
+    fn func_equal_empty_name_and_no_name_considered_the_same() {
+        // A VAR_FUNC with an empty string name vs. a VAR_PARTIAL with
+        // no pt_name and no pt_func - both resolve to "no name" and
+        // are considered equal, matching the original's own "empty
+        // and NULL function name considered the same" comment.
+        let empty_func = func_tv(b"");
+        let pt = crate::eval::typval_defs::PartialT::default();
+        let partial_tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(&pt as *const _ as *mut _),
+        };
+        assert!(unsafe { func_equal(&empty_func, &partial_tv, false) });
+    }
+
+    #[test]
+    fn func_equal_compares_partial_dicts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_nr(&mut *d1, b"x", 1);
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"x", 1);
+
+            let pt1 = crate::eval::typval_defs::PartialT {
+                pt_name: Some(b"Foo".to_vec()),
+                pt_dict: d1,
+                ..Default::default()
+            };
+            let pt2 = crate::eval::typval_defs::PartialT {
+                pt_name: Some(b"Foo".to_vec()),
+                pt_dict: d2,
+                ..Default::default()
+            };
+            let tv1 = TypvalT {
+                v_lock: VarLockStatus::Unlocked,
+                value: TypvalValue::Partial(&pt1 as *const _ as *mut _),
+            };
+            let tv2 = TypvalT {
+                v_lock: VarLockStatus::Unlocked,
+                value: TypvalValue::Partial(&pt2 as *const _ as *mut _),
+            };
+            assert!(func_equal(&tv1, &tv2, false));
+
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"y", 2);
+            assert!(!func_equal(&tv1, &tv2, false));
+
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn func_equal_compares_partial_argv() {
+        let pt1 = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"Foo".to_vec()),
+            pt_argv: vec![TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(1) }],
+            ..Default::default()
+        };
+        let pt2 = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"Foo".to_vec()),
+            pt_argv: vec![TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(1) }],
+            ..Default::default()
+        };
+        let pt3 = crate::eval::typval_defs::PartialT {
+            pt_name: Some(b"Foo".to_vec()),
+            pt_argv: vec![TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(2) }],
+            ..Default::default()
+        };
+        let tv1 = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(&pt1 as *const _ as *mut _),
+        };
+        let tv2 = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(&pt2 as *const _ as *mut _),
+        };
+        let tv3 = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Partial(&pt3 as *const _ as *mut _),
+        };
+        assert!(unsafe { func_equal(&tv1, &tv2, false) });
+        assert!(!unsafe { func_equal(&tv1, &tv3, false) });
     }
 }

@@ -865,6 +865,25 @@ pub fn mb_stricmp(s1: &[u8], s2: &[u8]) -> i32 {
     mb_strnicmp(s1, s2, crate::pos_defs::MAXCOL as usize)
 }
 
+/// Compare strings, optionally case-insensitively (`mb_strcmp_ic`).
+///
+/// @return 0 if strings are equal, <0 if `s1` < `s2`, >0 if `s1` >
+/// `s2` (matching [`mb_stricmp`]'s own convention for the
+/// case-insensitive path; the case-sensitive path uses plain
+/// lexicographic byte comparison, `strcmp`'s Rust equivalent).
+#[must_use]
+pub fn mb_strcmp_ic(ic: bool, s1: &[u8], s2: &[u8]) -> i32 {
+    if ic {
+        mb_stricmp(s1, s2)
+    } else {
+        match s1.cmp(s2) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+}
+
 /// Return true if `c` (`>= 0x100`) is in `table`, a sorted list of
 /// non-overlapping `(first, last)` inclusive intervals (`intable`,
 /// `static` in the original - kept private here too).
@@ -1838,6 +1857,20 @@ mod tests {
         // É (U+00C9) vs é (U+00E9): equal under case folding, same as
         // utf_strnicmp/mb_strnicmp's own multi-byte handling.
         assert_eq!(mb_stricmp("É".as_bytes(), "é".as_bytes()), 0);
+    }
+
+    #[test]
+    fn mb_strcmp_ic_true_uses_case_insensitive_compare() {
+        assert_eq!(mb_strcmp_ic(true, b"FOO", b"foo"), 0);
+        assert_eq!(mb_strcmp_ic(true, b"FOO", b"bar"), mb_stricmp(b"FOO", b"bar"));
+    }
+
+    #[test]
+    fn mb_strcmp_ic_false_is_case_sensitive() {
+        assert_ne!(mb_strcmp_ic(false, b"FOO", b"foo"), 0);
+        assert_eq!(mb_strcmp_ic(false, b"foo", b"foo"), 0);
+        assert!(mb_strcmp_ic(false, b"abc", b"abd") < 0);
+        assert!(mb_strcmp_ic(false, b"abd", b"abc") > 0);
     }
 
     #[test]
