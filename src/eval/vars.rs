@@ -101,6 +101,16 @@
 //! omitted (message display, not tractable yet) - the boolean result
 //! itself is kept exactly.
 //!
+//! Also translated: `var_check_ro`/`var_check_lock`/`var_check_fixed` -
+//! the read-only/locked/fixed variable-assignment guards, operating
+//! directly on `DictitemT.di_flags` (plus `GLOBALS.sandbox` for
+//! `var_check_ro`'s sandbox-specific check). Drop the original's
+//! `name`/`name_len` parameters entirely, matching
+//! `value_check_lock`/`tv_check_lock`'s own already-established
+//! precedent (`eval/typval.rs`) for this exact pattern - those
+//! parameters only ever feed the omitted `semsg()` message text, never
+//! affecting the returned bool.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
@@ -996,6 +1006,41 @@ pub fn valid_varname(varname: &[u8]) -> bool {
     true
 }
 
+/// Whether it's NOT OK to change a variable with the given
+/// `DictitemT.di_flags`: `true` when read-only, or
+/// read-only-in-the-sandbox while currently inside the sandbox
+/// (`var_check_ro`).
+///
+/// Drops the original's `name`/`name_len` parameters entirely - they
+/// only ever affect the omitted `semsg()` message text, never the
+/// return value, matching `value_check_lock`/`tv_check_lock`'s own
+/// established precedent (`eval/typval.rs`) for this exact pattern.
+#[must_use]
+pub fn var_check_ro(flags: u8) -> bool {
+    // SAFETY: only reads GLOBALS.sandbox, matching this crate's usual
+    // "internal GlobalCell access, exposed as a safe pub fn" pattern
+    // (e.g. function_list_modified).
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    flags & dict_item_flags::RO != 0 || (flags & dict_item_flags::RO_SBX != 0 && g.sandbox != 0)
+}
+
+/// Whether a variable with the given `di_flags` is locked
+/// (`DI_FLAGS_LOCK`) (`var_check_lock`). See [`var_check_ro`]'s own
+/// doc comment for why `name`/`name_len` are dropped.
+#[must_use]
+pub fn var_check_lock(flags: u8) -> bool {
+    flags & dict_item_flags::LOCK != 0
+}
+
+/// Whether a variable with the given `di_flags` is fixed
+/// (`DI_FLAGS_FIX`, cannot be `:unlet`/`remove()`d) (`var_check_fixed`).
+/// See [`var_check_ro`]'s own doc comment for why `name`/`name_len`
+/// are dropped.
+#[must_use]
+pub fn var_check_fixed(flags: u8) -> bool {
+    flags & dict_item_flags::FIX != 0
+}
+
 #[cfg(test)]
 mod set_vcount_and_valid_varname_tests {
     use super::*;
@@ -1048,6 +1093,44 @@ mod set_vcount_and_valid_varname_tests {
     fn valid_varname_rejects_other_punctuation() {
         assert!(!valid_varname(b"foo-bar"));
         assert!(!valid_varname(b"foo bar"));
+    }
+
+    #[test]
+    fn var_check_ro_true_when_readonly_flag_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(var_check_ro(dict_item_flags::RO));
+    }
+
+    #[test]
+    fn var_check_ro_false_for_plain_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        assert!(!var_check_ro(0));
+        assert!(!var_check_ro(dict_item_flags::FIX));
+    }
+
+    #[test]
+    fn var_check_ro_sandbox_flag_only_blocks_inside_the_sandbox() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        assert!(!var_check_ro(dict_item_flags::RO_SBX));
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 1;
+        assert!(var_check_ro(dict_item_flags::RO_SBX));
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+    }
+
+    #[test]
+    fn var_check_lock_reflects_the_lock_flag() {
+        assert!(var_check_lock(dict_item_flags::LOCK));
+        assert!(!var_check_lock(dict_item_flags::RO));
+        assert!(!var_check_lock(0));
+    }
+
+    #[test]
+    fn var_check_fixed_reflects_the_fix_flag() {
+        assert!(var_check_fixed(dict_item_flags::FIX));
+        assert!(!var_check_fixed(dict_item_flags::LOCK));
+        assert!(!var_check_fixed(0));
     }
 }
 
