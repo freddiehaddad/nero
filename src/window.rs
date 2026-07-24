@@ -25,6 +25,12 @@
 //! `tabpage_win_valid`'s own single-tabpage walk nested inside an
 //! outer tabpage loop.
 //!
+//! Also translated: `check_can_set_curbuf_disabled`/
+//! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
+//! the original's real `emsg` call, matching the established "skip the
+//! deferred-subsystem side effect, keep the state/return value
+//! correct" policy.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -165,6 +171,45 @@ pub fn win_fdccol_count(wp: &WinT) -> i32 {
     }
 
     i32::from(fdc.first().copied().unwrap_or(b'0')) - i32::from(b'0')
+}
+
+/// Check if the current window is allowed to move to a different
+/// buffer (`check_can_set_curbuf_disabled`).
+///
+/// @return `false` if the window has `'winfixbuf'` set, `true`
+/// otherwise.
+///
+/// Omits the original's real
+/// `emsg(_(e_winfixbuf_cannot_go_to_buffer))` call - matching the
+/// established "skip the deferred-subsystem side effect, keep the
+/// state/return value correct" policy used throughout this crate.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+#[must_use]
+pub unsafe fn check_can_set_curbuf_disabled() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*crate::globals::GLOBALS.get_mut().curwin };
+    curwin.w_onebuf_opt.wo_wfb == 0
+}
+
+/// Check if the current window is allowed to move to a different
+/// buffer (`check_can_set_curbuf_forceit`).
+///
+/// @param forceit if `true`, always allowed. If `false` and
+/// `'winfixbuf'` is enabled, not allowed.
+///
+/// Omits the original's real `emsg` call, matching
+/// [`check_can_set_curbuf_disabled`].
+///
+/// # Safety
+/// Same as [`check_can_set_curbuf_disabled`].
+#[must_use]
+pub unsafe fn check_can_set_curbuf_forceit(forceit: bool) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*crate::globals::GLOBALS.get_mut().curwin };
+    forceit || curwin.w_onebuf_opt.wo_wfb == 0
 }
 
 /// Check that `tpc` points to a valid tab page (`valid_tabpage`).
@@ -548,5 +593,57 @@ mod tests {
         let _guard = WindowListGuard::set(std::ptr::null_mut(), &mut tp);
 
         assert_eq!(unsafe { win_count() }, 0);
+    }
+
+    #[test]
+    fn check_can_set_curbuf_disabled_true_when_winfixbuf_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_wfb = 0;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(unsafe { check_can_set_curbuf_disabled() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn check_can_set_curbuf_disabled_false_when_winfixbuf_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_wfb = 1;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { check_can_set_curbuf_disabled() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn check_can_set_curbuf_forceit_true_when_forced_even_with_winfixbuf() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_wfb = 1;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(unsafe { check_can_set_curbuf_forceit(true) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn check_can_set_curbuf_forceit_false_when_not_forced_and_winfixbuf_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_wfb = 1;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { check_can_set_curbuf_forceit(false) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 }
