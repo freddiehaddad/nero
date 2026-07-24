@@ -44,7 +44,7 @@
 //! taking `&[u8]`), `tv_dict_item_free`, `tv_dict_item_copy`,
 //! `tv_dict_item_remove`, `tv_dict_alloc`, `tv_dict_free_contents`/
 //! `tv_dict_free_dict`/`tv_dict_free`/`tv_dict_unref`, `tv_dict_find`/
-//! `tv_dict_has_key`, `tv_dict_add` (omits the original's
+//! `tv_dict_has_key`/`tv_dict_len`, `tv_dict_add` (omits the original's
 //! `tv_dict_wrong_func_name` g:/l: validation - needs
 //! `get_globvar_dict`/`get_funccal_local_ht`/`var_wrong_func_name`,
 //! none translated, and nothing in this crate can even construct a
@@ -58,7 +58,8 @@
 //! `tv_dict_get_string_chk` (collapsing the original's `_buf`/`save`
 //! variants the same way `tv_get_string_chk`'s own doc comment
 //! explains - tractable now that `tv_get_string`/`tv_get_string_chk`
-//! exist).
+//! exist), `tv_dict_get_tv`/`tv_dict_get_number`/
+//! `tv_dict_get_number_def`/`tv_dict_get_bool`.
 //!
 //! **List**: `tv_list_alloc`, `tv_list_item_alloc` (private, matching
 //! the original's own `static`), `tv_list_free_contents`/
@@ -69,7 +70,10 @@
 //! `tv_dict_add_str`)/`tv_list_append_number`, `tv_list_insert`/
 //! `tv_list_insert_tv`, `tv_list_drop_items`/`tv_list_remove_items`/
 //! `tv_list_item_remove`, `tv_list_watch_add`/`tv_list_watch_remove`/
-//! `tv_list_watch_fix`.
+//! `tv_list_watch_fix`, `tv_list_uidx`/`tv_list_find`/
+//! `tv_list_find_nr`/`tv_list_find_str`/`tv_list_find_index` (private,
+//! matching the original's own `static`)/`tv_list_idx_of_item`/
+//! `tv_list_reverse`.
 //!
 //! **Blob**: `tv_blob_alloc`/`tv_blob_free`/`tv_blob_unref`,
 //! `tv_blob_len`/`tv_blob_set_ret` (`eval/typval.h`'s own `static
@@ -1294,6 +1298,71 @@ pub unsafe fn tv_dict_get_string_chk(
     tv_get_string_chk(unsafe { &(*di).di_tv })
 }
 
+/// Get a typval item from a dictionary and copy it into `rettv`
+/// (`tv_dict_get_tv`).
+///
+/// @return `OK` in case of success or `FAIL` if nothing was found.
+///
+/// # Safety
+/// Same as [`tv_dict_get_string`], plus `rettv`'s existing value, if
+/// any, must be safe to overwrite without leaking (matching
+/// [`tv_copy`]'s own safety doc, forwarded here).
+pub unsafe fn tv_dict_get_tv(d: Option<&mut DictT>, key: &[u8], rettv: &mut TypvalT) -> i32 {
+    let Some(di) = tv_dict_find(d, key) else {
+        return FAIL;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(&(*di).di_tv, rettv) };
+    OK
+}
+
+/// Get a number item from a dictionary, or `0` if the item does not
+/// exist (`tv_dict_get_number`).
+///
+/// # Safety
+/// Same as [`tv_dict_get_string`].
+#[must_use]
+pub unsafe fn tv_dict_get_number(d: Option<&mut DictT>, key: &[u8]) -> crate::eval::typval_defs::VarnumberT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_dict_get_number_def(d, key, 0) }
+}
+
+/// Get a number item from a dictionary, or a given default value
+/// (`tv_dict_get_number_def`).
+///
+/// # Safety
+/// Same as [`tv_dict_get_string`].
+#[must_use]
+pub unsafe fn tv_dict_get_number_def(
+    d: Option<&mut DictT>,
+    key: &[u8],
+    def: crate::eval::typval_defs::VarnumberT,
+) -> crate::eval::typval_defs::VarnumberT {
+    let Some(di) = tv_dict_find(d, key) else {
+        return def;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    tv_get_number(unsafe { &(*di).di_tv })
+}
+
+/// Get a boolean item from a dictionary, or a given default value
+/// (`tv_dict_get_bool`).
+///
+/// # Safety
+/// Same as [`tv_dict_get_string`].
+#[must_use]
+pub unsafe fn tv_dict_get_bool(
+    d: Option<&mut DictT>,
+    key: &[u8],
+    def: crate::eval::typval_defs::VarnumberT,
+) -> crate::eval::typval_defs::VarnumberT {
+    let Some(di) = tv_dict_find(d, key) else {
+        return def;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    tv_get_bool(unsafe { &(*di).di_tv })
+}
+
 /// Add item to dictionary (`tv_dict_add`).
 ///
 /// @return `FAIL` if key already exists.
@@ -1658,6 +1727,209 @@ pub unsafe fn tv_list_first(l: *const crate::eval::typval_defs::ListT) -> *mut c
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { (*l).lv_first }
+}
+
+// Indexing/searching:
+
+/// Normalize an index: negative counts from the end, out-of-range
+/// becomes `-1` (`tv_list_uidx`, `eval/typval.h`'s own `static
+/// inline`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_uidx(l: *const crate::eval::typval_defs::ListT, n: i32) -> i32 {
+    // Negative index is relative to the end.
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { tv_list_len(l) };
+    let n = if n < 0 { n + len } else { n };
+
+    // Check for index out of range.
+    if n < 0 || n >= len {
+        return -1;
+    }
+    n
+}
+
+/// Locate item with a given index in a list and return it, or null if
+/// `n` is out of range (`tv_list_find`).
+///
+/// Caches the found index/item in `l.lv_idx`/`l.lv_idx_item`, and
+/// searches outward from the closest of {start, cached index, end} -
+/// matching the original's own performance optimization exactly.
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT` whose
+/// `lv_idx_item`, if non-null, is reachable via `lv_first`'s own
+/// `li_next` chain.
+#[must_use]
+pub unsafe fn tv_list_find(
+    l: *mut crate::eval::typval_defs::ListT,
+    n: i32,
+) -> *mut crate::eval::typval_defs::ListitemT {
+    if l.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { tv_list_uidx(l, n) };
+    if n == -1 {
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let list = unsafe { &mut *l };
+    let (mut item, mut idx) = if !list.lv_idx_item.is_null() {
+        if n < list.lv_idx / 2 {
+            // Closest to the start of the list.
+            (list.lv_first, 0)
+        } else if n > (list.lv_idx + list.lv_len) / 2 {
+            // Closest to the end of the list.
+            (list.lv_last, list.lv_len - 1)
+        } else {
+            // Closest to the cached index.
+            (list.lv_idx_item, list.lv_idx)
+        }
+    } else if n < list.lv_len / 2 {
+        // Closest to the start of the list.
+        (list.lv_first, 0)
+    } else {
+        // Closest to the end of the list.
+        (list.lv_last, list.lv_len - 1)
+    };
+
+    while n > idx {
+        // Search forward.
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+        idx += 1;
+    }
+    while n < idx {
+        // Search backward.
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_prev };
+        idx -= 1;
+    }
+
+    // Cache the used index.
+    list.lv_idx = idx;
+    list.lv_idx_item = item;
+
+    item
+}
+
+/// Get list item `l[n]` as a number (`tv_list_find_nr`).
+///
+/// # Safety
+/// Same as [`tv_list_find`].
+pub unsafe fn tv_list_find_nr(
+    l: *mut crate::eval::typval_defs::ListT,
+    n: i32,
+    ret_error: Option<&mut bool>,
+) -> crate::eval::typval_defs::VarnumberT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let li = unsafe { tv_list_find(l, n) };
+    if li.is_null() {
+        if let Some(e) = ret_error {
+            *e = true;
+        }
+        return -1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    tv_get_number_chk(unsafe { &(*li).li_tv }, ret_error)
+}
+
+/// Get list item `l[n]` as a string, or `None` on error (`out of
+/// range` - real, reachable error, message display skipped, matching
+/// this module's established policy) (`tv_list_find_str`).
+///
+/// # Safety
+/// Same as [`tv_list_find`].
+#[must_use]
+pub unsafe fn tv_list_find_str(l: *mut crate::eval::typval_defs::ListT, n: i32) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let li = unsafe { tv_list_find(l, n) };
+    if li.is_null() {
+        // semsg(_(e_list_index_out_of_range_nr), n) omitted - see this
+        // module's own doc comment.
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    Some(tv_get_string(unsafe { &(*li).li_tv }))
+}
+
+/// Like [`tv_list_find`], but when a negative index is used that is
+/// not found, use zero and set `idx` to zero. Used for the first
+/// index of a range (`tv_list_find_index`).
+///
+/// # Safety
+/// Same as [`tv_list_find`].
+#[allow(dead_code)] // no real translated caller yet (tv_list_check_range_index_one, its only caller, not yet translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
+fn tv_list_find_index(l: *mut crate::eval::typval_defs::ListT, idx: &mut i32) -> *mut crate::eval::typval_defs::ListitemT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let li = unsafe { tv_list_find(l, *idx) };
+    if !li.is_null() {
+        return li;
+    }
+
+    if *idx < 0 {
+        *idx = 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { tv_list_find(l, *idx) };
+    }
+    li
+}
+
+/// Locate `item` in a list and return its index, or `-1` if not found
+/// (`tv_list_idx_of_item`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_idx_of_item(
+    l: *const crate::eval::typval_defs::ListT,
+    item: *const crate::eval::typval_defs::ListitemT,
+) -> i32 {
+    if l.is_null() || item.is_null() {
+        return -1;
+    }
+    let mut idx = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut li = unsafe { (*l).lv_first };
+    while !li.is_null() && !std::ptr::eq(li, item) {
+        // SAFETY: forwarded from this function's own safety doc.
+        li = unsafe { (*li).li_next };
+        idx += 1;
+    }
+    if li.is_null() {
+        return -1;
+    }
+    idx
+}
+
+/// Reverse list in-place (`tv_list_reverse`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT` whose
+/// every item is reachable via `lv_first`'s own `li_next` chain.
+pub unsafe fn tv_list_reverse(l: *mut crate::eval::typval_defs::ListT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_list_len(l) } <= 1 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let list = unsafe { &mut *l };
+    std::mem::swap(&mut list.lv_first, &mut list.lv_last);
+
+    let mut li = list.lv_first;
+    while !li.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { std::mem::swap(&mut (*li).li_next, &mut (*li).li_prev) };
+        // SAFETY: forwarded from this function's own safety doc.
+        li = unsafe { (*li).li_next };
+    }
+
+    list.lv_idx = list.lv_len - list.lv_idx - 1;
 }
 
 /// Advance watchers to the next item. Used just before removing an
@@ -4812,6 +5084,221 @@ mod tests {
         unsafe {
             *TV_EQUAL_RECURSIVE_CNT.get_mut() = 0;
             *TV_EQUAL_RECURSE_LIMIT.get_mut() = 1000;
+        }
+    }
+
+    // ---- tv_dict_get_tv / tv_dict_get_number(_def) / tv_dict_get_bool --
+
+    #[test]
+    fn tv_dict_get_tv_copies_the_found_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d, b"a", 42);
+            let mut rettv = TypvalT::default();
+            assert_eq!(tv_dict_get_tv(d.as_mut(), b"a", &mut rettv), OK);
+            assert_eq!(rettv.value, TypvalValue::Number(42));
+            tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_tv_fails_for_missing_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let mut rettv = TypvalT::default();
+            assert_eq!(tv_dict_get_tv(d.as_mut(), b"missing", &mut rettv), FAIL);
+            tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_number_and_def_use_the_default_for_a_missing_key() {
+        assert_eq!(unsafe { tv_dict_get_number(None, b"x") }, 0);
+        assert_eq!(unsafe { tv_dict_get_number_def(None, b"x", 99) }, 99);
+    }
+
+    #[test]
+    fn tv_dict_get_number_and_def_read_a_found_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d, b"a", 7);
+            assert_eq!(tv_dict_get_number(d.as_mut(), b"a"), 7);
+            assert_eq!(tv_dict_get_number_def(d.as_mut(), b"a", 99), 7);
+            tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn tv_dict_get_bool_uses_default_for_missing_key_and_reads_found_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            assert_eq!(tv_dict_get_bool(d.as_mut(), b"missing", 1), 1);
+            tv_dict_add_nr(&mut *d, b"flag", 0);
+            assert_eq!(tv_dict_get_bool(d.as_mut(), b"flag", 1), 0);
+            tv_dict_unref(d);
+        }
+    }
+
+    // ---- tv_list_uidx / tv_list_find(_nr/_str/_index) / idx_of_item /
+    // reverse --------------------------------------------------------
+
+    #[test]
+    fn tv_list_uidx_normalizes_negative_and_rejects_out_of_range() {
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(l, 1);
+            tv_list_append_number(l, 2);
+            tv_list_append_number(l, 3);
+
+            assert_eq!(tv_list_uidx(l, 0), 0);
+            assert_eq!(tv_list_uidx(l, 2), 2);
+            assert_eq!(tv_list_uidx(l, -1), 2); // last item
+            assert_eq!(tv_list_uidx(l, -3), 0); // first item
+            assert_eq!(tv_list_uidx(l, 3), -1); // out of range
+            assert_eq!(tv_list_uidx(l, -4), -1); // out of range
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_find_locates_by_index_and_caches() {
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(l, 10);
+            tv_list_append_number(l, 20);
+            tv_list_append_number(l, 30);
+
+            let item = tv_list_find(l, 1);
+            assert!(!item.is_null());
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(20));
+            assert_eq!((*l).lv_idx, 1);
+            assert_eq!((*l).lv_idx_item, item);
+
+            // Negative index.
+            let last = tv_list_find(l, -1);
+            assert_eq!((*last).li_tv.value, TypvalValue::Number(30));
+
+            // Out of range.
+            assert!(tv_list_find(l, 5).is_null());
+            assert!(tv_list_find(std::ptr::null_mut(), 0).is_null());
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_find_nr_reads_number_and_reports_error_when_not_found() {
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(l, 42);
+            let mut err = false;
+            assert_eq!(tv_list_find_nr(l, 0, Some(&mut err)), 42);
+            assert!(!err);
+
+            let mut err = false;
+            assert_eq!(tv_list_find_nr(l, 5, Some(&mut err)), -1);
+            assert!(err);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_find_str_reads_string_and_none_when_not_found() {
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_string(l, Some(b"hi"));
+            assert_eq!(tv_list_find_str(l, 0), Some(b"hi".to_vec()));
+            assert_eq!(tv_list_find_str(l, 5), None);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_find_index_falls_back_to_zero_for_an_unfound_negative_index() {
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l, 1);
+            tv_list_append_number(l, 2);
+
+            // A valid negative index is found directly.
+            let mut idx = -1;
+            let item = tv_list_find_index(l, &mut idx);
+            assert!(!item.is_null());
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(2));
+
+            // An out-of-range negative index falls back to 0.
+            let mut idx = -5;
+            let item = tv_list_find_index(l, &mut idx);
+            assert_eq!(idx, 0);
+            assert!(!item.is_null());
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_idx_of_item_finds_position_or_minus_one() {
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l, 1);
+            tv_list_append_number(l, 2);
+            let item0 = (*l).lv_first;
+            let item1 = (*item0).li_next;
+
+            assert_eq!(tv_list_idx_of_item(l, item0), 0);
+            assert_eq!(tv_list_idx_of_item(l, item1), 1);
+            assert_eq!(tv_list_idx_of_item(l, std::ptr::null()), -1);
+            assert_eq!(tv_list_idx_of_item(std::ptr::null(), item0), -1);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_reverse_reorders_items_and_updates_idx() {
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(l, 1);
+            tv_list_append_number(l, 2);
+            tv_list_append_number(l, 3);
+
+            tv_list_reverse(l);
+
+            let mut collected = Vec::new();
+            let mut item = (*l).lv_first;
+            while !item.is_null() {
+                if let TypvalValue::Number(n) = (*item).li_tv.value {
+                    collected.push(n);
+                }
+                item = (*item).li_next;
+            }
+            assert_eq!(collected, vec![3, 2, 1]);
+            // lv_last must now be the original first item.
+            assert_eq!((*(*l).lv_last).li_tv.value, TypvalValue::Number(1));
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_reverse_is_a_noop_for_0_or_1_items() {
+        let empty = tv_list_alloc(0);
+        let one = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(one, 1);
+            tv_list_reverse(empty); // must not panic
+            tv_list_reverse(one);
+            assert_eq!((*(*one).lv_first).li_tv.value, TypvalValue::Number(1));
+            tv_list_free(empty);
+            tv_list_free(one);
         }
     }
 }
