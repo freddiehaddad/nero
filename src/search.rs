@@ -19,6 +19,9 @@
 //! written anywhere in the real source - only `lastc[0]` (via
 //! `*lastc`) is ever touched.
 //!
+//! Also translated: `linewhite` (needed only `charset.c`'s
+//! `skipwhite` and `memline.c`'s `ml_get`, both already real).
+//!
 //! Deferred: everything else in the file - `SearchPattern`/
 //! `SearchOffset`/`spats[]` (the `/`/`?`/`:s` search-pattern-history
 //! state) and the functions built on them (`last_search_pat`,
@@ -125,6 +128,21 @@ pub fn set_csearch_until(t_cmd: bool) {
     unsafe { LAST_CSEARCH.get_mut() }.t_cmd = t_cmd;
 }
 
+/// @return `true` if line `lnum` is empty or has white characters
+/// only (`linewhite`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` whose `b_ml.ml_mfp`, if non-null, points to a live
+/// `MemfileT`.
+#[must_use]
+pub unsafe fn linewhite(lnum: crate::pos_defs::LinenrT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(lnum) };
+    let off = crate::charset::skipwhite(&line);
+    line.get(off).copied().unwrap_or(0) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +224,61 @@ mod tests {
         // SAFETY: forwarded from the module's own GlobalCell convention.
         let state = unsafe { LAST_CSEARCH.get_mut() };
         assert_eq!(state.lastc, b'A');
+    }
+
+    fn test_buf_with_line(line: &[u8]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        buf
+    }
+
+    fn close_test_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn linewhite_true_for_empty_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf_with_line(b"\0");
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        assert!(unsafe { linewhite(1) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn linewhite_true_for_whitespace_only_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf_with_line(b"   \t \0");
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        assert!(unsafe { linewhite(1) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn linewhite_false_for_line_with_content() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf_with_line(b"  hello\0");
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        assert!(!unsafe { linewhite(1) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
     }
 }
