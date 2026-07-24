@@ -157,6 +157,40 @@
 //! `DictT` (not yet built; `VIMVARS` is still a bare `Vec<Vimvar>`),
 //! part of the larger `evalvars_init` effort already deferred above.
 //!
+//! Also translated: `find_var_ht_dict`/`find_var_ht` - the core
+//! scope-prefix (`g:`/`b:`/`w:`/`t:`/`a:`/`l:`/`s:`, or implicit)
+//! resolution used throughout `:let`/expression evaluation. New
+//! `COMPAT_HASHTAB` file-static (always empty until `evalvars_init`
+//! populates it, matching `GLOBVARDICT`/`FUNCARGS`'s own "structure
+//! before population" precedent). Reused `BufT.b_vars`/`WinT.w_vars`/
+//! `TabpageT.tp_vars` (all three already real fields, just never
+//! populated by anything yet - a pleasant surprise found while
+//! investigating this function) and `GLOBALS.curbuf`/`curwin`/
+//! `curtab`. The `s:` branch's lazy script-item creation (for an
+//! anonymous, string-sourced or Lua script context) is translated in
+//! full, including the real side effect of updating
+//! `GLOBALS.current_sctx.sc_sid` - verified via a dedicated test. The
+//! original's `nlua_set_sctx` call inside that branch is omitted (only
+//! resolves a Lua filename/line number for "last set" diagnostic
+//! messages, confirmed by reading its own body that it never touches
+//! `sc_sid` itself, so this omission doesn't change which dict is
+//! ultimately resolved). The `v:` scope is NOT YET SUPPORTED (always
+//! resolves to null) - deliberately deferred pending a real
+//! `vimvardict`/`get_vimvar_dict`, the same piece
+//! `garbage_collect_vimvars` above needs; reshaping `VIMVARS`'s
+//! current `Vec<Vimvar>` into a `DictitemT`-compatible shape risks the
+//! already-tested `get_vim_var_*`/`set_vim_var_*` family, so this is
+//! deliberately left for a dedicated future pass rather than rushed.
+//! `find_var`/`find_var_in_ht`/`find_var_in_scoped_ht` (the next layer
+//! up, actually looking an item up BY NAME once the right hashtable is
+//! known) remain untranslated - they need `globvars_var`/`vimvars_var`
+//! (whole-scope-as-a-single-item statics), `curbuf.b_bufvar`/
+//! `curwin.w_winvar`/`curtab.tp_winvar` fields (not yet checked for
+//! existence), and `script_autoload` (real file I/O + script sourcing,
+//! substantial on its own) - confirmed via direct reading of their
+//! real bodies, not assumed; correctly left as a separate future
+//! increment rather than folded into this one.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
@@ -164,6 +198,9 @@ use crate::eval::typval_defs::{
     dict_item_flags, BoolVarValue, DictT, DictitemT, ScidT, ScopeDictDictItem, ScopeType,
     SpecialVarValue, TypvalT, TypvalValue, VarLockStatus, VarType, VarnumberT, DO_NOT_FREE_CNT,
 };
+use crate::eval::userfunc::{get_funccal_args_dict, get_funccal_local_dict};
+use crate::hashtab::hashitem_empty;
+use crate::hashtab_defs::HashtabT;
 use crate::runtime_defs::ScriptvarT;
 
 /// `-1`, matching `LuaRef`'s "no reference" convention already
@@ -838,6 +875,153 @@ pub unsafe fn garbage_collect_scriptvars(copy_id: i32) -> bool {
             };
     }
     abort
+}
+
+/// The `compat_hashtab` file-static - names valid in ALL scopes that
+/// should also be found via implicit (no-scope-prefix) lookup, e.g.
+/// `"version"` for `v:version` (`compat_hashtab`).
+///
+/// Always empty until `evalvars_init` (not yet translated) populates
+/// it with every `VV_COMPAT`-flagged `v:` variable's own name,
+/// matching `GLOBVARDICT`/`FUNCARGS`'s own "translate the structure,
+/// not yet populated" precedent elsewhere in this crate.
+static COMPAT_HASHTAB: std::sync::LazyLock<crate::globals::GlobalCell<crate::hashtab_defs::HashtabT>> =
+    std::sync::LazyLock::new(|| {
+        crate::globals::GlobalCell::new(crate::hashtab_defs::HashtabT::hash_init())
+    });
+
+/// Find the hashtable and owning dict used for a variable
+/// (`find_var_ht_dict`).
+///
+/// Collapses the original's `const char **varname`/`dict_T **d`
+/// out-parameters into part of the return value: `(hashtab,
+/// clean_name, dict)`. `hashtab`/`dict` are null if `name` doesn't
+/// resolve to a known scope. `clean_name` is `name`'s own suffix with
+/// any scope prefix (`g:`/`b:`/etc.) stripped.
+///
+/// The `v:` scope (needs `get_vimvar_dict`, itself needing a real
+/// `DictT` wrapping `VIMVARS` - not yet built, since `VIMVARS`'s
+/// current `Vec<Vimvar>` shape isn't `DictitemT`-compatible the way
+/// the original's own embedded `vimvar.vv_di` is, and reshaping it
+/// risks the already-tested `get_vim_var_*`/`set_vim_var_*` family) is
+/// NOT YET SUPPORTED - always resolves to a null dict for now, a
+/// deliberate, documented gap, not a silent bug.
+///
+/// The original's `nlua_set_sctx(&current_sctx)` call inside the `s:`
+/// branch is omitted - it only resolves a Lua filename/line number for
+/// "last set" diagnostic messages, never affecting
+/// `current_sctx.sc_sid` itself (confirmed by reading its own real
+/// body), so this omission doesn't change which dict/hashtable is
+/// ultimately resolved.
+#[must_use]
+pub fn find_var_ht_dict(name: &[u8]) -> (*mut HashtabT, &[u8], *mut DictT) {
+    if name.is_empty() {
+        return (std::ptr::null_mut(), name, std::ptr::null_mut());
+    }
+
+    let mut d: *mut DictT = std::ptr::null_mut();
+    let varname: &[u8];
+
+    if name.len() == 1 || name.get(1) != Some(&b':') {
+        // name has implicit scope
+        if name[0] == b':' || name[0] == crate::eval::eval::AUTOLOAD_CHAR {
+            // The name must not start with a colon or #.
+            return (std::ptr::null_mut(), name, std::ptr::null_mut());
+        }
+        varname = name;
+
+        // "version" is "v:version" in all scopes.
+        // SAFETY: only touches this module's own COMPAT_HASHTAB cell.
+        let found = !hashitem_empty(unsafe { COMPAT_HASHTAB.get_mut() }.hash_find(name));
+        if found {
+            // SAFETY: forwarded from the same reasoning above.
+            return (
+                unsafe { COMPAT_HASHTAB.get_mut() as *mut crate::hashtab_defs::HashtabT },
+                varname,
+                std::ptr::null_mut(),
+            );
+        }
+
+        d = get_funccal_local_dict();
+        if d.is_null() {
+            d = get_globvar_dict(); // global variable
+        }
+    } else {
+        varname = &name[2..];
+        if name[0] == b'g' {
+            // global variable
+            d = get_globvar_dict();
+        } else if name.len() > 2
+            && (name[2..].contains(&b':') || name[2..].contains(&crate::eval::eval::AUTOLOAD_CHAR))
+        {
+            // There must be no ':' or '#' in the rest of the name if
+            // g: was not used.
+            return (std::ptr::null_mut(), varname, std::ptr::null_mut());
+        }
+
+        // SAFETY: curbuf/curwin/curtab are always valid pointers to
+        // the real current buffer/window/tabpage in a running crate
+        // instance, matching the original's own unchecked dereference.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        match name[0] {
+            b'b' => d = unsafe { (*g.curbuf).b_vars },  // buffer variable
+            b'w' => d = unsafe { (*g.curwin).w_vars },  // window variable
+            b't' => d = unsafe { (*g.curtab).tp_vars }, // tab page variable
+            b'v' => {
+                // v: variable - NOT YET SUPPORTED, see this
+                // function's own doc comment for why.
+            }
+            b'a' => d = get_funccal_args_dict(), // a: function argument
+            b'l' => d = get_funccal_local_dict(), // l: local variable
+            b's'
+                if (g.current_sctx.sc_sid > 0
+                    || g.current_sctx.sc_sid == crate::globals::SID_STR
+                    || g.current_sctx.sc_sid == crate::globals::SID_LUA)
+                    && g.current_sctx.sc_sid <= crate::runtime::script_item_count() =>
+            {
+                // script variable. For anonymous scripts without a
+                // script item, create one now so script vars can be
+                // used.
+                if g.current_sctx.sc_sid == crate::globals::SID_STR
+                    || g.current_sctx.sc_sid == crate::globals::SID_LUA
+                {
+                    // Create SID if s: scope is accessed from Lua or
+                    // anon Vimscript.
+                    let (new_sid, _) = crate::runtime::new_script_item(None);
+                    g.current_sctx.sc_sid = new_sid;
+                }
+                let item = crate::runtime::script_item(g.current_sctx.sc_sid);
+                // SAFETY: script_item never returns null for an id
+                // within 1..=script_item_count(), which the guard
+                // above (or new_script_item's own freshly-created sid)
+                // ensures.
+                d = unsafe { &mut (*(*item).sn_vars).sv_dict as *mut DictT };
+            }
+            _ => {}
+        }
+    }
+
+    let ht = if d.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: d just checked non-null above.
+        unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
+    };
+    (ht, varname, d)
+}
+
+/// Find the hashtable used for a variable (`find_var_ht`).
+///
+/// Drops the original's `dict_T **d` out-parameter entirely - unlike
+/// [`find_var_ht_dict`], `find_var_ht` itself never uses it (the
+/// original computes it into a throwaway local and discards it too).
+///
+/// @return the scope hashtable (null if `name` is not valid) and the
+/// clean name without its scope prefix.
+#[must_use]
+pub fn find_var_ht(name: &[u8]) -> (*mut HashtabT, &[u8]) {
+    let (ht, varname, _d) = find_var_ht_dict(name);
+    (ht, varname)
 }
 
 /// Get the name of `v:` variable `idx`, without the `v:` prefix
@@ -2000,5 +2184,296 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         crate::runtime::tests_reset_for_test();
         new_script_vars(42);
+    }
+}
+
+#[cfg(test)]
+mod find_var_ht_dict_tests {
+    use super::*;
+    use crate::eval::typval_defs::FunccallT;
+
+    /// Sets `GLOBALS.curbuf`/`curwin`/`curtab` to freshly-boxed,
+    /// plain-`Default` structs (no `ml_open`/memline setup needed -
+    /// `find_var_ht_dict`'s `b:`/`w:`/`t:` branches only ever read
+    /// `b_vars`/`w_vars`/`tp_vars` directly), restoring the previous
+    /// values and freeing everything on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's entire lifetime,
+    /// matching `undo.rs`'s own `TestBufWin` established convention
+    /// for the same kind of curbuf/curwin RAII setup (extended here to
+    /// also cover curtab, which that helper doesn't need).
+    struct TestCurBufWinTab {
+        buf: *mut crate::buffer_defs::BufT,
+        win: *mut crate::buffer_defs::WinT,
+        tab: *mut crate::buffer_defs::TabpageT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl TestCurBufWinTab {
+        fn new() -> Self {
+            let buf = Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+            let win = Box::into_raw(Box::new(crate::buffer_defs::WinT::default()));
+            let tab = Box::into_raw(Box::new(crate::buffer_defs::TabpageT::default()));
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_curbuf = g.curbuf;
+            let prev_curwin = g.curwin;
+            let prev_curtab = g.curtab;
+            g.curbuf = buf;
+            g.curwin = win;
+            g.curtab = tab;
+            TestCurBufWinTab { buf, win, tab, prev_curbuf, prev_curwin, prev_curtab }
+        }
+    }
+
+    impl Drop for TestCurBufWinTab {
+        fn drop(&mut self) {
+            unsafe {
+                let g = crate::globals::GLOBALS.get_mut();
+                g.curbuf = self.prev_curbuf;
+                g.curwin = self.prev_curwin;
+                g.curtab = self.prev_curtab;
+                drop(Box::from_raw(self.buf));
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.tab));
+            }
+        }
+    }
+
+    /// Every test here must leave `CURRENT_FUNCCAL`/`GLOBVARDICT`/
+    /// `COMPAT_HASHTAB`/script items reset, matching this crate's
+    /// established test-isolation discipline for shared `GlobalCell`
+    /// state.
+    fn reset_shared_state() {
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe { vars_clear(GLOBVARDICT.get_mut()) };
+        unsafe { *COMPAT_HASHTAB.get_mut() = crate::hashtab_defs::HashtabT::hash_init() };
+        crate::runtime::tests_reset_for_test();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = Default::default();
+    }
+
+    #[test]
+    fn find_var_ht_dict_empty_name_returns_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht, varname, d) = find_var_ht_dict(b"");
+        assert!(ht.is_null());
+        assert!(d.is_null());
+        assert_eq!(varname, b"");
+    }
+
+    #[test]
+    fn find_var_ht_dict_rejects_leading_colon_or_hash() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        assert!(find_var_ht_dict(b":foo").0.is_null());
+        assert!(find_var_ht_dict(b"#foo").0.is_null());
+    }
+
+    #[test]
+    fn find_var_ht_dict_implicit_scope_falls_back_to_globvar() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht, varname, d) = find_var_ht_dict(b"foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(d, get_globvar_dict());
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
+        reset_shared_state();
+    }
+
+    #[test]
+    fn find_var_ht_dict_implicit_scope_prefers_funccal_local_when_present() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut fc = Box::new(FunccallT::default());
+        fc.fc_l_vars.dv_refcount = DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let (ht, varname, d) = find_var_ht_dict(b"foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_vars as *mut DictT });
+        assert_eq!(ht, unsafe { &mut (*fc_ptr).fc_l_vars.dv_hashtab as *mut HashtabT });
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn find_var_ht_dict_g_colon_resolves_to_globvar_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht, varname, d) = find_var_ht_dict(b"g:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(d, get_globvar_dict());
+        assert!(!ht.is_null());
+        reset_shared_state();
+    }
+
+    #[test]
+    fn find_var_ht_dict_rejects_extra_colon_or_hash_without_g_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        assert!(find_var_ht_dict(b"b:foo:bar").0.is_null());
+        assert!(find_var_ht_dict(b"b:foo#bar").0.is_null());
+        // But "g:" itself is exempt from this check.
+        assert!(!find_var_ht_dict(b"g:foo:bar").0.is_null());
+        reset_shared_state();
+    }
+
+    #[test]
+    fn find_var_ht_dict_b_colon_resolves_to_curbuf_b_vars() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let cbwt = TestCurBufWinTab::new();
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*cbwt.buf).b_vars = d };
+
+        let (ht, varname, found_d) = find_var_ht_dict(b"b:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(found_d, d);
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
+
+        unsafe {
+            (*cbwt.buf).b_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn find_var_ht_dict_w_colon_resolves_to_curwin_w_vars() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let cbwt = TestCurBufWinTab::new();
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*cbwt.win).w_vars = d };
+
+        let (ht, varname, found_d) = find_var_ht_dict(b"w:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(found_d, d);
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
+
+        unsafe {
+            (*cbwt.win).w_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn find_var_ht_dict_t_colon_resolves_to_curtab_tp_vars() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let cbwt = TestCurBufWinTab::new();
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*cbwt.tab).tp_vars = d };
+
+        let (ht, varname, found_d) = find_var_ht_dict(b"t:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(found_d, d);
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
+
+        unsafe {
+            (*cbwt.tab).tp_vars = std::ptr::null_mut();
+            crate::eval::typval::tv_dict_free(d);
+        }
+    }
+
+    #[test]
+    fn find_var_ht_dict_v_colon_is_not_yet_supported() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht, varname, d) = find_var_ht_dict(b"v:count");
+        assert_eq!(varname, b"count");
+        assert!(ht.is_null());
+        assert!(d.is_null());
+    }
+
+    #[test]
+    fn find_var_ht_dict_a_colon_resolves_to_funccal_args_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut fc = Box::new(FunccallT::default());
+        fc.fc_l_vars.dv_refcount = DO_NOT_FREE_CNT; // gates get_funccal_args_dict too
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let (ht, varname, d) = find_var_ht_dict(b"a:1");
+        assert_eq!(varname, b"1");
+        assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_avars as *mut DictT });
+        assert_eq!(ht, unsafe { &mut (*fc_ptr).fc_l_avars.dv_hashtab as *mut HashtabT });
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn find_var_ht_dict_l_colon_resolves_to_funccal_local_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut fc = Box::new(FunccallT::default());
+        fc.fc_l_vars.dv_refcount = DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        crate::eval::userfunc::set_current_funccal(fc_ptr);
+
+        let (ht, varname, d) = find_var_ht_dict(b"l:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_vars as *mut DictT });
+        assert_eq!(ht, unsafe { &mut (*fc_ptr).fc_l_vars.dv_hashtab as *mut HashtabT });
+
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn find_var_ht_dict_s_colon_resolves_to_current_scripts_own_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (sid, item) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+        let sv = unsafe { (*item).sn_vars };
+
+        let (ht, varname, d) = find_var_ht_dict(b"s:foo");
+        assert_eq!(varname, b"foo");
+        assert_eq!(d, unsafe { &mut (*sv).sv_dict as *mut DictT });
+        assert_eq!(ht, unsafe { &mut (*sv).sv_dict.dv_hashtab as *mut HashtabT });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn find_var_ht_dict_s_colon_lazily_creates_a_script_item_for_sid_str() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = crate::globals::SID_STR;
+
+        let (ht, varname, d) = find_var_ht_dict(b"s:foo");
+        assert_eq!(varname, b"foo");
+        assert!(!d.is_null());
+        assert!(!ht.is_null());
+        // A brand-new, real script item was created and current_sctx
+        // updated to point at it (no longer the SID_STR sentinel).
+        let new_sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+        assert!(new_sid > 0);
+        assert_eq!(crate::runtime::script_item_count(), new_sid);
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn find_var_ht_dict_unknown_scope_letter_returns_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht, varname, d) = find_var_ht_dict(b"x:foo");
+        assert_eq!(varname, b"foo");
+        assert!(ht.is_null());
+        assert!(d.is_null());
+    }
+
+    #[test]
+    fn find_var_ht_delegates_to_find_var_ht_dict_dropping_the_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (ht_from_dict, varname_from_dict, _d) = find_var_ht_dict(b"g:foo");
+        let (ht, varname) = find_var_ht(b"g:foo");
+        assert_eq!(ht, ht_from_dict);
+        assert_eq!(varname, varname_from_dict);
+        reset_shared_state();
     }
 }
