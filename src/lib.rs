@@ -86,6 +86,7 @@ pub mod profile;
 pub mod regexp_defs;
 pub mod runtime;
 pub mod runtime_defs;
+pub mod search;
 pub mod search_defs;
 pub mod sha256;
 pub mod sign_defs;
