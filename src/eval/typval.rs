@@ -1,6 +1,7 @@
 //! Translated from `src/nvim/eval/typval.c` (tractable core: the
 //! `dict_T`/`list_T`/`blob_T` alloc/free/refcount/insertion primitives,
-//! `tv_copy`, and `tv_get_number`/`tv_get_bool`).
+//! `tv_copy`, `tv_get_number`/`tv_get_bool`, and the full type-check/
+//! argument-check family).
 //!
 //! `typval.c` (~4000 lines) is the core of the Vimscript value system:
 //! `typval_T`/`list_T`/`dict_T`/`blob_T` construction, (de)serialization
@@ -156,6 +157,23 @@
 //!   (`tv_dict_extend`, `tv_list_copy`, `tv_list_concat`, blob
 //!   byte-level accessors, iteration helpers, etc.): straightforward
 //!   to add once needed, layered on top of the primitives here.
+//!
+//! # Type checks
+//! `tv_check_str_or_nr`/`tv_check_num`/`tv_check_str` (pure type-tag
+//! predicates), `tv_list_locked`/`tv_islocked`/`value_check_lock`/
+//! `tv_check_lock` (needed only already-real `lv_lock`/`dv_lock`/
+//! `bv_lock` fields - `value_check_lock`/`tv_check_lock` drop the
+//! original's `name_len` parameter entirely, since its
+//! `TV_TRANSLATE`/`TV_CSTRING` sentinel-encoding only ever affected
+//! the omitted message TEXT, never the return value - see
+//! [`value_check_lock`]'s own doc comment), and the full
+//! `tv_check_for_*_arg` family (21 functions: argument-type guards
+//! used by builtin Vimscript function implementations to validate
+//! their own arguments before proceeding) - `args[idx]` indexing
+//! becomes a plain Rust slice index. Every real `emsg`/`semsg` call in
+//! this whole section is omitted (message display, not tractable),
+//! keeping only the `bool`/`OK`/`FAIL` result, matching this module's
+//! established policy throughout.
 
 use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
@@ -401,6 +419,373 @@ pub fn tv_get_string_chk(tv: &TypvalT) -> Option<Vec<u8>> {
 #[must_use]
 pub fn tv_get_string(tv: &TypvalT) -> Vec<u8> {
     tv_get_string_chk(tv).unwrap_or_default()
+}
+
+// Type checks:
+
+/// Check that given value is a number or string (`tv_check_str_or_nr`).
+///
+/// The original's own `emsg`/`semsg` calls reporting exactly which
+/// wrong type was found are omitted (message display, not tractable) -
+/// only the boolean result is kept, matching this module's established
+/// "skip the display, keep the state" policy.
+#[must_use]
+pub fn tv_check_str_or_nr(tv: &TypvalT) -> bool {
+    matches!(tv.value, TypvalValue::Number(_) | TypvalValue::String(_))
+}
+
+/// Check that given value is a number or can be converted to it
+/// (`tv_check_num`). Same message-display omission as
+/// [`tv_check_str_or_nr`].
+#[must_use]
+pub fn tv_check_num(tv: &TypvalT) -> bool {
+    matches!(
+        tv.value,
+        TypvalValue::Number(_) | TypvalValue::Bool(_) | TypvalValue::Special(_) | TypvalValue::String(_)
+    )
+}
+
+/// Check that given value is a Vimscript String or can be "cast" to it
+/// (`tv_check_str`). Same message-display omission as
+/// [`tv_check_str_or_nr`].
+#[must_use]
+pub fn tv_check_str(tv: &TypvalT) -> bool {
+    matches!(
+        tv.value,
+        TypvalValue::Number(_)
+            | TypvalValue::Bool(_)
+            | TypvalValue::Special(_)
+            | TypvalValue::String(_)
+            | TypvalValue::Float(_)
+    )
+}
+
+/// Get a list's lock status, or `VAR_FIXED` for a null list
+/// (`tv_list_locked`, `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live
+/// `crate::eval::typval_defs::ListT`.
+#[must_use]
+pub unsafe fn tv_list_locked(l: *const crate::eval::typval_defs::ListT) -> VarLockStatus {
+    if l.is_null() {
+        return VarLockStatus::Fixed;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_lock }
+}
+
+/// Return true if typval is locked (`tv_islocked`).
+///
+/// # Safety
+/// If `tv.value` holds a `List`/`Dict`, that pointer, if non-null, must
+/// be a valid pointer to a live `ListT`/`DictT`.
+#[must_use]
+pub unsafe fn tv_islocked(tv: &TypvalT) -> bool {
+    if tv.v_lock == VarLockStatus::Locked {
+        return true;
+    }
+    match &tv.value {
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let lock = unsafe { tv_list_locked(*l) };
+            lock == VarLockStatus::Locked
+        }
+        TypvalValue::Dict(d) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            !d.is_null() && unsafe { &**d }.dv_lock == VarLockStatus::Locked
+        }
+        _ => false,
+    }
+}
+
+/// Return true if variable `name` has a locked (immutable) value
+/// (`value_check_lock`).
+///
+/// The original's own `emsg`/`semsg` calls (real, reachable user
+/// errors reporting which lock kind was hit) are omitted - message
+/// display not tractable - but the exact same `true`/`false` return is
+/// kept. `name`/`name_len` only ever affected the omitted message
+/// TEXT in the original (never the return value itself), so
+/// `name_len`'s `TV_TRANSLATE`/`TV_CSTRING` sentinel-encoding has no
+/// meaningful Rust equivalent here and isn't translated; `name` itself
+/// is still accepted (unused) to preserve the original's "was a name
+/// provided" call-site shape for any future real caller.
+#[must_use]
+pub fn value_check_lock(lock: VarLockStatus, _name: Option<&[u8]>) -> bool {
+    lock != VarLockStatus::Unlocked
+}
+
+/// Check that a typval isn't locked, giving an error if it is
+/// (`tv_check_lock`). See [`value_check_lock`]'s own doc comment for
+/// why `name_len` isn't translated.
+///
+/// # Safety
+/// If `tv.value` holds a `Blob`/`List`/`Dict`, that pointer, if
+/// non-null, must be a valid pointer to a live `BlobT`/`ListT`/`DictT`.
+#[must_use]
+pub unsafe fn tv_check_lock(tv: &TypvalT, name: Option<&[u8]>) -> bool {
+    let lock = match &tv.value {
+        TypvalValue::Blob(b) => {
+            if b.is_null() {
+                VarLockStatus::Unlocked
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &**b }.bv_lock
+            }
+        }
+        TypvalValue::List(l) => {
+            if l.is_null() {
+                VarLockStatus::Unlocked
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &**l }.lv_lock
+            }
+        }
+        TypvalValue::Dict(d) => {
+            if d.is_null() {
+                VarLockStatus::Unlocked
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &**d }.dv_lock
+            }
+        }
+        _ => VarLockStatus::Unlocked,
+    };
+    value_check_lock(tv.v_lock, name) || (lock != VarLockStatus::Unlocked && value_check_lock(lock, name))
+}
+
+// Argument type checks (used by builtin Vimscript function
+// implementations to validate their own arguments; `args[idx]`
+// indexing becomes a plain Rust slice index - `eval/typval.c`'s
+// `tv_check_for_*_arg` family). Every real `emsg`/`semsg` call
+// reporting exactly which argument/expected-type mismatched is
+// omitted (message display, not tractable) - only the `OK`/`FAIL`
+// result is kept, matching this module's established policy.
+
+/// Give an error and return `FAIL` unless `args[idx]` is a string
+/// (`tv_check_for_string_arg`).
+#[must_use]
+pub fn tv_check_for_string_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::String(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a non-empty
+/// string (`tv_check_for_nonempty_string_arg`).
+#[must_use]
+pub fn tv_check_for_nonempty_string_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if tv_check_for_string_arg(args, idx) == FAIL {
+        return FAIL;
+    }
+    let TypvalValue::String(s) = &args[idx].value else { unreachable!() };
+    if s.as_deref().unwrap_or(&[]).is_empty() {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check for an optional string argument at `idx`
+/// (`tv_check_for_opt_string_arg`).
+#[must_use]
+pub fn tv_check_for_opt_string_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if matches!(args[idx].value, TypvalValue::Unknown) || tv_check_for_string_arg(args, idx) != FAIL {
+        OK
+    } else {
+        FAIL
+    }
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a number
+/// (`tv_check_for_number_arg`).
+#[must_use]
+pub fn tv_check_for_number_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::Number(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check for an optional number argument at `idx`
+/// (`tv_check_for_opt_number_arg`).
+#[must_use]
+pub fn tv_check_for_opt_number_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if matches!(args[idx].value, TypvalValue::Unknown) || tv_check_for_number_arg(args, idx) != FAIL {
+        OK
+    } else {
+        FAIL
+    }
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a float or a
+/// number (`tv_check_for_float_or_nr_arg`).
+#[must_use]
+pub fn tv_check_for_float_or_nr_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::Float(_) | TypvalValue::Number(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a bool
+/// (`tv_check_for_bool_arg`). A plain `Number` holding `0` or `1` is
+/// also accepted, matching the original's own leniency.
+#[must_use]
+pub fn tv_check_for_bool_arg(args: &[TypvalT], idx: usize) -> i32 {
+    let ok = matches!(args[idx].value, TypvalValue::Bool(_))
+        || matches!(args[idx].value, TypvalValue::Number(0 | 1));
+    if !ok {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check for an optional bool argument at `idx`
+/// (`tv_check_for_opt_bool_arg`).
+#[must_use]
+pub fn tv_check_for_opt_bool_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if matches!(args[idx].value, TypvalValue::Unknown) {
+        return OK;
+    }
+    tv_check_for_bool_arg(args, idx)
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a blob
+/// (`tv_check_for_blob_arg`).
+#[must_use]
+pub fn tv_check_for_blob_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::Blob(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a list
+/// (`tv_check_for_list_arg`).
+#[must_use]
+pub fn tv_check_for_list_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::List(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a dict
+/// (`tv_check_for_dict_arg`).
+#[must_use]
+pub fn tv_check_for_dict_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::Dict(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a non-`NULL`
+/// dict (`tv_check_for_nonnull_dict_arg`).
+#[must_use]
+pub fn tv_check_for_nonnull_dict_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if tv_check_for_dict_arg(args, idx) == FAIL {
+        return FAIL;
+    }
+    let TypvalValue::Dict(d) = args[idx].value else { unreachable!() };
+    if d.is_null() {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check for an optional dict argument at `idx`
+/// (`tv_check_for_opt_dict_arg`).
+#[must_use]
+pub fn tv_check_for_opt_dict_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if matches!(args[idx].value, TypvalValue::Unknown) || tv_check_for_dict_arg(args, idx) != FAIL {
+        OK
+    } else {
+        FAIL
+    }
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a string or a
+/// number (`tv_check_for_string_or_number_arg`).
+#[must_use]
+pub fn tv_check_for_string_or_number_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::String(_) | TypvalValue::Number(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a buffer
+/// number (a number or a string) (`tv_check_for_buffer_arg`).
+#[must_use]
+pub fn tv_check_for_buffer_arg(args: &[TypvalT], idx: usize) -> i32 {
+    tv_check_for_string_or_number_arg(args, idx)
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a line
+/// number (a number or a string) (`tv_check_for_lnum_arg`).
+#[must_use]
+pub fn tv_check_for_lnum_arg(args: &[TypvalT], idx: usize) -> i32 {
+    tv_check_for_string_or_number_arg(args, idx)
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a string or a
+/// list (`tv_check_for_string_or_list_arg`).
+#[must_use]
+pub fn tv_check_for_string_or_list_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::String(_) | TypvalValue::List(_)) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a string, a
+/// list, or a blob (`tv_check_for_string_or_list_or_blob_arg`).
+#[must_use]
+pub fn tv_check_for_string_or_list_or_blob_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(
+        args[idx].value,
+        TypvalValue::String(_) | TypvalValue::List(_) | TypvalValue::Blob(_)
+    ) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check for an optional string or list argument at `idx`
+/// (`tv_check_for_opt_string_or_list_arg`).
+#[must_use]
+pub fn tv_check_for_opt_string_or_list_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if matches!(args[idx].value, TypvalValue::Unknown) || tv_check_for_string_or_list_arg(args, idx) != FAIL {
+        OK
+    } else {
+        FAIL
+    }
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a string or a
+/// function reference (`tv_check_for_string_or_func_arg`).
+#[must_use]
+pub fn tv_check_for_string_or_func_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(
+        args[idx].value,
+        TypvalValue::Partial(_) | TypvalValue::Func(_) | TypvalValue::String(_)
+    ) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Give an error and return `FAIL` unless `args[idx]` is a list or a
+/// blob (`tv_check_for_list_or_blob_arg`).
+#[must_use]
+pub fn tv_check_for_list_or_blob_arg(args: &[TypvalT], idx: usize) -> i32 {
+    if !matches!(args[idx].value, TypvalValue::List(_) | TypvalValue::Blob(_)) {
+        return FAIL;
+    }
+    OK
 }
 
 /// Formats `value` matching C's `printf("%g", value)` with the
@@ -3493,5 +3878,325 @@ mod tests {
 
             tv_list_free(l);
         }
+    }
+
+    fn string_tv(s: &[u8]) -> TypvalT {
+        TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(Some(s.to_vec())) }
+    }
+
+    fn unknown_tv() -> TypvalT {
+        TypvalT::default()
+    }
+
+    // ---- tv_check_str_or_nr / tv_check_num / tv_check_str --------------
+
+    #[test]
+    fn tv_check_str_or_nr_accepts_number_and_string_only() {
+        assert!(tv_check_str_or_nr(&number_tv(1)));
+        assert!(tv_check_str_or_nr(&string_tv(b"x")));
+        assert!(!tv_check_str_or_nr(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Float(1.0)
+        }));
+        assert!(!tv_check_str_or_nr(&unknown_tv()));
+    }
+
+    #[test]
+    fn tv_check_num_accepts_number_bool_special_string() {
+        assert!(tv_check_num(&number_tv(1)));
+        assert!(tv_check_num(&string_tv(b"x")));
+        assert!(tv_check_num(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True)
+        }));
+        assert!(tv_check_num(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)
+        }));
+        assert!(!tv_check_num(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Float(1.0)
+        }));
+    }
+
+    #[test]
+    fn tv_check_str_accepts_number_bool_special_string_float() {
+        assert!(tv_check_str(&number_tv(1)));
+        assert!(tv_check_str(&string_tv(b"x")));
+        assert!(tv_check_str(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Float(1.0)
+        }));
+        assert!(!tv_check_str(&TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::List(std::ptr::null_mut())
+        }));
+    }
+
+    // ---- tv_list_locked / tv_islocked / value_check_lock / tv_check_lock
+
+    #[test]
+    fn tv_list_locked_null_is_fixed() {
+        assert_eq!(unsafe { tv_list_locked(std::ptr::null()) }, VarLockStatus::Fixed);
+    }
+
+    #[test]
+    fn tv_list_locked_reads_lv_lock() {
+        let mut l = test_list();
+        l.lv_lock = VarLockStatus::Locked;
+        assert_eq!(unsafe { tv_list_locked(&l as *const _) }, VarLockStatus::Locked);
+    }
+
+    #[test]
+    fn tv_islocked_true_when_v_lock_locked() {
+        let tv = TypvalT { v_lock: VarLockStatus::Locked, value: TypvalValue::Number(0) };
+        assert!(unsafe { tv_islocked(&tv) });
+    }
+
+    #[test]
+    fn tv_islocked_true_when_inner_list_locked() {
+        let mut l = test_list();
+        l.lv_lock = VarLockStatus::Locked;
+        let tv =
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(&mut l as *mut _) };
+        assert!(unsafe { tv_islocked(&tv) });
+    }
+
+    #[test]
+    fn tv_islocked_false_when_nothing_locked() {
+        assert!(!unsafe { tv_islocked(&number_tv(1)) });
+        let tv =
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) };
+        assert!(!unsafe { tv_islocked(&tv) });
+    }
+
+    #[test]
+    fn value_check_lock_true_for_locked_and_fixed_false_for_unlocked() {
+        assert!(!value_check_lock(VarLockStatus::Unlocked, None));
+        assert!(value_check_lock(VarLockStatus::Locked, None));
+        assert!(value_check_lock(VarLockStatus::Fixed, Some(b"x")));
+    }
+
+    #[test]
+    fn tv_check_lock_true_when_tv_itself_locked() {
+        let tv = TypvalT { v_lock: VarLockStatus::Locked, value: TypvalValue::Number(0) };
+        assert!(unsafe { tv_check_lock(&tv, None) });
+    }
+
+    #[test]
+    fn tv_check_lock_true_when_inner_dict_locked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe { (*d).dv_lock = VarLockStatus::Locked };
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d) };
+        assert!(unsafe { tv_check_lock(&tv, None) });
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_check_lock_false_when_nothing_locked() {
+        assert!(!unsafe { tv_check_lock(&number_tv(1), None) });
+    }
+
+    // ---- tv_check_for_*_arg family --------------------------------------
+
+    #[test]
+    fn tv_check_for_string_arg_accepts_only_string() {
+        let args = [string_tv(b"x"), number_tv(1)];
+        assert_eq!(tv_check_for_string_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_string_arg(&args, 1), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_nonempty_string_arg_rejects_empty_and_none() {
+        let args = [string_tv(b"x"), string_tv(b""), number_tv(1)];
+        assert_eq!(tv_check_for_nonempty_string_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_nonempty_string_arg(&args, 1), FAIL);
+        assert_eq!(tv_check_for_nonempty_string_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_opt_string_arg_allows_unknown() {
+        let args = [string_tv(b"x"), unknown_tv(), number_tv(1)];
+        assert_eq!(tv_check_for_opt_string_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_opt_string_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_opt_string_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_number_arg_accepts_only_number() {
+        let args = [number_tv(1), string_tv(b"x")];
+        assert_eq!(tv_check_for_number_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_number_arg(&args, 1), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_opt_number_arg_allows_unknown() {
+        let args = [number_tv(1), unknown_tv(), string_tv(b"x")];
+        assert_eq!(tv_check_for_opt_number_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_opt_number_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_opt_number_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_float_or_nr_arg_accepts_float_and_number() {
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.0) },
+            number_tv(1),
+            string_tv(b"x"),
+        ];
+        assert_eq!(tv_check_for_float_or_nr_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_float_or_nr_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_float_or_nr_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_bool_arg_accepts_bool_and_0_or_1_number() {
+        let args = [
+            TypvalT {
+                v_lock: VarLockStatus::Unlocked,
+                value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+            },
+            number_tv(0),
+            number_tv(1),
+            number_tv(2),
+            string_tv(b"x"),
+        ];
+        assert_eq!(tv_check_for_bool_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_bool_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_bool_arg(&args, 2), OK);
+        assert_eq!(tv_check_for_bool_arg(&args, 3), FAIL); // 2 is not 0/1
+        assert_eq!(tv_check_for_bool_arg(&args, 4), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_opt_bool_arg_allows_unknown() {
+        let args = [unknown_tv(), number_tv(0), string_tv(b"x")];
+        assert_eq!(tv_check_for_opt_bool_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_opt_bool_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_opt_bool_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_blob_arg_accepts_only_blob() {
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(std::ptr::null_mut()) },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_blob_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_blob_arg(&args, 1), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_list_arg_accepts_only_list() {
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_list_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_list_arg(&args, 1), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_dict_arg_accepts_only_dict() {
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_dict_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_dict_arg(&args, 1), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_nonnull_dict_arg_rejects_null_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d) },
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_nonnull_dict_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_nonnull_dict_arg(&args, 1), FAIL);
+        assert_eq!(tv_check_for_nonnull_dict_arg(&args, 2), FAIL);
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_check_for_opt_dict_arg_allows_unknown() {
+        let args = [
+            unknown_tv(),
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(std::ptr::null_mut()) },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_opt_dict_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_opt_dict_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_opt_dict_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_string_or_number_arg_and_aliases() {
+        let args = [string_tv(b"x"), number_tv(1), unknown_tv()];
+        assert_eq!(tv_check_for_string_or_number_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_string_or_number_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_string_or_number_arg(&args, 2), FAIL);
+        // tv_check_for_buffer_arg/tv_check_for_lnum_arg are literal
+        // delegates - verify they behave identically.
+        assert_eq!(tv_check_for_buffer_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_lnum_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_buffer_arg(&args, 2), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_string_or_list_arg_family() {
+        let args = [
+            string_tv(b"x"),
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) },
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(std::ptr::null_mut()) },
+            number_tv(1),
+            unknown_tv(),
+        ];
+        assert_eq!(tv_check_for_string_or_list_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_string_or_list_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_string_or_list_arg(&args, 2), FAIL); // blob not accepted
+        assert_eq!(tv_check_for_string_or_list_arg(&args, 3), FAIL);
+
+        assert_eq!(tv_check_for_string_or_list_or_blob_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_string_or_list_or_blob_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_string_or_list_or_blob_arg(&args, 2), OK); // blob IS accepted here
+        assert_eq!(tv_check_for_string_or_list_or_blob_arg(&args, 3), FAIL);
+
+        assert_eq!(tv_check_for_opt_string_or_list_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_opt_string_or_list_arg(&args, 4), OK); // unknown allowed
+        assert_eq!(tv_check_for_opt_string_or_list_arg(&args, 3), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_string_or_func_arg_accepts_partial_func_string() {
+        let args = [
+            string_tv(b"x"),
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Func(None) },
+            TypvalT {
+                v_lock: VarLockStatus::Unlocked,
+                value: TypvalValue::Partial(std::ptr::null_mut()),
+            },
+            number_tv(1),
+        ];
+        assert_eq!(tv_check_for_string_or_func_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_string_or_func_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_string_or_func_arg(&args, 2), OK);
+        assert_eq!(tv_check_for_string_or_func_arg(&args, 3), FAIL);
+    }
+
+    #[test]
+    fn tv_check_for_list_or_blob_arg_accepts_list_and_blob() {
+        let args = [
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(std::ptr::null_mut()) },
+            TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Blob(std::ptr::null_mut()) },
+            string_tv(b"x"),
+        ];
+        assert_eq!(tv_check_for_list_or_blob_arg(&args, 0), OK);
+        assert_eq!(tv_check_for_list_or_blob_arg(&args, 1), OK);
+        assert_eq!(tv_check_for_list_or_blob_arg(&args, 2), FAIL);
     }
 }
