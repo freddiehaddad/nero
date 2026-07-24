@@ -171,6 +171,24 @@
 //! exactly like the original's own `create_funccal`/`call_user_func`
 //! split, so tests exercising `register_closure` must set this up
 //! explicitly first.
+//!
+//! Also translated: `eval_fname_script`/`eval_fname_sid`/
+//! `fname_trans_sid` - the first piece of a larger, multi-commit
+//! effort to translate the GC mark-phase's `set_ref_in_*` family
+//! (`eval/gc`-equivalent logic actually lives in `eval.c`/
+//! `eval/userfunc.c` directly - there is no separate `eval/gc.c`
+//! file). `fname_trans_sid` translates `<SID>`/`s:`/`<SNR>`-prefixed
+//! names into the internally-encoded `<SNR>{sid}_` form, returning a
+//! freshly-owned `Vec<u8>` (matching `cat_func_name`'s own established
+//! simplification for the original's "fixed buffer + heap-allocated
+//! overflow fallback" idiom) and a `Result<_, FnameTransError>` in
+//! place of the original's `*error` out-parameter, which - unlike the
+//! original itself - stops immediately on error rather than falling
+//! through with a degraded value, since every real caller either
+//! ignores the error (an equivalent outcome, confirmed by reading
+//! `set_ref_in_func`/`make_partial`, neither of which inspects
+//! `error`) or genuinely needs the signal (`get_func_arity`, not yet
+//! translated).
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -342,6 +360,86 @@ pub fn cat_func_name(fp: &UfuncT) -> Vec<u8> {
     } else {
         clean.to_vec()
     }
+}
+
+/// `keycodes.h`'s `KS_EXTRA` (253) - the second byte of an internally-
+/// encoded key/`<SNR>` sequence.
+const KS_EXTRA: u8 = 253;
+/// `keycodes.h`'s `KE_SNR` (82) - the third byte marking `<SNR>`
+/// specifically (`K_SPECIAL KS_EXTRA KE_SNR`).
+const KE_SNR: u8 = 82;
+
+/// The number of bytes of a script-local name prefix at the start of
+/// `name`: 5 for `"<SID>"`/`"<SNR>"`, 2 for `"s:"`, 0 otherwise
+/// (`eval_fname_script`).
+#[must_use]
+pub fn eval_fname_script(name: &[u8]) -> usize {
+    if name.first() == Some(&b'<')
+        && (crate::mbyte::mb_strnicmp(&name[1..], b"SID>", 4) == 0
+            || crate::mbyte::mb_strnicmp(&name[1..], b"SNR>", 4) == 0)
+    {
+        return 5;
+    }
+    if name.first() == Some(&b's') && name.get(1) == Some(&b':') {
+        return 2;
+    }
+    0
+}
+
+/// Whether `name` (already confirmed via [`eval_fname_script`] to have
+/// a script-local prefix) is `"<SID>"`/`"s:"`-style (needing the
+/// current script's own ID substituted in), as opposed to `"<SNR>"`-
+/// style (which already has an explicit numeric ID baked in)
+/// (`eval_fname_sid`).
+#[must_use]
+fn eval_fname_sid(name: &[u8]) -> bool {
+    name.first() == Some(&b's')
+        || name.get(2).is_some_and(|&c| crate::macros_defs::toupper_asc(c as i32) == i32::from(b'I'))
+}
+
+/// Translate `<SID>`/`s:`/`<SNR>`-prefixed names into the internally-
+/// encoded `K_SPECIAL KS_EXTRA KE_SNR {sid}_` form (`fname_trans_sid`).
+///
+/// Unlike the original (writes into a caller-provided fixed-size
+/// `fname_buf`, falling back to a separate heap allocation via
+/// `tofree` if the result doesn't fit), returns a freshly-owned,
+/// never-truncated `Vec<u8>` directly, matching `cat_func_name`'s own
+/// established simplification for this exact "fixed buffer + overflow
+/// fallback" C idiom. Returns `Err(FnameTransError::Script)` in place
+/// of the original's `*error = FCERR_SCRIPT` (reached when translating
+/// a `<SID>`/`s:` name outside any script context) - unlike the
+/// original, which doesn't stop on this error (its caller almost never
+/// checks it anyway - confirmed by reading `set_ref_in_func`/
+/// `make_partial`, neither of which inspects `error` at all), this
+/// returns `Err` immediately: every real caller either ignores the
+/// error (treating it the same as "no function found" - a harmless,
+/// equivalent outcome, since the degraded name the original would
+/// have produced doesn't resolve to anything real either) or, for the
+/// one real caller that DOES check it (`get_func_arity`, not yet
+/// translated), needs exactly this signal.
+pub fn fname_trans_sid(name: &[u8]) -> Result<Vec<u8>, FnameTransError> {
+    let prefix_len = eval_fname_script(name);
+    if prefix_len == 0 {
+        return Ok(name.to_vec()); // no prefix
+    }
+    let script_name = &name[prefix_len..];
+
+    let mut result = vec![K_SPECIAL, KS_EXTRA, KE_SNR];
+    if eval_fname_sid(name) {
+        // SAFETY: only reads GLOBALS.current_sctx, matching this
+        // crate's usual "internal GlobalCell access, exposed as a
+        // safe pub fn" pattern.
+        let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+        if sid <= 0 {
+            return Err(FnameTransError::Script);
+        }
+        result.extend_from_slice(sid.to_string().as_bytes());
+        result.push(b'_');
+    }
+    // else: "<SNR>" already has its own explicit numeric ID baked into
+    // script_name itself - nothing more to add to the prefix.
+    result.extend_from_slice(script_name);
+    Ok(result)
 }
 
 /// Returns `fp`'s "print name": `uf_name_exp` if set (populated when
@@ -2281,6 +2379,64 @@ mod tests {
         // be treated as if the last real byte were a terminator.
         let fp = UfuncT { uf_name: b"MyFunc".to_vec(), ..Default::default() };
         assert_eq!(cat_func_name(&fp), b"MyFunc");
+    }
+
+    #[test]
+    fn eval_fname_script_recognizes_sid_snr_and_s_colon_prefixes() {
+        assert_eq!(eval_fname_script(b"<SID>Foo"), 5);
+        assert_eq!(eval_fname_script(b"<SNR>123_Foo"), 5);
+        // Case-insensitive, matching mb_strnicmp's own semantics.
+        assert_eq!(eval_fname_script(b"<sid>Foo"), 5);
+        assert_eq!(eval_fname_script(b"s:Foo"), 2);
+    }
+
+    #[test]
+    fn eval_fname_script_zero_for_ordinary_or_empty_names() {
+        assert_eq!(eval_fname_script(b"Foo"), 0);
+        assert_eq!(eval_fname_script(b""), 0);
+        assert_eq!(eval_fname_script(b"<Foo"), 0);
+    }
+
+    #[test]
+    fn eval_fname_sid_true_for_s_colon_and_sid_style() {
+        assert!(eval_fname_sid(b"s:Foo"));
+        assert!(eval_fname_sid(b"<SID>Foo"));
+    }
+
+    #[test]
+    fn eval_fname_sid_false_for_snr_style() {
+        assert!(!eval_fname_sid(b"<SNR>123_Foo"));
+    }
+
+    #[test]
+    fn fname_trans_sid_no_prefix_returns_name_verbatim() {
+        assert_eq!(fname_trans_sid(b"Foo"), Ok(b"Foo".to_vec()));
+    }
+
+    #[test]
+    fn fname_trans_sid_s_colon_substitutes_the_current_script_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 7;
+        assert_eq!(
+            fname_trans_sid(b"s:Foo"),
+            Ok(vec![K_SPECIAL, KS_EXTRA, KE_SNR, b'7', b'_', b'F', b'o', b'o'])
+        );
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 0;
+    }
+
+    #[test]
+    fn fname_trans_sid_snr_style_keeps_its_own_explicit_id() {
+        assert_eq!(
+            fname_trans_sid(b"<SNR>123_Foo"),
+            Ok(vec![K_SPECIAL, KS_EXTRA, KE_SNR, b'1', b'2', b'3', b'_', b'F', b'o', b'o'])
+        );
+    }
+
+    #[test]
+    fn fname_trans_sid_errors_outside_any_script_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 0;
+        assert_eq!(fname_trans_sid(b"s:Foo"), Err(FnameTransError::Script));
     }
 
     #[test]
