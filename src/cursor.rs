@@ -92,8 +92,18 @@
 //! correct and complete for the overwhelmingly common no-folds case,
 //! panicking (not silently wrong) otherwise.
 //!
-//! Deferred: `set_leftcol` (needs `redraw_later`/`changed_cline_bef_curs`,
-//! drawscreen.c's redraw-tracking side).
+//! Also translated: **`set_leftcol`** (adjusts `curwin.w_leftcol` and,
+//! if needed, the cursor position, to keep the cursor visible after a
+//! horizontal scroll) - found via a re-scan of `cursor.c` now that
+//! `plines.c` is fully complete. A stale module-doc note had this
+//! deferred citing `move.c`'s redraw-tracking side as a blocker, but
+//! every REAL dependency (`changed_cline_bef_curs`/`win_col_off`/
+//! `validate_virtcol` in `move.rs`, `get_sidescrolloff_value` in
+//! `option.rs`, `coladvance` above, `getvvcol` in `plines.rs`) was
+//! already translated - only the original's trailing
+//! `redraw_later(curwin, UPD_NOT_VALID)` call is omitted, matching the
+//! same established "skip the deferred-subsystem side effect, keep
+//! the state correct" policy used throughout this crate.
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::pos_defs::{ColnrT, LinenrT, MAXCOL, PosT};
@@ -798,6 +808,111 @@ pub unsafe fn get_cursor_rel_lnum(wp: *mut WinT, lnum: crate::pos_defs::LinenrT)
     );
 }
 
+/// Set `curwin.w_leftcol` to `leftcol`, adjusting the cursor position
+/// if needed (`set_leftcol`).
+///
+/// @return `true` if the cursor was moved.
+///
+/// Omits the original's trailing `redraw_later(curwin, UPD_NOT_VALID)`
+/// call - a pure redraw-scheduling side effect that doesn't feed back
+/// into any value this crate currently computes, matching the same
+/// established "skip the deferred-subsystem side effect, keep the
+/// state correct" policy already used throughout this crate (e.g.
+/// `move.rs`'s own `set_valid_virtcol`/`set_topline`). Every other
+/// dependency (`changed_cline_bef_curs`, `win_col_off`,
+/// `validate_virtcol`, `get_sidescrolloff_value`, `coladvance`,
+/// `getvvcol`) was already translated - found via a re-scan of
+/// `cursor.c` now that `plines.c` is fully complete.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+pub unsafe fn set_leftcol(leftcol: ColnrT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // Return quickly when there is no change.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*curwin).w_leftcol } == leftcol {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*curwin).w_leftcol = leftcol;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::changed_cline_bef_curs(curwin) };
+
+    // Each `&mut *curwin`/`&*curwin`/field access below is created
+    // fresh immediately before its one use and never held across a
+    // call to another `curwin`-based function - matching the aliasing
+    // discipline already established for `plines.rs`'s
+    // `plines_win_full`/`win_text_height`.
+    // SAFETY: forwarded from this function's own safety doc.
+    let col_off = unsafe { crate::r#move::win_col_off(&mut *curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (w_leftcol, w_view_width) = unsafe { ((*curwin).w_leftcol, (*curwin).w_view_width) };
+    let lastcol = i64::from(w_leftcol) + i64::from(w_view_width) - i64::from(col_off) - 1;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::validate_virtcol(curwin) };
+
+    let mut retval = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    let siso = unsafe { crate::option::get_sidescrolloff_value(&*curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_virtcol = unsafe { (*curwin).w_virtcol };
+    if i64::from(w_virtcol) > lastcol - siso {
+        retval = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { coladvance(curwin, (lastcol - siso) as ColnrT) };
+    } else if i64::from(w_virtcol) < i64::from(w_leftcol) + siso {
+        retval = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { coladvance(curwin, (i64::from(w_leftcol) + siso) as ColnrT) };
+    }
+
+    let mut s: ColnrT = 0;
+    let mut e: ColnrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::plines::getvvcol(
+            curwin,
+            &mut (*curwin).w_cursor,
+            Some(&mut s),
+            None,
+            Some(&mut e),
+            0,
+        );
+    }
+    if i64::from(e) > lastcol {
+        retval = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { coladvance(curwin, s - 1) };
+    } else if s < w_leftcol {
+        retval = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { coladvance(curwin, e + 1) } == crate::vim_defs::FAIL {
+            // there isn't another character - adjust w_leftcol instead
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                (*curwin).w_leftcol = s;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::changed_cline_bef_curs(curwin) };
+        }
+    }
+
+    if retval {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*curwin).w_set_curswant = true;
+        }
+    }
+    retval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1501,80 @@ mod tests {
 
         assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 3) }, 2);
         assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 1) }, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn set_leftcol_no_change_returns_false_quickly() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+        win.w_leftcol = 5;
+
+        // Same value as the current w_leftcol - the "return quickly
+        // when there is no change" fast path, no other side effect.
+        assert!(!unsafe { set_leftcol(5) });
+        assert_eq!(win.w_leftcol, 5);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn set_leftcol_scrolls_right_and_pulls_cursor_into_view() {
+        // Hand-traced: 20 'a' characters (1 cell each), w_view_width=10,
+        // no number/foldcolumn/sign columns (win_col_off == 0). Cursor
+        // starts at col 2 (virtual column 2, well within the initial
+        // [0, 9] visible range). Scrolling to leftcol=5 makes the
+        // visible range [5, 14] - the cursor (at vcol 2) is now to the
+        // LEFT of that range, so set_leftcol should advance it to
+        // exactly vcol 5 (get_sidescrolloff_value defaults to 0), then
+        // find s=e=5 (a 1-cell character), neither exceeding lastcol
+        // (14) nor falling short of the new leftcol (5) - so no further
+        // adjustment happens after the initial coladvance.
+        let mut line = vec![b'a'; 20];
+        line.push(0);
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 2, coladd: 0 },
+            w_view_width: 10,
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, &line);
+
+        assert!(unsafe { set_leftcol(5) });
+        assert_eq!(win.w_leftcol, 5);
+        assert_eq!(win.w_cursor.col, 5);
+        assert!(win.w_set_curswant);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn set_leftcol_no_adjustment_needed_when_cursor_already_visible() {
+        // Same 20-'a' line/window, but the cursor (col 6, vcol 6) is
+        // already within the new visible range [5, 14] after scrolling
+        // to leftcol=5 - no coladvance call should be needed, so the
+        // cursor position is untouched and retval is false.
+        let mut line = vec![b'a'; 20];
+        line.push(0);
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 6, coladd: 0 },
+            w_view_width: 10,
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, &line);
+
+        assert!(!unsafe { set_leftcol(5) });
+        assert_eq!(win.w_leftcol, 5);
+        assert_eq!(win.w_cursor.col, 6); // untouched
+        assert!(!win.w_set_curswant);
 
         drop(guard);
         close_buf_with_memline(buf);
