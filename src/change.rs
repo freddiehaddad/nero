@@ -23,10 +23,13 @@
 //! real message display (`msg_start`/`msg_source`/`msg_puts_hl`/
 //! `msg_clr_eos`/`msg_end`/`msg_delay`/`showmode`) is skipped -
 //! `message.c`'s display pipeline is not yet tractable - but every
-//! OTHER observable state change is kept faithfully (see its own doc
-//! comment for the one exception: `set_vim_var_string(VV_WARNINGMSG,
-//! ...)`, which needs the eval engine's real `v:` variable table,
-//! `evalvars_init`, not yet translated).
+//! OTHER observable state change is kept faithfully, including
+//! `set_vim_var_string(VV_WARNINGMSG, ...)`: unlike `evalvars_init`
+//! (the full `v:` scope-dict-wiring bootstrap, still not translated),
+//! `set_vim_var_string` itself only writes directly to the `VIMVARS`
+//! storage slot (`crate::eval::vars::VIMVARS[idx].tv`), which is real
+//! and requires no dict/hashtable wiring at all - confirmed by reading
+//! its own body before wiring this call in for real.
 //!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display
@@ -93,11 +96,11 @@ pub unsafe fn file_ff_differs(buf: &mut BufT, ignore_empty: bool) -> bool {
 /// `message.c`'s display pipeline is not yet tractable - but every
 /// OTHER observable state change is kept: `apply_autocmds` is called
 /// for real (currently always a no-op today - see
-/// `crate::autocmd`'s own module doc), and `buf.b_did_warn`/
-/// `GLOBALS.redraw_cmdline` are still set exactly as the original
-/// does. `set_vim_var_string(VV_WARNINGMSG, ...)` is the one skipped
-/// state change: it needs the eval engine's real `v:` variable table
-/// (`evalvars_init`), not yet translated.
+/// `crate::autocmd`'s own module doc), `v:warningmsg` is set for real
+/// via `set_vim_var_string` (it only touches the `VIMVARS` storage
+/// slot directly, no `evalvars_init` dict-wiring needed), and
+/// `buf.b_did_warn`/`GLOBALS.redraw_cmdline` are still set exactly as
+/// the original does.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
@@ -126,8 +129,16 @@ pub unsafe fn change_warning(buf: &mut BufT, _col: i32) {
             return;
         }
 
-        // Real message display and set_vim_var_string(VV_WARNINGMSG,
-        // ...) are skipped - see this function's own doc comment.
+        // Real message display is skipped - see this function's own
+        // doc comment. v:warningmsg IS set for real, matching the
+        // original's set_vim_var_string(VV_WARNINGMSG, _(w_readonly), -1).
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Warningmsg,
+                Some(b"W10: Warning: Changing a readonly file"),
+            )
+        };
         buf.b_did_warn = true;
         unsafe { crate::globals::GLOBALS.get_mut() }.redraw_cmdline = false;
     }
@@ -338,10 +349,33 @@ mod tests {
         // b_ro_locked is incremented then decremented around the
         // apply_autocmds call - net zero once change_warning returns.
         assert_eq!(buf.b_ro_locked, 0);
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Warningmsg) },
+            b"W10: Warning: Changing a readonly file"
+        );
 
         // A second call is now a no-op (b_did_warn short-circuits).
         unsafe { crate::globals::GLOBALS.get_mut() }.redraw_cmdline = true;
         unsafe { change_warning(&mut buf, 0) };
         assert!(unsafe { crate::globals::GLOBALS.get_mut() }.redraw_cmdline);
+
+        // Reset: VIMVARS is shared, process-wide state.
+        unsafe {
+            crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Warningmsg, None)
+        };
+    }
+
+    #[test]
+    fn change_warning_leaves_warningmsg_untouched_when_a_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_ro: 0, ..Default::default() };
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        unsafe { change_warning(&mut buf, 0) };
+
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Warningmsg) },
+            Vec::<u8>::new()
+        );
     }
 }
