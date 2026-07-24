@@ -26,15 +26,29 @@
 //! Also translated: `linewhite` (needed only `charset.c`'s
 //! `skipwhite` and `memline.c`'s `ml_get`, both already real).
 //!
-//! Deferred: everything else in the file - `SearchPattern`/
-//! `SearchOffset`/`spats[]` (the `/`/`?`/`:s` search-pattern-history
-//! state) and the functions built on them (`last_search_pat`,
-//! `reset_search_dir`, `set_last_search_pat`, etc.) need the real
-//! regex engine (to actually COMPILE a stored pattern) and
-//! `set_vim_var_nr`/`VV_SEARCHFORWARD` (the `v:` special-variable
-//! subsystem, not yet translated) - a separate, substantial
-//! undertaking from this file's own small "last character search"
-//! corner, left for a dedicated future pass.
+//! Also translated: `search.h`'s `SearchPattern`/`SearchOffset`
+//! structs (this file has no dedicated `_defs.rs` module of its own -
+//! same treatment as `charset.h`'s `vim_isbreak` embedded directly in
+//! `charset.rs`) and the "last used search pattern" `spats[]`/
+//! `last_idx` file-statics, bundled into one `SearchPatterns` struct
+//! behind one `GlobalCell`. Their simple accessors -
+//! `get_search_pattern`/`get_substitute_pattern`/
+//! `get_search_pattern_timestamp`/`search_pattern_cleared`/
+//! `set_substitute_pattern`/`set_last_used_pattern`/
+//! `search_was_last_used` - are translated too. `free_spat`'s explicit
+//! `xfree` calls have no Rust equivalent needed: assigning a new
+//! `SearchPattern` automatically drops the old `pat`/`additional_data`
+//! heap allocations.
+//!
+//! Deferred: `set_search_pattern` (needs `set_vv_searchforward` ->
+//! `set_vim_var_nr`/`VV_SEARCHFORWARD`, the `v:` special-variable
+//! subsystem, not yet translated - `set_substitute_pattern` doesn't
+//! call it, which is why that one IS translated) and everything else
+//! in the file - the functions actually building/using a compiled
+//! search pattern (`last_search_pat`, `reset_search_dir`,
+//! `set_last_search_pat`, `do_search`, etc.) need the real regex
+//! engine, a separate, substantial undertaking from this file's own
+//! small tractable corner, left for a dedicated future pass.
 
 use crate::types_defs::MAX_SCHAR_SIZE;
 use crate::vim_defs::Direction;
@@ -171,6 +185,151 @@ pub unsafe fn linewhite(lnum: crate::pos_defs::LinenrT) -> bool {
     let line = unsafe { crate::memline::ml_get(lnum) };
     let off = crate::charset::skipwhite(&line);
     line.get(off).copied().unwrap_or(0) == 0
+}
+
+/// Offset applied to the last search pattern (`SearchOffset`, from
+/// `search.h`).
+///
+/// @note Only the offset for the last SEARCH pattern is ever used, not
+/// for the last substitute pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOffset {
+    /// search direction: forward (`'/'`) or backward (`'?'`)
+    pub dir: u8,
+    /// `true` if the search has a line offset
+    pub line: bool,
+    /// `true` if the search sets the cursor at the end
+    pub end: bool,
+    /// actual offset value
+    pub off: i64,
+}
+
+impl Default for SearchOffset {
+    fn default() -> Self {
+        // Matches spats[]' own static initializer exactly: `{ '/',
+        // false, false, 0 }` - NOT all-zero (dir defaults to '/', not
+        // NUL), so the derived all-zero Default would be wrong here.
+        SearchOffset { dir: b'/', line: false, end: false, off: 0 }
+    }
+}
+
+/// Last search pattern and its attributes (`SearchPattern`, from
+/// `search.h`).
+///
+/// `pat`/`patlen` (a nullable `char *` plus its own separate length in
+/// the original) are combined into one `Option<Vec<u8>>`, matching
+/// this crate's established convention for such pairs (e.g.
+/// `mark_defs.rs`'s `fmark_T` fields) - `Vec::len()` gives `patlen`
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPattern {
+    /// the pattern, or `None` if unset
+    pub pat: Option<Vec<u8>>,
+    /// magicness of the pattern
+    pub magic: bool,
+    /// no smartcase for this pattern
+    pub no_scs: bool,
+    /// time of the last change
+    pub timestamp: crate::os::time_defs::Timestamp,
+    /// pattern offset
+    pub off: SearchOffset,
+    /// additional data from a ShaDa file
+    pub additional_data: Option<Box<crate::types_defs::AdditionalData>>,
+}
+
+impl Default for SearchPattern {
+    fn default() -> Self {
+        // Matches spats[]' own static initializer exactly: `{ NULL, 0,
+        // true, false, 0, { '/', false, false, 0 }, NULL }` - `magic`
+        // defaults to `true`, NOT the derived all-zero `false`.
+        SearchPattern {
+            pat: None,
+            magic: true,
+            no_scs: false,
+            timestamp: 0,
+            off: SearchOffset::default(),
+            additional_data: None,
+        }
+    }
+}
+
+/// Bundled "last used search pattern" file-static state (`spats[2]`
+/// and `last_idx`, kept together since they're always used in
+/// combination - matches `LastCsearch`'s own bundling precedent).
+/// Indices `0`/`1` correspond to the original's `RE_SEARCH`/`RE_SUBST`.
+#[derive(Debug, Clone, Default)]
+struct SearchPatterns {
+    /// last used search pattern / last used substitute pattern
+    /// (`spats[2]`)
+    spats: [SearchPattern; 2],
+    /// index in `spats` for `RE_LAST` (`last_idx`)
+    last_idx: usize,
+}
+
+static SEARCH_PATTERNS: std::sync::LazyLock<crate::globals::GlobalCell<SearchPatterns>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SearchPatterns::default()));
+
+/// Get the last search pattern, as a copy (`get_search_pattern`).
+#[must_use]
+pub fn get_search_pattern() -> SearchPattern {
+    // SAFETY: no overlapping live access to SEARCH_PATTERNS from other
+    // threads - `unsafe` here only for consistency with this crate's
+    // established `GlobalCell::get_mut` convention.
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].clone()
+}
+
+/// Get the last substitute pattern, as a copy, with its own offset
+/// cleared (`get_substitute_pattern`).
+#[must_use]
+pub fn get_substitute_pattern() -> SearchPattern {
+    // SAFETY: see [`get_search_pattern`].
+    let mut pat = unsafe { SEARCH_PATTERNS.get_mut() }.spats[1].clone();
+    pat.off = SearchOffset { dir: 0, line: false, end: false, off: 0 };
+    pat
+}
+
+/// Get the timestamp of the last search or substitute pattern
+/// (`get_search_pattern_timestamp`).
+#[must_use]
+pub fn get_search_pattern_timestamp(substitute: bool) -> crate::os::time_defs::Timestamp {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[usize::from(substitute)].timestamp
+}
+
+/// Check whether the last search or substitute pattern is cleared
+/// (`search_pattern_cleared`).
+#[must_use]
+pub fn search_pattern_cleared(substitute: bool) -> bool {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[usize::from(substitute)].pat.is_none()
+}
+
+/// Set the last substitute pattern (`set_substitute_pattern`).
+///
+/// Unlike `set_search_pattern` (not yet translated - see this
+/// module's own doc comment), this does NOT call
+/// `set_vv_searchforward` in the original either, so it has no such
+/// gap to defer.
+pub fn set_substitute_pattern(pat: SearchPattern) {
+    // SAFETY: see [`get_search_pattern`].
+    let state = unsafe { SEARCH_PATTERNS.get_mut() };
+    state.spats[1] = pat;
+    state.spats[1].off = SearchOffset { dir: 0, line: false, end: false, off: 0 };
+}
+
+/// Set the last used search pattern - `true` for the substitute
+/// pattern, `false` for the search pattern (`set_last_used_pattern`).
+pub fn set_last_used_pattern(is_substitute_pattern: bool) {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.last_idx = usize::from(is_substitute_pattern);
+}
+
+/// @return `true` if the search pattern (as opposed to the substitute
+/// pattern) was the last one used (`search_was_last_used`).
+#[must_use]
+pub fn search_was_last_used() -> bool {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.last_idx == 0
 }
 
 #[cfg(test)]
@@ -344,5 +503,130 @@ mod tests {
         assert_eq!(bytes.len(), MAX_SCHAR_SIZE + 1);
         assert_eq!(bytes[0], b'z');
         assert!(bytes[1..].iter().all(|&b| b == 0));
+    }
+
+    /// Resets `SEARCH_PATTERNS` to its default state. Callers must
+    /// hold `global_state_test_lock()` for their whole test body -
+    /// every test below needs a known starting point since
+    /// `SEARCH_PATTERNS` is shared, mutable state.
+    fn reset_search_patterns() {
+        // SAFETY: no overlapping live access - see get_search_pattern's
+        // own doc comment on the established GlobalCell convention.
+        *unsafe { SEARCH_PATTERNS.get_mut() } = SearchPatterns::default();
+    }
+
+    #[test]
+    fn search_offset_default_matches_c_static_initializer() {
+        // { '/', false, false, 0 } - NOT all-zero.
+        let off = SearchOffset::default();
+        assert_eq!(off.dir, b'/');
+        assert!(!off.line);
+        assert!(!off.end);
+        assert_eq!(off.off, 0);
+    }
+
+    #[test]
+    fn search_pattern_default_matches_c_static_initializer() {
+        // { NULL, 0, true, false, 0, {...}, NULL } - magic defaults to
+        // true, NOT the derived all-zero false.
+        let pat = SearchPattern::default();
+        assert!(pat.pat.is_none());
+        assert!(pat.magic);
+        assert!(!pat.no_scs);
+        assert_eq!(pat.timestamp, 0);
+        assert_eq!(pat.off, SearchOffset::default());
+        assert!(pat.additional_data.is_none());
+    }
+
+    #[test]
+    fn get_search_pattern_returns_a_copy_of_spats_0() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        // SAFETY: see get_search_pattern's own doc comment.
+        unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = Some(b"needle".to_vec());
+
+        let pat = get_search_pattern();
+        assert_eq!(pat.pat, Some(b"needle".to_vec()));
+    }
+
+    #[test]
+    fn get_substitute_pattern_clears_its_own_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        // SAFETY: see get_search_pattern's own doc comment.
+        let state = unsafe { SEARCH_PATTERNS.get_mut() };
+        state.spats[1].pat = Some(b"replacement".to_vec());
+        state.spats[1].off = SearchOffset { dir: b'/', line: true, end: true, off: 5 };
+
+        let pat = get_substitute_pattern();
+        assert_eq!(pat.pat, Some(b"replacement".to_vec()));
+        assert_eq!(pat.off, SearchOffset { dir: 0, line: false, end: false, off: 0 });
+        // The ORIGINAL spats[1] itself is untouched - only the copy's
+        // own offset is cleared (matches get_substitute_pattern's own
+        // "memcpy then CLEAR_FIELD(pat->off)" structure exactly).
+        // SAFETY: see get_search_pattern's own doc comment.
+        assert_eq!(
+            unsafe { SEARCH_PATTERNS.get_mut() }.spats[1].off,
+            SearchOffset { dir: b'/', line: true, end: true, off: 5 }
+        );
+    }
+
+    #[test]
+    fn get_search_pattern_timestamp_reads_the_right_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        // SAFETY: see get_search_pattern's own doc comment.
+        let state = unsafe { SEARCH_PATTERNS.get_mut() };
+        state.spats[0].timestamp = 111;
+        state.spats[1].timestamp = 222;
+
+        assert_eq!(get_search_pattern_timestamp(false), 111);
+        assert_eq!(get_search_pattern_timestamp(true), 222);
+    }
+
+    #[test]
+    fn search_pattern_cleared_true_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        assert!(search_pattern_cleared(false));
+        assert!(search_pattern_cleared(true));
+    }
+
+    #[test]
+    fn search_pattern_cleared_false_once_pat_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        // SAFETY: see get_search_pattern's own doc comment.
+        unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = Some(b"x".to_vec());
+        assert!(!search_pattern_cleared(false));
+        assert!(search_pattern_cleared(true)); // substitute untouched
+    }
+
+    #[test]
+    fn set_substitute_pattern_stores_pat_and_clears_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        let mut pat = SearchPattern { pat: Some(b"foo".to_vec()), ..SearchPattern::default() };
+        pat.off = SearchOffset { dir: b'?', line: true, end: false, off: 3 };
+
+        set_substitute_pattern(pat);
+
+        // SAFETY: see get_search_pattern's own doc comment.
+        let stored = &unsafe { SEARCH_PATTERNS.get_mut() }.spats[1];
+        assert_eq!(stored.pat, Some(b"foo".to_vec()));
+        assert_eq!(stored.off, SearchOffset { dir: 0, line: false, end: false, off: 0 });
+    }
+
+    #[test]
+    fn set_last_used_pattern_and_search_was_last_used_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        assert!(search_was_last_used()); // default: last_idx == 0
+
+        set_last_used_pattern(true);
+        assert!(!search_was_last_used());
+
+        set_last_used_pattern(false);
+        assert!(search_was_last_used());
     }
 }
