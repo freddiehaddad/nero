@@ -92,9 +92,27 @@
 //! ahead of their real callers (`:function` listing code, none of
 //! which is translated yet), matching this crate's established
 //! precedent for small, self-contained, no-design-freedom functions.
+//!
+//! Also translated: `get_funccal`/`get_funccal_local_dict`/
+//! `get_funccal_local_ht`/`get_funccal_local_var`/
+//! `get_funccal_args_dict`/`get_funccal_args_ht`/`get_funccal_args_var`
+//! (the `CURRENT_FUNCCAL`-plus-`debug_backtrace_level`-aware accessor
+//! family - `debug_backtrace_level` already existed in `globals.rs`,
+//! part of `globals.h`'s own translation from phase 3) and
+//! `add_nr_var` (adds a read-only/fixed number variable such as `a:0`
+//! to a dict, layered on the already-real `tv_dict_add`).
+//! `get_funccal_local_var`/`get_funccal_args_var` return
+//! `*mut ScopeDictDictItem` rather than the original's `dictitem_T*` -
+//! see their own doc comments for why (the original relies on a
+//! shared-layout reinterpret-cast this crate's distinct
+//! `ScopeDictDictItem`/`DictitemT` types don't support, and don't need
+//! to, since nothing calls these two yet).
 
 use crate::ascii_defs::ascii_isdigit;
-use crate::eval::typval_defs::{FunccallT, TypvalT, UfuncT};
+use crate::eval::typval_defs::{
+    DictT, DictitemT, FunccallT, ScopeDictDictItem, TypvalT, TypvalValue, UfuncT, VarLockStatus,
+    VarnumberT, dict_item_flags,
+};
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
 use crate::hashtab_defs::HashtabT;
@@ -631,6 +649,154 @@ pub unsafe fn free_unref_funccal(copy_id: i32, _testing: i32) -> bool {
     did_free
 }
 
+/// Get function call environment based on backtrace debug level
+/// (`get_funccal`).
+///
+/// # Safety
+/// `CURRENT_FUNCCAL` must currently be non-null, and every entry
+/// reachable from its own `fc_caller` chain must be a valid, live
+/// `FunccallT` (matching the original's own unchecked dereference).
+#[must_use]
+pub unsafe fn get_funccal() -> *mut FunccallT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut funccal = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    if g.debug_backtrace_level > 0 {
+        // NOT a Rust `for i in 0..g.debug_backtrace_level` range (which
+        // would snapshot the upper bound once) - the original's C
+        // `for` loop re-checks `i < debug_backtrace_level` on every
+        // iteration, and the loop body itself can lower
+        // `debug_backtrace_level` mid-walk (the "overflow" branch
+        // below), which must shorten the walk immediately, not just on
+        // some future call. A manual `while` reproduces that exactly.
+        let mut i = 0;
+        while i < g.debug_backtrace_level {
+            // SAFETY: forwarded from this function's own safety doc.
+            let temp_funccal = unsafe { (*funccal).fc_caller };
+            if !temp_funccal.is_null() {
+                funccal = temp_funccal;
+            } else {
+                // Backtrace level overflow - reset to max.
+                g.debug_backtrace_level = i;
+            }
+            i += 1;
+        }
+    }
+    funccal
+}
+
+/// @return dict used for local variables in the current funccal, or
+/// null if there is no current funccal (`get_funccal_local_dict`).
+#[must_use]
+pub fn get_funccal_local_dict() -> *mut DictT {
+    // SAFETY: only reads CURRENT_FUNCCAL/the (crate-invariant) live
+    // fc_caller chain, exactly like get_funccal itself.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: current just checked non-null.
+    if current.is_null() || unsafe { (*current).fc_l_vars.dv_refcount } == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
+    // get_funccal's own safety precondition.
+    unsafe { &mut (*get_funccal()).fc_l_vars as *mut DictT }
+}
+
+/// @return the `l:` scope variable, or null if there is no current
+/// funccal (`get_funccal_local_var`).
+///
+/// Returns a `*mut ScopeDictDictItem` rather than the original's
+/// `dictitem_T*`: the original casts `&fc->fc_l_vars_var` (a
+/// `scope_dictitem_T`, the exact same field layout as `dictitem_T`
+/// with a fixed-size key buffer) to `dictitem_T*`, relying on that
+/// shared layout - `ScopeDictDictItem`/`DictitemT` are distinct Rust
+/// types here (see `ScopeDictDictItem`'s own doc comment), so no such
+/// reinterpret-cast is attempted; callers needing a `*mut DictitemT`
+/// specifically don't exist yet.
+#[must_use]
+pub fn get_funccal_local_var() -> *mut ScopeDictDictItem {
+    // SAFETY: only reads CURRENT_FUNCCAL/the (crate-invariant) live
+    // fc_caller chain, exactly like get_funccal itself.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: current just checked non-null.
+    if current.is_null() || unsafe { (*current).fc_l_vars.dv_refcount } == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
+    // get_funccal's own safety precondition.
+    unsafe { &mut (*get_funccal()).fc_l_vars_var as *mut ScopeDictDictItem }
+}
+
+/// @return the hashtable used for local variables in the current
+/// funccal, or null if there is no current funccal
+/// (`get_funccal_local_ht`).
+#[must_use]
+pub fn get_funccal_local_ht() -> *mut HashtabT {
+    let d = get_funccal_local_dict();
+    if d.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: get_funccal_local_dict only ever returns null or a
+    // pointer to a live DictT's own fc_l_vars field.
+    unsafe { &mut (*d).dv_hashtab as *mut HashtabT }
+}
+
+/// @return the dict used for arguments in the current funccal, or
+/// null if there is no current funccal (`get_funccal_args_dict`).
+#[must_use]
+pub fn get_funccal_args_dict() -> *mut DictT {
+    // SAFETY: only reads CURRENT_FUNCCAL/the (crate-invariant) live
+    // fc_caller chain, exactly like get_funccal itself.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: current just checked non-null. Matches the original's
+    // own (slightly surprising, but faithfully preserved) check
+    // against fc_l_vars's refcount here too, not fc_l_avars's.
+    if current.is_null() || unsafe { (*current).fc_l_vars.dv_refcount } == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
+    // get_funccal's own safety precondition.
+    unsafe { &mut (*get_funccal()).fc_l_avars as *mut DictT }
+}
+
+/// @return the `a:` scope variable, or null if there is no current
+/// funccal (`get_funccal_args_var`).
+///
+/// See [`get_funccal_local_var`]'s own doc comment for why this
+/// returns `*mut ScopeDictDictItem` rather than the original's
+/// `dictitem_T*`.
+#[must_use]
+pub fn get_funccal_args_var() -> *mut ScopeDictDictItem {
+    // SAFETY: only reads CURRENT_FUNCCAL/the (crate-invariant) live
+    // fc_caller chain, exactly like get_funccal itself.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    // SAFETY: current just checked non-null. Matches the original's
+    // own check against fc_l_vars's refcount here too, not
+    // fc_l_avars's.
+    if current.is_null() || unsafe { (*current).fc_l_vars.dv_refcount } == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: CURRENT_FUNCCAL just checked non-null above, satisfying
+    // get_funccal's own safety precondition.
+    unsafe { &mut (*get_funccal()).fc_l_avars_var as *mut ScopeDictDictItem }
+}
+
+/// Add a number variable `name` to dict `dp` with value `nr`
+/// (`add_nr_var`).
+///
+/// # Safety
+/// `v` must be a valid, non-null pointer to a live `DictitemT`, not
+/// already present in `dp`'s hashtable, outliving the resulting entry.
+pub unsafe fn add_nr_var(dp: &mut DictT, v: *mut DictitemT, name: &[u8], nr: VarnumberT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let v_ref = unsafe { &mut *v };
+    v_ref.di_key = name.to_vec();
+    v_ref.di_key.push(0);
+    v_ref.di_flags = dict_item_flags::RO | dict_item_flags::FIX;
+    v_ref.di_tv = TypvalT { v_lock: VarLockStatus::Fixed, value: TypvalValue::Number(nr) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_dict_add(dp, v) };
+}
+
 /// @return the name of the executed function for a funccall cookie
 /// (`func_name`).
 ///
@@ -1087,6 +1253,137 @@ mod tests {
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
         fp.uf_refcount -= 1;
         unsafe { drop(Box::from_raw(fc)) };
+    }
+
+    // ---- get_funccal / get_funccal_local_*/get_funccal_args_* / add_nr_var
+
+    #[test]
+    fn get_funccal_returns_current_funccal_when_backtrace_level_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.debug_backtrace_level = 0;
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        assert_eq!(unsafe { get_funccal() }, fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn get_funccal_walks_fc_caller_chain_by_backtrace_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+
+        let mut outer = Box::new(FunccallT::default());
+        let outer_ptr = outer.as_mut() as *mut FunccallT;
+        let mut inner = Box::new(FunccallT { fc_caller: outer_ptr, ..Default::default() });
+        let inner_ptr = inner.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_ptr };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.debug_backtrace_level = 1;
+        assert_eq!(unsafe { get_funccal() }, outer_ptr);
+
+        // Requesting a level deeper than the chain resets
+        // debug_backtrace_level to how far it actually got (matching
+        // the original's own "backtrace level overflow" comment).
+        unsafe { crate::globals::GLOBALS.get_mut() }.debug_backtrace_level = 5;
+        assert_eq!(unsafe { get_funccal() }, outer_ptr);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.debug_backtrace_level, 1);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.debug_backtrace_level = 0;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn get_funccal_local_dict_and_ht_null_without_a_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert!(get_funccal_local_dict().is_null());
+        assert!(get_funccal_local_ht().is_null());
+        assert!(get_funccal_local_var().is_null());
+    }
+
+    #[test]
+    fn get_funccal_local_dict_and_ht_null_when_fc_l_vars_unreferenced() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default()); // fc_l_vars.dv_refcount == 0
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        assert!(get_funccal_local_dict().is_null());
+        assert!(get_funccal_local_ht().is_null());
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn get_funccal_local_dict_and_ht_and_var_point_at_the_real_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default());
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let d = get_funccal_local_dict();
+        assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_vars as *mut DictT });
+
+        let ht = get_funccal_local_ht();
+        assert_eq!(ht, unsafe { &mut (*d).dv_hashtab as *mut HashtabT });
+
+        let v = get_funccal_local_var();
+        assert_eq!(v, unsafe { &mut (*fc_ptr).fc_l_vars_var as *mut ScopeDictDictItem });
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn get_funccal_args_dict_and_var_null_without_a_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert!(get_funccal_args_dict().is_null());
+        assert!(get_funccal_args_var().is_null());
+    }
+
+    #[test]
+    fn get_funccal_args_dict_and_var_point_at_the_real_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default());
+        // The original gates get_funccal_args_dict/_var on
+        // fc_l_vars's own refcount, not fc_l_avars's - preserved here.
+        fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let d = get_funccal_args_dict();
+        assert_eq!(d, unsafe { &mut (*fc_ptr).fc_l_avars as *mut DictT });
+
+        let v = get_funccal_args_var();
+        assert_eq!(v, unsafe { &mut (*fc_ptr).fc_l_avars_var as *mut ScopeDictDictItem });
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn add_nr_var_sets_key_flags_value_and_registers_in_the_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict_ptr = crate::eval::typval::tv_dict_alloc();
+        let item_ptr = crate::eval::typval::tv_dict_item_alloc(b"0");
+        unsafe { add_nr_var(&mut *dict_ptr, item_ptr, b"0", 42) };
+
+        assert_eq!(unsafe { &(*item_ptr).di_key }, b"0\0");
+        assert_eq!(
+            unsafe { (*item_ptr).di_flags },
+            dict_item_flags::RO | dict_item_flags::FIX
+        );
+        assert_eq!(unsafe { (*item_ptr).di_tv.v_lock }, VarLockStatus::Fixed);
+        assert!(matches!(unsafe { (*item_ptr).di_tv.value.clone() }, TypvalValue::Number(42)));
+
+        let found = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict_ptr }), b"0");
+        assert_eq!(found, Some(item_ptr));
+
+        unsafe { crate::eval::typval::tv_dict_free(dict_ptr) };
     }
 
     // ---- can_free_funccal / free_unref_funccal --------------------------
