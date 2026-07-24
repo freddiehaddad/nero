@@ -40,15 +40,18 @@
 //! `SearchPattern` automatically drops the old `pat`/`additional_data`
 //! heap allocations.
 //!
-//! Deferred: `set_search_pattern` (needs `set_vv_searchforward` ->
-//! `set_vim_var_nr`/`VV_SEARCHFORWARD`, the `v:` special-variable
-//! subsystem, not yet translated - `set_substitute_pattern` doesn't
-//! call it, which is why that one IS translated) and everything else
-//! in the file - the functions actually building/using a compiled
-//! search pattern (`last_search_pat`, `reset_search_dir`,
-//! `set_last_search_pat`, `do_search`, etc.) need the real regex
-//! engine, a separate, substantial undertaking from this file's own
-//! small tractable corner, left for a dedicated future pass.
+//! Also translated, now that `eval/vars.rs`'s `v:` special-variable
+//! storage layer exists: `set_vv_searchforward` (`static` in the
+//! original - kept private here too), `set_search_pattern`,
+//! `reset_search_dir`, and `set_last_search_pat` - each was blocked
+//! ONLY on `set_vv_searchforward` -> `set_vim_var_nr`/
+//! `VV_SEARCHFORWARD`, now real.
+//!
+//! Deferred: everything else in the file - the functions actually
+//! building/using a COMPILED search pattern (`last_search_pat`,
+//! `do_search`, `searchit`, etc.) need the real regex engine, a
+//! separate, substantial undertaking from this file's own small
+//! tractable corner, left for a dedicated future pass.
 
 use crate::types_defs::MAX_SCHAR_SIZE;
 use crate::vim_defs::Direction;
@@ -330,6 +333,84 @@ pub fn set_last_used_pattern(is_substitute_pattern: bool) {
 pub fn search_was_last_used() -> bool {
     // SAFETY: see [`get_search_pattern`].
     unsafe { SEARCH_PATTERNS.get_mut() }.last_idx == 0
+}
+
+/// Set `v:searchforward` to whether `spats[0].off.dir` is `'/'`
+/// (`set_vv_searchforward`, `static` in the original).
+///
+/// # Safety
+/// No additional requirement beyond the usual
+/// `crate::eval::vars::get_vim_var_tv` contract (no overlapping live
+/// access to the shared `v:` variable storage).
+unsafe fn set_vv_searchforward() {
+    // SAFETY: see [`get_search_pattern`].
+    let dir = unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].off.dir;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::vars::set_vim_var_nr(
+            crate::eval::vars::VimVarIndex::Searchforward,
+            i64::from(dir == b'/'),
+        );
+    }
+}
+
+/// Set the last search pattern (`set_search_pattern`).
+///
+/// # Safety
+/// Same as `set_vv_searchforward`.
+pub unsafe fn set_search_pattern(pat: SearchPattern) {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0] = pat;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vv_searchforward() };
+}
+
+/// Reset search direction to forward. For `"gd"`/`"gD"` commands
+/// (`reset_search_dir`).
+///
+/// # Safety
+/// Same as `set_vv_searchforward`.
+pub unsafe fn reset_search_dir() {
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].off.dir = b'/';
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vv_searchforward() };
+}
+
+/// Set the last search pattern. For `":let @/ ="` and ShaDa file
+/// (`set_last_search_pat`).
+///
+/// `idx`/`setlast` match the original's own `RE_SEARCH`(`false`)/
+/// `RE_SUBST`(`true`) convention, matching this file's own established
+/// `substitute: bool` precedent (e.g. [`search_pattern_cleared`])
+/// rather than the original's raw `int`.
+///
+/// Also set the saved search pattern, so that this works in an
+/// autocommand.
+///
+/// # Safety
+/// Same as `set_vv_searchforward`.
+pub unsafe fn set_last_search_pat(s: &[u8], is_substitute: bool, magic: bool, setlast: bool) {
+    let idx = usize::from(is_substitute);
+    // SAFETY: see [`get_search_pattern`].
+    let state = unsafe { SEARCH_PATTERNS.get_mut() };
+    // An empty string means that nothing should be matched.
+    state.spats[idx].pat = if s.is_empty() { None } else { Some(s.to_vec()) };
+    state.spats[idx].timestamp = crate::os::time::os_time();
+    state.spats[idx].additional_data = None;
+    state.spats[idx].magic = magic;
+    state.spats[idx].no_scs = false;
+    state.spats[idx].off.dir = b'/';
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vv_searchforward() };
+    // SAFETY: see [`get_search_pattern`].
+    let state = unsafe { SEARCH_PATTERNS.get_mut() };
+    state.spats[idx].off.line = false;
+    state.spats[idx].off.end = false;
+    state.spats[idx].off.off = 0;
+    if setlast {
+        state.last_idx = idx;
+    }
 }
 
 #[cfg(test)]
@@ -628,5 +709,111 @@ mod tests {
 
         set_last_used_pattern(false);
         assert!(search_was_last_used());
+    }
+
+    /// Resets `v:searchforward` (in the separate `eval::vars` shared
+    /// `VIMVARS` state) back to its own true static-initializer
+    /// default (`Number(0)`) - callers must hold
+    /// `global_state_test_lock()`, matching `reset_search_patterns`'s
+    /// own established convention (this file's functions touch BOTH
+    /// `SEARCH_PATTERNS` and `VIMVARS`, so both need resetting).
+    fn reset_vv_searchforward() {
+        // SAFETY: no overlapping live access - test-only, single
+        // threaded under the held lock.
+        unsafe {
+            crate::eval::vars::set_vim_var_nr(crate::eval::vars::VimVarIndex::Searchforward, 0);
+        }
+    }
+
+    fn vv_searchforward() -> i64 {
+        // SAFETY: forwarded from reset_vv_searchforward's own doc.
+        unsafe { crate::eval::vars::get_vim_var_nr(crate::eval::vars::VimVarIndex::Searchforward) }
+    }
+
+    #[test]
+    fn reset_search_dir_sets_forward_and_updates_vv_searchforward() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            SEARCH_PATTERNS.get_mut().spats[0].off.dir = b'?'; // start backward
+            reset_search_dir();
+            assert_eq!(SEARCH_PATTERNS.get_mut().spats[0].off.dir, b'/');
+        }
+        assert_eq!(vv_searchforward(), 1);
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn set_search_pattern_stores_pattern_and_updates_vv_searchforward() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        let pat = SearchPattern {
+            pat: Some(b"needle".to_vec()),
+            off: SearchOffset { dir: b'?', line: false, end: false, off: 0 },
+            ..SearchPattern::default()
+        };
+        unsafe {
+            set_search_pattern(pat);
+            assert_eq!(SEARCH_PATTERNS.get_mut().spats[0].pat, Some(b"needle".to_vec()));
+        }
+        // dir == '?' (backward), so v:searchforward becomes 0.
+        assert_eq!(vv_searchforward(), 0);
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn set_last_search_pat_stores_pattern_and_resets_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            SEARCH_PATTERNS.get_mut().spats[0].off =
+                SearchOffset { dir: b'?', line: true, end: true, off: 5 };
+
+            set_last_search_pat(b"pattern", false, true, false);
+
+            let stored = &SEARCH_PATTERNS.get_mut().spats[0];
+            assert_eq!(stored.pat, Some(b"pattern".to_vec()));
+            assert!(stored.magic);
+            assert!(!stored.no_scs);
+            // off.dir reset to forward ('/'), line/end/off all cleared.
+            assert_eq!(stored.off, SearchOffset { dir: b'/', line: false, end: false, off: 0 });
+        }
+        assert_eq!(vv_searchforward(), 1);
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn set_last_search_pat_empty_string_means_pattern_is_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            set_last_search_pat(b"", false, true, false);
+            assert!(SEARCH_PATTERNS.get_mut().spats[0].pat.is_none());
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn set_last_search_pat_setlast_true_updates_last_idx() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            assert_eq!(SEARCH_PATTERNS.get_mut().last_idx, 0);
+            set_last_search_pat(b"x", true, true, true);
+            assert_eq!(SEARCH_PATTERNS.get_mut().last_idx, 1);
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn set_last_search_pat_setlast_false_leaves_last_idx_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            set_last_used_pattern(true); // last_idx = 1
+            set_last_search_pat(b"x", false, true, false);
+            assert_eq!(SEARCH_PATTERNS.get_mut().last_idx, 1); // untouched
+        }
+        reset_vv_searchforward();
     }
 }
