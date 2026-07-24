@@ -128,6 +128,23 @@
 //! iteration (`eval/typval.rs`), conditionally skipping the
 //! `tv_clear_simple` step per `free_val`.
 //!
+//! Also translated: a new `GLOBVARDICT` file-static (the `g:` scope
+//! dict, `globvardict` - never heap-allocated/GC-list-linked, matching
+//! `new_script_vars`'s own precedent for the analogous script-scope
+//! dict; currently reads as its bare, zero-valued PRE-`evalvars_init`
+//! state, matching `VIMVARS`'s own already-documented limitation) plus
+//! `get_globvar_dict` and `del_menutrans_vars` (filters `GLOBVARDICT`'s
+//! own `dv_index` directly rather than the original's `HASHTAB_ITER`
+//! walk, reusing the already-real `tv_dict_item_remove` in place of a
+//! separate `delete_var` binding - both do exactly the same thing).
+//! Building `GLOBVARDICT` also newly unlocks `get_globvar_dict`'s
+//! future role as one of `find_var_ht_dict`'s many branches, though
+//! that function (and `find_var`/`check_vars`/most of `ex_let`, all
+//! genuinely substantial, needing `compat_hashtab`/`get_vimvar_dict`/
+//! `curbuf.b_vars`-style fields/`current_sctx` script tracking) remain
+//! deliberately NOT started - confirmed via direct reading of their
+//! real bodies, not assumed.
+//!
 //! Deferred: everything else in this file (variable get/set/unlet,
 //! `:let` parsing, `evalvars_init`, etc.).
 
@@ -692,6 +709,80 @@ static VIMVARS: std::sync::LazyLock<crate::globals::GlobalCell<Vec<Vimvar>>> =
         ])
     });
 
+/// The global (`g:`) scope dict (`globvardict`; `globvarht` is just
+/// `globvardict.dv_hashtab` in the original, via a `#define`).
+///
+/// A `dict_T` file-static in the original - never heap-allocated,
+/// hence never linked into `GC_FIRST_DICT`'s used-dicts list, matching
+/// `new_script_vars`'s own already-established precedent for the
+/// analogous script-scope dict (see its doc comment in
+/// `crate::runtime`). Currently reads as the bare, zero-valued
+/// PRE-`evalvars_init` state (`dv_refcount: 0`, an empty
+/// `dv_hashtab`) - `evalvars_init`'s own
+/// `init_var_dict(get_globvar_dict(), &globvars_var, VAR_DEF_SCOPE)`
+/// call (not yet translated) is what would normally set
+/// `dv_refcount = DO_NOT_FREE_CNT` and wire it up as a real scope
+/// dict, matching `VIMVARS`'s own already-documented "reads as its
+/// bare static-initializer default, NOT its real runtime value"
+/// limitation until that lands.
+static GLOBVARDICT: std::sync::LazyLock<crate::globals::GlobalCell<DictT>> =
+    std::sync::LazyLock::new(|| {
+        crate::globals::GlobalCell::new(DictT {
+            dv_lock: VarLockStatus::Unlocked,
+            dv_scope: ScopeType::NoScope,
+            dv_refcount: 0,
+            dv_copy_id: 0,
+            dv_hashtab: crate::hashtab_defs::HashtabT::hash_init(),
+            dv_index: std::collections::HashMap::new(),
+            dv_copydict: std::ptr::null_mut(),
+            dv_used_next: std::ptr::null_mut(),
+            dv_used_prev: std::ptr::null_mut(),
+            lua_table_ref: LUA_NOREF,
+        })
+    });
+
+/// @return the global (`g:`) variable dictionary (`get_globvar_dict`).
+#[must_use]
+pub fn get_globvar_dict() -> *mut DictT {
+    // SAFETY: GLOBVARDICT is only ever read/written through this
+    // module's own functions, matching VIMVARS's own established
+    // convention.
+    unsafe { GLOBVARDICT.get_mut() as *mut DictT }
+}
+
+/// Delete all `"menutrans_"`-prefixed global variables
+/// (`del_menutrans_vars`).
+///
+/// Unlike the original (locks `globvarht`, walks it via
+/// `HASHTAB_ITER`, calling the small file-static `delete_var(ht, hi)`
+/// per match), filters `GLOBVARDICT`'s own `dv_index` directly - no
+/// hashtab traversal/locking needed, matching `vars_clear_ext`'s own
+/// established precedent - and calls the already-real
+/// [`crate::eval::typval::tv_dict_item_remove`] per match, which is
+/// functionally identical to the original's own `delete_var` (both:
+/// remove from the hashtab, clear the value, free the item shell) -
+/// so no separate `delete_var` binding is needed here.
+pub fn del_menutrans_vars() {
+    // SAFETY: only touches this module's own GLOBVARDICT cell.
+    let d = unsafe { GLOBVARDICT.get_mut() };
+    let items: Vec<*mut DictitemT> = d
+        .dv_index
+        .values()
+        .copied()
+        .filter(|&item| {
+            // SAFETY: every dv_index entry is a live DictitemT
+            // pointer, populated/depopulated in lockstep with
+            // dv_hashtab by this module's own functions.
+            unsafe { (*item).di_key.starts_with(b"menutrans_") }
+        })
+        .collect();
+    for item in items {
+        // SAFETY: item was just looked up from d's own dv_index,
+        // satisfying tv_dict_item_remove's own safety contract.
+        unsafe { crate::eval::typval::tv_dict_item_remove(d, item) };
+    }
+}
+
 /// Get the name of `v:` variable `idx`, without the `v:` prefix
 /// (`get_vim_var_name`).
 #[must_use]
@@ -1249,6 +1340,68 @@ mod set_vcount_and_valid_varname_tests {
         assert!(var_check_fixed(dict_item_flags::FIX));
         assert!(!var_check_fixed(dict_item_flags::LOCK));
         assert!(!var_check_fixed(0));
+    }
+}
+
+#[cfg(test)]
+mod globvardict_tests {
+    use super::*;
+    use crate::eval::typval::tv_dict_add;
+
+    /// Every test here must leave `GLOBVARDICT` empty again afterward -
+    /// it is a genuinely shared, persistent static (unlike a
+    /// `tv_dict_alloc()`-allocated dict a test can freely free), so
+    /// stale entries would otherwise leak across tests. Reuses this
+    /// module's own real `vars_clear`, dogfooding it the same way
+    /// `add_nr_var`'s own test already exercises `tv_dict_add`.
+    fn reset_globvardict() {
+        unsafe { vars_clear(GLOBVARDICT.get_mut()) };
+    }
+
+    #[test]
+    fn get_globvar_dict_returns_a_usable_pointer_to_the_shared_globvardict() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globvardict();
+        let d = get_globvar_dict();
+        assert!(!d.is_null());
+        assert_eq!(unsafe { (*d).dv_index.len() }, 0);
+        // Same underlying storage every call - not a fresh allocation.
+        assert_eq!(get_globvar_dict(), d);
+        reset_globvardict();
+    }
+
+    #[test]
+    fn del_menutrans_vars_removes_only_menutrans_prefixed_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globvardict();
+        let d = get_globvar_dict();
+        let menu_item = crate::eval::typval::tv_dict_item_alloc(b"menutrans_File");
+        let other_item = crate::eval::typval::tv_dict_item_alloc(b"other_var");
+        unsafe { tv_dict_add(&mut *d, menu_item) };
+        unsafe { tv_dict_add(&mut *d, other_item) };
+        assert_eq!(unsafe { (*d).dv_index.len() }, 2);
+
+        del_menutrans_vars();
+
+        assert_eq!(unsafe { (*d).dv_index.len() }, 1);
+        assert!(crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"other_var").is_some());
+        assert!(crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"menutrans_File").is_none());
+
+        reset_globvardict();
+    }
+
+    #[test]
+    fn del_menutrans_vars_is_a_noop_when_nothing_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globvardict();
+        let d = get_globvar_dict();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"other_var");
+        unsafe { tv_dict_add(&mut *d, item) };
+
+        del_menutrans_vars();
+
+        assert_eq!(unsafe { (*d).dv_index.len() }, 1);
+        reset_globvardict();
     }
 }
 
