@@ -178,6 +178,22 @@
 //! this whole section is omitted (message display, not tractable),
 //! keeping only the `bool`/`OK`/`FAIL` result, matching this module's
 //! established policy throughout.
+//!
+//! # Locks
+//! `tv_item_lock`: recursively (un)locks an item and (for `deep < 0`
+//! or `> 1`) every value it contains, using a new `TV_ITEM_LOCK_RECURSE`
+//! `GlobalCell` for the original's own function-local recursion-depth
+//! counter (matching `tv_equal`'s own established translation of the
+//! same C idiom) - its own `emsg` for exceeding `DICT_MAXNEST` is
+//! omitted, keeping the identical silent-give-up control flow.
+//!
+//! # Indexing/searching
+//! `tv_list_uidx`/`tv_list_find` (the cache-aware nearest-of-{start,
+//! cached, end} search, including its `lv_idx`/`lv_idx_item` caching
+//! side effect)/`tv_list_find_nr`/`tv_list_find_str`/
+//! `tv_list_find_index` (private, matching the original's own
+//! `static`)/`tv_list_idx_of_item`/`tv_list_reverse` (in-place
+//! doubly-linked-list reversal).
 
 use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
 use crate::globals::GlobalCell;
@@ -557,6 +573,128 @@ pub unsafe fn tv_check_lock(tv: &TypvalT, name: Option<&[u8]>) -> bool {
         _ => VarLockStatus::Unlocked,
     };
     value_check_lock(tv.v_lock, name) || (lock != VarLockStatus::Unlocked && value_check_lock(lock, name))
+}
+
+/// Maximum nesting of lists and dicts for [`tv_item_lock`] (`DICT_MAXNEST`).
+const DICT_MAXNEST: i32 = 100;
+
+/// Recursion depth counter for [`tv_item_lock`] - matches the
+/// original's own function-local `static int recurse`.
+static TV_ITEM_LOCK_RECURSE: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Lock or unlock an item, recursively for `deep` levels (`-1` for
+/// unlimited) (`tv_item_lock`).
+///
+/// If `check_refcount` is true, does not lock a list or dict with a
+/// reference count greater than 1.
+///
+/// The original's own `emsg(_(e_variable_nested_too_deep_for_unlock))`
+/// (a real, reachable "too deeply nested" error) is omitted - message
+/// display not tractable - while the identical early-return control
+/// flow (silently giving up once `DICT_MAXNEST` is hit) is kept.
+///
+/// # Safety
+/// If `tv.value` holds a `Blob`/`List`/`Dict` with a non-null pointer,
+/// that pointer must be a valid, live `BlobT`/`ListT`/`DictT`,
+/// recursively satisfying this same contract for every value it
+/// (in)directly contains (its own `li_tv`/`di_tv` entries).
+pub unsafe fn tv_item_lock(tv: &mut TypvalT, deep: i32, lock: bool, check_refcount: bool) {
+    // TODO(ZyX-I): Make this not recursive (matches the original's own
+    // TODO comment).
+    // SAFETY: TV_ITEM_LOCK_RECURSE is a private, crate-internal
+    // GlobalCell only ever touched by this function.
+    let recurse = unsafe { *TV_ITEM_LOCK_RECURSE.get_mut() };
+    if recurse >= DICT_MAXNEST {
+        // emsg(_(e_variable_nested_too_deep_for_unlock)) omitted - see
+        // this function's own doc comment.
+        return;
+    }
+    if deep == 0 {
+        return;
+    }
+    unsafe { *TV_ITEM_LOCK_RECURSE.get_mut() += 1 };
+
+    // lock/unlock the item itself
+    let change_lock = |cur: VarLockStatus| -> VarLockStatus {
+        match cur {
+            VarLockStatus::Unlocked | VarLockStatus::Locked => {
+                if lock {
+                    VarLockStatus::Locked
+                } else {
+                    VarLockStatus::Unlocked
+                }
+            }
+            VarLockStatus::Fixed => VarLockStatus::Fixed,
+        }
+    };
+    tv.v_lock = change_lock(tv.v_lock);
+
+    match &tv.value {
+        TypvalValue::Blob(b) => {
+            let b = *b;
+            if !b.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                let refcount = unsafe { (*b).bv_refcount };
+                if !(check_refcount && refcount > 1) {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*b).bv_lock = change_lock((*b).bv_lock) };
+                }
+            }
+        }
+        TypvalValue::List(l) => {
+            let l = *l;
+            if !l.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                let refcount = unsafe { (*l).lv_refcount };
+                if !(check_refcount && refcount > 1) {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*l).lv_lock = change_lock((*l).lv_lock) };
+                    if !(0..=1).contains(&deep) {
+                        // Recursive: lock/unlock the items the List contains.
+                        // SAFETY: forwarded from this function's own safety doc.
+                        let mut item = unsafe { (*l).lv_first };
+                        while !item.is_null() {
+                            // SAFETY: forwarded from this function's own safety doc.
+                            unsafe { tv_item_lock(&mut (*item).li_tv, deep - 1, lock, check_refcount) };
+                            // SAFETY: forwarded from this function's own safety doc.
+                            item = unsafe { (*item).li_next };
+                        }
+                    }
+                }
+            }
+        }
+        TypvalValue::Dict(d) => {
+            let d = *d;
+            if !d.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                let refcount = unsafe { (*d).dv_refcount };
+                if !(check_refcount && refcount > 1) {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*d).dv_lock = change_lock((*d).dv_lock) };
+                    if !(0..=1).contains(&deep) {
+                        // recursive: lock/unlock the items the Dict contains
+                        // SAFETY: forwarded from this function's own safety doc.
+                        let items: Vec<*mut DictitemT> =
+                            unsafe { (*d).dv_index.values().copied().collect() };
+                        for di in items {
+                            // SAFETY: forwarded from this function's own safety doc.
+                            unsafe { tv_item_lock(&mut (*di).di_tv, deep - 1, lock, check_refcount) };
+                        }
+                    }
+                }
+            }
+        }
+        TypvalValue::Number(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::String(_)
+        | TypvalValue::Func(_)
+        | TypvalValue::Partial(_)
+        | TypvalValue::Bool(_)
+        | TypvalValue::Special(_) => {}
+        TypvalValue::Unknown => unreachable!("tv_item_lock called with an Unknown tv"),
+    }
+
+    unsafe { *TV_ITEM_LOCK_RECURSE.get_mut() -= 1 };
 }
 
 // Argument type checks (used by builtin Vimscript function
@@ -5299,6 +5437,107 @@ mod tests {
             assert_eq!((*(*one).lv_first).li_tv.value, TypvalValue::Number(1));
             tv_list_free(empty);
             tv_list_free(one);
+        }
+    }
+
+    // ---- tv_item_lock ---------------------------------------------------
+
+    #[test]
+    fn tv_item_lock_locks_and_unlocks_the_typval_itself() {
+        let mut tv = number_tv(1);
+        unsafe { tv_item_lock(&mut tv, 1, true, false) };
+        assert_eq!(tv.v_lock, VarLockStatus::Locked);
+        unsafe { tv_item_lock(&mut tv, 1, false, false) };
+        assert_eq!(tv.v_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn tv_item_lock_fixed_stays_fixed_regardless_of_lock_flag() {
+        let mut tv = TypvalT { v_lock: VarLockStatus::Fixed, value: TypvalValue::Number(1) };
+        unsafe { tv_item_lock(&mut tv, 1, true, false) };
+        assert_eq!(tv.v_lock, VarLockStatus::Fixed);
+        unsafe { tv_item_lock(&mut tv, 1, false, false) };
+        assert_eq!(tv.v_lock, VarLockStatus::Fixed);
+    }
+
+    #[test]
+    fn tv_item_lock_deep_0_is_a_complete_noop() {
+        let mut tv = number_tv(1);
+        unsafe { tv_item_lock(&mut tv, 0, true, false) };
+        assert_eq!(tv.v_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn tv_item_lock_deep_1_locks_list_itself_but_not_its_items() {
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_tv(l, &number_tv(1));
+            let mut tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(l) };
+
+            tv_item_lock(&mut tv, 1, true, false);
+
+            assert_eq!((*l).lv_lock, VarLockStatus::Locked);
+            // deep == 1 does not recurse into the item.
+            assert_eq!((*(*l).lv_first).li_tv.v_lock, VarLockStatus::Unlocked);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_item_lock_deep_negative_one_recurses_unlimited() {
+        let inner = tv_list_alloc(1);
+        let outer = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(inner, 42);
+            let inner_tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(inner) };
+            tv_list_append_tv(outer, &inner_tv);
+
+            let mut tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(outer) };
+            tv_item_lock(&mut tv, -1, true, false);
+
+            assert_eq!((*outer).lv_lock, VarLockStatus::Locked);
+            let outer_item = (*outer).lv_first;
+            assert_eq!((*outer_item).li_tv.v_lock, VarLockStatus::Locked);
+            let TypvalValue::List(inner_ptr) = (*outer_item).li_tv.value else { panic!("expected List") };
+            assert_eq!((*inner_ptr).lv_lock, VarLockStatus::Locked);
+            // Recurses all the way to the leaf number's own v_lock too.
+            assert_eq!((*(*inner_ptr).lv_first).li_tv.v_lock, VarLockStatus::Locked);
+
+            tv_list_free(outer); // frees inner transitively via tv_list_free_contents
+        }
+    }
+
+    #[test]
+    fn tv_item_lock_skips_when_check_refcount_and_refcount_over_1() {
+        let l = tv_list_alloc(0);
+        unsafe {
+            (*l).lv_refcount = 2;
+            let mut tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(l) };
+
+            tv_item_lock(&mut tv, 1, true, true);
+
+            assert_eq!((*l).lv_lock, VarLockStatus::Unlocked); // untouched
+            (*l).lv_refcount = 0; // avoid tripping tv_list_free's own checks
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_item_lock_recurses_into_dict_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d, b"a", 1);
+            let mut tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Dict(d) };
+
+            tv_item_lock(&mut tv, -1, true, false);
+
+            assert_eq!((*d).dv_lock, VarLockStatus::Locked);
+            let item = tv_dict_find(d.as_mut(), b"a").unwrap();
+            assert_eq!((*item).di_tv.v_lock, VarLockStatus::Locked);
+
+            tv_dict_unref(d);
         }
     }
 }
