@@ -12,7 +12,10 @@
 //! `bufref_valid`/`buf_valid` (+ its own `buf_free_count` private
 //! counter, `BUF_FREE_COUNT`), the `'buftype'`-testing predicate
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
-//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`, `buf_hide`,
+//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`/
+//! `bt_dontwrite_msg` (the latter's real `emsg()` display omitted,
+//! matching the established "skip the deferred-subsystem side effect,
+//! keep the state/return value correct" policy), `buf_hide`,
 //! `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
 //! exists), `buffer.h`'s `buf_meta_total` (a tiny `static inline`
 //! header function, not from `buffer.c` itself - harvested for
@@ -34,7 +37,6 @@
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
 //!   itself deferred (real file I/O) - translating it now would be
 //!   genuinely dead code.
-//! - `bt_dontwrite_msg`: needs `emsg()` (`message.c`).
 //! - `read_buffer`/`buf_ensure_loaded`/`open_buffer`/`close_buffer`/
 //!   `buf_freeall`/`free_buffer`/`buflist_new`/`buflist_getfile`/
 //!   `buflist_findnr`/etc.: need real file I/O, `ctx_switch` (window
@@ -227,6 +229,26 @@ pub fn bt_dontwrite(buf: Option<&BufT>) -> bool {
     buf.is_some_and(|b| {
         opt_byte(&b.b_p_bt, 0) == b'n' || !b.terminal.is_null() || opt_byte(&b.b_p_bt, 0) == b'p'
     })
+}
+
+/// Like [`bt_dontwrite`], but also reports (via a real, reachable
+/// `emsg("E382: ...")` call in the original) that writing was
+/// disallowed (`bt_dontwrite_msg`).
+///
+/// The message display itself is omitted - `message.c`'s display
+/// pipeline is still not tractable - but the return value (the actual
+/// observable behavior every real caller checks) is fully correct,
+/// matching the established "skip the deferred-subsystem side effect,
+/// keep the state/return value correct" policy used throughout this
+/// crate (e.g. `u_get_headentry`/`u_getbot`/`mf_write`'s own omitted
+/// `iemsg`/`emsg` calls). Has no real translated caller yet (its own
+/// callers are all in `ex_cmds.c`, not translated) - translated ahead
+/// of one anyway since it's a small, simple, mechanically-correct
+/// wrapper with no design freedom to get wrong, matching this crate's
+/// precedent for `ops_defs.rs`'s `OpType`/`expand_T`'s struct shape.
+#[must_use]
+pub fn bt_dontwrite_msg(buf: Option<&BufT>) -> bool {
+    bt_dontwrite(buf)
 }
 
 /// `true` if the buffer should be hidden, according to `'bufhidden'`,
@@ -485,6 +507,18 @@ mod tests {
         assert!(bt_dontwrite(Some(&buf_with_bt("nowrite"))));
         assert!(bt_dontwrite(Some(&buf_with_bt("prompt"))));
         assert!(!bt_dontwrite(Some(&buf_with_bt("help"))));
+    }
+
+    #[test]
+    fn bt_dontwrite_msg_matches_bt_dontwrite_return_value() {
+        // The message display itself is omitted (message.c not
+        // tractable), but the return value must exactly match
+        // bt_dontwrite's own - true for every case it covers, and
+        // false (with no message) for a buffer it doesn't cover.
+        assert!(bt_dontwrite_msg(Some(&buf_with_bt("nowrite"))));
+        assert!(bt_dontwrite_msg(Some(&buf_with_bt("prompt"))));
+        assert!(!bt_dontwrite_msg(Some(&buf_with_bt("help"))));
+        assert!(!bt_dontwrite_msg(None));
     }
 
     #[test]
