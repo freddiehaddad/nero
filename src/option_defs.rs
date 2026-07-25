@@ -107,6 +107,30 @@ pub mod opt_flags {
     pub const COLON: u32 = 1 << 25;
 }
 
+/// Flags for option-getting/-setting functions (`OptionSetFlags`).
+/// When `OPT_GLOBAL` and `OPT_LOCAL` are both missing, set both local
+/// and global values, get local value. Kept as plain `u32` bit-flag
+/// constants (matching [`opt_flags`]'s own reasoning), not a Rust
+/// `enum`, since they combine via bitwise OR.
+pub mod opt_set_flags {
+    /// Use global value.
+    pub const OPT_GLOBAL: u32 = 0x01;
+    /// Use local value.
+    pub const OPT_LOCAL: u32 = 0x02;
+    /// Option in modeline.
+    pub const OPT_MODELINE: u32 = 0x04;
+    /// Only set window-local options.
+    pub const OPT_WINONLY: u32 = 0x08;
+    /// Don't set window-local options.
+    pub const OPT_NOWIN: u32 = 0x10;
+    /// List options one per line.
+    pub const OPT_ONECOLUMN: u32 = 0x20;
+    /// Ignore redraw flags on option.
+    pub const OPT_NO_REDRAW: u32 = 0x40;
+    /// `"skiprtp"` in `'sessionoptions'`.
+    pub const OPT_SKIPRTP: u32 = 0x80;
+}
+
 /// Option value type/value (`OptValType`+`OptValData`, unified into one
 /// safe Rust enum): the original stores these as two separate fields
 /// (`OptVal { OptValType type; OptValData data; }`, the latter a union of

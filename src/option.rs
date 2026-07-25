@@ -4,8 +4,7 @@
 //! `:set`/options-parsing engine, deeply entangled with the eval
 //! engine, autocmd triggers, and nearly every other subsystem: the
 //! `:set` command parser (`do_set`/`ex_set`) and the typed
-//! `get_option_value`/`set_option_value` entry points are not
-//! attempted here.
+//! `set_option_value` entry point are not attempted here.
 //!
 //! Translated: `get_fileformat` (harvested first because it directly
 //! unblocks part of `memline.c`'s `ml_open`); `get_fileformat_force`
@@ -57,6 +56,22 @@
 //! only once `do_set`'s `:setlocal`/`:setglobal` scope flags actually
 //! exist as callers.
 //!
+//! Also translated this pass: `optval_from_varp` (type-punning a
+//! `*mut c_void` back into a real `OptVal`, dispatching on the
+//! option's own declared `OptValType` - independently verified
+//! field-by-field that every one of `get_varp_from`'s 145 branches
+//! targets a Rust field whose type matches its option's declared type
+//! exactly - `i32` for Boolean, `OptInt` for Number, `Option<Vec<u8>>`
+//! for String - with zero mismatches, before trusting this) and
+//! `get_option_value` (opt_flags == 0 only - the "just get the
+//! effective value" case, by far the most common caller pattern,
+//! and exactly equivalent to the original falling through
+//! `get_varp_scope_from` to `get_varp_from` when neither `OPT_GLOBAL`
+//! nor `OPT_LOCAL` is requested; a genuine `OPT_LOCAL`/`OPT_GLOBAL`
+//! caller needs `get_varp_scope_from`, deferred above, so
+//! `get_option_value` deliberately `unimplemented!()`s rather than
+//! silently mis-resolving for those flag combinations).
+//!
 //! **No Rust equivalent needed** (not "deferred" - genuinely
 //! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
 //! exist in the original purely to manually manage `OptVal`'s C union
@@ -88,15 +103,15 @@
 //! to have any meaningful test value), `parse_winhl_opt` (needs the
 //! decoration/highlight-group subsystem: `nvim_create_namespace`/
 //! `get_decor_provider`/`syn_check_group`/`ns_hl_def`), and `do_set`/
-//! `ex_set`'s command-line parsing plus `get_option_value`/
-//! `set_option_value`/`option_was_set`/`get_winbuf_options`/
-//! `get_vimoption`/etc. (everything that needs the full parsed-`:set`-
-//! argument machinery, not just a resolved storage address).
+//! `ex_set`'s command-line parsing plus `set_option_value`/
+//! `option_was_set`/`get_winbuf_options`/`get_vimoption`/etc.
+//! (everything that needs the full parsed-`:set`-argument machinery,
+//! not just a resolved storage address and a read).
 
 use crate::buffer_defs::{BufT, WinT};
-use crate::option_defs::{OptIndex, OptScope, OptValType, VimoptionT, OPTIONS};
+use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
-use crate::types_defs::OptInt;
+use crate::types_defs::{OptInt, TriState};
 use std::ffi::c_void;
 
 /// Gets the `'fileformat'` of `buf` as an `EOL_*` constant
@@ -978,6 +993,90 @@ pub unsafe fn get_varp(opt_idx: OptIndex) -> *mut c_void {
     unsafe { get_varp_from(opt_idx, globals.curbuf, globals.curwin) }
 }
 
+/// Create an `OptVal` from a var pointer (`optval_from_varp`).
+///
+/// # Safety
+/// `varp` must be a valid, non-null pointer of the correct concrete
+/// type for `opt_idx`'s own declared `OptValType` - `*mut i32` for
+/// Boolean, `*mut OptInt` for Number, `*mut Option<Vec<u8>>` for
+/// String - exactly what `get_varp_from`/`get_varp` always produce
+/// (independently verified field-by-field against every one of
+/// `get_varp_from`'s 145 branches before trusting this type-punning
+/// approach, given a `*mut c_void` erases which concrete type is on
+/// the other end).
+///
+/// Also requires `crate::globals::GLOBALS.curbuf` to be null OR a
+/// valid, non-null pointer to a live `BufT` (used only for the
+/// `'modified'`/`b_changed` special case below).
+#[must_use]
+pub unsafe fn optval_from_varp(opt_idx: OptIndex, varp: *mut c_void) -> OptVal {
+    // Special case: 'modified' is b_changed, but we also want to
+    // consider it set when 'fileformat'/'fileencoding' changed.
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    if !curbuf.is_null() {
+        // SAFETY: curbuf just checked non-null; forwarded from this
+        // function's own safety doc.
+        let b_changed_ptr = unsafe { std::ptr::addr_of_mut!((*curbuf).b_changed) as *mut c_void };
+        if varp == b_changed_ptr {
+            // SAFETY: forwarded from this function's own safety doc.
+            let changed = unsafe { crate::undo::curbuf_is_changed() };
+            return OptVal::Boolean(if changed { TriState::True } else { TriState::False });
+        }
+    }
+
+    match get_option(opt_idx).r#type {
+        OptValType::Nil => OptVal::Nil,
+        OptValType::Boolean => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let v = unsafe { *(varp as *mut i32) };
+            OptVal::Boolean(crate::types_defs::tristate_from_int(v as i64))
+        }
+        OptValType::Number => {
+            // SAFETY: forwarded from this function's own safety doc.
+            OptVal::Number(unsafe { *(varp as *mut OptInt) })
+        }
+        OptValType::String => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let s = unsafe { &*(varp as *mut Option<Vec<u8>>) };
+            OptVal::String(s.clone().unwrap_or_default())
+        }
+    }
+}
+
+/// Get the value of an option (`get_option_value`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` values.
+///
+/// # Panics
+/// `opt_flags != 0` (i.e. `opt_set_flags::OPT_LOCAL`/`OPT_GLOBAL`-
+/// forced resolution, used by `:setlocal`/`:setglobal`) isn't
+/// supported yet - needs `get_varp_scope_from`, deliberately not
+/// translated this pass (see this file's own module doc comment).
+/// `opt_flags == 0` (the "just get the effective value" case, and by
+/// far the most common caller pattern) is fully supported: it's
+/// exactly equivalent to the original's own `get_varp_scope_from`
+/// falling through to `get_varp_from` when neither `OPT_GLOBAL` nor
+/// `OPT_LOCAL` is requested, not an approximation of it.
+#[must_use]
+pub unsafe fn get_option_value(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
+    if opt_idx == OptIndex::Invalid {
+        return OptVal::Nil;
+    }
+    if opt_flags != 0 {
+        unimplemented!(
+            "get_option_value: OPT_LOCAL/OPT_GLOBAL-forced resolution needs get_varp_scope_from, not yet translated"
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { get_varp(opt_idx) };
+    // SAFETY: get_varp always returns a pointer of the type
+    // optval_from_varp expects for opt_idx's own declared type.
+    unsafe { optval_from_varp(opt_idx, varp) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1851,3 +1950,125 @@ mod varp_tests {
         globals.curwin = prev_win;
     }
 }
+
+#[cfg(test)]
+mod optval_tests {
+    use super::*;
+
+    #[test]
+    fn optval_from_varp_reads_boolean_via_tristate_from_int() {
+        let mut val: i32 = 1;
+        let varp = &mut val as *mut i32 as *mut c_void;
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Allowrevins, varp) }, OptVal::Boolean(TriState::True));
+
+        // Write through varp itself (not the original `val` binding) from
+        // here on - a later write through `val` directly would invalidate
+        // the pointer already derived from it (a real Tree Borrows
+        // violation caught by Miri in this exact test during development;
+        // see eval/vars.rs's own `Box::as_mut()`-then-reborrow precedent
+        // for the same class of bug).
+        unsafe { *(varp as *mut i32) = 0 };
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Allowrevins, varp) }, OptVal::Boolean(TriState::False));
+
+        unsafe { *(varp as *mut i32) = -1 };
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Allowrevins, varp) }, OptVal::Boolean(TriState::None));
+    }
+
+    #[test]
+    fn optval_from_varp_reads_number() {
+        let mut val: OptInt = 224;
+        let varp = &mut val as *mut OptInt as *mut c_void;
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Aleph, varp) }, OptVal::Number(224));
+    }
+
+    #[test]
+    fn optval_from_varp_reads_string_cloning_it_out() {
+        let mut val: Option<Vec<u8>> = Some(b"double".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        assert_eq!(
+            unsafe { optval_from_varp(OptIndex::Ambiwidth, varp) },
+            OptVal::String(b"double".to_vec())
+        );
+    }
+
+    #[test]
+    fn optval_from_varp_reads_none_string_as_empty() {
+        let mut val: Option<Vec<u8>> = None;
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Ambiwidth, varp) }, OptVal::String(Vec::new()));
+    }
+
+    #[test]
+    fn optval_from_varp_special_cases_b_changed_via_curbuf_is_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        globals.curbuf = &mut buf as *mut BufT;
+
+        // Derive varp from globals.curbuf itself (not from `buf` directly) -
+        // optval_from_varp/curbuf_is_changed both access the buffer through
+        // GLOBALS.curbuf internally, so a pointer derived independently
+        // from `buf` would be a Tree Borrows sibling access, not the same
+        // lineage, and a later write through it would invalidate
+        // GLOBALS.curbuf's own pointer (caught by Miri during development).
+        let curbuf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let varp = unsafe { std::ptr::addr_of_mut!((*curbuf_ptr).b_changed) as *mut c_void };
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Modified, varp) }, OptVal::Boolean(TriState::False));
+        unsafe { *(varp as *mut i32) = 1 };
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Modified, varp) }, OptVal::Boolean(TriState::True));
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+    }
+
+    #[test]
+    fn get_option_value_returns_nil_for_invalid_index() {
+        assert_eq!(unsafe { get_option_value(OptIndex::Invalid, 0) }, OptVal::Nil);
+    }
+
+    #[test]
+    fn get_option_value_resolves_the_effective_value_for_current_buffer_and_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_ai: 1, ..Default::default() };
+        let mut win = WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_win = globals.curwin;
+        globals.curbuf = &mut buf as *mut BufT;
+        globals.curwin = &mut win as *mut WinT;
+
+        assert_eq!(
+            unsafe { get_option_value(OptIndex::Autoindent, 0) },
+            OptVal::Boolean(TriState::True)
+        );
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.curwin = prev_win;
+    }
+
+    #[test]
+    #[should_panic]
+    fn get_option_value_panics_for_unsupported_opt_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_win = globals.curwin;
+        globals.curbuf = &mut buf as *mut BufT;
+        globals.curwin = &mut win as *mut WinT;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            get_option_value(OptIndex::Autoindent, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        }));
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.curwin = prev_win;
+
+        result.unwrap();
+    }
+}
+
