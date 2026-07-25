@@ -1431,6 +1431,623 @@ pub fn set_tty_option(name: &[u8], value: Vec<u8>) -> bool {
     false
 }
 
+/// Error message for `'chistory'`/`'lhistory'` given a non-positive
+/// value (`e_cannot_have_negative_or_zero_number_of_quickfix`, a
+/// file-local `static const char[]` in the original - kept file-local
+/// here too, matching the original's own scoping, rather than added
+/// to the shared `errors.rs`).
+#[allow(non_upper_case_globals)]
+const e_cannot_have_negative_or_zero_number_of_quickfix: &str =
+    crate::gettext_defs::gettext_noop("E1542: Cannot have a negative or zero number of quickfix/location lists");
+
+/// Error message for `'chistory'`/`'lhistory'` given a too-large value
+/// (`e_cannot_have_more_than_hundred_quickfix`, file-local in the
+/// original - see the constant above's own doc comment).
+#[allow(non_upper_case_globals)]
+const e_cannot_have_more_than_hundred_quickfix: &str =
+    crate::gettext_defs::gettext_noop("E1543: Cannot have more than a hundred quickfix/location lists");
+
+/// Check the bounds of numeric options (`check_num_option_bounds`).
+///
+/// Returns `Some(error_message)` when the value was out of bounds -
+/// `*newval` may ALSO have been corrected in that case (or even when
+/// there's no error at all, e.g. `Pumblend`'s silent clamp), matching
+/// the original's own in-out `newval` parameter.
+///
+/// # Panics
+/// `unimplemented!()`s for `OptIndex::Lines`/`OptIndex::Scroll` - each
+/// needs `window.c`'s NOT-YET-TRANSLATED frame-layout/window-splitting
+/// subsystem (`min_rows_for_all_tabpages`/`win_default_scroll`, which
+/// themselves need `frame_minheight`/`tabline_height`/
+/// `global_stl_height`) to compute their real bound - see this file's
+/// own module doc comment. Every OTHER branch (including
+/// `OptIndex::Scrolljump`, which only needs the already-real
+/// `GLOBALS.Rows`, not the frame-layout subsystem) is fully real.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` - not actually dereferenced by any branch below
+/// TODAY (the one branch that would need it, `OptIndex::Scroll`,
+/// currently always panics first), but documented as a real,
+/// forward-looking requirement so this function's contract doesn't
+/// silently change once that branch is unblocked.
+#[must_use]
+pub unsafe fn check_num_option_bounds(opt_idx: OptIndex, newval: &mut OptInt) -> Option<&'static str> {
+    match opt_idx {
+        OptIndex::Lines => unimplemented!(
+            "check_num_option_bounds: OptIndex::Lines needs min_rows_for_all_tabpages, \
+             not yet translated (window.c's frame-layout subsystem)"
+        ),
+        OptIndex::Columns => {
+            let full_screen = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+            let mut errmsg = None;
+            if *newval < OptInt::from(crate::window::MIN_COLUMNS) && full_screen {
+                // "12" mirrors MIN_COLUMNS's own value (see window.rs).
+                errmsg = Some("E594: Need at least 12 columns");
+                *newval = OptInt::from(crate::window::MIN_COLUMNS);
+            }
+            *newval = (*newval).min(OptInt::from(i32::MAX));
+            errmsg
+        }
+        OptIndex::Pumblend => {
+            *newval = (*newval).clamp(0, 100);
+            None
+        }
+        OptIndex::Scrolljump => {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            if (*newval < -100 || *newval >= OptInt::from(globals.Rows)) && globals.full_screen {
+                *newval = 1;
+                return Some(crate::errors::e_scroll);
+            }
+            None
+        }
+        OptIndex::Scroll => unimplemented!(
+            "check_num_option_bounds: OptIndex::Scroll needs win_default_scroll, \
+             not yet translated (window.c's frame-layout subsystem)"
+        ),
+        _ => None,
+    }
+}
+
+/// Validate and bound check option value (`validate_num_option`).
+///
+/// Returns `Some(error_message)` on failure; `*newval` may ALSO have
+/// been corrected even on success (e.g. `Maxcombine` always forces
+/// `MAX_MCO`, `Pyxversion` forces `3`).
+///
+/// # Panics
+/// `unimplemented!()`s for `OptIndex::Lines`/`OptIndex::Scroll`, via
+/// the final [`check_num_option_bounds`] call - see that function's
+/// own doc comment. No OTHER branch panics.
+///
+/// # Safety
+/// Forwards [`check_num_option_bounds`]'s own safety requirement.
+#[must_use]
+pub unsafe fn validate_num_option(opt_idx: OptIndex, newval: &mut OptInt) -> Option<&'static str> {
+    let value = *newval;
+
+    if value < OptInt::from(i32::MIN) || value > OptInt::from(i32::MAX) {
+        return Some(crate::errors::e_invarg);
+    }
+
+    // if you increase this, also increase SEARCH_STAT_BUF_LEN in search.c
+    const MAX_SEARCH_COUNT: OptInt = 9999;
+
+    let full_screen = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+    let opt_vars = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+
+    match opt_idx {
+        OptIndex::Helpheight
+        | OptIndex::Titlelen
+        | OptIndex::Updatecount
+        | OptIndex::Report
+        | OptIndex::Updatetime
+        | OptIndex::Sidescroll
+        | OptIndex::Foldlevel
+        | OptIndex::Shiftwidth
+        | OptIndex::Textwidth
+        | OptIndex::Writedelay
+        | OptIndex::Timeoutlen => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            }
+        }
+        OptIndex::Winheight => {
+            if value < 1 {
+                return Some(crate::errors::e_positive);
+            } else if opt_vars.p_wmh > value {
+                return Some(crate::errors::e_winheight);
+            }
+        }
+        OptIndex::Winminheight => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            } else if value > opt_vars.p_wh {
+                return Some(crate::errors::e_winheight);
+            }
+        }
+        OptIndex::Winwidth => {
+            if value < 1 {
+                return Some(crate::errors::e_positive);
+            } else if opt_vars.p_wmw > value {
+                return Some(crate::errors::e_winwidth);
+            }
+        }
+        OptIndex::Winminwidth => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            } else if value > opt_vars.p_wiw {
+                return Some(crate::errors::e_winwidth);
+            }
+        }
+        OptIndex::Maxcombine => {
+            *newval = OptInt::from(crate::option_vars::MAX_MCO);
+        }
+        OptIndex::Cmdheight => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            }
+        }
+        OptIndex::History => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            } else if value > 10000 {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Pyxversion => {
+            if value == 0 {
+                *newval = 3;
+            } else if value != 3 {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Regexpengine => {
+            if !(0..=2).contains(&value) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Scrolloff => {
+            if value < 0 && full_screen {
+                return Some(crate::errors::e_positive);
+            }
+        }
+        OptIndex::Scrolloffpad => {
+            if value < 0 {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Sidescrolloff => {
+            if value < 0 && full_screen {
+                return Some(crate::errors::e_positive);
+            }
+        }
+        OptIndex::Cmdwinheight => {
+            if value < 1 {
+                return Some(crate::errors::e_positive);
+            }
+        }
+        OptIndex::Conceallevel => {
+            if value < 0 {
+                return Some(crate::errors::e_positive);
+            } else if value > 3 {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Numberwidth => {
+            if value < 1 {
+                return Some(crate::errors::e_positive);
+            } else if value > OptInt::from(crate::option_vars::MAX_NUMBERWIDTH) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Iminsert => {
+            if !(0..=crate::buffer_defs::B_IMODE_LAST).contains(&value) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Imsearch => {
+            if !(-1..=crate::buffer_defs::B_IMODE_LAST).contains(&value) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Channel => {
+            return Some(crate::errors::e_invarg);
+        }
+        OptIndex::Scrollback => {
+            if !(-1..=OptInt::from(crate::option_vars::SB_MAX)).contains(&value) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Tabstop => {
+            if value < 1 {
+                return Some(crate::errors::e_positive);
+            } else if value > OptInt::from(crate::option_vars::TABSTOP_MAX) {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        OptIndex::Chistory | OptIndex::Lhistory => {
+            if value < 1 {
+                return Some(e_cannot_have_negative_or_zero_number_of_quickfix);
+            } else if value > 100 {
+                return Some(e_cannot_have_more_than_hundred_quickfix);
+            }
+        }
+        OptIndex::Maxsearchcount => {
+            if value <= 0 {
+                return Some(crate::errors::e_positive);
+            } else if value > MAX_SEARCH_COUNT {
+                return Some(crate::errors::e_invarg);
+            }
+        }
+        _ => {}
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_num_option_bounds(opt_idx, newval) }
+}
+
+#[cfg(test)]
+mod num_option_bounds_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic]
+    fn check_num_option_bounds_lines_panics() {
+        let mut v: OptInt = 10;
+        let _ = unsafe { check_num_option_bounds(OptIndex::Lines, &mut v) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn check_num_option_bounds_scroll_panics() {
+        let mut v: OptInt = 10;
+        let _ = unsafe { check_num_option_bounds(OptIndex::Scroll, &mut v) };
+    }
+
+    #[test]
+    fn check_num_option_bounds_columns_clamps_and_errors_when_full_screen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = true;
+
+        let mut v: OptInt = 5;
+        let err = unsafe { check_num_option_bounds(OptIndex::Columns, &mut v) };
+        assert_eq!(err, Some("E594: Need at least 12 columns"));
+        assert_eq!(v, 12);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev;
+    }
+
+    #[test]
+    fn check_num_option_bounds_columns_no_error_when_not_full_screen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = false;
+
+        let mut v: OptInt = 5;
+        let err = unsafe { check_num_option_bounds(OptIndex::Columns, &mut v) };
+        assert_eq!(err, None);
+        assert_eq!(v, 5); // not clamped to MIN_COLUMNS, only the i32::MAX ceiling applies
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev;
+    }
+
+    #[test]
+    fn check_num_option_bounds_columns_clamps_to_i32_max() {
+        let mut v: OptInt = OptInt::from(i32::MAX) + 1000;
+        let err = unsafe { check_num_option_bounds(OptIndex::Columns, &mut v) };
+        assert_eq!(err, None);
+        assert_eq!(v, OptInt::from(i32::MAX));
+    }
+
+    #[test]
+    fn check_num_option_bounds_pumblend_clamps_both_directions() {
+        let mut v: OptInt = -5;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Pumblend, &mut v) }, None);
+        assert_eq!(v, 0);
+
+        let mut v2: OptInt = 250;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Pumblend, &mut v2) }, None);
+        assert_eq!(v2, 100);
+    }
+
+    #[test]
+    fn check_num_option_bounds_scrolljump_errors_when_out_of_range_and_full_screen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_full_screen = globals.full_screen;
+        let prev_rows = globals.Rows;
+        globals.full_screen = true;
+        globals.Rows = 24;
+
+        let mut v: OptInt = -200;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scrolljump, &mut v) }, Some(crate::errors::e_scroll));
+        assert_eq!(v, 1);
+
+        let mut v2: OptInt = 30;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scrolljump, &mut v2) }, Some(crate::errors::e_scroll));
+        assert_eq!(v2, 1);
+
+        let mut v3: OptInt = 5;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scrolljump, &mut v3) }, None);
+        assert_eq!(v3, 5);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.full_screen = prev_full_screen;
+        globals.Rows = prev_rows;
+    }
+
+    #[test]
+    fn check_num_option_bounds_scrolljump_no_error_when_not_full_screen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_full_screen = globals.full_screen;
+        globals.full_screen = false;
+
+        let mut v: OptInt = -200;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scrolljump, &mut v) }, None);
+        assert_eq!(v, -200);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev_full_screen;
+    }
+
+    #[test]
+    fn check_num_option_bounds_default_case_leaves_value_untouched() {
+        let mut v: OptInt = 224;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Aleph, &mut v) }, None);
+        assert_eq!(v, 224);
+    }
+
+    #[test]
+    fn validate_num_option_rejects_out_of_i32_range() {
+        let mut v: OptInt = OptInt::from(i32::MAX) + 1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Cmdheight, &mut v) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_simple_non_negative_group() {
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Timeoutlen, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 5;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Timeoutlen, &mut v2) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_winheight_checks_against_p_wmh() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh = 5;
+
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winheight, &mut v) }, Some(crate::errors::e_positive));
+
+        let mut v2: OptInt = 3;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winheight, &mut v2) }, Some(crate::errors::e_winheight));
+
+        let mut v3: OptInt = 10;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winheight, &mut v3) }, None);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh = prev;
+    }
+
+    #[test]
+    fn validate_num_option_winminheight_checks_against_p_wh() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wh;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wh = 5;
+
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winminheight, &mut v) }, Some(crate::errors::e_positive));
+
+        let mut v2: OptInt = 10;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winminheight, &mut v2) }, Some(crate::errors::e_winheight));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wh = prev;
+    }
+
+    #[test]
+    fn validate_num_option_winwidth_checks_against_p_wmw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = 5;
+
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winwidth, &mut v) }, Some(crate::errors::e_positive));
+
+        let mut v2: OptInt = 3;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winwidth, &mut v2) }, Some(crate::errors::e_winwidth));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = prev;
+    }
+
+    #[test]
+    fn validate_num_option_winminwidth_checks_against_p_wiw() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wiw;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wiw = 5;
+
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winminwidth, &mut v) }, Some(crate::errors::e_positive));
+
+        let mut v2: OptInt = 10;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Winminwidth, &mut v2) }, Some(crate::errors::e_winwidth));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wiw = prev;
+    }
+
+    #[test]
+    fn validate_num_option_maxcombine_always_forces_max_mco() {
+        let mut v: OptInt = 999;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Maxcombine, &mut v) }, None);
+        assert_eq!(v, OptInt::from(crate::option_vars::MAX_MCO));
+    }
+
+    #[test]
+    fn validate_num_option_history_bounds() {
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::History, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 20000;
+        assert_eq!(unsafe { validate_num_option(OptIndex::History, &mut v2) }, Some(crate::errors::e_invarg));
+        let mut v3: OptInt = 500;
+        assert_eq!(unsafe { validate_num_option(OptIndex::History, &mut v3) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_pyxversion_forces_3_or_rejects() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Pyxversion, &mut v) }, None);
+        assert_eq!(v, 3);
+
+        let mut v2: OptInt = 2;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Pyxversion, &mut v2) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_regexpengine_range() {
+        let mut v: OptInt = 3;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Regexpengine, &mut v) }, Some(crate::errors::e_invarg));
+        let mut v2: OptInt = 1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Regexpengine, &mut v2) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_scrolloff_needs_full_screen_to_error() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = true;
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrolloff, &mut v) }, Some(crate::errors::e_positive));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = false;
+        let mut v2: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrolloff, &mut v2) }, None);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev;
+    }
+
+    #[test]
+    fn validate_num_option_scrolloffpad_errors_regardless_of_full_screen() {
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrolloffpad, &mut v) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_sidescrolloff_needs_full_screen_to_error() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = true;
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Sidescrolloff, &mut v) }, Some(crate::errors::e_positive));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev;
+    }
+
+    #[test]
+    fn validate_num_option_cmdwinheight() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Cmdwinheight, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Cmdwinheight, &mut v2) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_conceallevel_bounds() {
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Conceallevel, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 4;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Conceallevel, &mut v2) }, Some(crate::errors::e_invarg));
+        let mut v3: OptInt = 2;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Conceallevel, &mut v3) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_numberwidth_bounds() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Numberwidth, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 21;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Numberwidth, &mut v2) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_iminsert_and_imsearch_bounds() {
+        let mut v: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Iminsert, &mut v) }, Some(crate::errors::e_invarg));
+        let mut v2: OptInt = 2;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Iminsert, &mut v2) }, Some(crate::errors::e_invarg));
+
+        let mut v3: OptInt = -2;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Imsearch, &mut v3) }, Some(crate::errors::e_invarg));
+        let mut v4: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Imsearch, &mut v4) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_channel_always_errors() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Channel, &mut v) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_scrollback_bounds() {
+        let mut v: OptInt = -2;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrollback, &mut v) }, Some(crate::errors::e_invarg));
+        let mut v2: OptInt = OptInt::from(crate::option_vars::SB_MAX) + 1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrollback, &mut v2) }, Some(crate::errors::e_invarg));
+        let mut v3: OptInt = -1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Scrollback, &mut v3) }, None);
+    }
+
+    #[test]
+    fn validate_num_option_tabstop_bounds() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Tabstop, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = OptInt::from(crate::option_vars::TABSTOP_MAX) + 1;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Tabstop, &mut v2) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_chistory_and_lhistory_bounds() {
+        let mut v: OptInt = 0;
+        assert_eq!(
+            unsafe { validate_num_option(OptIndex::Chistory, &mut v) },
+            Some(e_cannot_have_negative_or_zero_number_of_quickfix)
+        );
+        let mut v2: OptInt = 101;
+        assert_eq!(
+            unsafe { validate_num_option(OptIndex::Lhistory, &mut v2) },
+            Some(e_cannot_have_more_than_hundred_quickfix)
+        );
+    }
+
+    #[test]
+    fn validate_num_option_maxsearchcount_bounds() {
+        let mut v: OptInt = 0;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Maxsearchcount, &mut v) }, Some(crate::errors::e_positive));
+        let mut v2: OptInt = 10000;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Maxsearchcount, &mut v2) }, Some(crate::errors::e_invarg));
+    }
+
+    #[test]
+    fn validate_num_option_default_case_delegates_to_check_num_option_bounds() {
+        // Pumblend has no explicit arm in validate_num_option's own
+        // switch - it must fall through to check_num_option_bounds,
+        // which clamps it.
+        let mut v: OptInt = 500;
+        assert_eq!(unsafe { validate_num_option(OptIndex::Pumblend, &mut v) }, None);
+        assert_eq!(v, 100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn validate_num_option_lines_panics_via_check_num_option_bounds() {
+        let mut v: OptInt = 10;
+        let _ = unsafe { validate_num_option(OptIndex::Lines, &mut v) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

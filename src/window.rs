@@ -31,9 +31,20 @@
 //! deferred-subsystem side effect, keep the state/return value
 //! correct" policy.
 //!
+//! Also translated, from `window.h` (not `window.c` - a tiny, self-
+//! contained enum needed by `option.c`'s `check_num_option_bounds`):
+//! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
+
+/// minimal columns for screen (`MIN_COLUMNS`).
+pub const MIN_COLUMNS: i32 = 12;
+/// minimal lines for screen (`MIN_LINES`).
+pub const MIN_LINES: i32 = 2;
+/// height of a status line under a window (`STATUS_HEIGHT`).
+pub const STATUS_HEIGHT: i32 = 1;
 
 /// Check if `win` is a pointer to an existing window in tabpage `tp`
 /// (`tabpage_win_valid`).
@@ -260,6 +271,13 @@ pub unsafe fn is_bottom_win(wp: &WinT) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_columns_min_lines_status_height_match_c_enum() {
+        assert_eq!(MIN_COLUMNS, 12);
+        assert_eq!(MIN_LINES, 2);
+        assert_eq!(STATUS_HEIGHT, 1);
+    }
 
     #[test]
     fn win_fdccol_count_defaults_to_zero_when_unset() {
