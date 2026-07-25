@@ -834,12 +834,22 @@ static GLOBVARS_VAR: std::sync::LazyLock<crate::globals::GlobalCell<ScopeDictDic
     });
 
 /// @return the global (`g:`) variable dictionary (`get_globvar_dict`).
+///
+/// Uses `GLOBVARDICT.as_ptr()` (not `.get_mut()`) so that the returned
+/// pointer remains valid across ANY later, independent call to this
+/// same function - `.get_mut()` creates a fresh exclusive reference on
+/// every call, which (proven for real by Miri's Tree Borrows checker
+/// against `VIMVARDICT`'s own analogous bug, fixed alongside this one)
+/// would otherwise invalidate a previously-returned pointer the
+/// moment `get_globvar_dict()` is called again from anywhere else -
+/// exactly what happens whenever a caller holds onto an earlier
+/// result across a call to another function (e.g. `del_menutrans_vars`)
+/// that itself calls `get_globvar_dict()` again internally.
 #[must_use]
 pub fn get_globvar_dict() -> *mut DictT {
     // SAFETY: GLOBVARDICT is only ever read/written through this
-    // module's own functions, matching VIMVARS's own established
-    // convention.
-    unsafe { GLOBVARDICT.get_mut() as *mut DictT }
+    // module's own functions.
+    GLOBVARDICT.as_ptr()
 }
 
 /// @return the global (`g:`) variable hash table (`get_globvar_ht`).
@@ -864,8 +874,10 @@ pub fn get_globvar_ht() -> *mut HashtabT {
 /// remove from the hashtab, clear the value, free the item shell) -
 /// so no separate `delete_var` binding is needed here.
 pub fn del_menutrans_vars() {
-    // SAFETY: only touches this module's own GLOBVARDICT cell.
-    let d = unsafe { GLOBVARDICT.get_mut() };
+    // SAFETY: get_globvar_dict() (as_ptr()-based) never creates a
+    // reference, so this is safe to call regardless of any other live
+    // pointer into GLOBVARDICT elsewhere.
+    let d = unsafe { &mut *get_globvar_dict() };
     let items: Vec<*mut DictitemT> = d
         .dv_index
         .values()
@@ -894,7 +906,7 @@ pub fn del_menutrans_vars() {
 #[must_use]
 pub unsafe fn garbage_collect_globvars(copy_id: i32) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { crate::eval::eval::set_ref_in_ht(GLOBVARDICT.get_mut() as *mut DictT, copy_id, std::ptr::null_mut()) }
+    unsafe { crate::eval::eval::set_ref_in_ht(get_globvar_dict(), copy_id, std::ptr::null_mut()) }
 }
 
 /// Mark all lists/dicts referenced through every registered script's
@@ -947,14 +959,16 @@ pub unsafe fn garbage_collect_scriptvars(copy_id: i32) -> bool {
 static COMPAT_HASHTAB: std::sync::LazyLock<crate::globals::GlobalCell<crate::hashtab_defs::HashtabT>> =
     std::sync::LazyLock::new(|| {
         let mut ht = crate::hashtab_defs::HashtabT::hash_init();
-        // SAFETY: only touches this module's own VIMVARS cell, and
-        // every di_key pointer added here is owned by that same
-        // Vec (never resized/freed afterward - see get_vim_var_tv's
+        // SAFETY: only touches this module's own VIMVARS cell (via
+        // vimvar_ptr_at, never creating a `&mut Vec`/`&mut [Vimvar]`
+        // reference - see that function's own doc comment), and every
+        // di_key pointer added here is owned by that same Vec's own
+        // element (never resized/freed afterward - see get_vim_var_tv's
         // own doc comment), so it outlives this hashtable entry.
-        let vimvars = unsafe { VIMVARS.get_mut() };
-        for v in vimvars.iter_mut() {
-            if v.flags & vv_flag::COMPAT != 0 {
-                let key_ptr = v.di.di_key.as_mut_ptr() as *mut std::os::raw::c_char;
+        for i in 0..vimvars_len() {
+            let v = vimvar_ptr_at(i);
+            if unsafe { (*v).flags } & vv_flag::COMPAT != 0 {
+                let key_ptr = unsafe { (*v).di.di_key.as_mut_ptr() as *mut std::os::raw::c_char };
                 unsafe { ht.hash_add(key_ptr) };
             }
         }
@@ -1015,30 +1029,40 @@ static VIMVARDICT: std::sync::LazyLock<crate::globals::GlobalCell<DictT>> =
             dv_used_prev: std::ptr::null_mut(),
             lua_table_ref: LUA_NOREF,
         };
-        // SAFETY: only touches this module's own VIMVARS cell; every
-        // di_key pointer added here is owned by that same Vec (never
-        // resized/freed afterward), and &mut v.di likewise stays a
-        // valid, stable address for the rest of the program - see
-        // this static's own doc comment.
-        let vimvars = unsafe { VIMVARS.get_mut() };
-        for v in vimvars.iter_mut() {
-            if v.di.di_tv.value.var_type() == VarType::Unknown {
+        // SAFETY: only touches this module's own VIMVARS cell, via
+        // vimvar_ptr_at - never creating a `&mut Vec`/`&mut [Vimvar]`
+        // reference (see that function's own doc comment) - so the
+        // pointers stored into dv_index below remain valid across
+        // every LATER, independent call to any
+        // get_vim_var_*/set_vim_var_* function (which also now uses
+        // vimvar_ptr/vimvar_ptr_at exclusively, for the same reason).
+        // Proven necessary for real by Miri's Tree Borrows checker: the
+        // original `VIMVARS.get_mut().iter_mut()`-derived pointers here
+        // were invalidated by set_vim_var_dict's own (then-separate)
+        // `VIMVARS.get_mut()[idx]` call - a genuine bug, not just a
+        // theoretical one.
+        for i in 0..vimvars_len() {
+            let v = vimvar_ptr_at(i);
+            if unsafe { (*v).di.di_tv.value.var_type() } == VarType::Unknown {
                 continue;
             }
-            let key_ptr = v.di.di_key.as_mut_ptr() as *mut std::os::raw::c_char;
+            let key_ptr = unsafe { (*v).di.di_key.as_mut_ptr() as *mut std::os::raw::c_char };
             unsafe { dict.dv_hashtab.hash_add(key_ptr) };
-            dict.dv_index.insert(key_ptr as usize, &mut v.di as *mut DictitemT);
+            dict.dv_index.insert(key_ptr as usize, unsafe { std::ptr::addr_of_mut!((*v).di) });
         }
         crate::globals::GlobalCell::new(dict)
     });
 
 /// @return the `v:` variable dictionary (`get_vimvar_dict`).
+///
+/// Uses `VIMVARDICT.as_ptr()` (not `.get_mut()`), for the exact same
+/// reason as [`get_globvar_dict`] - see that function's own doc
+/// comment.
 #[must_use]
 pub fn get_vimvar_dict() -> *mut DictT {
     // SAFETY: VIMVARDICT is only ever read/written through this
-    // module's own functions, matching GLOBVARDICT's own established
-    // convention.
-    unsafe { VIMVARDICT.get_mut() as *mut DictT }
+    // module's own functions.
+    VIMVARDICT.as_ptr()
 }
 
 /// The `vimvars_var` file-static - the whole `v:` scope, "as if it
@@ -1362,33 +1386,93 @@ pub unsafe fn find_var(
     (unsafe { crate::eval::userfunc::find_var_in_scoped_ht(name, no_autoload) }, ht)
 }
 
+/// Get a raw pointer to `VIMVARS`'s element at raw index `idx`,
+/// without ever creating a `&mut Vec<Vimvar>`/`&mut [Vimvar]`
+/// reference the way `VIMVARS.get_mut()[idx]` indexing does - see
+/// `GlobalCell::as_ptr`'s own doc comment for why this matters:
+/// [`VIMVARDICT`]'s own `dv_index` holds long-lived pointers into
+/// these same elements (derived the same way, via this helper), which
+/// must remain valid across every later call to any
+/// `get_vim_var_*`/`set_vim_var_*` function - proven for real by
+/// Miri's Tree Borrows checker to otherwise be a genuine bug (a
+/// `.get_mut()[idx]`-derived pointer stored in `VIMVARDICT.dv_index`
+/// was invalidated by a LATER, unrelated `.get_mut()[idx]` call from
+/// `set_vim_var_dict`).
+///
+/// Takes a raw `usize` (not [`VimVarIndex`]) so [`COMPAT_HASHTAB`]'s/
+/// [`VIMVARDICT`]'s own construction can iterate every entry (`0..108`)
+/// without needing a `usize -> VimVarIndex` conversion - [`vimvar_ptr`]
+/// (below) is the type-safe wrapper real accessor functions use.
+///
+/// # Safety
+/// `idx` must be in `VIMVARS`'s own fixed 108-entry range.
+fn vimvar_ptr_at(idx: usize) -> *mut Vimvar {
+    // SAFETY: VIMVARS's own LazyLock ensures it is populated (a fixed
+    // 108 entries, never resized afterward - see this function's own
+    // safety doc) before this pointer is ever dereferenced elsewhere.
+    // as_ptr() never creates a reference, so calling this repeatedly -
+    // even while other pointers derived the same way remain live - is
+    // sound, unlike get_mut().
+    let vimvars_ptr = VIMVARS.as_ptr();
+    // SAFETY: forwarded from this function's own safety doc - the
+    // `&mut Vec` this briefly, implicitly creates (to call
+    // `as_mut_ptr`) is used and discarded immediately, never held
+    // across any other access.
+    let buf_ptr = unsafe { (*vimvars_ptr).as_mut_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_ptr.add(idx) }
+}
+
+/// Get a raw pointer to `VIMVARS`'s element at `idx` - the type-safe,
+/// [`VimVarIndex`]-taking wrapper around [`vimvar_ptr_at`] every real
+/// `get_vim_var_*`/`set_vim_var_*` accessor uses. See that function's
+/// own doc comment for the full reasoning.
+///
+/// # Safety
+/// `idx` must be a valid `VimVarIndex` variant (always true - every
+/// variant is in `VIMVARS`'s own fixed 108-entry range by
+/// construction).
+fn vimvar_ptr(idx: VimVarIndex) -> *mut Vimvar {
+    vimvar_ptr_at(idx as usize)
+}
+
+/// The number of entries in `VIMVARS` (always 108, its own fixed,
+/// populate-once length) - used by [`COMPAT_HASHTAB`]'s/
+/// [`VIMVARDICT`]'s own construction to iterate every raw index via
+/// [`vimvar_ptr_at`], matching that helper's own "never create a
+/// `&mut Vec`/`&mut [Vimvar]` reference" reasoning.
+fn vimvars_len() -> usize {
+    // SAFETY: forwarded from vimvar_ptr_at's own safety doc - the
+    // `&mut Vec` this briefly, implicitly creates (to call `.len()`)
+    // is used and discarded immediately.
+    unsafe { (*VIMVARS.as_ptr()).len() }
+}
+
 /// Get the name of `v:` variable `idx`, without the `v:` prefix
 /// (`get_vim_var_name`).
 #[must_use]
 pub fn get_vim_var_name(idx: VimVarIndex) -> &'static str {
-    // SAFETY: VIMVARS is only ever read/written through this module's
-    // own functions, none of which hold a live reference across
-    // another call into this same cell.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].name
+    // SAFETY: forwarded from vimvar_ptr's own safety doc.
+    unsafe { (*vimvar_ptr(idx)).name }
 }
 
 /// Get a raw pointer to `v:` variable `idx`'s own `typval_T`
 /// (`get_vim_var_tv`).
 ///
 /// # Safety
-/// The returned pointer stays valid as long as `VIMVARS` itself
-/// (the whole program's lifetime, in practice): its backing `Vec` is
+/// The returned pointer stays valid as long as `VIMVARS` itself (the
+/// whole program's lifetime, in practice): its backing `Vec` is
 /// populated once, with a fixed 108 entries, and never resized
 /// afterward by any function in this module, so indexing into it can
-/// never be invalidated by reallocation. Callers must still not
-/// retain the returned pointer across any call that could conflict
-/// with this crate's usual `GlobalCell` aliasing rule (no two live
-/// mutable accesses to the same cell at once).
+/// never be invalidated by reallocation. Derived via `vimvar_ptr`
+/// (not `VIMVARS.get_mut()[idx]` directly) so the returned pointer
+/// safely remains valid across any LATER call to another
+/// `get_vim_var_*`/`set_vim_var_*` function too - see that helper's
+/// own doc comment.
 #[must_use]
 pub unsafe fn get_vim_var_tv(idx: VimVarIndex) -> *mut TypvalT {
     // SAFETY: forwarded from this function's own safety doc.
-    std::ptr::addr_of_mut!(unsafe { &mut *VIMVARS.get_mut() }[idx as usize].di.di_tv)
+    unsafe { std::ptr::addr_of_mut!((*vimvar_ptr(idx)).di.di_tv) }
 }
 
 /// Get number `v:` variable `idx`'s value (`get_vim_var_nr`).
@@ -1500,8 +1584,7 @@ pub unsafe fn get_vim_var_partial(idx: VimVarIndex) -> *mut crate::eval::typval_
 /// pointer must be valid.
 pub unsafe fn set_vim_var_tv(idx: VimVarIndex, tv: TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv = tv;
+    unsafe { *get_vim_var_tv(idx) = tv };
 }
 
 /// Set the type of `v:` variable `idx` to `ty`, WITHOUT changing its
@@ -1521,8 +1604,7 @@ pub unsafe fn set_vim_var_type(idx: VimVarIndex, ty: VarType) {
         "set_vim_var_type: only VarType::Number is ever used by any real caller"
     );
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Number(0);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Number(0) };
 }
 
 /// Set number `v:` variable `idx` to `val`. Does not change the type -
@@ -1537,8 +1619,7 @@ pub unsafe fn set_vim_var_nr(idx: VimVarIndex, val: VarnumberT) {
     // and sets the new value - faithful to every real caller, which
     // only ever targets an already-Number-typed slot (see this
     // module's own doc comment).
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Number(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Number(val) };
 }
 
 /// Set boolean `v:` variable `idx` to `val` (`set_vim_var_bool`).
@@ -1547,8 +1628,7 @@ pub unsafe fn set_vim_var_nr(idx: VimVarIndex, val: VarnumberT) {
 /// Same as [`get_vim_var_tv`].
 pub unsafe fn set_vim_var_bool(idx: VimVarIndex, val: BoolVarValue) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Bool(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Bool(val) };
 }
 
 /// Set special `v:` variable `idx` to `val` (`set_vim_var_special`).
@@ -1557,8 +1637,7 @@ pub unsafe fn set_vim_var_bool(idx: VimVarIndex, val: BoolVarValue) {
 /// Same as [`get_vim_var_tv`].
 pub unsafe fn set_vim_var_special(idx: VimVarIndex, val: SpecialVarValue) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Special(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Special(val) };
 }
 
 /// Set string `v:` variable `idx` to a copy of `val`
@@ -1571,8 +1650,7 @@ pub unsafe fn set_vim_var_special(idx: VimVarIndex, val: SpecialVarValue) {
 /// Same as [`get_vim_var_tv`].
 pub unsafe fn set_vim_var_string(idx: VimVarIndex, val: Option<&[u8]>) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::String(val.map(<[u8]>::to_vec));
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::String(val.map(<[u8]>::to_vec)) };
 }
 
 /// Set list `v:` variable `idx` to `val`. Reference count will be
@@ -1583,8 +1661,7 @@ pub unsafe fn set_vim_var_string(idx: VimVarIndex, val: Option<&[u8]>) {
 /// pointer to a live [`crate::eval::typval_defs::ListT`].
 pub unsafe fn set_vim_var_list(idx: VimVarIndex, val: *mut crate::eval::typval_defs::ListT) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::List(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::List(val) };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::typval::tv_list_ref(val) };
 }
@@ -1598,8 +1675,7 @@ pub unsafe fn set_vim_var_list(idx: VimVarIndex, val: *mut crate::eval::typval_d
 /// pointer to a live [`DictT`].
 pub unsafe fn set_vim_var_dict(idx: VimVarIndex, val: *mut DictT) {
     // SAFETY: forwarded from this function's own safety doc.
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Dict(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Dict(val) };
     if val.is_null() {
         return;
     }
@@ -1621,8 +1697,7 @@ pub unsafe fn set_vim_var_partial(idx: VimVarIndex, val: *mut crate::eval::typva
     // for the same reason as set_vim_var_nr - every real caller only
     // ever targets VV_LUA, already Partial-typed (see this module's
     // own doc comment).
-    let vimvars = unsafe { VIMVARS.get_mut() };
-    vimvars[idx as usize].di.di_tv.value = TypvalValue::Partial(val);
+    unsafe { (*get_vim_var_tv(idx)).value = TypvalValue::Partial(val) };
 }
 
 /// Set `v:char` to character `c` (`set_vim_var_char`).
@@ -3207,7 +3282,13 @@ mod find_var_ht_dict_tests {
         reset_shared_state();
 
         // outer_fc: the enclosing function's own funccall, holding the
-        // real "x" variable in its l: scope.
+        // real "x" variable in its l: scope. All field access after
+        // deriving outer_fc_ptr goes through THAT raw pointer, not
+        // through outer_fc directly - re-borrowing through the Box
+        // after a raw pointer has already been derived from it is a
+        // real Stacked Borrows violation (confirmed by Miri) that
+        // invalidates the earlier pointer, even though the underlying
+        // memory address doesn't change.
         let mut outer_fp = crate::eval::typval_defs::UfuncT::default();
         let mut outer_fc = Box::new(FunccallT::default());
         outer_fc.fc_l_vars.dv_refcount = DO_NOT_FREE_CNT;
@@ -3215,7 +3296,7 @@ mod find_var_ht_dict_tests {
         let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
         let item = crate::eval::typval::tv_dict_item_alloc(b"x");
         unsafe { (*item).di_tv.value = TypvalValue::Number(99) };
-        unsafe { crate::eval::typval::tv_dict_add(&mut outer_fc.fc_l_vars, item) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut (*outer_fc_ptr).fc_l_vars, item) };
 
         // inner_fp/inner_fc: the currently-executing lambda, scoped to
         // outer_fc via uf_scoped - its OWN l: scope does not have "x".

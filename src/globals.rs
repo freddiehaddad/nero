@@ -1214,6 +1214,32 @@ impl<T> GlobalCell<T> {
     pub unsafe fn get_mut(&self) -> &mut T {
         unsafe { &mut *self.0.get() }
     }
+
+    /// Returns a raw pointer to the single global value, WITHOUT ever
+    /// creating an intermediate `&mut T` reference the way
+    /// [`Self::get_mut`] does.
+    ///
+    /// Needed by code that must derive a long-lived raw pointer INTO
+    /// this cell's contents (e.g. a pointer to one element of a `Vec<_>`
+    /// stored here, cached elsewhere for repeated later use) that has
+    /// to remain valid across LATER, unrelated calls to
+    /// [`Self::get_mut`]. That method's own safety doc does not
+    /// guarantee this: each `get_mut()` call is its own fresh
+    /// exclusive borrow, so a pointer derived from an EARLIER
+    /// `get_mut()`'s returned reference is not safe to keep using once
+    /// a LATER, independent `get_mut()` call has happened (confirmed
+    /// for real by Miri's Tree Borrows checker against
+    /// `eval/vars.rs`'s `VIMVARDICT`, which stores pointers into
+    /// `VIMVARS`'s own `Vec` elements while
+    /// `set_vim_var_*`/`get_vim_var_*` independently call
+    /// `VIMVARS.get_mut()` on every invocation). Deriving the SAME
+    /// pointer via `as_ptr()` instead never creates a reference at
+    /// all, so there is no borrow to invalidate, avoiding this class
+    /// of bug entirely.
+    #[must_use]
+    pub fn as_ptr(&self) -> *mut T {
+        self.0.get()
+    }
 }
 
 /// [`GlobalCell`] specialized for [`Globals`] itself.

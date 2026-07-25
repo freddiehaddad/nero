@@ -667,6 +667,43 @@ static PREVIOUS_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
 static CURRENT_FUNCCAL: LazyLock<GlobalCell<*mut FunccallT>> =
     LazyLock::new(|| GlobalCell::new(std::ptr::null_mut()));
 
+/// RAII guard that restores `CURRENT_FUNCCAL` to a saved value when
+/// dropped - used by [`find_var_in_scoped_ht`]/[`find_hi_in_scoped_ht`]
+/// to guarantee their own temporary reassignment of `CURRENT_FUNCCAL`
+/// (while walking an enclosing lambda's `uf_scoped` chain) is always
+/// undone before returning, INCLUDING if a call made from inside that
+/// walk panics and unwinds through it.
+///
+/// This is not just test hygiene: `find_var_in_ht` (called on every
+/// step of the walk) can reach a genuine `unimplemented!()` panic via
+/// `script_autoload`'s not-yet-translated substantive path (any
+/// ancestor scope whose own `fc_l_vars` isn't yet marked "real" -
+/// `dv_refcount == 0`, `FunccallT::default()`'s own value - falls
+/// back to the global scope for an implicit-scope name, exactly like
+/// `find_var_ht_dict`'s own implicit-scope branch already does).
+/// Without this guard, such a panic would leave `CURRENT_FUNCCAL`
+/// pointing at whatever ancestor `FunccallT` was being searched at
+/// the moment of the panic - a process-wide, use-after-free-prone
+/// dangling pointer the instant that `FunccallT` is freed (e.g. when
+/// the panicking test's own local `Box<FunccallT>` is dropped during
+/// unwinding), which any LATER caller (in this thread, or - since
+/// this is one process-wide static - any other) reading
+/// `CURRENT_FUNCCAL` would then dereference.
+struct CurrentFunccalRestoreGuard {
+    saved: *mut FunccallT,
+}
+
+impl Drop for CurrentFunccalRestoreGuard {
+    fn drop(&mut self) {
+        // SAFETY: CURRENT_FUNCCAL is only ever accessed through this
+        // module's own functions; restoring it to a value captured
+        // before this guard's own construction (and never touched by
+        // this guard itself in between) is always sound, whether this
+        // runs via normal return or during a panic unwind.
+        unsafe { *CURRENT_FUNCCAL.get_mut() = self.saved };
+    }
+}
+
 /// A save/restore point for `CURRENT_FUNCCAL` (`funccal_entry_T`,
 /// spelled with a single "l" like `current_funccal`/`funccal_stack`
 /// themselves, unlike `funccall_T`/`FunccallT` - a real, deliberate
@@ -1314,11 +1351,11 @@ pub unsafe fn set_ref_in_func_args(copy_id: i32) -> bool {
 /// `a:` resolution reads `CURRENT_FUNCCAL` - so this is how a lambda
 /// body reaches into an ENCLOSING function's locals: not a parameter
 /// passed down, a genuine global rebind for the duration of this
-/// search, restored (via a plain assignment, matching the original -
-/// no `Drop` guard, since nothing called in this loop can panic under
-/// normal operation, exactly like the original has no
-/// setjmp/longjmp-style unwind-safety here either) before returning on
-/// every path, including "not found".
+/// search. Restored via `CurrentFunccalRestoreGuard` - see that
+/// type's own doc comment for why a panic-safe (`Drop`-based) restore
+/// is genuinely necessary here, not merely defensive: `find_var_in_ht`
+/// (called every iteration) can reach a real `unimplemented!()` panic
+/// via `script_autoload`'s not-yet-translated substantive path.
 ///
 /// Uses `find_var_ht_dict` (not `find_var_ht`) internally to obtain
 /// the owning dict `find_var_in_ht` needs directly, rather than
@@ -1355,6 +1392,12 @@ pub unsafe fn find_var_in_scoped_ht(
         return None;
     }
 
+    // Guarantees CURRENT_FUNCCAL is restored to old_current_funccal
+    // when this function returns - by normal return OR by a panic
+    // unwinding through the loop below - see the guard's own doc
+    // comment.
+    let _restore_guard = CurrentFunccalRestoreGuard { saved: old_current_funccal };
+
     let mut v = None;
     // Search in parent scope which is possible to reference from lambda.
     // SAFETY: forwarded from this function's own safety doc.
@@ -1379,8 +1422,8 @@ pub unsafe fn find_var_in_scoped_ht(
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *CURRENT_FUNCCAL.get_mut() = current };
     }
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { *CURRENT_FUNCCAL.get_mut() = old_current_funccal };
+    // _restore_guard's own Drop (below, at end of scope) restores
+    // CURRENT_FUNCCAL - no manual restore needed here.
 
     v
 }
@@ -1420,10 +1463,16 @@ pub fn get_current_funccal_dict(ht: *mut HashtabT) -> *mut DictT {
 ///
 /// Otherwise an exact sibling of [`find_var_in_scoped_ht`] - see that
 /// function's own doc comment for the full explanation of the
-/// `CURRENT_FUNCCAL`-reassignment walk and its inherited "cannot
-/// cycle" assumption; this one calls `find_var_ht` (not
-/// `find_var_ht_dict`), matching the original exactly, since it only
-/// ever needs the hashtable, never the owning dict.
+/// `CURRENT_FUNCCAL`-reassignment walk, its
+/// `CurrentFunccalRestoreGuard`-based panic-safe restore, and its
+/// inherited "cannot cycle" assumption; this one calls `find_var_ht`
+/// (not `find_var_ht_dict`), matching the original exactly, since it
+/// only ever needs the hashtable, never the owning dict - so it never
+/// itself calls `find_var_in_ht`/reaches `script_autoload`, but still
+/// uses the same guard on principle (defense in depth: `hash_find`
+/// itself is not expected to panic, but nothing outside this function
+/// can verify that will always remain true, and the guard costs
+/// nothing to keep here).
 ///
 /// # Safety
 /// Same as [`find_var_in_scoped_ht`].
@@ -1439,6 +1488,9 @@ pub unsafe fn find_hi_in_scoped_ht(name: &[u8]) -> Option<(*mut HashitemT, *mut 
     if current.is_null() {
         return None;
     }
+
+    // See find_var_in_scoped_ht's own use of this same guard.
+    let _restore_guard = CurrentFunccalRestoreGuard { saved: old_current_funccal };
 
     let mut result = None;
     // Search in parent scope which is possible to reference from lambda.
@@ -1465,8 +1517,8 @@ pub unsafe fn find_hi_in_scoped_ht(name: &[u8]) -> Option<(*mut HashitemT, *mut 
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *CURRENT_FUNCCAL.get_mut() = current };
     }
-    // SAFETY: forwarded from this function's own safety doc.
-    unsafe { *CURRENT_FUNCCAL.get_mut() = old_current_funccal };
+    // _restore_guard's own Drop (below, at end of scope) restores
+    // CURRENT_FUNCCAL - no manual restore needed here.
 
     result
 }
@@ -2391,14 +2443,20 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
 
         // outer_fc: the enclosing function's own funccall, holding a
-        // real "x" variable in its l: scope.
+        // real "x" variable in its l: scope. All field access after
+        // deriving outer_fc_ptr goes through THAT raw pointer, not
+        // through outer_fc directly - re-borrowing through the Box
+        // after a raw pointer has already been derived from it is a
+        // real Stacked Borrows violation (confirmed by Miri) that
+        // invalidates the earlier pointer, even though the underlying
+        // memory address doesn't change.
         let mut outer_fp = UfuncT::default();
         let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
         outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
         let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
         let item = crate::eval::typval::tv_dict_item_alloc(b"x");
         unsafe { (*item).di_tv.value = TypvalValue::Number(123) };
-        unsafe { crate::eval::typval::tv_dict_add(&mut outer_fc.fc_l_vars, item) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut (*outer_fc_ptr).fc_l_vars, item) };
 
         // inner_fp/inner_fc: the currently-executing lambda, scoped to
         // outer_fc via uf_scoped.
@@ -2415,6 +2473,9 @@ mod tests {
         assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        // Frees item (added via tv_dict_add above), matching this
+        // crate's usual explicit-free test-cleanup convention.
+        unsafe { crate::eval::vars::vars_clear(&mut (*outer_fc_ptr).fc_l_vars) };
     }
 
     #[test]
@@ -2448,11 +2509,19 @@ mod tests {
         // "current_funccal == current_funccal->fc_func->uf_scoped"
         // guard (preserved here) must still stop this exact case
         // (length-1 self-loop) rather than hang forever.
+        //
+        // outer_fp_ptr is derived once, immediately, and used
+        // consistently for every later access to outer_fp (including
+        // the self-reference write below) - writing to outer_fp
+        // directly by name AFTER its address has already been handed
+        // out (stored in fc_func) would be a Stacked Borrows violation
+        // (confirmed by Miri) that invalidates that earlier pointer.
         let mut outer_fp = UfuncT::default();
-        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        let outer_fp_ptr = &mut outer_fp as *mut UfuncT;
+        let mut outer_fc = Box::new(FunccallT { fc_func: outer_fp_ptr, ..Default::default() });
         outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
         let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
-        outer_fp.uf_scoped = outer_fc_ptr; // self-reference
+        unsafe { (*outer_fp_ptr).uf_scoped = outer_fc_ptr }; // self-reference
 
         let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
         let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
@@ -2466,6 +2535,65 @@ mod tests {
         assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_var_in_scoped_ht_restores_current_funccal_even_if_find_var_in_ht_panics() {
+        // Regression test for a real bug: find_var_in_scoped_ht used
+        // to restore CURRENT_FUNCCAL via a plain assignment at the end
+        // of the function. If find_var_in_ht (called on every loop
+        // iteration) panicked - which it genuinely can, via
+        // script_autoload's own not-yet-translated unimplemented!()
+        // path - that restore was skipped entirely, permanently
+        // leaving CURRENT_FUNCCAL pointing at whatever ancestor
+        // FunccallT was being searched. The very next thing to touch
+        // that dangling pointer (once the ancestor's own Box is
+        // dropped) is undefined behavior - exactly the kind of bug
+        // that manifests as an unattributed, seemingly-random crash
+        // much later, in unrelated code, under parallel test
+        // execution. Fixed by CurrentFunccalRestoreGuard, a Drop-based
+        // guard that restores CURRENT_FUNCCAL unconditionally,
+        // including during a panic unwind - this test proves it.
+        let _lock = crate::globals::global_state_test_lock();
+
+        // outer_fc's own fc_l_vars is deliberately left at its
+        // Default::default() dv_refcount (0, "not yet marked real") -
+        // this makes find_var_ht_dict's implicit-scope branch fall
+        // back to the GLOBAL scope for a plain, unprefixed name,
+        // exactly like a real but not-yet-fully-initialized enclosing
+        // function's funccall would.
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        // A plain, unprefixed (implicit-scope), genuinely
+        // autoload-shaped name ('#' not at position 0) that is
+        // guaranteed not to already exist in the real global scope -
+        // this reaches find_var_in_ht's autoload retry against
+        // globvardict, which panics via script_autoload's
+        // unimplemented!().
+        let name = b"NeroRegressionTestAutoloadStyleName#thing";
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            find_var_in_scoped_ht(name, false)
+        }));
+        assert!(result.is_err(), "expected find_var_in_scoped_ht to panic via script_autoload");
+
+        // The critical assertion: CURRENT_FUNCCAL must be back to
+        // inner_fc_ptr (the value from BEFORE this call), not left
+        // pointing at outer_fc_ptr (which this test is about to free
+        // via `drop(outer_fc)` below - without the fix, the next line
+        // would leave a dangling pointer in CURRENT_FUNCCAL).
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        drop(outer_fc);
+        drop(inner_fc);
     }
 
     // ---- get_current_funccal_dict / find_hi_in_scoped_ht -----------------
@@ -2529,13 +2657,18 @@ mod tests {
     fn find_hi_in_scoped_ht_finds_a_hashitem_in_the_immediate_enclosing_scope() {
         let _lock = crate::globals::global_state_test_lock();
 
+        // All field access after deriving outer_fc_ptr goes through
+        // THAT raw pointer, not through outer_fc directly - see
+        // find_var_in_scoped_ht_finds_a_variable_in_the_immediate_enclosing_scope's
+        // own comment for why (a real Stacked Borrows violation,
+        // confirmed by Miri, otherwise).
         let mut outer_fp = UfuncT::default();
         let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
         outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
         let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
         let item = crate::eval::typval::tv_dict_item_alloc(b"x");
         unsafe { (*item).di_tv.value = TypvalValue::Number(55) };
-        unsafe { crate::eval::typval::tv_dict_add(&mut outer_fc.fc_l_vars, item) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut (*outer_fc_ptr).fc_l_vars, item) };
 
         let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
         let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
@@ -2545,7 +2678,12 @@ mod tests {
         let found = unsafe { find_hi_in_scoped_ht(b"x") };
         match found {
             Some((hi, ht)) => {
-                assert_eq!(ht, &mut outer_fc.fc_l_vars.dv_hashtab as *mut HashtabT);
+                // addr_of_mut! computes the pointer directly, with no
+                // intermediate `&mut` reference/retag - unlike `&mut
+                // (*outer_fc_ptr).fc_l_vars.dv_hashtab as *mut
+                // HashtabT`, this cannot invalidate hi's own
+                // (unrelated, but overlapping-allocation) borrow tag.
+                assert_eq!(ht, unsafe { std::ptr::addr_of_mut!((*outer_fc_ptr).fc_l_vars.dv_hashtab) });
                 assert!(!hashitem_empty(unsafe { &*hi }));
                 assert_eq!(unsafe { (*hi).hi_key }, unsafe { (*item).di_key.as_mut_ptr() as *mut std::os::raw::c_char });
             }
@@ -2556,6 +2694,9 @@ mod tests {
         assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        // Frees item (added via tv_dict_add above), matching this
+        // crate's usual explicit-free test-cleanup convention.
+        unsafe { crate::eval::vars::vars_clear(&mut (*outer_fc_ptr).fc_l_vars) };
     }
 
     #[test]
@@ -2582,11 +2723,15 @@ mod tests {
     fn find_hi_in_scoped_ht_self_referential_uf_scoped_does_not_infinite_loop() {
         let _lock = crate::globals::global_state_test_lock();
 
+        // See find_var_in_scoped_ht_self_referential_uf_scoped_does_not_infinite_loop's
+        // own comment for why outer_fp_ptr must be derived once and
+        // used consistently.
         let mut outer_fp = UfuncT::default();
-        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        let outer_fp_ptr = &mut outer_fp as *mut UfuncT;
+        let mut outer_fc = Box::new(FunccallT { fc_func: outer_fp_ptr, ..Default::default() });
         outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
         let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
-        outer_fp.uf_scoped = outer_fc_ptr; // self-reference
+        unsafe { (*outer_fp_ptr).uf_scoped = outer_fc_ptr }; // self-reference
 
         let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
         let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
@@ -3045,11 +3190,19 @@ mod tests {
 
     #[test]
     fn func_has_abort_reflects_uf_flags() {
+        // fp_ptr is derived once and used consistently for the later
+        // uf_flags write - writing to fp directly by name AFTER its
+        // address has already been handed out (stored in fc.fc_func)
+        // is a Stacked/Tree Borrows violation (confirmed by Miri) that
+        // invalidates that earlier pointer, matching the same class of
+        // bug already fixed elsewhere in this file's own
+        // find_var_in_scoped_ht/find_hi_in_scoped_ht tests.
         let mut fp = UfuncT { uf_flags: fc_flags::ABORT, ..Default::default() };
-        let fc = FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() };
+        let fp_ptr = &mut fp as *mut UfuncT;
+        let fc = FunccallT { fc_func: fp_ptr, ..Default::default() };
         assert!(unsafe { func_has_abort(&fc as *const FunccallT) });
 
-        fp.uf_flags = fc_flags::RANGE;
+        unsafe { (*fp_ptr).uf_flags = fc_flags::RANGE };
         assert!(!unsafe { func_has_abort(&fc as *const FunccallT) });
     }
 
