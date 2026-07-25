@@ -36,10 +36,19 @@
 //! genuine "leak for the process lifetime" design in the original
 //! itself, not an oversight here.
 //!
+//! Also translated: `script_autoload`'s own fast-reject path (no `#`
+//! after `name`'s first byte means there is no package name at all,
+//! so the answer is unconditionally `false`) - needed to unblock
+//! `eval/vars.rs`'s `find_var_in_ht`. The substantive path (real
+//! `'runtimepath'` traversal + file I/O + actually sourcing a script)
+//! is `unimplemented!()` - see [`script_autoload`]'s own doc comment
+//! for why that is safe to leave for now.
+//!
 //! Deferred: everything else in this file (runtime-path search,
 //! `:runtime`, `:scriptnames`, per-script `:profile` reporting,
-//! script unloading/`GA_DEEP_CLEAR` teardown, etc.) - each needs real
-//! file I/O and/or the expression evaluator.
+//! script unloading/`GA_DEEP_CLEAR` teardown, `autoload_name`/
+//! `do_in_runtimepath`/`source_callback`/`ga_loaded`, etc.) - each
+//! needs real file I/O and/or the expression evaluator.
 
 use crate::eval::typval_defs::ScidT;
 use crate::globals::GlobalCell;
@@ -117,6 +126,43 @@ pub fn new_script_item(name: Option<Vec<u8>>) -> (ScidT, *mut ScriptitemT) {
 pub fn script_item_count() -> ScidT {
     // SAFETY: forwarded from script_item's own reasoning.
     unsafe { SCRIPT_ITEMS.get_mut() }.len() as ScidT
+}
+
+/// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
+/// first byte), try autoloading the script for it (`script_autoload`).
+///
+/// Only the original's own fast-reject path is translated for real:
+/// if there is no `#` after `name`'s first byte, there is no package
+/// name at all, so the answer is unconditionally `false` (`runtime.c`
+/// lines 3043-3046). The substantive path (actually go source
+/// `$VIMRUNTIME/autoload/<name>.vim`) needs `do_in_runtimepath` (real
+/// `'runtimepath'` traversal + file I/O), `source_callback` (actually
+/// sourcing a Vimscript file - the parser doesn't exist yet), and a
+/// new `ga_loaded` growarray tracking which autoload scripts were
+/// already loaded - all substantial, separate undertakings, so that
+/// path is `unimplemented!()`. It is reached only when a real
+/// autoload-style (`Name#sub`) variable name is looked up - which
+/// cannot happen yet in this crate today (no Vimscript parser exists
+/// to ever produce such a lookup) - matching this crate's established
+/// "unimplemented!() only reached when nothing in this crate can
+/// currently trigger it" precedent (e.g. `fold.c`'s real fold-tree
+/// search, `cursor.c`'s `coladvance2` narrow branch).
+///
+/// `autoload_name` (builds the `autoload/<name-with-# replaced-by-/>.vim`
+/// script path) is needed only by the substantive path above, so it
+/// remains deferred alongside it.
+pub fn script_autoload(name: &[u8], reload: bool) -> bool {
+    // If there is no '#' after name[0] there is no package name.
+    let Some(pos) = name.iter().position(|&b| b == crate::eval::eval::AUTOLOAD_CHAR) else {
+        return false;
+    };
+    if pos == 0 {
+        return false;
+    }
+    let _ = reload;
+    unimplemented!(
+        "script_autoload: real autoload-script sourcing needs do_in_runtimepath/source_callback/ga_loaded, none translated yet - see this function's own doc comment"
+    );
 }
 
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
@@ -214,5 +260,29 @@ mod tests {
         new_script_item(None);
         new_script_item(None);
         assert_eq!(script_item_count(), 3);
+    }
+
+    #[test]
+    fn script_autoload_false_when_name_has_no_autoload_char_at_all() {
+        assert!(!script_autoload(b"foo", false));
+    }
+
+    #[test]
+    fn script_autoload_false_when_autoload_char_is_the_first_byte() {
+        // "Caller must make sure that name contains AUTOLOAD_CHAR" per
+        // the original's own doc comment - but the original itself
+        // still explicitly guards against a LEADING '#' (p == name),
+        // treating it the same as "no package name", so this is a
+        // real, faithfully-preserved behavior, not just an unchecked
+        // caller precondition.
+        assert!(!script_autoload(b"#foo", false));
+    }
+
+    #[test]
+    #[should_panic]
+    fn script_autoload_unimplemented_for_a_real_autoload_style_name() {
+        // "foo#bar" - a genuine package name (# after the first byte) -
+        // reaches the not-yet-translated substantive path.
+        script_autoload(b"foo#bar", false);
     }
 }

@@ -644,9 +644,10 @@ pub struct ChangedtickDictItem {
 }
 
 /// Structure to hold a scope dictionary (e.g. `b:`/`w:`/`t:`), pretending
-/// to `find_var_in_ht()` (not yet translated) to be a `dictitem_T`
-/// (`ScopeDictDictItem`, a `TV_DICTITEM_STRUCT(1)` instance). Same
-/// `di_key`-as-`Vec<u8>` reasoning as [`ChangedtickDictItem`] above.
+/// to [`find_var_in_ht`](crate::eval::vars::find_var_in_ht) to be a
+/// `dictitem_T` (`ScopeDictDictItem`, a `TV_DICTITEM_STRUCT(1)`
+/// instance). Same `di_key`-as-`Vec<u8>` reasoning as
+/// [`ChangedtickDictItem`] above.
 #[derive(Debug, Clone, Default)]
 pub struct ScopeDictDictItem {
     /// Structure that holds the scope dictionary itself (`di_tv`).
@@ -655,6 +656,43 @@ pub struct ScopeDictDictItem {
     pub di_flags: u8,
     /// Key value (`di_key`).
     pub di_key: Vec<u8>,
+}
+
+/// A `dictitem_T*`-shaped result that might really point at a full,
+/// heap-allocated [`DictitemT`] OR at one of the fixed-size
+/// `TV_DICTITEM_STRUCT(...)` scope-pseudo-item instantiations
+/// ([`ScopeDictDictItem`]) representing a WHOLE scope as if it were a
+/// single item - `globvars_var`/`vimvars_var`/`curbuf.b_bufvar`/
+/// `curwin.w_winvar`/`curtab.tp_winvar`/a script's own `sv_var`, or a
+/// funccall's own `fc_l_vars_var`/`fc_l_avars_var`
+/// ([`crate::eval::vars::find_var_in_ht`]'s own `varname_len == 0`
+/// branch).
+///
+/// The original casts every one of these to a bare `dictitem_T*`
+/// (e.g. `(dictitem_T *)&globvars_var`), relying on `dictitem_T`/
+/// `scope_dictitem_T` sharing an identical field layout by
+/// construction (both stamped from the same `TV_DICTITEM_STRUCT(...)`
+/// macro). This crate's [`DictitemT`]/[`ScopeDictDictItem`] are
+/// distinct Rust types with no such layout guarantee (see
+/// [`DictitemT`]'s own doc comment) - `DictitemVariant` is a safe
+/// substitute that preserves every caller's actual need (a single,
+/// uniform "the found item" result) without any unsafe reinterpret-
+/// cast, matching this same file's own established `TypvalT`/
+/// `TypvalValue` precedent of using a safe Rust enum instead of
+/// literally replicating a C union/cast trick.
+///
+/// A third variant for [`ChangedtickDictItem`] (`b:changedtick`'s own
+/// pseudo-item) could be added later following this exact same
+/// pattern, if/when a real caller needs it - not added now since none
+/// exists yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictitemVariant {
+    /// A full, heap-allocated dictionary item (`*mut DictitemT`).
+    Dict(*mut DictitemT),
+    /// A scope pseudo-item (`*mut ScopeDictDictItem`) - `g:`, `v:`,
+    /// `b:`, `w:`, `t:`, `s:`, `l:`, or `a:`'s own "the WHOLE scope,
+    /// as if it were one dictitem_T" representation.
+    Scope(*mut ScopeDictDictItem),
 }
 
 /// Discriminant for which kind of callback a [`Callback`] holds

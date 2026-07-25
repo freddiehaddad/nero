@@ -105,8 +105,10 @@
 //! `*mut ScopeDictDictItem` rather than the original's `dictitem_T*` -
 //! see their own doc comments for why (the original relies on a
 //! shared-layout reinterpret-cast this crate's distinct
-//! `ScopeDictDictItem`/`DictitemT` types don't support, and don't need
-//! to, since nothing calls these two yet).
+//! `ScopeDictDictItem`/`DictitemT` types don't support; `find_var_in_ht`,
+//! added later in this same file's history, is their first real
+//! caller, wrapping the returned pointer in `DictitemVariant::Scope`
+//! instead of any such cast).
 //!
 //! Also translated: `builtin_function` (whether a name looks like a
 //! builtin, not a user-defined, function name - collapses the
@@ -209,6 +211,20 @@
 //! since nothing pre-existing constrains its representation the way
 //! `fc_ufuncs` already did for `register_closure` - always empty until
 //! `call_user_func`, not yet translated, exists to populate it).
+//!
+//! Also translated: `find_var_in_scoped_ht` - searches an enclosing
+//! lambda's own scope for a variable, by temporarily reassigning
+//! `CURRENT_FUNCCAL` to walk the `fc_func.uf_scoped` chain (the same
+//! chain `set_ref_in_func`'s own outer loop walks, and the same
+//! inherited "cannot cycle" assumption applies here too - see that
+//! function's own doc comment). Needed `eval/vars.rs`'s new
+//! `find_var_in_ht`/`find_var_ht_dict` (this crate's real item-lookup
+//! layer, built alongside this function in the same commit) and the
+//! new `DictitemVariant` enum (`eval/typval_defs.rs`) in place of the
+//! original's `dictitem_T*`/`scope_dictitem_T*` reinterpret-cast - see
+//! that type's own doc comment. `get_funccal_local_var`/
+//! `get_funccal_args_var` (translated earlier, returning
+//! `*mut ScopeDictDictItem`) now have their first real caller.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -1276,6 +1292,87 @@ pub unsafe fn set_ref_in_func_args(copy_id: i32) -> bool {
     false
 }
 
+/// Search variable in parent (enclosing lambda) scope
+/// (`find_var_in_scoped_ht`).
+///
+/// Temporarily reassigns `CURRENT_FUNCCAL` to each ancestor closure
+/// scope in turn (matching the original's own `current_funccal =
+/// current_funccal->fc_func->uf_scoped` reassignment) - internally,
+/// `crate::eval::vars::find_var_ht_dict`/`find_var_in_ht`'s own `l:`/
+/// `a:` resolution reads `CURRENT_FUNCCAL` - so this is how a lambda
+/// body reaches into an ENCLOSING function's locals: not a parameter
+/// passed down, a genuine global rebind for the duration of this
+/// search, restored (via a plain assignment, matching the original -
+/// no `Drop` guard, since nothing called in this loop can panic under
+/// normal operation, exactly like the original has no
+/// setjmp/longjmp-style unwind-safety here either) before returning on
+/// every path, including "not found".
+///
+/// Uses `find_var_ht_dict` (not `find_var_ht`) internally to obtain
+/// the owning dict `find_var_in_ht` needs directly, rather than
+/// re-deriving it a second time - the same adaptation already
+/// documented on `find_var`'s own doc comment.
+///
+/// Preserves the original's own single-step
+/// `current_funccal == current_funccal->fc_func->uf_scoped` guard
+/// (stops if the NEXT step would be a no-op self-loop). This does NOT
+/// generally protect against a longer cycle, matching
+/// `set_ref_in_func`'s own already-documented inherited assumption
+/// that a real closure's `uf_scoped` chain cannot cycle by
+/// construction in real Vimscript execution.
+///
+/// # Safety
+/// `CURRENT_FUNCCAL`, if non-null, must have a valid `fc_func` whose
+/// `uf_scoped` chain (each node's own `fc_func`, then THAT function's
+/// own `uf_scoped`) is valid throughout, and every `DictT`/`ScidT`
+/// reached along the way (via `find_var_ht_dict`/`find_var_in_ht`)
+/// satisfies THEIR OWN safety contracts.
+#[must_use]
+pub unsafe fn find_var_in_scoped_ht(
+    name: &[u8],
+    no_autoload: bool,
+) -> Option<crate::eval::typval_defs::DictitemVariant> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_current_funccal = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    if old_current_funccal.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut current = unsafe { (*(*old_current_funccal).fc_func).uf_scoped };
+    if current.is_null() {
+        return None;
+    }
+
+    let mut v = None;
+    // Search in parent scope which is possible to reference from lambda.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = current };
+    while !current.is_null() {
+        let (ht, varname, d) = crate::eval::vars::find_var_ht_dict(name);
+        if !ht.is_null() && !varname.is_empty() {
+            // SAFETY: forwarded from this function's own safety doc.
+            // ht non-null here guarantees name is non-empty, so
+            // name[0] cannot panic (same reasoning as find_var's own).
+            v = unsafe { crate::eval::vars::find_var_in_ht(d, name[0], varname, no_autoload) };
+            if v.is_some() {
+                break;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*(*current).fc_func).uf_scoped };
+        if next == current {
+            break;
+        }
+        current = next;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *CURRENT_FUNCCAL.get_mut() = current };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = old_current_funccal };
+
+    v
+}
+
 /// Allocate a `FunccallT`, link it into `current_funccal`, and fill in
 /// `fp`/`rettv` (`create_funccal`).
 ///
@@ -1448,8 +1545,10 @@ pub fn get_funccal_local_dict() -> *mut DictT {
 /// with a fixed-size key buffer) to `dictitem_T*`, relying on that
 /// shared layout - `ScopeDictDictItem`/`DictitemT` are distinct Rust
 /// types here (see `ScopeDictDictItem`'s own doc comment), so no such
-/// reinterpret-cast is attempted; callers needing a `*mut DictitemT`
-/// specifically don't exist yet.
+/// reinterpret-cast is attempted; `find_var_in_ht`'s own `'l'` branch
+/// (this crate's first real caller) instead wraps the returned
+/// pointer in `DictitemVariant::Scope`, matching that type's own
+/// safe-substitute design.
 #[must_use]
 pub fn get_funccal_local_var() -> *mut ScopeDictDictItem {
     // SAFETY: only reads CURRENT_FUNCCAL/the (crate-invariant) live
@@ -2162,6 +2261,113 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         unsafe { FUNCARGS.get_mut() }.clear();
         assert!(!unsafe { set_ref_in_func_args(1) });
+    }
+
+    // ---- find_var_in_scoped_ht -------------------------------------------
+
+    #[test]
+    fn find_var_in_scoped_ht_none_when_no_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert_eq!(unsafe { find_var_in_scoped_ht(b"x", false) }, None);
+    }
+
+    #[test]
+    fn find_var_in_scoped_ht_none_when_current_funccal_has_no_enclosing_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fp = UfuncT::default(); // uf_scoped starts null
+        let mut fc = Box::new(FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() });
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        assert_eq!(unsafe { find_var_in_scoped_ht(b"x", false) }, None);
+        // CURRENT_FUNCCAL must be untouched - the function returns
+        // before ever reassigning it in this case.
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_var_in_scoped_ht_finds_a_variable_in_the_immediate_enclosing_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        // outer_fc: the enclosing function's own funccall, holding a
+        // real "x" variable in its l: scope.
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(123) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut outer_fc.fc_l_vars, item) };
+
+        // inner_fp/inner_fc: the currently-executing lambda, scoped to
+        // outer_fc via uf_scoped.
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        let found = unsafe { find_var_in_scoped_ht(b"x", false) };
+        assert_eq!(found, Some(crate::eval::typval_defs::DictitemVariant::Dict(item)));
+
+        // CURRENT_FUNCCAL must be restored to inner_fc, not left
+        // pointing at outer_fc.
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_var_in_scoped_ht_none_when_variable_is_nowhere_in_the_chain() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        assert_eq!(unsafe { find_var_in_scoped_ht(b"nowhere", false) }, None);
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_var_in_scoped_ht_self_referential_uf_scoped_does_not_infinite_loop() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        // outer_fc's own uf_scoped points back at itself - an
+        // unrealistic scenario neither the original nor this
+        // translation is designed to fully protect against for chains
+        // longer than one step, but the original's own single-step
+        // "current_funccal == current_funccal->fc_func->uf_scoped"
+        // guard (preserved here) must still stop this exact case
+        // (length-1 self-loop) rather than hang forever.
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+        outer_fp.uf_scoped = outer_fc_ptr; // self-reference
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        // Must return promptly (not hang) with None, since "missing"
+        // isn't in outer_fc's own l: scope and the self-loop guard
+        // stops further descent.
+        assert_eq!(unsafe { find_var_in_scoped_ht(b"missing", false) }, None);
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
     }
 
     // ---- cleanup_function_call ------------------------------------------
