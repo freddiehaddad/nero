@@ -3,10 +3,8 @@
 //! `option.c` is a massive (~6897-line) file implementing the entire
 //! `:set`/options-parsing engine, deeply entangled with the eval
 //! engine, autocmd triggers, and nearly every other subsystem: the
-//! generic `get_option_value`/`set_option_value` entry points, the
-//! `:set` command parser (`do_set`/`ex_set`), and most of the
-//! per-option getters all bottleneck through the huge generated
-//! `vimoption_T options[]` table (~8000 lines) - none of that is
+//! `:set` command parser (`do_set`/`ex_set`) and the typed
+//! `get_option_value`/`set_option_value` entry points are not
 //! attempted here.
 //!
 //! Translated: `get_fileformat` (harvested first because it directly
@@ -30,6 +28,34 @@
 //! (also translated this pass - re-examined and found NOT actually
 //! blocked on `g_chartab`/`option.c` as an earlier note claimed, see
 //! `strings.rs`'s own module doc).
+//!
+//! Now also translated, now that `option_defs.rs`'s [`OPTIONS`] table
+//! is real: `is_option_hidden`/`option_has_type`/`option_has_scope`/
+//! `option_is_global_local`/`option_is_global_only`/
+//! `option_is_window_local` (small boolean predicates over a single
+//! entry's `scope_flags`/`immutable`/`var`/`type`), `get_option`
+//! (index -> `&'static VimoptionT`, via `OPTIONS.as_ptr()` - never
+//! `.get_mut()`, so the returned reference stays valid across any
+//! later, unrelated `OPTIONS`/`OPTION_VARS` access elsewhere, matching
+//! `eval/vars.rs`'s `vimvar_ptr` precedent), and the big one:
+//! `get_varp_from`/`get_varp` (the ~145-branch "resolve an option's
+//! effective storage address for THIS buffer/window" engine - every
+//! branch mechanically transcribed via a throwaway Python parser
+//! script against a captured copy of the real function body, cross-
+//! checked field-by-field against `BufT`/`WinT`/`WinoptT`/
+//! `SynblockT`'s real Rust field names and types before trusting the
+//! generated code, same methodology as `option_defs.rs`'s own
+//! `OPTIONS` table). `get_varp_scope_from`/`get_varp_scope`/
+//! `get_option_varp_scope_from` (the `:setlocal`/`:setglobal`-specific
+//! wrapper, needing its OWN separate ~34-branch "force the local
+//! value" table plus `GLOBAL_WO`'s pointer-arithmetic trick - unsound
+//! to replicate directly in Rust, since it computes a sibling
+//! `WinT.w_allbuf_opt` field's address via byte-offset arithmetic from
+//! a `w_onebuf_opt`-derived pointer, which has no provenance over
+//! `w_allbuf_opt`'s separate allocation) are deliberately NOT included
+//! in this pass - a well-defined, self-contained follow-up, needed
+//! only once `do_set`'s `:setlocal`/`:setglobal` scope flags actually
+//! exist as callers.
 //!
 //! **No Rust equivalent needed** (not "deferred" - genuinely
 //! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
@@ -57,20 +83,21 @@
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
 //! Deferred: everything else, including `was_set_insecurely`/
-//! `insecure_flag` (`OptIndex` itself now exists in `option_defs.rs`,
-//! but these still need the real `options[]` table's own `.flags`
-//! field for their fallback case), `parse_winhl_opt` (needs the
+//! `insecure_flag` (still needs `OPTIONS[idx].flags`' own
+//! `WAS_SET`/`INSECURE` bits threaded through a real `:set` call site
+//! to have any meaningful test value), `parse_winhl_opt` (needs the
 //! decoration/highlight-group subsystem: `nvim_create_namespace`/
-//! `get_decor_provider`/`syn_check_group`/`ns_hl_def`), and every
-//! function needing the real `options[]` table
-//! (`get_option_value`/`set_option_value`/`option_was_set`/
-//! `is_option_hidden`/`option_has_type`/`option_has_scope`/
-//! `get_winbuf_options`/`get_vimoption`/etc.) or `do_set`/`ex_set`'s
-//! command-line parsing.
+//! `get_decor_provider`/`syn_check_group`/`ns_hl_def`), and `do_set`/
+//! `ex_set`'s command-line parsing plus `get_option_value`/
+//! `set_option_value`/`option_was_set`/`get_winbuf_options`/
+//! `get_vimoption`/etc. (everything that needs the full parsed-`:set`-
+//! argument machinery, not just a resolved storage address).
 
 use crate::buffer_defs::{BufT, WinT};
+use crate::option_defs::{OptIndex, OptScope, OptValType, VimoptionT, OPTIONS};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
 use crate::types_defs::OptInt;
+use std::ffi::c_void;
 
 /// Gets the `'fileformat'` of `buf` as an `EOL_*` constant
 /// (`get_fileformat`).
@@ -451,6 +478,504 @@ pub fn fill_culopt_flags(val: Option<&[u8]>, wp: &mut WinT) -> i32 {
     wp.w_p_culopt_flags = flags_new;
 
     crate::vim_defs::OK
+}
+
+
+/// Hidden options are always immutable and point to their default
+/// value (`is_option_hidden`). In this crate's own encoding (see
+/// `option_defs.rs`'s own `OPTIONS` doc comment), the original's
+/// self-referential `var == &options[opt_idx].def_val.data` check
+/// becomes simply `var.is_null()` - verified 1:1 equivalent to
+/// `immutable == true` for every entry when `OPTIONS` was built.
+#[must_use]
+pub fn is_option_hidden(opt_idx: OptIndex) -> bool {
+    if opt_idx == OptIndex::Invalid {
+        return false;
+    }
+    let p = get_option(opt_idx);
+    p.immutable && p.var.is_null()
+}
+
+/// Check if option supports a specific type (`option_has_type`).
+#[must_use]
+pub fn option_has_type(opt_idx: OptIndex, typ: OptValType) -> bool {
+    opt_idx != OptIndex::Invalid && get_option(opt_idx).r#type == typ
+}
+
+/// Check if option supports a specific scope (`option_has_scope`).
+#[must_use]
+pub fn option_has_scope(opt_idx: OptIndex, scope: OptScope) -> bool {
+    get_option(opt_idx).scope_flags & (1 << (scope as u8)) != 0
+}
+
+/// Check if option is global-local (has global AND buffer/window
+/// scope). Tab scope is independent and does not make an option
+/// "global-local" (`option_is_global_local`).
+#[must_use]
+pub fn option_is_global_local(opt_idx: OptIndex) -> bool {
+    if opt_idx == OptIndex::Invalid {
+        return false;
+    }
+    let bw = (1 << (OptScope::Buf as u8)) | (1 << (OptScope::Win as u8));
+    (get_option(opt_idx).scope_flags & bw) != 0 && option_has_scope(opt_idx, OptScope::Global)
+}
+
+/// Check if option only supports global scope, ignoring tab scope
+/// (which is independent) (`option_is_global_only`).
+#[must_use]
+pub fn option_is_global_only(opt_idx: OptIndex) -> bool {
+    if opt_idx == OptIndex::Invalid {
+        return false;
+    }
+    let bw = (1 << (OptScope::Buf as u8)) | (1 << (OptScope::Win as u8));
+    (get_option(opt_idx).scope_flags & bw) == 0 && option_has_scope(opt_idx, OptScope::Global)
+}
+
+/// Check if option only supports window scope, ignoring tab scope
+/// (which is independent) (`option_is_window_local`).
+#[must_use]
+pub fn option_is_window_local(opt_idx: OptIndex) -> bool {
+    if opt_idx == OptIndex::Invalid {
+        return false;
+    }
+    let exclude = (1 << (OptScope::Global as u8)) | (1 << (OptScope::Buf as u8));
+    (get_option(opt_idx).scope_flags & exclude) == 0 && option_has_scope(opt_idx, OptScope::Win)
+}
+
+/// Get a raw pointer to `OPTIONS`'s element at `opt_idx`. Built on
+/// `GlobalCell::as_ptr()` (never `.get_mut()`), matching
+/// `eval/vars.rs`'s `vimvar_ptr`/`vimvar_ptr_at` precedent exactly:
+/// `as_ptr()` never creates an intermediate reference, so pointers
+/// (and the `&'static VimoptionT` references `get_option` hands out
+/// below) derived this way stay valid across any later, unrelated
+/// `OPTIONS`/`OPTION_VARS` access elsewhere in this crate - unlike a
+/// `.get_mut()[idx]`-derived reference, which `GlobalCell::get_mut`'s
+/// own doc comment already warns is invalidated by the very next call
+/// to `.get_mut()` (the exact root cause fixed for `VIMVARDICT`
+/// earlier this session).
+fn opt_ptr(opt_idx: OptIndex) -> *mut VimoptionT {
+    let base = OPTIONS.as_ptr() as *mut VimoptionT;
+    // SAFETY: OPTIONS's own LazyLock ensures its fixed OPT_COUNT-entry
+    // array is fully populated before this pointer is ever
+    // dereferenced elsewhere, and every `OptIndex` variant (other than
+    // `Invalid`) is a valid 0..OPT_COUNT index into it by construction.
+    unsafe { base.add(opt_idx as usize) }
+}
+
+/// Return information for the option at `opt_idx` (`get_option`).
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
+/// original's own `assert(opt_idx != kOptInvalid)`.
+#[must_use]
+pub fn get_option(opt_idx: OptIndex) -> &'static VimoptionT {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: opt_ptr's own safety reasoning; VimoptionT itself is
+    // never mutated anywhere in this crate once OPTIONS is built, so a
+    // shared reference derived this way is sound to hold indefinitely.
+    unsafe { &*opt_ptr(opt_idx) }
+}
+
+/// Get pointer to option variable, given the option and the buffer/
+/// window it should be resolved against (`get_varp_from`). Every
+/// branch below mirrors the original's own big `switch` exactly - see
+/// this file's own module doc comment for the transcription
+/// methodology.
+///
+/// # Safety
+/// `buf`/`win` must be valid, non-null pointers to live `BufT`/`WinT`
+/// values (a purely buffer-scoped option never dereferences `win`, and
+/// a purely window-scoped option never dereferences `buf`, but the
+/// original itself has no way to know which in advance either, hence
+/// both are always required).
+#[must_use]
+pub unsafe fn get_varp_from(opt_idx: OptIndex, buf: *mut BufT, win: *mut WinT) -> *mut c_void {
+    let p = get_option(opt_idx);
+
+    // Hidden options and global-only options always use the same var pointer.
+    if is_option_hidden(opt_idx) || option_is_global_only(opt_idx) {
+        return p.var;
+    }
+
+    match opt_idx {
+        OptIndex::Equalprg => {
+            if (*buf).b_p_ep.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_ep) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Keywordprg => {
+            if (*buf).b_p_kp.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_kp) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Path => {
+            if (*buf).b_p_path.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_path) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Autocomplete => {
+            if (*buf).b_p_ac >= 0 {
+                std::ptr::addr_of_mut!((*buf).b_p_ac) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Autoread => {
+            if (*buf).b_p_ar >= 0 {
+                std::ptr::addr_of_mut!((*buf).b_p_ar) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Tags => {
+            if (*buf).b_p_tags.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_tags) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Tagcase => {
+            if (*buf).b_p_tc.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_tc) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Sidescrolloff => {
+            if (*win).w_onebuf_opt.wo_siso >= 0 {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_siso) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Scrolloff => {
+            if (*win).w_onebuf_opt.wo_so >= 0 {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_so) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Scrolloffpad => {
+            if (*win).w_onebuf_opt.wo_sop >= 0 {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_sop) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Backupcopy => {
+            if (*buf).b_p_bkc.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_bkc) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Define => {
+            if (*buf).b_p_def.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_def) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Include => {
+            if (*buf).b_p_inc.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_inc) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Completeopt => {
+            if (*buf).b_p_cot.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_cot) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Dictionary => {
+            if (*buf).b_p_dict.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_dict) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Diffanchors => {
+            if (*buf).b_p_dia.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_dia) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Thesaurus => {
+            if (*buf).b_p_tsr.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_tsr) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Thesaurusfunc => {
+            if (*buf).b_p_tsrfu.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_tsrfu) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Formatprg => {
+            if (*buf).b_p_fp.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_fp) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Fsync => {
+            if (*buf).b_p_fs >= 0 {
+                std::ptr::addr_of_mut!((*buf).b_p_fs) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Findfunc => {
+            if (*buf).b_p_ffu.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_ffu) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Errorformat => {
+            if (*buf).b_p_efm.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_efm) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Grepformat => {
+            if (*buf).b_p_gefm.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_gefm) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Grepprg => {
+            if (*buf).b_p_gp.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_gp) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Makeprg => {
+            if (*buf).b_p_mp.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_mp) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Showbreak => {
+            if (*win).w_onebuf_opt.wo_sbr.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_sbr) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Statusline => {
+            if (*win).w_onebuf_opt.wo_stl.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_stl) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Winbar => {
+            if (*win).w_onebuf_opt.wo_wbr.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wbr) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Undolevels => {
+            if (*buf).b_p_ul != crate::option_vars::NO_LOCAL_UNDOLEVEL {
+                std::ptr::addr_of_mut!((*buf).b_p_ul) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Lispwords => {
+            if (*buf).b_p_lw.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_lw) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Makeencoding => {
+            if (*buf).b_p_menc.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*buf).b_p_menc) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Fillchars => {
+            if (*win).w_onebuf_opt.wo_fcs.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fcs) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Listchars => {
+            if (*win).w_onebuf_opt.wo_lcs.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_lcs) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Virtualedit => {
+            if (*win).w_onebuf_opt.wo_ve.as_deref().is_some_and(|s| !s.is_empty()) {
+                std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_ve) as *mut c_void
+            } else {
+                p.var
+            }
+        }
+        OptIndex::Arabic => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_arab) as *mut c_void,
+        OptIndex::List => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_list) as *mut c_void,
+        OptIndex::Spell => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_spell) as *mut c_void,
+        OptIndex::Cursorcolumn => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_cuc) as *mut c_void,
+        OptIndex::Cursorline => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_cul) as *mut c_void,
+        OptIndex::Cursorlineopt => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_culopt) as *mut c_void,
+        OptIndex::Colorcolumn => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_cc) as *mut c_void,
+        OptIndex::Diff => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_diff) as *mut c_void,
+        OptIndex::Eventignorewin => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_eiw) as *mut c_void,
+        OptIndex::Foldcolumn => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdc) as *mut c_void,
+        OptIndex::Foldenable => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fen) as *mut c_void,
+        OptIndex::Foldignore => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdi) as *mut c_void,
+        OptIndex::Foldlevel => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdl) as *mut c_void,
+        OptIndex::Foldmethod => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdm) as *mut c_void,
+        OptIndex::Foldminlines => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fml) as *mut c_void,
+        OptIndex::Foldnestmax => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdn) as *mut c_void,
+        OptIndex::Foldexpr => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fde) as *mut c_void,
+        OptIndex::Foldtext => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fdt) as *mut c_void,
+        OptIndex::Foldmarker => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fmr) as *mut c_void,
+        OptIndex::Number => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_nu) as *mut c_void,
+        OptIndex::Relativenumber => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_rnu) as *mut c_void,
+        OptIndex::Numberwidth => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_nuw) as *mut c_void,
+        OptIndex::Winfixbuf => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wfb) as *mut c_void,
+        OptIndex::Winfixheight => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wfh) as *mut c_void,
+        OptIndex::Winfixwidth => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wfw) as *mut c_void,
+        OptIndex::Winpinned => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wp) as *mut c_void,
+        OptIndex::Previewwindow => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_pvw) as *mut c_void,
+        OptIndex::Lhistory => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_lhi) as *mut c_void,
+        OptIndex::Rightleft => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_rl) as *mut c_void,
+        OptIndex::Rightleftcmd => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_rlc) as *mut c_void,
+        OptIndex::Scroll => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_scr) as *mut c_void,
+        OptIndex::Smoothscroll => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_sms) as *mut c_void,
+        OptIndex::Wrap => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wrap) as *mut c_void,
+        OptIndex::Linebreak => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_lbr) as *mut c_void,
+        OptIndex::Breakindent => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_bri) as *mut c_void,
+        OptIndex::Breakindentopt => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_briopt) as *mut c_void,
+        OptIndex::Scrollbind => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_scb) as *mut c_void,
+        OptIndex::Cursorbind => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_crb) as *mut c_void,
+        OptIndex::Concealcursor => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_cocu) as *mut c_void,
+        OptIndex::Conceallevel => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_cole) as *mut c_void,
+        OptIndex::Autoindent => std::ptr::addr_of_mut!((*buf).b_p_ai) as *mut c_void,
+        OptIndex::Binary => std::ptr::addr_of_mut!((*buf).b_p_bin) as *mut c_void,
+        OptIndex::Bomb => std::ptr::addr_of_mut!((*buf).b_p_bomb) as *mut c_void,
+        OptIndex::Bufhidden => std::ptr::addr_of_mut!((*buf).b_p_bh) as *mut c_void,
+        OptIndex::Buftype => std::ptr::addr_of_mut!((*buf).b_p_bt) as *mut c_void,
+        OptIndex::Buflisted => std::ptr::addr_of_mut!((*buf).b_p_bl) as *mut c_void,
+        OptIndex::Busy => std::ptr::addr_of_mut!((*buf).b_p_busy) as *mut c_void,
+        OptIndex::Channel => std::ptr::addr_of_mut!((*buf).b_p_channel) as *mut c_void,
+        OptIndex::Copyindent => std::ptr::addr_of_mut!((*buf).b_p_ci) as *mut c_void,
+        OptIndex::Cindent => std::ptr::addr_of_mut!((*buf).b_p_cin) as *mut c_void,
+        OptIndex::Cinkeys => std::ptr::addr_of_mut!((*buf).b_p_cink) as *mut c_void,
+        OptIndex::Cinoptions => std::ptr::addr_of_mut!((*buf).b_p_cino) as *mut c_void,
+        OptIndex::Cinscopedecls => std::ptr::addr_of_mut!((*buf).b_p_cinsd) as *mut c_void,
+        OptIndex::Cinwords => std::ptr::addr_of_mut!((*buf).b_p_cinw) as *mut c_void,
+        OptIndex::Comments => std::ptr::addr_of_mut!((*buf).b_p_com) as *mut c_void,
+        OptIndex::Commentstring => std::ptr::addr_of_mut!((*buf).b_p_cms) as *mut c_void,
+        OptIndex::Complete => std::ptr::addr_of_mut!((*buf).b_p_cpt) as *mut c_void,
+        #[cfg(windows)]
+        OptIndex::Completeslash => std::ptr::addr_of_mut!((*buf).b_p_csl) as *mut c_void,
+        OptIndex::Completefunc => std::ptr::addr_of_mut!((*buf).b_p_cfu) as *mut c_void,
+        OptIndex::Omnifunc => std::ptr::addr_of_mut!((*buf).b_p_ofu) as *mut c_void,
+        OptIndex::Endoffile => std::ptr::addr_of_mut!((*buf).b_p_eof) as *mut c_void,
+        OptIndex::Endofline => std::ptr::addr_of_mut!((*buf).b_p_eol) as *mut c_void,
+        OptIndex::Fixendofline => std::ptr::addr_of_mut!((*buf).b_p_fixeol) as *mut c_void,
+        OptIndex::Expandtab => std::ptr::addr_of_mut!((*buf).b_p_et) as *mut c_void,
+        OptIndex::Fileencoding => std::ptr::addr_of_mut!((*buf).b_p_fenc) as *mut c_void,
+        OptIndex::Fileformat => std::ptr::addr_of_mut!((*buf).b_p_ff) as *mut c_void,
+        OptIndex::Filetype => std::ptr::addr_of_mut!((*buf).b_p_ft) as *mut c_void,
+        OptIndex::Formatoptions => std::ptr::addr_of_mut!((*buf).b_p_fo) as *mut c_void,
+        OptIndex::Formatlistpat => std::ptr::addr_of_mut!((*buf).b_p_flp) as *mut c_void,
+        OptIndex::Iminsert => std::ptr::addr_of_mut!((*buf).b_p_iminsert) as *mut c_void,
+        OptIndex::Imsearch => std::ptr::addr_of_mut!((*buf).b_p_imsearch) as *mut c_void,
+        OptIndex::Infercase => std::ptr::addr_of_mut!((*buf).b_p_inf) as *mut c_void,
+        OptIndex::Iskeyword => std::ptr::addr_of_mut!((*buf).b_p_isk) as *mut c_void,
+        OptIndex::Includeexpr => std::ptr::addr_of_mut!((*buf).b_p_inex) as *mut c_void,
+        OptIndex::Indentexpr => std::ptr::addr_of_mut!((*buf).b_p_inde) as *mut c_void,
+        OptIndex::Indentkeys => std::ptr::addr_of_mut!((*buf).b_p_indk) as *mut c_void,
+        OptIndex::Formatexpr => std::ptr::addr_of_mut!((*buf).b_p_fex) as *mut c_void,
+        OptIndex::Lisp => std::ptr::addr_of_mut!((*buf).b_p_lisp) as *mut c_void,
+        OptIndex::Lispoptions => std::ptr::addr_of_mut!((*buf).b_p_lop) as *mut c_void,
+        OptIndex::Modeline => std::ptr::addr_of_mut!((*buf).b_p_ml) as *mut c_void,
+        OptIndex::Matchpairs => std::ptr::addr_of_mut!((*buf).b_p_mps) as *mut c_void,
+        OptIndex::Modifiable => std::ptr::addr_of_mut!((*buf).b_p_ma) as *mut c_void,
+        OptIndex::Modified => std::ptr::addr_of_mut!((*buf).b_changed) as *mut c_void,
+        OptIndex::Nrformats => std::ptr::addr_of_mut!((*buf).b_p_nf) as *mut c_void,
+        OptIndex::Preserveindent => std::ptr::addr_of_mut!((*buf).b_p_pi) as *mut c_void,
+        OptIndex::Quoteescape => std::ptr::addr_of_mut!((*buf).b_p_qe) as *mut c_void,
+        OptIndex::Readonly => std::ptr::addr_of_mut!((*buf).b_p_ro) as *mut c_void,
+        OptIndex::Scrollback => std::ptr::addr_of_mut!((*buf).b_p_scbk) as *mut c_void,
+        OptIndex::Smartindent => std::ptr::addr_of_mut!((*buf).b_p_si) as *mut c_void,
+        OptIndex::Softtabstop => std::ptr::addr_of_mut!((*buf).b_p_sts) as *mut c_void,
+        OptIndex::Suffixesadd => std::ptr::addr_of_mut!((*buf).b_p_sua) as *mut c_void,
+        OptIndex::Swapfile => std::ptr::addr_of_mut!((*buf).b_p_swf) as *mut c_void,
+        OptIndex::Synmaxcol => std::ptr::addr_of_mut!((*buf).b_p_smc) as *mut c_void,
+        OptIndex::Syntax => std::ptr::addr_of_mut!((*buf).b_p_syn) as *mut c_void,
+        OptIndex::Spellcapcheck => std::ptr::addr_of_mut!((*(*win).w_s).b_p_spc) as *mut c_void,
+        OptIndex::Spellfile => std::ptr::addr_of_mut!((*(*win).w_s).b_p_spf) as *mut c_void,
+        OptIndex::Spelllang => std::ptr::addr_of_mut!((*(*win).w_s).b_p_spl) as *mut c_void,
+        OptIndex::Spelloptions => std::ptr::addr_of_mut!((*(*win).w_s).b_p_spo) as *mut c_void,
+        OptIndex::Shiftwidth => std::ptr::addr_of_mut!((*buf).b_p_sw) as *mut c_void,
+        OptIndex::Tagfunc => std::ptr::addr_of_mut!((*buf).b_p_tfu) as *mut c_void,
+        OptIndex::Tabstop => std::ptr::addr_of_mut!((*buf).b_p_ts) as *mut c_void,
+        OptIndex::Textwidth => std::ptr::addr_of_mut!((*buf).b_p_tw) as *mut c_void,
+        OptIndex::Undofile => std::ptr::addr_of_mut!((*buf).b_p_udf) as *mut c_void,
+        OptIndex::Wrapmargin => std::ptr::addr_of_mut!((*buf).b_p_wm) as *mut c_void,
+        OptIndex::Varsofttabstop => std::ptr::addr_of_mut!((*buf).b_p_vsts) as *mut c_void,
+        OptIndex::Vartabstop => std::ptr::addr_of_mut!((*buf).b_p_vts) as *mut c_void,
+        OptIndex::Keymap => std::ptr::addr_of_mut!((*buf).b_p_keymap) as *mut c_void,
+        OptIndex::Signcolumn => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_scl) as *mut c_void,
+        OptIndex::Winhighlight => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_winhl) as *mut c_void,
+        OptIndex::Winblend => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_winbl) as *mut c_void,
+        OptIndex::Statuscolumn => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_stc) as *mut c_void,
+        _ => {
+            // Matches the original's own `default: iemsg(...)` branch:
+            // every OptIndex reaching this point should already have
+            // been handled above (buf-scoped or win-scoped - the only
+            // way to reach the switch at all, given the is_option_hidden/
+            // option_is_global_only early return above) - this is an
+            // internal-consistency safety net, not a reachable case in
+            // practice (`iemsg` itself isn't translated yet - message.c
+            // is a separate, not-yet-started subsystem).
+            debug_assert!(false, "E356: get_varp ERROR - unhandled OptIndex in get_varp_from");
+            // always return a valid pointer to avoid a crash!
+            std::ptr::addr_of_mut!((*buf).b_p_wm) as *mut c_void
+        }
+    }
+}
+
+/// Get pointer to option variable, using the current buffer/window
+/// (`get_varp`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` values.
+#[must_use]
+pub unsafe fn get_varp(opt_idx: OptIndex) -> *mut c_void {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_varp_from(opt_idx, globals.curbuf, globals.curwin) }
 }
 
 #[cfg(test)]
@@ -1088,5 +1613,241 @@ mod tests {
         }
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ffu = prev;
+    }
+}
+
+#[cfg(test)]
+mod varp_tests {
+    use super::*;
+
+    #[test]
+    fn is_option_hidden_true_for_immutable_option_false_for_normal_one() {
+        assert!(is_option_hidden(OptIndex::Aleph)); // immutable, self-ref var
+        assert!(!is_option_hidden(OptIndex::Allowrevins));
+        assert!(!is_option_hidden(OptIndex::Invalid));
+    }
+
+    #[test]
+    fn option_has_type_matches_the_declared_type() {
+        assert!(option_has_type(OptIndex::Aleph, OptValType::Number));
+        assert!(!option_has_type(OptIndex::Aleph, OptValType::String));
+        assert!(option_has_type(OptIndex::Ambiwidth, OptValType::String));
+        assert!(option_has_type(OptIndex::Allowrevins, OptValType::Boolean));
+    }
+
+    #[test]
+    fn option_has_scope_reflects_scope_flags() {
+        assert!(option_has_scope(OptIndex::Allowrevins, OptScope::Global));
+        assert!(!option_has_scope(OptIndex::Allowrevins, OptScope::Win));
+        assert!(option_has_scope(OptIndex::Arabic, OptScope::Win));
+        assert!(!option_has_scope(OptIndex::Arabic, OptScope::Global));
+    }
+
+    #[test]
+    fn option_is_global_local_true_only_for_global_plus_buf_or_win() {
+        assert!(option_is_global_local(OptIndex::Equalprg)); // global + buf
+        assert!(!option_is_global_local(OptIndex::Allowrevins)); // global only
+        assert!(!option_is_global_local(OptIndex::Arabic)); // win only
+        assert!(!option_is_global_local(OptIndex::Invalid));
+    }
+
+    #[test]
+    fn option_is_global_only_true_only_when_no_buf_or_win_scope() {
+        assert!(option_is_global_only(OptIndex::Allowrevins));
+        assert!(!option_is_global_only(OptIndex::Equalprg)); // also has buf scope
+        assert!(!option_is_global_only(OptIndex::Arabic)); // win only, no global
+        assert!(!option_is_global_only(OptIndex::Invalid));
+    }
+
+    #[test]
+    fn option_is_window_local_true_only_for_pure_window_scope() {
+        assert!(option_is_window_local(OptIndex::Arabic));
+        assert!(!option_is_window_local(OptIndex::Allowrevins)); // global only
+        assert!(!option_is_window_local(OptIndex::Equalprg)); // global + buf
+        assert!(!option_is_window_local(OptIndex::Invalid));
+    }
+
+    #[test]
+    fn get_option_returns_the_right_entry() {
+        assert_eq!(get_option(OptIndex::Aleph).fullname, b"aleph");
+        assert_eq!(get_option(OptIndex::Ambiwidth).fullname, b"ambiwidth");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn get_option_debug_panics_on_invalid_index() {
+        let _ = get_option(OptIndex::Invalid);
+    }
+
+    #[test]
+    fn get_varp_from_global_only_option_returns_p_var_directly() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Allowrevins);
+        let varp = unsafe { get_varp_from(OptIndex::Allowrevins, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+        assert!(!varp.is_null());
+    }
+
+    #[test]
+    fn get_varp_from_hidden_immutable_option_returns_p_var() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Aleph);
+        let varp = unsafe { get_varp_from(OptIndex::Aleph, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+        assert!(varp.is_null()); // aleph's var is null (see OPTIONS's own doc comment)
+    }
+
+    #[test]
+    fn get_varp_from_string_fallback_uses_global_when_buffer_local_unset() {
+        let mut buf = BufT::default(); // b_p_ep defaults to None (unset)
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Equalprg);
+        let varp = unsafe { get_varp_from(OptIndex::Equalprg, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+    }
+
+    #[test]
+    fn get_varp_from_string_fallback_uses_buffer_local_when_set() {
+        let mut buf = BufT { b_p_ep: Some(b"myprg".to_vec()), ..Default::default() };
+        let mut win = WinT::default();
+        let varp = unsafe { get_varp_from(OptIndex::Equalprg, &mut buf as *mut BufT, &mut win as *mut WinT) }
+            as *mut Option<Vec<u8>>;
+        // Verify the pointer genuinely aliases buf.b_p_ep (write through it,
+        // observe the change via the original binding), not just a copy.
+        unsafe { *varp = Some(b"changed".to_vec()) };
+        assert_eq!(buf.b_p_ep, Some(b"changed".to_vec()));
+    }
+
+    #[test]
+    fn get_varp_from_string_fallback_treats_empty_string_as_unset() {
+        let mut buf = BufT { b_p_ep: Some(Vec::new()), ..Default::default() }; // empty = unset, matching *x != NUL in C
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Equalprg);
+        let varp = unsafe { get_varp_from(OptIndex::Equalprg, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+    }
+
+    #[test]
+    fn get_varp_from_number_fallback_uses_global_when_negative() {
+        let mut buf = BufT { b_p_ac: -1, ..Default::default() };
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Autocomplete);
+        let varp = unsafe { get_varp_from(OptIndex::Autocomplete, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+    }
+
+    #[test]
+    fn get_varp_from_number_fallback_uses_buffer_local_when_non_negative() {
+        let mut buf = BufT { b_p_ac: 1, ..Default::default() };
+        let mut win = WinT::default();
+        let varp =
+            unsafe { get_varp_from(OptIndex::Autocomplete, &mut buf as *mut BufT, &mut win as *mut WinT) } as *mut i32;
+        unsafe { *varp = 42 };
+        assert_eq!(buf.b_p_ac, 42);
+    }
+
+    #[test]
+    fn get_varp_from_undolevels_special_sentinel_case() {
+        let mut buf = BufT { b_p_ul: crate::option_vars::NO_LOCAL_UNDOLEVEL, ..Default::default() };
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Undolevels);
+        let varp = unsafe { get_varp_from(OptIndex::Undolevels, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert_eq!(varp, p.var);
+
+        buf.b_p_ul = 500;
+        let varp2 =
+            unsafe { get_varp_from(OptIndex::Undolevels, &mut buf as *mut BufT, &mut win as *mut WinT) } as *mut OptInt;
+        unsafe { *varp2 = 999 };
+        assert_eq!(buf.b_p_ul, 999);
+    }
+
+    #[test]
+    fn get_varp_from_window_local_option_aliases_w_onebuf_opt() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp =
+            unsafe { get_varp_from(OptIndex::Arabic, &mut buf as *mut BufT, &mut win as *mut WinT) } as *mut i32;
+        unsafe { *varp = 1 };
+        assert_eq!(win.w_onebuf_opt.wo_arab, 1);
+    }
+
+    #[test]
+    fn get_varp_from_buffer_local_option_aliases_buf_field_directly() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp =
+            unsafe { get_varp_from(OptIndex::Autoindent, &mut buf as *mut BufT, &mut win as *mut WinT) } as *mut i32;
+        unsafe { *varp = 1 };
+        assert_eq!(buf.b_p_ai, 1);
+    }
+
+    #[test]
+    fn get_varp_from_modified_aliases_b_changed() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp =
+            unsafe { get_varp_from(OptIndex::Modified, &mut buf as *mut BufT, &mut win as *mut WinT) } as *mut i32;
+        unsafe { *varp = 1 };
+        assert_eq!(buf.b_changed, 1);
+    }
+
+    #[test]
+    fn get_varp_from_spell_option_goes_through_w_s() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let varp = unsafe { get_varp_from(OptIndex::Spellcapcheck, &mut buf as *mut BufT, &mut win as *mut WinT) }
+            as *mut Option<Vec<u8>>;
+        unsafe { *varp = Some(b"foo".to_vec()) };
+        assert_eq!(syn.b_p_spc, Some(b"foo".to_vec()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn get_varp_from_completeslash_resolves_on_windows() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp = unsafe { get_varp_from(OptIndex::Completeslash, &mut buf as *mut BufT, &mut win as *mut WinT) }
+            as *mut Option<Vec<u8>>;
+        unsafe { *varp = Some(b"slash".to_vec()) };
+        assert_eq!(buf.b_p_csl, Some(b"slash".to_vec()));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn get_varp_from_completeslash_is_hidden_off_windows() {
+        // enable_if = 'BACKSLASH_IN_FILENAME' makes it immutable with a
+        // null self-ref var off Windows (see OPTIONS's own doc comment) -
+        // get_varp_from never even reaches the switch for it.
+        assert!(is_option_hidden(OptIndex::Completeslash));
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp =
+            unsafe { get_varp_from(OptIndex::Completeslash, &mut buf as *mut BufT, &mut win as *mut WinT) };
+        assert!(varp.is_null());
+    }
+
+    #[test]
+    fn get_varp_uses_current_buffer_and_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_win = globals.curwin;
+        globals.curbuf = &mut buf as *mut BufT;
+        globals.curwin = &mut win as *mut WinT;
+
+        let varp = unsafe { get_varp(OptIndex::Autoindent) } as *mut i32;
+        unsafe { *varp = 1 };
+        assert_eq!(buf.b_p_ai, 1);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.curwin = prev_win;
     }
 }
