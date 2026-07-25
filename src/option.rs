@@ -44,17 +44,31 @@
 //! checked field-by-field against `BufT`/`WinT`/`WinoptT`/
 //! `SynblockT`'s real Rust field names and types before trusting the
 //! generated code, same methodology as `option_defs.rs`'s own
-//! `OPTIONS` table). `get_varp_scope_from`/`get_varp_scope`/
-//! `get_option_varp_scope_from` (the `:setlocal`/`:setglobal`-specific
-//! wrapper, needing its OWN separate ~34-branch "force the local
-//! value" table plus `GLOBAL_WO`'s pointer-arithmetic trick - unsound
-//! to replicate directly in Rust, since it computes a sibling
-//! `WinT.w_allbuf_opt` field's address via byte-offset arithmetic from
-//! a `w_onebuf_opt`-derived pointer, which has no provenance over
-//! `w_allbuf_opt`'s separate allocation) are deliberately NOT included
-//! in this pass - a well-defined, self-contained follow-up, needed
-//! only once `do_set`'s `:setlocal`/`:setglobal` scope flags actually
-//! exist as callers.
+//! `OPTIONS` table), and now also `get_varp_scope_from`/
+//! `get_varp_scope` (the `:setlocal`/`:setglobal`-specific wrapper -
+//! folds in `get_option_varp_scope_from`, since this crate's
+//! `OptIndex`-taking signatures already make that a pure duplicate).
+//! Its own ~34-entry "force the local value" table was extracted
+//! mechanically from the ALREADY-committed `get_varp_from` source
+//! (the single source of truth for these field names, not re-derived
+//! from the C source a second time - avoids a second chance to
+//! introduce a transcription mismatch between the two functions).
+//! Its `OPT_GLOBAL`-for-a-window-local-option branch replaces the
+//! original's `GLOBAL_WO(p)` pointer-arithmetic trick (computing a
+//! sibling `WinT.w_allbuf_opt` field's address via byte-offset
+//! arithmetic from a `w_onebuf_opt`-derived pointer - unsound in Rust,
+//! since the result has no provenance over `w_allbuf_opt`'s own,
+//! separate allocation) with a real, from-scratch 44-entry
+//! `w_allbuf_opt` field table instead, mechanically derived from
+//! `get_varp_from`'s own window-local arms by substituting
+//! `w_onebuf_opt` for `w_allbuf_opt`. Deliberately omits `kOptTagfunc`
+//! from the "force local" table - present in the original's own
+//! switch, but unreachable there given `tagfunc`'s real, verified
+//! `scope_flags` (buf-only, no global scope) make
+//! `option_is_global_local` always `false` for it, so the guard
+//! already prevents that arm from ever being reached in the original
+//! either (a likely harmless upstream leftover, not replicated as
+//! dead code here).
 //!
 //! Also translated this pass: `optval_from_varp` (type-punning a
 //! `*mut c_void` back into a real `OptVal`, dispatching on the
@@ -63,14 +77,8 @@
 //! targets a Rust field whose type matches its option's declared type
 //! exactly - `i32` for Boolean, `OptInt` for Number, `Option<Vec<u8>>`
 //! for String - with zero mismatches, before trusting this) and
-//! `get_option_value` (opt_flags == 0 only - the "just get the
-//! effective value" case, by far the most common caller pattern,
-//! and exactly equivalent to the original falling through
-//! `get_varp_scope_from` to `get_varp_from` when neither `OPT_GLOBAL`
-//! nor `OPT_LOCAL` is requested; a genuine `OPT_LOCAL`/`OPT_GLOBAL`
-//! caller needs `get_varp_scope_from`, deferred above, so
-//! `get_option_value` deliberately `unimplemented!()`s rather than
-//! silently mis-resolving for those flag combinations).
+//! `get_option_value` (now fully faithful for every `opt_flags`
+//! combination, since `get_varp_scope_from` exists).
 //!
 //! **No Rust equivalent needed** (not "deferred" - genuinely
 //! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
@@ -993,6 +1001,161 @@ pub unsafe fn get_varp(opt_idx: OptIndex) -> *mut c_void {
     unsafe { get_varp_from(opt_idx, globals.curbuf, globals.curwin) }
 }
 
+
+/// Get pointer to option variable, depending on local or global scope
+/// (`get_varp_scope_from`).
+///
+/// `opt_flags` can be `opt_set_flags::OPT_LOCAL`, `OPT_GLOBAL`, or a
+/// combination - when both are missing, this falls through to
+/// [`get_varp_from`] exactly (the "just get the effective value"
+/// case).
+///
+/// # Safety
+/// `buf`/`win` must be valid, non-null pointers to live `BufT`/`WinT`
+/// values.
+#[must_use]
+pub unsafe fn get_varp_scope_from(opt_idx: OptIndex, opt_flags: u32, buf: *mut BufT, win: *mut WinT) -> *mut c_void {
+    if (opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL) != 0 && !option_is_global_only(opt_idx) {
+        if option_is_window_local(opt_idx) {
+            // Real per-field addressing into WinT.w_allbuf_opt, NOT the
+            // original's GLOBAL_WO(p) byte-offset-from-w_onebuf_opt trick
+            // (which has no sound Rust equivalent - the resulting pointer
+            // would have no provenance over w_allbuf_opt's own, separate
+            // allocation). See this file's own module doc comment.
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe {
+                match opt_idx {
+        OptIndex::Arabic => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_arab) as *mut c_void,
+        OptIndex::List => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_list) as *mut c_void,
+        OptIndex::Spell => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_spell) as *mut c_void,
+        OptIndex::Cursorcolumn => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_cuc) as *mut c_void,
+        OptIndex::Cursorline => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_cul) as *mut c_void,
+        OptIndex::Cursorlineopt => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_culopt) as *mut c_void,
+        OptIndex::Colorcolumn => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_cc) as *mut c_void,
+        OptIndex::Diff => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_diff) as *mut c_void,
+        OptIndex::Eventignorewin => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_eiw) as *mut c_void,
+        OptIndex::Foldcolumn => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdc) as *mut c_void,
+        OptIndex::Foldenable => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fen) as *mut c_void,
+        OptIndex::Foldignore => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdi) as *mut c_void,
+        OptIndex::Foldlevel => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdl) as *mut c_void,
+        OptIndex::Foldmethod => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdm) as *mut c_void,
+        OptIndex::Foldminlines => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fml) as *mut c_void,
+        OptIndex::Foldnestmax => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdn) as *mut c_void,
+        OptIndex::Foldexpr => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fde) as *mut c_void,
+        OptIndex::Foldtext => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fdt) as *mut c_void,
+        OptIndex::Foldmarker => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_fmr) as *mut c_void,
+        OptIndex::Number => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_nu) as *mut c_void,
+        OptIndex::Relativenumber => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_rnu) as *mut c_void,
+        OptIndex::Numberwidth => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_nuw) as *mut c_void,
+        OptIndex::Winfixbuf => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wfb) as *mut c_void,
+        OptIndex::Winfixheight => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wfh) as *mut c_void,
+        OptIndex::Winfixwidth => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wfw) as *mut c_void,
+        OptIndex::Winpinned => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wp) as *mut c_void,
+        OptIndex::Previewwindow => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_pvw) as *mut c_void,
+        OptIndex::Lhistory => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_lhi) as *mut c_void,
+        OptIndex::Rightleft => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_rl) as *mut c_void,
+        OptIndex::Rightleftcmd => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_rlc) as *mut c_void,
+        OptIndex::Scroll => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_scr) as *mut c_void,
+        OptIndex::Smoothscroll => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_sms) as *mut c_void,
+        OptIndex::Wrap => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wrap) as *mut c_void,
+        OptIndex::Linebreak => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_lbr) as *mut c_void,
+        OptIndex::Breakindent => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_bri) as *mut c_void,
+        OptIndex::Breakindentopt => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_briopt) as *mut c_void,
+        OptIndex::Scrollbind => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_scb) as *mut c_void,
+        OptIndex::Cursorbind => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_crb) as *mut c_void,
+        OptIndex::Concealcursor => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_cocu) as *mut c_void,
+        OptIndex::Conceallevel => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_cole) as *mut c_void,
+        OptIndex::Signcolumn => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_scl) as *mut c_void,
+        OptIndex::Winhighlight => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_winhl) as *mut c_void,
+        OptIndex::Winblend => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_winbl) as *mut c_void,
+        OptIndex::Statuscolumn => std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_stc) as *mut c_void,
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "get_varp_scope_from: OPT_GLOBAL window-local branch missing an OptIndex arm"
+                        );
+                        std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wrap) as *mut c_void
+                    }
+                }
+            };
+        }
+        return get_option(opt_idx).var;
+    }
+
+    if (opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL) != 0 && option_is_global_local(opt_idx) {
+        // Force the local value regardless of whether it's currently
+        // "unset" (unlike get_varp_from's own fallback branches, which
+        // check for that) - matches the original's own separate switch
+        // exactly. Deliberately omits `kOptTagfunc`, present in the
+        // original's switch but unreachable there: `tagfunc`'s real,
+        // verified `scope_flags` (buf-only, no global scope - see
+        // OPTIONS's own [309] entry) make `option_is_global_local`
+        // always false for it, so this guard would never let control
+        // reach that case in the original either - a likely harmless
+        // upstream leftover, not replicated as dead code here.
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe {
+            match opt_idx {
+        OptIndex::Equalprg => std::ptr::addr_of_mut!((*buf).b_p_ep) as *mut c_void,
+        OptIndex::Keywordprg => std::ptr::addr_of_mut!((*buf).b_p_kp) as *mut c_void,
+        OptIndex::Path => std::ptr::addr_of_mut!((*buf).b_p_path) as *mut c_void,
+        OptIndex::Autocomplete => std::ptr::addr_of_mut!((*buf).b_p_ac) as *mut c_void,
+        OptIndex::Autoread => std::ptr::addr_of_mut!((*buf).b_p_ar) as *mut c_void,
+        OptIndex::Tags => std::ptr::addr_of_mut!((*buf).b_p_tags) as *mut c_void,
+        OptIndex::Tagcase => std::ptr::addr_of_mut!((*buf).b_p_tc) as *mut c_void,
+        OptIndex::Sidescrolloff => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_siso) as *mut c_void,
+        OptIndex::Scrolloff => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_so) as *mut c_void,
+        OptIndex::Scrolloffpad => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_sop) as *mut c_void,
+        OptIndex::Backupcopy => std::ptr::addr_of_mut!((*buf).b_p_bkc) as *mut c_void,
+        OptIndex::Define => std::ptr::addr_of_mut!((*buf).b_p_def) as *mut c_void,
+        OptIndex::Include => std::ptr::addr_of_mut!((*buf).b_p_inc) as *mut c_void,
+        OptIndex::Completeopt => std::ptr::addr_of_mut!((*buf).b_p_cot) as *mut c_void,
+        OptIndex::Dictionary => std::ptr::addr_of_mut!((*buf).b_p_dict) as *mut c_void,
+        OptIndex::Diffanchors => std::ptr::addr_of_mut!((*buf).b_p_dia) as *mut c_void,
+        OptIndex::Thesaurus => std::ptr::addr_of_mut!((*buf).b_p_tsr) as *mut c_void,
+        OptIndex::Thesaurusfunc => std::ptr::addr_of_mut!((*buf).b_p_tsrfu) as *mut c_void,
+        OptIndex::Formatprg => std::ptr::addr_of_mut!((*buf).b_p_fp) as *mut c_void,
+        OptIndex::Fsync => std::ptr::addr_of_mut!((*buf).b_p_fs) as *mut c_void,
+        OptIndex::Findfunc => std::ptr::addr_of_mut!((*buf).b_p_ffu) as *mut c_void,
+        OptIndex::Errorformat => std::ptr::addr_of_mut!((*buf).b_p_efm) as *mut c_void,
+        OptIndex::Grepformat => std::ptr::addr_of_mut!((*buf).b_p_gefm) as *mut c_void,
+        OptIndex::Grepprg => std::ptr::addr_of_mut!((*buf).b_p_gp) as *mut c_void,
+        OptIndex::Makeprg => std::ptr::addr_of_mut!((*buf).b_p_mp) as *mut c_void,
+        OptIndex::Showbreak => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_sbr) as *mut c_void,
+        OptIndex::Statusline => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_stl) as *mut c_void,
+        OptIndex::Winbar => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_wbr) as *mut c_void,
+        OptIndex::Undolevels => std::ptr::addr_of_mut!((*buf).b_p_ul) as *mut c_void,
+        OptIndex::Lispwords => std::ptr::addr_of_mut!((*buf).b_p_lw) as *mut c_void,
+        OptIndex::Makeencoding => std::ptr::addr_of_mut!((*buf).b_p_menc) as *mut c_void,
+        OptIndex::Fillchars => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fcs) as *mut c_void,
+        OptIndex::Listchars => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_lcs) as *mut c_void,
+        OptIndex::Virtualedit => std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_ve) as *mut c_void,
+                _ => {
+                    debug_assert!(false, "get_varp_scope_from: OPT_LOCAL global-local branch missing an OptIndex arm");
+                    get_option(opt_idx).var
+                }
+            }
+        };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_varp_from(opt_idx, buf, win) }
+}
+
+/// Get pointer to option variable, depending on local or global scope,
+/// using the current buffer/window (`get_varp_scope`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` values.
+#[must_use]
+pub unsafe fn get_varp_scope(opt_idx: OptIndex, opt_flags: u32) -> *mut c_void {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_varp_scope_from(opt_idx, opt_flags, globals.curbuf, globals.curwin) }
+}
+
 /// Create an `OptVal` from a var pointer (`optval_from_varp`).
 ///
 /// # Safety
@@ -1049,30 +1212,14 @@ pub unsafe fn optval_from_varp(opt_idx: OptIndex, varp: *mut c_void) -> OptVal {
 /// # Safety
 /// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
 /// pointers to live `BufT`/`WinT` values.
-///
-/// # Panics
-/// `opt_flags != 0` (i.e. `opt_set_flags::OPT_LOCAL`/`OPT_GLOBAL`-
-/// forced resolution, used by `:setlocal`/`:setglobal`) isn't
-/// supported yet - needs `get_varp_scope_from`, deliberately not
-/// translated this pass (see this file's own module doc comment).
-/// `opt_flags == 0` (the "just get the effective value" case, and by
-/// far the most common caller pattern) is fully supported: it's
-/// exactly equivalent to the original's own `get_varp_scope_from`
-/// falling through to `get_varp_from` when neither `OPT_GLOBAL` nor
-/// `OPT_LOCAL` is requested, not an approximation of it.
 #[must_use]
 pub unsafe fn get_option_value(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
     if opt_idx == OptIndex::Invalid {
         return OptVal::Nil;
     }
-    if opt_flags != 0 {
-        unimplemented!(
-            "get_option_value: OPT_LOCAL/OPT_GLOBAL-forced resolution needs get_varp_scope_from, not yet translated"
-        );
-    }
     // SAFETY: forwarded from this function's own safety doc.
-    let varp = unsafe { get_varp(opt_idx) };
-    // SAFETY: get_varp always returns a pointer of the type
+    let varp = unsafe { get_varp_scope(opt_idx, opt_flags) };
+    // SAFETY: get_varp_scope always returns a pointer of the type
     // optval_from_varp expects for opt_idx's own declared type.
     unsafe { optval_from_varp(opt_idx, varp) }
 }
@@ -2049,10 +2196,71 @@ mod optval_tests {
     }
 
     #[test]
-    #[should_panic]
-    fn get_option_value_panics_for_unsupported_opt_flags() {
-        let _lock = crate::globals::global_state_test_lock();
+    fn get_varp_scope_from_opt_local_forces_the_buffer_local_value_even_when_unset() {
+        let mut buf = BufT::default(); // b_p_ep unset (None)
+        let mut win = WinT::default();
+        let varp = unsafe {
+            get_varp_scope_from(OptIndex::Equalprg, crate::option_defs::opt_set_flags::OPT_LOCAL, &mut buf, &mut win)
+        } as *mut Option<Vec<u8>>;
+        unsafe { *varp = Some(b"forced".to_vec()) };
+        assert_eq!(buf.b_p_ep, Some(b"forced".to_vec()));
+    }
+
+    #[test]
+    fn get_varp_scope_from_opt_local_forces_the_window_local_value() {
         let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp = unsafe {
+            get_varp_scope_from(
+                OptIndex::Sidescrolloff,
+                crate::option_defs::opt_set_flags::OPT_LOCAL,
+                &mut buf,
+                &mut win,
+            )
+        } as *mut OptInt;
+        unsafe { *varp = 5 };
+        assert_eq!(win.w_onebuf_opt.wo_siso, 5);
+    }
+
+    #[test]
+    fn get_varp_scope_from_opt_global_on_global_local_option_returns_p_var() {
+        let mut buf = BufT { b_p_ep: Some(b"local".to_vec()), ..Default::default() };
+        let mut win = WinT::default();
+        let p = get_option(OptIndex::Equalprg);
+        let varp = unsafe {
+            get_varp_scope_from(OptIndex::Equalprg, crate::option_defs::opt_set_flags::OPT_GLOBAL, &mut buf, &mut win)
+        };
+        assert_eq!(varp, p.var);
+    }
+
+    #[test]
+    fn get_varp_scope_from_opt_global_on_window_local_only_option_uses_w_allbuf_opt() {
+        // 'arabic' is purely window-local (no global scope) - OPT_GLOBAL
+        // must resolve to w_allbuf_opt, NOT w_onebuf_opt (the original's
+        // GLOBAL_WO(p) trick, replaced here with real field addressing).
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp = unsafe {
+            get_varp_scope_from(OptIndex::Arabic, crate::option_defs::opt_set_flags::OPT_GLOBAL, &mut buf, &mut win)
+        } as *mut i32;
+        unsafe { *varp = 1 };
+        assert_eq!(win.w_allbuf_opt.wo_arab, 1);
+        assert_eq!(win.w_onebuf_opt.wo_arab, 0); // untouched
+    }
+
+    #[test]
+    fn get_varp_scope_from_no_flags_falls_through_to_get_varp_from() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let a = unsafe { get_varp_scope_from(OptIndex::Autoindent, 0, &mut buf, &mut win) };
+        let b = unsafe { get_varp_from(OptIndex::Autoindent, &mut buf, &mut win) };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn get_option_value_with_opt_local_reads_the_forced_local_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default(); // b_p_ep unset
         let mut win = WinT::default();
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         let prev_buf = globals.curbuf;
@@ -2060,15 +2268,16 @@ mod optval_tests {
         globals.curbuf = &mut buf as *mut BufT;
         globals.curwin = &mut win as *mut WinT;
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            get_option_value(OptIndex::Autoindent, crate::option_defs::opt_set_flags::OPT_LOCAL)
-        }));
+        // OPT_LOCAL forces the (unset, empty) local value, unlike plain
+        // get_option_value(opt_idx, 0) which would fall back to global.
+        assert_eq!(
+            unsafe { get_option_value(OptIndex::Equalprg, crate::option_defs::opt_set_flags::OPT_LOCAL) },
+            OptVal::String(Vec::new())
+        );
 
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         globals.curbuf = prev_buf;
         globals.curwin = prev_win;
-
-        result.unwrap();
     }
 }
 
