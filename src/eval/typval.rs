@@ -392,6 +392,22 @@ pub fn tv_get_bool_chk(tv: &TypvalT, ret_error: Option<&mut bool>) -> crate::eva
     tv_get_number_chk(tv, ret_error)
 }
 
+/// Get the float value of `tv` (`tv_get_float`).
+///
+/// The original's own `emsg(...)` calls reporting exactly which wrong
+/// type was found (`Func`/`Partial`/`String`/`List`/`Dict`/`Bool`/
+/// `Special`/`Blob`/`Unknown`) are omitted (message display, not
+/// tractable) - only the `0.0` fallback result is kept, matching this
+/// module's established "skip the display, keep the state" policy.
+#[must_use]
+pub fn tv_get_float(tv: &TypvalT) -> f64 {
+    match tv.value {
+        TypvalValue::Number(n) => n as f64,
+        TypvalValue::Float(f) => f,
+        _ => 0.0,
+    }
+}
+
 /// Get the string value of a "stringish" Vimscript object
 /// (`tv_get_string_chk`).
 ///
@@ -478,6 +494,33 @@ pub fn tv_check_str(tv: &TypvalT) -> bool {
             | TypvalValue::String(_)
             | TypvalValue::Float(_)
     )
+}
+
+/// Return `true` when `tv` is not falsy: non-zero, non-empty string,
+/// non-empty list, etc. - mostly like what JavaScript does, except
+/// that an empty list and an empty dictionary are false (`tv2bool`).
+///
+/// # Safety
+/// If `tv`'s value is `List`/`Dict`/`Blob`-typed with a non-null
+/// pointer, that pointer must be a valid, live
+/// `ListT`/`DictT`/`BlobT`.
+#[must_use]
+pub unsafe fn tv2bool(tv: &TypvalT) -> bool {
+    match &tv.value {
+        TypvalValue::Number(n) => *n != 0,
+        TypvalValue::Float(f) => *f != 0.0,
+        TypvalValue::Partial(p) => !p.is_null(),
+        TypvalValue::Func(s) | TypvalValue::String(s) => s.as_ref().is_some_and(|s| !s.is_empty()),
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::List(l) => !l.is_null() && unsafe { tv_list_len(*l) } > 0,
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::Dict(d) => !d.is_null() && tv_dict_len(unsafe { d.as_ref() }) > 0,
+        TypvalValue::Bool(b) => *b == crate::eval::typval_defs::BoolVarValue::True,
+        TypvalValue::Special(s) => *s != crate::eval::typval_defs::SpecialVarValue::Null,
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::Blob(b) => !b.is_null() && unsafe { tv_blob_len(*b) } > 0,
+        TypvalValue::Unknown => false,
+    }
 }
 
 /// Get a list's lock status, or `VAR_FIXED` for a null list
@@ -3586,6 +3629,98 @@ mod tests {
     }
 
     #[test]
+    fn tv_get_float_number_widens() {
+        assert_eq!(tv_get_float(&number_tv(7)), 7.0);
+    }
+
+    #[test]
+    fn tv_get_float_float_passes_through() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(2.5) };
+        assert_eq!(tv_get_float(&tv), 2.5);
+    }
+
+    #[test]
+    fn tv_get_float_everything_else_is_zero() {
+        for value in [
+            TypvalValue::String(Some(b"1.5".to_vec())),
+            TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+            TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+            TypvalValue::List(std::ptr::null_mut()),
+            TypvalValue::Dict(std::ptr::null_mut()),
+            TypvalValue::Blob(std::ptr::null_mut()),
+            TypvalValue::Unknown,
+        ] {
+            let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value };
+            assert_eq!(tv_get_float(&tv), 0.0);
+        }
+    }
+
+    #[test]
+    fn tv2bool_number_nonzero_is_true() {
+        assert!(unsafe { tv2bool(&number_tv(1)) });
+        assert!(!unsafe { tv2bool(&number_tv(0)) });
+    }
+
+    #[test]
+    fn tv2bool_float_nonzero_is_true() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(0.5) };
+        assert!(unsafe { tv2bool(&tv) });
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(0.0) };
+        assert!(!unsafe { tv2bool(&tv) });
+    }
+
+    #[test]
+    fn tv2bool_string_empty_vs_nonempty() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(b"x".to_vec())),
+        };
+        assert!(unsafe { tv2bool(&tv) });
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(Some(Vec::new())) };
+        assert!(!unsafe { tv2bool(&tv) });
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(None) };
+        assert!(!unsafe { tv2bool(&tv) });
+    }
+
+    #[test]
+    fn tv2bool_null_containers_are_false() {
+        for value in [
+            TypvalValue::List(std::ptr::null_mut()),
+            TypvalValue::Dict(std::ptr::null_mut()),
+            TypvalValue::Blob(std::ptr::null_mut()),
+            TypvalValue::Partial(std::ptr::null_mut()),
+        ] {
+            let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value };
+            assert!(!unsafe { tv2bool(&tv) });
+        }
+    }
+
+    #[test]
+    fn tv2bool_nonempty_list_is_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe { tv_list_append_number(l, 0) };
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::List(l) };
+        assert!(unsafe { tv2bool(&tv) });
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tv2bool_special_null_is_false() {
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+        };
+        assert!(!unsafe { tv2bool(&tv) });
+    }
+
+    #[test]
+    fn tv2bool_unknown_is_false() {
+        let tv = TypvalT::default();
+        assert!(!unsafe { tv2bool(&tv) });
+    }
+
+    #[test]
     fn tv_get_string_chk_number_formats_as_decimal() {
         let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(-42) };
         assert_eq!(tv_get_string_chk(&tv), Some(b"-42".to_vec()));
@@ -4924,6 +5059,7 @@ mod tests {
 
     #[test]
     fn tv_list_equal_null_and_empty_are_equal() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(0);
         unsafe {
             assert!(tv_list_equal(std::ptr::null(), std::ptr::null(), false));
@@ -4935,6 +5071,7 @@ mod tests {
 
     #[test]
     fn tv_list_equal_same_pointer_is_equal() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(1);
         unsafe {
             assert!(tv_list_equal(l, l, false));
@@ -4944,6 +5081,7 @@ mod tests {
 
     #[test]
     fn tv_list_equal_compares_items_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
         let l1 = tv_list_alloc(2);
         let l2 = tv_list_alloc(2);
         unsafe {
@@ -4960,6 +5098,7 @@ mod tests {
 
     #[test]
     fn tv_list_equal_false_for_different_length_or_content() {
+        let _lock = crate::globals::global_state_test_lock();
         let l1 = tv_list_alloc(2);
         let l2 = tv_list_alloc(1);
         let l3 = tv_list_alloc(2);
@@ -5120,6 +5259,7 @@ mod tests {
 
     #[test]
     fn tv_equal_list_delegates_to_tv_list_equal() {
+        let _lock = crate::globals::global_state_test_lock();
         let l1 = tv_list_alloc(1);
         let l2 = tv_list_alloc(1);
         unsafe {
@@ -5286,6 +5426,7 @@ mod tests {
 
     #[test]
     fn tv_list_uidx_normalizes_negative_and_rejects_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(3);
         unsafe {
             tv_list_append_number(l, 1);
@@ -5305,6 +5446,7 @@ mod tests {
 
     #[test]
     fn tv_list_find_locates_by_index_and_caches() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(3);
         unsafe {
             tv_list_append_number(l, 10);
@@ -5331,6 +5473,7 @@ mod tests {
 
     #[test]
     fn tv_list_find_nr_reads_number_and_reports_error_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(1);
         unsafe {
             tv_list_append_number(l, 42);
@@ -5348,6 +5491,7 @@ mod tests {
 
     #[test]
     fn tv_list_find_str_reads_string_and_none_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(1);
         unsafe {
             tv_list_append_string(l, Some(b"hi"));
@@ -5360,6 +5504,7 @@ mod tests {
 
     #[test]
     fn tv_list_find_index_falls_back_to_zero_for_an_unfound_negative_index() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(2);
         unsafe {
             tv_list_append_number(l, 1);
@@ -5384,6 +5529,7 @@ mod tests {
 
     #[test]
     fn tv_list_idx_of_item_finds_position_or_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(2);
         unsafe {
             tv_list_append_number(l, 1);
@@ -5402,6 +5548,7 @@ mod tests {
 
     #[test]
     fn tv_list_reverse_reorders_items_and_updates_idx() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(3);
         unsafe {
             tv_list_append_number(l, 1);
@@ -5428,6 +5575,7 @@ mod tests {
 
     #[test]
     fn tv_list_reverse_is_a_noop_for_0_or_1_items() {
+        let _lock = crate::globals::global_state_test_lock();
         let empty = tv_list_alloc(0);
         let one = tv_list_alloc(1);
         unsafe {
@@ -5469,6 +5617,7 @@ mod tests {
 
     #[test]
     fn tv_item_lock_deep_1_locks_list_itself_but_not_its_items() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(1);
         unsafe {
             tv_list_append_tv(l, &number_tv(1));
@@ -5486,6 +5635,7 @@ mod tests {
 
     #[test]
     fn tv_item_lock_deep_negative_one_recurses_unlimited() {
+        let _lock = crate::globals::global_state_test_lock();
         let inner = tv_list_alloc(1);
         let outer = tv_list_alloc(1);
         unsafe {
@@ -5510,6 +5660,7 @@ mod tests {
 
     #[test]
     fn tv_item_lock_skips_when_check_refcount_and_refcount_over_1() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(0);
         unsafe {
             (*l).lv_refcount = 2;

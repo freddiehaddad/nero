@@ -147,29 +147,85 @@
 //!   sequence). Only the `interpolate = false` case is modeled
 //!   (`eval7`'s own only call site) - see its own doc comment.
 //!
-//! Deferred: everything else - the actual parser/lvalue/loop/call
-//! machinery is a separate, substantial undertaking of its own. In
-//! particular, `eval7` itself is not yet translated: it still needs
-//! `eval_string` (double-quoted string literals - genuinely more
-//! involved than `eval_lit_string` above: its `\x`/`\u`/`\U`/octal
-//! escapes are tractable already via `mbyte.rs`'s real
-//! `utf_char2bytes`, but its `\<C-W>`-style special-key escape needs
-//! `trans_special`/`find_special_key`, which need the ENTIRE
-//! `keycodes.c` subsystem - key-name tables, modifier parsing, a
-//! whole generated `keycode_names.generated.h` - a substantial,
-//! separate undertaking of its own, not a small add-on; deliberately
-//! not attempted partially here since `\<...>` escapes are common
-//! enough in real Vimscript that skipping them would be a real,
-//! user-visible gap, not a provably-unreachable-today one like this
-//! module's other deferrals), `eval_list`/`eval_dict`/`eval_lit_dict`
-//! (list/dict literals), `get_lambda_tv` (lambda expressions),
-//! `eval_option` (needs the real `options[]` table, a separate MAJOR
-//! undertaking), `eval_env_var`/`eval_interp_string` (`$VAR`/
-//! interpolated strings), `get_reg_contents` (`@register`, needs
-//! `register.c`), `get_name_len`/`eval_func`/`eval_variable`
-//! (variable/function-name lookup, needs the funccal stack), and
-//! `handle_subscript` (`[...]`/`.`/`->`/`(...)` chaining) - before it
-//! can itself be translated even partially.
+//! Also translated: `EvalargT`/`EVAL_EVALUATE`/`clear_evalarg`
+//! (`evalarg_T`, `eval.h`), `ExprType` (`exprtype_T`, `eval.h`), and
+//! the FULL `eval0`-`eval7` recursive-descent parser/evaluator chain
+//! itself, plus `typval_compare` and a minimal `handle_subscript`.
+//! `arg: &[u8]` is always "the remaining unconsumed input, indexed
+//! from 0" (never a full original buffer plus a cursor), and every
+//! function returns `(status, bytes_consumed)` - matching this
+//! module's own already-established `eval_number`/`eval7_leader`
+//! idiom - rather than mutating a shared `char **arg` in place.
+//! `evalarg: Option<&mut EvalargT>` models the original's nullable
+//! `evalarg_T *const evalarg`; the ternary/`||`/`&&` operators'
+//! "construct a local, zero-flags `evalarg_T` when none was passed"
+//! fallback is translated literally (a local `EvalargT::default()`,
+//! used in place of the caller's `None`, for exactly the scope the
+//! original's own `local_evalarg` covers).
+//!
+//! `eval7` is deliberately minimal, covering only what all of
+//! `eval1`-`eval6`'s own tests need: number/float/`0z`-blob literals
+//! (`eval_number`), single-quoted string literals (`eval_lit_string`),
+//! leading `!`/`-`/`+` (`eval7_leader`), and parenthesized
+//! sub-expressions (recursing into `eval1`). Every other primary-
+//! expression form in the original's own `switch` -
+//! double-quoted strings (`eval_string`, needs the whole `keycodes.c`
+//! subsystem for `\<C-...>` escapes - a real, common, user-visible
+//! gap, not a provably-unreachable one, so deliberately NOT
+//! partially modeled), list/dict/lambda literals (`eval_list`/
+//! `eval_dict`/`eval_lit_dict`/`get_lambda_tv`), option values
+//! (`eval_option`, needs the real `options[]` get/set engine),
+//! environment variables/interpolated strings (`eval_env_var`/
+//! `eval_interp_string`), register contents (`get_reg_contents`,
+//! needs `register.c`), and variable/function-name lookup
+//! (`get_name_len`/`eval_variable`/`eval_func`, needs the funccal
+//! stack/name-resolution machinery) - panics via `unimplemented!()`,
+//! each with its own specific, documented reason, when the FIRST byte
+//! of the primary expression genuinely indicates one of these forms
+//! (a byte that would make `get_name_len` itself report "no name
+//! here at all", e.g. trailing garbage or an unbalanced closing
+//! delimiter, is instead a real, graceful `FAIL` - exactly matching
+//! `get_name_len`'s own behavior for such input, not a deferred gap).
+//! `handle_subscript` mirrors this same minimality: only the real
+//! "nothing follows" fast path (no `[`/`.`/`(`/`->` continuation)
+//! returns successfully; anything that would actually need
+//! `eval_index`/`call_func_rettv`/`eval_method`/`eval_lambda`
+//! (all substantial, separate undertakings) panics via
+//! `unimplemented!()` instead. Its own `preceded_by_whitespace`
+//! parameter replaces the original's `!ascii_iswhite(*(*arg - 1))`
+//! check (looking at the byte immediately BEFORE `arg`, which this
+//! module's own "remaining slice, indexed from 0" idiom can't express
+//! directly) - see its own doc comment for why this is exactly
+//! equivalent.
+//!
+//! `eval1` (ternary `?:`/`??`) through `eval6` (`*`/`/`/`%`) are
+//! translated IN FULL: every dependency they need (the whole "leaf"
+//! arithmetic family above, `typval_compare`, `tv_check_num`/
+//! `tv_check_str`, `mb_strcmp_ic`, `p_ic`) already existed. `eval0`
+//! (the top-level entry point) is translated in full too, using the
+//! new `crate::ex_docmd::ends_excmd`/`check_nextcmd` (harvested
+//! alongside, `ex_docmd.rs`'s own tiny-harvest precedent) - its `eap:
+//! Option<&mut ExargT>` parameter is modeled but has no real caller
+//! yet (nothing translated constructs a real `ExargT` and calls
+//! `eval0` through it), so this is genuinely a standalone expression
+//! evaluator today, not yet wired into any real Ex-command context
+//! (`:echo`/`:let`/`:if`, none of which are translated).
+//!
+//! `typval_compare` is translated in full except `EXPR_MATCH`/
+//! `EXPR_NOMATCH` (`=~`/`!~`) against two strings - needs
+//! `pattern_match`, the real regex engine (`regexp.c`), confirmed
+//! globally blocked (matches `search.c`'s own already-documented
+//! status) - `unimplemented!()`s only when actually reached (neither
+//! operand Blob/List/Dict/Func/Float/Number-typed, i.e. a genuine
+//! string/Bool/Special `=~`/`!~` comparison).
+//!
+//! Found and fixed, directly tied to building `eval5` (its real
+//! caller, for the first time): `eval_concat_str`'s type-error path
+//! only released `tv1` (always a no-op in practice) and silently
+//! skipped releasing `tv2`'s own reference when `tv2` genuinely can't
+//! be stringified (e.g. `"str" . [1, 2, 3]`) - a real, if narrow,
+//! reference-leak divergence from the original's own `tv_clear(tv1);
+//! tv_clear(tv2);`, now fixed to release both.
 //!
 //! Also translated: the GC mark-phase's `set_ref_in_ht`/
 //! `set_ref_in_list_items`/`set_ref_in_item_dict`/
@@ -190,7 +246,9 @@
 //! `set_ref_in_item_dict` is omitted - `DictT` has no `watchers` field
 //! yet (the same accepted gap already documented on `DictT` itself).
 
+use crate::charset::skipwhite;
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
+use crate::vim_defs::{FAIL, OK};
 
 /// "n1" divided by "n2", taking care of dividing by zero
 /// (`num_divide`).
@@ -309,21 +367,36 @@ pub fn grow_string_tv(tv1: &mut TypvalT, s2: &[u8]) -> bool {
 /// (`eval_concat_str`).
 ///
 /// Returns `false` if `tv2` cannot be stringified (a type error) -
-/// `tv1` is assumed already stringifiable (the caller, Vimscript's
-/// `.`/`..` operator dispatch in `eval5`, not yet translated, only
-/// calls this after confirming that), matching the original's own
-/// "s1 already checked" comment.
+/// `tv1` is assumed already stringifiable (`eval5`, this function's
+/// only real caller, only calls it after confirming that via
+/// `tv_check_str` whenever evaluation is actually happening), matching
+/// the original's own "s1 already checked" comment.
+///
+/// On that type-error path, the original releases BOTH operands
+/// (`tv_clear(tv1); tv_clear(tv2);`) - this crate's own earlier
+/// translation only released `tv1` (itself always a no-op release in
+/// practice, per the paragraph above) and silently skipped `tv2`,
+/// which genuinely CAN be a `List`/`Dict`/`Blob`/`Partial` needing a
+/// real refcount release (e.g. `"str" . [1, 2, 3]`) - found and fixed
+/// here, directly tied to building `eval5` (this function's real
+/// caller) for the first time.
 ///
 /// # Safety
-/// If `tv1`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with a
-/// non-null pointer, that pointer must be valid - forwarded to
+/// If `tv1`/`tv2`'s value is `List`/`Dict`/`Blob`/`Partial`-typed with
+/// a non-null pointer, that pointer must be valid - forwarded to
 /// `eval/typval.rs`'s `tv_clear_simple`'s own contract, used here to
-/// release `tv1`'s old value when it can't be grown in place.
+/// release `tv1`'s old value when it can't be grown in place, and to
+/// release both operands on the type-error path.
 pub unsafe fn eval_concat_str(tv1: &mut TypvalT, tv2: &TypvalT) -> bool {
     use crate::eval::typval::{tv_clear_simple, tv_get_string, tv_get_string_chk};
 
     let s1 = tv_get_string(tv1);
     let Some(s2) = tv_get_string_chk(tv2) else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            tv_clear_simple(tv1);
+            tv_clear_simple(tv2);
+        }
         return false;
     };
 
@@ -1478,6 +1551,1098 @@ pub fn eval_isnamec1(c: i32) -> bool {
     crate::macros_defs::ascii_isalpha(c) || c == i32::from(b'_')
 }
 
+/// Flag for expression evaluation: when missing (`eval_flags == 0`),
+/// don't actually evaluate - only parse (`EVAL_EVALUATE`).
+pub const EVAL_EVALUATE: i32 = 1;
+
+/// Passed to an `eval*` function to enable evaluation (`evalarg_T`).
+///
+/// `eval_getline`/`eval_cookie` (copied from an `exarg_T` when
+/// "getline" is `getsourceline`, for `:source`-driven multi-line
+/// expression continuation) and `eval_tofree` (the "keep the original
+/// command line" bookkeeping `clear_evalarg` releases) are modeled
+/// but never populated by anything in this crate today - nothing
+/// translated drives expression evaluation from a real `:source`
+/// context yet, matching `ExargT.ea_getline`'s own current status.
+#[derive(Debug, Default)]
+pub struct EvalargT {
+    /// `EVAL_*` flag values (`eval_flags`).
+    pub eval_flags: i32,
+    /// Copied from `exarg_T` when "getline" is `getsourceline`. Can be
+    /// `None` (`eval_getline`).
+    pub eval_getline: Option<crate::ex_cmds_defs::LineGetter>,
+    /// Argument for `eval_getline()` (`eval_cookie`).
+    pub eval_cookie: *mut std::ffi::c_void,
+    /// Pointer to the last line obtained with `getsourceline()`
+    /// (`eval_tofree`).
+    pub eval_tofree: Option<Vec<u8>>,
+}
+
+/// After using `evalarg` filled from `eap`: free the memory
+/// (`clear_evalarg`).
+///
+/// A real, faithful (if currently always-a-no-op) translation: nothing
+/// in this crate populates `eval_tofree` yet, so the original's
+/// `xfree`/command-line-swap logic never actually has anything to do -
+/// kept as a real function anyway (small, simple, no design freedom to
+/// get wrong) rather than omitted, ready for whenever a future
+/// `:source`-driven caller populates `eval_tofree` for real.
+pub fn clear_evalarg(evalarg: Option<&mut EvalargT>, eap: Option<&mut crate::ex_cmds_defs::ExargT>) {
+    let Some(evalarg) = evalarg else { return };
+    let Some(tofree) = evalarg.eval_tofree.take() else { return };
+
+    if let Some(eap) = eap {
+        // We may need to keep the original command line, e.g. for
+        // ":let" it has the variable names. But we may also need the
+        // new one, "nextcmd" points into it. Keep both.
+        eap.cmdline_tofree = eap.arg.take();
+        eap.arg = Some(tofree);
+    }
+    // else: xfree(evalarg->eval_tofree) - Rust's own drop of `tofree`
+    // (already taken above) already does this.
+}
+
+/// Types for expressions (`exprtype_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExprType {
+    #[default]
+    Unknown,
+    /// `==`
+    Equal,
+    /// `!=`
+    Nequal,
+    /// `>`
+    Greater,
+    /// `>=`
+    Gequal,
+    /// `<`
+    Smaller,
+    /// `<=`
+    Sequal,
+    /// `=~`
+    Match,
+    /// `!~`
+    Nomatch,
+    /// `is`
+    Is,
+    /// `isnot`
+    Isnot,
+}
+
+/// Compare `typ1` and `typ2`. Put the result in `typ1`
+/// (`typval_compare`).
+///
+/// Returns `false` on a type error, `true` on success - matching the
+/// original's `FAIL`/`OK` (a plain `bool`, not `crate::vim_defs::OK`/
+/// `FAIL` directly, matching `eval_addsub_number`/`eval_multdiv_number`/
+/// `eval_addlist`'s own "no position/consumed-byte tracking needed"
+/// precedent - this function, like those, operates on two already-
+/// evaluated operands).
+///
+/// # Deferred
+/// `ExprType::Match`/`ExprType::Nomatch` (`=~`/`!~`) against two
+/// strings need `pattern_match`, the real regex engine (`regexp.c`) -
+/// confirmed globally blocked, matching `search.c`'s own already-
+/// documented status. `unimplemented!()`s only when actually reached:
+/// this requires neither operand to be Blob/List/Dict/Func/Float/
+/// Number-typed (each of those has its own earlier, dedicated branch
+/// that either handles `=~`/`!~` as a hard `FAIL` - matching the
+/// original's own "invalid operation" `emsg` for those types - or
+/// simply never reaches the string-comparison fallback at all).
+///
+/// # Safety
+/// If `typ1`/`typ2`'s value is `List`/`Dict`/`Blob`/`Partial`-typed
+/// with a non-null pointer, that pointer must be a valid, live value,
+/// recursively satisfying the same contract for anything it
+/// (in)directly contains - forwarded from `tv_equal`/`tv_list_equal`/
+/// `tv_dict_equal`/`tv_blob_equal`/`tv_clear_simple`'s own safety
+/// docs.
+pub unsafe fn typval_compare(typ1: &mut TypvalT, typ2: &TypvalT, typ: ExprType, ic: bool) -> bool {
+    use crate::eval::typval::{
+        tv_blob_equal, tv_clear_simple, tv_dict_equal, tv_equal, tv_get_float, tv_get_number,
+        tv_get_string, tv_is_func, tv_list_equal,
+    };
+
+    let type_is = typ == ExprType::Is || typ == ExprType::Isnot;
+    let n1: VarnumberT;
+
+    if type_is && typ1.var_type() != typ2.var_type() {
+        // For "is" a different type always means false, for "isnot"
+        // it means true.
+        n1 = VarnumberT::from(typ == ExprType::Isnot);
+    } else if matches!(typ1.value, TypvalValue::Blob(_)) || matches!(typ2.value, TypvalValue::Blob(_)) {
+        if type_is {
+            let mut eq = typ1.var_type() == typ2.var_type();
+            if eq {
+                if let (TypvalValue::Blob(b1), TypvalValue::Blob(b2)) = (&typ1.value, &typ2.value) {
+                    eq = b1 == b2;
+                }
+            }
+            n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
+        } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
+            // emsg("E977: Can only compare Blob with Blob")/
+            // emsg(_(e_invalblob)) omitted - message display, not
+            // tractable; the identical FAIL is kept.
+            unsafe { tv_clear_simple(typ1) };
+            return false;
+        } else {
+            let (TypvalValue::Blob(b1), TypvalValue::Blob(b2)) = (&typ1.value, &typ2.value) else {
+                unreachable!("typ1/typ2 already confirmed Blob-typed above")
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            let mut eq = unsafe { tv_blob_equal(*b1, *b2) };
+            if typ == ExprType::Nequal {
+                eq = !eq;
+            }
+            n1 = VarnumberT::from(eq);
+        }
+    } else if matches!(typ1.value, TypvalValue::List(_)) || matches!(typ2.value, TypvalValue::List(_)) {
+        if type_is {
+            let mut eq = typ1.var_type() == typ2.var_type();
+            if eq {
+                if let (TypvalValue::List(l1), TypvalValue::List(l2)) = (&typ1.value, &typ2.value) {
+                    eq = l1 == l2;
+                }
+            }
+            n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
+        } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
+            // emsg("E691: Can only compare List with List")/
+            // emsg("E692: Invalid operation for List") omitted.
+            unsafe { tv_clear_simple(typ1) };
+            return false;
+        } else {
+            let (TypvalValue::List(l1), TypvalValue::List(l2)) = (&typ1.value, &typ2.value) else {
+                unreachable!("typ1/typ2 already confirmed List-typed above")
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            let mut eq = unsafe { tv_list_equal(*l1, *l2, ic) };
+            if typ == ExprType::Nequal {
+                eq = !eq;
+            }
+            n1 = VarnumberT::from(eq);
+        }
+    } else if matches!(typ1.value, TypvalValue::Dict(_)) || matches!(typ2.value, TypvalValue::Dict(_)) {
+        if type_is {
+            let mut eq = typ1.var_type() == typ2.var_type();
+            if eq {
+                if let (TypvalValue::Dict(d1), TypvalValue::Dict(d2)) = (&typ1.value, &typ2.value) {
+                    eq = d1 == d2;
+                }
+            }
+            n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
+        } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
+            // emsg("E735: Can only compare Dictionary with Dictionary")/
+            // emsg("E736: Invalid operation for Dictionary") omitted.
+            unsafe { tv_clear_simple(typ1) };
+            return false;
+        } else {
+            let (TypvalValue::Dict(d1), TypvalValue::Dict(d2)) = (&typ1.value, &typ2.value) else {
+                unreachable!("typ1/typ2 already confirmed Dict-typed above")
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            let mut eq = unsafe { tv_dict_equal(*d1, *d2, ic) };
+            if typ == ExprType::Nequal {
+                eq = !eq;
+            }
+            n1 = VarnumberT::from(eq);
+        }
+    } else if tv_is_func(typ1) || tv_is_func(typ2) {
+        if !matches!(typ, ExprType::Equal | ExprType::Nequal | ExprType::Is | ExprType::Isnot) {
+            // emsg("E694: Invalid operation for Funcrefs") omitted.
+            unsafe { tv_clear_simple(typ1) };
+            return false;
+        }
+        let typ1_null_partial = matches!(&typ1.value, TypvalValue::Partial(p) if p.is_null());
+        let typ2_null_partial = matches!(&typ2.value, TypvalValue::Partial(p) if p.is_null());
+        let mut eq = if typ1_null_partial || typ2_null_partial {
+            // When both partials are NULL, then they are equal.
+            // Otherwise they are not equal.
+            matches!(
+                (&typ1.value, &typ2.value),
+                (TypvalValue::Partial(p1), TypvalValue::Partial(p2)) if p1 == p2
+            )
+        } else if type_is {
+            if matches!(typ1.value, TypvalValue::Func(_)) && matches!(typ2.value, TypvalValue::Func(_)) {
+                // Strings are considered the same if their value is
+                // the same.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_equal(typ1, typ2, ic) }
+            } else if let (TypvalValue::Partial(p1), TypvalValue::Partial(p2)) = (&typ1.value, &typ2.value) {
+                p1 == p2
+            } else {
+                false
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_equal(typ1, typ2, ic) }
+        };
+        if typ == ExprType::Nequal || typ == ExprType::Isnot {
+            eq = !eq;
+        }
+        n1 = VarnumberT::from(eq);
+    } else if (matches!(typ1.value, TypvalValue::Float(_)) || matches!(typ2.value, TypvalValue::Float(_)))
+        && !matches!(typ, ExprType::Match | ExprType::Nomatch)
+    {
+        // If one of the two variables is a float, compare as a float.
+        let f1 = tv_get_float(typ1);
+        let f2 = tv_get_float(typ2);
+        n1 = VarnumberT::from(match typ {
+            ExprType::Is | ExprType::Equal => f1 == f2,
+            ExprType::Isnot | ExprType::Nequal => f1 != f2,
+            ExprType::Greater => f1 > f2,
+            ExprType::Gequal => f1 >= f2,
+            ExprType::Smaller => f1 < f2,
+            ExprType::Sequal => f1 <= f2,
+            ExprType::Unknown | ExprType::Match | ExprType::Nomatch => false,
+        });
+    } else if (matches!(typ1.value, TypvalValue::Number(_)) || matches!(typ2.value, TypvalValue::Number(_)))
+        && !matches!(typ, ExprType::Match | ExprType::Nomatch)
+    {
+        // If one of the two variables is a number, compare as a number.
+        let a = tv_get_number(typ1);
+        let b = tv_get_number(typ2);
+        n1 = VarnumberT::from(match typ {
+            ExprType::Is | ExprType::Equal => a == b,
+            ExprType::Isnot | ExprType::Nequal => a != b,
+            ExprType::Greater => a > b,
+            ExprType::Gequal => a >= b,
+            ExprType::Smaller => a < b,
+            ExprType::Sequal => a <= b,
+            ExprType::Unknown | ExprType::Match | ExprType::Nomatch => false,
+        });
+    } else {
+        let s1 = tv_get_string(typ1);
+        let s2 = tv_get_string(typ2);
+        let i = if !matches!(typ, ExprType::Match | ExprType::Nomatch) {
+            crate::mbyte::mb_strcmp_ic(ic, &s1, &s2)
+        } else {
+            0
+        };
+        n1 = VarnumberT::from(match typ {
+            ExprType::Is | ExprType::Equal => i == 0,
+            ExprType::Isnot | ExprType::Nequal => i != 0,
+            ExprType::Greater => i > 0,
+            ExprType::Gequal => i >= 0,
+            ExprType::Smaller => i < 0,
+            ExprType::Sequal => i <= 0,
+            ExprType::Match | ExprType::Nomatch => {
+                unimplemented!(
+                    "typval_compare: '=~'/'!~' against strings need pattern_match, the real \
+                     regex engine (regexp.c) - not yet translated"
+                );
+            }
+            ExprType::Unknown => false,
+        });
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(typ1) };
+    typ1.value = TypvalValue::Number(n1);
+    true
+}
+
+/// Handle `expr[expr]`/`expr.name`/`expr(expr)`/`expr->name(expr)`
+/// subscript chaining after an already-parsed primary expression
+/// (`handle_subscript`).
+///
+/// Only the common "nothing follows" fast path is modeled: if the
+/// original's own `while` loop condition would be true for even its
+/// very first iteration (there really is a `[`/`.`/`(`/`->`
+/// continuation to handle), this panics via `unimplemented!()` - the
+/// real subscript/index/method-call/function-call logic
+/// (`eval_index`/`call_func_rettv`/`eval_method`/`eval_lambda`) is a
+/// substantial, separate undertaking, not attempted here.
+///
+/// `tv_is_luafunc(rettv)` (gating the original's own `v:lua`-specific
+/// lambda-name-parsing branch) is always `false` here: nothing this
+/// crate can currently construct produces a `VAR_PARTIAL` bound to a
+/// Lua function (lambdas/`v:lua` support are both still
+/// unimplemented), so that branch is dead code in this crate today -
+/// correctly omitted rather than translated ahead of any real need.
+///
+/// `preceded_by_whitespace` replaces the original's own
+/// `!ascii_iswhite(*(*arg - 1))` check (looking at the byte
+/// immediately BEFORE `arg`): this module's own "remaining slice,
+/// indexed from 0" parsing idiom has no way to look backward past its
+/// own start, so callers instead report whether their own most recent
+/// `skipwhite` call (immediately before invoking this function)
+/// actually consumed at least one byte - exactly equivalent, since a
+/// `skipwhite` call consuming zero bytes means the byte immediately
+/// before the (unchanged) position was not whitespace to begin with,
+/// and consuming one or more means it definitely was.
+///
+/// Returns `(OK, 0)` for the fast path (nothing to consume - the
+/// original's own loop, having never executed, leaves `*arg`
+/// unmodified).
+#[must_use]
+pub fn handle_subscript(
+    arg: &[u8],
+    rettv: &TypvalT,
+    evalarg: Option<&EvalargT>,
+    preceded_by_whitespace: bool,
+) -> (i32, usize) {
+    use crate::eval::typval::tv_is_func;
+
+    let evaluate = evalarg.is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+
+    let starts_index_dot_or_call = arg.first() == Some(&b'[')
+        || (arg.first() == Some(&b'.') && matches!(rettv.value, TypvalValue::Dict(_)))
+        || (arg.first() == Some(&b'(') && (!evaluate || tv_is_func(rettv)));
+    let starts_method_call = arg.first() == Some(&b'-') && arg.get(1) == Some(&b'>');
+
+    if (!preceded_by_whitespace && starts_index_dot_or_call) || starts_method_call {
+        unimplemented!(
+            "handle_subscript: subscript/index (eval_index), function-call \
+             (call_func_rettv), and method-call (eval_method/eval_lambda) handling \
+             not yet translated"
+        );
+    }
+
+    (crate::vim_defs::OK, 0)
+}
+
+/// Recursion depth counter for [`eval7`] - the original's own
+/// function-local `static int recurse = 0`, translated as a
+/// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
+/// treatment of the same C idiom.
+static EVAL7_RECURSE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// The recursion depth limit [`eval7`] enforces (`recurse == 1000` in
+/// the original on non-MSVC builds - this crate has no MSVC-specific
+/// smaller-stack concern, so only that branch is modeled).
+const EVAL7_MAX_RECURSE: i32 = 1000;
+
+/// Handle sixth level expression: number/blob/single-quoted-string
+/// literals and parenthesized sub-expressions, plus leading
+/// `!`/`-`/`+` and trailing subscript chaining (`eval7`).
+///
+/// See this module's own doc comment for exactly which primary-
+/// expression forms are (and aren't) modeled, and why.
+///
+/// `arg` must point to the first non-white of the expression, and
+/// `want_string` is `true` after a `.` operator (float vs. string
+/// concatenation - only meaningful for the number-literal case, see
+/// `eval_number`'s own doc comment).
+///
+/// # Safety
+/// If `rettv`'s (or an intermediate value's) value is
+/// `List`/`Dict`/`Blob`/`Partial`/`Func`-typed with a non-null
+/// pointer, that pointer must be valid - forwarded from
+/// `tv_clear_simple`/`eval1`/`eval7_leader`'s own safety docs.
+pub unsafe fn eval7(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    mut evalarg: Option<&mut EvalargT>,
+    want_string: bool,
+) -> (i32, usize) {
+    use crate::eval::typval::tv_clear_simple;
+
+    let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+
+    // Initialise variable so tv_clear can't mistake this for a string
+    // and free a string that isn't there.
+    rettv.value = TypvalValue::Unknown;
+
+    // Skip '!', '-' and '+' characters. They are handled later.
+    let mut pos = 0;
+    while matches!(arg.get(pos), Some(&b'!') | Some(&b'-') | Some(&b'+')) {
+        pos += 1;
+        pos += skipwhite(&arg[pos..]);
+    }
+    let leader = &arg[0..pos];
+    let mut leader_remaining = leader.len();
+
+    // Limit recursion to 1000 levels. At least at 10000 we run out of
+    // stack and crash.
+    let recurse = unsafe { *EVAL7_RECURSE.get_mut() };
+    if recurse == EVAL7_MAX_RECURSE {
+        // semsg(_(e_expression_too_recursive_str), *arg) omitted -
+        // message display, not tractable; the identical FAIL is kept.
+        return (FAIL, pos);
+    }
+    unsafe { *EVAL7_RECURSE.get_mut() = recurse + 1 };
+
+    let mut ret;
+
+    match arg.get(pos) {
+        // Number constant.
+        Some(b'0'..=b'9') => {
+            let (r, consumed) = eval_number(&arg[pos..], rettv, evaluate, want_string);
+            ret = r;
+            pos += consumed;
+
+            // Apply prefixed "-" and "+" now. Matters especially when
+            // "->" follows.
+            if ret == OK && evaluate && leader_remaining > 0 {
+                // SAFETY: forwarded from this function's own safety doc.
+                ret = unsafe { eval7_leader(rettv, true, leader, &mut leader_remaining) };
+            }
+        }
+        // String constant: "string".
+        Some(b'"') => {
+            unimplemented!(
+                "eval7: double-quoted string literals (eval_string) need keycodes.c's \
+                 \\<C-...> escape handling, a substantial separate undertaking - not yet \
+                 translated"
+            );
+        }
+        // Literal string constant: 'str''ing'.
+        Some(b'\'') => {
+            let (r, consumed) = eval_lit_string(&arg[pos..], rettv, evaluate);
+            ret = r;
+            pos += consumed;
+        }
+        // List: [expr, expr]
+        Some(b'[') => {
+            unimplemented!("eval7: list literals (eval_list) not yet translated");
+        }
+        // Literal Dictionary: #{key: val, key: val}
+        Some(b'#') => {
+            unimplemented!("eval7: literal-key dictionary literals (eval_lit_dict) not yet translated");
+        }
+        // Lambda: {arg, arg -> expr}. Dictionary: {'key': val, 'key': val}
+        Some(b'{') => {
+            unimplemented!(
+                "eval7: lambda expressions (get_lambda_tv) and dictionary literals \
+                 (eval_dict) not yet translated"
+            );
+        }
+        // Option value: &name
+        Some(b'&') => {
+            unimplemented!(
+                "eval7: option values (eval_option) need the real options[] get/set engine, \
+                 not yet translated"
+            );
+        }
+        // Environment variable: $VAR. Interpolated string: $"..."/$'...'.
+        Some(b'$') => {
+            unimplemented!(
+                "eval7: environment variables ($VAR) and interpolated strings ($\"...\") not \
+                 yet translated"
+            );
+        }
+        // Register contents: @r.
+        Some(b'@') => {
+            unimplemented!("eval7: register contents (@r) need register.c, not yet translated");
+        }
+        // Nested expression: (expression).
+        Some(b'(') => {
+            pos += 1;
+            pos += skipwhite(&arg[pos..]);
+
+            let (r, consumed) = unsafe { eval1(&arg[pos..], rettv, evalarg.as_deref_mut()) };
+            pos += consumed;
+            ret = r;
+
+            if arg.get(pos) == Some(&b')') {
+                pos += 1;
+            } else if ret == OK {
+                // emsg(_("E110: Missing ')'")) omitted - message
+                // display, not tractable; the identical FAIL/tv_clear
+                // is kept.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(rettv) };
+                ret = FAIL;
+            }
+        }
+        // Must be a variable or function name, or a genuine parse
+        // failure (matching get_name_len's own "len <= 0 -> FAIL" for
+        // anything that doesn't even start like a name - e.g. trailing
+        // garbage or an unbalanced closing delimiter).
+        maybe_name_start => {
+            if maybe_name_start.is_some_and(|&c| eval_isnamec1(i32::from(c))) {
+                unimplemented!(
+                    "eval7: variable/function-name lookup (get_name_len/eval_variable/\
+                     eval_func) not yet translated"
+                );
+            }
+            ret = FAIL;
+        }
+    }
+
+    let ws_skip = skipwhite(&arg[pos..]);
+    pos += ws_skip;
+
+    // Handle following '[', '(' and '.' for expr[expr], expr.name,
+    // expr(expr), expr->name(expr).
+    if ret == OK {
+        let (r, consumed) = handle_subscript(&arg[pos..], rettv, evalarg.as_deref(), ws_skip > 0);
+        ret = r;
+        pos += consumed;
+    }
+
+    // Apply logical NOT and unary '-', from right to left, ignore '+'.
+    if ret == OK && evaluate && leader_remaining > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        ret = unsafe { eval7_leader(rettv, false, leader, &mut leader_remaining) };
+    }
+
+    unsafe { *EVAL7_RECURSE.get_mut() -= 1 };
+    (ret, pos)
+}
+
+/// Handle fifth level expression: `*`/`/`/`%` (`eval6`).
+///
+/// `arg` must point to the first non-white of the expression;
+/// `want_string` is `true` if `.` is string concatenation, otherwise
+/// float.
+///
+/// # Safety
+/// Forwarded from [`eval7`]/[`eval_multdiv_number`]'s own safety docs.
+pub unsafe fn eval6(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    mut evalarg: Option<&mut EvalargT>,
+    want_string: bool,
+) -> (i32, usize) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval7(arg, rettv, evalarg.as_deref_mut(), want_string) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    loop {
+        let op = arg.get(pos).copied();
+        let mul_div_op = match op {
+            Some(b'*') => MulDivOp::Mul,
+            Some(b'/') => MulDivOp::Div,
+            Some(b'%') => MulDivOp::Mod,
+            _ => break,
+        };
+
+        let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+
+        // Get the second variable.
+        pos += 1;
+        pos += skipwhite(&arg[pos..]);
+        let mut var2 = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret2, consumed2) = unsafe { eval7(&arg[pos..], &mut var2, evalarg.as_deref_mut(), false) };
+        pos += consumed2;
+        if ret2 == FAIL {
+            return (FAIL, pos);
+        }
+
+        if evaluate {
+            // SAFETY: forwarded from this function's own safety doc.
+            if !unsafe { eval_multdiv_number(rettv, &var2, mul_div_op) } {
+                return (FAIL, pos);
+            }
+        }
+    }
+
+    (OK, pos)
+}
+
+/// Handle fourth level expression: `+`/`-`/`.`/`..` (`eval5`).
+///
+/// `arg` must point to the first non-white of the expression.
+///
+/// # Safety
+/// Forwarded from [`eval6`]/[`eval_concat_str`]/[`eval_addblob`]/
+/// [`eval_addlist`]/[`eval_addsub_number`]/`tv_clear_simple`'s own
+/// safety docs.
+pub unsafe fn eval5(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::{tv_check_num, tv_check_str, tv_clear_simple};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval6(arg, rettv, evalarg.as_deref_mut(), false) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    // Repeat computing, until no '+', '-' or '.' is following.
+    loop {
+        let op = arg.get(pos).copied();
+        let concat = op == Some(b'.');
+        if op != Some(b'+') && op != Some(b'-') && !concat {
+            break;
+        }
+
+        let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+        if (op != Some(b'+') || !matches!(rettv.value, TypvalValue::List(_) | TypvalValue::Blob(_)))
+            && (concat || !matches!(rettv.value, TypvalValue::Float(_)))
+            && evaluate
+            && ((concat && !tv_check_str(rettv)) || (!concat && !tv_check_num(rettv)))
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            return (FAIL, pos);
+        }
+
+        // Get the second variable.
+        if concat && arg.get(pos + 1) == Some(&b'.') {
+            pos += 1;
+        }
+        pos += 1;
+        pos += skipwhite(&arg[pos..]);
+        let mut var2 = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret2, consumed2) = unsafe { eval6(&arg[pos..], &mut var2, evalarg.as_deref_mut(), concat) };
+        pos += consumed2;
+        if ret2 == FAIL {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            return (FAIL, pos);
+        }
+
+        if evaluate {
+            if concat {
+                // SAFETY: forwarded from this function's own safety doc.
+                if !unsafe { eval_concat_str(rettv, &var2) } {
+                    return (FAIL, pos);
+                }
+            } else if op == Some(b'+')
+                && matches!(rettv.value, TypvalValue::Blob(_))
+                && matches!(var2.value, TypvalValue::Blob(_))
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { eval_addblob(rettv, &var2) };
+            } else if op == Some(b'+')
+                && matches!(rettv.value, TypvalValue::List(_))
+                && matches!(var2.value, TypvalValue::List(_))
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                if !unsafe { eval_addlist(rettv, &var2) } {
+                    return (FAIL, pos);
+                }
+            } else {
+                let addsub_op = if op == Some(b'+') { AddSubOp::Add } else { AddSubOp::Sub };
+                // SAFETY: forwarded from this function's own safety doc.
+                if !unsafe { eval_addsub_number(rettv, &var2, addsub_op) } {
+                    return (FAIL, pos);
+                }
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&var2) };
+        }
+    }
+
+    (OK, pos)
+}
+
+/// Handle third level expression: `==`/`=~`/`!=`/`!~`/`>`/`>=`/`<`/
+/// `<=`/`is`/`isnot` (`eval4`).
+///
+/// `arg` must point to the first non-white of the expression.
+///
+/// # Safety
+/// Forwarded from [`eval5`]/[`typval_compare`]/`tv_clear_simple`'s own
+/// safety docs.
+pub unsafe fn eval4(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::tv_clear_simple;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval5(arg, rettv, evalarg.as_deref_mut()) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    let mut typ = ExprType::Unknown;
+    let mut len = 2usize;
+
+    match (arg.get(pos), arg.get(pos + 1)) {
+        (Some(&b'='), Some(&b'=')) => typ = ExprType::Equal,
+        (Some(&b'='), Some(&b'~')) => typ = ExprType::Match,
+        (Some(&b'!'), Some(&b'=')) => typ = ExprType::Nequal,
+        (Some(&b'!'), Some(&b'~')) => typ = ExprType::Nomatch,
+        (Some(&b'>'), Some(&b'=')) => typ = ExprType::Gequal,
+        (Some(&b'>'), _) => {
+            typ = ExprType::Greater;
+            len = 1;
+        }
+        (Some(&b'<'), Some(&b'=')) => typ = ExprType::Sequal,
+        (Some(&b'<'), _) => {
+            typ = ExprType::Smaller;
+            len = 1;
+        }
+        (Some(&b'i'), Some(&b's')) => {
+            let mut l = 2;
+            if arg.get(pos + 2) == Some(&b'n') && arg.get(pos + 3) == Some(&b'o') && arg.get(pos + 4) == Some(&b't')
+            {
+                l = 5;
+            }
+            let next_is_alnum_or_underscore =
+                arg.get(pos + l).is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_');
+            if !next_is_alnum_or_underscore {
+                typ = if l == 2 { ExprType::Is } else { ExprType::Isnot };
+                len = l;
+            }
+        }
+        _ => {}
+    }
+
+    // If there is a comparative operator, use it.
+    if typ != ExprType::Unknown {
+        let ic = if arg.get(pos + len) == Some(&b'?') {
+            // extra question mark appended: ignore case
+            len += 1;
+            true
+        } else if arg.get(pos + len) == Some(&b'#') {
+            // extra '#' appended: match case
+            len += 1;
+            false
+        } else {
+            // nothing appended: use 'ignorecase'
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic != 0
+        };
+
+        // Get the second variable.
+        pos += len;
+        pos += skipwhite(&arg[pos..]);
+        let mut var2 = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret2, consumed2) = unsafe { eval5(&arg[pos..], &mut var2, evalarg.as_deref_mut()) };
+        pos += consumed2;
+        if ret2 == FAIL {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            return (FAIL, pos);
+        }
+        if evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let ok = unsafe { typval_compare(rettv, &var2, typ, ic) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&var2) };
+            return (if ok { OK } else { FAIL }, pos);
+        }
+    }
+
+    (OK, pos)
+}
+
+/// Handle second level expression: `expr3 && expr3 && expr3` (logical
+/// AND) (`eval3`).
+///
+/// `arg` must point to the first non-white of the expression.
+///
+/// # Safety
+/// Forwarded from [`eval4`]/`tv_get_number_chk`/`tv_clear_simple`'s
+/// own safety docs.
+pub unsafe fn eval3(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::{tv_clear_simple, tv_get_number_chk};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval4(arg, rettv, evalarg.as_deref_mut()) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    // Handle the "&&" operator.
+    if arg.get(pos) == Some(&b'&') && arg.get(pos + 1) == Some(&b'&') {
+        let mut local_evalarg = EvalargT::default();
+        let evalarg_used: &mut EvalargT = match evalarg.as_deref_mut() {
+            Some(e) => e,
+            None => &mut local_evalarg,
+        };
+        let orig_flags = evalarg_used.eval_flags;
+        let evaluate = orig_flags & EVAL_EVALUATE != 0;
+
+        let mut result = true;
+        if evaluate {
+            let mut error = false;
+            if tv_get_number_chk(rettv, Some(&mut error)) == 0 {
+                result = false;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            if error {
+                return (FAIL, pos);
+            }
+        }
+
+        // Repeat until there is no following "&&".
+        while arg.get(pos) == Some(&b'&') && arg.get(pos + 1) == Some(&b'&') {
+            // Get the second variable.
+            pos += 2;
+            pos += skipwhite(&arg[pos..]);
+            evalarg_used.eval_flags = if result { orig_flags } else { orig_flags & !EVAL_EVALUATE };
+            let mut var2 = TypvalT::default();
+            // SAFETY: forwarded from this function's own safety doc.
+            let (ret2, consumed2) = unsafe { eval4(&arg[pos..], &mut var2, Some(&mut *evalarg_used)) };
+            pos += consumed2;
+            if ret2 == FAIL {
+                return (FAIL, pos);
+            }
+
+            // Compute the result.
+            if evaluate && result {
+                let mut error = false;
+                if tv_get_number_chk(&var2, Some(&mut error)) == 0 {
+                    result = false;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(&var2) };
+                if error {
+                    return (FAIL, pos);
+                }
+            }
+            if evaluate {
+                rettv.value = TypvalValue::Number(VarnumberT::from(result));
+            }
+        }
+
+        if let Some(e) = evalarg {
+            e.eval_flags = orig_flags;
+        }
+        // else: local_evalarg simply drops - eval_tofree is always
+        // None here, matching clear_evalarg's own no-op behavior for
+        // that case.
+    }
+
+    (OK, pos)
+}
+
+/// Handle first level expression: `expr2 || expr2 || expr2` (logical
+/// OR) (`eval2`).
+///
+/// `arg` must point to the first non-white of the expression.
+///
+/// # Safety
+/// Forwarded from [`eval3`]/`tv_get_number_chk`/`tv_clear_simple`'s
+/// own safety docs.
+pub unsafe fn eval2(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::{tv_clear_simple, tv_get_number_chk};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval3(arg, rettv, evalarg.as_deref_mut()) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    // Handle the "||" operator.
+    if arg.get(pos) == Some(&b'|') && arg.get(pos + 1) == Some(&b'|') {
+        let mut local_evalarg = EvalargT::default();
+        let evalarg_used: &mut EvalargT = match evalarg.as_deref_mut() {
+            Some(e) => e,
+            None => &mut local_evalarg,
+        };
+        let orig_flags = evalarg_used.eval_flags;
+        let evaluate = orig_flags & EVAL_EVALUATE != 0;
+
+        let mut result = false;
+        if evaluate {
+            let mut error = false;
+            if tv_get_number_chk(rettv, Some(&mut error)) != 0 {
+                result = true;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            if error {
+                return (FAIL, pos);
+            }
+        }
+
+        // Repeat until there is no following "||".
+        while arg.get(pos) == Some(&b'|') && arg.get(pos + 1) == Some(&b'|') {
+            // Get the second variable.
+            pos += 2;
+            pos += skipwhite(&arg[pos..]);
+            evalarg_used.eval_flags = if !result { orig_flags } else { orig_flags & !EVAL_EVALUATE };
+            let mut var2 = TypvalT::default();
+            // SAFETY: forwarded from this function's own safety doc.
+            let (ret2, consumed2) = unsafe { eval3(&arg[pos..], &mut var2, Some(&mut *evalarg_used)) };
+            pos += consumed2;
+            if ret2 == FAIL {
+                return (FAIL, pos);
+            }
+
+            // Compute the result.
+            if evaluate && !result {
+                let mut error = false;
+                if tv_get_number_chk(&var2, Some(&mut error)) != 0 {
+                    result = true;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(&var2) };
+                if error {
+                    return (FAIL, pos);
+                }
+            }
+            if evaluate {
+                rettv.value = TypvalValue::Number(VarnumberT::from(result));
+            }
+        }
+
+        if let Some(e) = evalarg {
+            e.eval_flags = orig_flags;
+        }
+    }
+
+    (OK, pos)
+}
+
+/// Handle top level expression: `expr2 ? expr1 : expr1` /
+/// `expr2 ?? expr1` (`eval1`).
+///
+/// `arg` must point to the first non-white of the expression.
+///
+/// # Safety
+/// Forwarded from [`eval2`]/`tv2bool`/`tv_get_number_chk`/
+/// `tv_clear_simple`'s own safety docs.
+pub unsafe fn eval1(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::{tv2bool, tv_clear_simple, tv_get_number_chk};
+
+    *rettv = TypvalT::default();
+
+    // Get the first variable.
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos) = unsafe { eval2(arg, rettv, evalarg.as_deref_mut()) };
+    if ret == FAIL {
+        return (FAIL, pos);
+    }
+
+    if arg.get(pos) == Some(&b'?') {
+        let op_falsy = arg.get(pos + 1) == Some(&b'?');
+
+        let mut local_evalarg = EvalargT::default();
+        let evalarg_used: &mut EvalargT = match evalarg.as_deref_mut() {
+            Some(e) => e,
+            None => &mut local_evalarg,
+        };
+        let orig_flags = evalarg_used.eval_flags;
+        let evaluate = orig_flags & EVAL_EVALUATE != 0;
+
+        let mut result = false;
+        if evaluate {
+            let mut error = false;
+            if op_falsy {
+                // SAFETY: forwarded from this function's own safety doc.
+                result = unsafe { tv2bool(rettv) };
+            } else if tv_get_number_chk(rettv, Some(&mut error)) != 0 {
+                result = true;
+            }
+            if error || !op_falsy || !result {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(rettv) };
+            }
+            if error {
+                return (FAIL, pos);
+            }
+        }
+
+        // Get the second variable. Recursive!
+        if op_falsy {
+            pos += 1;
+        }
+        pos += 1;
+        pos += skipwhite(&arg[pos..]);
+        evalarg_used.eval_flags =
+            if if op_falsy { !result } else { result } { orig_flags } else { orig_flags & !EVAL_EVALUATE };
+        let mut var2 = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret2, consumed2) = unsafe { eval1(&arg[pos..], &mut var2, Some(&mut *evalarg_used)) };
+        pos += consumed2;
+        if ret2 == FAIL {
+            evalarg_used.eval_flags = orig_flags;
+            return (FAIL, pos);
+        }
+        if !op_falsy || !result {
+            *rettv = var2;
+        }
+
+        if !op_falsy {
+            // Check for the ":".
+            if arg.get(pos) != Some(&b':') {
+                // emsg(_("E109: Missing ':' after '?'")) omitted -
+                // message display, not tractable; the identical
+                // FAIL/tv_clear is kept.
+                if evaluate && result {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { tv_clear_simple(rettv) };
+                }
+                evalarg_used.eval_flags = orig_flags;
+                return (FAIL, pos);
+            }
+
+            // Get the third variable. Recursive!
+            pos += 1;
+            pos += skipwhite(&arg[pos..]);
+            evalarg_used.eval_flags = if !result { orig_flags } else { orig_flags & !EVAL_EVALUATE };
+            let mut var3 = TypvalT::default();
+            // SAFETY: forwarded from this function's own safety doc.
+            let (ret3, consumed3) = unsafe { eval1(&arg[pos..], &mut var3, Some(&mut *evalarg_used)) };
+            pos += consumed3;
+            if ret3 == FAIL {
+                if evaluate && result {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { tv_clear_simple(rettv) };
+                }
+                evalarg_used.eval_flags = orig_flags;
+                return (FAIL, pos);
+            }
+            if evaluate && !result {
+                *rettv = var3;
+            }
+        }
+
+        if let Some(e) = evalarg {
+            e.eval_flags = orig_flags;
+        } else {
+            clear_evalarg(Some(&mut local_evalarg), None);
+        }
+    }
+
+    (OK, pos)
+}
+
+/// Handle zero level expression. Calls [`eval1`] and handles the
+/// trailing-argument/next-command bookkeeping (`eval0`).
+///
+/// `arg` need not be pre-skipped of leading whitespace (`eval0` does
+/// this itself, matching the original).
+///
+/// # Safety
+/// Forwarded from [`eval1`]'s own safety doc.
+pub unsafe fn eval0(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    mut eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    evalarg: Option<&mut EvalargT>,
+) -> i32 {
+    use crate::eval::typval::tv_clear_simple;
+
+    let start = skipwhite(arg);
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, consumed) = unsafe { eval1(&arg[start..], rettv, evalarg) };
+    let pos = start + consumed;
+
+    let end_error = ret != FAIL && !crate::ex_docmd::ends_excmd(arg.get(pos).copied().unwrap_or(0));
+
+    if ret == FAIL || end_error {
+        if ret != FAIL {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+        }
+        // Report the invalid expression unless the expression
+        // evaluation has been cancelled due to an aborting error, an
+        // interrupt, or an exception, or we already gave a more
+        // specific error - the original's own `did_emsg`/
+        // `called_emsg`/`aborting()`-gated `semsg(...)` calls
+        // themselves are omitted entirely (message display, not
+        // tractable, and the gating condition has no other observable
+        // effect once the display itself is gone), while the
+        // identical FAIL/`eap.nextcmd` behavior below is kept exactly.
+        if let Some(eap) = eap.as_deref_mut() {
+            // Some of the expression may not have been consumed. Only
+            // execute a next command if it cannot be a "||" operator.
+            // The next command may be "catch".
+            if let Some(next) = crate::ex_docmd::check_nextcmd(&arg[pos..]) {
+                if arg.get(pos + next) != Some(&b'|') {
+                    eap.nextcmd = Some(arg[pos + next..].to_vec());
+                }
+            }
+        }
+        return FAIL;
+    }
+
+    if let Some(eap) = eap {
+        eap.nextcmd = crate::ex_docmd::check_nextcmd(&arg[pos..]).map(|next| arg[pos + next..].to_vec());
+    }
+
+    ret
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1662,8 +2827,36 @@ mod tests {
     }
 
     #[test]
+    fn eval_concat_str_releases_tv2_when_it_is_unstringifiable() {
+        use crate::eval::typval::tv_list_alloc;
+
+        let _lock = crate::globals::global_state_test_lock();
+
+        // tv2 is a real, non-null List with refcount 1 - the type-error
+        // path must still release it (matching the original's own
+        // `tv_clear(tv2)`), not silently leak its reference - this is
+        // the exact bug found and fixed while building eval5 (this
+        // function's real caller): an earlier draft only released tv1
+        // (always a no-op in practice) and skipped tv2 entirely.
+        let l = tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::Unknown as isize);
+        unsafe { (*l).lv_refcount = 1 };
+        let mut tv1 = TypvalT { value: TypvalValue::String(Some(b"foo".to_vec())), ..Default::default() };
+        let tv2 = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+
+        let ok = unsafe { eval_concat_str(&mut tv1, &tv2) };
+        assert!(!ok);
+        // The list was freed at refcount 0 - re-allocate at the same
+        // spirit to confirm no crash/leak-sanitizer complaint would
+        // have fired (the absence of a use-after-free crash under
+        // Miri/ASan IS the check here, matching this crate's own
+        // established style for refcount-release tests).
+    }
+
+    #[test]
     fn eval_concat_str_releases_tv1s_old_list_when_it_cannot_grow_in_place() {
         use crate::eval::typval::tv_list_alloc;
+
+        let _lock = crate::globals::global_state_test_lock();
 
         // tv1 starts as a List with refcount 2 - eval_concat_str must
         // release one reference (via tv_clear_simple's generic
@@ -2702,4 +3895,530 @@ mod tests {
 
         unsafe { crate::eval::typval::tv_list_unref(list) };
     }
+
+    // --- typval_compare ---
+
+    fn evaluate_evalarg() -> EvalargT {
+        EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() }
+    }
+
+    /// Parses and fully evaluates `s` via the whole `eval0`-`eval7`
+    /// chain, returning `(status, rettv)`.
+    fn eval_str(s: &[u8]) -> (i32, TypvalT) {
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let ret = unsafe { eval0(s, &mut rettv, None, Some(&mut evalarg)) };
+        (ret, rettv)
+    }
+
+    #[test]
+    fn typval_compare_number_relational_operators() {
+        let cases: &[(ExprType, VarnumberT, VarnumberT, bool)] = &[
+            (ExprType::Equal, 1, 1, true),
+            (ExprType::Equal, 1, 2, false),
+            (ExprType::Nequal, 1, 2, true),
+            (ExprType::Greater, 2, 1, true),
+            (ExprType::Greater, 1, 2, false),
+            (ExprType::Gequal, 1, 1, true),
+            (ExprType::Smaller, 1, 2, true),
+            (ExprType::Sequal, 1, 1, true),
+        ];
+        for &(typ, a, b, expected) in cases {
+            let mut t1 = TypvalT { value: TypvalValue::Number(a), ..Default::default() };
+            let t2 = TypvalT { value: TypvalValue::Number(b), ..Default::default() };
+            assert!(unsafe { typval_compare(&mut t1, &t2, typ, false) });
+            assert_eq!(t1.value, TypvalValue::Number(VarnumberT::from(expected)), "{typ:?}({a}, {b})");
+        }
+    }
+
+    #[test]
+    fn typval_compare_float_relational_operators() {
+        let mut t1 = TypvalT { value: TypvalValue::Float(1.5), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::Float(2.5), ..Default::default() };
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Smaller, false) });
+        assert_eq!(t1.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn typval_compare_string_case_sensitivity() {
+        let t1 = TypvalT { value: TypvalValue::String(Some(b"ABC".to_vec())), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::String(Some(b"abc".to_vec())), ..Default::default() };
+
+        let mut ic = t1.clone();
+        assert!(unsafe { typval_compare(&mut ic, &t2, ExprType::Equal, true) });
+        assert_eq!(ic.value, TypvalValue::Number(1));
+
+        let mut cs = t1.clone();
+        assert!(unsafe { typval_compare(&mut cs, &t2, ExprType::Equal, false) });
+        assert_eq!(cs.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn typval_compare_is_isnot_different_types_is_always_false_true() {
+        let mut t1 = TypvalT { value: TypvalValue::Number(1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::String(Some(b"1".to_vec())), ..Default::default() };
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Is, false) });
+        assert_eq!(t1.value, TypvalValue::Number(0));
+
+        let mut t1 = TypvalT { value: TypvalValue::Number(1), ..Default::default() };
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Isnot, false) });
+        assert_eq!(t1.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn typval_compare_blob_equal_nequal() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        unsafe {
+            (*b1).bv_ga.ga_append(1);
+            (*b2).bv_ga.ga_append(1);
+        }
+        let mut t1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+        // typval_compare's own internal tv_clear_simple(typ1) releases
+        // b1 (a fresh tv_blob_alloc() starts at refcount 0, so this
+        // single unref frees it immediately) - do NOT free b1 again.
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Equal, false) });
+        assert_eq!(t1.value, TypvalValue::Number(1));
+
+        unsafe { tv_blob_free(b2) };
+    }
+
+    #[test]
+    fn typval_compare_blob_is_uses_pointer_identity() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        let mut t1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+        // Two distinct, empty blobs: equal by content ("==") but NOT
+        // the same object ("is"). typval_compare's own tv_clear_simple
+        // already releases b1 (see typval_compare_blob_equal_nequal's
+        // own comment) - do not free b1 again.
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Is, false) });
+        assert_eq!(t1.value, TypvalValue::Number(0));
+
+        unsafe { tv_blob_free(b2) };
+    }
+
+    #[test]
+    fn typval_compare_blob_relational_operator_is_a_type_error() {
+        use crate::eval::typval::{tv_blob_alloc, tv_blob_free};
+
+        let b1 = tv_blob_alloc();
+        let b2 = tv_blob_alloc();
+        let mut t1 = TypvalT { value: TypvalValue::Blob(b1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::Blob(b2), ..Default::default() };
+        // The type-error path ALSO calls tv_clear_simple(typ1),
+        // releasing b1 - do not free b1 again.
+        assert!(!unsafe { typval_compare(&mut t1, &t2, ExprType::Greater, false) });
+
+        unsafe { tv_blob_free(b2) };
+    }
+
+    #[test]
+    fn typval_compare_list_equal_and_is() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_append_number, tv_list_unref};
+
+        let _lock = crate::globals::global_state_test_lock();
+
+        // "==" (equal by content).
+        let l1 = tv_list_alloc(1);
+        let l2 = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(l1, 5);
+            tv_list_append_number(l2, 5);
+        }
+        let mut t1 = TypvalT { value: TypvalValue::List(l1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::List(l2), ..Default::default() };
+        // typval_compare's own tv_clear_simple(typ1) frees l1 (a fresh
+        // tv_list_alloc() starts at refcount 0) - do not reuse or free
+        // l1 again.
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Equal, false) });
+        assert_eq!(t1.value, TypvalValue::Number(1));
+
+        // "is" (pointer identity) - needs a FRESH list for typ1, since
+        // l1 was already freed by the call above.
+        let l3 = tv_list_alloc(1);
+        unsafe { tv_list_append_number(l3, 5) };
+        let mut t3 = TypvalT { value: TypvalValue::List(l3), ..Default::default() };
+        assert!(unsafe { typval_compare(&mut t3, &t2, ExprType::Is, false) });
+        assert_eq!(t3.value, TypvalValue::Number(0), "equal-content lists are not the same object");
+
+        unsafe { tv_list_unref(l2) };
+    }
+
+    #[test]
+    fn typval_compare_list_invalid_operation_is_a_type_error() {
+        use crate::eval::typval::{tv_list_alloc, tv_list_unref};
+
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = tv_list_alloc(0);
+        let l2 = tv_list_alloc(0);
+        let mut t1 = TypvalT { value: TypvalValue::List(l1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::List(l2), ..Default::default() };
+        // The type-error path also calls tv_clear_simple(typ1),
+        // freeing l1 - do not free l1 again.
+        assert!(!unsafe { typval_compare(&mut t1, &t2, ExprType::Smaller, false) });
+
+        unsafe { tv_list_unref(l2) };
+    }
+
+    #[test]
+    fn typval_compare_dict_equal_and_invalid_op() {
+        use crate::eval::typval::{tv_dict_add_nr, tv_dict_alloc, tv_dict_free};
+
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = tv_dict_alloc();
+        let d2 = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *d1, b"a", 1);
+            tv_dict_add_nr(&mut *d2, b"a", 1);
+        }
+        let mut t1 = TypvalT { value: TypvalValue::Dict(d1), ..Default::default() };
+        let t2 = TypvalT { value: TypvalValue::Dict(d2), ..Default::default() };
+        // typval_compare's own tv_clear_simple(typ1) frees d1 - do not
+        // reuse or free d1 again.
+        assert!(unsafe { typval_compare(&mut t1, &t2, ExprType::Equal, false) });
+        assert_eq!(t1.value, TypvalValue::Number(1));
+
+        // Needs a FRESH dict for typ1, since d1 was already freed
+        // above - this call's own type-error path frees IT too.
+        let d3 = tv_dict_alloc();
+        unsafe { tv_dict_add_nr(&mut *d3, b"a", 1) };
+        let mut t3 = TypvalT { value: TypvalValue::Dict(d3), ..Default::default() };
+        assert!(!unsafe { typval_compare(&mut t3, &t2, ExprType::Greater, false) });
+
+        unsafe { tv_dict_free(d2) };
+    }
+
+    #[test]
+    fn typval_compare_match_against_strings_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| {
+            let mut t1 = TypvalT { value: TypvalValue::String(Some(b"abc".to_vec())), ..Default::default() };
+            let t2 = TypvalT { value: TypvalValue::String(Some(b"a.c".to_vec())), ..Default::default() };
+            unsafe { typval_compare(&mut t1, &t2, ExprType::Match, false) }
+        });
+        assert!(result.is_err(), "expected a panic (pattern_match not yet translated)");
+    }
+
+    // --- handle_subscript ---
+
+    #[test]
+    fn handle_subscript_nothing_follows_is_ok() {
+        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"", &rettv, Some(&evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+        let (ret, consumed) = handle_subscript(b" + 1", &rettv, Some(&mut evalarg).map(|e| &*e), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn handle_subscript_index_bracket_panics() {
+        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let evalarg = evaluate_evalarg();
+        let result = std::panic::catch_unwind(|| handle_subscript(b"[0]", &rettv, Some(&evalarg), false));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_subscript_whitespace_before_bracket_suppresses_it() {
+        // "5 [0]" - a space before "[" means it's NOT treated as a
+        // subscript continuation (matches the original's own
+        // whitespace-sensitivity), so this must NOT panic.
+        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[0]", &rettv, Some(&evalarg), true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn handle_subscript_dot_only_continues_for_a_dict() {
+        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let evalarg = evaluate_evalarg();
+        // "." after a Number (not a Dict) does not continue.
+        let (ret, consumed) = handle_subscript(b".foo", &rettv, Some(&evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+
+        let dict_rettv = TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() };
+        let result = std::panic::catch_unwind(|| handle_subscript(b".foo", &dict_rettv, Some(&evalarg), false));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_subscript_arrow_method_call_panics_even_with_preceding_whitespace() {
+        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let evalarg = evaluate_evalarg();
+        // "->" continues regardless of preceding whitespace (matches
+        // the original's own `|| (**arg == '-' && (*arg)[1] == '>')`
+        // being a separate OR-branch, not gated by the whitespace
+        // check at all).
+        let result = std::panic::catch_unwind(|| handle_subscript(b"->len()", &rettv, Some(&evalarg), true));
+        assert!(result.is_err());
+    }
+
+    // --- clear_evalarg ---
+
+    #[test]
+    fn clear_evalarg_none_is_a_no_op() {
+        clear_evalarg(None, None);
+    }
+
+    #[test]
+    fn clear_evalarg_with_no_tofree_is_a_no_op() {
+        let mut evalarg = EvalargT::default();
+        clear_evalarg(Some(&mut evalarg), None);
+        assert!(evalarg.eval_tofree.is_none());
+    }
+
+    #[test]
+    fn clear_evalarg_with_tofree_and_no_eap_just_drops() {
+        let mut evalarg = EvalargT { eval_tofree: Some(b"stale".to_vec()), ..Default::default() };
+        clear_evalarg(Some(&mut evalarg), None);
+        assert!(evalarg.eval_tofree.is_none());
+    }
+
+    #[test]
+    fn clear_evalarg_with_tofree_and_eap_swaps_into_cmdline_tofree() {
+        let mut evalarg = EvalargT { eval_tofree: Some(b"new_line".to_vec()), ..Default::default() };
+        let mut eap = crate::ex_cmds_defs::ExargT { arg: Some(b"old_line".to_vec()), ..Default::default() };
+        clear_evalarg(Some(&mut evalarg), Some(&mut eap));
+        assert!(evalarg.eval_tofree.is_none());
+        assert_eq!(eap.cmdline_tofree, Some(b"old_line".to_vec()));
+        assert_eq!(eap.arg, Some(b"new_line".to_vec()));
+    }
+
+    // --- eval0-eval7 end-to-end ---
+
+    #[test]
+    fn e2e_plain_number() {
+        let (ret, tv) = eval_str(b"42");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn e2e_unary_minus() {
+        let (ret, tv) = eval_str(b"-5");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(-5));
+    }
+
+    #[test]
+    fn e2e_unary_not() {
+        assert_eq!(eval_str(b"!0").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"!5").1.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn e2e_double_negation() {
+        assert_eq!(eval_str(b"--5").1.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn e2e_arithmetic_precedence() {
+        // "*" binds tighter than "+".
+        let (ret, tv) = eval_str(b"1 + 2 * 3");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn e2e_parenthesized_overrides_precedence() {
+        let (ret, tv) = eval_str(b"(1 + 2) * 3");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(9));
+    }
+
+    #[test]
+    fn e2e_nested_parens() {
+        assert_eq!(eval_str(b"((1 + 2))").1.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn e2e_division_and_modulo() {
+        assert_eq!(eval_str(b"10 / 3").1.value, TypvalValue::Number(3));
+        assert_eq!(eval_str(b"10 % 3").1.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn e2e_float_arithmetic() {
+        let (ret, tv) = eval_str(b"1.5 + 2.5");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Float(4.0));
+    }
+
+    #[test]
+    fn e2e_string_concatenation() {
+        let (ret, tv) = eval_str(b"'a' . 'b'");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn e2e_literal_string_escaped_quote() {
+        assert_eq!(eval_str(b"'a''b'").1.value, TypvalValue::String(Some(b"a'b".to_vec())));
+    }
+
+    #[test]
+    fn e2e_comparison_operators() {
+        assert_eq!(eval_str(b"1 == 1").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 != 2").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 < 2").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"2 > 1").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 <= 1").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 >= 2").1.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn e2e_is_isnot() {
+        assert_eq!(eval_str(b"1 is 1").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 isnot 2").1.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn e2e_logical_and_or() {
+        assert_eq!(eval_str(b"1 && 0").1.value, TypvalValue::Number(0));
+        assert_eq!(eval_str(b"1 && 1").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"1 || 0").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"0 || 0").1.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn e2e_ternary() {
+        assert_eq!(eval_str(b"1 ? 2 : 3").1.value, TypvalValue::Number(2));
+        assert_eq!(eval_str(b"0 ? 2 : 3").1.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn e2e_falsy_coalescing() {
+        assert_eq!(eval_str(b"0 ?? 5").1.value, TypvalValue::Number(5));
+        assert_eq!(eval_str(b"3 ?? 5").1.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn e2e_blob_literal() {
+        let (ret, tv) = eval_str(b"0z0011");
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(b) = tv.value else { panic!("expected a Blob") };
+        assert!(!b.is_null());
+        unsafe {
+            assert_eq!((*b).bv_ga.ga_len, 2);
+            assert_eq!((&(*b).bv_ga.ga_data)[0], 0x00);
+            assert_eq!((&(*b).bv_ga.ga_data)[1], 0x11);
+            crate::eval::typval::tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn e2e_number_plus_numeric_string() {
+        assert_eq!(eval_str(b"1 + '2'").1.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn e2e_case_insensitive_string_equality() {
+        assert_eq!(eval_str(b"'ABC' ==? 'abc'").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"'ABC' ==# 'abc'").1.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn e2e_trailing_garbage_fails() {
+        let (ret, _) = eval_str(b"1 2");
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn e2e_unbalanced_paren_fails() {
+        let (ret, _) = eval_str(b"(1 + 2");
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn e2e_empty_input_fails() {
+        let (ret, _) = eval_str(b"");
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn e2e_leading_and_trailing_whitespace_is_skipped() {
+        assert_eq!(eval_str(b"  42  ").1.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn e2e_eval0_sets_nextcmd_on_success() {
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let ret = unsafe { eval0(b"1 | echo 2", &mut rettv, Some(&mut eap), Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        // check_nextcmd only skips whitespace BEFORE the separator, not
+        // after it - matches the original's own `return s + 1;`
+        // (pointing right after "|", not further whitespace-skipped).
+        assert_eq!(eap.nextcmd, Some(b" echo 2".to_vec()));
+    }
+
+    #[test]
+    fn e2e_eval0_sets_nextcmd_on_a_failure_right_before_a_separator() {
+        // An unbalanced paren fails to parse, stopping exactly at the
+        // "|" - eval0's own FAIL path still finds and sets nextcmd in
+        // this case (matches the original's own "some of the
+        // expression may not have been consumed" comment).
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let ret = unsafe { eval0(b"(1 | echo 3", &mut rettv, Some(&mut eap), Some(&mut evalarg)) };
+        assert_eq!(ret, FAIL);
+        assert_eq!(eap.nextcmd, Some(b" echo 3".to_vec()));
+    }
+
+    #[test]
+    fn e2e_eval0_does_not_search_past_unrelated_trailing_garbage_for_a_separator() {
+        // check_nextcmd only checks whether the very next non-
+        // whitespace character (right where parsing stopped) is a
+        // separator - it does NOT search further ahead through
+        // unrelated text to find a LATER "|", matching the original's
+        // own narrow contract exactly.
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        let ret = unsafe { eval0(b"1 2 | echo 3", &mut rettv, Some(&mut eap), Some(&mut evalarg)) };
+        assert_eq!(ret, FAIL);
+        assert_eq!(eap.nextcmd, None);
+    }
+
+    #[test]
+    fn e2e_parse_only_mode_does_not_populate_rettv() {
+        // evalarg with EVAL_EVALUATE unset: parse-only, rettv stays
+        // VAR_UNKNOWN (matches the module doc's own "the functions may
+        // return OK, but the rettv will be of type VAR_UNKNOWN"
+        // documented contract).
+        let mut rettv = TypvalT::default();
+        let mut evalarg = EvalargT::default();
+        let ret = unsafe { eval0(b"1 + 2", &mut rettv, None, Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn e2e_short_circuit_and_does_not_panic_on_unimplemented_rhs() {
+        // "0 && ..." must short-circuit WITHOUT actually evaluating a
+        // real value for the right-hand side, but "eval4" (its own
+        // recursive call) still needs to fully PARSE the right-hand
+        // side syntactically - a plain number literal on the RHS is
+        // always safely parseable regardless of whether it's actually
+        // evaluated, so this specifically avoids any subscript/name-
+        // lookup syntax this module's own eval7 doesn't yet support.
+        assert_eq!(eval_str(b"0 && 5").1.value, TypvalValue::Number(0));
+        assert_eq!(eval_str(b"1 || 5").1.value, TypvalValue::Number(1));
+    }
 }
+
