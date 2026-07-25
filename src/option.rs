@@ -1431,6 +1431,804 @@ pub fn set_tty_option(name: &[u8], value: Vec<u8>) -> bool {
     false
 }
 
+/// Every recognized option name (both full names and short
+/// abbreviations, e.g. `"equalalways"` and `"ea"` both map to the
+/// same entry) mapped to its `OptIndex` (`option_hash_elems[]` +
+/// `find_option_hash`, both entirely machine-generated in the
+/// original from `options.lua` via `src/gen/gen_options.lua`, into
+/// `build/.../options_map.generated.h`).
+///
+/// Uses a plain `HashMap` instead of literally replicating the
+/// original's own hand-rolled length-plus-last/first-character
+/// dispatch tree (narrowing to a small `[low, high)` range within a
+/// flat array, then a linear `memcmp` scan) - that structure is a
+/// pure C performance micro-optimization over the exact same
+/// (name, `OptIndex`) data this table holds, not a simplification of
+/// any business logic; a `HashMap` gives the same O(1)-ish lookup
+/// far more simply and with no hand-rolled dispatch tree to
+/// transcribe or verify. The 725-entry DATA itself (every real name
+/// -> `OptIndex` mapping, including historical aliases like
+/// `"viminfo"`/`"vi"` for `shada`) is mechanically transcribed and
+/// cross-checked in full: exactly 725 entries, all unique names, all
+/// 725 `OptIndex` references resolved against the real enum with
+/// zero gaps.
+pub static OPTION_HASH_ELEMS: std::sync::LazyLock<std::collections::HashMap<&'static [u8], OptIndex>> =
+    std::sync::LazyLock::new(|| {
+        [
+            (&b"ea"[..], OptIndex::Equalalways),
+            (&b"wa"[..], OptIndex::Writeany),
+            (&b"pa"[..], OptIndex::Path),
+            (&b"ma"[..], OptIndex::Modifiable),
+            (&b"wb"[..], OptIndex::Writebackup),
+            (&b"cb"[..], OptIndex::Clipboard),
+            (&b"vb"[..], OptIndex::Visualbell),
+            (&b"sb"[..], OptIndex::Splitbelow),
+            (&b"pb"[..], OptIndex::Pumblend),
+            (&b"eb"[..], OptIndex::Errorbells),
+            (&b"sc"[..], OptIndex::Showcmd),
+            (&b"tc"[..], OptIndex::Tagcase),
+            (&b"wc"[..], OptIndex::Wildchar),
+            (&b"uc"[..], OptIndex::Updatecount),
+            (&b"ac"[..], OptIndex::Autocomplete),
+            (&b"cc"[..], OptIndex::Colorcolumn),
+            (&b"ic"[..], OptIndex::Ignorecase),
+            (&b"gd"[..], OptIndex::Gdefault),
+            (&b"cd"[..], OptIndex::Cdpath),
+            (&b"wd"[..], OptIndex::Writedelay),
+            (&b"ed"[..], OptIndex::Edcompatible),
+            (&b"sd"[..], OptIndex::Shada),
+            (&b"ve"[..], OptIndex::Virtualedit),
+            (&b"re"[..], OptIndex::Regexpengine),
+            (&b"qe"[..], OptIndex::Quoteescape),
+            (&b"hf"[..], OptIndex::Helpfile),
+            (&b"ef"[..], OptIndex::Errorfile),
+            (&b"ff"[..], OptIndex::Fileformat),
+            (&b"tf"[..], OptIndex::Ttyfast),
+            (&b"cf"[..], OptIndex::Confirm),
+            (&b"nf"[..], OptIndex::Nrformats),
+            (&b"dg"[..], OptIndex::Digraph),
+            (&b"bg"[..], OptIndex::Background),
+            (&b"hh"[..], OptIndex::Helpheight),
+            (&b"wh"[..], OptIndex::Winheight),
+            (&b"ph"[..], OptIndex::Pumheight),
+            (&b"ch"[..], OptIndex::Cmdheight),
+            (&b"bh"[..], OptIndex::Bufhidden),
+            (&b"mh"[..], OptIndex::Mousehide),
+            (&b"sh"[..], OptIndex::Shell),
+            (&b"ei"[..], OptIndex::Eventignore),
+            (&b"pi"[..], OptIndex::Preserveindent),
+            (&b"hi"[..], OptIndex::History),
+            (&b"wi"[..], OptIndex::Window),
+            (&b"si"[..], OptIndex::Smartindent),
+            (&b"ai"[..], OptIndex::Autoindent),
+            (&b"ri"[..], OptIndex::Revins),
+            (&b"ci"[..], OptIndex::Copyindent),
+            (&b"vi"[..], OptIndex::Shada),
+            (&b"sj"[..], OptIndex::Scrolljump),
+            (&b"hk"[..], OptIndex::Hkmap),
+            (&b"bk"[..], OptIndex::Backup),
+            (&b"ul"[..], OptIndex::Undolevels),
+            (&b"al"[..], OptIndex::Aleph),
+            (&b"tl"[..], OptIndex::Taglength),
+            (&b"rl"[..], OptIndex::Rightleft),
+            (&b"bl"[..], OptIndex::Buflisted),
+            (&b"ml"[..], OptIndex::Modeline),
+            (&b"hl"[..], OptIndex::Highlight),
+            (&b"wm"[..], OptIndex::Wrapmargin),
+            (&b"tm"[..], OptIndex::Timeoutlen),
+            (&b"sm"[..], OptIndex::Showmatch),
+            (&b"pm"[..], OptIndex::Patchmode),
+            (&b"im"[..], OptIndex::Insertmode),
+            (&b"lm"[..], OptIndex::Langmenu),
+            (&b"km"[..], OptIndex::Keymodel),
+            (&b"fo"[..], OptIndex::Formatoptions),
+            (&b"to"[..], OptIndex::Timeout),
+            (&b"co"[..], OptIndex::Columns),
+            (&b"bo"[..], OptIndex::Belloff),
+            (&b"go"[..], OptIndex::Guioptions),
+            (&b"so"[..], OptIndex::Scrolloff),
+            (&b"ro"[..], OptIndex::Readonly),
+            (&b"fp"[..], OptIndex::Formatprg),
+            (&b"gp"[..], OptIndex::Grepprg),
+            (&b"wp"[..], OptIndex::Winpinned),
+            (&b"pp"[..], OptIndex::Packpath),
+            (&b"cp"[..], OptIndex::Compatible),
+            (&b"kp"[..], OptIndex::Keywordprg),
+            (&b"mp"[..], OptIndex::Makeprg),
+            (&b"ep"[..], OptIndex::Equalprg),
+            (&b"sp"[..], OptIndex::Shellpipe),
+            (&b"tr"[..], OptIndex::Tagrelative),
+            (&b"ur"[..], OptIndex::Undoreload),
+            (&b"ar"[..], OptIndex::Autoread),
+            (&b"sr"[..], OptIndex::Shiftround),
+            (&b"ws"[..], OptIndex::Wrapscan),
+            (&b"ts"[..], OptIndex::Tabstop),
+            (&b"ss"[..], OptIndex::Sidescroll),
+            (&b"js"[..], OptIndex::Joinspaces),
+            (&b"bs"[..], OptIndex::Backspace),
+            (&b"fs"[..], OptIndex::Fsync),
+            (&b"is"[..], OptIndex::Incsearch),
+            (&b"ls"[..], OptIndex::Laststatus),
+            (&b"et"[..], OptIndex::Expandtab),
+            (&b"ut"[..], OptIndex::Updatetime),
+            (&b"pt"[..], OptIndex::Pastetoggle),
+            (&b"bt"[..], OptIndex::Buftype),
+            (&b"ft"[..], OptIndex::Filetype),
+            (&b"ru"[..], OptIndex::Ruler),
+            (&b"su"[..], OptIndex::Suffixes),
+            (&b"nu"[..], OptIndex::Number),
+            (&b"sw"[..], OptIndex::Shiftwidth),
+            (&b"ww"[..], OptIndex::Whichwrap),
+            (&b"tw"[..], OptIndex::Textwidth),
+            (&b"pw"[..], OptIndex::Pumwidth),
+            (&b"aw"[..], OptIndex::Autowrite),
+            (&b"lw"[..], OptIndex::Lispwords),
+            (&b"ex"[..], OptIndex::Exrc),
+            (&b"dy"[..], OptIndex::Display),
+            (&b"lz"[..], OptIndex::Lazyredraw),
+            (&b"sta"[..], OptIndex::Smarttab),
+            (&b"awa"[..], OptIndex::Autowriteall),
+            (&b"sua"[..], OptIndex::Suffixesadd),
+            (&b"cia"[..], OptIndex::Completeitemalign),
+            (&b"dia"[..], OptIndex::Diffanchors),
+            (&b"wfb"[..], OptIndex::Winfixbuf),
+            (&b"swb"[..], OptIndex::Switchbuf),
+            (&b"scb"[..], OptIndex::Scrollbind),
+            (&b"rdb"[..], OptIndex::Redrawdebug),
+            (&b"crb"[..], OptIndex::Cursorbind),
+            (&b"enc"[..], OptIndex::Encoding),
+            (&b"smc"[..], OptIndex::Synmaxcol),
+            (&b"tgc"[..], OptIndex::Termguicolors),
+            (&b"stc"[..], OptIndex::Statuscolumn),
+            (&b"imc"[..], OptIndex::Imcmdline),
+            (&b"inc"[..], OptIndex::Include),
+            (&b"spc"[..], OptIndex::Spellcapcheck),
+            (&b"wic"[..], OptIndex::Wildignorecase),
+            (&b"bkc"[..], OptIndex::Backupcopy),
+            (&b"msc"[..], OptIndex::Maxsearchcount),
+            (&b"cuc"[..], OptIndex::Cursorcolumn),
+            (&b"fic"[..], OptIndex::Fileignorecase),
+            (&b"fdc"[..], OptIndex::Foldcolumn),
+            (&b"rlc"[..], OptIndex::Rightleftcmd),
+            (&b"ead"[..], OptIndex::Eadirection),
+            (&b"hid"[..], OptIndex::Hidden),
+            (&b"smd"[..], OptIndex::Showmode),
+            (&b"imd"[..], OptIndex::Imdisable),
+            (&b"acd"[..], OptIndex::Autochdir),
+            (&b"mfd"[..], OptIndex::Maxfuncdepth),
+            (&b"mmd"[..], OptIndex::Maxmapdepth),
+            (&b"mod"[..], OptIndex::Modified),
+            (&b"sxe"[..], OptIndex::Shellxescape),
+            (&b"mle"[..], OptIndex::Modelineexpr),
+            (&b"fde"[..], OptIndex::Foldexpr),
+            (&b"eof"[..], OptIndex::Endoffile),
+            (&b"ruf"[..], OptIndex::Rulerformat),
+            (&b"swf"[..], OptIndex::Swapfile),
+            (&b"spf"[..], OptIndex::Spellfile),
+            (&b"tpf"[..], OptIndex::Termpastefilter),
+            (&b"plf"[..], OptIndex::Packlockfile),
+            (&b"udf"[..], OptIndex::Undofile),
+            (&b"inf"[..], OptIndex::Infercase),
+            (&b"mef"[..], OptIndex::Makeef),
+            (&b"isf"[..], OptIndex::Isfname),
+            (&b"sdf"[..], OptIndex::Shadafile),
+            (&b"vif"[..], OptIndex::Shadafile),
+            (&b"def"[..], OptIndex::Define),
+            (&b"tag"[..], OptIndex::Tags),
+            (&b"hlg"[..], OptIndex::Helplang),
+            (&b"wig"[..], OptIndex::Wildignore),
+            (&b"cdh"[..], OptIndex::Cdhome),
+            (&b"wfh"[..], OptIndex::Winfixheight),
+            (&b"wmh"[..], OptIndex::Winminheight),
+            (&b"pvh"[..], OptIndex::Previewheight),
+            (&b"cwh"[..], OptIndex::Cmdwinheight),
+            (&b"chi"[..], OptIndex::Chistory),
+            (&b"ari"[..], OptIndex::Allowrevins),
+            (&b"imi"[..], OptIndex::Iminsert),
+            (&b"isi"[..], OptIndex::Isident),
+            (&b"bri"[..], OptIndex::Breakindent),
+            (&b"lhi"[..], OptIndex::Lhistory),
+            (&b"fdi"[..], OptIndex::Foldignore),
+            (&b"wak"[..], OptIndex::Winaltkeys),
+            (&b"spk"[..], OptIndex::Splitkeep),
+            (&b"bsk"[..], OptIndex::Backupskip),
+            (&b"brk"[..], OptIndex::Breakat),
+            (&b"isk"[..], OptIndex::Iskeyword),
+            (&b"gtl"[..], OptIndex::Guitablabel),
+            (&b"sel"[..], OptIndex::Selection),
+            (&b"fml"[..], OptIndex::Foldminlines),
+            (&b"stl"[..], OptIndex::Statusline),
+            (&b"tcl"[..], OptIndex::Tabclose),
+            (&b"sol"[..], OptIndex::Startofline),
+            (&b"scl"[..], OptIndex::Signcolumn),
+            (&b"spl"[..], OptIndex::Spelllang),
+            (&b"acl"[..], OptIndex::Autocompletedelay),
+            (&b"tal"[..], OptIndex::Tabline),
+            (&b"csl"[..], OptIndex::Completeslash),
+            (&b"eol"[..], OptIndex::Endofline),
+            (&b"lpl"[..], OptIndex::Loadplugins),
+            (&b"ssl"[..], OptIndex::Shellslash),
+            (&b"fcl"[..], OptIndex::Foldclose),
+            (&b"cul"[..], OptIndex::Cursorline),
+            (&b"fdl"[..], OptIndex::Foldlevel),
+            (&b"gfm"[..], OptIndex::Grepformat),
+            (&b"efm"[..], OptIndex::Errorformat),
+            (&b"wim"[..], OptIndex::Wildmode),
+            (&b"ttm"[..], OptIndex::Ttimeoutlen),
+            (&b"icm"[..], OptIndex::Inccommand),
+            (&b"wcm"[..], OptIndex::Wildcharm),
+            (&b"com"[..], OptIndex::Comments),
+            (&b"tpm"[..], OptIndex::Tabpagemax),
+            (&b"slm"[..], OptIndex::Selectmode),
+            (&b"msm"[..], OptIndex::Mkspellmem),
+            (&b"lrm"[..], OptIndex::Langremap),
+            (&b"shm"[..], OptIndex::Shortmess),
+            (&b"fdm"[..], OptIndex::Foldmethod),
+            (&b"fdn"[..], OptIndex::Foldnestmax),
+            (&b"gfn"[..], OptIndex::Guifont),
+            (&b"cin"[..], OptIndex::Cindent),
+            (&b"syn"[..], OptIndex::Syntax),
+            (&b"bin"[..], OptIndex::Binary),
+            (&b"fen"[..], OptIndex::Foldenable),
+            (&b"fdo"[..], OptIndex::Foldopen),
+            (&b"emo"[..], OptIndex::Emoji),
+            (&b"sbo"[..], OptIndex::Scrollopt),
+            (&b"spo"[..], OptIndex::Spelloptions),
+            (&b"cto"[..], OptIndex::Completetimeout),
+            (&b"mco"[..], OptIndex::Maxcombine),
+            (&b"cpo"[..], OptIndex::Cpoptions),
+            (&b"flp"[..], OptIndex::Formatlistpat),
+            (&b"cmp"[..], OptIndex::Casemap),
+            (&b"hkp"[..], OptIndex::Hkmapp),
+            (&b"sop"[..], OptIndex::Scrolloffpad),
+            (&b"wop"[..], OptIndex::Wildoptions),
+            (&b"vop"[..], OptIndex::Viewoptions),
+            (&b"top"[..], OptIndex::Tildeop),
+            (&b"isp"[..], OptIndex::Isprint),
+            (&b"jop"[..], OptIndex::Jumpoptions),
+            (&b"kmp"[..], OptIndex::Keymap),
+            (&b"rtp"[..], OptIndex::Runtimepath),
+            (&b"lop"[..], OptIndex::Lispoptions),
+            (&b"lsp"[..], OptIndex::Linespace),
+            (&b"mmp"[..], OptIndex::Maxmempattern),
+            (&b"dip"[..], OptIndex::Diffopt),
+            (&b"sxq"[..], OptIndex::Shellxquote),
+            (&b"shq"[..], OptIndex::Shellquote),
+            (&b"dir"[..], OptIndex::Directory),
+            (&b"gcr"[..], OptIndex::Guicursor),
+            (&b"sbr"[..], OptIndex::Showbreak),
+            (&b"wbr"[..], OptIndex::Winbar),
+            (&b"tsr"[..], OptIndex::Thesaurus),
+            (&b"spr"[..], OptIndex::Splitright),
+            (&b"scr"[..], OptIndex::Scroll),
+            (&b"lbr"[..], OptIndex::Linebreak),
+            (&b"srr"[..], OptIndex::Shellredir),
+            (&b"lnr"[..], OptIndex::Langnoremap),
+            (&b"fmr"[..], OptIndex::Foldmarker),
+            (&b"hls"[..], OptIndex::Hlsearch),
+            (&b"vts"[..], OptIndex::Vartabstop),
+            (&b"tbs"[..], OptIndex::Tagbsearch),
+            (&b"sps"[..], OptIndex::Spellsuggest),
+            (&b"vbs"[..], OptIndex::Verbose),
+            (&b"ims"[..], OptIndex::Imsearch),
+            (&b"sts"[..], OptIndex::Softtabstop),
+            (&b"sms"[..], OptIndex::Smoothscroll),
+            (&b"scs"[..], OptIndex::Smartcase),
+            (&b"cms"[..], OptIndex::Commentstring),
+            (&b"lcs"[..], OptIndex::Listchars),
+            (&b"mps"[..], OptIndex::Matchpairs),
+            (&b"mis"[..], OptIndex::Menuitems),
+            (&b"ffs"[..], OptIndex::Fileformats),
+            (&b"fcs"[..], OptIndex::Fillchars),
+            (&b"mls"[..], OptIndex::Modelines),
+            (&b"fdt"[..], OptIndex::Foldtext),
+            (&b"gtt"[..], OptIndex::Guitabtooltip),
+            (&b"sft"[..], OptIndex::Showfulltag),
+            (&b"act"[..], OptIndex::Autocompletetimeout),
+            (&b"cpt"[..], OptIndex::Complete),
+            (&b"cot"[..], OptIndex::Completeopt),
+            (&b"mat"[..], OptIndex::Matchtime),
+            (&b"rdt"[..], OptIndex::Redrawtime),
+            (&b"tfu"[..], OptIndex::Tagfunc),
+            (&b"cfu"[..], OptIndex::Completefunc),
+            (&b"ffu"[..], OptIndex::Findfunc),
+            (&b"ofu"[..], OptIndex::Omnifunc),
+            (&b"rnu"[..], OptIndex::Relativenumber),
+            (&b"ccv"[..], OptIndex::Charconvert),
+            (&b"gfw"[..], OptIndex::Guifontwide),
+            (&b"wfw"[..], OptIndex::Winfixwidth),
+            (&b"wmw"[..], OptIndex::Winminwidth),
+            (&b"wiw"[..], OptIndex::Winwidth),
+            (&b"pmw"[..], OptIndex::Pummaxwidth),
+            (&b"pvw"[..], OptIndex::Previewwindow),
+            (&b"nuw"[..], OptIndex::Numberwidth),
+            (&b"eiw"[..], OptIndex::Eventignorewin),
+            (&b"fex"[..], OptIndex::Formatexpr),
+            (&b"pex"[..], OptIndex::Patchexpr),
+            (&b"pyx"[..], OptIndex::Pyxversion),
+            (&b"bex"[..], OptIndex::Backupext),
+            (&b"dex"[..], OptIndex::Diffexpr),
+            (&b"para"[..], OptIndex::Paragraphs),
+            (&b"arab"[..], OptIndex::Arabic),
+            (&b"bomb"[..], OptIndex::Bomb),
+            (&b"exrc"[..], OptIndex::Exrc),
+            (&b"sloc"[..], OptIndex::Showcmdloc),
+            (&b"tenc"[..], OptIndex::Termencoding),
+            (&b"fenc"[..], OptIndex::Fileencoding),
+            (&b"menc"[..], OptIndex::Makeencoding),
+            (&b"cole"[..], OptIndex::Conceallevel),
+            (&b"more"[..], OptIndex::More),
+            (&b"inde"[..], OptIndex::Indentexpr),
+            (&b"qftf"[..], OptIndex::Quickfixtextfunc),
+            (&b"shcf"[..], OptIndex::Shellcmdflag),
+            (&b"diff"[..], OptIndex::Diff),
+            (&b"path"[..], OptIndex::Path),
+            (&b"cink"[..], OptIndex::Cinkeys),
+            (&b"scbk"[..], OptIndex::Scrollback),
+            (&b"indk"[..], OptIndex::Indentkeys),
+            (&b"stal"[..], OptIndex::Showtabline),
+            (&b"warn"[..], OptIndex::Warn),
+            (&b"icon"[..], OptIndex::Icon),
+            (&b"siso"[..], OptIndex::Sidescrolloff),
+            (&b"cino"[..], OptIndex::Cinoptions),
+            (&b"deco"[..], OptIndex::Delcombine),
+            (&b"wrap"[..], OptIndex::Wrap),
+            (&b"stmp"[..], OptIndex::Shelltemp),
+            (&b"lmap"[..], OptIndex::Langmap),
+            (&b"lisp"[..], OptIndex::Lisp),
+            (&b"ssop"[..], OptIndex::Sessionoptions),
+            (&b"vdir"[..], OptIndex::Viewdir),
+            (&b"udir"[..], OptIndex::Undodir),
+            (&b"bdir"[..], OptIndex::Backupdir),
+            (&b"vsts"[..], OptIndex::Varsofttabstop),
+            (&b"tags"[..], OptIndex::Tags),
+            (&b"fdls"[..], OptIndex::Foldlevelstart),
+            (&b"sect"[..], OptIndex::Sections),
+            (&b"list"[..], OptIndex::List),
+            (&b"tgst"[..], OptIndex::Tagstack),
+            (&b"mopt"[..], OptIndex::Messagesopt),
+            (&b"dict"[..], OptIndex::Dictionary),
+            (&b"wmnu"[..], OptIndex::Wildmenu),
+            (&b"cocu"[..], OptIndex::Concealcursor),
+            (&b"odev"[..], OptIndex::Opendevice),
+            (&b"cinw"[..], OptIndex::Cinwords),
+            (&b"ambw"[..], OptIndex::Ambiwidth),
+            (&b"inex"[..], OptIndex::Includeexpr),
+            (&b"busy"[..], OptIndex::Busy),
+            (&b"aleph"[..], OptIndex::Aleph),
+            (&b"bsdir"[..], OptIndex::Browsedir),
+            (&b"cedit"[..], OptIndex::Cedit),
+            (&b"cinsd"[..], OptIndex::Cinscopedecls),
+            (&b"debug"[..], OptIndex::Debug),
+            (&b"emoji"[..], OptIndex::Emoji),
+            (&b"fsync"[..], OptIndex::Fsync),
+            (&b"fencs"[..], OptIndex::Fileencodings),
+            (&b"hkmap"[..], OptIndex::Hkmap),
+            (&b"lines"[..], OptIndex::Lines),
+            (&b"magic"[..], OptIndex::Magic),
+            (&b"mouse"[..], OptIndex::Mouse),
+            (&b"paste"[..], OptIndex::Paste),
+            (&b"remap"[..], OptIndex::Remap),
+            (&b"ruler"[..], OptIndex::Ruler),
+            (&b"shell"[..], OptIndex::Shell),
+            (&b"spell"[..], OptIndex::Spell),
+            (&b"shada"[..], OptIndex::Shada),
+            (&b"tbidi"[..], OptIndex::Termbidi),
+            (&b"terse"[..], OptIndex::Terse),
+            (&b"tsrfu"[..], OptIndex::Thesaurusfunc),
+            (&b"title"[..], OptIndex::Title),
+            (&b"vfile"[..], OptIndex::Verbosefile),
+            (&b"write"[..], OptIndex::Write),
+            (&b"winhl"[..], OptIndex::Winhighlight),
+            (&b"winbl"[..], OptIndex::Winblend),
+            (&b"arabic"[..], OptIndex::Arabic),
+            (&b"secure"[..], OptIndex::Secure),
+            (&b"backup"[..], OptIndex::Backup),
+            (&b"hidden"[..], OptIndex::Hidden),
+            (&b"opfunc"[..], OptIndex::Operatorfunc),
+            (&b"define"[..], OptIndex::Define),
+            (&b"cdhome"[..], OptIndex::Cdhome),
+            (&b"briopt"[..], OptIndex::Breakindentopt),
+            (&b"makeef"[..], OptIndex::Makeef),
+            (&b"culopt"[..], OptIndex::Cursorlineopt),
+            (&b"hkmapp"[..], OptIndex::Hkmapp),
+            (&b"number"[..], OptIndex::Number),
+            (&b"window"[..], OptIndex::Window),
+            (&b"winbar"[..], OptIndex::Winbar),
+            (&b"binary"[..], OptIndex::Binary),
+            (&b"syntax"[..], OptIndex::Syntax),
+            (&b"prompt"[..], OptIndex::Prompt),
+            (&b"cdpath"[..], OptIndex::Cdpath),
+            (&b"report"[..], OptIndex::Report),
+            (&b"scroll"[..], OptIndex::Scroll),
+            (&b"mousef"[..], OptIndex::Mousefocus),
+            (&b"mousem"[..], OptIndex::Mousemodel),
+            (&b"mouses"[..], OptIndex::Mouseshape),
+            (&b"mouset"[..], OptIndex::Mousetime),
+            (&b"revins"[..], OptIndex::Revins),
+            (&b"fixeol"[..], OptIndex::Fixendofline),
+            (&b"keymap"[..], OptIndex::Keymap),
+            (&b"channel"[..], OptIndex::Channel),
+            (&b"tabline"[..], OptIndex::Tabline),
+            (&b"tabstop"[..], OptIndex::Tabstop),
+            (&b"include"[..], OptIndex::Include),
+            (&b"undodir"[..], OptIndex::Undodir),
+            (&b"viewdir"[..], OptIndex::Viewdir),
+            (&b"grepprg"[..], OptIndex::Grepprg),
+            (&b"breakat"[..], OptIndex::Breakat),
+            (&b"diffopt"[..], OptIndex::Diffopt),
+            (&b"buftype"[..], OptIndex::Buftype),
+            (&b"isfname"[..], OptIndex::Isfname),
+            (&b"digraph"[..], OptIndex::Digraph),
+            (&b"tagcase"[..], OptIndex::Tagcase),
+            (&b"tagfunc"[..], OptIndex::Tagfunc),
+            (&b"guifont"[..], OptIndex::Guifont),
+            (&b"isident"[..], OptIndex::Isident),
+            (&b"makeprg"[..], OptIndex::Makeprg),
+            (&b"tildeop"[..], OptIndex::Tildeop),
+            (&b"columns"[..], OptIndex::Columns),
+            (&b"belloff"[..], OptIndex::Belloff),
+            (&b"timeout"[..], OptIndex::Timeout),
+            (&b"viminfo"[..], OptIndex::Shada),
+            (&b"cindent"[..], OptIndex::Cindent),
+            (&b"cinkeys"[..], OptIndex::Cinkeys),
+            (&b"langmap"[..], OptIndex::Langmap),
+            (&b"confirm"[..], OptIndex::Confirm),
+            (&b"showcmd"[..], OptIndex::Showcmd),
+            (&b"isprint"[..], OptIndex::Isprint),
+            (&b"verbose"[..], OptIndex::Verbose),
+            (&b"display"[..], OptIndex::Display),
+            (&b"casemap"[..], OptIndex::Casemap),
+            (&b"history"[..], OptIndex::History),
+            (&b"arshape"[..], OptIndex::Arabicshape),
+            (&b"ttyfast"[..], OptIndex::Ttyfast),
+            (&b"autoread"[..], OptIndex::Autoread),
+            (&b"chistory"[..], OptIndex::Chistory),
+            (&b"comments"[..], OptIndex::Comments),
+            (&b"complete"[..], OptIndex::Complete),
+            (&b"cinwords"[..], OptIndex::Cinwords),
+            (&b"diffexpr"[..], OptIndex::Diffexpr),
+            (&b"encoding"[..], OptIndex::Encoding),
+            (&b"equalprg"[..], OptIndex::Equalprg),
+            (&b"foldopen"[..], OptIndex::Foldopen),
+            (&b"foldtext"[..], OptIndex::Foldtext),
+            (&b"findfunc"[..], OptIndex::Findfunc),
+            (&b"filetype"[..], OptIndex::Filetype),
+            (&b"foldexpr"[..], OptIndex::Foldexpr),
+            (&b"gdefault"[..], OptIndex::Gdefault),
+            (&b"helpfile"[..], OptIndex::Helpfile),
+            (&b"helplang"[..], OptIndex::Helplang),
+            (&b"hlsearch"[..], OptIndex::Hlsearch),
+            (&b"iminsert"[..], OptIndex::Iminsert),
+            (&b"imsearch"[..], OptIndex::Imsearch),
+            (&b"keymodel"[..], OptIndex::Keymodel),
+            (&b"langmenu"[..], OptIndex::Langmenu),
+            (&b"lhistory"[..], OptIndex::Lhistory),
+            (&b"modeline"[..], OptIndex::Modeline),
+            (&b"mousemev"[..], OptIndex::Mousemoveevent),
+            (&b"modified"[..], OptIndex::Modified),
+            (&b"omnifunc"[..], OptIndex::Omnifunc),
+            (&b"packpath"[..], OptIndex::Packpath),
+            (&b"pumwidth"[..], OptIndex::Pumwidth),
+            (&b"pumblend"[..], OptIndex::Pumblend),
+            (&b"readonly"[..], OptIndex::Readonly),
+            (&b"sections"[..], OptIndex::Sections),
+            (&b"swapfile"[..], OptIndex::Swapfile),
+            (&b"suffixes"[..], OptIndex::Suffixes),
+            (&b"showmode"[..], OptIndex::Showmode),
+            (&b"smarttab"[..], OptIndex::Smarttab),
+            (&b"tabclose"[..], OptIndex::Tabclose),
+            (&b"tagstack"[..], OptIndex::Tagstack),
+            (&b"termbidi"[..], OptIndex::Termbidi),
+            (&b"termsync"[..], OptIndex::Termsync),
+            (&b"titlelen"[..], OptIndex::Titlelen),
+            (&b"titleold"[..], OptIndex::Titleold),
+            (&b"ttimeout"[..], OptIndex::Ttimeout),
+            (&b"undofile"[..], OptIndex::Undofile),
+            (&b"writeany"[..], OptIndex::Writeany),
+            (&b"wrapscan"[..], OptIndex::Wrapscan),
+            (&b"winwidth"[..], OptIndex::Winwidth),
+            (&b"wildmenu"[..], OptIndex::Wildmenu),
+            (&b"wildchar"[..], OptIndex::Wildchar),
+            (&b"winblend"[..], OptIndex::Winblend),
+            (&b"wildmode"[..], OptIndex::Wildmode),
+            (&b"expandtab"[..], OptIndex::Expandtab),
+            (&b"winborder"[..], OptIndex::Winborder),
+            (&b"pumborder"[..], OptIndex::Pumborder),
+            (&b"whichwrap"[..], OptIndex::Whichwrap),
+            (&b"guicursor"[..], OptIndex::Guicursor),
+            (&b"patchexpr"[..], OptIndex::Patchexpr),
+            (&b"patchmode"[..], OptIndex::Patchmode),
+            (&b"matchtime"[..], OptIndex::Matchtime),
+            (&b"wildcharm"[..], OptIndex::Wildcharm),
+            (&b"foldclose"[..], OptIndex::Foldclose),
+            (&b"shadafile"[..], OptIndex::Shadafile),
+            (&b"foldlevel"[..], OptIndex::Foldlevel),
+            (&b"directory"[..], OptIndex::Directory),
+            (&b"infercase"[..], OptIndex::Infercase),
+            (&b"linespace"[..], OptIndex::Linespace),
+            (&b"selection"[..], OptIndex::Selection),
+            (&b"linebreak"[..], OptIndex::Linebreak),
+            (&b"iskeyword"[..], OptIndex::Iskeyword),
+            (&b"modelines"[..], OptIndex::Modelines),
+            (&b"winfixbuf"[..], OptIndex::Winfixbuf),
+            (&b"langremap"[..], OptIndex::Langremap),
+            (&b"highlight"[..], OptIndex::Highlight),
+            (&b"winheight"[..], OptIndex::Winheight),
+            (&b"pumheight"[..], OptIndex::Pumheight),
+            (&b"cmdheight"[..], OptIndex::Cmdheight),
+            (&b"rightleft"[..], OptIndex::Rightleft),
+            (&b"bufhidden"[..], OptIndex::Bufhidden),
+            (&b"imdisable"[..], OptIndex::Imdisable),
+            (&b"splitkeep"[..], OptIndex::Splitkeep),
+            (&b"ambiwidth"[..], OptIndex::Ambiwidth),
+            (&b"backspace"[..], OptIndex::Backspace),
+            (&b"backupdir"[..], OptIndex::Backupdir),
+            (&b"backupext"[..], OptIndex::Backupext),
+            (&b"spellfile"[..], OptIndex::Spellfile),
+            (&b"spelllang"[..], OptIndex::Spelllang),
+            (&b"taglength"[..], OptIndex::Taglength),
+            (&b"buflisted"[..], OptIndex::Buflisted),
+            (&b"shellpipe"[..], OptIndex::Shellpipe),
+            (&b"fillchars"[..], OptIndex::Fillchars),
+            (&b"shelltemp"[..], OptIndex::Shelltemp),
+            (&b"formatprg"[..], OptIndex::Formatprg),
+            (&b"imcmdline"[..], OptIndex::Imcmdline),
+            (&b"synmaxcol"[..], OptIndex::Synmaxcol),
+            (&b"endoffile"[..], OptIndex::Endoffile),
+            (&b"endofline"[..], OptIndex::Endofline),
+            (&b"scrolloff"[..], OptIndex::Scrolloff),
+            (&b"scrollopt"[..], OptIndex::Scrollopt),
+            (&b"autochdir"[..], OptIndex::Autochdir),
+            (&b"autowrite"[..], OptIndex::Autowrite),
+            (&b"errorfile"[..], OptIndex::Errorfile),
+            (&b"nrformats"[..], OptIndex::Nrformats),
+            (&b"winpinned"[..], OptIndex::Winpinned),
+            (&b"clipboard"[..], OptIndex::Clipboard),
+            (&b"lispwords"[..], OptIndex::Lispwords),
+            (&b"cpoptions"[..], OptIndex::Cpoptions),
+            (&b"shortmess"[..], OptIndex::Shortmess),
+            (&b"smartcase"[..], OptIndex::Smartcase),
+            (&b"thesaurus"[..], OptIndex::Thesaurus),
+            (&b"incsearch"[..], OptIndex::Incsearch),
+            (&b"mousehide"[..], OptIndex::Mousehide),
+            (&b"mousetime"[..], OptIndex::Mousetime),
+            (&b"textwidth"[..], OptIndex::Textwidth),
+            (&b"switchbuf"[..], OptIndex::Switchbuf),
+            (&b"listchars"[..], OptIndex::Listchars),
+            (&b"menuitems"[..], OptIndex::Menuitems),
+            (&b"showmatch"[..], OptIndex::Showmatch),
+            (&b"browsedir"[..], OptIndex::Browsedir),
+            (&b"showbreak"[..], OptIndex::Showbreak),
+            (&b"tagbsearch"[..], OptIndex::Tagbsearch),
+            (&b"joinspaces"[..], OptIndex::Joinspaces),
+            (&b"paragraphs"[..], OptIndex::Paragraphs),
+            (&b"laststatus"[..], OptIndex::Laststatus),
+            (&b"matchpairs"[..], OptIndex::Matchpairs),
+            (&b"modifiable"[..], OptIndex::Modifiable),
+            (&b"foldenable"[..], OptIndex::Foldenable),
+            (&b"visualbell"[..], OptIndex::Visualbell),
+            (&b"scrollback"[..], OptIndex::Scrollback),
+            (&b"scrollbind"[..], OptIndex::Scrollbind),
+            (&b"maxcombine"[..], OptIndex::Maxcombine),
+            (&b"cursorbind"[..], OptIndex::Cursorbind),
+            (&b"delcombine"[..], OptIndex::Delcombine),
+            (&b"ignorecase"[..], OptIndex::Ignorecase),
+            (&b"backupcopy"[..], OptIndex::Backupcopy),
+            (&b"showcmdloc"[..], OptIndex::Showcmdloc),
+            (&b"keywordprg"[..], OptIndex::Keywordprg),
+            (&b"lazyredraw"[..], OptIndex::Lazyredraw),
+            (&b"copyindent"[..], OptIndex::Copyindent),
+            (&b"autoindent"[..], OptIndex::Autoindent),
+            (&b"formatexpr"[..], OptIndex::Formatexpr),
+            (&b"errorbells"[..], OptIndex::Errorbells),
+            (&b"writedelay"[..], OptIndex::Writedelay),
+            (&b"tabpagemax"[..], OptIndex::Tabpagemax),
+            (&b"splitbelow"[..], OptIndex::Splitbelow),
+            (&b"shellredir"[..], OptIndex::Shellredir),
+            (&b"indentexpr"[..], OptIndex::Indentexpr),
+            (&b"mouseshape"[..], OptIndex::Mouseshape),
+            (&b"guioptions"[..], OptIndex::Guioptions),
+            (&b"helpheight"[..], OptIndex::Helpheight),
+            (&b"splitright"[..], OptIndex::Splitright),
+            (&b"compatible"[..], OptIndex::Compatible),
+            (&b"shiftwidth"[..], OptIndex::Shiftwidth),
+            (&b"cinoptions"[..], OptIndex::Cinoptions),
+            (&b"scrolljump"[..], OptIndex::Scrolljump),
+            (&b"winaltkeys"[..], OptIndex::Winaltkeys),
+            (&b"indentkeys"[..], OptIndex::Indentkeys),
+            (&b"statusline"[..], OptIndex::Statusline),
+            (&b"undoreload"[..], OptIndex::Undoreload),
+            (&b"signcolumn"[..], OptIndex::Signcolumn),
+            (&b"foldcolumn"[..], OptIndex::Foldcolumn),
+            (&b"mkspellmem"[..], OptIndex::Mkspellmem),
+            (&b"shellslash"[..], OptIndex::Shellslash),
+            (&b"cursorline"[..], OptIndex::Cursorline),
+            (&b"inccommand"[..], OptIndex::Inccommand),
+            (&b"selectmode"[..], OptIndex::Selectmode),
+            (&b"insertmode"[..], OptIndex::Insertmode),
+            (&b"wildignore"[..], OptIndex::Wildignore),
+            (&b"foldignore"[..], OptIndex::Foldignore),
+            (&b"dictionary"[..], OptIndex::Dictionary),
+            (&b"shiftround"[..], OptIndex::Shiftround),
+            (&b"background"[..], OptIndex::Background),
+            (&b"mousefocus"[..], OptIndex::Mousefocus),
+            (&b"mousemodel"[..], OptIndex::Mousemodel),
+            (&b"grepformat"[..], OptIndex::Grepformat),
+            (&b"wrapmargin"[..], OptIndex::Wrapmargin),
+            (&b"iconstring"[..], OptIndex::Iconstring),
+            (&b"sidescroll"[..], OptIndex::Sidescroll),
+            (&b"fileformat"[..], OptIndex::Fileformat),
+            (&b"foldmarker"[..], OptIndex::Foldmarker),
+            (&b"vartabstop"[..], OptIndex::Vartabstop),
+            (&b"backupskip"[..], OptIndex::Backupskip),
+            (&b"pyxversion"[..], OptIndex::Pyxversion),
+            (&b"updatetime"[..], OptIndex::Updatetime),
+            (&b"timeoutlen"[..], OptIndex::Timeoutlen),
+            (&b"foldmethod"[..], OptIndex::Foldmethod),
+            (&b"redrawtime"[..], OptIndex::Redrawtime),
+            (&b"shellquote"[..], OptIndex::Shellquote),
+            (&b"undolevels"[..], OptIndex::Undolevels),
+            (&b"opendevice"[..], OptIndex::Opendevice),
+            (&b"equalalways"[..], OptIndex::Equalalways),
+            (&b"virtualedit"[..], OptIndex::Virtualedit),
+            (&b"softtabstop"[..], OptIndex::Softtabstop),
+            (&b"showtabline"[..], OptIndex::Showtabline),
+            (&b"guitablabel"[..], OptIndex::Guitablabel),
+            (&b"writebackup"[..], OptIndex::Writebackup),
+            (&b"arabicshape"[..], OptIndex::Arabicshape),
+            (&b"colorcolumn"[..], OptIndex::Colorcolumn),
+            (&b"includeexpr"[..], OptIndex::Includeexpr),
+            (&b"foldnestmax"[..], OptIndex::Foldnestmax),
+            (&b"updatecount"[..], OptIndex::Updatecount),
+            (&b"eadirection"[..], OptIndex::Eadirection),
+            (&b"quoteescape"[..], OptIndex::Quoteescape),
+            (&b"completeopt"[..], OptIndex::Completeopt),
+            (&b"rulerformat"[..], OptIndex::Rulerformat),
+            (&b"errorformat"[..], OptIndex::Errorformat),
+            (&b"viminfofile"[..], OptIndex::Shadafile),
+            (&b"messagesopt"[..], OptIndex::Messagesopt),
+            (&b"smartindent"[..], OptIndex::Smartindent),
+            (&b"breakindent"[..], OptIndex::Breakindent),
+            (&b"eventignore"[..], OptIndex::Eventignore),
+            (&b"tagrelative"[..], OptIndex::Tagrelative),
+            (&b"loadplugins"[..], OptIndex::Loadplugins),
+            (&b"runtimepath"[..], OptIndex::Runtimepath),
+            (&b"guifontwide"[..], OptIndex::Guifontwide),
+            (&b"winminwidth"[..], OptIndex::Winminwidth),
+            (&b"diffanchors"[..], OptIndex::Diffanchors),
+            (&b"charconvert"[..], OptIndex::Charconvert),
+            (&b"ttimeoutlen"[..], OptIndex::Ttimeoutlen),
+            (&b"startofline"[..], OptIndex::Startofline),
+            (&b"fileformats"[..], OptIndex::Fileformats),
+            (&b"langnoremap"[..], OptIndex::Langnoremap),
+            (&b"wildoptions"[..], OptIndex::Wildoptions),
+            (&b"viewoptions"[..], OptIndex::Viewoptions),
+            (&b"jumpoptions"[..], OptIndex::Jumpoptions),
+            (&b"lispoptions"[..], OptIndex::Lispoptions),
+            (&b"maxmapdepth"[..], OptIndex::Maxmapdepth),
+            (&b"allowrevins"[..], OptIndex::Allowrevins),
+            (&b"numberwidth"[..], OptIndex::Numberwidth),
+            (&b"verbosefile"[..], OptIndex::Verbosefile),
+            (&b"titlestring"[..], OptIndex::Titlestring),
+            (&b"mousescroll"[..], OptIndex::Mousescroll),
+            (&b"pastetoggle"[..], OptIndex::Pastetoggle),
+            (&b"showfulltag"[..], OptIndex::Showfulltag),
+            (&b"redrawdebug"[..], OptIndex::Redrawdebug),
+            (&b"winfixwidth"[..], OptIndex::Winfixwidth),
+            (&b"pummaxwidth"[..], OptIndex::Pummaxwidth),
+            (&b"suffixesadd"[..], OptIndex::Suffixesadd),
+            (&b"shellxquote"[..], OptIndex::Shellxquote),
+            (&b"statuscolumn"[..], OptIndex::Statuscolumn),
+            (&b"edcompatible"[..], OptIndex::Edcompatible),
+            (&b"packlockfile"[..], OptIndex::Packlockfile),
+            (&b"modelineexpr"[..], OptIndex::Modelineexpr),
+            (&b"cmdwinheight"[..], OptIndex::Cmdwinheight),
+            (&b"operatorfunc"[..], OptIndex::Operatorfunc),
+            (&b"spellsuggest"[..], OptIndex::Spellsuggest),
+            (&b"spelloptions"[..], OptIndex::Spelloptions),
+            (&b"shellxescape"[..], OptIndex::Shellxescape),
+            (&b"shellcmdflag"[..], OptIndex::Shellcmdflag),
+            (&b"regexpengine"[..], OptIndex::Regexpengine),
+            (&b"rightleftcmd"[..], OptIndex::Rightleftcmd),
+            (&b"makeencoding"[..], OptIndex::Makeencoding),
+            (&b"fileencoding"[..], OptIndex::Fileencoding),
+            (&b"foldminlines"[..], OptIndex::Foldminlines),
+            (&b"completefunc"[..], OptIndex::Completefunc),
+            (&b"winfixheight"[..], OptIndex::Winfixheight),
+            (&b"winhighlight"[..], OptIndex::Winhighlight),
+            (&b"winminheight"[..], OptIndex::Winminheight),
+            (&b"conceallevel"[..], OptIndex::Conceallevel),
+            (&b"smoothscroll"[..], OptIndex::Smoothscroll),
+            (&b"scrolloffpad"[..], OptIndex::Scrolloffpad),
+            (&b"termencoding"[..], OptIndex::Termencoding),
+            (&b"cursorcolumn"[..], OptIndex::Cursorcolumn),
+            (&b"autocomplete"[..], OptIndex::Autocomplete),
+            (&b"autowriteall"[..], OptIndex::Autowriteall),
+            (&b"maxfuncdepth"[..], OptIndex::Maxfuncdepth),
+            (&b"fixendofline"[..], OptIndex::Fixendofline),
+            (&b"concealcursor"[..], OptIndex::Concealcursor),
+            (&b"guitabtooltip"[..], OptIndex::Guitabtooltip),
+            (&b"sidescrolloff"[..], OptIndex::Sidescrolloff),
+            (&b"spellcapcheck"[..], OptIndex::Spellcapcheck),
+            (&b"previewheight"[..], OptIndex::Previewheight),
+            (&b"completeslash"[..], OptIndex::Completeslash),
+            (&b"previewwindow"[..], OptIndex::Previewwindow),
+            (&b"maxmempattern"[..], OptIndex::Maxmempattern),
+            (&b"fileencodings"[..], OptIndex::Fileencodings),
+            (&b"commentstring"[..], OptIndex::Commentstring),
+            (&b"cinscopedecls"[..], OptIndex::Cinscopedecls),
+            (&b"cursorlineopt"[..], OptIndex::Cursorlineopt),
+            (&b"formatlistpat"[..], OptIndex::Formatlistpat),
+            (&b"formatoptions"[..], OptIndex::Formatoptions),
+            (&b"termguicolors"[..], OptIndex::Termguicolors),
+            (&b"thesaurusfunc"[..], OptIndex::Thesaurusfunc),
+            (&b"breakindentopt"[..], OptIndex::Breakindentopt),
+            (&b"eventignorewin"[..], OptIndex::Eventignorewin),
+            (&b"fileignorecase"[..], OptIndex::Fileignorecase),
+            (&b"foldlevelstart"[..], OptIndex::Foldlevelstart),
+            (&b"maxsearchcount"[..], OptIndex::Maxsearchcount),
+            (&b"mousemoveevent"[..], OptIndex::Mousemoveevent),
+            (&b"preserveindent"[..], OptIndex::Preserveindent),
+            (&b"relativenumber"[..], OptIndex::Relativenumber),
+            (&b"sessionoptions"[..], OptIndex::Sessionoptions),
+            (&b"varsofttabstop"[..], OptIndex::Varsofttabstop),
+            (&b"wildignorecase"[..], OptIndex::Wildignorecase),
+            (&b"completetimeout"[..], OptIndex::Completetimeout),
+            (&b"termpastefilter"[..], OptIndex::Termpastefilter),
+            (&b"quickfixtextfunc"[..], OptIndex::Quickfixtextfunc),
+            (&b"autocompletedelay"[..], OptIndex::Autocompletedelay),
+            (&b"completeitemalign"[..], OptIndex::Completeitemalign),
+            (&b"autocompletetimeout"[..], OptIndex::Autocompletetimeout),
+        ]
+        .into_iter()
+        .collect()
+    });
+
+/// Find the index for an option name, without going beyond `len`
+/// bytes of `name` (`find_option_len`).
+///
+/// Returns [`OptIndex::Invalid`] if `len` is out of bounds for `name`
+/// or the option wasn't found - matching the original's own
+/// `kOptInvalid` return exactly (a caller-contract violation on
+/// `len` is treated the same as "not found" rather than panicking,
+/// since every real caller derives `len` from scanning WITHIN `name`
+/// itself, so it can never actually exceed `name.len()` in practice).
+#[must_use]
+pub fn find_option_len(name: &[u8], len: usize) -> OptIndex {
+    name.get(..len).map_or(OptIndex::Invalid, find_option)
+}
+
+/// Find the index for an option name (`find_option`).
+#[must_use]
+pub fn find_option(name: &[u8]) -> OptIndex {
+    OPTION_HASH_ELEMS.get(name).copied().unwrap_or(OptIndex::Invalid)
+}
+
+/// Find the end of an option name, handling TTY options separately
+/// (`find_option_end`).
+///
+/// Returns `(end, opt_idx)`: `end` is the byte offset just past the
+/// name, or `None` if `arg` doesn't start with a valid option name at
+/// all (matching the original's own `NULL` return; `opt_idx` is
+/// meaningless/`Invalid` in that case, matching the original leaving
+/// `*opt_idxp` set to `kOptInvalid` there too).
+#[must_use]
+pub fn find_option_end(arg: &[u8]) -> (Option<usize>, OptIndex) {
+    if let Some(end) = find_tty_option_end(arg) {
+        return (Some(end), OptIndex::Invalid);
+    }
+
+    if !arg.first().is_some_and(|&c| crate::macros_defs::ascii_isalpha(i32::from(c))) {
+        return (None, OptIndex::Invalid);
+    }
+    let mut p = 0;
+    while arg.get(p).is_some_and(|&c| crate::macros_defs::ascii_isalpha(i32::from(c))) {
+        p += 1;
+    }
+    (Some(p), find_option_len(arg, p))
+}
+
 /// Error message for `'chistory'`/`'lhistory'` given a non-positive
 /// value (`e_cannot_have_negative_or_zero_number_of_quickfix`, a
 /// file-local `static const char[]` in the original - kept file-local
@@ -3270,6 +4068,101 @@ mod tty_option_tests {
     fn set_tty_option_non_settable_name_returns_false() {
         assert!(!set_tty_option(b"t_Co", b"8".to_vec()));
         assert!(!set_tty_option(b"autoindent", b"x".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod find_option_tests {
+    use super::*;
+
+    #[test]
+    fn find_option_matches_full_name() {
+        assert_eq!(find_option(b"equalalways"), OptIndex::Equalalways);
+    }
+
+    #[test]
+    fn find_option_matches_short_abbreviation() {
+        assert_eq!(find_option(b"ea"), OptIndex::Equalalways);
+    }
+
+    #[test]
+    fn find_option_matches_historical_alias() {
+        // "viminfo"/"vi" are pre-rename aliases for "shada"/"sd".
+        assert_eq!(find_option(b"viminfo"), OptIndex::Shada);
+        assert_eq!(find_option(b"vi"), OptIndex::Shada);
+        assert_eq!(find_option(b"shada"), OptIndex::Shada);
+        assert_eq!(find_option(b"sd"), OptIndex::Shada);
+    }
+
+    #[test]
+    fn find_option_unknown_name_is_invalid() {
+        assert_eq!(find_option(b"notarealoption"), OptIndex::Invalid);
+        assert_eq!(find_option(b""), OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_is_case_sensitive() {
+        // Option names are always lowercase; an uppercase variant must
+        // not match.
+        assert_eq!(find_option(b"Equalalways"), OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_len_bounds_the_search_to_a_prefix() {
+        assert_eq!(find_option_len(b"eaXXXX", 2), OptIndex::Equalalways);
+    }
+
+    #[test]
+    fn find_option_len_out_of_bounds_is_invalid() {
+        assert_eq!(find_option_len(b"ea", 10), OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_end_plain_alpha_name() {
+        let (end, idx) = find_option_end(b"equalalways more text");
+        assert_eq!(end, Some(11));
+        assert_eq!(idx, OptIndex::Equalalways);
+    }
+
+    #[test]
+    fn find_option_end_short_name_with_trailing_equals() {
+        let (end, idx) = find_option_end(b"ea=foo");
+        assert_eq!(end, Some(2));
+        assert_eq!(idx, OptIndex::Equalalways);
+    }
+
+    #[test]
+    fn find_option_end_unknown_alpha_name_still_returns_end_but_invalid_idx() {
+        // The scan itself only looks for alpha characters - an
+        // unrecognized (but alpha-shaped) name still reports where it
+        // ends, just with an Invalid index (matching the original's
+        // own find_option_len returning kOptInvalid there).
+        let (end, idx) = find_option_end(b"notarealoption=x");
+        assert_eq!(end, Some(14));
+        assert_eq!(idx, OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_end_non_alpha_start_is_none() {
+        assert_eq!(find_option_end(b"123"), (None, OptIndex::Invalid));
+        assert_eq!(find_option_end(b""), (None, OptIndex::Invalid));
+    }
+
+    #[test]
+    fn find_option_end_tty_option_takes_priority() {
+        // "term"/"ttytype" are recognized as TTY options FIRST, before
+        // the ordinary alpha-name/OPTIONS-table scan - matching the
+        // original's own find_tty_option_end short-circuit.
+        let (end, idx) = find_option_end(b"term");
+        assert_eq!(end, Some(4));
+        assert_eq!(idx, OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_end_keycode_form_is_a_tty_option_with_invalid_idx() {
+        let (end, idx) = find_option_end(b"t_kb=x");
+        assert_eq!(end, Some(4));
+        assert_eq!(idx, OptIndex::Invalid);
     }
 }
 

@@ -171,20 +171,21 @@
 //! `eval_dict`/`eval_lit_dict` - `eval_dict`'s own deferred `{expr}`-
 //! vs-dict-literal speculative pre-check aside, see its own doc
 //! comment), leading `!`/`-`/`+` (`eval7_leader`), parenthesized
-//! sub-expressions (recursing into `eval1`), and plain variable
-//! references (`get_name_len`/`eval_variable`/`check_vars`) are all
-//! real. Only genuinely substantial remaining pieces still panic via
-//! `unimplemented!()`, each with its own specific, documented reason:
-//! lambda expressions (`get_lambda_tv` - detected via the new
-//! `crate::eval::userfunc::is_lambda_start` and declined cleanly,
-//! rather than being misparsed as a dict literal, needs closure/
-//! lambda compilation), option values (`eval_option`, needs the real
-//! `options[]` get/set engine plus `find_option_len`'s perfect-hash
-//! table), environment variables/interpolated strings (`eval_env_var`/
-//! `eval_interp_string`), register contents (`get_reg_contents`, needs
-//! `register.c`), and function calls (`eval_func`, needs either the
-//! whole Ex-command execution engine for user-defined functions or
-//! `eval/funcs.c`'s own huge builtin-dispatch table). A byte that
+//! sub-expressions (recursing into `eval1`), plain variable references
+//! (`get_name_len`/`eval_variable`/`check_vars`), and option values
+//! (`eval_option`/`find_option_var_end`, now that `option.rs`'s real
+//! `options[]` table/`find_option`/`get_option_value`/`get_varp_from`
+//! engine all exist) are all real. Only genuinely substantial
+//! remaining pieces still panic via `unimplemented!()`, each with its
+//! own specific, documented reason: lambda expressions (`get_lambda_tv`,
+//! detected via the new `crate::eval::userfunc::is_lambda_start` and
+//! declined cleanly, rather than being misparsed as a dict literal,
+//! needs closure/lambda compilation), environment variables/
+//! interpolated strings (`eval_env_var`/`eval_interp_string`), register
+//! contents (`get_reg_contents`, needs `register.c`), and function
+//! calls (`eval_func`, needs either the whole Ex-command execution
+//! engine for user-defined functions or `eval/funcs.c`'s own huge
+//! builtin-dispatch table). A byte that
 //! would make `get_name_len` itself report "no name here at all" (e.g.
 //! trailing garbage or an unbalanced closing delimiter) is instead a
 //! real, graceful `FAIL` - exactly matching `get_name_len`'s own
@@ -251,6 +252,7 @@
 
 use crate::charset::skipwhite;
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
+use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
 /// "n1" divided by "n2", taking care of dividing by zero
@@ -2560,6 +2562,96 @@ pub unsafe fn eval_dict(
     (OK, pos)
 }
 
+/// Skip over the name of an option variable: `"&option"`, `"&g:option"`,
+/// or `"&l:option"` (`find_option_var_end`).
+///
+/// `arg` must point to the `&` (or `+`, for `has("+option")` - the
+/// leading byte itself is never inspected, only skipped, matching the
+/// original's own unconditional `p++`).
+///
+/// Returns `(name_start, consumed, opt_idx, opt_flags)`: `name_start`
+/// is the offset where the bare option name itself begins (i.e. past
+/// any `&`/`g:`/`l:` prefix - `arg[name_start..consumed]` is the bare
+/// name, matching what the original's own `*arg` points to right
+/// after this function returns); both are `0` if no option name was
+/// found at all (matching the original's own `NULL` return, which
+/// leaves `*arg` UNCHANGED - equivalent to "0 bytes consumed" in this
+/// crate's own idiom).
+#[must_use]
+pub fn find_option_var_end(arg: &[u8]) -> (usize, usize, OptIndex, u32) {
+    let mut p = 1;
+    let opt_flags = if arg.get(p) == Some(&b'g') && arg.get(p + 1) == Some(&b':') {
+        p += 2;
+        crate::option_defs::opt_set_flags::OPT_GLOBAL
+    } else if arg.get(p) == Some(&b'l') && arg.get(p + 1) == Some(&b':') {
+        p += 2;
+        crate::option_defs::opt_set_flags::OPT_LOCAL
+    } else {
+        0
+    };
+
+    match crate::option::find_option_end(&arg[p..]) {
+        (Some(consumed), opt_idx) => (p, p + consumed, opt_idx, opt_flags),
+        (None, _) => (0, 0, OptIndex::Invalid, opt_flags),
+    }
+}
+
+/// Get an option value (`eval_option`).
+///
+/// `arg` must point to the `&` or `+` before the option name (`+` is
+/// used for `has("+option")` - the `working` distinction only matters
+/// for [`crate::option::is_option_hidden`]'s own narrow "hidden AND
+/// not evaluating" early-return path below).
+///
+/// Returns `(status, consumed)`, matching this module's own
+/// established idiom - `FAIL`/`0` when `arg` doesn't start with a
+/// valid option name at all.
+///
+/// # Safety
+/// Forwarded from [`crate::option::get_option_value`]'s own safety
+/// doc.
+#[must_use]
+pub unsafe fn eval_option(arg: &[u8], rettv: Option<&mut TypvalT>, evaluate: bool) -> (i32, usize) {
+    let working = arg.first() == Some(&b'+');
+
+    let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(arg);
+    if consumed == 0 {
+        // semsg(_("E112: Option name missing: %s"), *arg) omitted when
+        // rettv.is_some() - message display, not tractable; the
+        // identical FAIL is kept.
+        return (FAIL, 0);
+    }
+
+    if !evaluate {
+        return (OK, consumed);
+    }
+
+    let is_tty_opt = crate::option::is_tty_option(&arg[name_start..consumed]);
+
+    let ret;
+    if opt_idx == OptIndex::Invalid && !is_tty_opt {
+        // semsg(_("E113: Unknown option: %s"), *arg) omitted when
+        // rettv.is_some().
+        ret = FAIL;
+    } else if let Some(rettv) = rettv {
+        // SAFETY: forwarded from this function's own safety doc.
+        let value = if is_tty_opt {
+            crate::option::get_tty_option(&arg[name_start..consumed])
+        } else {
+            unsafe { crate::option::get_option_value(opt_idx, opt_flags) }
+        };
+        debug_assert!(value.value_type() != crate::option_defs::OptValType::Nil);
+        *rettv = crate::eval::vars::optval_as_tv(value, true);
+        ret = OK;
+    } else if working && !is_tty_opt && crate::option::is_option_hidden(opt_idx) {
+        ret = FAIL;
+    } else {
+        ret = OK;
+    }
+
+    (ret, consumed)
+}
+
 /// Recursion depth counter for [`eval7`] - the original's own
 /// function-local `static int recurse = 0`, translated as a
 /// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
@@ -2684,10 +2776,10 @@ pub unsafe fn eval7(
         }
         // Option value: &name
         Some(b'&') => {
-            unimplemented!(
-                "eval7: option values (eval_option) need the real options[] get/set engine, \
-                 not yet translated"
-            );
+            // SAFETY: forwarded from this function's own safety doc.
+            let (r, consumed) = unsafe { eval_option(&arg[pos..], Some(rettv), evaluate) };
+            ret = r;
+            pos += consumed;
         }
         // Environment variable: $VAR. Interpolated string: $"..."/$'...'.
         Some(b'$') => {
@@ -5391,6 +5483,211 @@ mod tests {
         assert!(result.is_err(), "expected a panic (make_expanded_name not yet translated)");
     }
 
+    // --- find_option_var_end / eval_option ---
+
+    #[test]
+    fn find_option_var_end_bare_name() {
+        let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(b"&ignorecase rest");
+        assert_eq!(name_start, 1);
+        assert_eq!(consumed, 11);
+        assert_eq!(opt_idx, OptIndex::Ignorecase);
+        assert_eq!(opt_flags, 0);
+    }
+
+    #[test]
+    fn find_option_var_end_short_abbreviation() {
+        let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(b"&ic");
+        assert_eq!(name_start, 1);
+        assert_eq!(consumed, 3);
+        assert_eq!(opt_idx, OptIndex::Ignorecase);
+        assert_eq!(opt_flags, 0);
+    }
+
+    #[test]
+    fn find_option_var_end_global_scope_prefix() {
+        let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(b"&g:ignorecase");
+        // name_start skips past "&g:" (3 bytes) - the bare name itself
+        // must NOT include the "g:" prefix (is_tty_option/get_tty_option
+        // need the bare name only).
+        assert_eq!(name_start, 3);
+        assert_eq!(consumed, 13);
+        assert_eq!(&b"&g:ignorecase"[name_start..consumed], b"ignorecase");
+        assert_eq!(opt_idx, OptIndex::Ignorecase);
+        assert_eq!(opt_flags, crate::option_defs::opt_set_flags::OPT_GLOBAL);
+    }
+
+    #[test]
+    fn find_option_var_end_local_scope_prefix() {
+        let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(b"&l:tabstop");
+        assert_eq!(name_start, 3);
+        assert_eq!(&b"&l:tabstop"[name_start..consumed], b"tabstop");
+        assert_eq!(opt_idx, OptIndex::Tabstop);
+        assert_eq!(opt_flags, crate::option_defs::opt_set_flags::OPT_LOCAL);
+    }
+
+    #[test]
+    fn find_option_var_end_tty_option_has_invalid_idx_but_real_end() {
+        let (name_start, consumed, opt_idx, opt_flags) = find_option_var_end(b"&term");
+        assert_eq!(name_start, 1);
+        assert_eq!(consumed, 5);
+        assert_eq!(opt_idx, OptIndex::Invalid);
+        assert_eq!(opt_flags, 0);
+    }
+
+    #[test]
+    fn find_option_var_end_unrecognized_alpha_name_still_consumes() {
+        // Alpha-shaped but unrecognized - find_option_end still reports
+        // an end (just with an Invalid index), matching the original.
+        let (name_start, consumed, opt_idx, _) = find_option_var_end(b"&notarealoption=x");
+        assert_eq!(name_start, 1);
+        assert_eq!(consumed, 15);
+        assert_eq!(opt_idx, OptIndex::Invalid);
+    }
+
+    #[test]
+    fn find_option_var_end_non_alpha_start_consumes_nothing() {
+        assert_eq!(find_option_var_end(b"&123"), (0, 0, OptIndex::Invalid, 0));
+        assert_eq!(find_option_var_end(b"&"), (0, 0, OptIndex::Invalid, 0));
+    }
+
+    /// RAII-free helper installing `buf`/`win` as `GLOBALS.curbuf`/
+    /// `curwin` for the duration of `f`, then restoring the previous
+    /// pointers - matching `option.rs`'s own established inline
+    /// save/restore pattern for tests exercising `get_option_value`'s
+    /// `GLOBALS.curbuf`/`curwin` dependency (not a full guard type,
+    /// since this module has no existing guard to reuse and the
+    /// pattern is only needed by a handful of tests here).
+    fn with_curbuf_curwin<R>(
+        buf: &mut crate::buffer_defs::BufT,
+        win: &mut crate::buffer_defs::WinT,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_win = globals.curwin;
+        globals.curbuf = buf as *mut crate::buffer_defs::BufT;
+        globals.curwin = win as *mut crate::buffer_defs::WinT;
+
+        let result = f();
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.curwin = prev_win;
+        result
+    }
+
+    #[test]
+    fn eval_option_boolean_option_becomes_a_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = 1;
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let mut rettv = TypvalT::default();
+            let (ret, consumed) = unsafe { eval_option(b"&ignorecase", Some(&mut rettv), true) };
+            assert_eq!(ret, OK);
+            assert_eq!(consumed, 11);
+            // numbool=true: even a boolean option evaluates to a plain
+            // Number, matching real Vimscript's `&ignorecase == 1`.
+            assert_eq!(rettv.value, TypvalValue::Number(1));
+        });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = 0;
+    }
+
+    #[test]
+    fn eval_option_number_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 4, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let mut rettv = TypvalT::default();
+            let (ret, consumed) = unsafe { eval_option(b"&tabstop", Some(&mut rettv), true) };
+            assert_eq!(ret, OK);
+            assert_eq!(consumed, 8);
+            assert_eq!(rettv.value, TypvalValue::Number(4));
+        });
+    }
+
+    #[test]
+    fn eval_option_string_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ambw = Some(b"double".to_vec());
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let mut rettv = TypvalT::default();
+            let (ret, _) = unsafe { eval_option(b"&ambiwidth", Some(&mut rettv), true) };
+            assert_eq!(ret, OK);
+            assert_eq!(rettv.value, TypvalValue::String(Some(b"double".to_vec())));
+        });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ambw = None;
+    }
+
+    #[test]
+    fn eval_option_tty_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let mut rettv = TypvalT::default();
+            // 'term' defaults to "nvim" when unset (get_tty_option's
+            // own established default) - no need to set_tty_option
+            // first.
+            let (ret, consumed) = unsafe { eval_option(b"&term", Some(&mut rettv), true) };
+            assert_eq!(ret, OK);
+            assert_eq!(consumed, 5);
+            assert_eq!(rettv.value, TypvalValue::String(Some(b"nvim".to_vec())));
+        });
+    }
+
+    #[test]
+    fn eval_option_unknown_name_fails() {
+        let mut rettv = TypvalT::default();
+        let (ret, _) = unsafe { eval_option(b"&notarealoption", Some(&mut rettv), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_option_no_name_at_all_fails_with_zero_consumed() {
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_option(b"&", Some(&mut rettv), true) };
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn eval_option_parse_only_mode_does_not_touch_rettv() {
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_option(b"&ignorecase", Some(&mut rettv), false) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 11);
+        // evaluate == false: rettv is untouched, still its Default.
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_option_has_feature_semantics_via_none_rettv() {
+        // rettv == None models has("+feature")'s own call pattern:
+        // a valid, non-hidden option succeeds without needing a real
+        // value.
+        let (ret, _) = unsafe { eval_option(b"+ignorecase", None, true) };
+        assert_eq!(ret, OK);
+    }
+
+    #[test]
+    fn eval_option_has_feature_fails_for_a_hidden_option() {
+        // OptIndex::Aleph is immutable/hidden (see option.rs's own
+        // is_option_hidden test) - has("+aleph")-style lookup fails.
+        let (ret, _) = unsafe { eval_option(b"+aleph", None, true) };
+        assert_eq!(ret, FAIL);
+    }
+
     // --- eval0-eval7 end-to-end: variables ---
 
     /// Resets global-variable/funccal state shared across these tests,
@@ -5771,6 +6068,39 @@ mod tests {
     fn e2e_double_quoted_string_special_key_escape_is_unimplemented() {
         let result = std::panic::catch_unwind(|| eval_str(b"\"\\<C-W>\""));
         assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
+    }
+
+    #[test]
+    fn e2e_option_value_boolean() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = 1;
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let (ret, tv) = eval_str(b"&ignorecase");
+            assert_eq!(ret, OK);
+            assert_eq!(tv.value, TypvalValue::Number(1));
+        });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ic = 0;
+    }
+
+    #[test]
+    fn e2e_option_value_number_in_an_expression() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 4, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            assert_eq!(eval_str(b"&tabstop + 1").1.value, TypvalValue::Number(5));
+        });
+    }
+
+    #[test]
+    fn e2e_option_value_unknown_name_fails() {
+        let (ret, _) = eval_str(b"&notarealoption");
+        assert_eq!(ret, FAIL);
     }
 }
 

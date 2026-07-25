@@ -1439,6 +1439,36 @@ pub unsafe fn eval_variable(name: &[u8], rettv: Option<&mut TypvalT>, _verbose: 
     }
 }
 
+/// Convert an option value to a Vimscript value (`optval_as_tv`).
+///
+/// `numbool`, if `true`, converts a `Boolean` value to a plain number
+/// (`0`/`1`/`-1` for `false`/`true`/unset) rather than a real
+/// `Bool`/`Special(Null)` - matching [`crate::eval::eval::eval_option`]'s
+/// own `numbool = true` call (options have always been numbers in
+/// Vimscript, even boolean ones, for backward compatibility).
+#[must_use]
+pub fn optval_as_tv(value: crate::option_defs::OptVal, numbool: bool) -> TypvalT {
+    use crate::option_defs::OptVal;
+    use crate::types_defs::TriState;
+
+    let value = match value {
+        OptVal::Nil => TypvalValue::Special(SpecialVarValue::Null),
+        OptVal::Boolean(b) => {
+            if numbool {
+                TypvalValue::Number(VarnumberT::from(b as i8))
+            } else if b != TriState::None {
+                TypvalValue::Bool(if b == TriState::True { BoolVarValue::True } else { BoolVarValue::False })
+            } else {
+                // return v:null for a None boolean value.
+                TypvalValue::Special(SpecialVarValue::Null)
+            }
+        }
+        OptVal::Number(n) => TypvalValue::Number(n),
+        OptVal::String(s) => TypvalValue::String(Some(s)),
+    };
+    TypvalT { v_lock: VarLockStatus::Unlocked, value }
+}
+
 /// Out-flag for the not-yet-translated lambda-compilation code: when
 /// `Some`, [`check_vars`] sets the pointed-to `bool` to `true` upon
 /// finding that a checked name resolves to a local variable or
@@ -3549,5 +3579,84 @@ mod find_var_ht_dict_tests {
 
         unsafe { *EVAL_LAVARS_USED.get_mut() = None };
         reset_shared_state();
+    }
+}
+
+#[cfg(test)]
+mod optval_as_tv_tests {
+    use super::*;
+    use crate::option_defs::OptVal;
+    use crate::types_defs::TriState;
+
+    #[test]
+    fn nil_becomes_special_null() {
+        let tv = optval_as_tv(OptVal::Nil, true);
+        assert_eq!(tv.value, TypvalValue::Special(SpecialVarValue::Null));
+        assert_eq!(tv.v_lock, VarLockStatus::Unlocked);
+    }
+
+    #[test]
+    fn boolean_true_with_numbool_becomes_number_one() {
+        let tv = optval_as_tv(OptVal::Boolean(TriState::True), true);
+        assert_eq!(tv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn boolean_false_with_numbool_becomes_number_zero() {
+        let tv = optval_as_tv(OptVal::Boolean(TriState::False), true);
+        assert_eq!(tv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn boolean_none_with_numbool_becomes_number_negative_one() {
+        // Even TriState::None becomes the NUMBER -1 (not null!) when
+        // numbool is true - matching the original's own
+        // `tv->vval.v_number = (varnumber_T)value.data.boolean;`
+        // unconditional cast, with TriState::kNone == -1.
+        let tv = optval_as_tv(OptVal::Boolean(TriState::None), true);
+        assert_eq!(tv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn boolean_true_without_numbool_becomes_bool_true() {
+        let tv = optval_as_tv(OptVal::Boolean(TriState::True), false);
+        assert_eq!(tv.value, TypvalValue::Bool(BoolVarValue::True));
+    }
+
+    #[test]
+    fn boolean_false_without_numbool_becomes_bool_false() {
+        let tv = optval_as_tv(OptVal::Boolean(TriState::False), false);
+        assert_eq!(tv.value, TypvalValue::Bool(BoolVarValue::False));
+    }
+
+    #[test]
+    fn boolean_none_without_numbool_becomes_special_null() {
+        // Neither the "numbool" branch nor the "b != None" branch
+        // fires - stays at the function's initial VAR_SPECIAL/
+        // kSpecialVarNull default in the original.
+        let tv = optval_as_tv(OptVal::Boolean(TriState::None), false);
+        assert_eq!(tv.value, TypvalValue::Special(SpecialVarValue::Null));
+    }
+
+    #[test]
+    fn number_becomes_number_directly() {
+        let tv = optval_as_tv(OptVal::Number(42), true);
+        assert_eq!(tv.value, TypvalValue::Number(42));
+        let tv = optval_as_tv(OptVal::Number(-7), false);
+        assert_eq!(tv.value, TypvalValue::Number(-7));
+    }
+
+    #[test]
+    fn string_becomes_string_directly() {
+        let tv = optval_as_tv(OptVal::String(b"hello".to_vec()), true);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn empty_string_becomes_some_empty_vec_not_none() {
+        // NvimString = Vec<u8>, always present, never null in this
+        // Rust representation.
+        let tv = optval_as_tv(OptVal::String(Vec::new()), true);
+        assert_eq!(tv.value, TypvalValue::String(Some(Vec::new())));
     }
 }
