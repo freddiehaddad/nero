@@ -155,14 +155,31 @@ pub enum OptVal {
     String(NvimString),
 }
 
+impl OptVal {
+    /// This value's own `OptValType` tag (`option_get_type`'s own
+    /// dispatch target, but reachable directly off the value itself
+    /// here rather than needing a separate `opt_idx` lookup - useful
+    /// for call sites, like `set_option_varp`'s own `assert
+    /// (option_has_type(opt_idx, value.type))`, that already have a
+    /// concrete `OptVal` in hand and just need its tag).
+    #[must_use]
+    pub fn value_type(&self) -> OptValType {
+        match self {
+            OptVal::Nil => OptValType::Nil,
+            OptVal::Boolean(_) => OptValType::Boolean,
+            OptVal::Number(_) => OptValType::Number,
+            OptVal::String(_) => OptValType::String,
+        }
+    }
+}
+
 /// Bare *type tag* for an option's accepted value kind, with no value
 /// attached (`OptValType`) - reintroduced standalone alongside
 /// [`OptVal`] specifically for [`VimoptionT`]'s own `type` field: an
-/// entry in the (still-deferred) `options[]` table describes what
-/// *kind* of value a given option accepts, independent of any
-/// particular value, so `OptVal`'s own tag-plus-value unification
-/// doesn't fit this use site the way it does for actual runtime option
-/// values.
+/// entry in the `options[]` table describes what *kind* of value a
+/// given option accepts, independent of any particular value, so
+/// `OptVal`'s own tag-plus-value unification doesn't fit this use site
+/// the way it does for actual runtime option values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptValType {
     /// (`kOptValTypeNil = -1`).
@@ -398,6 +415,14 @@ mod tests {
         assert_ne!(OptVal::Nil, OptVal::Number(0));
         assert_eq!(OptVal::Number(5), OptVal::Number(5));
         assert_ne!(OptVal::Boolean(TriState::True), OptVal::Boolean(TriState::False));
+    }
+
+    #[test]
+    fn opt_val_value_type_matches_each_variant() {
+        assert_eq!(OptVal::Nil.value_type(), OptValType::Nil);
+        assert_eq!(OptVal::Boolean(TriState::True).value_type(), OptValType::Boolean);
+        assert_eq!(OptVal::Number(1).value_type(), OptValType::Number);
+        assert_eq!(OptVal::String(b"x".to_vec()).value_type(), OptValType::String);
     }
 
     #[test]

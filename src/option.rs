@@ -70,15 +70,18 @@
 //! either (a likely harmless upstream leftover, not replicated as
 //! dead code here).
 //!
-//! Also translated this pass: `optval_from_varp` (type-punning a
-//! `*mut c_void` back into a real `OptVal`, dispatching on the
-//! option's own declared `OptValType` - independently verified
-//! field-by-field that every one of `get_varp_from`'s 145 branches
-//! targets a Rust field whose type matches its option's declared type
-//! exactly - `i32` for Boolean, `OptInt` for Number, `Option<Vec<u8>>`
-//! for String - with zero mismatches, before trusting this) and
-//! `get_option_value` (now fully faithful for every `opt_flags`
-//! combination, since `get_varp_scope_from` exists).
+//! Also translated this pass: `set_option_varp` (the write-side
+//! counterpart to `optval_from_varp`, symmetric type-punning in the
+//! other direction - deliberately drops the original's
+//! `free_oldval: bool` parameter, a pure C-manual-memory-management
+//! artifact that doesn't apply to a real Rust enum with automatic
+//! `Drop` semantics, see its own doc comment for the full reasoning);
+//! `find_tty_option_end`/`is_tty_option`/`get_tty_option`/
+//! `set_tty_option` (small, self-contained TTY/keycode-option name
+//! parsing and value storage - `p_term`/`p_ttytype` translated as new
+//! file-local `GlobalCell` statics, matching `os/env.rs`'s own
+//! `HOMEDIR` precedent for file-local state that doesn't belong in
+//! the shared `OptionVars`/`Globals` struct bags).
 //!
 //! **No Rust equivalent needed** (not "deferred" - genuinely
 //! unnecessary): `optval_free`/`optval_copy`/`optval_equal`. These
@@ -105,16 +108,47 @@
 //! trailing NUL only invites bugs like direct content comparisons
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
-//! Deferred: everything else, including `was_set_insecurely`/
-//! `insecure_flag` (still needs `OPTIONS[idx].flags`' own
-//! `WAS_SET`/`INSECURE` bits threaded through a real `:set` call site
-//! to have any meaningful test value), `parse_winhl_opt` (needs the
-//! decoration/highlight-group subsystem: `nvim_create_namespace`/
-//! `get_decor_provider`/`syn_check_group`/`ns_hl_def`), and `do_set`/
-//! `ex_set`'s command-line parsing plus `set_option_value`/
-//! `option_was_set`/`get_winbuf_options`/`get_vimoption`/etc.
-//! (everything that needs the full parsed-`:set`-argument machinery,
-//! not just a resolved storage address and a read).
+//! Deferred: the full `set_option_value`/`set_option`/
+//! `did_set_option`/`validate_option_value` write pipeline - each
+//! layer found to need a currently-blocked subsystem while scoping
+//! this pass:
+//! - `did_set_option` needs the ~150 real `did_set_*`/`expand_*`
+//!   per-option callbacks (already known-deferred, see
+//!   `option_defs.rs`'s own `OPTIONS` doc comment) AND the redraw
+//!   pipeline (`check_redraw`/`redraw_later`/`redraw_buf_later`/
+//!   `redraw_all_later`/`changed_window_setting` - already documented
+//!   as blocking `undo.c`'s undo/redo state machine, per this
+//!   project's own plan) AND the `OptionSet` autocommand trigger
+//!   machinery.
+//! - `validate_option_value`/`validate_num_option`/
+//!   `check_num_option_bounds` are NEWLY FOUND to need the frame-
+//!   layout/window-splitting subsystem for several of their numeric
+//!   bound checks (`kOptLines`/`kOptScrolljump`/`kOptScroll` need
+//!   `min_rows_for_all_tabpages`/`win_default_scroll`, which
+//!   themselves need `frame_minheight`/`tabline_height`/
+//!   `global_stl_height` - none of `window.c`'s frame-tree layout
+//!   logic is translated yet). The OTHER, simpler numeric bound
+//!   checks (most of the switch) have no such blocker and would be a
+//!   reasonable follow-up once isolated from the 3 blocked cases.
+//! - `find_option`/`find_option_len` (option name -> `OptIndex`
+//!   lookup, needed by `do_set`'s own parsing) rely on a real,
+//!   machine-generated PERFECT HASH function and table
+//!   (`option.c.generated.h`/`options_map.generated.h`, produced by
+//!   `src/gen/gen_options.lua` from the same `options.lua` master
+//!   table `options.generated.h` itself comes from) - a substantial,
+//!   self-contained mechanical-transcription undertaking of its own,
+//!   directly analogous to `option_defs.rs`'s own `OPTIONS` table
+//!   effort, good future-session material but not chased here.
+//! - `was_set_insecurely`/`insecure_flag` still need `OPTIONS[idx]
+//!   .flags`'s own `WAS_SET`/`INSECURE` bits threaded through a real
+//!   `:set` call site to have any meaningful test value.
+//! - `parse_winhl_opt` needs the decoration/highlight-group subsystem
+//!   (`nvim_create_namespace`/`get_decor_provider`/`syn_check_group`/
+//!   `ns_hl_def`).
+//! - `do_set`/`ex_set`'s command-line parsing itself, plus
+//!   `option_was_set`/`get_winbuf_options`/`get_vimoption`/etc.
+//!   (everything needing the full parsed-`:set`-argument machinery,
+//!   not just a resolved storage address and a read/write).
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS};
@@ -1207,6 +1241,59 @@ pub unsafe fn optval_from_varp(opt_idx: OptIndex, varp: *mut c_void) -> OptVal {
     }
 }
 
+/// Set option var pointer value from an `OptVal` (`set_option_varp`).
+///
+/// Deliberately drops the original's `free_oldval: bool` parameter.
+/// `free_oldval` exists purely to navigate C's MANUAL memory
+/// management around [`optval_from_varp`]'s OWN `String` case
+/// ALIASING (not copying) the existing `char *` at `varp` in the
+/// original - some callers capture an `old_value` that still points
+/// at the SAME buffer `varp` currently holds, and must avoid a
+/// double-free/premature-free until that alias is done being read.
+/// This crate's own `optval_from_varp` (see its own doc comment)
+/// instead CLONES the string out (a real, independent `Vec<u8>`, no
+/// aliasing) - so there is no aliasing hazard to navigate here:
+/// assigning `*varp = ...` through an `Option<Vec<u8>>`-typed pointer
+/// already correctly drops whatever `Vec<u8>` was previously there
+/// (Rust's ordinary assignment-drops-the-previous-place-value
+/// semantics), unconditionally, for free - exactly matching
+/// `free_oldval: true`'s behavior in EVERY call site, since no caller
+/// needs the aliasing-avoidance `false` behavior once cloning
+/// replaces aliasing.
+///
+/// # Safety
+/// `varp` must be a valid, non-null pointer of the correct concrete
+/// type for `value`'s own `OptVal` variant - see [`optval_from_varp`]'s
+/// own safety doc for the exact type-per-variant mapping (the same
+/// mapping applies symmetrically here, for writes).
+///
+/// # Panics
+/// Debug-asserts `option_has_type(opt_idx, value.value_type())`,
+/// matching the original's own `assert`. Panics via `unreachable!()`
+/// for `OptVal::Nil`, matching the original's own `abort()` - the
+/// original documents this case as "not a real option value", only
+/// ever produced transiently and never actually written through a
+/// `varp` (`kOptValTypeNil` exists solely so `Nil` can't be
+/// bitshifted and mistaken for a real option type flag).
+pub unsafe fn set_option_varp(opt_idx: OptIndex, varp: *mut c_void, value: OptVal) {
+    debug_assert!(option_has_type(opt_idx, value.value_type()));
+    match value {
+        OptVal::Nil => unreachable!("set_option_varp: Nil OptVal (matches the original's own abort())"),
+        OptVal::Boolean(b) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *(varp as *mut i32) = b as i32 };
+        }
+        OptVal::Number(n) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *(varp as *mut OptInt) = n };
+        }
+        OptVal::String(s) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *(varp as *mut Option<Vec<u8>>) = Some(s) };
+        }
+    }
+}
+
 /// Get the value of an option (`get_option_value`).
 ///
 /// # Safety
@@ -1222,6 +1309,126 @@ pub unsafe fn get_option_value(opt_idx: OptIndex, opt_flags: u32) -> OptVal {
     // SAFETY: get_varp_scope always returns a pointer of the type
     // optval_from_varp expects for opt_idx's own declared type.
     unsafe { optval_from_varp(opt_idx, varp) }
+}
+
+/// The `'term'` value (`p_term`, a file-local `static char *` in the
+/// original - not an `EXTERN` global, same treatment as `os/env.rs`'s
+/// own `HOMEDIR` precedent for a file-static piece of state that
+/// doesn't belong in the shared `OptionVars`/`Globals` struct bags).
+static P_TERM: std::sync::LazyLock<crate::globals::GlobalCell<Option<Vec<u8>>>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(None));
+
+/// The `'ttytype'` value (`p_ttytype`, file-local in the original -
+/// see [`P_TERM`]'s own doc comment).
+static P_TTYTYPE: std::sync::LazyLock<crate::globals::GlobalCell<Option<Vec<u8>>>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(None));
+
+/// Skip over the name of a TTY option or keycode option
+/// (`find_tty_option_end`).
+///
+/// Returns `None` when `arg` isn't (wholly, or as a `t_xx`/`<t_xx>`
+/// prefix) a TTY or keycode option name. Otherwise, the byte offset
+/// into `arg` just past the option name - NOT necessarily `arg.len()`
+/// for the `t_xx`/`<t_xx>` keycode forms, which may have trailing
+/// bytes after the returned offset when embedded in a larger `:set`
+/// argument string.
+///
+/// `arg == b"term"`/`arg == b"ttytype"` deliberately require an EXACT,
+/// WHOLE-slice match (matching the original's own `strequal`, a full
+/// `strcmp`, not a prefix check) - this only recognizes a BARE
+/// `"term"`/`"ttytype"` with nothing else following (e.g. for
+/// `:set term?`), NOT `"term=xterm"` (that reaches this function too,
+/// via the not-yet-translated `find_option_end`, but falls through to
+/// an ordinary alpha-name scan there instead, per the original's own
+/// logic).
+fn find_tty_option_end(arg: &[u8]) -> Option<usize> {
+    if arg == b"term" {
+        return Some(4);
+    }
+    if arg == b"ttytype" {
+        return Some(7);
+    }
+
+    let mut p = 0usize;
+    let mut delimit = false; // whether to delimit '<'
+
+    if arg.first() == Some(&b'<') {
+        // look out for <t_>;>
+        delimit = true;
+        p += 1;
+    }
+    if arg.get(p) == Some(&b't') && arg.get(p + 1) == Some(&b'_') && arg.get(p + 2).is_some() && arg.get(p + 3).is_some()
+    {
+        // "t_xx" ("t_Co") option.
+        p += 4;
+    } else if delimit {
+        // Search for delimiting '>'.
+        while p < arg.len() && arg[p] != b'>' {
+            p += 1;
+        }
+    }
+    // Return None when delimiting '>' is not found.
+    if delimit {
+        if arg.get(p) != Some(&b'>') {
+            return None;
+        }
+        p += 1;
+    }
+
+    if p == 0 { None } else { Some(p) }
+}
+
+/// Whether `name` is (wholly) a TTY option or keycode option name
+/// (`is_tty_option`).
+#[must_use]
+pub fn is_tty_option(name: &[u8]) -> bool {
+    find_tty_option_end(name).is_some()
+}
+
+/// Get value of TTY option (`get_tty_option`).
+///
+/// Returns `OptVal::Nil` if `name` isn't a TTY option, matching the
+/// original's own `NIL_OPTVAL` return (rather than this crate's
+/// `Option<OptVal>` convention elsewhere) since `OptVal` itself
+/// already has a dedicated `Nil` variant for exactly this "no value"
+/// case - the original's own caller (`get_option_value_for`) already
+/// treats `NIL_OPTVAL` as the "not found" signal, so mirroring that
+/// exactly (rather than wrapping in `Option`) keeps this a direct,
+/// literal translation.
+#[must_use]
+pub fn get_tty_option(name: &[u8]) -> OptVal {
+    if name == b"t_Co" {
+        let t_colors = unsafe { crate::globals::GLOBALS.get_mut() }.t_colors;
+        let value = if t_colors <= 1 { Vec::new() } else { t_colors.to_string().into_bytes() };
+        return OptVal::String(value);
+    }
+    if name == b"term" {
+        let value = unsafe { P_TERM.get_mut() }.clone();
+        return OptVal::String(value.unwrap_or_else(|| b"nvim".to_vec()));
+    }
+    if name == b"ttytype" {
+        let value = unsafe { P_TTYTYPE.get_mut() }.clone();
+        return OptVal::String(value.unwrap_or_else(|| b"nvim".to_vec()));
+    }
+    if is_tty_option(name) {
+        // XXX: All other t_* options were removed in 3baba1e7.
+        return OptVal::String(Vec::new());
+    }
+    OptVal::Nil
+}
+
+/// Set value of TTY option (`set_tty_option`). Returns `false` when
+/// `name` isn't a settable TTY option (only `'term'`/`'ttytype'` are).
+pub fn set_tty_option(name: &[u8], value: Vec<u8>) -> bool {
+    if name == b"term" {
+        unsafe { *P_TERM.get_mut() = Some(value) };
+        return true;
+    }
+    if name == b"ttytype" {
+        unsafe { *P_TTYTYPE.get_mut() = Some(value) };
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -2278,6 +2485,174 @@ mod optval_tests {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         globals.curbuf = prev_buf;
         globals.curwin = prev_win;
+    }
+}
+
+#[cfg(test)]
+mod set_option_varp_tests {
+    use super::*;
+
+    #[test]
+    fn set_option_varp_writes_boolean() {
+        let mut val: i32 = 0;
+        let varp = &mut val as *mut i32 as *mut c_void;
+        unsafe { set_option_varp(OptIndex::Allowrevins, varp, OptVal::Boolean(TriState::True)) };
+        assert_eq!(unsafe { *(varp as *mut i32) }, 1);
+
+        unsafe { set_option_varp(OptIndex::Allowrevins, varp, OptVal::Boolean(TriState::None)) };
+        assert_eq!(unsafe { *(varp as *mut i32) }, -1);
+    }
+
+    #[test]
+    fn set_option_varp_writes_number() {
+        let mut val: OptInt = 0;
+        let varp = &mut val as *mut OptInt as *mut c_void;
+        unsafe { set_option_varp(OptIndex::Aleph, varp, OptVal::Number(42)) };
+        assert_eq!(unsafe { *(varp as *mut OptInt) }, 42);
+    }
+
+    #[test]
+    fn set_option_varp_writes_string_replacing_previous_value() {
+        let mut val: Option<Vec<u8>> = Some(b"old".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        unsafe { set_option_varp(OptIndex::Ambiwidth, varp, OptVal::String(b"double".to_vec())) };
+        assert_eq!(unsafe { (*(varp as *mut Option<Vec<u8>>)).clone() }, Some(b"double".to_vec()));
+    }
+
+    #[test]
+    fn set_option_varp_roundtrips_through_optval_from_varp() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let varp = unsafe { get_varp_from(OptIndex::Autoindent, &mut buf, &mut win) };
+        unsafe { set_option_varp(OptIndex::Autoindent, varp, OptVal::Boolean(TriState::True)) };
+        assert_eq!(unsafe { optval_from_varp(OptIndex::Autoindent, varp) }, OptVal::Boolean(TriState::True));
+        assert_eq!(buf.b_p_ai, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_option_varp_nil_panics() {
+        let mut val: i32 = 0;
+        let varp = &mut val as *mut i32 as *mut c_void;
+        unsafe { set_option_varp(OptIndex::Allowrevins, varp, OptVal::Nil) };
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn set_option_varp_debug_panics_on_type_mismatch() {
+        let mut val: OptInt = 0;
+        let varp = &mut val as *mut OptInt as *mut c_void;
+        // Allowrevins is Boolean-typed; writing a Number should trip the
+        // debug_assert! (matches the original's own `assert`).
+        unsafe { set_option_varp(OptIndex::Allowrevins, varp, OptVal::Number(1)) };
+    }
+}
+
+#[cfg(test)]
+mod tty_option_tests {
+    use super::*;
+
+    #[test]
+    fn find_tty_option_end_matches_exact_term_and_ttytype() {
+        assert_eq!(find_tty_option_end(b"term"), Some(4));
+        assert_eq!(find_tty_option_end(b"ttytype"), Some(7));
+    }
+
+    #[test]
+    fn find_tty_option_end_rejects_term_with_trailing_content() {
+        // "term=xterm" isn't a WHOLE match for "term" - falls through to
+        // the t_xx/delimited scan, which also doesn't match, so None.
+        assert_eq!(find_tty_option_end(b"term=xterm"), None);
+    }
+
+    #[test]
+    fn find_tty_option_end_matches_t_xx_keycode_form() {
+        assert_eq!(find_tty_option_end(b"t_Co"), Some(4));
+        // Embedded in a larger string: offset points just past "t_Co".
+        assert_eq!(find_tty_option_end(b"t_Co=5"), Some(4));
+    }
+
+    #[test]
+    fn find_tty_option_end_matches_delimited_angle_bracket_form() {
+        assert_eq!(find_tty_option_end(b"<t_Co>"), Some(6));
+        assert_eq!(find_tty_option_end(b"<t_Co>rest"), Some(6));
+    }
+
+    #[test]
+    fn find_tty_option_end_rejects_unterminated_delimited_form() {
+        assert_eq!(find_tty_option_end(b"<t_Co"), None);
+    }
+
+    #[test]
+    fn find_tty_option_end_none_for_ordinary_option_name() {
+        assert_eq!(find_tty_option_end(b"autoindent"), None);
+        assert_eq!(find_tty_option_end(b""), None);
+    }
+
+    #[test]
+    fn is_tty_option_matches_find_tty_option_end() {
+        assert!(is_tty_option(b"term"));
+        assert!(is_tty_option(b"t_Co"));
+        assert!(!is_tty_option(b"autoindent"));
+    }
+
+    #[test]
+    fn get_tty_option_t_co_reflects_t_colors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.t_colors;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 1;
+        assert_eq!(get_tty_option(b"t_Co"), OptVal::String(Vec::new()));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = 256;
+        assert_eq!(get_tty_option(b"t_Co"), OptVal::String(b"256".to_vec()));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.t_colors = prev;
+    }
+
+    #[test]
+    fn get_and_set_tty_option_term_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { P_TERM.get_mut() }.clone();
+
+        unsafe { *P_TERM.get_mut() = None };
+        assert_eq!(get_tty_option(b"term"), OptVal::String(b"nvim".to_vec()));
+
+        assert!(set_tty_option(b"term", b"xterm-256color".to_vec()));
+        assert_eq!(get_tty_option(b"term"), OptVal::String(b"xterm-256color".to_vec()));
+
+        unsafe { *P_TERM.get_mut() = prev };
+    }
+
+    #[test]
+    fn get_and_set_tty_option_ttytype_roundtrip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { P_TTYTYPE.get_mut() }.clone();
+
+        unsafe { *P_TTYTYPE.get_mut() = None };
+        assert_eq!(get_tty_option(b"ttytype"), OptVal::String(b"nvim".to_vec()));
+
+        assert!(set_tty_option(b"ttytype", b"xterm".to_vec()));
+        assert_eq!(get_tty_option(b"ttytype"), OptVal::String(b"xterm".to_vec()));
+
+        unsafe { *P_TTYTYPE.get_mut() = prev };
+    }
+
+    #[test]
+    fn get_tty_option_generic_keycode_returns_empty_string() {
+        assert_eq!(get_tty_option(b"t_kb"), OptVal::String(Vec::new()));
+    }
+
+    #[test]
+    fn get_tty_option_non_tty_name_returns_nil() {
+        assert_eq!(get_tty_option(b"autoindent"), OptVal::Nil);
+    }
+
+    #[test]
+    fn set_tty_option_non_settable_name_returns_false() {
+        assert!(!set_tty_option(b"t_Co", b"8".to_vec()));
+        assert!(!set_tty_option(b"autoindent", b"x".to_vec()));
     }
 }
 
