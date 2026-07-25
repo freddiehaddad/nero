@@ -1901,6 +1901,212 @@ pub fn handle_subscript(
     (crate::vim_defs::OK, 0)
 }
 
+/// `eval.c`'s own file-static `namespace_char` - the single-character
+/// scope prefixes that may legitimately precede a `:` within a plain
+/// identifier (e.g. `s:` in `s:var`) without ending the name scan
+/// there (`namespace_char`).
+const NAMESPACE_CHAR: &[u8] = b"abglstvw";
+
+/// `eval.h`'s `find_name_end`/[`find_name_end`] flag: include `[`/`.`
+/// in the name scan (used only by `get_lval`'s lvalue-resolution code,
+/// not yet translated - see [`find_name_end`]'s own doc comment for
+/// why it's not modeled here) (`FNE_INCL_BR`).
+#[allow(dead_code)]
+const FNE_INCL_BR: i32 = 1;
+/// `eval.h`'s `find_name_end` flag: check that the name starts with a
+/// valid character (`FNE_CHECK_START`).
+const FNE_CHECK_START: i32 = 2;
+
+/// Get the length of the name of a variable or function, handling (at
+/// most) a single scope-prefix colon (e.g. `"s:"` in `"s:var"`, but
+/// NOT `"n:"` in a slice `[n:]`) (`get_id_len`).
+///
+/// Returns `(name_len, consumed)`: `name_len` is the length of the
+/// name itself; `consumed` is `name_len` plus any trailing whitespace
+/// (matching the original's own internal `*arg = skipwhite(p)` before
+/// returning) - `(0, 0)` if no valid name is found at all.
+#[must_use]
+pub fn get_id_len(arg: &[u8]) -> (usize, usize) {
+    let mut p = 0;
+    while arg.get(p).is_some_and(|&c| eval_isnamec(i32::from(c))) {
+        if arg[p] == b':' {
+            let len = p;
+            if len > 1 || (len == 1 && crate::strings::vim_strchr(NAMESPACE_CHAR, i32::from(arg[0])).is_none())
+            {
+                break;
+            }
+        }
+        p += 1;
+    }
+    if p == 0 {
+        return (0, 0);
+    }
+    let ws = skipwhite(&arg[p..]);
+    (p, p + ws)
+}
+
+/// Find the end of a variable or function name, taking care of magic
+/// braces (`find_name_end`).
+///
+/// Scans at the BYTE level rather than the original's own multi-byte-
+/// character-aware `MB_PTR_ADV` walk: every character class tested
+/// here (`eval_isnamec`, `'`, `"`, `:`, `[`, `]`, `{`, `}`) is a plain
+/// ASCII byte, and valid UTF-8 continuation/lead bytes are always
+/// `>= 0x80`, so a raw byte can never appear as part of a multi-byte
+/// sequence - a byte-level scan finds the exact same boundary the
+/// original's character-aware walk would, for any well-formed UTF-8
+/// input (same reasoning as `eval_lit_string`'s own doc comment).
+///
+/// `FNE_INCL_BR` (letting `[`/`.` continue the name scan, used only
+/// by `get_lval`'s lvalue-resolution code) is NOT modeled - `flags` is
+/// only ever checked against `FNE_CHECK_START` here, since nothing
+/// in this crate can pass `FNE_INCL_BR` yet ([`get_name_len`], the
+/// only real caller, never does).
+///
+/// Returns `(end, magic_braces)`: `end` is the byte offset just past
+/// the name (`0` if there is no valid name at all - matching the
+/// original's own "return arg unchanged"); `magic_braces`, if
+/// `Some((expr_start, expr_end))`, means a `{...}` span was found
+/// within the name (byte offsets of its own `{`/`}`, `expr_end == 0`
+/// if the closing `}` was never found) - expanding it needs
+/// `make_expanded_name`, not yet translated (see [`get_name_len`]'s
+/// own doc comment for how it handles this).
+#[must_use]
+pub fn find_name_end(arg: &[u8], flags: i32) -> (usize, Option<(usize, usize)>) {
+    if (flags & FNE_CHECK_START) != 0
+        && !eval_isnamec1(i32::from(arg.first().copied().unwrap_or(0)))
+        && arg.first() != Some(&b'{')
+    {
+        return (0, None);
+    }
+
+    let mut mb_nest = 0i32;
+    let mut br_nest = 0i32;
+    let mut expr_start = None;
+    let mut expr_end = None;
+
+    let mut p = 0;
+    while p < arg.len() {
+        let c = arg[p];
+        if !(eval_isnamec(i32::from(c)) || c == b'{' || mb_nest != 0 || br_nest != 0) {
+            break;
+        }
+
+        let mut unterminated = false;
+        if c == b'\'' {
+            // skip over 'string' to avoid counting [ and ] inside it.
+            p += 1;
+            while p < arg.len() && arg[p] != b'\'' {
+                p += 1;
+            }
+            unterminated = p >= arg.len();
+        } else if c == b'"' {
+            // skip over "str\"ing" to avoid counting [ and ] inside it.
+            p += 1;
+            while p < arg.len() && arg[p] != b'"' {
+                if arg[p] == b'\\' && p + 1 < arg.len() {
+                    p += 1;
+                }
+                p += 1;
+            }
+            unterminated = p >= arg.len();
+        } else if br_nest == 0 && mb_nest == 0 && c == b':' {
+            // "s:" is start of "s:var", but "n:" is not and can be
+            // used in slice "[n:]". Also "xx:" is not a namespace.
+            // But {ns}: is.
+            let len = p;
+            if (len > 1 && arg[len - 1] != b'}')
+                || (len == 1 && crate::strings::vim_strchr(NAMESPACE_CHAR, i32::from(arg[0])).is_none())
+            {
+                break;
+            }
+        }
+        if unterminated {
+            break;
+        }
+
+        if mb_nest == 0 {
+            if arg[p] == b'[' {
+                br_nest += 1;
+            } else if arg[p] == b']' {
+                br_nest -= 1;
+            }
+        }
+        if br_nest == 0 {
+            if arg[p] == b'{' {
+                mb_nest += 1;
+                if expr_start.is_none() {
+                    expr_start = Some(p);
+                }
+            } else if arg[p] == b'}' {
+                mb_nest -= 1;
+                if mb_nest == 0 && expr_end.is_none() {
+                    expr_end = Some(p);
+                }
+            }
+        }
+
+        p += 1;
+    }
+
+    (p, expr_start.map(|s| (s, expr_end.unwrap_or(0))))
+}
+
+/// Get the length of the name of a variable or function
+/// (`get_name_len`).
+///
+/// Only the name itself is recognized - does not handle `.key` or
+/// `[idx]` (that's [`handle_subscript`]'s own job, afterward).
+///
+/// Magic-braces name expansion (`foo{expr}bar`) is detected (via
+/// [`find_name_end`]) but only actually EXPANDED when `evaluate` is
+/// `false` (where the original itself doesn't need to expand
+/// anything - it only needs to know how much input the whole
+/// construct occupies syntactically, via `find_name_end`'s own end
+/// position). When `evaluate` is `true`, expanding it for real needs
+/// `make_expanded_name`, not yet translated - `unimplemented!()`s in
+/// that specific case only.
+///
+/// The original's `K_SPECIAL`/`KS_EXTRA`/`KE_SNR` hard-coded-`<SNR>`-
+/// byte-sequence fast path (an internal representation used by
+/// already-substituted function names, not something ordinary
+/// Vimscript source text contains) is not modeled - unreachable today
+/// since nothing in this crate constructs such a byte sequence yet.
+///
+/// Returns `(name_len, consumed)`: `name_len` is the length of the
+/// name itself (`arg[0..name_len]`, e.g. all 5 bytes of `"s:foo"`, but
+/// NOT including trailing whitespace); `consumed` is how far to
+/// advance the overall parse position (name length plus any trailing
+/// whitespace) - `(0, 0)` if no valid name is found at all (`len <= 0`
+/// in the original; the original's own `semsg(_(e_invexpr2), *arg)` in
+/// that case, gated on `verbose`, is omitted - message display, not
+/// tractable).
+#[must_use]
+pub fn get_name_len(arg: &[u8], evaluate: bool) -> (usize, usize) {
+    let script_len = crate::eval::userfunc::eval_fname_script(arg);
+    let after_script = &arg[script_len..];
+
+    let flags = if script_len > 0 { 0 } else { FNE_CHECK_START };
+    let (end, magic) = find_name_end(after_script, flags);
+    if magic.is_some() {
+        if !evaluate {
+            let ws = skipwhite(&after_script[end..]);
+            return (script_len + end, script_len + end + ws);
+        }
+        unimplemented!(
+            "get_name_len: magic-braces name expansion (foo{{expr}}bar) needs \
+             make_expanded_name, not yet translated"
+        );
+    }
+
+    let (id_len, id_consumed) = get_id_len(after_script);
+    let name_len = script_len + id_len;
+    if name_len == 0 {
+        return (0, 0);
+    }
+    (name_len, script_len + id_consumed)
+}
+
 /// Recursion depth counter for [`eval7`] - the original's own
 /// function-local `static int recurse = 0`, translated as a
 /// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
@@ -2049,14 +2255,41 @@ pub unsafe fn eval7(
         // failure (matching get_name_len's own "len <= 0 -> FAIL" for
         // anything that doesn't even start like a name - e.g. trailing
         // garbage or an unbalanced closing delimiter).
-        maybe_name_start => {
-            if maybe_name_start.is_some_and(|&c| eval_isnamec1(i32::from(c))) {
-                unimplemented!(
-                    "eval7: variable/function-name lookup (get_name_len/eval_variable/\
-                     eval_func) not yet translated"
-                );
+        _ => {
+            let (name_len, name_consumed) = get_name_len(&arg[pos..], evaluate);
+            if name_len == 0 {
+                ret = FAIL;
+            } else {
+                let name = &arg[pos..pos + name_len];
+                pos += name_consumed;
+
+                if arg.get(pos) == Some(&b'(') {
+                    // "name(..."  recursive! - needs the whole
+                    // function-call machinery (eval_func/call_func/
+                    // call_user_func/the funccall-frame lifecycle),
+                    // a substantial separate undertaking, not yet
+                    // translated.
+                    unimplemented!("eval7: function calls (eval_func) not yet translated");
+                } else if evaluate {
+                    // get value of variable
+                    // SAFETY: forwarded from this function's own safety doc.
+                    ret = unsafe { crate::eval::vars::eval_variable(name, Some(rettv), true, false) };
+                } else {
+                    // skip the name. The original's further "if
+                    // rettv->v_type == VAR_UNKNOWN && !evaluate &&
+                    // strnequal(s, "v:lua.", 6)" v:lua-Partial fallback
+                    // is Lua-specific (phase 13) and unreachable here
+                    // regardless: `rettv` was just set to `Unknown`
+                    // at the top of this function and evaluate is
+                    // false in this branch, so the ONLY way it could
+                    // matter is if this crate could already construct
+                    // a v:lua-bound Partial some other way, which it
+                    // cannot yet.
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::eval::vars::check_vars(name) };
+                    ret = OK;
+                }
             }
-            ret = FAIL;
         }
     }
 
@@ -4419,6 +4652,188 @@ mod tests {
         // lookup syntax this module's own eval7 doesn't yet support.
         assert_eq!(eval_str(b"0 && 5").1.value, TypvalValue::Number(0));
         assert_eq!(eval_str(b"1 || 5").1.value, TypvalValue::Number(1));
+    }
+
+    // --- get_id_len ---
+
+    #[test]
+    fn get_id_len_plain_identifier() {
+        assert_eq!(get_id_len(b"foo_bar123 rest"), (10, 11));
+    }
+
+    #[test]
+    fn get_id_len_single_char_namespace_prefix_continues_the_scan() {
+        // "s:" (a valid namespace_char prefix) continues into the rest
+        // of the identifier as ONE combined name.
+        assert_eq!(get_id_len(b"s:myvar"), (7, 7));
+    }
+
+    #[test]
+    fn get_id_len_non_namespace_single_char_colon_stops_before_it() {
+        // "n:" is not a valid namespace prefix (matches a slice like
+        // "[n:]") - the scan stops right before the colon.
+        assert_eq!(get_id_len(b"n:foo"), (1, 1));
+    }
+
+    #[test]
+    fn get_id_len_multi_char_prefix_before_colon_stops_there_too() {
+        // "xx:" (more than 1 char before the colon) is never a
+        // namespace prefix, regardless of content.
+        assert_eq!(get_id_len(b"xx:foo"), (2, 2));
+    }
+
+    #[test]
+    fn get_id_len_empty_is_zero() {
+        assert_eq!(get_id_len(b""), (0, 0));
+    }
+
+    #[test]
+    fn get_id_len_has_no_first_character_restriction_of_its_own() {
+        // Unlike find_name_end's own FNE_CHECK_START gate (which uses
+        // eval_isnamec1 to reject a leading digit), get_id_len itself
+        // just scans while eval_isnamec holds for EVERY character,
+        // including the first - a leading digit is only ever rejected
+        // earlier, by find_name_end's own check inside get_name_len's
+        // real call chain.
+        assert_eq!(get_id_len(b"1foo"), (4, 4));
+    }
+
+    #[test]
+    fn get_id_len_stops_at_the_first_non_isnamec_byte() {
+        assert_eq!(get_id_len(b"+foo"), (0, 0));
+    }
+
+    // --- find_name_end ---
+
+    #[test]
+    fn find_name_end_plain_name_no_magic_braces() {
+        let (end, magic) = find_name_end(b"foo_bar(", 0);
+        assert_eq!(end, 7);
+        assert_eq!(magic, None);
+    }
+
+    #[test]
+    fn find_name_end_fne_check_start_rejects_invalid_first_byte() {
+        assert_eq!(find_name_end(b"1foo", FNE_CHECK_START), (0, None));
+        assert_eq!(find_name_end(b"", FNE_CHECK_START), (0, None));
+    }
+
+    #[test]
+    fn find_name_end_detects_magic_braces_span() {
+        let (end, magic) = find_name_end(b"foo{expr}bar ", 0);
+        assert_eq!(end, 12);
+        assert_eq!(magic, Some((3, 8)));
+    }
+
+    #[test]
+    fn find_name_end_unterminated_magic_braces_has_zero_expr_end() {
+        let (_end, magic) = find_name_end(b"foo{expr", 0);
+        assert_eq!(magic, Some((3, 0)));
+    }
+
+    #[test]
+    fn find_name_end_skips_quoted_content_without_counting_brackets() {
+        // A "'" inside the (already-started, via a leading "{") magic-
+        // braces span must not have its own embedded "[" mistaken for
+        // a real bracket-nest change.
+        let (end, magic) = find_name_end(b"foo{'[oops'}bar", 0);
+        assert_eq!(magic, Some((3, 11)));
+        assert_eq!(end, 15);
+    }
+
+    // --- get_name_len ---
+
+    #[test]
+    fn get_name_len_plain_global_scoped_name() {
+        assert_eq!(get_name_len(b"g:foo ", true), (5, 6));
+    }
+
+    #[test]
+    fn get_name_len_script_prefixed_name() {
+        assert_eq!(get_name_len(b"s:myvar", true), (7, 7));
+    }
+
+    #[test]
+    fn get_name_len_no_valid_name_is_zero() {
+        assert_eq!(get_name_len(b")", true), (0, 0));
+        assert_eq!(get_name_len(b"", true), (0, 0));
+    }
+
+    #[test]
+    fn get_name_len_magic_braces_when_not_evaluating_is_real() {
+        let (name_len, consumed) = get_name_len(b"foo{expr}bar(", false);
+        assert_eq!(name_len, 12);
+        assert_eq!(consumed, 12);
+    }
+
+    #[test]
+    fn get_name_len_magic_braces_when_evaluating_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| get_name_len(b"foo{expr}bar", true));
+        assert!(result.is_err(), "expected a panic (make_expanded_name not yet translated)");
+    }
+
+    // --- eval0-eval7 end-to-end: variables ---
+
+    /// Resets global-variable/funccal state shared across these tests,
+    /// matching `eval/vars.rs`'s own private `reset_shared_state`
+    /// helper (can't reuse it directly - different module - but the
+    /// same 2 steps are all that's needed for these plain-`g:`-only
+    /// tests).
+    fn reset_globals_for_test() {
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn e2e_global_variable_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"answer");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(42) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let (ret, tv) = eval_str(b"g:answer");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(42));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_global_variable_in_an_expression() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(10) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        assert_eq!(eval_str(b"g:x + 5").1.value, TypvalValue::Number(15));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_undefined_variable_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let (ret, _) = eval_str(b"g:does_not_exist");
+        assert_eq!(ret, FAIL);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_function_call_syntax_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let result = std::panic::catch_unwind(|| eval_str(b"Foo()"));
+        assert!(result.is_err(), "expected a panic (eval_func not yet translated)");
+
+        reset_globals_for_test();
     }
 }
 

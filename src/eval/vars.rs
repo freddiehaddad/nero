@@ -1386,6 +1386,102 @@ pub unsafe fn find_var(
     (unsafe { crate::eval::userfunc::find_var_in_scoped_ht(name, no_autoload) }, ht)
 }
 
+/// Get the value of variable `name`, copying it into `rettv`
+/// (`eval_variable`).
+///
+/// Returns `crate::vim_defs::FAIL` when `name` doesn't resolve to any
+/// variable, `crate::vim_defs::OK` otherwise (matching the original's
+/// own `int` return, not a `bool`, since this crate's established
+/// convention reserves `bool` for functions with no historical `OK`/
+/// `FAIL`-constant call sites - `eval7`, this function's real caller,
+/// checks the result the same way as every other `eval*` function).
+///
+/// Drops the original's `dip: dictitem_T **` out-parameter (letting a
+/// caller later WRITE BACK into the found item, e.g. for `:let`
+/// augmented assignment) - no translated caller needs it yet
+/// (`eval7`'s own call site always passes `NULL`); add it back the
+/// same way [`find_var`] models `htp` if/when `get_lval` needs it.
+///
+/// # Safety
+/// Forwarded from [`find_var`]'s own safety doc; if `rettv` is
+/// `Some`, its own value must satisfy [`crate::eval::typval::tv_copy`]'s
+/// safety contract as the "to" side (any old contents are overwritten
+/// without being released first, matching `tv_copy`'s own documented
+/// caller responsibility).
+pub unsafe fn eval_variable(name: &[u8], rettv: Option<&mut TypvalT>, _verbose: bool, no_autoload: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (item, _ht) = unsafe { find_var(name, false, no_autoload) };
+
+    match item {
+        None => {
+            // semsg(_("E121: Undefined variable: %.*s"), len, name)
+            // omitted when rettv.is_some() && verbose - message
+            // display, not tractable; the identical FAIL is kept.
+            crate::vim_defs::FAIL
+        }
+        Some(variant) => {
+            if let Some(rettv) = rettv {
+                let src: *const TypvalT = match variant {
+                    DictitemVariant::Dict(p) => {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { &(*p).di_tv }
+                    }
+                    DictitemVariant::Scope(p) => {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { &(*p).di_tv }
+                    }
+                };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_copy(&*src, rettv) };
+            }
+            crate::vim_defs::OK
+        }
+    }
+}
+
+/// Out-flag for the not-yet-translated lambda-compilation code: when
+/// `Some`, [`check_vars`] sets the pointed-to `bool` to `true` upon
+/// finding that a checked name resolves to a local variable or
+/// argument (`eval_lavars_used`).
+///
+/// Always `None` today - nothing in this crate constructs a real
+/// lambda body needing this tracked yet (needs `get_lambda_tv`, not
+/// yet translated), matching the original's own `NULL` default before
+/// any lambda compilation begins.
+static EVAL_LAVARS_USED: crate::globals::GlobalCell<Option<*mut bool>> = crate::globals::GlobalCell::new(None);
+
+/// Check if variable `name` is a local variable or an argument - if
+/// so, sets the flag `EVAL_LAVARS_USED` points to, if any
+/// (`check_vars`).
+///
+/// A real, faithful (if currently always-inert) translation: kept as
+/// its own function rather than omitted, ready for whenever lambda-
+/// compilation code populates `EVAL_LAVARS_USED` for real.
+///
+/// # Safety
+/// Forwarded from [`find_var`]'s own safety doc.
+pub unsafe fn check_vars(name: &[u8]) {
+    // SAFETY: EVAL_LAVARS_USED is a private, crate-internal GlobalCell
+    // only ever touched by this function and (in the future) lambda-
+    // compilation code.
+    let Some(flag) = (unsafe { *EVAL_LAVARS_USED.get_mut() }) else {
+        return;
+    };
+
+    let (ht, _varname) = find_var_ht(name);
+    if ht == crate::eval::userfunc::get_funccal_local_ht() || ht == crate::eval::userfunc::get_funccal_args_ht()
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { find_var(name, false, true) }.0.is_some() {
+            // SAFETY: forwarded from this function's own safety doc -
+            // a non-null EVAL_LAVARS_USED must point at a valid,
+            // live bool, exactly like the original's own contract for
+            // eval_lavars_used.
+            unsafe { *flag = true };
+        }
+    }
+}
+
 /// Get a raw pointer to `VIMVARS`'s element at raw index `idx`,
 /// without ever creating a `&mut Vec<Vimvar>`/`&mut [Vimvar]`
 /// reference the way `VIMVARS.get_mut()[idx]` indexing does - see
@@ -3340,5 +3436,118 @@ mod find_var_ht_dict_tests {
         assert_eq!(crate::eval::userfunc::get_current_funccal(), inner_fc_ptr);
 
         crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+    }
+
+    // ---- eval_variable ----
+
+    #[test]
+    fn eval_variable_undefined_returns_fail() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_variable(b"g:nope", Some(&mut rettv), false, false) };
+        assert_eq!(ret, crate::vim_defs::FAIL);
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn eval_variable_found_copies_the_value_into_rettv() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"count");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_variable(b"g:count", Some(&mut rettv), true, false) };
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn eval_variable_with_no_rettv_still_reports_found_or_not() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        assert_eq!(unsafe { eval_variable(b"g:nope", None, false, false) }, crate::vim_defs::FAIL);
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"count");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
+        assert_eq!(unsafe { eval_variable(b"g:count", None, false, false) }, crate::vim_defs::OK);
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn eval_variable_reads_whole_scope_dict_for_a_bare_g_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_variable(b"g:", Some(&mut rettv), true, false) };
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(rettv.value, TypvalValue::Dict(get_globvar_dict()));
+
+        reset_shared_state();
+    }
+
+    // ---- check_vars ----
+
+    #[test]
+    fn check_vars_is_a_no_op_when_eval_lavars_used_is_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        assert!(unsafe { *EVAL_LAVARS_USED.get_mut() }.is_none());
+
+        // Must not panic even for a name that would otherwise resolve.
+        unsafe { check_vars(b"g:anything") };
+    }
+
+    #[test]
+    fn check_vars_sets_the_flag_for_a_local_funccal_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let mut fp = crate::eval::typval_defs::UfuncT::default();
+        let mut fc = Box::new(FunccallT::default());
+        fc.fc_l_vars.dv_refcount = DO_NOT_FREE_CNT;
+        fc.fc_func = &mut fp as *mut _;
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut fc.fc_l_vars, item) };
+        crate::eval::userfunc::set_current_funccal(fc.as_mut() as *mut FunccallT);
+
+        let mut used = false;
+        unsafe { *EVAL_LAVARS_USED.get_mut() = Some(&mut used as *mut bool) };
+        unsafe { check_vars(b"x") };
+        assert!(used, "expected check_vars to set the local-var-used flag");
+
+        unsafe { *EVAL_LAVARS_USED.get_mut() = None };
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        reset_shared_state();
+    }
+
+    #[test]
+    fn check_vars_does_not_set_the_flag_for_a_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"g_only");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
+
+        let mut used = false;
+        unsafe { *EVAL_LAVARS_USED.get_mut() = Some(&mut used as *mut bool) };
+        unsafe { check_vars(b"g:g_only") };
+        assert!(!used, "a global variable is not a local var/arg");
+
+        unsafe { *EVAL_LAVARS_USED.get_mut() = None };
+        reset_shared_state();
     }
 }
