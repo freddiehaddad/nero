@@ -163,29 +163,32 @@
 //! used in place of the caller's `None`, for exactly the scope the
 //! original's own `local_evalarg` covers).
 //!
-//! `eval7` is deliberately minimal, covering only what all of
-//! `eval1`-`eval6`'s own tests need: number/float/`0z`-blob literals
-//! (`eval_number`), single-quoted string literals (`eval_lit_string`),
-//! leading `!`/`-`/`+` (`eval7_leader`), and parenthesized
-//! sub-expressions (recursing into `eval1`). Every other primary-
-//! expression form in the original's own `switch` -
-//! double-quoted strings (`eval_string`, needs the whole `keycodes.c`
-//! subsystem for `\<C-...>` escapes - a real, common, user-visible
-//! gap, not a provably-unreachable one, so deliberately NOT
-//! partially modeled), list/dict/lambda literals (`eval_list`/
-//! `eval_dict`/`eval_lit_dict`/`get_lambda_tv`), option values
-//! (`eval_option`, needs the real `options[]` get/set engine),
-//! environment variables/interpolated strings (`eval_env_var`/
-//! `eval_interp_string`), register contents (`get_reg_contents`,
-//! needs `register.c`), and variable/function-name lookup
-//! (`get_name_len`/`eval_variable`/`eval_func`, needs the funccal
-//! stack/name-resolution machinery) - panics via `unimplemented!()`,
-//! each with its own specific, documented reason, when the FIRST byte
-//! of the primary expression genuinely indicates one of these forms
-//! (a byte that would make `get_name_len` itself report "no name
-//! here at all", e.g. trailing garbage or an unbalanced closing
-//! delimiter, is instead a real, graceful `FAIL` - exactly matching
-//! `get_name_len`'s own behavior for such input, not a deferred gap).
+//! `eval7` started deliberately minimal and has grown since: number/
+//! float/`0z`-blob literals (`eval_number`), single-quoted string
+//! literals (`eval_lit_string`), double-quoted string literals
+//! (`eval_string` - full except `\<C-...>` special-key escapes, see
+//! its own doc comment), list/dict/literal-dict literals (`eval_list`/
+//! `eval_dict`/`eval_lit_dict` - `eval_dict`'s own deferred `{expr}`-
+//! vs-dict-literal speculative pre-check aside, see its own doc
+//! comment), leading `!`/`-`/`+` (`eval7_leader`), parenthesized
+//! sub-expressions (recursing into `eval1`), and plain variable
+//! references (`get_name_len`/`eval_variable`/`check_vars`) are all
+//! real. Only genuinely substantial remaining pieces still panic via
+//! `unimplemented!()`, each with its own specific, documented reason:
+//! lambda expressions (`get_lambda_tv` - detected via the new
+//! `crate::eval::userfunc::is_lambda_start` and declined cleanly,
+//! rather than being misparsed as a dict literal, needs closure/
+//! lambda compilation), option values (`eval_option`, needs the real
+//! `options[]` get/set engine plus `find_option_len`'s perfect-hash
+//! table), environment variables/interpolated strings (`eval_env_var`/
+//! `eval_interp_string`), register contents (`get_reg_contents`, needs
+//! `register.c`), and function calls (`eval_func`, needs either the
+//! whole Ex-command execution engine for user-defined functions or
+//! `eval/funcs.c`'s own huge builtin-dispatch table). A byte that
+//! would make `get_name_len` itself report "no name here at all" (e.g.
+//! trailing garbage or an unbalanced closing delimiter) is instead a
+//! real, graceful `FAIL` - exactly matching `get_name_len`'s own
+//! behavior for such input, not a deferred gap.
 //! `handle_subscript` mirrors this same minimality: only the real
 //! "nothing follows" fast path (no `[`/`.`/`(`/`->` continuation)
 //! returns successfully; anything that would actually need
@@ -1450,6 +1453,192 @@ pub fn eval_number(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, want_string:
     }
 }
 
+/// Evaluate a double-quoted string constant (`eval_string`).
+///
+/// Only the `interpolate = false` case (`eval7`'s own only call site)
+/// is modeled - matching [`eval_lit_string`]'s own established
+/// precedent for the exact same reason (`interpolate = true` needs
+/// `eval_interp_string`, not yet translated, anyway).
+///
+/// Scans/copies at the BYTE level rather than the original's own
+/// multi-byte-character-aware `MB_PTR_ADV`/`mb_copy_char` walk - same
+/// "no ASCII test byte (`\`, `"`, or any recognized escape letter) can
+/// appear as part of a multi-byte UTF-8 sequence" reasoning
+/// [`eval_lit_string`]'s own doc comment already establishes: copying
+/// one raw byte at a time in the "not a recognized escape"/"plain
+/// character" cases produces byte-identical output to the original's
+/// own `mb_copy_char` for any well-formed UTF-8 input, since a
+/// multi-byte character's own continuation bytes (always `>= 0x80`)
+/// just get individually "copied" as their own plain-character
+/// iterations instead of as one multi-byte unit - the final output
+/// byte sequence is identical either way.
+///
+/// Returns `(status, bytes_consumed)`, matching this module's own
+/// established idiom.
+///
+/// # Deferred
+/// `\<C-...>`-style special-key escapes need `find_special_key`/
+/// `trans_special`, which need the ENTIRE `keycodes.c` subsystem - key-
+/// name tables, modifier parsing, a whole generated
+/// `keycode_names.generated.h` - a substantial, separate undertaking
+/// of its own, not a small add-on. Rather than silently mishandle it,
+/// `unimplemented!()`s the MOMENT a `\<` is encountered anywhere in the
+/// string (even during the first, string-end-finding pass, exactly
+/// where the original itself would first need `find_special_key`).
+/// Every OTHER escape form (`\b`/`\e`/`\f`/`\n`/`\r`/`\t`, hex/Unicode/
+/// octal, and the literal default fallback) is translated in full.
+#[must_use]
+pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
+    use crate::ascii_defs::{ascii_isxdigit, BS, CAR, ESC, FF, NL, TAB};
+    use crate::charset::hex2nr;
+    use crate::mbyte::utf_char2bytes;
+
+    // First pass: find the end of the string (this crate's own
+    // Vec<u8>-based output never needs the original's own pre-
+    // computed allocation size, so nothing else is tracked here).
+    let mut p = 1;
+    while arg.get(p).is_some_and(|&c| c != b'"') {
+        if arg[p] == b'\\' && arg.get(p + 1).is_some() {
+            p += 1;
+            if arg[p] == b'<' {
+                unimplemented!(
+                    "eval_string: \\<C-...>-style special-key escapes need find_special_key/\
+                     trans_special, the whole keycodes.c subsystem - not yet translated"
+                );
+            }
+        }
+        p += 1;
+    }
+
+    if arg.get(p) != Some(&b'"') {
+        // semsg(_("E114: Missing quote: %s"), *arg) omitted - message
+        // display, not tractable; the identical FAIL is kept.
+        return (FAIL, 0);
+    }
+
+    if !evaluate {
+        return (OK, p + 1);
+    }
+
+    // Second pass: copy the string, handling backslashed characters.
+    let mut s = Vec::new();
+    let mut q = 1;
+    while arg.get(q).is_some_and(|&c| c != b'"') {
+        if arg[q] == b'\\' {
+            q += 1;
+            match arg.get(q) {
+                Some(&b'b') => {
+                    s.push(BS);
+                    q += 1;
+                }
+                Some(&b'e') => {
+                    s.push(ESC);
+                    q += 1;
+                }
+                Some(&b'f') => {
+                    s.push(FF);
+                    q += 1;
+                }
+                Some(&b'n') => {
+                    s.push(NL);
+                    q += 1;
+                }
+                Some(&b'r') => {
+                    s.push(CAR);
+                    q += 1;
+                }
+                Some(&b't') => {
+                    s.push(TAB);
+                    q += 1;
+                }
+                // hex: "\x1", "\x12"; Unicode: "\u0023"
+                Some(&c) if matches!(c, b'X' | b'x' | b'u' | b'U')
+                    && arg.get(q + 1).is_some_and(|&d| ascii_isxdigit(i32::from(d))) =>
+                {
+                    let is_x = c.eq_ignore_ascii_case(&b'X');
+                    let max_digits = if is_x {
+                        2
+                    } else if c == b'u' {
+                        4
+                    } else {
+                        8
+                    };
+                    let mut nr: i32 = 0;
+                    let mut n = max_digits;
+                    loop {
+                        n -= 1;
+                        if n < 0 {
+                            break;
+                        }
+                        if arg.get(q + 1).is_some_and(|&d| ascii_isxdigit(i32::from(d))) {
+                            q += 1;
+                            nr = nr.wrapping_shl(4).wrapping_add(hex2nr(i32::from(arg[q])));
+                        } else {
+                            break;
+                        }
+                    }
+                    q += 1;
+                    if is_x {
+                        s.push(nr as u8);
+                    } else {
+                        // For "\u" store the number according to
+                        // 'encoding'.
+                        let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+                        let n = utf_char2bytes(nr, &mut buf);
+                        s.extend_from_slice(&buf[..n as usize]);
+                    }
+                }
+                // octal: "\1", "\12", "\123"
+                Some(&c) if (b'0'..=b'7').contains(&c) => {
+                    let mut val = i32::from(c - b'0');
+                    q += 1;
+                    if arg.get(q).is_some_and(|&d| (b'0'..=b'7').contains(&d)) {
+                        val = (val << 3) + i32::from(arg[q] - b'0');
+                        q += 1;
+                        if arg.get(q).is_some_and(|&d| (b'0'..=b'7').contains(&d)) {
+                            val = (val << 3) + i32::from(arg[q] - b'0');
+                            q += 1;
+                        }
+                    }
+                    s.push(val as u8);
+                }
+                // Special key, e.g.: "\<C-W>" - the first pass above
+                // already unimplemented!()s before this second pass
+                // could ever be reached with a '<' here; kept only so
+                // this match stays exhaustive/documents the original's
+                // own case.
+                Some(&b'<') => {
+                    unimplemented!(
+                        "eval_string: \\<C-...>-style special-key escapes need \
+                         find_special_key/trans_special - not yet translated"
+                    );
+                }
+                // default: copy the byte literally (see this
+                // function's own doc comment for why byte-level
+                // copying is equivalent to mb_copy_char here) - also
+                // covers the "\\x"/"\\u"/etc. with no digit following"
+                // case (the guarded arm above didn't match, so control
+                // falls through to here with `q` still pointing at
+                // that same escape letter, exactly matching the
+                // original's own "no digit -> fall through unchanged,
+                // let the NEXT plain-character copy pick it up"
+                // behavior).
+                _ => {
+                    if let Some(&c) = arg.get(q) {
+                        s.push(c);
+                        q += 1;
+                    }
+                }
+            }
+        } else if let Some(&c) = arg.get(q) {
+            s.push(c);
+            q += 1;
+        }
+    }
+    rettv.value = TypvalValue::String(Some(s));
+    (OK, q + 1)
+}
+
 /// Scans `arg` (assumed to start at the opening `'`) for the byte
 /// offset of the closing, un-escaped `'`, treating `''` as an escaped
 /// literal quote - shared by both of [`eval_lit_string`]'s own passes
@@ -2450,11 +2639,9 @@ pub unsafe fn eval7(
         }
         // String constant: "string".
         Some(b'"') => {
-            unimplemented!(
-                "eval7: double-quoted string literals (eval_string) need keycodes.c's \
-                 \\<C-...> escape handling, a substantial separate undertaking - not yet \
-                 translated"
-            );
+            let (r, consumed) = eval_string(&arg[pos..], rettv, evaluate);
+            ret = r;
+            pos += consumed;
         }
         // Literal string constant: 'str''ing'.
         Some(b'\'') => {
@@ -4026,6 +4213,156 @@ mod tests {
     }
 
     #[test]
+    fn eval_string_plain_no_escapes() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"\"hello\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 7);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_common_control_escapes() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\n\\t\\r\\b\\e\\f\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::String(Some(vec![
+                crate::ascii_defs::NL,
+                crate::ascii_defs::TAB,
+                crate::ascii_defs::CAR,
+                crate::ascii_defs::BS,
+                crate::ascii_defs::ESC,
+                crate::ascii_defs::FF,
+            ]))
+        );
+    }
+
+    #[test]
+    fn eval_string_hex_escape() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\x41\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_hex_escape_single_digit() {
+        // "\x1" - only 1 hex digit given, max for \x is 2, so it stops
+        // early rather than consuming a 2nd non-hex character.
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\x1\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(vec![1])));
+
+        let mut tv2 = TypvalT::default();
+        let (ret2, _) = eval_string(b"\"\\x1g\"", &mut tv2, true);
+        assert_eq!(ret2, OK);
+        assert_eq!(tv2.value, TypvalValue::String(Some(vec![1, b'g'])));
+    }
+
+    #[test]
+    fn eval_string_unicode_escape_4_digit() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\u0041\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_unicode_escape_8_digit() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\U00000041\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_unicode_escape_multibyte_output() {
+        let mut tv = TypvalT::default();
+        // U+00E9 (é) encodes as 2 UTF-8 bytes.
+        let (ret, _) = eval_string(b"\"\\u00e9\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some("é".as_bytes().to_vec())));
+    }
+
+    #[test]
+    fn eval_string_octal_escape() {
+        let mut tv = TypvalT::default();
+        // Octal 101 == decimal 65 == 'A'.
+        let (ret, _) = eval_string(b"\"\\101\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_octal_escape_single_digit() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\7\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(vec![7])));
+    }
+
+    #[test]
+    fn eval_string_default_escape_copies_literal_char() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"\\q\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"q".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_hex_escape_with_no_digit_falls_back_to_literal_letter() {
+        // "\x" with no HEX-digit following (note: 'b' through 'f' ARE
+        // valid hex digits, so 'g' is used here to genuinely NOT
+        // qualify): the backslash is dropped and the escape letter
+        // itself becomes a plain character.
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"\"a\\xg\"", &mut tv, true);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"axg".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_missing_quote_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"\"abc", &mut tv, true);
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn eval_string_parse_only_mode_still_computes_length() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"\"hello\\nworld\"", &mut tv, false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 14);
+        assert_eq!(tv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_string_special_key_escape_is_unimplemented() {
+        let mut tv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eval_string(b"\"\\<C-W>\"", &mut tv, true)
+        }));
+        assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
+    }
+
+    #[test]
+    fn eval_string_special_key_escape_panics_even_when_not_evaluating() {
+        // The FIRST pass (finding the string's end) also needs
+        // find_special_key whenever '\<' appears, even in parse-only
+        // mode - matching the original exactly.
+        let mut tv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eval_string(b"\"\\<C-W>\"", &mut tv, false)
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn eval_lit_string_parses_simple_literal() {
         let mut tv = TypvalT::default();
         let (ret, len) = eval_lit_string(b"'hello'", &mut tv, true);
@@ -5402,6 +5739,38 @@ mod tests {
         // the original's own NOTDONE-cascade rather than panicking.
         let (ret, _) = eval_str(b"#foo");
         assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn e2e_double_quoted_string_literal() {
+        let (ret, tv) = eval_str(b"\"hello world\"");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello world".to_vec())));
+    }
+
+    #[test]
+    fn e2e_double_quoted_string_with_escapes() {
+        let (ret, tv) = eval_str(b"\"line1\\nline2\\ttab\"");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"line1\nline2\ttab".to_vec())));
+    }
+
+    #[test]
+    fn e2e_double_quoted_string_concatenation() {
+        let (ret, tv) = eval_str(b"\"foo\" . \"bar\"");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"foobar".to_vec())));
+    }
+
+    #[test]
+    fn e2e_double_quoted_string_hex_escape_in_expression() {
+        assert_eq!(eval_str(b"\"\\x41\" == 'A'").1.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn e2e_double_quoted_string_special_key_escape_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| eval_str(b"\"\\<C-W>\""));
+        assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
     }
 }
 
