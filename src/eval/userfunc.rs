@@ -225,6 +225,18 @@
 //! that type's own doc comment. `get_funccal_local_var`/
 //! `get_funccal_args_var` (translated earlier, returning
 //! `*mut ScopeDictDictItem`) now have their first real caller.
+//!
+//! Also translated (found via a full function-name diff re-scan of
+//! this file, the same methodology used throughout this project):
+//! `get_current_funccal_dict` (trivial - just an `fc_l_vars.dv_hashtab`
+//! pointer-identity check) and `find_hi_in_scoped_ht` - an exact
+//! sibling of `find_var_in_scoped_ht` that stops at the raw
+//! `hashitem_T` rather than recovering the owning `dictitem_T`/
+//! `ScopeDictDictItem`, needed (alongside `get_current_funccal_dict`)
+//! by `eval/vars.c`'s own `do_unlet` (`:unlet`, a substantial function
+//! in its own right, not yet translated) - both are translated ahead
+//! of that real caller, matching this crate's established "small
+//! self-contained helper ahead of its larger caller" precedent.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -233,7 +245,7 @@ use crate::eval::typval_defs::{
 };
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
-use crate::hashtab_defs::HashtabT;
+use crate::hashtab_defs::{HashitemT, HashtabT};
 use crate::vim_defs::OK;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -1373,6 +1385,92 @@ pub unsafe fn find_var_in_scoped_ht(
     v
 }
 
+/// If `ht` is the hashtable for local variables in the current
+/// funccal, return the dict that contains it. Otherwise return null
+/// (`get_current_funccal_dict`).
+#[must_use]
+pub fn get_current_funccal_dict(ht: *mut HashtabT) -> *mut DictT {
+    // SAFETY: only reads CURRENT_FUNCCAL/its own fc_l_vars field,
+    // matching this module's own established convention.
+    let current = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    if current.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: current just checked non-null above.
+    let fc_l_vars_ht = unsafe { &mut (*current).fc_l_vars.dv_hashtab as *mut HashtabT };
+    if ht == fc_l_vars_ht {
+        // SAFETY: current just checked non-null above.
+        unsafe { &mut (*current).fc_l_vars as *mut DictT }
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// Search hashitem in parent (enclosing lambda) scope
+/// (`find_hi_in_scoped_ht`).
+///
+/// Collapses the original's `hashtab_T **pht` out-parameter into the
+/// return value, matching `find_var_ht_dict`'s own established
+/// precedent - `Some((hi, ht))` when found (`ht` being the hashtable
+/// it was found in); `None` when there is no current funccal, no
+/// enclosing scope, or the name simply isn't defined in any ancestor
+/// scope (matching the original's own `hi` staying `NULL` in every
+/// one of those cases - never an "empty" `hashitem_T*`, always either
+/// `NULL` or a genuinely found one).
+///
+/// Otherwise an exact sibling of [`find_var_in_scoped_ht`] - see that
+/// function's own doc comment for the full explanation of the
+/// `CURRENT_FUNCCAL`-reassignment walk and its inherited "cannot
+/// cycle" assumption; this one calls `find_var_ht` (not
+/// `find_var_ht_dict`), matching the original exactly, since it only
+/// ever needs the hashtable, never the owning dict.
+///
+/// # Safety
+/// Same as [`find_var_in_scoped_ht`].
+#[must_use]
+pub unsafe fn find_hi_in_scoped_ht(name: &[u8]) -> Option<(*mut HashitemT, *mut HashtabT)> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_current_funccal = unsafe { *CURRENT_FUNCCAL.get_mut() };
+    if old_current_funccal.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut current = unsafe { (*(*old_current_funccal).fc_func).uf_scoped };
+    if current.is_null() {
+        return None;
+    }
+
+    let mut result = None;
+    // Search in parent scope which is possible to reference from lambda.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = current };
+    while !current.is_null() {
+        let (ht, varname) = crate::eval::vars::find_var_ht(name);
+        if !ht.is_null() && !varname.is_empty() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let hi = unsafe { (*ht).hash_find(varname) as *mut HashitemT };
+            // SAFETY: hi was just obtained above from a live HashtabT,
+            // always valid to read.
+            if !hashitem_empty(unsafe { &*hi }) {
+                result = Some((hi, ht));
+                break;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*(*current).fc_func).uf_scoped };
+        if next == current {
+            break;
+        }
+        current = next;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *CURRENT_FUNCCAL.get_mut() = current };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_FUNCCAL.get_mut() = old_current_funccal };
+
+    result
+}
+
 /// Allocate a `FunccallT`, link it into `current_funccal`, and fill in
 /// `fp`/`rettv` (`create_funccal`).
 ///
@@ -2365,6 +2463,137 @@ mod tests {
         // isn't in outer_fc's own l: scope and the self-loop guard
         // stops further descent.
         assert_eq!(unsafe { find_var_in_scoped_ht(b"missing", false) }, None);
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    // ---- get_current_funccal_dict / find_hi_in_scoped_ht -----------------
+
+    #[test]
+    fn get_current_funccal_dict_null_when_no_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert!(get_current_funccal_dict(std::ptr::null_mut()).is_null());
+    }
+
+    #[test]
+    fn get_current_funccal_dict_returns_fc_l_vars_when_ht_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        let ht = unsafe { &mut (*fc_ptr).fc_l_vars.dv_hashtab as *mut HashtabT };
+        assert_eq!(get_current_funccal_dict(ht), unsafe { &mut (*fc_ptr).fc_l_vars as *mut DictT });
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn get_current_funccal_dict_null_when_ht_does_not_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fc = Box::new(FunccallT::default());
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        // A totally unrelated hashtable - fc_l_avars's, not fc_l_vars's.
+        let other_ht = unsafe { &mut (*fc_ptr).fc_l_avars.dv_hashtab as *mut HashtabT };
+        assert!(get_current_funccal_dict(other_ht).is_null());
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_hi_in_scoped_ht_none_when_no_current_funccal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+        assert_eq!(unsafe { find_hi_in_scoped_ht(b"x") }, None);
+    }
+
+    #[test]
+    fn find_hi_in_scoped_ht_none_when_current_funccal_has_no_enclosing_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fp = UfuncT::default(); // uf_scoped starts null
+        let mut fc = Box::new(FunccallT { fc_func: &mut fp as *mut UfuncT, ..Default::default() });
+        let fc_ptr = fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = fc_ptr };
+
+        assert_eq!(unsafe { find_hi_in_scoped_ht(b"x") }, None);
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_hi_in_scoped_ht_finds_a_hashitem_in_the_immediate_enclosing_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(55) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut outer_fc.fc_l_vars, item) };
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        let found = unsafe { find_hi_in_scoped_ht(b"x") };
+        match found {
+            Some((hi, ht)) => {
+                assert_eq!(ht, &mut outer_fc.fc_l_vars.dv_hashtab as *mut HashtabT);
+                assert!(!hashitem_empty(unsafe { &*hi }));
+                assert_eq!(unsafe { (*hi).hi_key }, unsafe { (*item).di_key.as_mut_ptr() as *mut std::os::raw::c_char });
+            }
+            None => panic!("expected Some((hi, ht))"),
+        }
+
+        // CURRENT_FUNCCAL restored to inner_fc.
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_hi_in_scoped_ht_none_when_not_found_in_any_enclosing_scope() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        assert_eq!(unsafe { find_hi_in_scoped_ht(b"nowhere") }, None);
+        assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
+
+        unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
+    }
+
+    #[test]
+    fn find_hi_in_scoped_ht_self_referential_uf_scoped_does_not_infinite_loop() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut outer_fp = UfuncT::default();
+        let mut outer_fc = Box::new(FunccallT { fc_func: &mut outer_fp as *mut UfuncT, ..Default::default() });
+        outer_fc.fc_l_vars.dv_refcount = crate::eval::typval_defs::DO_NOT_FREE_CNT;
+        let outer_fc_ptr = outer_fc.as_mut() as *mut FunccallT;
+        outer_fp.uf_scoped = outer_fc_ptr; // self-reference
+
+        let mut inner_fp = UfuncT { uf_scoped: outer_fc_ptr, ..Default::default() };
+        let mut inner_fc = Box::new(FunccallT { fc_func: &mut inner_fp as *mut UfuncT, ..Default::default() });
+        let inner_fc_ptr = inner_fc.as_mut() as *mut FunccallT;
+        unsafe { *CURRENT_FUNCCAL.get_mut() = inner_fc_ptr };
+
+        assert_eq!(unsafe { find_hi_in_scoped_ht(b"missing") }, None);
         assert_eq!(unsafe { *CURRENT_FUNCCAL.get_mut() }, inner_fc_ptr);
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
