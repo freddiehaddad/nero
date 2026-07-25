@@ -17,6 +17,17 @@
 //! cross-checked via `cargo check --target x86_64-unknown-linux-gnu`,
 //! since this crate's dev machine is Windows-only).
 //!
+//! `vim_getenv` is now translated too, but only its common-case path:
+//! a real environment variable (via `os_getenv`, with the `TO_SLASH`
+//! backslash-to-forward-slash normalization for a handful of specific
+//! path-like names on Windows) and the Windows-only `$HOME` special
+//! case (`os_homedir`). Its OWN fallback - discovering `$VIM`/
+//! `$VIMRUNTIME` by locating the nvim executable itself when neither
+//! is set as a real environment variable - `unimplemented!()`s when
+//! actually reached (needs `vim_runtime_dir`/
+//! `vim_get_prefix_from_exepath`, real runtime-path auto-discovery,
+//! not yet translated).
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `os_getenv_buf`/`os_getenv_noalloc`: write into `NameBuff`
 //!   (`crate::globals::GLOBALS`) - tractable in principle, deferred only
@@ -32,10 +43,12 @@
 //!   reasoning as other `EXITFREE`-gated functions elsewhere); also
 //!   moot here since `HOMEDIR`'s `Option<Vec<u8>>` already drops its
 //!   contents automatically, with no separate "free" step needed.
-//! - `expand_env*`/`vim_getenv`/`home_replace*`: need `path.c`'s
-//!   directory/file-name manipulation functions and writable access to
-//!   `option_vars.h`'s options from here.
-//! - `vim_runtime_dir`/`remove_tail`: only called by `vim_getenv`,
+//! - `expand_env*`/`home_replace*`: need `path.c`'s directory/file-name
+//!   manipulation functions (`home_replace*`) or a much larger slice of
+//!   them plus `` `=expr` `` Vimscript-expression substitution
+//!   (`expand_env*`) than `vim_getenv` alone needed.
+//! - `vim_runtime_dir`/`remove_tail`: only called by `vim_getenv`'s own
+//!   still-deferred `$VIM`/`$VIMRUNTIME` auto-discovery fallback,
 //!   deferred with it.
 //! - `vim_env_iter`/`vim_env_iter_rev`: only consumed by
 //!   `set_runtimepath_default`/similar (not yet translated).
@@ -372,6 +385,56 @@ pub unsafe fn init_homedir() {
     }
 }
 
+/// `getenv()` wrapper with special handling of `$HOME` (Windows only),
+/// `$VIM`, `$VIMRUNTIME` (`vim_getenv`).
+///
+/// Returns `None` when `name` isn't set in the environment (or is set
+/// to an empty string - [`os_getenv`]'s own established "empty is
+/// `None`" treatment already covers the original's separate `string
+/// == NULL || *string == NUL` check at every real call site).
+///
+/// # Safety
+/// Forwarded from [`os_homedir`]'s own safety doc (Windows `$HOME`
+/// path only).
+#[must_use]
+pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
+    if cfg!(windows) && name == b"HOME" {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { os_homedir() };
+    }
+
+    if let Some(mut value) = os_getenv(name) {
+        // Backslashes in these specific path-like variables are
+        // normalized to forward slashes on Windows
+        // (`BACKSLASH_IN_FILENAME` builds only) - TO_SLASH's own
+        // established treatment; a no-op macro on Unix.
+        if cfg!(windows) {
+            const SLASH_NORMALIZED_NAMES: &[&[u8]] =
+                &[b"VIMRUNTIME", b"PATH", b"CDPATH", b"TMPDIR", b"TMP", b"TEMP", b"VIM", b"MYVIMRC"];
+            if SLASH_NORMALIZED_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+                crate::path::path_to_slash(&mut value);
+            }
+        }
+        return Some(value);
+    }
+
+    if name == b"VIM" || name == b"VIMRUNTIME" {
+        // When expanding $VIM/$VIMRUNTIME fails via a real
+        // environment variable, the original falls back to
+        // discovering the runtime directory relative to the nvim
+        // executable itself (vim_runtime_dir/
+        // vim_get_prefix_from_exepath, using 'helpfile' or argv[0] as
+        // a last resort) - none of that runtime-path-discovery
+        // machinery is translated yet.
+        unimplemented!(
+            "vim_getenv: $VIM/$VIMRUNTIME auto-discovery (vim_runtime_dir/\
+             vim_get_prefix_from_exepath) not yet translated"
+        );
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +683,114 @@ mod tests {
         // from_utf16_lossy; on Unix, real hostnames are ASCII/UTF-8 in
         // virtually every real deployment).
         assert!(std::str::from_utf8(&name).is_ok());
+    }
+
+    // --- vim_getenv ---
+
+    #[test]
+    fn vim_getenv_returns_a_real_environment_variable() {
+        // NERO_TEST_ENV_* is a unique, crate-specific name - no lock
+        // needed (this file's own established convention).
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_ENV_VIM_GETENV", Some("hello"))]);
+        assert_eq!(unsafe { vim_getenv(b"NERO_TEST_ENV_VIM_GETENV") }, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn vim_getenv_returns_none_for_an_unset_arbitrary_variable() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_ENV_VIM_GETENV_UNSET", None)]);
+        assert_eq!(unsafe { vim_getenv(b"NERO_TEST_ENV_VIM_GETENV_UNSET") }, None);
+    }
+
+    #[test]
+    fn vim_getenv_returns_none_for_an_empty_variable() {
+        // os_getenv's own established "empty is None" treatment
+        // already covers the original's "NULL or empty" check.
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_ENV_VIM_GETENV_EMPTY", Some(""))]);
+        assert_eq!(unsafe { vim_getenv(b"NERO_TEST_ENV_VIM_GETENV_EMPTY") }, None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn vim_getenv_home_on_windows_uses_os_homedir_not_the_raw_env_var() {
+        let _lock = homedir_test_lock();
+        // A real $HOME env var is deliberately set to something
+        // DIFFERENT from what init_homedir/os_homedir would resolve,
+        // to prove vim_getenv(b"HOME") really goes through
+        // os_homedir() on Windows rather than a plain os_getenv.
+        let _guard = EnvVarGuard::set(&[("HOME", Some("C:/raw/env/value"))]);
+        unsafe {
+            init_homedir();
+            assert_eq!(vim_getenv(b"HOME"), os_homedir());
+            assert_eq!(vim_getenv(b"HOME"), Some(b"C:/raw/env/value".to_vec()));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn vim_getenv_home_on_unix_is_a_plain_environment_variable() {
+        // On Unix, "HOME" has no special-case in vim_getenv itself -
+        // it's resolved exactly like any other real env var (via
+        // os_getenv directly), regardless of what os_homedir/
+        // init_homedir would separately resolve.
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/raw/env/value"))]);
+        assert_eq!(unsafe { vim_getenv(b"HOME") }, Some(b"/raw/env/value".to_vec()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn vim_getenv_normalizes_backslashes_for_specific_names_on_windows() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("PATH", Some(r"C:\foo\bar"))]);
+        assert_eq!(unsafe { vim_getenv(b"PATH") }, Some(b"C:/foo/bar".to_vec()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn vim_getenv_slash_normalization_name_check_is_case_insensitive() {
+        // Sets the env var under a mixed-case spelling ("MyVimRc") so
+        // os_getenv/std::env::var_os finds it via an EXACT match
+        // (avoiding any dependency on the OS's own env-var-name case-
+        // folding, which is a separate, unrelated concern this
+        // function doesn't implement itself) - this specifically
+        // tests that the SLASH_NORMALIZED_NAMES membership check
+        // (this function's own translation of the original's
+        // case-insensitive striequal()) still recognizes "MyVimRc" as
+        // meaning the same thing as the list's own "MYVIMRC" entry.
+        // Uses MYVIMRC rather than PATH/similar to avoid any risk of
+        // touching a real, load-bearing variable the test process
+        // itself might depend on (Windows env vars are case-
+        // insensitive at the OS level, so setting e.g. "Path" here
+        // could alias the real "PATH").
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("MyVimRc", Some(r"C:\foo\bar"))]);
+        assert_eq!(unsafe { vim_getenv(b"MyVimRc") }, Some(b"C:/foo/bar".to_vec()));
+    }
+
+    #[test]
+    fn vim_getenv_does_not_normalize_backslashes_for_unlisted_names() {
+        // Not in the TO_SLASH-normalized name list (on any platform) -
+        // backslashes must pass through untouched.
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_ENV_VIM_GETENV_NOSLASH", Some(r"C:\foo\bar"))]);
+        assert_eq!(
+            unsafe { vim_getenv(b"NERO_TEST_ENV_VIM_GETENV_NOSLASH") },
+            Some(br"C:\foo\bar".to_vec())
+        );
+    }
+
+    #[test]
+    fn vim_getenv_vimruntime_auto_discovery_is_unimplemented_when_unset() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIMRUNTIME", None)]);
+        let result = std::panic::catch_unwind(|| unsafe { vim_getenv(b"VIMRUNTIME") });
+        assert!(result.is_err(), "expected a panic (vim_runtime_dir not yet translated)");
+    }
+
+    #[test]
+    fn vim_getenv_vim_auto_discovery_is_unimplemented_when_unset() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIM", None)]);
+        let result = std::panic::catch_unwind(|| unsafe { vim_getenv(b"VIM") });
+        assert!(result.is_err(), "expected a panic (vim_runtime_dir not yet translated)");
     }
 }

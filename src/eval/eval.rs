@@ -172,20 +172,25 @@
 //! vs-dict-literal speculative pre-check aside, see its own doc
 //! comment), leading `!`/`-`/`+` (`eval7_leader`), parenthesized
 //! sub-expressions (recursing into `eval1`), plain variable references
-//! (`get_name_len`/`eval_variable`/`check_vars`), and option values
+//! (`get_name_len`/`eval_variable`/`check_vars`), option values
 //! (`eval_option`/`find_option_var_end`, now that `option.rs`'s real
 //! `options[]` table/`find_option`/`get_option_value`/`get_varp_from`
-//! engine all exist) are all real. Only genuinely substantial
-//! remaining pieces still panic via `unimplemented!()`, each with its
-//! own specific, documented reason: lambda expressions (`get_lambda_tv`,
+//! engine all exist), and environment variables (`eval_env_var`/
+//! `get_env_len`, now that `charset.rs`'s `vim_isidc` exists and
+//! `os/env.rs`'s `vim_getenv` covers the common "real OS environment
+//! variable" case) are all real. Only genuinely substantial remaining
+//! pieces still panic via `unimplemented!()`, each with its own
+//! specific, documented reason: lambda expressions (`get_lambda_tv`,
 //! detected via the new `crate::eval::userfunc::is_lambda_start` and
 //! declined cleanly, rather than being misparsed as a dict literal,
-//! needs closure/lambda compilation), environment variables/
-//! interpolated strings (`eval_env_var`/`eval_interp_string`), register
-//! contents (`get_reg_contents`, needs `register.c`), and function
-//! calls (`eval_func`, needs either the whole Ex-command execution
-//! engine for user-defined functions or `eval/funcs.c`'s own huge
-//! builtin-dispatch table). A byte that
+//! needs closure/lambda compilation), interpolated strings
+//! (`eval_interp_string`, `$"..."`/`$'...'`), a `$VAR` whose value
+//! `vim_getenv` can't resolve directly (needs `expand_env_save`'s own
+//! `~`/`~user`/`` `=expr` ``-handling fallback, see `os/env.rs`'s own
+//! doc comment), register contents (`get_reg_contents`, needs
+//! `register.c`), and function calls (`eval_func`, needs either the
+//! whole Ex-command execution engine for user-defined functions or
+//! `eval/funcs.c`'s own huge builtin-dispatch table). A byte that
 //! would make `get_name_len` itself report "no name here at all" (e.g.
 //! trailing garbage or an unbalanced closing delimiter) is instead a
 //! real, graceful `FAIL` - exactly matching `get_name_len`'s own
@@ -251,7 +256,7 @@
 //! yet (the same accepted gap already documented on `DictT` itself).
 
 use crate::charset::skipwhite;
-use crate::eval::typval_defs::{TypvalT, TypvalValue, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
+use crate::eval::typval_defs::{TypvalT, TypvalValue, VarLockStatus, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
@@ -2652,6 +2657,79 @@ pub unsafe fn eval_option(arg: &[u8], rettv: Option<&mut TypvalT>, evaluate: boo
     (ret, consumed)
 }
 
+/// Get the length of an environment-variable name (`get_env_len`).
+///
+/// `arg` must point to the first byte of the candidate name (i.e.
+/// past the leading `$`). Returns `0` if `arg` doesn't start with an
+/// identifier character at all (matching the original's own "no name
+/// found" `p == *arg` check) - the original's own "advance `*arg` past
+/// the name" side effect becomes moot in this crate's own idiom (the
+/// returned length already IS the amount consumed).
+#[must_use]
+pub fn get_env_len(arg: &[u8]) -> usize {
+    let mut p = 0;
+    while p < arg.len() && crate::charset::vim_isidc(i32::from(arg[p])) {
+        p += 1;
+    }
+    p
+}
+
+/// Get an environment variable's value: `$VAR` (`eval_env_var`).
+///
+/// `arg` must point to the `$` itself - the leading byte is skipped
+/// unconditionally, matching the original's own `(*arg)++` (never
+/// inspected, only skipped, same treatment as
+/// [`find_option_var_end`]'s own leading `&`/`+`).
+///
+/// Unlike [`eval_option`], a missing/empty name only `FAIL`s when
+/// `evaluate` is `true` - in parse-only mode (`evaluate == false`) this
+/// always succeeds, consuming however many identifier characters
+/// follow (possibly zero), matching the original's own `len == 0`
+/// check being nested strictly inside its `if (evaluate)` block.
+///
+/// # Safety
+/// Forwarded from [`crate::os::env::vim_getenv`]'s own safety doc
+/// (Windows `$HOME` path only).
+#[must_use]
+pub unsafe fn eval_env_var(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
+    let name_start = 1;
+    let len = get_env_len(&arg[name_start..]);
+    let consumed = name_start + len;
+
+    if evaluate {
+        if len == 0 {
+            // semsg-free FAIL - invalid empty name; message display
+            // isn't reachable from here regardless (not tractable).
+            return (FAIL, consumed);
+        }
+        let name = &arg[name_start..name_start + len];
+
+        // First try vim_getenv(), fast for normal environment vars -
+        // its own None already covers the original's combined "NULL
+        // or empty" check (os_getenv's own established treatment).
+        // SAFETY: forwarded from this function's own safety doc.
+        let string = match unsafe { crate::os::env::vim_getenv(name) } {
+            Some(s) => Some(s),
+            None => {
+                // Next try expanding things like $VIM and ${HOME} -
+                // needs expand_env_save/expand_env_esc (~/, ~user/,
+                // `=expr`, Unix-style ${VAR} braces), a substantial
+                // separate undertaking beyond vim_getenv's own scope,
+                // not yet translated.
+                unimplemented!(
+                    "eval_env_var: expand_env_save (the $VIM/${{HOME}}-style path-expansion \
+                     fallback for a name vim_getenv couldn't resolve) not yet translated"
+                );
+            }
+        };
+
+        rettv.value = TypvalValue::String(string);
+        rettv.v_lock = VarLockStatus::Unlocked;
+    }
+
+    (OK, consumed)
+}
+
 /// Recursion depth counter for [`eval7`] - the original's own
 /// function-local `static int recurse = 0`, translated as a
 /// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
@@ -2783,10 +2861,16 @@ pub unsafe fn eval7(
         }
         // Environment variable: $VAR. Interpolated string: $"..."/$'...'.
         Some(b'$') => {
-            unimplemented!(
-                "eval7: environment variables ($VAR) and interpolated strings ($\"...\") not \
-                 yet translated"
-            );
+            if matches!(arg.get(pos + 1), Some(&b'"') | Some(&b'\'')) {
+                unimplemented!(
+                    "eval7: interpolated strings ($\"...\"/$'...') need eval_interp_string, \
+                     not yet translated"
+                );
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let (r, consumed) = unsafe { eval_env_var(&arg[pos..], rettv, evaluate) };
+            ret = r;
+            pos += consumed;
         }
         // Register contents: @r.
         Some(b'@') => {
@@ -5686,6 +5770,97 @@ mod tests {
         // is_option_hidden test) - has("+aleph")-style lookup fails.
         let (ret, _) = unsafe { eval_option(b"+aleph", None, true) };
         assert_eq!(ret, FAIL);
+    }
+
+    // --- get_env_len / eval_env_var ---
+
+    #[test]
+    fn get_env_len_scans_identifier_characters_only() {
+        assert_eq!(get_env_len(b"FOO_BAR baz"), 7);
+        assert_eq!(get_env_len(b""), 0);
+        assert_eq!(get_env_len(b"!bad"), 0);
+        // No "must not start with a digit" rule - vim_isidc doesn't
+        // distinguish position, matching the original's own get_env_len.
+        assert_eq!(get_env_len(b"1st"), 3);
+    }
+
+    /// Serializes tests that set a real, well-known environment
+    /// variable name via `eval_env_var`, matching `os/env.rs`'s own
+    /// `homedir_test_lock` precedent for the same reason (Rust's
+    /// multi-threaded test runner would otherwise race these against
+    /// concurrent tests touching the same name).
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn eval_env_var_reads_a_real_environment_variable() {
+        let _lock = env_test_lock();
+        // SAFETY: serialized via env_test_lock.
+        unsafe { std::env::set_var("NERO_TEST_EVAL_ENV_VAR", "hello") };
+
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_env_var(b"$NERO_TEST_EVAL_ENV_VAR", &mut rettv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, b"$NERO_TEST_EVAL_ENV_VAR".len());
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+
+        // SAFETY: serialized via env_test_lock.
+        unsafe { std::env::remove_var("NERO_TEST_EVAL_ENV_VAR") };
+    }
+
+    #[test]
+    fn eval_env_var_empty_name_fails_when_evaluating() {
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_env_var(b"$", &mut rettv, true) };
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 1); // the leading '$' is still consumed
+    }
+
+    #[test]
+    fn eval_env_var_empty_name_still_succeeds_in_parse_only_mode() {
+        // Unlike eval_option, the "empty name" FAIL is nested strictly
+        // inside "if evaluate" in the original - parse-only mode always
+        // succeeds, whatever get_env_len found (even nothing).
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_env_var(b"$", &mut rettv, false) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 1);
+        assert_eq!(rettv.value, TypvalValue::Unknown); // untouched
+    }
+
+    #[test]
+    fn eval_env_var_unset_variable_hits_the_expand_env_save_gap() {
+        let _lock = env_test_lock();
+        // SAFETY: serialized via env_test_lock.
+        unsafe { std::env::remove_var("NERO_TEST_EVAL_ENV_VAR_UNSET") };
+
+        let result = std::panic::catch_unwind(|| {
+            let mut rettv = TypvalT::default();
+            unsafe { eval_env_var(b"$NERO_TEST_EVAL_ENV_VAR_UNSET", &mut rettv, true) }
+        });
+        assert!(result.is_err(), "expected a panic (expand_env_save not yet translated)");
+    }
+
+    #[test]
+    fn e2e_environment_variable_reference() {
+        let _lock = env_test_lock();
+        // SAFETY: serialized via env_test_lock.
+        unsafe { std::env::set_var("NERO_TEST_EVAL_ENV_VAR_E2E", "world") };
+
+        let (ret, tv) = eval_str(b"$NERO_TEST_EVAL_ENV_VAR_E2E");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"world".to_vec())));
+
+        // SAFETY: serialized via env_test_lock.
+        unsafe { std::env::remove_var("NERO_TEST_EVAL_ENV_VAR_E2E") };
+    }
+
+    #[test]
+    fn e2e_interpolated_string_syntax_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| eval_str(b"$\"foo\""));
+        assert!(result.is_err(), "expected a panic (eval_interp_string not yet translated)");
     }
 
     // --- eval0-eval7 end-to-end: variables ---

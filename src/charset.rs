@@ -34,10 +34,19 @@
 //! Deferred (real forward dependencies):
 //! - `init_chartab`/`buf_init_chartab`/`check_isopt`: need `buf_T`
 //!   (`buffer_defs.h`) and option parsing (`option.c`).
-//! - `vim_isIDc`/`vim_iswordc`/`vim_iswordp`/`vim_isfilec` families: need
-//!   the real `g_chartab` (built by the above) - unlike `vim_isprintc`
-//!   above, these don't have a simple fixed-default-rule shortcut
-//!   (`'iskeyword'`'s default already varies by `'encoding'`).
+//! - `vim_isIDc` (as [`vim_isidc`]) is now translated too, using the
+//!   same fixed-default-rule shortcut as `vim_isprintc`/`vim_isbreak`
+//!   above - direct re-examination of `options.lua` found `'isident'`'s
+//!   own default does NOT actually vary by `'encoding'` (it's a fixed,
+//!   `MSWIN`-conditional two-way split, same shape as `'isfname'`'s own
+//!   default); a past note here conflating it with `'iskeyword'`'s own
+//!   separate (and NOT similarly shortcut-able) default was corrected.
+//! - `vim_iswordc`/`vim_iswordp`/`vim_isfilec` families: still need the
+//!   real `g_chartab` (built by `buf_init_chartab` above) - unlike
+//!   `vim_isIDc` just above, these depend on `'iskeyword'`/`'isfname'`,
+//!   whose own defaults (or per-buffer/filetype customization, for
+//!   `'iskeyword'`) this crate has not separately re-verified as
+//!   similarly shortcut-able yet.
 //! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
 //!   `vim_isfilec` (hence the real `g_chartab`).
 //! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
@@ -600,6 +609,42 @@ const DEFAULT_BREAKAT: &[u8] = b" \t!@*-+;:,./?";
 #[must_use]
 pub fn vim_isbreak(c: i32) -> bool {
     u8::try_from(c).is_ok_and(|b| DEFAULT_BREAKAT.contains(&b))
+}
+
+/// Whether byte `c` is an identifier character under `'isident'`'s own
+/// DEFAULT (non-customized) value - `g_chartab`'s `CT_ID_CHAR` bit,
+/// approximated the same "fixed default rule" way as [`vim_isprintc`]/
+/// [`vim_isbreak`] above (see their own doc comments).
+///
+/// `'isident'` defaults to `"@,48-57,_,192-255"` on Unix or
+/// `"@,48-57,_,128-167,224-235"` on Windows (`options.lua`'s own
+/// `MSWIN`-conditional default - a fixed, `'encoding'`-independent
+/// split, unlike `'iskeyword'`'s own default, which this crate does
+/// NOT attempt to shortcut this way - see this module's own "Deferred"
+/// list). The `"@"` part (any character `isalpha()` accepts) is
+/// approximated as ASCII-only (`u8::is_ascii_alphabetic`), matching
+/// this crate's implicit "C" locale assumption (no locale-dependent
+/// behavior is implemented anywhere else either).
+#[must_use]
+fn default_is_id_char(c: u8) -> bool {
+    if c.is_ascii_alphabetic() || c.is_ascii_digit() || c == b'_' {
+        return true;
+    }
+    if cfg!(windows) {
+        (128..=167).contains(&c) || (224..=235).contains(&c)
+    } else {
+        c >= 192
+    }
+}
+
+/// Check that `c` is an identifier character (`vim_isIDc`): letters,
+/// digits, underscore, and `'isident'`'s own extra bytes above the
+/// ASCII range - see `default_is_id_char`'s own doc comment for the
+/// "default-rule shortcut, not the real `g_chartab`" caveat that
+/// applies here identically.
+#[must_use]
+pub fn vim_isidc(c: i32) -> bool {
+    c > 0 && c < 0x100 && default_is_id_char(c as u8)
 }
 
 /// Return number of display cells occupied by character `c`
@@ -1378,6 +1423,47 @@ mod tests {
         assert!(!vim_isbreak(-1));
         assert!(!vim_isbreak(256));
         assert!(!vim_isbreak(i32::MAX));
+    }
+
+    #[test]
+    fn vim_isidc_accepts_ascii_letters_digits_and_underscore() {
+        assert!(vim_isidc(i32::from(b'a')));
+        assert!(vim_isidc(i32::from(b'Z')));
+        assert!(vim_isidc(i32::from(b'0')));
+        assert!(vim_isidc(i32::from(b'9')));
+        assert!(vim_isidc(i32::from(b'_')));
+    }
+
+    #[test]
+    fn vim_isidc_rejects_ordinary_ascii_punctuation() {
+        assert!(!vim_isidc(i32::from(b'-')));
+        assert!(!vim_isidc(i32::from(b'.')));
+        assert!(!vim_isidc(i32::from(b' ')));
+        assert!(!vim_isidc(i32::from(b'$')));
+    }
+
+    #[test]
+    fn vim_isidc_rejects_out_of_range_and_non_positive_values() {
+        assert!(!vim_isidc(0));
+        assert!(!vim_isidc(-1));
+        assert!(!vim_isidc(0x100));
+        assert!(!vim_isidc(i32::MAX));
+    }
+
+    #[test]
+    fn vim_isidc_high_byte_range_matches_platform_default() {
+        // 'isident' defaults to "@,48-57,_,192-255" on Unix or
+        // "@,48-57,_,128-167,224-235" on Windows - verify both the
+        // included and excluded parts of whichever split applies here.
+        if cfg!(windows) {
+            assert!(vim_isidc(150)); // inside 128-167
+            assert!(vim_isidc(230)); // inside 224-235
+            assert!(!vim_isidc(200)); // between the two Windows ranges
+        } else {
+            assert!(vim_isidc(192)); // start of the Unix range
+            assert!(vim_isidc(255)); // end of the Unix range
+            assert!(!vim_isidc(191)); // just below the Unix range
+        }
     }
 
     #[test]
