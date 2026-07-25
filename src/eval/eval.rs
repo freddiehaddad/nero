@@ -2107,6 +2107,270 @@ pub fn get_name_len(arg: &[u8], evaluate: bool) -> (usize, usize) {
     (name_len, script_len + id_consumed)
 }
 
+/// Get the key for `#{key: val}` into `tv` (`get_literal_key`).
+///
+/// Returns `(status, consumed)` - `FAIL`/`0` when there is no valid
+/// key (matching the original's own check).
+#[must_use]
+fn get_literal_key(arg: &[u8], tv: &mut TypvalT) -> (i32, usize) {
+    let is_key_byte = |c: u8| crate::macros_defs::ascii_isalnum(i32::from(c)) || c == b'_' || c == b'-';
+
+    if !arg.first().is_some_and(|&c| is_key_byte(c)) {
+        return (FAIL, 0);
+    }
+    let mut p = 0;
+    while arg.get(p).is_some_and(|&c| is_key_byte(c)) {
+        p += 1;
+    }
+    tv.value = TypvalValue::String(Some(arg[..p].to_vec()));
+    let ws = skipwhite(&arg[p..]);
+    (OK, p + ws)
+}
+
+/// Allocate a variable for a List and fill it from `arg` (`eval_list`).
+///
+/// `arg` must point to the `[`.
+///
+/// # Safety
+/// Forwarded from [`eval1`]/`tv_list_append_owned_tv`/`tv_list_free`/
+/// `tv_list_set_ret`'s own safety docs.
+pub unsafe fn eval_list(arg: &[u8], rettv: &mut TypvalT, mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    use crate::eval::typval::{tv_list_alloc, tv_list_append_owned_tv, tv_list_free, tv_list_set_ret};
+    use crate::eval::typval_defs::{ListLenSpecials, VarLockStatus};
+
+    let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+    let l = if evaluate { tv_list_alloc(ListLenSpecials::ShouldKnow as isize) } else { std::ptr::null_mut() };
+
+    let mut pos = 1;
+    pos += skipwhite(&arg[pos..]);
+
+    while !matches!(arg.get(pos), Some(b']') | None) {
+        let mut tv = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, consumed) = unsafe { eval1(&arg[pos..], &mut tv, evalarg.as_deref_mut()) };
+        pos += consumed;
+        if ret == FAIL {
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_list_free(l) };
+            }
+            return (FAIL, pos);
+        }
+        if evaluate {
+            tv.v_lock = VarLockStatus::Unlocked;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_append_owned_tv(l, tv) };
+        }
+
+        let had_comma = arg.get(pos) == Some(&b',');
+        if had_comma {
+            pos += 1;
+            pos += skipwhite(&arg[pos..]);
+        }
+        if arg.get(pos) == Some(&b']') {
+            break;
+        }
+        if !had_comma {
+            // semsg(_("E696: Missing comma in List: %s"), *arg)
+            // omitted - message display, not tractable; the identical
+            // FAIL is kept.
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_list_free(l) };
+            }
+            return (FAIL, pos);
+        }
+    }
+
+    if arg.get(pos) != Some(&b']') {
+        // semsg(_(e_list_end), *arg) omitted.
+        if evaluate {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_free(l) };
+        }
+        return (FAIL, pos);
+    }
+
+    pos += 1;
+    pos += skipwhite(&arg[pos..]);
+    if evaluate {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_set_ret(rettv, l) };
+    }
+    (OK, pos)
+}
+
+/// Allocate a variable for a Dictionary and fill it from `arg`
+/// (`eval_dict`).
+///
+/// `arg` must point to the `{` (or, for `literal == true`, one byte
+/// PAST the `#` - i.e. still at the `{` - matching `eval7`'s own call
+/// site, which skips the `#` itself before calling this).
+///
+/// # Deferred
+/// The original's own "is this really a curly-name expression
+/// `{expr}`, not a dict literal" speculative pre-check (only relevant
+/// for `literal == false`, calling `eval1` in throwaway, non-erroring
+/// parse-only mode) is NOT modeled: it would need to speculatively
+/// PARSE an arbitrary sub-expression that might land on a genuinely
+/// not-yet-implemented `eval7` form (e.g. a function call or a
+/// double-quoted string), which would panic via `unimplemented!()`
+/// rather than gracefully reporting "not a valid expression" the way
+/// the original's own real error handling does. A real, if narrow and
+/// rare, gap: a bare `{expr}` curly-name variable/function-name
+/// construction (itself not supported elsewhere in this crate either)
+/// will incorrectly attempt - and normally fail to parse as - a dict
+/// literal, instead of being correctly recognized as a curly-name
+/// expression.
+///
+/// # Safety
+/// Forwarded from [`eval1`]/`tv_dict_alloc`/`tv_dict_free`/
+/// `tv_dict_find`/`tv_dict_item_alloc`/`tv_dict_add`/
+/// `tv_dict_item_free`/`tv_dict_set_ret`/`tv_clear_simple`'s own
+/// safety docs.
+pub unsafe fn eval_dict(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    mut evalarg: Option<&mut EvalargT>,
+    literal: bool,
+) -> (i32, usize) {
+    use crate::eval::typval::{
+        tv_clear_simple, tv_dict_add, tv_dict_alloc, tv_dict_find, tv_dict_free, tv_dict_item_alloc,
+        tv_dict_item_free, tv_dict_set_ret, tv_get_string_chk,
+    };
+    use crate::eval::typval_defs::VarLockStatus;
+
+    let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+    let d = if evaluate { tv_dict_alloc() } else { std::ptr::null_mut() };
+
+    let mut pos = 1;
+    pos += skipwhite(&arg[pos..]);
+
+    while !matches!(arg.get(pos), Some(b'}') | None) {
+        let mut tvkey = TypvalT::default();
+        let (ret, consumed) = if literal {
+            get_literal_key(&arg[pos..], &mut tvkey)
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { eval1(&arg[pos..], &mut tvkey, evalarg.as_deref_mut()) }
+        };
+        pos += consumed;
+        if ret == FAIL {
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_dict_free(d) };
+            }
+            return (FAIL, pos);
+        }
+
+        if arg.get(pos) != Some(&b':') {
+            // semsg(_("E720: Missing colon in Dictionary: %s"), *arg)
+            // omitted.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&tvkey) };
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_dict_free(d) };
+            }
+            return (FAIL, pos);
+        }
+
+        let mut key: Option<Vec<u8>> = None;
+        if evaluate {
+            key = tv_get_string_chk(&tvkey);
+            if key.is_none() {
+                // "key" is None when tv_get_string_chk() would have
+                // reported a type error.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    tv_clear_simple(&tvkey);
+                    tv_dict_free(d);
+                }
+                return (FAIL, pos);
+            }
+        }
+
+        pos += 1;
+        pos += skipwhite(&arg[pos..]);
+        let mut tv = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret2, consumed2) = unsafe { eval1(&arg[pos..], &mut tv, evalarg.as_deref_mut()) };
+        pos += consumed2;
+        if ret2 == FAIL {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&tvkey) };
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_dict_free(d) };
+            }
+            return (FAIL, pos);
+        }
+
+        if evaluate {
+            let key = key.expect("key is Some when evaluate is true, checked above");
+            // SAFETY: forwarded from this function's own safety doc.
+            if tv_dict_find(unsafe { d.as_mut() }, &key).is_some() {
+                // semsg(_("E721: Duplicate key in Dictionary: \"%s\""),
+                // key) omitted.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    tv_clear_simple(&tvkey);
+                    tv_clear_simple(&tv);
+                    tv_dict_free(d);
+                }
+                return (FAIL, pos);
+            }
+            let item = tv_dict_item_alloc(&key);
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                (*item).di_tv = tv;
+                (*item).di_tv.v_lock = VarLockStatus::Unlocked;
+                if tv_dict_add(&mut *d, item) == FAIL {
+                    tv_dict_item_free(item);
+                }
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&tvkey) };
+
+        let had_comma = arg.get(pos) == Some(&b',');
+        if had_comma {
+            pos += 1;
+            pos += skipwhite(&arg[pos..]);
+        }
+        if arg.get(pos) == Some(&b'}') {
+            break;
+        }
+        if !had_comma {
+            // semsg(_("E722: Missing comma in Dictionary: %s"), *arg)
+            // omitted.
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_dict_free(d) };
+            }
+            return (FAIL, pos);
+        }
+    }
+
+    if arg.get(pos) != Some(&b'}') {
+        // semsg(_("E723: Missing end of Dictionary '}': %s"), *arg)
+        // omitted.
+        if evaluate {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_dict_free(d) };
+        }
+        return (FAIL, pos);
+    }
+
+    pos += 1;
+    pos += skipwhite(&arg[pos..]);
+    if evaluate {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_set_ret(rettv, d) };
+    }
+    (OK, pos)
+}
+
 /// Recursion depth counter for [`eval7`] - the original's own
 /// function-local `static int recurse = 0`, translated as a
 /// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
@@ -2200,18 +2464,36 @@ pub unsafe fn eval7(
         }
         // List: [expr, expr]
         Some(b'[') => {
-            unimplemented!("eval7: list literals (eval_list) not yet translated");
+            let (r, consumed) = unsafe { eval_list(&arg[pos..], rettv, evalarg.as_deref_mut()) };
+            ret = r;
+            pos += consumed;
         }
-        // Literal Dictionary: #{key: val, key: val}
-        Some(b'#') => {
-            unimplemented!("eval7: literal-key dictionary literals (eval_lit_dict) not yet translated");
+        // Literal Dictionary: #{key: val, key: val} - eval_lit_dict's
+        // own body is folded directly into this guard + call (its
+        // real body is only this exact "arg[1] == '{'" check plus a
+        // call to eval_dict(..., literal=true), with no other real
+        // caller of its own) - a bare '#' NOT followed immediately by
+        // '{' falls through to the final `_` arm below (name/function
+        // resolution), matching the original's own NOTDONE-cascade
+        // exactly (get_name_len's own FNE_CHECK_START rejects '#' as
+        // a name-starter, correctly FAILing rather than panicking).
+        Some(b'#') if arg.get(pos + 1) == Some(&b'{') => {
+            pos += 1;
+            let (r, consumed) = unsafe { eval_dict(&arg[pos..], rettv, evalarg.as_deref_mut(), true) };
+            ret = r;
+            pos += consumed;
         }
         // Lambda: {arg, arg -> expr}. Dictionary: {'key': val, 'key': val}
         Some(b'{') => {
-            unimplemented!(
-                "eval7: lambda expressions (get_lambda_tv) and dictionary literals \
-                 (eval_dict) not yet translated"
-            );
+            if crate::eval::userfunc::is_lambda_start(&arg[pos..]) {
+                unimplemented!(
+                    "eval7: lambda expressions (get_lambda_tv) not yet translated - needs \
+                     lambda/closure compilation, a substantial separate undertaking"
+                );
+            }
+            let (r, consumed) = unsafe { eval_dict(&arg[pos..], rettv, evalarg.as_deref_mut(), false) };
+            ret = r;
+            pos += consumed;
         }
         // Option value: &name
         Some(b'&') => {
@@ -4834,6 +5116,292 @@ mod tests {
         assert!(result.is_err(), "expected a panic (eval_func not yet translated)");
 
         reset_globals_for_test();
+    }
+
+    // --- get_literal_key ---
+
+    #[test]
+    fn get_literal_key_simple() {
+        let mut tv = TypvalT::default();
+        // No whitespace directly after "abc" (the very next byte is
+        // ':'), so nothing extra is skipped - consumed == the key's
+        // own length exactly.
+        let (ret, consumed) = get_literal_key(b"abc: 1}", &mut tv);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"abc".to_vec())));
+    }
+
+    #[test]
+    fn get_literal_key_skips_trailing_whitespace() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = get_literal_key(b"abc  : 1}", &mut tv);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 5);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"abc".to_vec())));
+    }
+
+    #[test]
+    fn get_literal_key_allows_dash_and_underscore() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = get_literal_key(b"my-key_2:", &mut tv);
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"my-key_2".to_vec())));
+    }
+
+    #[test]
+    fn get_literal_key_invalid_start_fails() {
+        let mut tv = TypvalT::default();
+        assert_eq!(get_literal_key(b" abc", &mut tv), (FAIL, 0));
+        assert_eq!(get_literal_key(b"", &mut tv), (FAIL, 0));
+    }
+
+    // --- eval_list ---
+
+    fn list_item(l: *mut crate::eval::typval_defs::ListT, n: i32) -> TypvalValue {
+        let item = unsafe { crate::eval::typval::tv_list_find(l, n) };
+        assert!(!item.is_null(), "expected an item at index {n}");
+        unsafe { (*item).li_tv.value.clone() }
+    }
+
+    #[test]
+    fn eval_list_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = unsafe { eval_list(b"[]", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 2);
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn eval_list_multiple_elements() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = unsafe { eval_list(b"[1, 2, 3]", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 9);
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 3);
+        assert_eq!(list_item(l, 0), TypvalValue::Number(1));
+        assert_eq!(list_item(l, 1), TypvalValue::Number(2));
+        assert_eq!(list_item(l, 2), TypvalValue::Number(3));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn eval_list_trailing_comma_allowed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_list(b"[1, 2,]", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn eval_list_missing_comma_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_list(b"[1 2]", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_list_unterminated_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_list(b"[1, 2", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_list_parse_only_mode_produces_no_real_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = EvalargT::default();
+        let (ret, consumed) = unsafe { eval_list(b"[1, 2, 3]", &mut rettv, Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 9);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    // --- eval_dict ---
+
+    #[test]
+    fn eval_dict_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = unsafe { eval_dict(b"{}", &mut rettv, Some(&mut evalarg), false) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 2);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        assert_eq!(crate::eval::typval::tv_dict_len(unsafe { d.as_ref() }), 0);
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn eval_dict_literal_simple() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = unsafe { eval_dict(b"{a: 1, b: 2}", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 12);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        assert_eq!(crate::eval::typval::tv_dict_len(unsafe { d.as_ref() }), 2);
+        let item_a = crate::eval::typval::tv_dict_find(unsafe { d.as_mut() }, b"a").unwrap();
+        assert_eq!(unsafe { (*item_a).di_tv.value.clone() }, TypvalValue::Number(1));
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn eval_dict_non_literal_string_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{'x': 42}", &mut rettv, Some(&mut evalarg), false) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        let item = crate::eval::typval::tv_dict_find(unsafe { d.as_mut() }, b"x").unwrap();
+        assert_eq!(unsafe { (*item).di_tv.value.clone() }, TypvalValue::Number(42));
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn eval_dict_duplicate_key_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{a: 1, a: 2}", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_dict_missing_colon_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{a 1}", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_dict_missing_comma_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{a: 1 b: 2}", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_dict_unterminated_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{a: 1", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_dict_trailing_comma_allowed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let mut evalarg = evaluate_evalarg();
+        let (ret, _) = unsafe { eval_dict(b"{a: 1,}", &mut rettv, Some(&mut evalarg), true) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        assert_eq!(crate::eval::typval::tv_dict_len(unsafe { d.as_ref() }), 1);
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    // --- eval0-eval7 end-to-end: list/dict literals ---
+
+    #[test]
+    fn e2e_list_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[1, 2, 3]");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 3);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn e2e_empty_list_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[]");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn e2e_list_equality_comparison() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(eval_str(b"[1, 2] == [1, 2]").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"[1, 2] == [1, 3]").1.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn e2e_nested_list_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[[1, 2], [3, 4]]");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        let inner = list_item(l, 0);
+        let TypvalValue::List(inner_l) = inner else { panic!("expected an inner List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(inner_l) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn e2e_literal_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"#{a: 1, b: 2}");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = tv.value else { panic!("expected a Dict") };
+        assert_eq!(crate::eval::typval::tv_dict_len(unsafe { d.as_ref() }), 2);
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn e2e_regular_dict_with_string_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"{'a': 1}");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = tv.value else { panic!("expected a Dict") };
+        let item = crate::eval::typval::tv_dict_find(unsafe { d.as_mut() }, b"a").unwrap();
+        assert_eq!(unsafe { (*item).di_tv.value.clone() }, TypvalValue::Number(1));
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn e2e_lambda_syntax_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| eval_str(b"{a -> a}"));
+        assert!(result.is_err(), "expected a panic (get_lambda_tv not yet translated)");
+    }
+
+    #[test]
+    fn e2e_bare_hash_without_brace_fails_gracefully() {
+        // "#" not immediately followed by "{" is not a literal-dict
+        // attempt at all - falls through to name resolution, which
+        // correctly FAILs ('#' is not a valid name-starter), matching
+        // the original's own NOTDONE-cascade rather than panicking.
+        let (ret, _) = eval_str(b"#foo");
+        assert_eq!(ret, FAIL);
     }
 }
 

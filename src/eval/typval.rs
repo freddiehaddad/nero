@@ -239,6 +239,17 @@ pub unsafe fn tv_list_ref(l: *mut crate::eval::typval_defs::ListT) {
     unsafe { (*l).lv_refcount += 1 };
 }
 
+/// Set the return value of `tv` to a list, incrementing its reference
+/// count (`tv_list_set_ret`, `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+pub unsafe fn tv_list_set_ret(tv: &mut TypvalT, l: *mut crate::eval::typval_defs::ListT) {
+    tv.value = TypvalValue::List(l);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_ref(l) };
+}
+
 /// Get the number of items in a list, or `0` if `l` is null
 /// (`tv_list_len`, `eval/typval.h`'s own `static inline`).
 ///
@@ -1284,6 +1295,20 @@ pub fn tv_dict_alloc() -> *mut DictT {
     unsafe { *GC_FIRST_DICT.get_mut() = d };
 
     d
+}
+
+/// Set the return value of `tv` to a dict, incrementing its reference
+/// count if non-null (`tv_dict_set_ret`, `eval/typval.h`'s own
+/// `static inline`).
+///
+/// # Safety
+/// `d`, if non-null, must be a valid pointer to a live `DictT`.
+pub unsafe fn tv_dict_set_ret(tv: &mut TypvalT, d: *mut DictT) {
+    tv.value = TypvalValue::Dict(d);
+    if !d.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*d).dv_refcount += 1 };
+    }
 }
 
 /// Set all existing keys in `dict` as read-only. Does not protect

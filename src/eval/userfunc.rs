@@ -434,6 +434,107 @@ pub fn eval_fname_script(name: &[u8]) -> usize {
     0
 }
 
+/// Scan one lambda-argument name, skip-only mode (`newargs` is always
+/// absent for this crate's only real caller, [`is_lambda_start`]'s own
+/// lambda-vs-dict-literal detection - matching the original's own
+/// `get_lambda_tv`, whose FIRST, detection-only call always passes
+/// `newargs = NULL`) (`one_function_arg`).
+///
+/// Returns the byte offset just past the identifier, or `0` if `arg`
+/// doesn't start with a valid argument name (empty, digit-first, or
+/// the reserved `"firstline"`/`"lastline"` names).
+#[must_use]
+fn one_function_arg_skip(arg: &[u8]) -> usize {
+    let mut p = 0;
+    while arg.get(p).is_some_and(|&c| crate::macros_defs::ascii_isalnum(i32::from(c)) || c == b'_') {
+        p += 1;
+    }
+    if p == 0 || arg[0].is_ascii_digit() || &arg[..p] == b"firstline" || &arg[..p] == b"lastline" {
+        return 0;
+    }
+    p
+}
+
+/// Get function arguments, skip-only mode (`newargs`/`varargs`/
+/// `default_args` always absent) (`get_function_args`).
+///
+/// This crate's only real caller, [`is_lambda_start`]'s own lambda-
+/// detection, only ever calls the original this way
+/// (`get_function_args(&s, '-', NULL, NULL, NULL, true)`) - the
+/// "populate `newargs`/`default_args`" branches (needed only once a
+/// lambda is confirmed and its arguments are parsed FOR REAL, which
+/// needs the rest of `get_lambda_tv` - lambda/closure compilation, a
+/// substantial separate undertaking) are not modeled.
+///
+/// Returns the byte offset just past `endchar`, or `None` on failure
+/// (matching the original's `OK`/`FAIL`).
+#[must_use]
+fn get_function_args_skip(arg: &[u8], endchar: u8) -> Option<usize> {
+    let mut p = 0;
+    let mut mustend = false;
+
+    while arg.get(p) != Some(&endchar) {
+        if arg.get(p) == Some(&b'.') && arg.get(p + 1) == Some(&b'.') && arg.get(p + 2) == Some(&b'.') {
+            p += 3;
+            mustend = true;
+        } else {
+            let consumed = one_function_arg_skip(&arg[p..]);
+            if consumed == 0 {
+                break;
+            }
+            p += consumed;
+
+            // "= default_expr" (needs default_args, always absent
+            // here) and the "non-default after default" error check
+            // (needs any_default, which can only ever become true
+            // once a default IS accepted - never, since default_args
+            // is always absent) are both unreachable for this crate's
+            // only real (skip-only, detection) caller.
+
+            let ws = crate::charset::skipwhite(&arg[p..]);
+            if ws > 0 && arg.get(p + ws) == Some(&b',') {
+                p += ws;
+            }
+            if arg.get(p) == Some(&b',') {
+                p += 1;
+            } else {
+                mustend = true;
+            }
+        }
+        p += crate::charset::skipwhite(&arg[p..]);
+        if mustend && arg.get(p) != Some(&endchar) {
+            break;
+        }
+    }
+
+    if arg.get(p) != Some(&endchar) {
+        return None;
+    }
+    Some(p + 1)
+}
+
+/// Whether `arg` (pointing at a `{`) looks like the start of a lambda
+/// expression (`{args -> expr}`) - the FIRST, detection-only check
+/// `get_lambda_tv` itself performs, before actually parsing the
+/// lambda's own arguments/body for real (needs the rest of
+/// `get_lambda_tv` - lambda/closure compilation, a substantial
+/// separate undertaking, not attempted here). A pure syntax check:
+/// never evaluates anything, so it's always safe to call even when
+/// `arg` isn't really a lambda (e.g. a genuine `{key: val}` dict
+/// literal or `{expr}` curly-name construct).
+///
+/// # Examples
+/// `is_lambda_start(b"{a, b -> a + b}")` is `true`;
+/// `is_lambda_start(b"{'key': 1}")` is `false` (no `->` found).
+#[must_use]
+pub fn is_lambda_start(arg: &[u8]) -> bool {
+    let s_start = 1 + crate::charset::skipwhite(arg.get(1..).unwrap_or(&[]));
+    match get_function_args_skip(&arg[s_start..], b'-') {
+        Some(consumed) => arg.get(s_start + consumed) == Some(&b'>'),
+        None => false,
+    }
+}
+
 /// Whether `name` (already confirmed via [`eval_fname_script`] to have
 /// a script-local prefix) is `"<SID>"`/`"s:"`-style (needing the
 /// current script's own ID substituted in), as opposed to `"<SNR>"`-
@@ -3386,6 +3487,41 @@ mod tests {
         assert_eq!(eval_fname_script(b"Foo"), 0);
         assert_eq!(eval_fname_script(b""), 0);
         assert_eq!(eval_fname_script(b"<Foo"), 0);
+    }
+
+    #[test]
+    fn is_lambda_start_true_for_multi_arg_lambda() {
+        assert!(is_lambda_start(b"{a, b -> a + b}"));
+    }
+
+    #[test]
+    fn is_lambda_start_true_for_single_arg_lambda() {
+        assert!(is_lambda_start(b"{a -> a}"));
+    }
+
+    #[test]
+    fn is_lambda_start_true_for_zero_arg_lambda() {
+        assert!(is_lambda_start(b"{-> 42}"));
+    }
+
+    #[test]
+    fn is_lambda_start_true_for_varargs_lambda() {
+        assert!(is_lambda_start(b"{... -> 42}"));
+    }
+
+    #[test]
+    fn is_lambda_start_false_for_a_dict_literal() {
+        assert!(!is_lambda_start(b"{'key': 1}"));
+    }
+
+    #[test]
+    fn is_lambda_start_false_for_an_empty_dict() {
+        assert!(!is_lambda_start(b"{}"));
+    }
+
+    #[test]
+    fn is_lambda_start_false_when_no_arrow_follows_the_args() {
+        assert!(!is_lambda_start(b"{a, b}"));
     }
 
     #[test]
