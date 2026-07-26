@@ -154,6 +154,12 @@
 //!
 //! Also `range()` (a `List` of numbers, optionally strided/counting
 //! down).
+//!
+//! Also `repeat()` (repeat a `String`/`List`/`Blob` `{count}` times,
+//! concatenated) - its `Blob` case builds the repeated buffer
+//! directly via a plain `Vec<u8>` rather than the original's own
+//! `ga_grow`+`tv_blob_set_range`-based approach (including a "skip
+//! the copy if already all zero" micro-optimization not needed here).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -248,6 +254,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"extend"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extend });
         m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
         m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
+        m.insert(&b"repeat"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_repeat });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2134,6 +2141,127 @@ unsafe fn f_range(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Repeat list `l` `n` times into a NEW list, set into `rettv`
+/// (`repeat_list`, `funcs.c`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::ListT`].
+unsafe fn repeat_list(l: *mut crate::eval::typval_defs::ListT, n: crate::eval::typval_defs::VarnumberT, rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len_hint = if n > 0 { n * i64::from(unsafe { crate::eval::typval::tv_list_len(l) }) } else { 0 };
+    // SAFETY: rettv is a plain `&mut TypvalT`, always safe to write
+    // into.
+    let new_list = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, len_hint as isize) };
+    let mut remaining = n;
+    while remaining > 0 {
+        remaining -= 1;
+        // SAFETY: `new_list` was just allocated above by this same
+        // call; `l`, forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_extend(new_list, l, std::ptr::null_mut()) };
+    }
+}
+
+/// Repeat blob `blob_tv`'s own bytes `n` times into a NEW blob, set
+/// into `rettv` (`repeat_blob`, `funcs.c`).
+///
+/// Builds the repeated byte buffer directly via a plain `Vec<u8>`
+/// (`bv_ga.ga_data` IS one in this crate) rather than the original's
+/// own `ga_grow`+`tv_blob_set_range`-based approach (including its
+/// own "skip the copy if every byte is already zero" optimization,
+/// a pure C-level micro-optimization not needed here) - `funcs.c`'s
+/// own general-purpose `tv_blob_set_range` (used elsewhere for list-
+/// index-assignment into a blob, not yet translated) isn't needed for
+/// this one, simpler, always-appending caller.
+///
+/// # Safety
+/// `blob_tv.value` must be `Blob`-typed; if its pointer is non-null,
+/// it must be valid.
+unsafe fn repeat_blob(blob_tv: &TypvalT, n: crate::eval::typval_defs::VarnumberT, rettv: &mut TypvalT) {
+    let TypvalValue::Blob(blob) = blob_tv.value else { unreachable!() };
+
+    let new_blob = crate::eval::typval::tv_blob_alloc_ret(rettv);
+    if blob.is_null() || n <= 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let slen = unsafe { crate::eval::typval::tv_blob_len(blob) };
+    let len = i64::from(slen) * n;
+    if len <= 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let src: Vec<u8> = unsafe { (&(*blob).bv_ga.ga_data)[..slen as usize].to_vec() };
+    let mut data = Vec::with_capacity(len as usize);
+    for _ in 0..n {
+        data.extend_from_slice(&src);
+    }
+    // SAFETY: `new_blob` was just allocated above, a fresh pointer
+    // not shared with anything yet.
+    unsafe {
+        (*new_blob).bv_ga.ga_data = data;
+        (*new_blob).bv_ga.ga_len = len as i32;
+        (*new_blob).bv_ga.ga_maxlen = len as i32;
+    }
+}
+
+/// Repeat string `str_tv`'s own bytes `n` times into a NEW string, set
+/// into `rettv` (`repeat_string`, `funcs.c`).
+///
+/// `strlen(p)` (the original's own C-string-bounded scan) is mirrored
+/// by stopping at the first embedded NUL (or the full length, if
+/// none) - this crate's own established "embedded NUL ends a
+/// C-string-modeled scan" idiom, used throughout this module.
+/// Overflow detection uses [`usize::checked_mul`] directly (a more
+/// robust equivalent of the original's own `len / n != slen`
+/// division-based check).
+fn repeat_string(str_tv: &TypvalT, n: crate::eval::typval_defs::VarnumberT, rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+    if n <= 0 {
+        return;
+    }
+
+    let s = crate::eval::typval::tv_get_string(str_tv);
+    let slen = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+    if slen == 0 {
+        return;
+    }
+    let Some(len) = slen.checked_mul(n as usize) else {
+        return; // overflow.
+    };
+
+    let mut r = Vec::with_capacity(len);
+    for _ in 0..n {
+        r.extend_from_slice(&s[..slen]);
+    }
+    rettv.value = TypvalValue::String(Some(r));
+}
+
+/// `repeat({expr}, {count})` - repeat `{expr}` `{count}` times,
+/// concatenated (`f_repeat`, `funcs.c`). `{expr}` may be a `List`
+/// (dispatches to [`repeat_list`]), `Blob` ([`repeat_blob`]), or
+/// anything else, stringified first ([`repeat_string`]).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Blob`-typed with a non-null
+/// pointer, that pointer must be valid.
+unsafe fn f_repeat(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let n = crate::eval::typval::tv_get_number(&argvars[1]);
+    match &argvars[0].value {
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { repeat_list(*l, n, rettv) };
+        }
+        TypvalValue::Blob(_) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { repeat_blob(&argvars[0], n, rettv) };
+        }
+        _ => repeat_string(&argvars[0], n, rettv),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2840,6 +2968,7 @@ mod tests {
             "extend",
             "extendnew",
             "range",
+            "repeat",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -4738,5 +4867,108 @@ mod tests {
         let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
         unsafe { f_range(&[num(5), num(1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- f_repeat ---
+
+    #[test]
+    fn repeat_string_repeats_n_times() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_repeat(&[string(b"ab"), num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"ababab".to_vec())));
+    }
+
+    #[test]
+    fn repeat_string_with_zero_or_negative_count_is_empty() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_repeat(&[string(b"ab"), num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+        unsafe { f_repeat(&[string(b"ab"), num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn repeat_string_stops_at_an_embedded_nul() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_repeat(&[string(b"ab\0cd"), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"abab".to_vec())));
+    }
+
+    #[test]
+    fn repeat_of_a_number_stringifies_first() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_repeat(&[num(12), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"1212".to_vec())));
+    }
+
+    #[test]
+    fn repeat_list_repeats_n_times() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(3)];
+        unsafe { f_repeat(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_ne!(l, list);
+        unsafe {
+            assert_eq!(list_values(l), vec![1, 2, 1, 2, 1, 2]);
+            crate::eval::typval::tv_list_unref(list);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn repeat_list_with_zero_count_is_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(0)];
+        unsafe { f_repeat(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(list);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn repeat_blob_repeats_n_times() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2];
+            (*blob).bv_ga.ga_len = 2;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(2)];
+        unsafe { f_repeat(&args, &mut rettv) };
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        assert_ne!(b, blob);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 4);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 0), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 1), 2);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 2), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 3), 2);
+            crate::eval::typval::tv_blob_free(blob);
+            crate::eval::typval::tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn repeat_blob_of_a_null_blob_is_an_empty_blob() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(std::ptr::null_mut()), ..Default::default() }, num(3)];
+        unsafe { f_repeat(&args, &mut rettv) };
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
+            crate::eval::typval::tv_blob_free(b);
+        }
     }
 }
