@@ -25,6 +25,17 @@
 //! `tabpage_win_valid`'s own single-tabpage walk nested inside an
 //! outer tabpage loop.
 //!
+//! Also translated: `win_has_winnr`/`win_get_tabwin` (both real
+//! `window.c` functions), plus `win_id2win`/`win_getid` (originally
+//! `static` helpers in `eval/window.c`, hosted here alongside their
+//! own `window.c` dependencies rather than in `eval/funcs.rs` - same
+//! "helper logic lives near its own dependencies, the builtin
+//! Vimscript-facing wrapper lives in `funcs.rs`" precedent as
+//! `state.rs`'s `get_mode`/`funcs.rs`'s `f_mode`). All 4 need the
+//! same window/tabpage-list walk already established above, plus
+//! `WinT.w_config`'s already-translated `hide`/`focusable` fields for
+//! `win_has_winnr`'s own floating-window-aware numbering check.
+//!
 //! Also translated: `check_can_set_curbuf_disabled`/
 //! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
 //! the original's real `emsg` call, matching the established "skip the
@@ -156,6 +167,166 @@ pub unsafe fn win_count() -> i32 {
         wp = unsafe { &*wp }.w_next;
     }
     count
+}
+
+/// Whether window `wp` "counts" toward window numbering in tab page
+/// `tp` (`win_has_winnr`). `tp`'s own current window always counts;
+/// otherwise, only a non-hidden, focusable window counts (a floating
+/// window can be configured, via `w_config`, to not participate in
+/// window numbering).
+///
+/// # Safety
+/// `wp`/`tp` must be valid, non-null pointers to live `WinT`/
+/// `TabpageT`.
+#[must_use]
+pub unsafe fn win_has_winnr(wp: *const WinT, tp: *const crate::buffer_defs::TabpageT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+    let tab_curwin = if is_curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_curwin
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_config = &unsafe { &*wp }.w_config;
+    std::ptr::eq(wp, tab_curwin) || (!w_config.hide && w_config.focusable)
+}
+
+/// Get the window number (within the CURRENT tab page only) for
+/// window handle `id`, or `0` if not found (or found but not counted,
+/// per [`win_has_winnr`]) (`win_id2win`, `eval/window.c`).
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid,
+/// live `WinT` pointers.
+#[must_use]
+pub unsafe fn win_id2win(id: crate::types_defs::HandleT) -> i32 {
+    let mut nr = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*wp }.handle == id {
+            // SAFETY: forwarded from this function's own safety doc.
+            return if unsafe { win_has_winnr(wp, curtab) } { nr } else { 0 };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        nr += i32::from(unsafe { win_has_winnr(wp, curtab) });
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    0
+}
+
+/// Get the tab number and window number (`(tabnr, winnr)`) for window
+/// handle `id`, both `0` if not found - or found, but not counted per
+/// [`win_has_winnr`] (`win_get_tabwin`, `window.c`).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// own window list, must consist of valid, live pointers.
+#[must_use]
+pub unsafe fn win_get_tabwin(id: crate::types_defs::HandleT) -> (i32, i32) {
+    let mut tnum = 1;
+    let mut wnum = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*wp }.handle == id {
+                // SAFETY: forwarded from this function's own safety doc.
+                return if unsafe { win_has_winnr(wp, tp) } { (tnum, wnum) } else { (0, 0) };
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wnum += i32::from(unsafe { win_has_winnr(wp, tp) });
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        tnum += 1;
+        wnum = 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    (0, 0)
+}
+
+/// Get the window handle for window number `winnr` in tab number
+/// `tabnr` (`win_getid`, `eval/window.c`). `winnr == None` means "the
+/// current window" (returns its handle directly, `tabnr` ignored,
+/// matching the original's own `argvars[0].v_type == VAR_UNKNOWN`
+/// early return). `0` if `winnr <= 0` or not found; `-1` if `tabnr`
+/// doesn't resolve to a real tab page.
+///
+/// # Safety
+/// Same requirement as [`win_get_tabwin`].
+#[must_use]
+pub unsafe fn win_getid(winnr: Option<i32>, tabnr: Option<i32>) -> crate::types_defs::HandleT {
+    let Some(mut winnr) = winnr else {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.handle;
+    };
+    if winnr <= 0 {
+        return 0;
+    }
+
+    let (tp, mut wp) = match tabnr {
+        None => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            (g.curtab, g.firstwin)
+        }
+        Some(mut tabnr) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+            while !tp.is_null() {
+                tabnr -= 1;
+                if tabnr == 0 {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                tp = unsafe { &*tp }.tp_next;
+            }
+            if tp.is_null() {
+                return -1;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+            let wp = if is_curtab {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &*tp }.tp_firstwin
+            };
+            (tp, wp)
+        }
+    };
+
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        winnr -= i32::from(unsafe { win_has_winnr(wp, tp) });
+        if winnr == 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { &*wp }.handle;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    0
 }
 
 /// Return the width, in columns, of `wp`'s `'foldcolumn'`
@@ -663,5 +834,241 @@ mod tests {
         assert!(!unsafe { check_can_set_curbuf_forceit(false) });
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    /// Points `GLOBALS.firstwin`/`GLOBALS.curtab`/`GLOBALS.curwin` at
+    /// the given values for the guard's lifetime, restoring all three
+    /// previous values on drop - extends `WindowListGuard`'s own
+    /// precedent to additionally cover `curwin`, needed by
+    /// `win_has_winnr`'s own "is this the tab's current window" check.
+    /// Takes `win` ONCE (used for both `firstwin` and `curwin`, since
+    /// every real caller wants "the only window IS the current
+    /// window") rather than as two separate parameters - deliberately
+    /// avoiding a second, independent `&mut win_variable` reborrow at
+    /// each call site, which would invalidate the raw pointer already
+    /// handed to the first `GLOBALS` field under Stacked Borrows (a
+    /// real bug caught here for real by Miri during development; see
+    /// `eval/vars.rs`'s own `Box::as_mut()`-then-reborrow precedent for
+    /// the same class of bug).
+    struct CurwinListGuard {
+        prev_firstwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_curwin: *mut WinT,
+    }
+
+    impl CurwinListGuard {
+        fn set(win: *mut WinT, tp: *mut crate::buffer_defs::TabpageT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CurwinListGuard {
+                prev_firstwin: globals.firstwin,
+                prev_curtab: globals.curtab,
+                prev_curwin: globals.curwin,
+            };
+            globals.firstwin = win;
+            globals.curtab = tp;
+            globals.curwin = win;
+            guard
+        }
+    }
+
+    impl Drop for CurwinListGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = self.prev_firstwin;
+            globals.curtab = self.prev_curtab;
+            globals.curwin = self.prev_curwin;
+        }
+    }
+
+    fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
+        WinT {
+            handle,
+            w_config: crate::buffer_defs::WinConfig { focusable: true, hide: false, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    // ---- win_has_winnr ----
+
+    #[test]
+    fn win_has_winnr_true_for_the_tab_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Deliberately NOT focusable/not-hidden - being the current
+        // window always counts, regardless of w_config.
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        // Compute both raw pointers ONCE, before any guard call, and
+        // reuse the SAME pointer values everywhere below - a second,
+        // independent `&mut win`/`&mut tp` reborrow after the first
+        // has already been handed to a GLOBALS field would invalidate
+        // it under Stacked Borrows (see CurwinListGuard's own doc
+        // comment for the real bug this avoids).
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert!(unsafe { win_has_winnr(win_ptr, tp_ptr) });
+    }
+
+    #[test]
+    fn win_has_winnr_true_for_a_focusable_non_hidden_non_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curwin = WinT { handle: 1, ..Default::default() };
+        let mut other = focusable_win(2);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let curwin_ptr = &mut curwin as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(curwin_ptr, tp_ptr);
+
+        assert!(unsafe { win_has_winnr(&mut other as *mut WinT, tp_ptr) });
+    }
+
+    #[test]
+    fn win_has_winnr_false_for_a_hidden_non_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curwin = WinT { handle: 1, ..Default::default() };
+        let mut other = WinT {
+            handle: 2,
+            w_config: crate::buffer_defs::WinConfig { focusable: true, hide: true, ..Default::default() },
+            ..Default::default()
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let curwin_ptr = &mut curwin as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(curwin_ptr, tp_ptr);
+
+        assert!(!unsafe { win_has_winnr(&mut other as *mut WinT, tp_ptr) });
+    }
+
+    // ---- win_id2win ----
+
+    #[test]
+    fn win_id2win_finds_the_matching_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = focusable_win(3);
+        let mut second = WinT { w_next: &mut third as *mut WinT, ..focusable_win(2) };
+        let mut first = WinT { w_next: &mut second as *mut WinT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(first_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_id2win(1) }, 1);
+        assert_eq!(unsafe { win_id2win(2) }, 2);
+        assert_eq!(unsafe { win_id2win(3) }, 3);
+    }
+
+    #[test]
+    fn win_id2win_returns_0_for_an_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_id2win(999) }, 0);
+    }
+
+    // ---- win_get_tabwin ----
+
+    #[test]
+    fn win_get_tabwin_finds_a_window_in_the_current_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let mut first = WinT { w_next: &mut second as *mut WinT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _lock2 = FirstTabpageGuard::set(tp_ptr);
+        let _guard = CurwinListGuard::set(first_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_get_tabwin(2) }, (1, 2));
+    }
+
+    #[test]
+    fn win_get_tabwin_finds_a_window_in_a_non_current_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_win = focusable_win(5);
+        let other_win_ptr = &mut other_win as *mut WinT;
+        let mut other_tp =
+            crate::buffer_defs::TabpageT { tp_firstwin: other_win_ptr, tp_curwin: other_win_ptr, ..Default::default() };
+        let mut cur_win = focusable_win(1);
+        let other_tp_ptr = &mut other_tp as *mut crate::buffer_defs::TabpageT;
+        let mut cur_tp = crate::buffer_defs::TabpageT { tp_next: other_tp_ptr, ..Default::default() };
+        // GLOBALS.first_tabpage must chain cur_tp -> other_tp for the
+        // walk to find the second tab.
+        let cur_win_ptr = &mut cur_win as *mut WinT;
+        let cur_tp_ptr = &mut cur_tp as *mut crate::buffer_defs::TabpageT;
+        let _lock2 = FirstTabpageGuard::set(cur_tp_ptr);
+        let _guard = CurwinListGuard::set(cur_win_ptr, cur_tp_ptr);
+
+        assert_eq!(unsafe { win_get_tabwin(5) }, (2, 1));
+    }
+
+    #[test]
+    fn win_get_tabwin_returns_0_0_for_an_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _lock2 = FirstTabpageGuard::set(tp_ptr);
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_get_tabwin(999) }, (0, 0));
+    }
+
+    // ---- win_getid ----
+
+    #[test]
+    fn win_getid_with_no_args_returns_curwin_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(42);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_getid(None, None) }, 42);
+    }
+
+    #[test]
+    fn win_getid_with_winnr_only_uses_current_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let mut first = WinT { w_next: &mut second as *mut WinT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(first_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_getid(Some(2), None) }, 2);
+    }
+
+    #[test]
+    fn win_getid_with_winnr_0_or_negative_returns_0() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_getid(Some(0), None) }, 0);
+        assert_eq!(unsafe { win_getid(Some(-1), None) }, 0);
+    }
+
+    #[test]
+    fn win_getid_with_a_tabnr_that_does_not_exist_returns_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _lock2 = FirstTabpageGuard::set(tp_ptr);
+        let _guard = CurwinListGuard::set(win_ptr, tp_ptr);
+
+        assert_eq!(unsafe { win_getid(Some(1), Some(99)) }, -1);
     }
 }

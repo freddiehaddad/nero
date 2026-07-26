@@ -414,6 +414,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
         m.insert(&b"getwinposx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposx });
         m.insert(&b"getwinposy"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposy });
+        m.insert(&b"win_getid"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_win_getid });
+        m.insert(&b"win_id2win"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2win });
+        m.insert(&b"win_id2tabwin"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2tabwin });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2807,6 +2810,51 @@ fn f_getwinposy(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(-1);
 }
 
+/// `win_getid([{win} [, {tab}]])` - the window-ID for window number
+/// `{win}` in tab number `{tab}` (`f_win_getid`, `eval/window.c`), via
+/// the already-existing [`crate::window::win_getid`].
+///
+/// # Safety
+/// Forwarded from `crate::window::win_getid`'s own safety doc.
+unsafe fn f_win_getid(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let winnr = if argvars.is_empty() { None } else { Some(crate::eval::typval::tv_get_number(&argvars[0]) as i32) };
+    let tabnr = if argvars.len() < 2 { None } else { Some(crate::eval::typval::tv_get_number(&argvars[1]) as i32) };
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(i64::from(unsafe { crate::window::win_getid(winnr, tabnr) }));
+}
+
+/// `win_id2win({expr})` - the window-number (within the current tab
+/// page) of window-ID `{expr}` (`f_win_id2win`, `eval/window.c`), via
+/// the already-existing [`crate::window::win_id2win`].
+///
+/// # Safety
+/// Forwarded from `crate::window::win_id2win`'s own safety doc.
+unsafe fn f_win_id2win(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let id = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(i64::from(unsafe { crate::window::win_id2win(id) }));
+}
+
+/// `win_id2tabwin({expr})` - `[tabnr, winnr]` for window-ID `{expr}`,
+/// `[0, 0]` if not found (`f_win_id2tabwin`, `eval/window.c`), via the
+/// already-existing [`crate::window::win_get_tabwin`].
+///
+/// # Safety
+/// Forwards `crate::window::win_get_tabwin`'s own safety doc, plus
+/// [`crate::eval::typval::tv_list_alloc_ret`]'s own safety doc.
+unsafe fn f_win_id2tabwin(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let id = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (tabnr, winnr) = unsafe { crate::window::win_get_tabwin(id) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+    // SAFETY: `l` was just allocated above by this same call.
+    unsafe {
+        crate::eval::typval::tv_list_append_number(l, i64::from(tabnr));
+        crate::eval::typval::tv_list_append_number(l, i64::from(winnr));
+    }
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4511,6 +4559,9 @@ mod tests {
             "getwinpos",
             "getwinposx",
             "getwinposy",
+            "win_getid",
+            "win_id2win",
+            "win_id2tabwin",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -7060,6 +7111,131 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_getwinposy(&[], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_win_getid / f_win_id2win / f_win_id2tabwin ---
+
+    /// Points `GLOBALS.firstwin`/`curtab`/`curwin`/`first_tabpage` at
+    /// the given values for the guard's lifetime, restoring all
+    /// previous values on drop - a `funcs.rs`-local copy of
+    /// `window.rs`'s own private `CurwinListGuard`/`FirstTabpageGuard`
+    /// test fixtures (that module's own version is private to its own
+    /// test module, so not reusable directly from here).
+    struct WinGlobalsGuard {
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl WinGlobalsGuard {
+        fn set(win: *mut crate::buffer_defs::WinT, tp: *mut crate::buffer_defs::TabpageT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = WinGlobalsGuard {
+                prev_firstwin: globals.firstwin,
+                prev_curtab: globals.curtab,
+                prev_curwin: globals.curwin,
+                prev_first_tabpage: globals.first_tabpage,
+            };
+            globals.firstwin = win;
+            globals.curtab = tp;
+            globals.curwin = win;
+            globals.first_tabpage = tp;
+            guard
+        }
+    }
+
+    impl Drop for WinGlobalsGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = self.prev_firstwin;
+            globals.curtab = self.prev_curtab;
+            globals.curwin = self.prev_curwin;
+            globals.first_tabpage = self.prev_first_tabpage;
+        }
+    }
+
+    fn focusable_win(handle: crate::types_defs::HandleT) -> crate::buffer_defs::WinT {
+        crate::buffer_defs::WinT {
+            handle,
+            w_config: crate::buffer_defs::WinConfig { focusable: true, hide: false, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn win_getid_with_no_args_returns_curwin_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(77);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_getid(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(77));
+    }
+
+    #[test]
+    fn win_id2win_finds_the_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(5);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_id2win(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn win_id2win_returns_0_for_an_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(5);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_id2win(&[num(999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn win_id2tabwin_returns_a_list_of_tabnr_and_winnr() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(9);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_id2tabwin(&[num(9)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let tabnr = crate::eval::typval::tv_list_find(l, 0);
+            let winnr = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*tabnr).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*winnr).li_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn win_id2tabwin_returns_0_0_for_an_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(9);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_id2tabwin(&[num(999)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let tabnr = crate::eval::typval::tv_list_find(l, 0);
+            let winnr = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*tabnr).li_tv.value, TypvalValue::Number(0));
+            assert_eq!((*winnr).li_tv.value, TypvalValue::Number(0));
+            crate::eval::typval::tv_list_unref(l);
+        }
     }
 
     // --- f_has ---
