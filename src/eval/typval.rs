@@ -3942,6 +3942,20 @@ mod tests {
     }
 
     #[test]
+    fn tv_dict_add_str_grows_past_the_small_hashtab_array() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            for i in 0..30 {
+                let key = format!("key{i}");
+                assert_eq!(tv_dict_add_str(&mut *d, key.as_bytes(), Some(b"v")), OK, "failed at i={i}");
+            }
+            assert_eq!(tv_dict_len(d.as_ref()), 30);
+            tv_dict_free(d);
+        }
+    }
+
+    #[test]
     fn tv_dict_add_func_stores_nul_stripped_name_and_refs_a_numbered_function() {
         let _lock = crate::globals::global_state_test_lock();
         crate::eval::userfunc::func_init();

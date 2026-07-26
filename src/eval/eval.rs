@@ -7252,27 +7252,33 @@ mod tests {
 
         // SAFETY: unique to this test, never touched elsewhere.
         unsafe { std::env::set_var("NERO_TEST_E2E_ENV_VAR", "e2e-value") };
-
         assert_eq!(
             eval_str(b"getenv('NERO_TEST_E2E_ENV_VAR')").1.value,
             TypvalValue::String(Some(b"e2e-value".to_vec()))
         );
+        // SAFETY: forwarded from the set_var call above.
+        unsafe { std::env::remove_var("NERO_TEST_E2E_ENV_VAR") };
+
         assert_eq!(
             eval_str(b"getenv('NERO_TEST_E2E_DEFINITELY_UNSET_VAR')").1.value,
             TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)
         );
 
+        // environ()'s own full enumeration is not safely reentrant
+        // against ANY concurrent env-var mutation from another thread
+        // (a well-known, platform-specific hazard, worse on Linux/
+        // glibc than Windows - see f_environ's own test module doc
+        // comment in funcs.rs) - deliberately checked here with no
+        // nearby set_var/remove_var mutation, just a non-empty-dict
+        // sanity check.
         let (ret, tv) = eval_str(b"environ()");
         assert_eq!(ret, OK);
         let TypvalValue::Dict(d) = tv.value else { panic!("expected a Dict") };
         unsafe {
-            let item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"NERO_TEST_E2E_ENV_VAR").unwrap();
-            assert_eq!((*item).di_tv.value, TypvalValue::String(Some(b"e2e-value".to_vec())));
+            assert!(crate::eval::typval::tv_dict_len(d.as_ref()) > 0);
             crate::eval::typval::tv_dict_unref(d);
         }
 
-        // SAFETY: forwarded from the set_var call above.
-        unsafe { std::env::remove_var("NERO_TEST_E2E_ENV_VAR") };
         reset_globals_for_test();
     }
 

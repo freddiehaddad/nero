@@ -5371,18 +5371,35 @@ mod tests {
     }
 
     #[test]
-    fn environ_includes_a_known_set_variable() {
-        // SAFETY: NERO_TEST_ENVIRON_UNIQUE_VAR is unique to this test.
-        unsafe { std::env::set_var("NERO_TEST_ENVIRON_UNIQUE_VAR", "world") };
+    fn environ_returns_a_non_empty_dict() {
+        // Missing this lock was the ACTUAL root cause of a
+        // hashtab-capacity panic reproduced on native Linux (not the
+        // env-mutation hazard suspected initially, which was a real
+        // but separate concern also worth avoiding - see below):
+        // tv_dict_alloc touches the crate-wide GC_FIRST_DICT linked
+        // list, so running concurrently with another dict-touching
+        // test (without this lock serializing them) is a genuine data
+        // race on that shared global list - this was caught by
+        // multiple_dicts_maintain_the_gc_linked_list_correctly also
+        // failing deterministically alongside this test on native
+        // Linux (never reproduced on Windows, latency/scheduling-
+        // dependent like most data races).
+        let _lock = crate::globals::global_state_test_lock();
+        // Also deliberately does NOT mutate the environment (no
+        // set_var/remove_var) - environ()'s own full enumeration is
+        // separately not safely reentrant against ANY concurrent
+        // env-var mutation from another thread (a well-known,
+        // platform-specific hazard, worse on Linux/glibc than
+        // Windows). Checking for a non-empty Dict (rather than
+        // mutating and checking a specific fresh key) avoids that
+        // hazard too, while still verifying real enumeration
+        // happened.
         let mut rettv = TypvalT::default();
         f_environ(&[], &mut rettv);
         let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
         unsafe {
-            let item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"NERO_TEST_ENVIRON_UNIQUE_VAR").unwrap();
-            assert_eq!((*item).di_tv.value, TypvalValue::String(Some(b"world".to_vec())));
+            assert!(crate::eval::typval::tv_dict_len(d.as_ref()) > 0);
             crate::eval::typval::tv_dict_unref(d);
         }
-        // SAFETY: forwarded from the set_var call above.
-        unsafe { std::env::remove_var("NERO_TEST_ENVIRON_UNIQUE_VAR") };
     }
 }

@@ -159,15 +159,32 @@ impl HashtabT {
         // key it's clear that the key isn't there. Return the first
         // available slot found (can be a slot of a removed item).
         //
-        // Safety net not present in the original: mathematically, this
-        // probe sequence visits every slot within `mask + 1` iterations, so
-        // never finding a null slot within that many steps can only mean
-        // the table is completely full (e.g. items were added to a locked
-        // table past its capacity, which `hash_lock`'s own doc comment
-        // warns against) or the recurrence has a bug. Either way, panicking
-        // loudly here is preferable to an infinite loop.
+        // Safety net not present in the original (which uses a genuinely
+        // unbounded `for (;; perturb >>= PERTURB_SHIFT)` loop, relying
+        // entirely on the recurrence's own mathematical guarantee with no
+        // artificial bound at all): once `perturb` fully decays to 0 (after
+        // at most `HashT::BITS / PERTURB_SHIFT` steps, since it is
+        // right-shifted by `PERTURB_SHIFT` bits every iteration), the
+        // recurrence collapses to the pure linear congruential generator
+        // `raw_idx = 5 * raw_idx + 1`, which is full-period over `mask + 1`
+        // (a power of 2) per the Hull-Dobell theorem (multiplier 5 is
+        // congruent to 1 mod 4, increment 1 is odd) - so it is guaranteed
+        // to visit every slot, but only after that decay phase PLUS one
+        // full LCG period, NOT within just `mask + 1` iterations as an
+        // earlier version of this safety net incorrectly assumed (caught
+        // via a real test failure: inserting real-world string keys, e.g.
+        // environment variable names, into a small table could still have
+        // 1-2 genuinely empty slots left yet exceed a `mask + 1`-iteration
+        // bound before reaching one of them, wrongly panicking on a table
+        // that was NOT actually full). Never finding a null slot within
+        // this wider, mathematically-justified bound can only mean the
+        // table is genuinely completely full (e.g. items were added to a
+        // locked table past its capacity, which `hash_lock`'s own doc
+        // comment warns against) or the recurrence has a bug - either way,
+        // panicking loudly here is preferable to an infinite loop.
+        let max_iterations = (HashT::BITS as usize).div_ceil(PERTURB_SHIFT as usize) + mask + 1;
         let mut perturb = hash;
-        for _ in 0..=mask {
+        for _ in 0..max_iterations {
             raw_idx = raw_idx.wrapping_mul(5).wrapping_add(perturb).wrapping_add(1);
             perturb >>= PERTURB_SHIFT;
             let idx = raw_idx & mask;
@@ -186,9 +203,10 @@ impl HashtabT {
             }
         }
         panic!(
-            "hashtab probe exceeded table size ({} slots) without finding a free slot - \
-             table is completely full, likely from adding items to a locked table past its \
-             capacity (see hash_lock's doc comment)",
+            "hashtab probe exceeded {} iterations without finding a free slot in a {}-slot \
+             table - table is completely full, likely from adding items to a locked table past \
+             its capacity (see hash_lock's doc comment)",
+            max_iterations,
             mask + 1
         );
     }
@@ -480,6 +498,43 @@ mod tests {
     }
 
     #[test]
+    fn resizes_correctly_with_real_world_shaped_keys() {
+        // Regression test: hash_lookup_idx's own probe-bound safety net
+        // (not present in the original, which uses a genuinely unbounded
+        // loop) originally assumed the perturbed probe sequence always
+        // visits every slot within `mask + 1` iterations - true only once
+        // `perturb` has fully decayed to 0 and the recurrence becomes a
+        // pure, full-period linear congruential generator; the "perturb
+        // still nonzero" phase before that can revisit already-seen slots
+        // without covering every slot, so genuinely needs several more
+        // iterations than that for some hash/key distributions. Real-
+        // world environment-variable-style names (found via environ()'s
+        // own new test-writing this session) reproduced this exact
+        // false-panic-on-a-non-full-table failure with as few as 14-15
+        // real keys in the still-small 16-slot array - plain sequential
+        // "key0".."key49" style test keys (see the test above) never
+        // happened to trigger it. This pins the fix with the exact kind
+        // of keys that originally exposed the bug.
+        let mut ht = HashtabT::hash_init();
+        let names = [
+            "CARGO", "CARGO_HOME", "CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH", "CARGO_PKG_AUTHORS",
+            "CARGO_PKG_DESCRIPTION", "CARGO_PKG_HOMEPAGE", "CARGO_PKG_LICENSE", "CARGO_PKG_LICENSE_FILE",
+            "CARGO_PKG_NAME", "CARGO_PKG_README", "CARGO_PKG_REPOSITORY", "CARGO_PKG_RUST_VERSION",
+            "CARGO_PKG_VERSION", "CARGO_PKG_VERSION_MAJOR", "CARGO_PKG_VERSION_MINOR", "CARGO_PKG_VERSION_PATCH",
+            "PATH", "HOME", "USER", "SHELL", "LANG", "TERM",
+        ];
+        let keys: Vec<std::ffi::CString> = names.iter().map(|s| std::ffi::CString::new(*s).unwrap()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(unsafe { ht.hash_add(key_ptr(k)) }, OK, "failed inserting {:?} at i={i}", names[i]);
+        }
+        assert_eq!(ht.ht_used, names.len());
+        for k in &keys {
+            let bytes = k.as_bytes();
+            assert!(!hashitem_empty(ht.hash_find(bytes)), "missing {bytes:?}");
+        }
+    }
+
+    #[test]
     fn hash_lock_prevents_resize() {
         // NOTE: hash_lock()'s contract explicitly warns "Don't use this
         // when items are to be added!" - a locked table never resizes, so
@@ -511,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "hashtab probe exceeded table size")]
+    #[should_panic(expected = "hashtab probe exceeded")]
     fn locking_past_capacity_panics_loudly_instead_of_hanging() {
         // Regression test: an earlier draft of hash_lookup_idx's probe
         // recurrence masked the running index on every iteration instead
