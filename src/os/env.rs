@@ -2,7 +2,8 @@
 //!
 //! Translated: `env_init`, `os_getenv` (like `getenv()` but returns
 //! `None` for an empty value), `os_env_exists`, `os_setenv`,
-//! `os_unsetenv`, `os_get_pid`. In the original these wrap
+//! `os_unsetenv`, `os_get_pid`, `vim_setenv_ext`, `vim_unsetenv_ext`.
+//! In the original these wrap
 //! `uv_os_getenv`/`uv_os_setenv`/`uv_os_unsetenv`/`getpid` (libuv or the
 //! C standard library) purely for portability; Rust's own `std::env`/
 //! `std::process` already provide the same portable primitives
@@ -55,9 +56,8 @@
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
 //! - `os_setenv_append_path`/`os_shell_is_cmdexe`: need `'shell'`
 //!   parsing logic not yet translated, and `os/fs.c` real I/O.
-//! - `vim_unsetenv_ext`/`vim_setenv_ext`/`restore_env_var`: thin
-//!   wrappers intentionally deferred alongside their only caller
-//!   (`os/lang.c`, not yet translated).
+//! - `restore_env_var`: `#ifdef MSWIN`-only, needs a not-yet-translated
+//!   caller to validate the save/restore contract against.
 
 use super::os::NVIM_TESTING;
 use crate::globals::GlobalCell;
@@ -167,6 +167,53 @@ pub unsafe fn os_unsetenv(name: &[u8]) -> i32 {
 #[must_use]
 pub fn os_get_pid() -> i64 {
     std::process::id() as i64
+}
+
+/// Removes environment variable `name` and takes care of side effects
+/// (`vim_unsetenv_ext`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (`didset_vim`/`didset_vimruntime`)
+/// plus forwards [`os_unsetenv`]'s own safety requirement.
+pub unsafe fn vim_unsetenv_ext(name: &[u8]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { os_unsetenv(name) };
+
+    // "homedir" is not cleared, keep using the old value until $HOME
+    // is set.
+    if name.eq_ignore_ascii_case(b"VIM") {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    } else if name.eq_ignore_ascii_case(b"VIMRUNTIME") {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = false;
+    }
+}
+
+/// Sets environment variable `name` to `val` and takes care of side
+/// effects (`vim_setenv_ext`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (`didset_vim`/`didset_vimruntime`,
+/// plus [`init_homedir`]'s own `HOMEDIR`) and forwards [`os_setenv`]'s
+/// own safety requirement.
+pub unsafe fn vim_setenv_ext(name: &[u8], val: &[u8]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { os_setenv(name, val, 1) };
+    if name.eq_ignore_ascii_case(b"HOME") {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { init_homedir() };
+    } else if unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim
+        && name.eq_ignore_ascii_case(b"VIM")
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    } else if unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime
+        && name.eq_ignore_ascii_case(b"VIMRUNTIME")
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = false;
+    }
 }
 
 /// Gets the hostname of the current machine (`os_get_hostname`).
@@ -792,5 +839,127 @@ mod tests {
         let _guard = EnvVarGuard::set(&[("VIM", None)]);
         let result = std::panic::catch_unwind(|| unsafe { vim_getenv(b"VIM") });
         assert!(result.is_err(), "expected a panic (vim_runtime_dir not yet translated)");
+    }
+
+    // --- vim_setenv_ext / vim_unsetenv_ext ---
+
+    #[test]
+    fn vim_setenv_ext_sets_an_ordinary_variable() {
+        let name = b"NERO_TEST_ENV_SETENV_EXT";
+        // SAFETY: single test-owned variable name, not touched by
+        // other tests; doesn't reach the VIM/VIMRUNTIME/HOME branches
+        // so no globals/homedir lock is needed.
+        unsafe {
+            vim_setenv_ext(name, b"hello");
+            assert_eq!(os_getenv(name), Some(b"hello".to_vec()));
+            os_unsetenv(name);
+        }
+    }
+
+    #[test]
+    fn vim_unsetenv_ext_removes_an_ordinary_variable() {
+        let name = b"NERO_TEST_ENV_UNSETENV_EXT";
+        // SAFETY: single test-owned variable name, not touched by
+        // other tests; doesn't reach the VIM/VIMRUNTIME branches so no
+        // globals lock is needed.
+        unsafe {
+            os_setenv(name, b"hello", 1);
+            vim_unsetenv_ext(name);
+            assert_eq!(os_getenv(name), None);
+        }
+    }
+
+    #[test]
+    fn vim_setenv_ext_calls_init_homedir_when_name_is_home() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", None)]);
+        unsafe {
+            vim_setenv_ext(b"HOME", b"C:/new/home");
+            assert_eq!(os_homedir(), Some(b"C:/new/home".to_vec()));
+        }
+    }
+
+    #[test]
+    fn vim_setenv_ext_resets_didset_vim_when_name_is_vim() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIM", None)]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = true;
+
+        unsafe { vim_setenv_ext(b"VIM", b"/some/vim") };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim);
+        // Reset for any other test relying on the default.
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    }
+
+    #[test]
+    fn vim_setenv_ext_resets_didset_vimruntime_when_name_is_vimruntime() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIMRUNTIME", None)]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = true;
+
+        unsafe { vim_setenv_ext(b"VIMRUNTIME", b"/some/runtime") };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = false;
+    }
+
+    #[test]
+    fn vim_setenv_ext_name_match_is_case_insensitive() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIM", None)]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = true;
+
+        // Lowercase "vim" - matches STRICMP's case-insensitivity.
+        unsafe { vim_setenv_ext(b"vim", b"/some/vim") };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    }
+
+    #[test]
+    fn vim_unsetenv_ext_resets_didset_vim_when_name_is_vim() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIM", Some("/some/vim"))]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = true;
+
+        unsafe { vim_unsetenv_ext(b"VIM") };
+
+        assert_eq!(os_getenv(b"VIM"), None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    }
+
+    #[test]
+    fn vim_unsetenv_ext_resets_didset_vimruntime_when_name_is_vimruntime() {
+        let _homedir_lock = homedir_test_lock();
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let _guard = EnvVarGuard::set(&[("VIMRUNTIME", Some("/some/runtime"))]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = true;
+
+        unsafe { vim_unsetenv_ext(b"VIMRUNTIME") };
+
+        assert_eq!(os_getenv(b"VIMRUNTIME"), None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = false;
+    }
+
+    #[test]
+    fn vim_unsetenv_ext_does_not_touch_didset_vim_for_an_unrelated_name() {
+        let _globals_lock = crate::globals::global_state_test_lock();
+        let name = b"NERO_TEST_ENV_UNSETENV_EXT_UNRELATED";
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = true;
+        // SAFETY: single test-owned variable name, not touched by
+        // other tests.
+        unsafe {
+            os_setenv(name, b"hello", 1);
+            vim_unsetenv_ext(name);
+        }
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim);
+        unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
     }
 }

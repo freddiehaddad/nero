@@ -366,6 +366,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"localtime"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_localtime });
         m.insert(&b"getenv"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getenv });
         m.insert(&b"environ"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_environ });
+        m.insert(&b"setenv"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 2, func: f_setenv });
         m.insert(&b"has"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_has });
         m.insert(&b"strlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strlen });
         m.insert(&b"strcharlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strcharlen });
@@ -2582,6 +2583,35 @@ fn f_environ(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
 }
 
+/// `setenv({name}, {val})` - set environment variable `{name}` to
+/// `{val}` (`{val}` == `v:null` deletes it instead) (`f_setenv`,
+/// `funcs.c`), via the already-existing
+/// [`crate::os::env::vim_setenv_ext`]/
+/// [`crate::os::env::vim_unsetenv_ext`]. No return value (`rettv`
+/// stays whatever the caller pre-initialized it to), matching the
+/// original's own `void`-typed implementation.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`] and `vim_setenv_ext`/
+/// `vim_unsetenv_ext` themselves).
+unsafe fn f_setenv(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    if matches!(argvars[1].value, TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::os::env::vim_unsetenv_ext(&name) };
+    } else {
+        let val = crate::eval::typval::tv_get_string(&argvars[1]);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::os::env::vim_setenv_ext(&name, &val) };
+    }
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4238,6 +4268,7 @@ mod tests {
             "localtime",
             "getenv",
             "environ",
+            "setenv",
             "has",
             "strlen",
             "strcharlen",
@@ -6489,6 +6520,65 @@ mod tests {
             assert!(crate::eval::typval::tv_dict_len(d.as_ref()) > 0);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // --- f_setenv ---
+    //
+    // Each test uses a uniquely-named test-only environment variable
+    // (never a well-known name) - see f_getenv/f_environ's own comment
+    // above. Also holds global_state_test_lock() for the same reason
+    // environ_returns_a_non_empty_dict does: mutating the environment
+    // (via set_var/remove_var, reached through vim_setenv_ext/
+    // vim_unsetenv_ext) is not safely reentrant against a concurrent
+    // full-environment enumeration on some platforms.
+
+    #[test]
+    fn setenv_sets_an_environment_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setenv(&[string(b"NERO_TEST_SETENV_UNIQUE_VAR"), string(b"hello")], &mut rettv);
+        }
+        assert_eq!(crate::os::env::os_getenv(b"NERO_TEST_SETENV_UNIQUE_VAR"), Some(b"hello".to_vec()));
+        // rettv is untouched (void function) - stays the Default (Unknown).
+        assert!(matches!(rettv.value, TypvalValue::Unknown));
+
+        // SAFETY: this test's own unique variable.
+        unsafe { crate::os::env::os_unsetenv(b"NERO_TEST_SETENV_UNIQUE_VAR") };
+    }
+
+    #[test]
+    fn setenv_with_null_value_unsets_the_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        // SAFETY: this test's own unique variable.
+        unsafe { crate::os::env::os_setenv(b"NERO_TEST_SETENV_NULL_VAR", b"hello", 1) };
+
+        let null_tv = TypvalT { value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { f_setenv(&[string(b"NERO_TEST_SETENV_NULL_VAR"), null_tv], &mut rettv) };
+
+        assert_eq!(crate::os::env::os_getenv(b"NERO_TEST_SETENV_NULL_VAR"), None);
+    }
+
+    #[test]
+    fn setenv_fails_silently_and_secure_is_bumped_when_secure_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_setenv(&[string(b"NERO_TEST_SETENV_SECURE_VAR"), string(b"hello")], &mut rettv);
+        }
+        assert_eq!(crate::os::env::os_getenv(b"NERO_TEST_SETENV_SECURE_VAR"), None);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
     }
 
     // --- f_has ---
