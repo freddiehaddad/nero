@@ -102,6 +102,10 @@
 //! accepts a `Funcref`/`Partial` (returning `"func"`/`"name"`/`"dict"`/
 //! `"args"`/`"arity"` introspection sub-fields via `get_func_arity`,
 //! not yet translated), which `f_get` declines explicitly.
+//!
+//! Also translated: `index()` (the index of the first `Blob`/`List`
+//! item equal to a given value, via the already-existing
+//! [`crate::eval::typval::tv_equal`]).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -185,6 +189,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"values"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_values });
         m.insert(&b"items"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_items });
         m.insert(&b"get"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_get });
+        m.insert(&b"index"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_index });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1209,6 +1214,99 @@ unsafe fn f_get(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `index({object}, {expr} [, {start} [, {ic}]])` - the index of the
+/// first item in `{object}` equal to `{expr}`, or `-1` if not found
+/// (`f_index`).
+///
+/// Any type other than `Blob`/`List` (matching the original's own
+/// `emsg(_(e_listblobreq))` case) leaves `rettv` at `-1`, exactly like
+/// the original's own pre-set default.
+///
+/// # Safety
+/// If `argvars[0].value` is `Blob`/`List`-typed with a non-null
+/// pointer, that pointer must be valid. Forwards
+/// [`crate::eval::typval::tv_equal`]'s own safety doc for every item
+/// compared against `argvars[1]`.
+unsafe fn f_index(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    if let TypvalValue::Blob(b) = &argvars[0].value {
+        let b = *b;
+        let mut start = 0;
+        if argvars.len() > 2 {
+            let mut error = false;
+            start = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) as i32;
+            if error {
+                return;
+            }
+        }
+        if b.is_null() {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::eval::typval::tv_blob_len(b) };
+        if start < 0 {
+            start = (len + start).max(0);
+        }
+        for idx in start..len {
+            let byte_tv = TypvalT {
+                // SAFETY: forwarded from this function's own safety doc.
+                value: TypvalValue::Number(i64::from(unsafe { crate::eval::typval::tv_blob_get(b, idx) })),
+                ..Default::default()
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::eval::typval::tv_equal(&byte_tv, &argvars[1], false) } {
+                rettv.value = TypvalValue::Number(i64::from(idx));
+                return;
+            }
+        }
+        return;
+    }
+
+    let TypvalValue::List(l) = &argvars[0].value else {
+        return;
+    };
+    let l = *l;
+    if l.is_null() {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { crate::eval::typval::tv_list_first(l) };
+    let mut idx = 0;
+    let mut ic = false;
+    if argvars.len() > 2 {
+        let mut error = false;
+        let start_n = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        let uidx = unsafe { crate::eval::typval::tv_list_uidx(l, start_n) };
+        if error || uidx == -1 {
+            item = std::ptr::null_mut();
+        } else {
+            idx = uidx;
+            // SAFETY: forwarded from this function's own safety doc.
+            item = unsafe { crate::eval::typval::tv_list_find(l, idx) };
+        }
+        if argvars.len() > 3 {
+            ic = crate::eval::typval::tv_get_number_chk(&argvars[3], Some(&mut error)) != 0;
+            if error {
+                item = std::ptr::null_mut();
+            }
+        }
+    }
+
+    while !item.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_equal(&(*item).li_tv, &argvars[1], ic) } {
+            rettv.value = TypvalValue::Number(i64::from(idx));
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+        idx += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,6 +2002,7 @@ mod tests {
             "values",
             "items",
             "get",
+            "index",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -2491,5 +2590,104 @@ mod tests {
             f_get(&args, &mut rettv);
         }));
         assert!(result.is_err(), "expected a panic (get_func_arity/partial introspection not yet translated)");
+    }
+
+    // --- f_index ---
+
+    #[test]
+    fn index_finds_a_present_number_in_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+            crate::eval::typval::tv_list_append_number(&mut *list, 30);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(20)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn index_of_a_missing_value_is_negative_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(99)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn index_with_a_start_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(4);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 5);
+            crate::eval::typval::tv_list_append_number(&mut *list, 5);
+            crate::eval::typval::tv_list_append_number(&mut *list, 5);
+            crate::eval::typval::tv_list_append_number(&mut *list, 5);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(5), num(2)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn index_case_insensitive_string_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_string(list, Some(b"Hello")) };
+        let mut rettv = TypvalT::default();
+        // Case-sensitive: no match.
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, string(b"hello"), num(0)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        // Case-insensitive: matches.
+        let args =
+            [TypvalT { value: TypvalValue::List(list), ..Default::default() }, string(b"hello"), num(0), num(1)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn index_in_a_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(20)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(99)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn index_of_a_non_list_non_blob_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_index(&[string(b"not a list"), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn index_of_a_null_list_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }, num(1)];
+        unsafe { f_index(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 }
