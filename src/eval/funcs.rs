@@ -259,6 +259,12 @@
 //! own version-detection code runs - not yet translated, so this
 //! matches the original's real "non-MS-Windows" behavior exactly on
 //! every platform today, not an approximation).
+//!
+//! Also `getreg([{regname} [, {expr} [, {list}]]])`, via the already-
+//! existing [`crate::register::get_reg_contents`] (defaults to
+//! `v:register` when `{regname}` is omitted). The `{list}`-truthy
+//! path panics inside `get_reg_contents` itself, matching that
+//! function's own already-documented `kGRegList` deferral.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -390,6 +396,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"visualmode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_visualmode });
         m.insert(&b"wildmenumode"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_wildmenumode });
         m.insert(&b"windowsversion"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_windowsversion });
+        m.insert(&b"getreg"[..], EvalFuncDefT { min_argc: 0, max_argc: 3, base_arg: 1, func: f_getreg });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3424,6 +3431,71 @@ fn f_windowsversion(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(raw[..end].to_vec()));
 }
 
+/// The register-name argument shared by `getreg()`/`getregtype()`,
+/// defaulting to `v:register` when omitted (`getreg_get_regname`,
+/// `funcs.c`). Returns `0` on a type error for an explicit argument;
+/// an empty name (explicit or from `v:register`) maps to `'"'` (the
+/// unnamed register), matching the original's own
+/// `*strregname == 0 ? '"' : ...` fallback.
+///
+/// # Safety
+/// Touches `crate::eval::vars::VIMVARS` (via `get_vim_var_str`).
+unsafe fn getreg_get_regname(argvars: &[TypvalT]) -> i32 {
+    let strregname = if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Reg) }
+    } else {
+        match crate::eval::typval::tv_get_string_chk(&argvars[0]) {
+            Some(s) => s,
+            None => return 0,
+        }
+    };
+    if strregname.is_empty() { i32::from(b'"') } else { i32::from(strregname[0]) }
+}
+
+/// `getreg([{regname} [, {expr} [, {list}]]])` - the contents of
+/// register `{regname}` (default `v:register`) as a `String`
+/// (`f_getreg`, `funcs.c`), via the already-existing
+/// [`crate::register::get_reg_contents`]. The `{list}`-truthy path
+/// (return a `List` instead) is not yet supported - it panics via
+/// `unimplemented!()` inside `get_reg_contents` itself, matching that
+/// function's own already-documented deferral (`kGRegList`).
+///
+/// # Safety
+/// Forwarded from [`getreg_get_regname`]/
+/// [`crate::register::get_reg_contents`]'s own safety docs.
+unsafe fn f_getreg(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let regname = unsafe { getreg_get_regname(argvars) };
+    if regname == 0 {
+        return;
+    }
+
+    let mut arg2 = false;
+    let mut return_list = false;
+    if argvars.len() > 1 {
+        let mut error = false;
+        arg2 = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error)) != 0;
+        if !error && argvars.len() > 2 {
+            return_list = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) != 0;
+        }
+        if error {
+            return;
+        }
+    }
+
+    let flags = if arg2 { crate::register_defs::greg_flags::EXPR_SRC } else { 0 };
+    if return_list {
+        // SAFETY: forwarded from this function's own safety doc. Always
+        // panics today (kGRegList not yet supported by get_reg_contents).
+        let _ = unsafe { crate::register::get_reg_contents(regname, flags | crate::register_defs::greg_flags::LIST) };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let contents = unsafe { crate::register::get_reg_contents(regname, flags) };
+        rettv.value = TypvalValue::String(contents);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4194,6 +4266,7 @@ mod tests {
             "visualmode",
             "wildmenumode",
             "windowsversion",
+            "getreg",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -7112,5 +7185,60 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = saved;
+    }
+
+    // --- f_getreg / getreg_get_regname ---
+
+    #[test]
+    fn getreg_black_hole_register_is_an_empty_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreg(&[string(b"_")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+    }
+
+    #[test]
+    fn getreg_never_yanked_named_register_is_null_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreg(&[string(b"a")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn getreg_defaults_to_v_register() {
+        let _guard = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Reg, Some(b"_")) };
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreg(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+        unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Reg, Some(b"\"")) };
+    }
+
+    #[test]
+    fn getreg_empty_regname_falls_back_to_unnamed() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { getreg_get_regname(&[string(b"")]) }, i32::from(b'"'));
+    }
+
+    #[test]
+    fn getreg_type_error_leaves_rettv_untouched() {
+        let mut rettv = TypvalT::default();
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        unsafe { f_getreg(&[list_tv], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "kGRegList")]
+    fn getreg_list_true_is_unimplemented() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Uses an ordinary named register ('a'), not the black hole
+        // ('_') or another special register - those are resolved by
+        // get_spec_reg BEFORE get_reg_contents ever reaches its own
+        // kGRegList check, so they never trigger this panic (caught
+        // via a real test failure, not assumed).
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreg(&[string(b"a"), num(0), num(1)], &mut rettv) };
     }
 }
