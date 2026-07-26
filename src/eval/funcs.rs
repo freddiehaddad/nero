@@ -142,6 +142,15 @@
 //! another) and the whole `tv_list_remove`/`tv_blob_remove`/
 //! `tv_dict_remove` trio (also `eval/typval.c`, one real function per
 //! container type, exactly matching the original's own 3-way split).
+//! Also `extend()`/`extendnew()` (merge one `List`/`Dict` into
+//! another, in place or into a new copy), which needed a new
+//! [`crate::eval::typval::tv_dict_extend`] (`eval/typval.c`) - its
+//! `action="move"` case (moving items rather than copying) panics if
+//! actually reached (needs a dict-item detach-without-free primitive
+//! this crate doesn't have yet), but is provably unreachable from
+//! `extend()`/`extendnew()` themselves (their own 3rd-argument
+//! validation never allows `"move"` - the original's only `"move"`
+//! caller is `window.c`'s scroll-event handling, not yet translated).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -233,6 +242,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
         m.insert(&b"insert"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_insert });
         m.insert(&b"remove"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_remove });
+        m.insert(&b"extend"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extend });
+        m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1885,6 +1896,187 @@ unsafe fn f_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// The `List` case of `extend()`/`extendnew()` (`extend_list`,
+/// `eval/list.c`).
+///
+/// `is_new` selects `extendnew()`'s own "copy first" behavior
+/// (`true`) vs. `extend()`'s own in-place mutation (`false`) - when
+/// `true`, `l1` is [`crate::eval::typval::tv_list_copy`]'d before
+/// extending, and the copy is moved DIRECTLY into `rettv` (no extra
+/// [`crate::eval::typval::tv_copy`]-based refcount increment, since
+/// `tv_list_copy` already set the new list's own refcount to `1`,
+/// exactly matching the original's own direct `rettv->vval.v_list =
+/// l1` field assignment).
+///
+/// # Safety
+/// `argvars[0]`/`argvars[1]`'s values must be `List`-typed with valid
+/// pointers (non-null, or null - a null `argvars[1]` is a no-op,
+/// matching the original's own `l2 == NULL` early-return).
+unsafe fn extend_list(argvars: &[TypvalT], is_new: bool, rettv: &mut TypvalT) {
+    let TypvalValue::List(mut l1) = argvars[0].value else { unreachable!() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if !is_new && crate::eval::typval::value_check_lock(unsafe { crate::eval::typval::tv_list_locked(l1) }, None) {
+        return;
+    }
+
+    if is_new {
+        // SAFETY: forwarded from this function's own safety doc.
+        l1 =
+            unsafe { crate::eval::typval::tv_list_copy(std::ptr::null(), l1, false, crate::eval::eval::get_copy_id()) };
+        if l1.is_null() {
+            return;
+        }
+    }
+
+    let TypvalValue::List(l2) = argvars[1].value else { unreachable!() };
+    if !l2.is_null() {
+        let mut item = std::ptr::null_mut();
+        // argvars.len() > 2 replaces the original's own
+        // argvars[2].v_type != VAR_UNKNOWN sentinel check.
+        if argvars.len() > 2 {
+            let mut error = false;
+            let before = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error));
+            if error {
+                if is_new {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::eval::typval::tv_list_unref(l1) };
+                }
+                return; // type error; errmsg already given in the original.
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            if before != i64::from(unsafe { crate::eval::typval::tv_list_len(l1) }) {
+                // SAFETY: forwarded from this function's own safety doc.
+                item = unsafe { crate::eval::typval::tv_list_find(l1, before as i32) };
+                if item.is_null() {
+                    if is_new {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { crate::eval::typval::tv_list_unref(l1) };
+                    }
+                    return; // semsg(_(e_list_index_out_of_range_nr), ...) omitted.
+                }
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_extend(l1, l2, item) };
+    }
+
+    if is_new {
+        rettv.value = TypvalValue::List(l1);
+        rettv.v_lock = crate::eval::typval_defs::VarLockStatus::Unlocked;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(&argvars[0], rettv) };
+    }
+}
+
+/// The `Dict` case of `extend()`/`extendnew()` (`extend_dict`,
+/// `eval/list.c`). See [`extend_list`]'s own doc comment for the
+/// shared `is_new` reasoning (identical here, for `Dict` instead of
+/// `List`).
+///
+/// # Safety
+/// `argvars[0]`/`argvars[1]`'s values must be `Dict`-typed with valid
+/// pointers.
+unsafe fn extend_dict(argvars: &[TypvalT], is_new: bool, rettv: &mut TypvalT) {
+    let TypvalValue::Dict(mut d1) = argvars[0].value else { unreachable!() };
+    if d1.is_null() {
+        // The original's own value_check_lock(VAR_FIXED, ...) call
+        // here always returns true (VAR_FIXED is always "locked") -
+        // its only real effect is the error message it would display
+        // (omitted, see this module's own doc comment), so a null d1
+        // always just returns, unconditionally.
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if !is_new && crate::eval::typval::value_check_lock(unsafe { (*d1).dv_lock }, None) {
+        return;
+    }
+
+    if is_new {
+        // SAFETY: forwarded from this function's own safety doc.
+        d1 =
+            unsafe { crate::eval::typval::tv_dict_copy(std::ptr::null(), d1, false, crate::eval::eval::get_copy_id()) };
+        if d1.is_null() {
+            return;
+        }
+    }
+
+    let TypvalValue::Dict(d2) = argvars[1].value else { unreachable!() };
+    if !d2.is_null() {
+        let mut action: Vec<u8> = b"force".to_vec();
+        if argvars.len() > 2 {
+            let Some(action_str) = crate::eval::typval::tv_get_string_chk(&argvars[2]) else {
+                if is_new {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::eval::typval::tv_dict_unref(d1) };
+                }
+                return; // type error; errmsg already given in the original.
+            };
+            if !matches!(action_str.as_slice(), b"keep" | b"force" | b"error") {
+                if is_new {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::eval::typval::tv_dict_unref(d1) };
+                }
+                return; // semsg(_(e_invarg2), ...) omitted.
+            }
+            action = action_str;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_dict_extend(d1, d2, &action) };
+    }
+
+    if is_new {
+        rettv.value = TypvalValue::Dict(d1);
+        rettv.v_lock = crate::eval::typval_defs::VarLockStatus::Unlocked;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(&argvars[0], rettv) };
+    }
+}
+
+/// Shared `extend()`/`extendnew()` dispatch by `argvars[0]`/`[1]`'s
+/// own types (`extend`, `eval/list.c`'s own private static helper).
+///
+/// # Safety
+/// Forwards [`extend_list`]/[`extend_dict`]'s own safety docs.
+unsafe fn extend(argvars: &[TypvalT], is_new: bool, rettv: &mut TypvalT) {
+    match (&argvars[0].value, &argvars[1].value) {
+        // SAFETY: forwarded from this function's own safety doc.
+        (TypvalValue::List(_), TypvalValue::List(_)) => unsafe { extend_list(argvars, is_new, rettv) },
+        // SAFETY: forwarded from this function's own safety doc.
+        (TypvalValue::Dict(_), TypvalValue::Dict(_)) => unsafe { extend_dict(argvars, is_new, rettv) },
+        _ => {
+            // semsg(_(e_listdictarg), is_new ? "extendnew()" : "extend()")
+            // omitted - message display, not tractable; rettv is
+            // simply left at its caller-provided default.
+        }
+    }
+}
+
+/// `extend({expr1}, {expr2} [, {expr3}])` - extend `{expr1}` (a `List`
+/// or `Dict`) in place with `{expr2}`'s own items (`f_extend`,
+/// `eval/list.c`). Returns the SAME (mutated) `{expr1}`.
+///
+/// # Safety
+/// Forwards [`extend`]'s own safety doc.
+unsafe fn f_extend(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { extend(argvars, false, rettv) };
+}
+
+/// `extendnew({expr1}, {expr2} [, {expr3}])` - like [`f_extend`], but
+/// `{expr1}` is copied first, leaving the original untouched
+/// (`f_extendnew`, `eval/list.c`). Returns the NEW, extended copy.
+///
+/// # Safety
+/// Forwards [`extend`]'s own safety doc.
+unsafe fn f_extendnew(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { extend(argvars, true, rettv) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2588,6 +2780,8 @@ mod tests {
             "add",
             "insert",
             "remove",
+            "extend",
+            "extendnew",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -4148,5 +4342,264 @@ mod tests {
         let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
         unsafe { f_remove(&[num(5), num(0)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_extend / f_extendnew ---
+
+    #[test]
+    fn extend_merges_two_lists_in_place() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l1, 1);
+            crate::eval::typval::tv_list_append_number(&mut *l1, 2);
+        }
+        let l2 = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l2, 3);
+            crate::eval::typval::tv_list_append_number(&mut *l2, 4);
+        }
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::List(l1), ..Default::default() }, TypvalT { value: TypvalValue::List(l2), ..Default::default() }];
+        unsafe { f_extend(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(l, l1); // same list, mutated in place.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 4);
+            let mut vals = Vec::new();
+            let mut item = crate::eval::typval::tv_list_first(l);
+            while !item.is_null() {
+                vals.push((*item).li_tv.value.clone());
+                item = (*item).li_next;
+            }
+            assert_eq!(vals, vec![TypvalValue::Number(1), TypvalValue::Number(2), TypvalValue::Number(3), TypvalValue::Number(4)]);
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_list_unref(l2);
+        }
+    }
+
+    #[test]
+    fn extend_inserts_before_a_given_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l1, 1);
+            crate::eval::typval::tv_list_append_number(&mut *l1, 4);
+        }
+        let l2 = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l2, 2);
+            crate::eval::typval::tv_list_append_number(&mut *l2, 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::List(l1), ..Default::default() },
+            TypvalT { value: TypvalValue::List(l2), ..Default::default() },
+            num(1),
+        ];
+        unsafe { f_extend(&args, &mut rettv) };
+        unsafe {
+            let mut vals = Vec::new();
+            let mut item = crate::eval::typval::tv_list_first(l1);
+            while !item.is_null() {
+                vals.push((*item).li_tv.value.clone());
+                item = (*item).li_next;
+            }
+            assert_eq!(vals, vec![TypvalValue::Number(1), TypvalValue::Number(2), TypvalValue::Number(3), TypvalValue::Number(4)]);
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_list_unref(l2);
+        }
+    }
+
+    #[test]
+    fn extend_of_a_locked_list_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*l1).lv_lock = crate::eval::typval_defs::VarLockStatus::Locked };
+        let l2 = crate::eval::typval::tv_list_alloc(0);
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args =
+            [TypvalT { value: TypvalValue::List(l1), ..Default::default() }, TypvalT { value: TypvalValue::List(l2), ..Default::default() }];
+        unsafe { f_extend(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_list_unref(l2);
+        }
+    }
+
+    #[test]
+    fn extend_merges_two_dicts_with_default_force_action() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d1, b"a", 1) };
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"a", 2);
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"b", 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::Dict(d1), ..Default::default() }, TypvalT { value: TypvalValue::Dict(d2), ..Default::default() }];
+        unsafe { f_extend(&args, &mut rettv) };
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        assert_eq!(d, d1);
+        unsafe {
+            let a = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"a").unwrap();
+            assert_eq!((*a).di_tv.value, TypvalValue::Number(2)); // overwritten by "force".
+            let b = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"b").unwrap();
+            assert_eq!((*b).di_tv.value, TypvalValue::Number(3));
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extend_dict_with_keep_action_preserves_existing_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d1, b"a", 1) };
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"a", 2);
+            crate::eval::typval::tv_dict_add_nr(&mut *d2, b"b", 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::Dict(d1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d2), ..Default::default() },
+            string(b"keep"),
+        ];
+        unsafe { f_extend(&args, &mut rettv) };
+        unsafe {
+            let a = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"a").unwrap();
+            assert_eq!((*a).di_tv.value, TypvalValue::Number(1)); // kept, not overwritten.
+            let b = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"b").unwrap();
+            assert_eq!((*b).di_tv.value, TypvalValue::Number(3)); // still added.
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extend_dict_with_error_action_and_a_duplicate_key_leaves_the_value_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d1, b"a", 1) };
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d2, b"a", 2) };
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::Dict(d1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d2), ..Default::default() },
+            string(b"error"),
+        ];
+        unsafe { f_extend(&args, &mut rettv) };
+        unsafe {
+            let a = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"a").unwrap();
+            assert_eq!((*a).di_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extend_of_a_locked_dict_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*d1).dv_lock = crate::eval::typval_defs::VarLockStatus::Locked };
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args =
+            [TypvalT { value: TypvalValue::Dict(d1), ..Default::default() }, TypvalT { value: TypvalValue::Dict(d2), ..Default::default() }];
+        unsafe { f_extend(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extend_with_mismatched_types_leaves_rettv_at_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = crate::eval::typval::tv_list_alloc(0);
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        let args =
+            [TypvalT { value: TypvalValue::List(l1), ..Default::default() }, TypvalT { value: TypvalValue::Dict(d2), ..Default::default() }];
+        unsafe { f_extend(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        unsafe {
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extend_dict_with_an_invalid_action_string_leaves_rettv_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [
+            TypvalT { value: TypvalValue::Dict(d1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d2), ..Default::default() },
+            string(b"bogus"),
+        ];
+        unsafe { f_extend(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+        }
+    }
+
+    #[test]
+    fn extendnew_returns_a_new_list_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l1 = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l1, 1);
+            crate::eval::typval::tv_list_append_number(&mut *l1, 2);
+        }
+        let l2 = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *l2, 3) };
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::List(l1), ..Default::default() }, TypvalT { value: TypvalValue::List(l2), ..Default::default() }];
+        unsafe { f_extendnew(&args, &mut rettv) };
+        let TypvalValue::List(new_list) = rettv.value else { panic!("expected a List") };
+        assert_ne!(new_list, l1); // a genuinely separate list.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(new_list), 3);
+            assert_eq!(crate::eval::typval::tv_list_len(l1), 2); // original untouched.
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_list_unref(l2);
+            crate::eval::typval::tv_list_unref(new_list);
+        }
+    }
+
+    #[test]
+    fn extendnew_returns_a_new_dict_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d1, b"a", 1) };
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d2, b"b", 2) };
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::Dict(d1), ..Default::default() }, TypvalT { value: TypvalValue::Dict(d2), ..Default::default() }];
+        unsafe { f_extendnew(&args, &mut rettv) };
+        let TypvalValue::Dict(new_dict) = rettv.value else { panic!("expected a Dict") };
+        assert_ne!(new_dict, d1);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_len(new_dict.as_ref()), 2);
+            assert_eq!(crate::eval::typval::tv_dict_len(d1.as_ref()), 1); // original untouched.
+            crate::eval::typval::tv_dict_unref(d1);
+            crate::eval::typval::tv_dict_unref(d2);
+            crate::eval::typval::tv_dict_unref(new_dict);
+        }
     }
 }

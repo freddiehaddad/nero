@@ -194,7 +194,7 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (52 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (54 functions so
 //! far, including a full cluster of `float_op_wrapper`-style math
 //! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
 //! original handful - the start of a long tail, `eval/funcs.c` itself
@@ -7097,6 +7097,51 @@ mod tests {
         unsafe { (*item).di_tv.value = TypvalValue::Blob(blob_item) };
         unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
         assert_eq!(eval_str(b"remove(g:myblob, 0)").1.value, TypvalValue::Number(10));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_extend_and_extendnew_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let (ret, tv) = eval_str(b"extend([1, 2], [3, 4])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 4);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        let (ret, tv) = eval_str(b"extend(#{a: 1}, #{b: 2})");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = tv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_len(d.as_ref()), 2);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+
+        // extendnew() through a real g: variable, confirming the
+        // original is genuinely untouched.
+        let orig = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_ref(orig);
+            crate::eval::typval::tv_list_append_number(&mut *orig, 1);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mylist");
+        unsafe { (*item).di_tv.value = TypvalValue::List(orig) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let (ret, tv) = eval_str(b"extendnew(g:mylist, [2])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(new_list) = tv.value else { panic!("expected a List") };
+        assert_ne!(new_list, orig);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(new_list), 2);
+            assert_eq!(crate::eval::typval::tv_list_len(orig), 1); // g:mylist itself untouched.
+            crate::eval::typval::tv_list_unref(new_list);
+        }
 
         reset_globals_for_test();
     }

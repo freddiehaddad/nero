@@ -1340,6 +1340,94 @@ pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Extend dictionary `d1` with items from dictionary `d2`
+/// (`tv_dict_extend`).
+///
+/// `action`'s first byte only is checked, matching the original's own
+/// `*action` comparisons: `b'e'` ("error") - a duplicate key gives an
+/// error (the loop stops early, matching the original's own `break`);
+/// `b'f'` ("force") - a duplicate key's value is replaced; anything
+/// else ("keep") - a duplicate key is silently ignored, the existing
+/// value kept.
+///
+/// # Panics
+/// Panics if `action`'s first byte is `b'm'` ("move" - items moved
+/// from `d2` into `d1` rather than copied). This needs a "detach a
+/// dict item from its own dict without freeing it" primitive this
+/// crate doesn't have yet (`tv_dict_item_remove` always frees).
+/// Genuinely unreachable from THIS crate's own only translated caller
+/// chain - `extend()`/`extendnew()`'s own 3rd-argument validation
+/// only ever allows `"keep"`/`"force"`/`"error"`, never `"move"` (the
+/// original's only `"move"` caller is `window.c`'s scroll-event
+/// handling, not yet translated) - kept as a real parameter value
+/// (not simply omitted) for signature fidelity with this genuinely
+/// reusable original function.
+///
+/// Omits the original's own `tv_dict_wrong_func_name` check (see
+/// [`tv_dict_add`]'s own doc comment for why this can never trigger
+/// yet) and its whole watcher-notification path
+/// (`tv_dict_is_watched`/`tv_dict_watcher_notify`) - analogously
+/// unreachable, since nothing in this crate ever sets up a dict
+/// watcher either (`DictT` has no watcher-list field at all).
+///
+/// # Safety
+/// `d1`/`d2` must be valid, non-null pointers to live `DictT`s, with
+/// every item genuinely allocated via `tv_dict_item_alloc`/
+/// `Box::into_raw`.
+pub unsafe fn tv_dict_extend(d1: *mut DictT, d2: *mut DictT, action: &[u8]) {
+    let action0 = action.first().copied().unwrap_or(b'f');
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut DictitemT> = unsafe { &*d2 }.dv_index.values().copied().collect();
+    for di2 in items {
+        // di_key always carries a trailing NUL terminator - strip it
+        // before searching d1, matching this module's own established
+        // stripping idiom used throughout.
+        // SAFETY: forwarded from this function's own safety doc.
+        let key: Vec<u8> = unsafe {
+            let k = &(*di2).di_key;
+            k[..k.len().saturating_sub(1)].to_vec()
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let di1 = unsafe { tv_dict_find(Some(&mut *d1), &key) };
+
+        match di1 {
+            None => {
+                if action0 == b'm' {
+                    unimplemented!(
+                        "tv_dict_extend: action=\"move\" needs a dict-item detach-without-free \
+                         primitive, not yet translated - unreachable from extend()/extendnew() \
+                         themselves, see this function's own doc comment"
+                    );
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                let new_di = unsafe { tv_dict_item_copy(di2) };
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { tv_dict_add(&mut *d1, new_di) } == FAIL {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { tv_dict_item_free(new_di) };
+                }
+            }
+            Some(_) if action0 == b'e' => {
+                break; // semsg(_("E737: Key already exists: %s"), ...) omitted.
+            }
+            Some(di1) if action0 == b'f' && di2 != di1 => {
+                // SAFETY: forwarded from this function's own safety doc.
+                let (locked, flags) = unsafe { ((*di1).di_tv.v_lock, (*di1).di_flags) };
+                if value_check_lock(locked, None) || crate::eval::vars::var_check_ro(flags) {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    tv_clear_simple(&(*di1).di_tv);
+                    tv_copy(&(*di2).di_tv, &mut (*di1).di_tv);
+                }
+            }
+            _ => {} // action == "keep" ('k'), or di2 == di1: do nothing.
+        }
+    }
+}
+
 /// Allocate an empty dictionary. Caller should take care of the
 /// reference count (`tv_dict_alloc`).
 #[must_use]
