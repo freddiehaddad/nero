@@ -106,6 +106,15 @@
 //! Also translated: `index()` (the index of the first `Blob`/`List`
 //! item equal to a given value, via the already-existing
 //! [`crate::eval::typval::tv_equal`]).
+//!
+//! Also translated: `reverse()` (`Blob`/`List`/`String` in place),
+//! needing a new [`crate::eval::typval::tv_blob_set`] (`eval/typval.h`'s
+//! own `static inline` byte-store counterpart to the already-
+//! translated `tv_blob_get`) and a new private `reverse_text` (a
+//! UTF-8-aware, non-destructive character reversal using the already-
+//! existing `crate::mbyte::utfc_ptr2len`). `copy()`/`deepcopy()`
+//! (needing `tv_dict_copy`/`tv_blob_copy`, neither translated yet)
+//! remain deferred - a natural next candidate once those exist.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -190,6 +199,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"items"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_items });
         m.insert(&b"get"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_get });
         m.insert(&b"index"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_index });
+        m.insert(&b"reverse"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reverse });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1307,6 +1317,82 @@ unsafe fn f_index(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Reverse text into a newly-allocated `Vec<u8>` (`reverse_text`).
+///
+/// A NUL byte inside `s` ends the reversal early, matching the
+/// original's own NUL-terminated `strlen(s)` bound exactly - the same
+/// established "embedded NUL ends a C-string-modeled scan" idiom used
+/// elsewhere in this module (e.g. `f_str2list`'s own doc comment).
+///
+/// # Safety
+/// Forwarded from `crate::mbyte::utfc_ptr2len`'s own safety doc.
+unsafe fn reverse_text(s: &[u8]) -> Vec<u8> {
+    let len = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+    let mut rev = vec![0u8; len];
+    let mut s_i = 0;
+    let mut rev_i = len;
+    while s_i < len {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mb_len = unsafe { crate::mbyte::utfc_ptr2len(&s[s_i..len]) } as usize;
+        rev_i -= mb_len;
+        rev[rev_i..rev_i + mb_len].copy_from_slice(&s[s_i..s_i + mb_len]);
+        s_i += mb_len;
+    }
+    rev
+}
+
+/// `reverse({object})` - reverse a `Blob`/`List`/`String` in place
+/// (`f_reverse`).
+///
+/// The original's own `E1252`-style "not a List/Blob/String" argument-
+/// type message is omitted, matching this crate's established "skip
+/// the display, keep an otherwise-harmless default" policy - `rettv`
+/// is simply left untouched for any other type. A locked `List`
+/// (matching the original's own `value_check_lock` guard) is likewise
+/// left untouched.
+///
+/// # Safety
+/// If `argvars[0].value` is `Blob`/`List`-typed with a non-null
+/// pointer, that pointer must be valid.
+unsafe fn f_reverse(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    match &argvars[0].value {
+        TypvalValue::Blob(b) => {
+            let b = *b;
+            // SAFETY: forwarded from this function's own safety doc.
+            let len = unsafe { crate::eval::typval::tv_blob_len(b) };
+            for i in 0..len / 2 {
+                // SAFETY: forwarded from this function's own safety doc.
+                let tmp = unsafe { crate::eval::typval::tv_blob_get(b, i) };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    let other = crate::eval::typval::tv_blob_get(b, len - i - 1);
+                    crate::eval::typval::tv_blob_set(b, i, other);
+                    crate::eval::typval::tv_blob_set(b, len - i - 1, tmp);
+                }
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_blob_set_ret(rettv, b) };
+        }
+        TypvalValue::String(s) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            rettv.value = TypvalValue::String(s.as_ref().map(|s| unsafe { reverse_text(s) }));
+        }
+        TypvalValue::List(l) => {
+            let l = *l;
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { crate::eval::typval::tv_list_locked(l) };
+            if !crate::eval::typval::value_check_lock(locked, None) {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::eval::typval::tv_list_reverse(l);
+                    crate::eval::typval::tv_list_set_ret(rettv, l);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,6 +2089,7 @@ mod tests {
             "items",
             "get",
             "index",
+            "reverse",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -2689,5 +2776,125 @@ mod tests {
         let args = [TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }, num(1)];
         unsafe { f_index(&args, &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_reverse / reverse_text ---
+
+    #[test]
+    fn reverse_text_reverses_ascii() {
+        let result = unsafe { reverse_text(b"hello") };
+        assert_eq!(result, b"olleh");
+    }
+
+    #[test]
+    fn reverse_text_keeps_multibyte_characters_intact() {
+        let result = unsafe { reverse_text("ab日本cd".as_bytes()) };
+        assert_eq!(result, "dc本日ba".as_bytes());
+    }
+
+    #[test]
+    fn reverse_text_stops_at_an_embedded_nul() {
+        let result = unsafe { reverse_text(b"ab\0cd") };
+        assert_eq!(result, b"ba");
+    }
+
+    #[test]
+    fn reverse_of_a_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_reverse(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"olleh".to_vec())));
+    }
+
+    #[test]
+    fn reverse_of_a_null_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_reverse(&[TypvalT { value: TypvalValue::String(None), ..Default::default() }], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn reverse_of_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+            crate::eval::typval::tv_list_append_number(&mut *list, 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_reverse(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(l, list); // reversed in place, same pointer returned.
+        unsafe {
+            let mut item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(3));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(2));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn reverse_of_a_locked_list_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+            (*list).lv_lock = crate::eval::typval_defs::VarLockStatus::Locked;
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_reverse(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            let item = crate::eval::typval::tv_list_first(list);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1)); // unchanged order.
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn reverse_of_a_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3, 4];
+            (*blob).bv_ga.ga_len = 4;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }];
+        unsafe { f_reverse(&args, &mut rettv) };
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        assert_eq!(b, blob);
+        unsafe {
+            assert_eq!((*b).bv_ga.ga_data, vec![4, 3, 2, 1]);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn reverse_of_an_odd_length_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }];
+        unsafe { f_reverse(&args, &mut rettv) };
+        unsafe {
+            assert_eq!((*blob).bv_ga.ga_data, vec![3, 2, 1]);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn reverse_of_a_number_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_reverse(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
     }
 }

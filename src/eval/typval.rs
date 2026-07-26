@@ -1856,6 +1856,18 @@ pub unsafe fn tv_blob_get(b: *const crate::eval::typval_defs::BlobT, idx: i32) -
     unsafe { (&(*b).bv_ga.ga_data)[idx as usize] }
 }
 
+/// Store a byte at index `idx` in a blob (`tv_blob_set`, `eval/typval.h`'s
+/// own `static inline`).
+///
+/// # Safety
+/// `b` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::BlobT`], and `idx` must be in bounds
+/// (`< tv_blob_len(b)`).
+pub unsafe fn tv_blob_set(b: *mut crate::eval::typval_defs::BlobT, idx: i32, c: u8) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (&mut (*b).bv_ga.ga_data)[idx as usize] = c };
+}
+
 /// Set the return value of `tv` to a blob (`tv_blob_set_ret`,
 /// `eval/typval.h`'s own `static inline`).
 ///
@@ -5166,6 +5178,19 @@ mod tests {
         b.bv_ga.ga_len = 3;
         unsafe {
             assert_eq!(tv_blob_get(&b as *const _, 0), 10);
+            assert_eq!(tv_blob_get(&b as *const _, 2), 30);
+        }
+    }
+
+    #[test]
+    fn tv_blob_set_writes_the_right_byte() {
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        b.bv_ga.ga_data = vec![10, 20, 30];
+        b.bv_ga.ga_len = 3;
+        unsafe {
+            tv_blob_set(&mut b as *mut _, 1, 99);
+            assert_eq!(tv_blob_get(&b as *const _, 0), 10);
+            assert_eq!(tv_blob_get(&b as *const _, 1), 99);
             assert_eq!(tv_blob_get(&b as *const _, 2), 30);
         }
     }

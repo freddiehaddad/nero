@@ -194,7 +194,7 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (45 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (46 functions so
 //! far, including a full cluster of `float_op_wrapper`-style math
 //! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
 //! original handful - the start of a long tail, `eval/funcs.c` itself
@@ -6610,6 +6610,25 @@ mod tests {
 
         assert_eq!(eval_str(b"index([10, 20, 30], 20)").1.value, TypvalValue::Number(1));
         assert_eq!(eval_str(b"index([10, 20, 30], 99)").1.value, TypvalValue::Number(-1));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_reverse_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"reverse(\"hello\")").1.value, TypvalValue::String(Some(b"olleh".to_vec())));
+
+        let (ret, tv) = eval_str(b"reverse([1, 2, 3])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            let item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(3));
+            crate::eval::typval::tv_list_unref(l);
+        }
 
         reset_globals_for_test();
     }
