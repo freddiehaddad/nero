@@ -121,13 +121,15 @@
 //!
 //! Also translated: `copy()` (a shallow copy of `List`/`Dict`/`Blob`/
 //! any other value, via [`crate::eval::typval::tv_list_copy`]/
-//! [`crate::eval::typval::tv_dict_copy`]/[`crate::eval::typval::tv_blob_copy`],
-//! the latter two new this batch and mirroring the already-existing
-//! `tv_list_copy`'s own `deep=false`-only scoping and `copy_id`/
-//! `got_int` bookkeeping exactly). `deepcopy()` (which would need
-//! `deep=true` support in all three, i.e. `var_item_copy`'s recursive
-//! dispatch) remains deferred - a natural next candidate now that its
-//! own prerequisites exist.
+//! [`crate::eval::typval::tv_dict_copy`]/[`crate::eval::typval::tv_blob_copy`]),
+//! and `deepcopy()` (a RECURSIVE copy, via `eval.c`'s own
+//! [`crate::eval::eval::var_item_copy`] plus real `deep=true` support
+//! added to `tv_list_copy`/`tv_dict_copy` - cycle detection via an
+//! optional `copy_id`/[`crate::eval::eval::get_copy_id`] is fully
+//! real too, matching the original's own documented `{noref}`
+//! semantics exactly: a container referenced more than once is only
+//! copied once by default, or once per occurrence with
+//! `deepcopy({expr}, 1)`).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -215,6 +217,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"reverse"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reverse });
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
+        m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1627,6 +1630,53 @@ unsafe fn f_copy(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `deepcopy({expr} [, {noref}])` - make a deep copy of `{expr}`
+/// (`f_deepcopy`).
+///
+/// Unlike [`f_copy`], nested `List`/`Dict` items are ALSO copied,
+/// recursively, via [`crate::eval::eval::var_item_copy`].
+///
+/// `{noref}` (default `0`/omitted) controls cycle handling: when
+/// `0`, a container referenced more than once (e.g. `let l = [1]` /
+/// `let outer = [l, l]`) is only copied ONCE - every reference in the
+/// result points to that SAME single copy, matching the original
+/// list's own sharing exactly (and correctly handling genuine cycles,
+/// e.g. a list containing itself). When `{noref}` is `1`, every
+/// occurrence gets its OWN separate copy instead - which means a
+/// genuine cycle would recurse forever, hence [`DICT_MAXNEST`]'s
+/// recursion limit turning that runaway recursion into a clean `FAIL`
+/// instead of a stack overflow (matching the original's own
+/// documented "a cyclic reference causes deepcopy() to fail" note for
+/// `{noref}=1`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::var_item_copy`]'s own safety
+/// doc, applied recursively through every nested List/Dict item
+/// reachable from `argvars[0]`.
+unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // argvars.len() > 1 replaces the original's own argvars[1].v_type
+    // != VAR_UNKNOWN sentinel check (this crate's argvars is already
+    // exactly as long as what was actually passed, unlike the
+    // original's own fixed-size, sentinel-padded array) -
+    // tv_check_for_opt_bool_arg itself indexes argvars[1] directly,
+    // so it must only ever be called when that index genuinely
+    // exists; skipping it entirely when the optional arg is absent
+    // produces the identical net effect, since tv_check_for_opt_bool_arg's
+    // own first check is precisely "argvars[1] unknown -> OK" anyway.
+    if argvars.len() > 1 && crate::eval::typval::tv_check_for_opt_bool_arg(argvars, 1) == crate::vim_defs::FAIL {
+        return;
+    }
+
+    let mut noref: crate::eval::typval_defs::VarnumberT = 0;
+    if argvars.len() > 1 {
+        noref = crate::eval::typval::tv_get_bool_chk(&argvars[1], None);
+    }
+
+    let copy_id = if noref == 0 { crate::eval::eval::get_copy_id() } else { 0 };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::var_item_copy(std::ptr::null(), &argvars[0], rettv, true, copy_id) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2326,6 +2376,7 @@ mod tests {
             "reverse",
             "count",
             "copy",
+            "deepcopy",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -3370,5 +3421,170 @@ mod tests {
     fn copy_of_unknown_panics_in_debug() {
         let mut rettv = TypvalT::default();
         unsafe { f_copy(&[TypvalT::default()], &mut rettv) };
+    }
+
+    // --- f_deepcopy ---
+
+    #[test]
+    fn deepcopy_of_a_nested_list_copies_recursively() {
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_ref(inner);
+            crate::eval::typval::tv_list_append_number(&mut *inner, 1);
+        }
+        let outer = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                outer,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            )
+        };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(outer), ..Default::default() }];
+        unsafe { f_deepcopy(&args, &mut rettv) };
+        let TypvalValue::List(outer_copy) = rettv.value else { panic!("expected a List") };
+        assert_ne!(outer_copy, outer);
+        unsafe {
+            let item = crate::eval::typval::tv_list_first(outer_copy);
+            let TypvalValue::List(inner_copy) = (*item).li_tv.value else { panic!("expected a List") };
+            // Deep copy: the nested list is ALSO a genuinely separate
+            // copy, not the same pointer as the original's own inner
+            // list (contrast copy()'s own shallow behavior).
+            assert_ne!(inner_copy, inner);
+
+            // Mutating the nested copy must not affect the nested
+            // original.
+            let inner_copy_item = crate::eval::typval::tv_list_first(inner_copy);
+            (*inner_copy_item).li_tv.value = TypvalValue::Number(99);
+            let inner_orig_item = crate::eval::typval::tv_list_first(inner);
+            assert_eq!((*inner_orig_item).li_tv.value, TypvalValue::Number(1));
+
+            crate::eval::typval::tv_list_unref(outer);
+            crate::eval::typval::tv_list_unref(outer_copy);
+        }
+    }
+
+    #[test]
+    fn deepcopy_of_a_nested_dict_copies_recursively() {
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*inner).dv_refcount += 1;
+            let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+            (*item).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *inner, item);
+        }
+        let outer = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item).di_tv.value = TypvalValue::Dict(inner);
+            crate::eval::typval::tv_dict_add(&mut *outer, item);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(outer), ..Default::default() }];
+        unsafe { f_deepcopy(&args, &mut rettv) };
+        let TypvalValue::Dict(outer_copy) = rettv.value else { panic!("expected a Dict") };
+        assert_ne!(outer_copy, outer);
+        unsafe {
+            let item = crate::eval::typval::tv_dict_find(Some(&mut *outer_copy), b"a").unwrap();
+            let TypvalValue::Dict(inner_copy) = (*item).di_tv.value else { panic!("expected a Dict") };
+            assert_ne!(inner_copy, inner);
+
+            let inner_copy_item = crate::eval::typval::tv_dict_find(Some(&mut *inner_copy), b"x").unwrap();
+            (*inner_copy_item).di_tv.value = TypvalValue::Number(99);
+            let inner_orig_item = crate::eval::typval::tv_dict_find(Some(&mut *inner), b"x").unwrap();
+            assert_eq!((*inner_orig_item).di_tv.value, TypvalValue::Number(1));
+
+            crate::eval::typval::tv_dict_unref(outer);
+            crate::eval::typval::tv_dict_unref(outer_copy);
+        }
+    }
+
+    #[test]
+    fn deepcopy_without_noref_reuses_the_same_copy_for_a_shared_reference() {
+        // deepcopy(x) (noref omitted, defaults to 0): the SAME list
+        // referenced twice produces the SAME copy both times.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(inner) };
+        let outer = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                outer,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+            crate::eval::typval::tv_list_ref(inner);
+            crate::eval::typval::tv_list_append_owned_tv(
+                outer,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(outer), ..Default::default() }];
+        unsafe { f_deepcopy(&args, &mut rettv) };
+        let TypvalValue::List(outer_copy) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let first = crate::eval::typval::tv_list_first(outer_copy);
+            let second = (*first).li_next;
+            let TypvalValue::List(first_copy) = (*first).li_tv.value else { panic!("expected a List") };
+            let TypvalValue::List(second_copy) = (*second).li_tv.value else { panic!("expected a List") };
+            assert_eq!(first_copy, second_copy);
+
+            crate::eval::typval::tv_list_unref(outer);
+            crate::eval::typval::tv_list_unref(outer_copy);
+        }
+    }
+
+    #[test]
+    fn deepcopy_with_noref_1_makes_separate_copies_for_a_shared_reference() {
+        // deepcopy(x, 1): every occurrence of the same referenced
+        // list gets its OWN separate copy instead.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_ref(inner) };
+        let outer = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_owned_tv(
+                outer,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+            crate::eval::typval::tv_list_ref(inner);
+            crate::eval::typval::tv_list_append_owned_tv(
+                outer,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(outer), ..Default::default() }, num(1)];
+        unsafe { f_deepcopy(&args, &mut rettv) };
+        let TypvalValue::List(outer_copy) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let first = crate::eval::typval::tv_list_first(outer_copy);
+            let second = (*first).li_next;
+            let TypvalValue::List(first_copy) = (*first).li_tv.value else { panic!("expected a List") };
+            let TypvalValue::List(second_copy) = (*second).li_tv.value else { panic!("expected a List") };
+            assert_ne!(first_copy, second_copy);
+
+            crate::eval::typval::tv_list_unref(outer);
+            crate::eval::typval::tv_list_unref(outer_copy);
+        }
+    }
+
+    #[test]
+    fn deepcopy_of_a_number_is_a_plain_value_copy() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_deepcopy(&[num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn deepcopy_with_only_the_required_argument_does_not_panic() {
+        // argvars.len() == 1 - the optional noref argument is simply
+        // absent, not an in-bounds Unknown-typed sentinel like the
+        // original's own fixed-size argvars array would have.
+        let mut rettv = TypvalT::default();
+        unsafe { f_deepcopy(&[num(7)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
     }
 }

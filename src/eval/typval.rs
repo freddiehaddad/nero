@@ -1613,16 +1613,21 @@ pub unsafe fn tv_dict_add(d: &mut DictT, item: *mut DictitemT) -> i32 {
 /// Make a copy of a dictionary (`tv_dict_copy`). Returns `None` if
 /// `orig` is null.
 ///
-/// # Deferred
-/// `deep = true` needs `eval.c`'s `var_item_copy` (recursive deep-copy
-/// dispatch, not yet translated) - `unimplemented!()`s only if
-/// actually reached, matching [`tv_list_copy`]'s own identical
-/// deferral policy.
+/// `deep=true` recursively copies every nested `List`/`Dict` item too,
+/// via [`crate::eval::eval::var_item_copy`] - if that fails partway
+/// through (recursion limit or a nested allocation failure), only the
+/// loop stops early; the partial copy accumulated so far is still
+/// returned (refcount incremented, and NOT discarded unless `got_int`
+/// is *also* set), matching the original's own plain `break` (not a
+/// `goto`-based abort) on this specific failure exactly - a real
+/// asymmetry already present in the original relative to
+/// [`tv_list_copy`]'s own full-abort behavior on the same kind of
+/// failure, not a translation choice.
 ///
 /// # Safety
 /// `orig`, if non-null, must be a valid pointer to a live `DictT`.
 pub unsafe fn tv_dict_copy(
-    _conv: *const crate::types_defs::VimconvT,
+    conv: *const crate::types_defs::VimconvT,
     orig: *mut DictT,
     deep: bool,
     copy_id: i32,
@@ -1658,13 +1663,25 @@ pub unsafe fn tv_dict_copy(
         let key = &key[..key.len() - 1];
         let new_di = tv_dict_item_alloc(key);
         if deep {
-            unimplemented!(
-                "tv_dict_copy: deep copy needs eval.c's var_item_copy, not yet translated - see \
-                 this function's own doc comment"
-            );
+            // SAFETY: forwarded from this function's own safety doc.
+            let ret = unsafe {
+                crate::eval::eval::var_item_copy(conv, &(*di).di_tv, &mut (*new_di).di_tv, deep, copy_id)
+            };
+            if ret == FAIL {
+                // xfree(new_di): new_di's own di_tv is either
+                // untouched (Unknown, recursion-limit case) or a null
+                // List/Dict pointer (nested-copy-failure case) at
+                // this point - either way there is nothing owned to
+                // release, matching the original's own plain
+                // xfree(new_di) (not a full tv_dict_item_free-based
+                // free) exactly.
+                drop(unsafe { Box::from_raw(new_di) });
+                break;
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_copy(&(*di).di_tv, &mut (*new_di).di_tv) };
         }
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { tv_copy(&(*di).di_tv, &mut (*new_di).di_tv) };
         // SAFETY: `copy`/`new_di` are both valid, freshly-prepared
         // pointers not shared with anything yet.
         if unsafe { tv_dict_add(&mut *copy, new_di) } == FAIL {
@@ -2746,6 +2763,31 @@ pub unsafe fn tv_list_insert_tv(
     unsafe { tv_list_insert(l, ni, item) };
 }
 
+/// Get a list's own copy ID, set by an earlier deep [`tv_list_copy`]
+/// call (`tv_list_copyid`, `eval/typval.h`'s own `static inline`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_copyid(l: *const crate::eval::typval_defs::ListT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_copy_id }
+}
+
+/// Get a list's own latest copy, set by an earlier deep
+/// [`tv_list_copy`] call (`tv_list_latest_copy`, `eval/typval.h`'s
+/// own `static inline`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+#[must_use]
+pub unsafe fn tv_list_latest_copy(
+    l: *const crate::eval::typval_defs::ListT,
+) -> *mut crate::eval::typval_defs::ListT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_copylist }
+}
+
 /// Make a copy of a list (`tv_list_copy`).
 ///
 /// Returns a null pointer if `orig` is null, or on failure. The
@@ -2756,25 +2798,24 @@ pub unsafe fn tv_list_insert_tv(
 /// here, matching the original's own `deep == false` behavior
 /// exactly).
 ///
-/// # Panics
-/// Panics if `deep` is `true` AND `orig` has at least one item to
-/// copy - the deep-copy path needs `eval.c`'s `var_item_copy` (a
-/// substantial recursive deep-copy engine handling conversion and
-/// cycle detection via `copy_id`), not yet translated. Nothing in
-/// this crate can currently request a deep copy (no `copy()`/
-/// `deepcopy()` Vimscript builtins exist yet), so this is unreachable
-/// in practice, not just narrow - matching this crate's established
-/// "harvest the reachable core" pattern. A deep copy of an EMPTY list
-/// does NOT panic, matching the original's own per-item (not
-/// upfront) `deep` check inside its copy loop.
+/// `deep=true` recursively copies every nested `List`/`Dict` item too,
+/// via [`crate::eval::eval::var_item_copy`] - if that fails partway
+/// through (recursion limit or a nested allocation failure), the
+/// WHOLE copy is discarded and null is returned, matching the
+/// original's own `goto tv_list_copy_error` behavior exactly (contrast
+/// [`tv_dict_copy`]'s own, genuinely different, "keep the partial
+/// copy" behavior on the same kind of failure - a real asymmetry
+/// already present in the original, not a translation choice).
 ///
 /// # Safety
 /// `orig`, if non-null, must be a valid pointer to a live `ListT`,
 /// and every item reachable via its `lv_first`/`li_next` chain must
 /// have a valid `li_tv` (forwarded to [`tv_copy`]'s own contract, used
-/// for the shallow-copy path).
+/// for the shallow-copy path, and to
+/// [`crate::eval::eval::var_item_copy`]'s own contract, used for the
+/// deep-copy path).
 pub unsafe fn tv_list_copy(
-    _conv: *const crate::types_defs::VimconvT,
+    conv: *const crate::types_defs::VimconvT,
     orig: *mut crate::eval::typval_defs::ListT,
     deep: bool,
     copy_id: i32,
@@ -2808,13 +2849,26 @@ pub unsafe fn tv_list_copy(
         }
         let ni = tv_list_item_alloc();
         if deep {
-            unimplemented!(
-                "tv_list_copy: deep copy needs eval.c's var_item_copy, not yet translated \
-                 - see this function's own doc comment"
-            );
+            // SAFETY: forwarded from this function's own safety doc.
+            let ret =
+                unsafe { crate::eval::eval::var_item_copy(conv, &(*item).li_tv, &mut (*ni).li_tv, deep, copy_id) };
+            if ret == FAIL {
+                // xfree(ni): ni's own li_tv is either untouched
+                // (Unknown, recursion-limit case) or a null List/Dict
+                // pointer (nested-copy-failure case) at this point -
+                // either way there is nothing owned to release,
+                // matching the original's own plain xfree(ni) (not a
+                // full tv_clear-based free) exactly.
+                drop(unsafe { Box::from_raw(ni) });
+                // SAFETY: `copy` was allocated by this same function
+                // above and is not shared with anything else yet.
+                unsafe { tv_list_unref(copy) };
+                return std::ptr::null_mut();
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_copy(&(*item).li_tv, &mut (*ni).li_tv) };
         }
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { tv_copy(&(*item).li_tv, &mut (*ni).li_tv) };
         // SAFETY: `copy`/`ni` are both valid, freshly-prepared pointers.
         unsafe { tv_list_append(copy, ni) };
         // SAFETY: forwarded from this function's own safety doc.
@@ -4713,13 +4767,94 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "deep copy needs eval.c's var_item_copy")]
-    fn tv_list_copy_deep_with_items_panics() {
+    fn tv_list_copy_deep_copies_a_nested_list_recursively() {
         let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_list_alloc(1);
+        unsafe { tv_list_ref(inner) };
+        unsafe { tv_list_append_number(&mut *inner, 1) };
         let orig = tv_list_alloc(1);
+        unsafe { tv_list_append_owned_tv(orig, TypvalT { value: TypvalValue::List(inner), ..Default::default() }) };
+
         unsafe {
-            tv_list_append_tv(orig, &number_tv(1));
-            tv_list_copy(std::ptr::null(), orig, true, 0);
+            let copy = tv_list_copy(std::ptr::null(), orig, true, 0);
+            assert!(!copy.is_null());
+            let outer_item = tv_list_first(copy);
+            let TypvalValue::List(inner_copy) = (*outer_item).li_tv.value else { panic!("expected a List") };
+            // The nested list was ALSO copied - a genuinely separate
+            // list, not the same pointer as the original's own inner
+            // list.
+            assert_ne!(inner_copy, inner);
+            assert_eq!((*inner_copy).lv_refcount, 1);
+
+            // Mutating the nested copy must not affect the nested
+            // original.
+            let inner_copy_item = tv_list_first(inner_copy);
+            (*inner_copy_item).li_tv.value = TypvalValue::Number(99);
+            let inner_orig_item = tv_list_first(inner);
+            assert_eq!((*inner_orig_item).li_tv.value, TypvalValue::Number(1));
+
+            tv_list_unref(orig);
+            tv_list_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_deep_with_noref_makes_a_second_copy_of_a_shared_reference() {
+        // Same list referenced twice ([inner, inner]) - a real
+        // copyID of 0 (as "noref=1" in deepcopy() terms) makes TWO
+        // separate copies, matching the original's own documented
+        // deepcopy({expr}, 1) behavior exactly.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_list_alloc(0);
+        unsafe { tv_list_ref(inner) };
+        let orig = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_owned_tv(orig, TypvalT { value: TypvalValue::List(inner), ..Default::default() });
+            tv_list_ref(inner);
+            tv_list_append_owned_tv(orig, TypvalT { value: TypvalValue::List(inner), ..Default::default() });
+        }
+
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, true, 0);
+            let first = tv_list_first(copy);
+            let second = (*first).li_next;
+            let TypvalValue::List(first_copy) = (*first).li_tv.value else { panic!("expected a List") };
+            let TypvalValue::List(second_copy) = (*second).li_tv.value else { panic!("expected a List") };
+            assert_ne!(first_copy, second_copy); // two genuinely separate copies.
+
+            tv_list_unref(orig);
+            tv_list_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_copy_deep_with_a_real_copy_id_reuses_the_same_copy_for_a_shared_reference() {
+        // Same setup as the noref=1 test above, but with a real
+        // (non-zero) copyID - the SAME list referenced twice now
+        // produces the SAME copy twice too (identity preserved),
+        // matching the original's own documented deepcopy({expr})
+        // (noref omitted/0) behavior exactly.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_list_alloc(0);
+        unsafe { tv_list_ref(inner) };
+        let orig = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_owned_tv(orig, TypvalT { value: TypvalValue::List(inner), ..Default::default() });
+            tv_list_ref(inner);
+            tv_list_append_owned_tv(orig, TypvalT { value: TypvalValue::List(inner), ..Default::default() });
+        }
+
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, true, 7);
+            let first = tv_list_first(copy);
+            let second = (*first).li_next;
+            let TypvalValue::List(first_copy) = (*first).li_tv.value else { panic!("expected a List") };
+            let TypvalValue::List(second_copy) = (*second).li_tv.value else { panic!("expected a List") };
+            assert_eq!(first_copy, second_copy); // same copy reused both times.
+            assert_eq!((*first_copy).lv_refcount, 2); // referenced twice.
+
+            tv_list_unref(orig);
+            tv_list_unref(copy);
         }
     }
 
@@ -4731,6 +4866,19 @@ mod tests {
             let copy = tv_list_copy(std::ptr::null(), orig, false, 42);
             assert_eq!((*orig).lv_copy_id, 42);
             assert_eq!((*orig).lv_copylist, copy);
+            tv_list_free(orig);
+            tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_list_copyid_and_tv_list_latest_copy_read_the_bookkeeping_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_list_alloc(0);
+        unsafe {
+            let copy = tv_list_copy(std::ptr::null(), orig, false, 42);
+            assert_eq!(tv_list_copyid(orig), 42);
+            assert_eq!(tv_list_latest_copy(orig), copy);
             tv_list_free(orig);
             tv_list_free(copy);
         }
@@ -4803,15 +4951,76 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "deep copy needs eval.c's var_item_copy")]
-    fn tv_dict_copy_deep_with_items_panics() {
+    fn tv_dict_copy_deep_copies_a_nested_dict_recursively() {
         let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_dict_alloc();
+        unsafe { (*inner).dv_refcount += 1 };
+        unsafe {
+            let inner_item = tv_dict_item_alloc(b"x");
+            (*inner_item).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *inner, inner_item);
+        }
         let orig = tv_dict_alloc();
         unsafe {
             let item = tv_dict_item_alloc(b"a");
-            (*item).di_tv.value = TypvalValue::Number(1);
+            (*item).di_tv.value = TypvalValue::Dict(inner);
             tv_dict_add(&mut *orig, item);
-            tv_dict_copy(std::ptr::null(), orig, true, 0);
+        }
+
+        unsafe {
+            let copy = tv_dict_copy(std::ptr::null(), orig, true, 0);
+            assert!(!copy.is_null());
+            let outer_item = tv_dict_find(Some(&mut *copy), b"a").unwrap();
+            let TypvalValue::Dict(inner_copy) = (*outer_item).di_tv.value else { panic!("expected a Dict") };
+            // The nested dict was ALSO copied - a genuinely separate
+            // dict, not the same pointer as the original's own inner
+            // dict.
+            assert_ne!(inner_copy, inner);
+            assert_eq!((*inner_copy).dv_refcount, 1);
+
+            // Mutating the nested copy must not affect the nested
+            // original.
+            let inner_copy_item = tv_dict_find(Some(&mut *inner_copy), b"x").unwrap();
+            (*inner_copy_item).di_tv.value = TypvalValue::Number(99);
+            let inner_orig_item = tv_dict_find(Some(&mut *inner), b"x").unwrap();
+            assert_eq!((*inner_orig_item).di_tv.value, TypvalValue::Number(1));
+
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_dict_copy_deep_with_a_real_copy_id_reuses_the_same_copy_for_a_shared_reference() {
+        // Same dict referenced from two different keys - a real
+        // (non-zero) copyID produces the SAME copy both times
+        // (identity preserved), matching deepcopy({expr})'s own
+        // documented (noref omitted/0) behavior exactly.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_dict_alloc();
+        unsafe { (*inner).dv_refcount += 1 };
+        let orig = tv_dict_alloc();
+        unsafe {
+            let item_a = tv_dict_item_alloc(b"a");
+            (*item_a).di_tv.value = TypvalValue::Dict(inner);
+            tv_dict_add(&mut *orig, item_a);
+            (*inner).dv_refcount += 1;
+            let item_b = tv_dict_item_alloc(b"b");
+            (*item_b).di_tv.value = TypvalValue::Dict(inner);
+            tv_dict_add(&mut *orig, item_b);
+        }
+
+        unsafe {
+            let copy = tv_dict_copy(std::ptr::null(), orig, true, 7);
+            let a_item = tv_dict_find(Some(&mut *copy), b"a").unwrap();
+            let b_item = tv_dict_find(Some(&mut *copy), b"b").unwrap();
+            let TypvalValue::Dict(a_copy) = (*a_item).di_tv.value else { panic!("expected a Dict") };
+            let TypvalValue::Dict(b_copy) = (*b_item).di_tv.value else { panic!("expected a Dict") };
+            assert_eq!(a_copy, b_copy); // same copy reused both times.
+            assert_eq!((*a_copy).dv_refcount, 2); // referenced twice.
+
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
         }
     }
 
