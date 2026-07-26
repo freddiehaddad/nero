@@ -1610,6 +1610,82 @@ pub unsafe fn tv_dict_add(d: &mut DictT, item: *mut DictitemT) -> i32 {
     rc
 }
 
+/// Make a copy of a dictionary (`tv_dict_copy`). Returns `None` if
+/// `orig` is null.
+///
+/// # Deferred
+/// `deep = true` needs `eval.c`'s `var_item_copy` (recursive deep-copy
+/// dispatch, not yet translated) - `unimplemented!()`s only if
+/// actually reached, matching [`tv_list_copy`]'s own identical
+/// deferral policy.
+///
+/// # Safety
+/// `orig`, if non-null, must be a valid pointer to a live `DictT`.
+pub unsafe fn tv_dict_copy(
+    _conv: *const crate::types_defs::VimconvT,
+    orig: *mut DictT,
+    deep: bool,
+    copy_id: i32,
+) -> *mut DictT {
+    if orig.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let copy = tv_dict_alloc();
+    if copy_id != 0 {
+        // Do this before adding the items, because one of the items
+        // may refer back to this dict.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*orig).dv_copy_id = copy_id;
+            (*orig).dv_copydict = copy;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut DictitemT> = unsafe { &*orig }.dv_index.values().copied().collect();
+    for di in items {
+        // SAFETY: GLOBALS is only ever accessed through this crate's
+        // established single-threaded-main-loop convention.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        // di_key always carries a trailing NUL terminator (matching
+        // hi_key's C-string contract) - strip it before re-allocating
+        // via tv_dict_item_alloc, which re-adds its own.
+        // SAFETY: `di` came from the dict's own live index above.
+        let key = unsafe { &(*di).di_key };
+        let key = &key[..key.len() - 1];
+        let new_di = tv_dict_item_alloc(key);
+        if deep {
+            unimplemented!(
+                "tv_dict_copy: deep copy needs eval.c's var_item_copy, not yet translated - see \
+                 this function's own doc comment"
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_copy(&(*di).di_tv, &mut (*new_di).di_tv) };
+        // SAFETY: `copy`/`new_di` are both valid, freshly-prepared
+        // pointers not shared with anything yet.
+        if unsafe { tv_dict_add(&mut *copy, new_di) } == FAIL {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_dict_item_free(new_di) };
+            break;
+        }
+    }
+
+    // SAFETY: `copy` was just allocated above by this same function.
+    unsafe { (*copy).dv_refcount += 1 };
+    // SAFETY: GLOBALS access, same convention as above.
+    if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_dict_unref(copy) };
+        return std::ptr::null_mut();
+    }
+
+    copy
+}
+
 /// Add a list entry to a dictionary; `list`'s reference count is
 /// incremented on success (`tv_dict_add_list`).
 ///
@@ -1880,6 +1956,38 @@ pub unsafe fn tv_blob_set_ret(tv: &mut TypvalT, b: *mut crate::eval::typval_defs
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { (*b).bv_refcount += 1 };
     }
+}
+
+/// Allocate an empty blob for a return value, setting its reference
+/// count (`tv_blob_alloc_ret`).
+pub fn tv_blob_alloc_ret(ret_tv: &mut TypvalT) -> *mut crate::eval::typval_defs::BlobT {
+    let b = tv_blob_alloc();
+    // SAFETY: `b` was just allocated above, a fresh pointer not shared
+    // with anything yet.
+    unsafe { tv_blob_set_ret(ret_tv, b) };
+    b
+}
+
+/// Copy a blob typval to a different typval (`tv_blob_copy`).
+///
+/// # Safety
+/// `from`, if non-null, must be a valid pointer to a live
+/// [`crate::eval::typval_defs::BlobT`].
+pub unsafe fn tv_blob_copy(from: *const crate::eval::typval_defs::BlobT, to: &mut TypvalT) {
+    if from.is_null() {
+        to.value = TypvalValue::Blob(std::ptr::null_mut());
+    } else {
+        let b = tv_blob_alloc_ret(to);
+        // SAFETY: forwarded from this function's own safety doc.
+        let (data, len) = unsafe { ((*from).bv_ga.ga_data.clone(), (*from).bv_ga.ga_len) };
+        // SAFETY: `b` was just allocated above by `tv_blob_alloc_ret`.
+        unsafe {
+            (*b).bv_ga.ga_data = data;
+            (*b).bv_ga.ga_len = len;
+            (*b).bv_ga.ga_maxlen = len;
+        }
+    }
+    to.v_lock = VarLockStatus::Unlocked;
 }
 
 /// `gc_first_list`: head of the linked list of all live lists (via
@@ -4625,6 +4733,128 @@ mod tests {
             assert_eq!((*orig).lv_copylist, copy);
             tv_list_free(orig);
             tv_list_free(copy);
+        }
+    }
+
+    #[test]
+    fn tv_dict_copy_null_orig_is_null() {
+        assert!(unsafe { tv_dict_copy(std::ptr::null(), std::ptr::null_mut(), false, 0) }.is_null());
+    }
+
+    #[test]
+    fn tv_dict_copy_shallow_copies_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_dict_alloc();
+        unsafe {
+            let item_a = tv_dict_item_alloc(b"a");
+            (*item_a).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *orig, item_a);
+            let item_b = tv_dict_item_alloc(b"b");
+            (*item_b).di_tv.value = TypvalValue::Number(2);
+            tv_dict_add(&mut *orig, item_b);
+
+            let copy = tv_dict_copy(std::ptr::null(), orig, false, 0);
+            assert!(!copy.is_null());
+            assert_eq!(tv_dict_len(copy.as_ref()), 2);
+            assert_eq!((*copy).dv_refcount, 1);
+            // The copy is a genuinely separate dict, not an alias.
+            assert_ne!(copy, orig);
+
+            let mut values: Vec<crate::eval::typval_defs::VarnumberT> = (*copy)
+                .dv_index
+                .values()
+                .map(|&di| match (*di).di_tv.value {
+                    TypvalValue::Number(n) => n,
+                    _ => panic!("expected a Number"),
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(values, vec![1, 2]);
+
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_dict_copy_of_empty_dict_is_empty_not_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_dict_alloc();
+        unsafe {
+            let copy = tv_dict_copy(std::ptr::null(), orig, false, 0);
+            assert!(!copy.is_null());
+            assert_eq!(tv_dict_len(copy.as_ref()), 0);
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_dict_copy_deep_of_empty_dict_does_not_panic() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_dict_alloc();
+        unsafe {
+            let copy = tv_dict_copy(std::ptr::null(), orig, true, 0);
+            assert!(!copy.is_null());
+            assert_eq!(tv_dict_len(copy.as_ref()), 0);
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "deep copy needs eval.c's var_item_copy")]
+    fn tv_dict_copy_deep_with_items_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_dict_alloc();
+        unsafe {
+            let item = tv_dict_item_alloc(b"a");
+            (*item).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *orig, item);
+            tv_dict_copy(std::ptr::null(), orig, true, 0);
+        }
+    }
+
+    #[test]
+    fn tv_dict_copy_honors_copy_id_bookkeeping() {
+        let _lock = crate::globals::global_state_test_lock();
+        let orig = tv_dict_alloc();
+        unsafe {
+            let copy = tv_dict_copy(std::ptr::null(), orig, false, 42);
+            assert_eq!((*orig).dv_copy_id, 42);
+            assert_eq!((*orig).dv_copydict, copy);
+            tv_dict_unref(orig);
+            tv_dict_unref(copy);
+        }
+    }
+
+    #[test]
+    fn tv_blob_copy_null_from_is_a_null_blob() {
+        let mut to = TypvalT::default();
+        unsafe { tv_blob_copy(std::ptr::null(), &mut to) };
+        assert_eq!(to.value, TypvalValue::Blob(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn tv_blob_copy_copies_bytes_into_a_separate_buffer() {
+        let from = tv_blob_alloc();
+        unsafe {
+            (*from).bv_ga.ga_data = vec![1, 2, 3];
+            (*from).bv_ga.ga_len = 3;
+        }
+        let mut to = TypvalT::default();
+        unsafe { tv_blob_copy(from, &mut to) };
+        let TypvalValue::Blob(b) = to.value else { panic!("expected a Blob") };
+        assert_ne!(b, from);
+        unsafe {
+            assert_eq!((*b).bv_ga.ga_data, vec![1, 2, 3]);
+            assert_eq!((*b).bv_ga.ga_len, 3);
+            assert_eq!((*b).bv_refcount, 1);
+            // Mutating the copy must not affect the original.
+            (&mut (*b).bv_ga.ga_data)[0] = 99;
+            assert_eq!((&(*from).bv_ga.ga_data)[0], 1);
+            tv_blob_free(from);
+            tv_blob_free(b);
         }
     }
 

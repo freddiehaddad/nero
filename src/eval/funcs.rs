@@ -112,14 +112,22 @@
 //! own `static inline` byte-store counterpart to the already-
 //! translated `tv_blob_get`) and a new private `reverse_text` (a
 //! UTF-8-aware, non-destructive character reversal using the already-
-//! existing `crate::mbyte::utfc_ptr2len`). `copy()`/`deepcopy()`
-//! (needing `tv_dict_copy`/`tv_blob_copy`, neither translated yet)
-//! remain deferred - a natural next candidate once those exist.
+//! existing `crate::mbyte::utfc_ptr2len`).
 //!
 //! Also translated: `count()` (occurrences of a value in a `String`/
 //! `List`/`Dict`, via three private helpers - `count_string`/
 //! `count_list`/`count_dict` - mirroring the original's own identical
 //! split exactly).
+//!
+//! Also translated: `copy()` (a shallow copy of `List`/`Dict`/`Blob`/
+//! any other value, via [`crate::eval::typval::tv_list_copy`]/
+//! [`crate::eval::typval::tv_dict_copy`]/[`crate::eval::typval::tv_blob_copy`],
+//! the latter two new this batch and mirroring the already-existing
+//! `tv_list_copy`'s own `deep=false`-only scoping and `copy_id`/
+//! `got_int` bookkeeping exactly). `deepcopy()` (which would need
+//! `deep=true` support in all three, i.e. `var_item_copy`'s recursive
+//! dispatch) remains deferred - a natural next candidate now that its
+//! own prerequisites exist.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -206,6 +214,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"index"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_index });
         m.insert(&b"reverse"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reverse });
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
+        m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1563,6 +1572,61 @@ unsafe fn f_count(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(n);
 }
 
+/// `copy({expr})` - make a shallow copy of `{expr}` (`f_copy`).
+///
+/// Mirrors the original's own `var_item_copy(NULL, &argvars[0], rettv,
+/// false, 0)` call exactly - `conv=NULL`/`deep=false`/`copyID=0` are
+/// the ONLY values `copy()` itself ever passes (only `deepcopy()`,
+/// not yet translated, ever passes `deep=true`/a real `copyID`), so
+/// this directly inlines `var_item_copy`'s own switch for exactly this
+/// fixed parameter set, rather than translating the full, more
+/// general `var_item_copy` (whose `copyID != 0` "use-the-copy-made-
+/// earlier" branches are unreachable dead code for this specific,
+/// always-`copyID`-`0` caller).
+///
+/// `List`/`Dict` assign [`crate::eval::typval::tv_list_copy`]/
+/// [`crate::eval::typval::tv_dict_copy`]'s own result DIRECTLY (not
+/// via `tv_list_set_ret`/`tv_dict_set_ret`, which would ref-count a
+/// SECOND time) - both copy functions already set the new container's
+/// own refcount to `1` internally themselves, exactly matching the
+/// original's own direct `to->vval.v_list = tv_list_copy(...)`/
+/// `to->vval.v_dict = tv_dict_copy(...)` field assignments (no
+/// separate `tv_list_ref`/`dv_refcount++` at this call site either).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Dict`/`Blob`/`Partial`-typed with
+/// a non-null pointer, that pointer must be valid.
+unsafe fn f_copy(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    match &argvars[0].value {
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let copy = unsafe { crate::eval::typval::tv_list_copy(std::ptr::null(), *l, false, 0) };
+            rettv.value = TypvalValue::List(copy);
+            rettv.v_lock = crate::eval::typval_defs::VarLockStatus::Unlocked;
+        }
+        TypvalValue::Blob(b) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_blob_copy(*b, rettv) };
+        }
+        TypvalValue::Dict(d) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let copy = unsafe { crate::eval::typval::tv_dict_copy(std::ptr::null(), *d, false, 0) };
+            rettv.value = TypvalValue::Dict(copy);
+            rettv.v_lock = crate::eval::typval_defs::VarLockStatus::Unlocked;
+        }
+        TypvalValue::Unknown => {
+            debug_assert!(false, "f_copy(UNKNOWN) - internal_error in the original");
+        }
+        _ => {
+            // Number/Float/Func/Partial/Bool/Special/String: always a
+            // plain tv_copy in the original too (String's own
+            // "conv == NULL" branch is always taken here).
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_copy(&argvars[0], rettv) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2261,6 +2325,7 @@ mod tests {
             "index",
             "reverse",
             "count",
+            "copy",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -3184,5 +3249,126 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_count(&[num(5), num(1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_copy ---
+
+    #[test]
+    fn copy_of_a_list_is_a_genuinely_separate_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_copy(&args, &mut rettv) };
+        let TypvalValue::List(copy) = rettv.value else { panic!("expected a List") };
+        assert_ne!(copy, list); // a genuinely separate list, not an alias.
+        assert_eq!(rettv.v_lock, crate::eval::typval_defs::VarLockStatus::Unlocked);
+        unsafe {
+            assert_eq!((*copy).lv_refcount, 1); // set exactly once, not double-counted.
+            assert_eq!((*list).lv_refcount, 0); // the original's own refcount is untouched.
+
+            // Mutating the copy must not affect the original.
+            let item = crate::eval::typval::tv_list_first(copy);
+            (*item).li_tv.value = TypvalValue::Number(99);
+            let orig_item = crate::eval::typval::tv_list_first(list);
+            assert_eq!((*orig_item).li_tv.value, TypvalValue::Number(1));
+
+            crate::eval::typval::tv_list_unref(copy);
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn copy_of_a_null_list_is_a_null_list() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }];
+        unsafe { f_copy(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::List(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn copy_of_a_dict_is_a_genuinely_separate_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = make_test_dict();
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        unsafe { f_copy(&args, &mut rettv) };
+        let TypvalValue::Dict(copy) = rettv.value else { panic!("expected a Dict") };
+        assert_ne!(copy, dict); // a genuinely separate dict, not an alias.
+        assert_eq!(rettv.v_lock, crate::eval::typval_defs::VarLockStatus::Unlocked);
+        unsafe {
+            assert_eq!((*copy).dv_refcount, 1); // set exactly once, not double-counted.
+            assert_eq!((*dict).dv_refcount, 0); // the original's own refcount is untouched.
+            assert_eq!(crate::eval::typval::tv_dict_len(copy.as_ref()), 2);
+
+            // Mutating the copy must not affect the original.
+            let item = crate::eval::typval::tv_dict_find(Some(&mut *copy), b"a").unwrap();
+            (*item).di_tv.value = TypvalValue::Number(99);
+            let orig_item = crate::eval::typval::tv_dict_find(Some(&mut *dict), b"a").unwrap();
+            assert_eq!((*orig_item).di_tv.value, TypvalValue::Number(1));
+
+            crate::eval::typval::tv_dict_unref(copy);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn copy_of_a_null_dict_is_a_null_dict() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }];
+        unsafe { f_copy(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Dict(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn copy_of_a_blob_is_a_genuinely_separate_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }];
+        unsafe { f_copy(&args, &mut rettv) };
+        let TypvalValue::Blob(copy) = rettv.value else { panic!("expected a Blob") };
+        assert_ne!(copy, blob); // a genuinely separate blob, not an alias.
+        unsafe {
+            assert_eq!((*copy).bv_ga.ga_data, vec![1, 2, 3]);
+            assert_eq!((*copy).bv_refcount, 1);
+            assert_eq!((*blob).bv_refcount, 0);
+
+            // Mutating the copy must not affect the original.
+            (&mut (*copy).bv_ga.ga_data)[0] = 99;
+            assert_eq!((&(*blob).bv_ga.ga_data)[0], 1);
+
+            crate::eval::typval::tv_blob_free(copy);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn copy_of_a_number_is_a_plain_value_copy() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_copy(&[num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn copy_of_a_string_is_a_plain_value_copy() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_copy(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "f_copy(UNKNOWN)")]
+    fn copy_of_unknown_panics_in_debug() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_copy(&[TypvalT::default()], &mut rettv) };
     }
 }

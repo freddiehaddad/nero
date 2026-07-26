@@ -194,7 +194,7 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (47 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (48 functions so
 //! far, including a full cluster of `float_op_wrapper`-style math
 //! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
 //! original handful - the start of a long tail, `eval/funcs.c` itself
@@ -6642,6 +6642,73 @@ mod tests {
         assert_eq!(eval_str(b"count([1, 2, 1, 1], 1)").1.value, TypvalValue::Number(3));
 
         reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_copy_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // A List argument read through a real g: variable (not a
+        // fresh literal) - exercises copy()'s own result surviving
+        // get_func_tv's argument-cleanup loop (which only clears the
+        // ARGUMENT typvals, never rettv) exactly as this whole arc's
+        // own get_func_tv fix intended, and proves the result is a
+        // genuinely separate list, not an alias of g:mylist's own.
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+            crate::eval::typval::tv_list_append_number(&mut *list, 3);
+        }
+        let list_item = crate::eval::typval::tv_dict_item_alloc(b"mylist");
+        unsafe { (*list_item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), list_item) };
+
+        let (ret, tv) = eval_str(b"copy(g:mylist)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(list_copy) = tv.value else { panic!("expected a List") };
+        assert_ne!(list_copy, list); // a genuinely separate list, not an alias.
+        unsafe {
+            assert_eq!((*list_copy).lv_refcount, 1);
+            let copy_item = crate::eval::typval::tv_list_first(list_copy);
+            (*copy_item).li_tv.value = TypvalValue::Number(99);
+            // g:mylist's own List must be untouched by that mutation.
+            let orig_item = crate::eval::typval::tv_list_first(list);
+            assert_eq!((*orig_item).li_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_list_unref(list_copy);
+        }
+
+        reset_globals_for_test(); // releases g:mylist's own List reference.
+
+        // A Dict argument, similarly.
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, a);
+        }
+        let dict_item = crate::eval::typval::tv_dict_item_alloc(b"mydict");
+        unsafe { (*dict_item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), dict_item) };
+
+        let (ret, tv) = eval_str(b"copy(g:mydict)");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(dict_copy) = tv.value else { panic!("expected a Dict") };
+        assert_ne!(dict_copy, dict); // a genuinely separate dict, not an alias.
+        unsafe {
+            assert_eq!((*dict_copy).dv_refcount, 1);
+            let copy_item = crate::eval::typval::tv_dict_find(Some(&mut *dict_copy), b"a").unwrap();
+            (*copy_item).di_tv.value = TypvalValue::Number(99);
+            // g:mydict's own Dict must be untouched by that mutation.
+            let orig_item = crate::eval::typval::tv_dict_find(Some(&mut *dict), b"a").unwrap();
+            assert_eq!((*orig_item).di_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_dict_unref(dict_copy);
+        }
+
+        reset_globals_for_test(); // releases g:mydict's own Dict reference.
     }
 
     // --- get_literal_key ---
