@@ -133,7 +133,8 @@
 //!
 //! Also translated (from `eval/list.c`, not `funcs.c` itself):
 //! `add()` (append one item to a `List`/`Blob`, returning the SAME
-//! container).
+//! container) and `insert()` (insert one item before a given index,
+//! or at the start by default, also returning the SAME container).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -223,6 +224,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
         m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
+        m.insert(&b"insert"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_insert });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1731,6 +1733,117 @@ unsafe fn f_add(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `insert({object}, {item} [, {idx}])` - insert `{item}` into
+/// `{object}` (a `List` or `Blob`) before index `{idx}` (default `0`,
+/// i.e. at the start) (`f_insert`, `eval/list.c`).
+///
+/// Returns the resulting `List`/`Blob` (the SAME container, mutated
+/// in place) via [`crate::eval::typval::tv_copy`], or leaves `rettv`
+/// at its caller-provided default (`Number(0)`) on any failure -
+/// unlike [`f_add`], this function never sets its own explicit
+/// "failed" sentinel, exactly matching the original's own structure
+/// (every error path is a bare early `return`).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Blob`-typed with a non-null
+/// pointer, that pointer must be valid.
+unsafe fn f_insert(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    match &argvars[0].value {
+        TypvalValue::Blob(b) => {
+            let b = *b;
+            if b.is_null() {
+                return;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { (*b).bv_lock };
+            if crate::eval::typval::value_check_lock(locked, None) {
+                return;
+            }
+
+            // SAFETY: forwarded from this function's own safety doc.
+            let len = unsafe { crate::eval::typval::tv_blob_len(b) };
+            let mut before: i32 = 0;
+            // argvars.len() > 2 replaces the original's own
+            // argvars[2].v_type != VAR_UNKNOWN sentinel check.
+            if argvars.len() > 2 {
+                let mut error = false;
+                before = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) as i32;
+                if error {
+                    return; // type error; errmsg already given in the original.
+                }
+                if before < 0 || before > len {
+                    return; // semsg(_(e_invarg2), ...) omitted - see this module's own doc comment.
+                }
+            }
+            let mut error = false;
+            let val = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error));
+            if error {
+                return;
+            }
+            if !(0..=255).contains(&val) {
+                return; // semsg(_(e_invarg2), ...) omitted.
+            }
+
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*b).bv_ga.ga_grow(1) };
+            // SAFETY: ga_grow just ensured ga_data has at least
+            // len+1 bytes of real capacity - shifting [before, len)
+            // right by one within that capacity (mirroring the
+            // original's own memmove) is safe.
+            unsafe {
+                let ga_data = &mut (*b).bv_ga.ga_data;
+                for i in (before..len).rev() {
+                    ga_data[(i + 1) as usize] = ga_data[i as usize];
+                }
+                ga_data[before as usize] = val as u8;
+                (*b).bv_ga.ga_len += 1;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_copy(&argvars[0], rettv) };
+        }
+        TypvalValue::List(_) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let TypvalValue::List(mut l) = argvars[0].value else { unreachable!() };
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { crate::eval::typval::tv_list_locked(l) };
+            if crate::eval::typval::value_check_lock(locked, None) {
+                return;
+            }
+
+            let mut before: crate::eval::typval_defs::VarnumberT = 0;
+            if argvars.len() > 2 {
+                let mut error = false;
+                before = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error));
+                if error {
+                    return;
+                }
+            }
+
+            let mut item = std::ptr::null_mut();
+            // SAFETY: forwarded from this function's own safety doc.
+            if before != i64::from(unsafe { crate::eval::typval::tv_list_len(l) }) {
+                // SAFETY: forwarded from this function's own safety doc.
+                item = unsafe { crate::eval::typval::tv_list_find(l, before as i32) };
+                if item.is_null() {
+                    l = std::ptr::null_mut(); // semsg(_(e_list_index_out_of_range_nr), ...) omitted.
+                }
+            }
+            if !l.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::eval::typval::tv_list_insert_tv(l, &argvars[1], item);
+                    crate::eval::typval::tv_copy(&argvars[0], rettv);
+                }
+            }
+        }
+        _ => {
+            // semsg(_(e_listblobarg), "insert()") omitted - message
+            // display, not tractable; rettv is simply left at its
+            // caller-provided default.
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2432,6 +2545,7 @@ mod tests {
             "copy",
             "deepcopy",
             "add",
+            "insert",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -3758,5 +3872,177 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_add(&[num(5), num(1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    // --- f_insert ---
+
+    #[test]
+    fn insert_into_a_list_at_the_start_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 2) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(l, list);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            let item2 = (*item).li_next;
+            assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn insert_into_a_list_before_a_given_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(2), num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        unsafe {
+            let item = crate::eval::typval::tv_list_first(list);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            let item2 = (*item).li_next;
+            assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
+            let item3 = (*item2).li_next;
+            assert_eq!((*item3).li_tv.value, TypvalValue::Number(3));
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn insert_at_the_end_when_idx_equals_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(2), num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(list), 2);
+            let item = crate::eval::typval::tv_list_first(list);
+            let item2 = (*item).li_next;
+            assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn insert_into_a_locked_list_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*list).lv_lock = crate::eval::typval_defs::VarLockStatus::Locked };
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999)); // untouched.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(list), 0);
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn insert_with_an_out_of_range_index_leaves_rettv_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1), num(5)];
+        unsafe { f_insert(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn insert_into_a_blob_at_the_start_by_default() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![2, 3];
+            (*blob).bv_ga.ga_len = 2;
+            (*blob).bv_ga.ga_maxlen = 2;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        assert_eq!(b, blob);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 3);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 0), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 1), 2);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 2), 3);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn insert_into_a_blob_before_a_given_index() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 3];
+            (*blob).bv_ga.ga_len = 2;
+            (*blob).bv_ga.ga_maxlen = 2;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(2), num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(blob), 3);
+            assert_eq!(crate::eval::typval::tv_blob_get(blob, 0), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(blob, 1), 2);
+            assert_eq!(crate::eval::typval::tv_blob_get(blob, 2), 3);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn insert_into_a_locked_blob_leaves_it_untouched() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_lock = crate::eval::typval_defs::VarLockStatus::Locked;
+            (*blob).bv_ga.ga_data = vec![1];
+            (*blob).bv_ga.ga_len = 1;
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(2)];
+        unsafe { f_insert(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(blob), 1);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn insert_with_an_out_of_range_blob_value_leaves_rettv_untouched() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(256)];
+        unsafe { f_insert(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn insert_into_a_null_blob_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Blob(std::ptr::null_mut()), ..Default::default() }, num(1)];
+        unsafe { f_insert(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    #[test]
+    fn insert_into_a_non_list_non_blob_leaves_rettv_at_default() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        unsafe { f_insert(&[num(5), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 }
