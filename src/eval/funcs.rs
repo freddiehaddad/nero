@@ -400,6 +400,13 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"wildmenumode"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_wildmenumode });
         m.insert(&b"windowsversion"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_windowsversion });
         m.insert(&b"getreg"[..], EvalFuncDefT { min_argc: 0, max_argc: 3, base_arg: 1, func: f_getreg });
+        m.insert(&b"changenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_changenr });
+        m.insert(&b"interrupt"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_interrupt });
+        m.insert(&b"invert"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_invert });
+        m.insert(&b"getfontname"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_getfontname });
+        m.insert(&b"isinf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isinf });
+        m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
+        m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2612,6 +2619,84 @@ unsafe fn f_setenv(argvars: &[TypvalT], _rettv: &mut TypvalT) {
     }
 }
 
+/// `changenr()` - the number of the most recent change (`f_changenr`,
+/// `funcs.c`), directly reading `curbuf.b_u_seq_cur`. `0` when the
+/// undo list is empty.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+unsafe fn f_changenr(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    rettv.value = TypvalValue::Number(i64::from(curbuf.b_u_seq_cur));
+}
+
+/// `interrupt()` - simulate a user-typed CTRL-C, aborting script
+/// execution (`f_interrupt`, `funcs.c`), by setting the already-real
+/// `GLOBALS.got_int`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`.
+unsafe fn f_interrupt(_argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.got_int = true;
+}
+
+/// `invert({expr})` - bitwise NOT of `{expr}` converted to a Number
+/// (`f_invert`, `funcs.c`).
+fn f_invert(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(!crate::eval::typval::tv_get_number_chk(&argvars[0], None));
+}
+
+/// `getfontname([{name}])` - GUI font name (`f_getfontname`, `funcs.c`).
+/// This crate never runs a GUI, so this always returns the original's
+/// own "GUI not running" result: an empty (`None`-backed) `String`,
+/// matching the real implementation's unconditional
+/// `rettv->vval.v_string = NULL` (it doesn't even inspect `argvars`).
+fn f_getfontname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+}
+
+/// `isinf({expr})` - `1` for positive infinity, `-1` for negative
+/// infinity, `0` otherwise (`f_isinf`, `funcs.c`).
+fn f_isinf(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if let TypvalValue::Float(f) = argvars[0].value {
+        if f.is_infinite() {
+            rettv.value = TypvalValue::Number(if f > 0.0 { 1 } else { -1 });
+        }
+    }
+}
+
+/// `isnan({expr})` - whether `{expr}` is a Float with value NaN
+/// (`f_isnan`, `funcs.c`).
+fn f_isnan(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let is_nan = matches!(argvars[0].value, TypvalValue::Float(f) if f.is_nan());
+    rettv.value = TypvalValue::Number(i64::from(is_nan));
+}
+
+/// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a
+/// Blob), as 64 hex characters (`f_sha256`, `funcs.c`), via the
+/// already-existing [`crate::sha256::sha256_bytes`].
+///
+/// # Safety
+/// If `{expr}` is a Blob, its pointer must be valid (matching every
+/// other function in this crate that touches `TypvalValue::Blob`).
+unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let hash = if let TypvalValue::Blob(b) = argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        let bytes = unsafe { b.as_ref() }.map_or(&[][..], |blob| {
+            let len = usize::try_from(blob.bv_ga.ga_len).unwrap_or(0).min(blob.bv_ga.ga_data.len());
+            &blob.bv_ga.ga_data[..len]
+        });
+        crate::sha256::sha256_bytes(bytes, None)
+    } else {
+        let s = crate::eval::typval::tv_get_string(&argvars[0]);
+        crate::sha256::sha256_bytes(&s, None)
+    };
+    rettv.value = TypvalValue::String(Some(hash.into_bytes()));
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4302,6 +4387,13 @@ mod tests {
             "wildmenumode",
             "windowsversion",
             "getreg",
+            "changenr",
+            "interrupt",
+            "invert",
+            "getfontname",
+            "isinf",
+            "isnan",
+            "sha256",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6579,6 +6671,152 @@ mod tests {
         assert_eq!(crate::os::env::os_getenv(b"NERO_TEST_SETENV_SECURE_VAR"), None);
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    // --- f_changenr ---
+
+    #[test]
+    fn changenr_reads_curbuf_b_u_seq_cur() {
+        let mut buf = crate::buffer_defs::BufT { b_u_seq_cur: 42, ..Default::default() };
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_changenr(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    // --- f_interrupt ---
+
+    #[test]
+    fn interrupt_sets_got_int() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.got_int = false;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_interrupt(&[], &mut rettv) };
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.got_int);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.got_int = false;
+    }
+
+    // --- f_invert ---
+
+    #[test]
+    fn invert_bitwise_nots_a_number() {
+        let mut rettv = TypvalT::default();
+        f_invert(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        let mut rettv = TypvalT::default();
+        f_invert(&[num(5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(!5));
+    }
+
+    // --- f_getfontname ---
+
+    #[test]
+    fn getfontname_always_returns_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        f_getfontname(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
+
+        // Even with an argument - the GUI-less stub ignores it.
+        let mut rettv = TypvalT::default();
+        f_getfontname(&[string(b"Courier")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    // --- f_isinf ---
+
+    #[test]
+    fn isinf_returns_1_for_positive_infinity() {
+        let mut rettv = TypvalT::default();
+        f_isinf(&[float(f64::INFINITY)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn isinf_returns_minus_1_for_negative_infinity() {
+        let mut rettv = TypvalT::default();
+        f_isinf(&[float(f64::NEG_INFINITY)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn isinf_leaves_rettv_default_for_a_finite_float() {
+        let mut rettv = TypvalT::default();
+        f_isinf(&[float(1.5)], &mut rettv);
+        assert!(matches!(rettv.value, TypvalValue::Unknown));
+    }
+
+    #[test]
+    fn isinf_leaves_rettv_default_for_a_non_float() {
+        let mut rettv = TypvalT::default();
+        f_isinf(&[num(5)], &mut rettv);
+        assert!(matches!(rettv.value, TypvalValue::Unknown));
+    }
+
+    // --- f_isnan ---
+
+    #[test]
+    fn isnan_true_for_nan_float() {
+        let mut rettv = TypvalT::default();
+        f_isnan(&[float(f64::NAN)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn isnan_false_for_an_ordinary_float() {
+        let mut rettv = TypvalT::default();
+        f_isnan(&[float(1.5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn isnan_false_for_a_non_float() {
+        let mut rettv = TypvalT::default();
+        f_isnan(&[num(5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_sha256 ---
+
+    #[test]
+    fn sha256_of_a_known_string() {
+        // Known SHA256("abc") test vector.
+        let mut rettv = TypvalT::default();
+        unsafe { f_sha256(&[string(b"abc")], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec()))
+        );
+    }
+
+    #[test]
+    fn sha256_of_a_blob() {
+        let b = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*b).bv_ga.ga_data = b"abc".to_vec();
+            (*b).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        unsafe { f_sha256(&[TypvalT { value: TypvalValue::Blob(b), ..Default::default() }], &mut rettv) };
+        assert_eq!(
+            rettv.value,
+            TypvalValue::String(Some(b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_vec()))
+        );
+        unsafe { crate::eval::typval::tv_blob_free(b) };
+    }
+
+    #[test]
+    fn sha256_of_a_null_blob_matches_empty_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_sha256(&[TypvalT { value: TypvalValue::Blob(std::ptr::null_mut()), ..Default::default() }], &mut rettv) };
+        let TypvalValue::String(Some(hash)) = rettv.value else { panic!("expected a String") };
+
+        let mut rettv2 = TypvalT::default();
+        unsafe { f_sha256(&[string(b"")], &mut rettv2) };
+        assert_eq!(rettv2.value, TypvalValue::String(Some(hash)));
     }
 
     // --- f_has ---
