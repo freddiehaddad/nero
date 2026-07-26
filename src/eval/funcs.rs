@@ -151,6 +151,9 @@
 //! `extend()`/`extendnew()` themselves (their own 3rd-argument
 //! validation never allows `"move"` - the original's only `"move"`
 //! caller is `window.c`'s scroll-event handling, not yet translated).
+//!
+//! Also `range()` (a `List` of numbers, optionally strided/counting
+//! down).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -244,6 +247,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"remove"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_remove });
         m.insert(&b"extend"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extend });
         m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
+        m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2077,6 +2081,59 @@ unsafe fn f_extendnew(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { extend(argvars, true, rettv) };
 }
 
+/// `range({expr} [, {max} [, {stride}]])` - a `List` of numbers
+/// (`f_range`, `funcs.c`).
+///
+/// One argument: `[0, 1, ..., {expr} - 1]`. Two: `[{expr}, {expr} + 1,
+/// ..., {max}]`. Three: like two, but stepping by `{stride}` each time
+/// (which may be negative, counting down).
+///
+/// Every error path (a type error reading any argument, a zero
+/// `{stride}`, or `{start}` past `{end}` for the given `{stride}`'s
+/// own direction) is a bare early return leaving `rettv` at its
+/// caller-provided default - the original's own `emsg` calls are
+/// omitted, message display not tractable (see this module's own doc
+/// comment).
+unsafe fn f_range(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut error = false;
+    let mut start = crate::eval::typval::tv_get_number_chk(&argvars[0], Some(&mut error));
+    let mut stride: crate::eval::typval_defs::VarnumberT = 1;
+    let end;
+    // argvars.len() > 1 replaces the original's own argvars[1].v_type
+    // != VAR_UNKNOWN sentinel check.
+    if argvars.len() <= 1 {
+        end = start - 1;
+        start = 0;
+    } else {
+        end = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error));
+        if argvars.len() > 2 {
+            stride = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error));
+        }
+    }
+
+    if error {
+        return; // type error; errmsg already given in the original.
+    }
+    if stride == 0 {
+        return; // emsg(_("E726: Stride is zero")) omitted.
+    }
+    if if stride > 0 { end + 1 < start } else { end - 1 > start } {
+        return; // emsg(_("E727: Start past end")) omitted.
+    }
+
+    // SAFETY: rettv is a plain `&mut TypvalT`, always safe to write
+    // into; tv_list_alloc_ret's own `len` hint is unused (see its own
+    // doc comment), so an oddly-signed `(end - start) / stride` here
+    // is harmless either way.
+    let list = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, ((end - start) / stride) as isize) };
+    let mut i = start;
+    while if stride > 0 { i <= end } else { i >= end } {
+        // SAFETY: `list` was just allocated above by this same call.
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, i) };
+        i += stride;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2782,6 +2839,7 @@ mod tests {
             "remove",
             "extend",
             "extendnew",
+            "range",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -4601,5 +4659,84 @@ mod tests {
             crate::eval::typval::tv_dict_unref(d2);
             crate::eval::typval::tv_dict_unref(new_dict);
         }
+    }
+
+    // --- f_range ---
+
+    fn list_values(l: *mut crate::eval::typval_defs::ListT) -> Vec<crate::eval::typval_defs::VarnumberT> {
+        let mut vals = Vec::new();
+        unsafe {
+            let mut item = crate::eval::typval::tv_list_first(l);
+            while !item.is_null() {
+                let TypvalValue::Number(n) = (*item).li_tv.value else { panic!("expected a Number") };
+                vals.push(n);
+                item = (*item).li_next;
+            }
+        }
+        vals
+    }
+
+    #[test]
+    fn range_with_one_argument_produces_zero_to_n_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_range(&[num(4)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_values(l), vec![0, 1, 2, 3]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn range_with_one_argument_of_zero_produces_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_range(&[num(0)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_values(l), Vec::<crate::eval::typval_defs::VarnumberT>::new());
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn range_with_two_arguments_is_inclusive_of_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_range(&[num(2), num(5)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_values(l), vec![2, 3, 4, 5]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn range_with_a_stride_steps_by_that_amount() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_range(&[num(0), num(10), num(3)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_values(l), vec![0, 3, 6, 9]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn range_with_a_negative_stride_counts_down() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_range(&[num(5), num(1), num(-2)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_values(l), vec![5, 3, 1]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn range_with_a_zero_stride_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_range(&[num(0), num(5), num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    #[test]
+    fn range_with_start_past_end_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_range(&[num(5), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
     }
 }
