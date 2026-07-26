@@ -160,6 +160,14 @@
 //! directly via a plain `Vec<u8>` rather than the original's own
 //! `ga_grow`+`tv_blob_set_range`-based approach (including a "skip
 //! the copy if already all zero" micro-optimization not needed here).
+//!
+//! Also `join()` (from `eval/typval.c`, not `funcs.c` itself), which
+//! needed a new [`crate::eval::typval::tv_list_join`] - fully real
+//! for `Number`/`Float`/`String`/`Bool`/`Special` items (the
+//! overwhelmingly common real-world case), but panics if an item is
+//! `List`/`Dict`/`Blob`/`Funcref`/`Partial`-typed - stringifying THOSE
+//! needs the full `encode_tv2echo` machinery (`eval/encode.c`, ~970
+//! lines, a substantial separate undertaking not attempted here).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -255,6 +263,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
         m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
         m.insert(&b"repeat"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_repeat });
+        m.insert(&b"join"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_join });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2262,6 +2271,42 @@ unsafe fn f_repeat(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `join({list} [, {sep}])` - join `{list}`'s own items into a single
+/// string, separated by `{sep}` (default `" "`) (`f_join`,
+/// `eval/typval.c`).
+///
+/// A non-`List` `argvars[0]` is a bare early return leaving `rettv` at
+/// its caller-provided default (the original's own `emsg(_(e_listreq))`
+/// is omitted). A `{sep}` type error still sets `rettv` to a null
+/// `String` (not left at the caller default) - matching the
+/// original's own unconditional `rettv->v_type = VAR_STRING;` once
+/// `argvars[0]` is confirmed to be a real `List`, regardless of
+/// whether `{sep}` itself was valid.
+///
+/// # Safety
+/// Forwards [`crate::eval::typval::tv_list_join`]'s own safety
+/// doc/panic condition.
+unsafe fn f_join(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if !matches!(argvars[0].value, TypvalValue::List(_)) {
+        return; // emsg(_(e_listreq)) omitted; rettv left at its caller-provided default.
+    }
+    let TypvalValue::List(l) = argvars[0].value else { unreachable!() };
+
+    let sep: Vec<u8> = if argvars.len() > 1 {
+        let Some(s) = crate::eval::typval::tv_get_string_chk(&argvars[1]) else {
+            rettv.value = TypvalValue::String(None);
+            return; // type error; errmsg already given in the original.
+        };
+        s
+    } else {
+        b" ".to_vec()
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let joined = unsafe { crate::eval::typval::tv_list_join(l, &sep) };
+    rettv.value = TypvalValue::String(Some(joined));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2969,6 +3014,7 @@ mod tests {
             "extendnew",
             "range",
             "repeat",
+            "join",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -4969,6 +5015,64 @@ mod tests {
         unsafe {
             assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
             crate::eval::typval::tv_blob_free(b);
+        }
+    }
+
+    // --- f_join ---
+
+    #[test]
+    fn join_with_default_separator_uses_a_space() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+            crate::eval::typval::tv_list_append_number(&mut *list, 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_join(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"1 2 3".to_vec())));
+        unsafe { crate::eval::typval::tv_list_free(list) };
+    }
+
+    #[test]
+    fn join_with_a_custom_separator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(list, Some(b"a"));
+            crate::eval::typval::tv_list_append_string(list, Some(b"b"));
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, string(b", ")];
+        unsafe { f_join(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"a, b".to_vec())));
+        unsafe { crate::eval::typval::tv_list_free(list) };
+    }
+
+    #[test]
+    fn join_of_a_non_list_leaves_rettv_at_default() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        unsafe { f_join(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn join_with_a_type_error_separator_sets_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let inner_sep = crate::eval::typval::tv_list_alloc(0);
+        let args = [
+            TypvalT { value: TypvalValue::List(list), ..Default::default() },
+            TypvalT { value: TypvalValue::List(inner_sep), ..Default::default() },
+        ];
+        unsafe { f_join(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+        unsafe {
+            crate::eval::typval::tv_list_free(list);
+            crate::eval::typval::tv_list_free(inner_sep);
         }
     }
 }

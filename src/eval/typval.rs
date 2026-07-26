@@ -3293,6 +3293,53 @@ pub unsafe fn tv_list_extend(
     }
 }
 
+/// Join list `l`'s own items into a single string, separated by `sep`
+/// (`tv_list_join`).
+///
+/// Simplified into a single pass rather than the original's own
+/// two-pass "stringify everything first, to precompute the total
+/// allocation size" approach (via a separate `Join` struct array) -
+/// Rust's `Vec` already grows efficiently via amortized doubling, so
+/// that precomputation isn't needed here for correctness or
+/// asymptotic performance.
+///
+/// # Panics
+/// Panics if any item is `List`/`Dict`/`Blob`/`Funcref`/`Partial`-
+/// typed - stringifying those needs the full `encode_tv2echo`
+/// machinery (`eval/encode.c`, ~970 lines, a substantial separate
+/// undertaking not attempted here) to render e.g. `[1, 2]`/`{'a': 1}`
+/// nested structures; `Number`/`Float`/`String`/`Bool`/`Special`
+/// items (the overwhelmingly common real-world case, matching
+/// `join()`'s own documented example of joining a `List` of strings)
+/// are fully real, via the already-existing [`tv_get_string_chk`].
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+pub unsafe fn tv_list_join(l: *mut crate::eval::typval_defs::ListT, sep: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut first = true;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { tv_list_first(l) };
+    while !item.is_null() {
+        if !first {
+            out.extend_from_slice(sep);
+        }
+        first = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let tv = unsafe { &(*item).li_tv };
+        let Some(s) = tv_get_string_chk(tv) else {
+            unimplemented!(
+                "tv_list_join: stringifying a List/Dict/Blob/Funcref item needs eval/encode.c's \
+                 encode_tv2echo, not yet translated - see this function's own doc comment"
+            );
+        };
+        out.extend_from_slice(&s);
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+    }
+    out
+}
+
 /// Concatenate lists into a new list (`tv_list_concat`).
 ///
 /// Returns `false` on failure. `tv`'s value is always set to a
@@ -6913,5 +6960,65 @@ mod tests {
             [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }, string_tv(b"a")];
         unsafe { tv_dict_remove(&args, &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- tv_list_join ---
+
+    #[test]
+    fn tv_list_join_joins_numbers_with_a_separator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(&mut *l, 1);
+            tv_list_append_number(&mut *l, 2);
+            tv_list_append_number(&mut *l, 3);
+        }
+        unsafe {
+            assert_eq!(tv_list_join(l, b", "), b"1, 2, 3".to_vec());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_join_of_an_empty_list_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(0);
+        unsafe {
+            assert_eq!(tv_list_join(l, b" "), Vec::<u8>::new());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_join_of_a_null_list_is_empty() {
+        unsafe { assert_eq!(tv_list_join(std::ptr::null_mut(), b" "), Vec::<u8>::new()) };
+    }
+
+    #[test]
+    fn tv_list_join_of_a_single_item_has_no_separator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe { tv_list_append_number(&mut *l, 42) };
+        unsafe {
+            assert_eq!(tv_list_join(l, b", "), b"42".to_vec());
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_join_of_a_nested_list_item_panics() {
+        // Uses catch_unwind (rather than #[should_panic]) so the
+        // allocated lists can be cleanly released regardless of the
+        // panic - #[should_panic] would leak them into GC_FIRST_LIST
+        // forever, corrupting every later GC-linked-list test in this
+        // process (matching eval.rs's own
+        // eval_to_string_list_value_is_unimplemented precedent).
+        let _lock = crate::globals::global_state_test_lock();
+        let inner = tv_list_alloc(0);
+        let l = tv_list_alloc(1);
+        unsafe { tv_list_append_owned_tv(l, TypvalT { value: TypvalValue::List(inner), ..Default::default() }) };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { tv_list_join(l, b" ") }));
+        assert!(result.is_err(), "expected a panic (encode_tv2echo not yet translated)");
+        unsafe { tv_list_free(l) };
     }
 }
