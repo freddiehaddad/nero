@@ -176,6 +176,16 @@
 //!
 //! Also `localtime()` (the current Unix timestamp, via the already-
 //! existing [`crate::os::time::os_time`]).
+//!
+//! Also `getenv()` (via the already-existing
+//! [`crate::os::env::vim_getenv`]) and `environ()` - the latter has NO
+//! C implementation at all in the original (it's implemented in Lua,
+//! `runtime/lua/vim/_core/vimfn.lua`'s own `M.f_environ`, calling
+//! `vim.uv.os_environ()` and force-uppercasing keys on Windows only) -
+//! translated directly from that Lua source using
+//! `std::env::vars_os()` as the portable equivalent, matching this
+//! whole mission's own scope (Neovim's Lua source, not just its C
+//! source).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -275,6 +285,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"flatten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flatten });
         m.insert(&b"flattennew"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flattennew });
         m.insert(&b"localtime"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_localtime });
+        m.insert(&b"getenv"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getenv });
+        m.insert(&b"environ"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_environ });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2407,6 +2419,57 @@ fn f_localtime(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(crate::os::time::os_time() as crate::eval::typval_defs::VarnumberT);
 }
 
+/// `getenv({name})` - the value of environment variable `{name}`, or
+/// `v:null` if unset (`f_getenv`, `funcs.c`), via the already-existing
+/// [`crate::os::env::vim_getenv`].
+///
+/// # Safety
+/// Forwards `vim_getenv`'s own safety doc (Windows `$HOME` path only).
+/// Also panics if `{name}` is `"VIM"`/`"VIMRUNTIME"` and that variable
+/// isn't ACTUALLY set in the real environment - `vim_getenv`'s own,
+/// pre-existing, already-documented gap (its `$VIM`/`$VIMRUNTIME`
+/// runtime-directory auto-discovery fallback isn't translated yet),
+/// not something this function itself introduces.
+unsafe fn f_getenv(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { crate::os::env::vim_getenv(&name) } {
+        Some(value) => rettv.value = TypvalValue::String(Some(value)),
+        None => rettv.value = TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+    }
+}
+
+/// `environ()` - all environment variables as a `Dict` (`f_environ`).
+///
+/// Unlike every other builtin in this module, this one has NO C
+/// implementation at all - the original itself implements it in Lua
+/// (`runtime/lua/vim/_core/vimfn.lua`'s own `M.f_environ`), calling
+/// `vim.uv.os_environ()` (libuv's own environment-enumeration) and,
+/// on Windows only, force-uppercasing every key (matching legacy Vim
+/// behavior, `#39443`). Translated directly from that Lua source
+/// (this whole mission's own scope explicitly includes Neovim's Lua
+/// source, not just its C source) using `std::env::vars_os()` as the
+/// portable equivalent of `os_environ()` - lossy-UTF-8-converted to
+/// `Vec<u8>`, matching [`crate::os::env::os_getenv`]'s own already-
+/// established conversion for the exact same underlying `OsString`
+/// values.
+fn f_environ(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let d = crate::eval::typval::tv_dict_alloc();
+    for (key, val) in std::env::vars_os() {
+        let mut key = key.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            key = key.to_uppercase();
+        }
+        let val = val.to_string_lossy().into_owned();
+        // SAFETY: `d` was just allocated above, a fresh pointer not
+        // shared with anything yet.
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *d, key.as_bytes(), Some(val.as_bytes())) };
+    }
+    // SAFETY: `d` was just allocated above, a fresh pointer not
+    // shared with anything yet.
+    unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3118,6 +3181,8 @@ mod tests {
             "flatten",
             "flattennew",
             "localtime",
+            "getenv",
+            "environ",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -5277,5 +5342,47 @@ mod tests {
         // (1577836800) - a loose sanity bound, not a flaky exact-time
         // check.
         assert!(n > 1_577_836_800);
+    }
+
+    // --- f_getenv / f_environ ---
+    //
+    // Each test below uses a uniquely-named test-only environment
+    // variable (never a well-known name like PATH/HOME/VIM) so it
+    // cannot race with any other test in the whole crate that also
+    // touches process-wide environment state, regardless of parallel
+    // execution - avoiding the need for a shared cross-module lock.
+
+    #[test]
+    fn getenv_returns_the_value_of_a_set_variable() {
+        // SAFETY: NERO_TEST_GETENV_UNIQUE_VAR is unique to this test.
+        unsafe { std::env::set_var("NERO_TEST_GETENV_UNIQUE_VAR", "hello") };
+        let mut rettv = TypvalT::default();
+        unsafe { f_getenv(&[string(b"NERO_TEST_GETENV_UNIQUE_VAR")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+        // SAFETY: forwarded from the set_var call above.
+        unsafe { std::env::remove_var("NERO_TEST_GETENV_UNIQUE_VAR") };
+    }
+
+    #[test]
+    fn getenv_returns_null_for_an_unset_variable() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_getenv(&[string(b"NERO_TEST_GETENV_DEFINITELY_UNSET_VAR")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null));
+    }
+
+    #[test]
+    fn environ_includes_a_known_set_variable() {
+        // SAFETY: NERO_TEST_ENVIRON_UNIQUE_VAR is unique to this test.
+        unsafe { std::env::set_var("NERO_TEST_ENVIRON_UNIQUE_VAR", "world") };
+        let mut rettv = TypvalT::default();
+        f_environ(&[], &mut rettv);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            let item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"NERO_TEST_ENVIRON_UNIQUE_VAR").unwrap();
+            assert_eq!((*item).di_tv.value, TypvalValue::String(Some(b"world".to_vec())));
+            crate::eval::typval::tv_dict_unref(d);
+        }
+        // SAFETY: forwarded from the set_var call above.
+        unsafe { std::env::remove_var("NERO_TEST_ENVIRON_UNIQUE_VAR") };
     }
 }
