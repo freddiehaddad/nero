@@ -3340,6 +3340,83 @@ pub unsafe fn tv_list_join(l: *mut crate::eval::typval_defs::ListT, sep: &[u8]) 
     out
 }
 
+/// Flatten up to `maxitems` items in `list`, starting at `first`, to
+/// depth `maxdepth` (`tv_list_flatten`). When `first` is null, use the
+/// first item. Does nothing if `maxdepth` is `0`.
+///
+/// Each `List`-typed item is replaced, in place, by its own items
+/// (recursively, up to `maxdepth`) - e.g. `[1, [2, 3], 4]` flattens to
+/// `[1, 2, 3, 4]`. Non-`List` items are left untouched.
+///
+/// # Safety
+/// `list` must be a valid, non-null pointer to a live `ListT`; `first`,
+/// if non-null, must be a valid pointer to an item actually present in
+/// `list`'s own `li_next` chain. Every `List`-typed item's own
+/// pointer, if non-null, must be valid, recursively.
+pub unsafe fn tv_list_flatten(
+    list: *mut crate::eval::typval_defs::ListT,
+    first: *mut crate::eval::typval_defs::ListitemT,
+    maxitems: i64,
+    maxdepth: i64,
+) {
+    if maxdepth == 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = if first.is_null() { unsafe { (*list).lv_first } } else { first };
+
+    let mut done: i64 = 0;
+    while !item.is_null() && done < maxitems {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*item).li_next };
+
+        // SAFETY: GLOBALS is only ever accessed through this crate's
+        // established single-threaded-main-loop convention.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            return;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let itemlist = match unsafe { &(*item).li_tv.value } {
+            TypvalValue::List(l) => Some(*l),
+            _ => None,
+        };
+        if let Some(itemlist) = itemlist {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_drop_items(list, item, item) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_list_extend(list, itemlist, next) };
+
+            if maxdepth > 0 {
+                // SAFETY: forwarded from this function's own safety doc.
+                let item_prev = unsafe { (*item).li_prev };
+                let new_first = if item_prev.is_null() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*list).lv_first }
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*item_prev).li_next }
+                };
+                // SAFETY: forwarded from this function's own safety doc.
+                let itemlist_len = i64::from(unsafe { tv_list_len(itemlist) });
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_list_flatten(list, new_first, itemlist_len, maxdepth - 1) };
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&(*item).li_tv) };
+            // SAFETY: `item` was just dropped from `list`'s own chain
+            // above by `tv_list_drop_items`, and was originally
+            // allocated via `tv_list_item_alloc`/`Box::into_raw`
+            // (forwarded from this function's own safety doc).
+            drop(unsafe { Box::from_raw(item) });
+        }
+
+        done += 1;
+        item = next;
+    }
+}
+
 /// Concatenate lists into a new list (`tv_list_concat`).
 ///
 /// Returns `false` on failure. `tv`'s value is always set to a
@@ -7020,5 +7097,106 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { tv_list_join(l, b" ") }));
         assert!(result.is_err(), "expected a panic (encode_tv2echo not yet translated)");
         unsafe { tv_list_free(l) };
+    }
+
+    // --- tv_list_flatten ---
+
+    fn append_nested_list(outer: *mut crate::eval::typval_defs::ListT, items: &[crate::eval::typval_defs::VarnumberT]) {
+        let inner = tv_list_alloc(items.len() as isize);
+        unsafe {
+            tv_list_ref(inner);
+            for &n in items {
+                tv_list_append_number(&mut *inner, n);
+            }
+            tv_list_append_owned_tv(outer, TypvalT { value: TypvalValue::List(inner), ..Default::default() });
+        }
+    }
+
+    #[test]
+    fn tv_list_flatten_flattens_one_level_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe { tv_list_append_number(&mut *l, 1) };
+        append_nested_list(l, &[2, 3]);
+        unsafe { tv_list_append_number(&mut *l, 4) };
+
+        unsafe {
+            let len = tv_list_len(l);
+            tv_list_flatten(l, std::ptr::null_mut(), i64::from(len), 999_999);
+            assert_eq!(tv_list_len(l), 4);
+            let mut vals = Vec::new();
+            let mut item = tv_list_first(l);
+            while !item.is_null() {
+                let TypvalValue::Number(n) = (*item).li_tv.value else { panic!("expected a Number") };
+                vals.push(n);
+                item = (*item).li_next;
+            }
+            assert_eq!(vals, vec![1, 2, 3, 4]);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_flatten_respects_maxdepth() {
+        let _lock = crate::globals::global_state_test_lock();
+        // [1, [2, [3, 4]]] with maxdepth=1 -> [1, 2, [3, 4]].
+        let l = tv_list_alloc(2);
+        unsafe { tv_list_append_number(&mut *l, 1) };
+        let middle = tv_list_alloc(2);
+        unsafe { tv_list_ref(middle) };
+        unsafe { tv_list_append_number(&mut *middle, 2) };
+        append_nested_list(middle, &[3, 4]);
+        unsafe {
+            tv_list_append_owned_tv(l, TypvalT { value: TypvalValue::List(middle), ..Default::default() });
+        }
+
+        unsafe {
+            let len = tv_list_len(l);
+            tv_list_flatten(l, std::ptr::null_mut(), i64::from(len), 1);
+            assert_eq!(tv_list_len(l), 3); // [1, 2, [3, 4]] - 3 top-level items.
+            let item = tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            let item2 = (*item).li_next;
+            assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
+            let item3 = (*item2).li_next;
+            let TypvalValue::List(nested) = (*item3).li_tv.value else { panic!("expected a nested List") };
+            assert_eq!(tv_list_len(nested), 2);
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_flatten_of_zero_maxdepth_does_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        append_nested_list(l, &[1, 2]);
+        unsafe {
+            let len = tv_list_len(l);
+            tv_list_flatten(l, std::ptr::null_mut(), i64::from(len), 0);
+            assert_eq!(tv_list_len(l), 1); // untouched.
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_flatten_absorbs_an_empty_nested_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(&mut *l, 1);
+            let empty = tv_list_alloc(0);
+            tv_list_ref(empty);
+            tv_list_append_owned_tv(l, TypvalT { value: TypvalValue::List(empty), ..Default::default() });
+            tv_list_append_number(&mut *l, 2);
+        }
+        unsafe {
+            let len = tv_list_len(l);
+            tv_list_flatten(l, std::ptr::null_mut(), i64::from(len), 999_999);
+            assert_eq!(tv_list_len(l), 2);
+            let item = tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*(*item).li_next).li_tv.value, TypvalValue::Number(2));
+            tv_list_free(l);
+        }
     }
 }

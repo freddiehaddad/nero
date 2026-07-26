@@ -168,6 +168,11 @@
 //! `List`/`Dict`/`Blob`/`Funcref`/`Partial`-typed - stringifying THOSE
 //! needs the full `encode_tv2echo` machinery (`eval/encode.c`, ~970
 //! lines, a substantial separate undertaking not attempted here).
+//!
+//! Also `flatten()`/`flattennew()` (recursively replace each nested
+//! `List` item, in place or into a new copy, up to an optional
+//! `{maxdepth}`), which needed a new
+//! [`crate::eval::typval::tv_list_flatten`] (`eval/typval.c`).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -264,6 +269,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
         m.insert(&b"repeat"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_repeat });
         m.insert(&b"join"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_join });
+        m.insert(&b"flatten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flatten });
+        m.insert(&b"flattennew"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flattennew });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2307,6 +2314,89 @@ unsafe fn f_join(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(joined));
 }
 
+/// Shared `flatten()`/`flattennew()` implementation (`flatten_common`,
+/// `funcs.c`). `make_copy` selects `flattennew()`'s own "copy first"
+/// behavior (`true`) vs. `flatten()`'s own in-place mutation
+/// (`false`) - matching [`extend_list`]'s own identical `is_new`
+/// reasoning (though here, unlike `extend_list`, `rettv`'s own List
+/// value is assigned UPFRONT, before flattening even begins, exactly
+/// matching the original's own statement order).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`-typed with a non-null pointer, it
+/// must be valid, recursively (forwarded to
+/// [`crate::eval::typval::tv_list_flatten`]'s own safety doc).
+unsafe fn flatten_common(argvars: &[TypvalT], make_copy: bool, rettv: &mut TypvalT) {
+    if !matches!(argvars[0].value, TypvalValue::List(_)) {
+        return; // semsg(_(e_listarg), "flatten()") omitted; rettv left at its caller-provided default.
+    }
+
+    let mut maxdepth: i64 = 999_999;
+    // argvars.len() > 1 replaces the original's own argvars[1].v_type
+    // != VAR_UNKNOWN sentinel check.
+    if argvars.len() > 1 {
+        let mut error = false;
+        maxdepth = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error));
+        if error {
+            return; // type error; errmsg already given in the original.
+        }
+        if maxdepth < 0 {
+            return; // emsg(_("E900: maxdepth must be non-negative number")) omitted.
+        }
+    }
+
+    let TypvalValue::List(mut list) = argvars[0].value else { unreachable!() };
+    rettv.value = TypvalValue::List(list);
+    if list.is_null() {
+        return;
+    }
+
+    if make_copy {
+        // SAFETY: forwarded from this function's own safety doc.
+        list = unsafe {
+            crate::eval::typval::tv_list_copy(std::ptr::null(), list, false, crate::eval::eval::get_copy_id())
+        };
+        rettv.value = TypvalValue::List(list);
+        if list.is_null() {
+            return;
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        if crate::eval::typval::value_check_lock(unsafe { crate::eval::typval::tv_list_locked(list) }, None) {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_ref(list) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { crate::eval::typval::tv_list_len(list) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_flatten(list, std::ptr::null_mut(), i64::from(len), maxdepth) };
+}
+
+/// `flatten({list} [, {maxdepth}])` - flatten `{list}` in place, up to
+/// `{maxdepth}` levels (default effectively unlimited) (`f_flatten`,
+/// `funcs.c`). Returns the SAME (mutated) `{list}`.
+///
+/// # Safety
+/// Forwards [`flatten_common`]'s own safety doc.
+unsafe fn f_flatten(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { flatten_common(argvars, false, rettv) };
+}
+
+/// `flattennew({list} [, {maxdepth}])` - like [`f_flatten`], but
+/// `{list}` is copied first, leaving the original untouched
+/// (`f_flattennew`, `funcs.c`). Returns the NEW, flattened copy.
+///
+/// # Safety
+/// Forwards [`flatten_common`]'s own safety doc.
+unsafe fn f_flattennew(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { flatten_common(argvars, true, rettv) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3015,6 +3105,8 @@ mod tests {
             "range",
             "repeat",
             "join",
+            "flatten",
+            "flattennew",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -5073,6 +5165,93 @@ mod tests {
         unsafe {
             crate::eval::typval::tv_list_free(list);
             crate::eval::typval::tv_list_free(inner_sep);
+        }
+    }
+
+    // --- f_flatten / f_flattennew ---
+
+    #[test]
+    fn flatten_flattens_in_place_and_returns_the_same_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        let inner = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_ref(inner);
+            crate::eval::typval::tv_list_append_number(&mut *inner, 2);
+            crate::eval::typval::tv_list_append_owned_tv(
+                list,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_flatten(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(l, list);
+        unsafe {
+            assert_eq!(list_values(l), vec![1, 2]);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn flatten_of_a_locked_list_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { (*list).lv_lock = crate::eval::typval_defs::VarLockStatus::Locked };
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_flatten(&args, &mut rettv) };
+        // rettv still gets the List value assigned upfront (matching
+        // the original's own unconditional rettv assignment before
+        // the lock check), even though flattening itself never runs.
+        assert_eq!(rettv.value, TypvalValue::List(list));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn flatten_with_a_negative_maxdepth_leaves_rettv_at_default() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(-1)];
+        unsafe { f_flatten(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        unsafe { crate::eval::typval::tv_list_free(list) };
+    }
+
+    #[test]
+    fn flatten_of_a_non_list_leaves_rettv_at_default() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        unsafe { f_flatten(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn flattennew_returns_a_new_list_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        let inner = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_ref(inner);
+            crate::eval::typval::tv_list_append_number(&mut *inner, 1);
+            crate::eval::typval::tv_list_append_owned_tv(
+                list,
+                TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+            );
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_flattennew(&args, &mut rettv) };
+        let TypvalValue::List(new_list) = rettv.value else { panic!("expected a List") };
+        assert_ne!(new_list, list);
+        unsafe {
+            assert_eq!(list_values(new_list), vec![1]);
+            assert_eq!(crate::eval::typval::tv_list_len(list), 1); // original still nested, untouched.
+            let orig_item = crate::eval::typval::tv_list_first(list);
+            assert!(matches!((*orig_item).li_tv.value, TypvalValue::List(_)));
+            crate::eval::typval::tv_list_unref(list);
+            crate::eval::typval::tv_list_unref(new_list);
         }
     }
 }
