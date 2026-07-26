@@ -417,6 +417,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_getid"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_win_getid });
         m.insert(&b"win_id2win"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2win });
         m.insert(&b"win_id2tabwin"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2tabwin });
+        m.insert(&b"win_findbuf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_findbuf });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2855,6 +2856,26 @@ unsafe fn f_win_id2tabwin(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `win_findbuf({bufnr})` - a `List` of window-IDs (across all tab
+/// pages) currently showing buffer `{bufnr}`, empty if none
+/// (`f_win_findbuf`, `eval/window.c`), via the already-existing
+/// [`crate::window::win_findbuf`].
+///
+/// # Safety
+/// Forwards `crate::window::win_findbuf`'s own safety doc, plus
+/// [`crate::eval::typval::tv_list_alloc_ret`]'s own safety doc.
+unsafe fn f_win_findbuf(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let bufnr = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    let handles = unsafe { crate::window::win_findbuf(bufnr) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, handles.len() as isize) };
+    for handle in handles {
+        // SAFETY: `l` was just allocated above by this same call.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(handle)) };
+    }
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4562,6 +4583,7 @@ mod tests {
             "win_getid",
             "win_id2win",
             "win_id2tabwin",
+            "win_findbuf",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -7234,6 +7256,42 @@ mod tests {
             let winnr = crate::eval::typval::tv_list_find(l, 1);
             assert_eq!((*tabnr).li_tv.value, TypvalValue::Number(0));
             assert_eq!((*winnr).li_tv.value, TypvalValue::Number(0));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn win_findbuf_returns_a_list_of_matching_window_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 42, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(9) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_findbuf(&[num(42)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(9));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn win_findbuf_returns_an_empty_list_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 42, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(9) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_findbuf(&[num(999)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
             crate::eval::typval::tv_list_unref(l);
         }
     }
