@@ -80,6 +80,21 @@
 //! than threading that requirement through its own established
 //! "embedded NUL ends a C-string-modeled scan" byte-length-bounded
 //! idiom used everywhere else in this module.
+//!
+//! Also translated: `has_key()` (via the already-existing
+//! [`crate::eval::typval::tv_dict_has_key`]) and `keys()`/`values()`/
+//! `items()` (a shared private `tv_dict2list` helper, mirroring the
+//! original's own `tv_dict2list`/`DictListType` split exactly). Only
+//! `items()`'s `Dict` case is translated - the original also accepts a
+//! `String`/`List`/`Blob` via `tv_string2items`/`tv_list2items`/
+//! `tv_blob2items`, none of which exist yet, so `f_items` declines
+//! those cases explicitly. A dict item's own `di_key` always carries a
+//! trailing NUL terminator (`DictitemT`'s own C-string-compatible
+//! storage convention) that must be stripped before use as a
+//! Vimscript `String` value - caught by a real test failure (asserting
+//! the exact string CONTENTS, not just the list's own length) during
+//! this function's own development, fixed using the same established
+//! stripping idiom `eval/typval.rs`'s own `tv_dict_equal` already uses.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -158,6 +173,10 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tolower"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_tolower });
         m.insert(&b"toupper"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_toupper });
         m.insert(&b"trim"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_trim });
+        m.insert(&b"has_key"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_has_key });
+        m.insert(&b"keys"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_keys });
+        m.insert(&b"values"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_values });
+        m.insert(&b"items"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_items });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -934,6 +953,155 @@ unsafe fn f_trim(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(s[head..tail].to_vec()));
 }
 
+/// `has_key({dict}, {key})` - whether `{dict}` has a key `{key}`
+/// (`f_has_key`).
+///
+/// The original's own `E715: Dictionary required` (a non-`Dict`
+/// argument) is omitted, matching this crate's established "skip the
+/// display, keep an otherwise-harmless default" policy - `rettv` is
+/// simply left untouched (still its caller's own default-initialized
+/// `Number(0)`).
+fn f_has_key(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let TypvalValue::Dict(d) = &argvars[0].value else {
+        return;
+    };
+    if d.is_null() {
+        return;
+    }
+    let key = crate::eval::typval::tv_get_string(&argvars[1]);
+    // SAFETY: `d` is non-null here, and every `Dict`-typed `argvars[0]`
+    // reaching this point must already carry a valid pointer, matching
+    // every other function in this crate touching that type.
+    let found = crate::eval::typval::tv_dict_has_key(unsafe { d.as_mut() }, &key);
+    rettv.value = TypvalValue::Number(i64::from(found));
+}
+
+/// What to place in each resulting list item for [`tv_dict2list`]
+/// (`DictListType`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictListType {
+    Keys,
+    Values,
+    Items,
+}
+
+/// Turn a dictionary into a `List` (`tv_dict2list`).
+///
+/// Scoped to `argvars[0]` always being `Dict`-typed (or absent
+/// entirely, i.e. a type error) - matches `keys()`/`values()`'s own
+/// real shape exactly; `items()` additionally accepts a `String`/
+/// `List`/`Blob` in the original (via `tv_string2items`/
+/// `tv_list2items`/`tv_blob2items`), none of which are translated yet,
+/// so [`f_items`] itself declines those cases explicitly rather than
+/// silently mishandling them here.
+///
+/// The original's own `E715: Dictionary required` (a non-`Dict`
+/// argument) is omitted, matching this crate's established "skip the
+/// display, keep an otherwise-harmless default" policy - an empty
+/// `List` is returned instead, matching the original's own
+/// `tv_list_alloc_ret(rettv, 0); return;` for this exact error path.
+///
+/// # Safety
+/// If `argvars[0].value` is `Dict`-typed with a non-null pointer, that
+/// pointer must be valid.
+unsafe fn tv_dict2list(argvars: &[TypvalT], rettv: &mut TypvalT, what: DictListType) {
+    let TypvalValue::Dict(d) = &argvars[0].value else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 0) };
+        return;
+    };
+    let d = *d;
+    let len = crate::eval::typval::tv_dict_len(unsafe { d.as_ref() });
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, len as isize) };
+    if d.is_null() {
+        return; // NULL dict behaves like an empty dict.
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut crate::eval::typval_defs::DictitemT> = unsafe { &*d }.dv_index.values().copied().collect();
+    for item in items {
+        // SAFETY: `item` came from the dict's own live index above.
+        let di = unsafe { &*item };
+        // di_key always carries a trailing NUL terminator (matching
+        // hi_key's C-string contract - see tv_dict_item_alloc's own
+        // doc comment), which a Vimscript String value must NOT
+        // include - strip it here, matching the same established
+        // idiom used elsewhere in this crate (e.g. typval.rs's own
+        // tv_dict_equal).
+        let key = &di.di_key[..di.di_key.len() - 1];
+        match what {
+            DictListType::Keys => {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_list_append_string(l, Some(key)) };
+            }
+            DictListType::Values => {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_list_append_tv(l, &di.di_tv) };
+            }
+            DictListType::Items => {
+                let sub_l = crate::eval::typval::tv_list_alloc(2);
+                // SAFETY: `sub_l` was just allocated above, a fresh
+                // pointer not shared with anything yet.
+                unsafe { crate::eval::typval::tv_list_ref(sub_l) };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_list_append_string(sub_l, Some(key)) };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_list_append_tv(sub_l, &di.di_tv) };
+                let tv_item = TypvalT { value: TypvalValue::List(sub_l), ..Default::default() };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_list_append_owned_tv(l, tv_item) };
+            }
+        }
+    }
+}
+
+/// `keys({dict})` - a `List` of `{dict}`'s own keys (`f_keys`).
+///
+/// # Safety
+/// Forwarded from [`tv_dict2list`]'s own safety doc.
+unsafe fn f_keys(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_dict2list(argvars, rettv, DictListType::Keys) };
+}
+
+/// `values({dict})` - a `List` of `{dict}`'s own values (`f_values`).
+///
+/// # Safety
+/// Forwarded from [`tv_dict2list`]'s own safety doc.
+unsafe fn f_values(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_dict2list(argvars, rettv, DictListType::Values) };
+}
+
+/// `items({dict})` - a `List` of `[key, value]` pairs from `{dict}`
+/// (`f_items`).
+///
+/// Only the `Dict` case is translated - the original also accepts a
+/// `String` (character-by-character), `List` (index/value pairs), or
+/// `Blob` (byte-index/value pairs) via `tv_string2items`/
+/// `tv_list2items`/`tv_blob2items`, none of which exist yet. Panics
+/// via `unimplemented!()` for those, rather than silently returning an
+/// empty/wrong result.
+///
+/// # Safety
+/// Forwarded from [`tv_dict2list`]'s own safety doc.
+unsafe fn f_items(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    match &argvars[0].value {
+        TypvalValue::String(_) => {
+            unimplemented!("f_items: a String argument needs tv_string2items, not yet translated")
+        }
+        TypvalValue::List(_) => {
+            unimplemented!("f_items: a List argument needs tv_list2items, not yet translated")
+        }
+        TypvalValue::Blob(_) => {
+            unimplemented!("f_items: a Blob argument needs tv_blob2items, not yet translated")
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        _ => unsafe { tv_dict2list(argvars, rettv, DictListType::Items) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1624,6 +1792,10 @@ mod tests {
             "tolower",
             "toupper",
             "trim",
+            "has_key",
+            "keys",
+            "values",
+            "items",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -1933,5 +2105,170 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_trim(&[string("日日hello日日".as_bytes()), string("日".as_bytes())], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    // --- f_has_key ---
+
+    #[test]
+    fn has_key_finds_a_present_key_and_rejects_a_missing_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string(b"a")];
+        f_has_key(&args, &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string(b"nope")];
+        f_has_key(&args, &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn has_key_null_dict_is_false() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [
+            TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() },
+            string(b"a"),
+        ];
+        f_has_key(&args, &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- f_keys / f_values / f_items ---
+
+    fn make_test_dict() -> *mut crate::eval::typval_defs::DictT {
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item_a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item_a).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_a);
+            let item_b = crate::eval::typval::tv_dict_item_alloc(b"b");
+            (*item_b).di_tv.value = TypvalValue::Number(2);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_b);
+        }
+        dict
+    }
+
+    #[test]
+    fn keys_returns_a_list_of_key_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = make_test_dict();
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        unsafe { f_keys(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        unsafe {
+            let mut item = crate::eval::typval::tv_list_first(l);
+            while !item.is_null() {
+                let TypvalValue::String(Some(s)) = &(*item).li_tv.value else { panic!("expected a String") };
+                keys.push(s.clone());
+                item = (*item).li_next;
+            }
+        }
+        keys.sort();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        unsafe {
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn values_returns_a_list_of_the_dicts_own_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = make_test_dict();
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        unsafe { f_values(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        let mut values: Vec<crate::eval::typval_defs::VarnumberT> = Vec::new();
+        unsafe {
+            let mut item = crate::eval::typval::tv_list_first(l);
+            while !item.is_null() {
+                let TypvalValue::Number(n) = (*item).li_tv.value else { panic!("expected a Number") };
+                values.push(n);
+                item = (*item).li_next;
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2]);
+        unsafe {
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn items_returns_a_list_of_key_value_pairs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item_a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item_a).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_a);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        unsafe { f_items(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+        unsafe {
+            let pair_item = crate::eval::typval::tv_list_first(l);
+            let TypvalValue::List(pair) = (*pair_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(pair), 2);
+            let key_item = crate::eval::typval::tv_list_first(pair);
+            assert_eq!((*key_item).li_tv.value, TypvalValue::String(Some(b"a".to_vec())));
+            let value_item = (*key_item).li_next;
+            assert_eq!((*value_item).li_tv.value, TypvalValue::Number(1));
+
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn keys_values_items_of_a_null_dict_are_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let args = [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }];
+        for f in [f_keys, f_values] {
+            let mut rettv = TypvalT::default();
+            unsafe { f(&args, &mut rettv) };
+            let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+            assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+            unsafe { crate::eval::typval::tv_list_unref(l) };
+        }
+    }
+
+    #[test]
+    fn keys_of_a_non_dict_is_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_keys(&[num(5)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn items_of_a_list_argument_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_items(&args, &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (tv_list2items not yet translated)");
+        unsafe { crate::eval::typval::tv_list_unref(list) };
     }
 }
