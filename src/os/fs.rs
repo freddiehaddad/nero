@@ -30,6 +30,19 @@
 //! returns `Option<std::fs::File>` directly (the opened resource, not
 //! a raw fd/error code) - see its own doc comment.
 //!
+//! Also translated: `os_fileinfo`/`os_fileinfo_link`/
+//! `os_fileinfo_size`/`os_fileinfo_mtime`/`os_fileinfo_type_str` (see
+//! [`FileInfoT`]) - but only a narrow subset of the original's own
+//! `FileInfo`/`uv_stat_t` (size, modification time, file type), all
+//! backed directly by `std::fs::Metadata` rather than a full `stat`
+//! translation. In particular, NO raw Unix-style mode/permission bits
+//! are modeled (the same still-deferred decision as `os_getperm`
+//! below) - `getfperm()`/`eval/fs.c`'s own caller of those bits
+//! remains deferred. `os_fileinfo_hardlinks`/`os_fileinfo_blksize`/
+//! `os_fileinfo_id`/`os_fileinfo_inode`/`os_fileid*` remain deferred
+//! too (no real caller yet needing the fields `std::fs::Metadata`
+//! doesn't portably expose).
+//!
 //! `os_set_cloexec` is intentionally NOT translated (not merely
 //! deferred): `std::fs::File`/`OpenOptions` already open every file
 //! with `O_CLOEXEC` set atomically on Unix, and with a non-inheritable
@@ -53,21 +66,15 @@
 //!   `std::io::{Read, Write, Seek}` on
 //!   `MemfileT.mf_fd: Option<std::fs::File>`, sidestepping the need
 //!   for these raw-fd wrappers entirely for that specific caller).
-//! - `os_fileinfo*`/`os_fileid*`: need the `FileInfo` struct itself
-//!   (deferred in `fs_defs.rs`, needs the same mode-bits decision).
-//!   `os_fileinfo_link`'s use in `memfile.c`'s `mf_do_open` is an
-//!   exception - its actual contract is just "does `lstat` succeed"
-//!   (a boolean), so `std::fs::symlink_metadata(path).is_ok()` covers
-//!   that one real caller directly without needing the full struct.
 //! - `os_exepath`/`os_can_exe`/`is_executable*`: executable-search
 //!   logic tied to `'path'`-searching semantics (`path.c`) and exec-bit
 //!   permission checks (`os_getperm`).
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
 //!   `os_file_owned`/`os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
-//! - `os_file_settime`/`os_file_is_readable`/`os_file_is_writable`:
-//!   tractable in principle (`std::fs::metadata`/permissions), deferred
-//!   only for lack of time this pass - revisit alongside `os_getperm`.
+//! - `os_file_settime`: tractable in principle
+//!   (`std::fs::File::set_modified`), deferred only for lack of time
+//!   this pass - revisit alongside `os_getperm`.
 //! - `os_mkdir_recurse`/`os_file_mkdir`/`os_mkdtemp`: build on
 //!   `os_mkdir` plus recursive-creation logic not ported this pass.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
@@ -289,6 +296,99 @@ pub fn os_isrealdir(name: &Path) -> bool {
         Ok(meta) => !meta.is_symlink() && meta.is_dir(),
         Err(_) => false,
     }
+}
+
+/// A narrow subset of the original's own `FileInfo` (`fs_defs.h`,
+/// itself just a thin wrapper over libuv's own `uv_stat_t`) - only
+/// what [`os_fileinfo_size`]/[`os_fileinfo_mtime`]/
+/// [`os_fileinfo_type_str`] need (size, modification time, file
+/// type), backed directly by `std::fs::Metadata` rather than a full
+/// `stat`/`uv_stat_t` translation. Deliberately has NO raw Unix-style
+/// mode/permission bits - see this module's own top doc comment for
+/// why (the same still-deferred decision as `os_getperm`).
+#[derive(Debug)]
+pub struct FileInfoT {
+    metadata: std::fs::Metadata,
+}
+
+/// Get information about a file, following symlinks (`os_fileinfo`).
+///
+/// @return `None` on failure (`path` doesn't exist, or some other
+///         `stat`-style error), matching the original's own `bool`
+///         success/failure return (this crate's own idiom folds the
+///         out-parameter and the status into one `Option`).
+#[must_use]
+pub fn os_fileinfo(path: &Path) -> Option<FileInfoT> {
+    std::fs::metadata(path).ok().map(|metadata| FileInfoT { metadata })
+}
+
+/// Get information about a file, WITHOUT following a trailing symlink
+/// (`os_fileinfo_link`).
+#[must_use]
+pub fn os_fileinfo_link(path: &Path) -> Option<FileInfoT> {
+    std::fs::symlink_metadata(path).ok().map(|metadata| FileInfoT { metadata })
+}
+
+/// Get the file size from a `FileInfoT` (`os_fileinfo_size`).
+#[must_use]
+pub fn os_fileinfo_size(info: &FileInfoT) -> u64 {
+    info.metadata.len()
+}
+
+/// Get the last modification time from a `FileInfoT`, as seconds
+/// since the Unix epoch (`file_info->stat.st_mtim.tv_sec` in the
+/// original). `0` if the platform can't report a modification time,
+/// or it's before the epoch (matching this crate's established
+/// "narrow, documented gap rather than a panic" convention for
+/// awkward corners of an otherwise-tractable function - a modern
+/// file's mtime is essentially never actually before 1970).
+#[must_use]
+pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
+    info.metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Get a `getftype()`-style file-type description from a `FileInfoT`
+/// (mirrors the original's own `f_getftype`'s `S_ISREG`/`S_ISDIR`/
+/// `S_ISLNK`/`S_ISBLK`/`S_ISCHR`/`S_ISFIFO`/`S_ISSOCK` dispatch,
+/// inlined here rather than as a separate `os_nodetype`-style function
+/// since this crate has no other caller for it yet). The block/char-
+/// device, FIFO, and socket distinctions are Unix-only (via
+/// `std::os::unix::fs::FileTypeExt`) - Windows has no equivalent
+/// concept, so those 4 variants are unreachable there, matching
+/// `std::fs::FileType`'s own platform-native capabilities.
+#[must_use]
+pub fn os_fileinfo_type_str(info: &FileInfoT) -> &'static str {
+    let ft = info.metadata.file_type();
+    if ft.is_symlink() {
+        return "link";
+    }
+    if ft.is_dir() {
+        return "dir";
+    }
+    if ft.is_file() {
+        return "file";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_block_device() {
+            return "bdev";
+        }
+        if ft.is_char_device() {
+            return "cdev";
+        }
+        if ft.is_fifo() {
+            return "fifo";
+        }
+        if ft.is_socket() {
+            return "socket";
+        }
+    }
+    "other"
 }
 
 /// Resolve `name` to its canonical (symlink-free, absolute) path
@@ -774,5 +874,81 @@ mod tests {
         assert!(os_file_is_readable(&path));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn os_fileinfo_returns_none_for_a_missing_path() {
+        let scratch = TempScratch::new("fileinfo_missing");
+        assert!(os_fileinfo(&scratch.path.join("nope.txt")).is_none());
+    }
+
+    #[test]
+    fn os_fileinfo_size_matches_the_written_content_length() {
+        let scratch = TempScratch::new("fileinfo_size");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+
+        let info = os_fileinfo(&path).expect("file exists");
+        assert_eq!(os_fileinfo_size(&info), 11);
+    }
+
+    #[test]
+    fn os_fileinfo_mtime_is_a_recent_real_timestamp() {
+        let scratch = TempScratch::new("fileinfo_mtime");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let info = os_fileinfo(&path).expect("file exists");
+        let mtime = os_fileinfo_mtime(&info);
+        // Comfortably past 2020-01-01 (1577836800) - a loose sanity
+        // bound, not a flaky exact-time check.
+        assert!(mtime > 1_577_836_800);
+    }
+
+    #[test]
+    fn os_fileinfo_type_str_identifies_a_regular_file() {
+        let scratch = TempScratch::new("fileinfo_type_file");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let info = os_fileinfo(&path).expect("file exists");
+        assert_eq!(os_fileinfo_type_str(&info), "file");
+    }
+
+    #[test]
+    fn os_fileinfo_type_str_identifies_a_directory() {
+        let scratch = TempScratch::new("fileinfo_type_dir");
+        let info = os_fileinfo(&scratch.path).expect("dir exists");
+        assert_eq!(os_fileinfo_type_str(&info), "dir");
+    }
+
+    #[test]
+    fn os_fileinfo_follows_symlinks_but_link_does_not() {
+        let scratch = TempScratch::new("fileinfo_symlink");
+        let target = scratch.path.join("target.txt");
+        std::fs::write(&target, b"hello").unwrap();
+        let link = scratch.path.join("link.txt");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        let symlink_created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        #[cfg(not(windows))]
+        let symlink_created = true;
+
+        // Creating a symlink on Windows needs a developer-mode/
+        // elevation privilege this local test run might not have -
+        // skip gracefully rather than fail on an unrelated
+        // permissions gap unrelated to the actual code under test.
+        if !symlink_created {
+            return;
+        }
+
+        let link_info = os_fileinfo_link(&link).expect("link exists");
+        assert_eq!(os_fileinfo_type_str(&link_info), "link");
+
+        let followed_info = os_fileinfo(&link).expect("target exists via the symlink");
+        assert_eq!(os_fileinfo_type_str(&followed_info), "file");
+        assert_eq!(os_fileinfo_size(&followed_info), 5);
     }
 }

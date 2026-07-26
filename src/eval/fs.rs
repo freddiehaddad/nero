@@ -14,16 +14,22 @@
 //! existing [`crate::path::path_is_absolute`]), `delete()` for its
 //! two tractable flag values (`""` - delete a file, via
 //! [`crate::os::fs::os_remove`]; `"d"` - delete an empty directory,
-//! via [`crate::os::fs::os_rmdir`]), and `filereadable()`/
+//! via [`crate::os::fs::os_rmdir`]), `filereadable()`/
 //! `filewritable()` (via the already-existing
 //! [`crate::os::fs::os_file_is_readable`]/
-//! [`crate::os::fs::os_file_is_writable`]). The `"rf"` (recursive
-//! delete) flag needs `delete_recursive` (a directory-tree walk, not
-//! yet translated) and panics via `unimplemented!()` if actually
-//! reached. Every function taking a path/name needs the byte string
-//! to be valid UTF-8 to build a `Path` from (this crate's established
-//! `path_full_dir_name`-style convention - see that function's own
-//! body in `path.rs`), gracefully treating invalid UTF-8 the same as
+//! [`crate::os::fs::os_file_is_writable`]), and `getfsize()`/
+//! `getftime()`/`getftype()` (via the already-existing
+//! [`crate::os::fs::os_fileinfo`]/[`crate::os::fs::os_fileinfo_link`]
+//! narrow-subset `FileInfo` - see that module's own doc comment for
+//! what's NOT modeled; `getfperm()`, needing the still-deferred
+//! `os_getperm` permission bits, is not translated here). The `"rf"`
+//! (recursive delete) flag needs `delete_recursive` (a directory-tree
+//! walk, not yet translated) and panics via `unimplemented!()` if
+//! actually reached. Every function taking a path/name needs the byte
+//! string to be valid UTF-8 to build a `Path` from (this crate's
+//! established `path_full_dir_name`-style convention - see that
+//! function's own body in `path.rs`), gracefully treating invalid UTF-8
+//! the same as
 //! a nonexistent path/name rather than panicking.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
@@ -74,6 +80,55 @@ pub(crate) fn f_filewritable(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let name = crate::eval::typval::tv_get_string(&argvars[0]);
     let writable = bytes_to_path(&name).map_or(0, crate::os::fs::os_file_is_writable);
     rettv.value = TypvalValue::Number(i64::from(writable));
+}
+
+/// `getfsize({fname})` - the size in bytes of `{fname}` (`f_getfsize`,
+/// `eval/fs.c`), via the already-existing [`crate::os::fs::os_fileinfo`]/
+/// [`crate::os::fs::os_fileinfo_size`]. `0` for a directory, `-1` if
+/// `{fname}` can't be found, `-2` on an (essentially unreachable on a
+/// 64-bit target) size overflow.
+pub(crate) fn f_getfsize(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let n = match bytes_to_path(&name) {
+        None => -1,
+        Some(path) => match crate::os::fs::os_fileinfo(path) {
+            None => -1,
+            Some(_) if crate::os::fs::os_isdir(path) => 0,
+            Some(info) => {
+                let size = crate::os::fs::os_fileinfo_size(&info);
+                let signed = size as i64;
+                if signed as u64 == size { signed } else { -2 }
+            }
+        },
+    };
+    rettv.value = TypvalValue::Number(n);
+}
+
+/// `getftime({fname})` - the last modification time of `{fname}`, in
+/// seconds since the Unix epoch (`f_getftime`, `eval/fs.c`), via the
+/// already-existing [`crate::os::fs::os_fileinfo`]/
+/// [`crate::os::fs::os_fileinfo_mtime`]. `-1` if `{fname}` can't be
+/// found.
+pub(crate) fn f_getftime(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mtime = bytes_to_path(&name).and_then(crate::os::fs::os_fileinfo).map(|info| crate::os::fs::os_fileinfo_mtime(&info));
+    rettv.value = TypvalValue::Number(mtime.unwrap_or(-1));
+}
+
+/// `getftype({fname})` - a description of `{fname}`'s file type
+/// (`f_getftype`, `eval/fs.c`), via the already-existing
+/// [`crate::os::fs::os_fileinfo_link`]/[`crate::os::fs::os_fileinfo_type_str`]
+/// (`lstat`-like - does NOT follow a trailing symlink, matching the
+/// original's own use of `os_fileinfo_link` here specifically). A
+/// NULL `String` (`v:null`-adjacent, matching the original's own
+/// `rettv->vval.v_string = NULL`, which stringifies to `""`) if
+/// `{fname}` doesn't exist.
+pub(crate) fn f_getftype(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let type_str = bytes_to_path(&name)
+        .and_then(crate::os::fs::os_fileinfo_link)
+        .map(|info| crate::os::fs::os_fileinfo_type_str(&info));
+    rettv.value = TypvalValue::String(type_str.map(|s| s.as_bytes().to_vec()));
 }
 
 /// `delete({name} [, {flags}])` - delete a file (`{flags}` omitted or
@@ -362,5 +417,79 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_filewritable(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_getfsize ---
+
+    #[test]
+    fn getfsize_returns_the_byte_length_of_a_file() {
+        let path = std::env::temp_dir().join("nero_test_getfsize.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let mut rettv = TypvalT::default();
+        f_getfsize(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(11));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn getfsize_returns_0_for_a_directory() {
+        let tmp = std::env::temp_dir();
+        let mut rettv = TypvalT::default();
+        f_getfsize(&[string(tmp.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn getfsize_returns_minus_1_for_a_nonexistent_path() {
+        let mut rettv = TypvalT::default();
+        f_getfsize(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_getftime ---
+
+    #[test]
+    fn getftime_returns_a_recent_real_timestamp() {
+        let path = std::env::temp_dir().join("nero_test_getftime.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut rettv = TypvalT::default();
+        f_getftime(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        let TypvalValue::Number(mtime) = rettv.value else { panic!("expected a Number") };
+        assert!(mtime > 1_577_836_800);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn getftime_returns_minus_1_for_a_nonexistent_path() {
+        let mut rettv = TypvalT::default();
+        f_getftime(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_getftype ---
+
+    #[test]
+    fn getftype_identifies_a_regular_file() {
+        let path = std::env::temp_dir().join("nero_test_getftype.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut rettv = TypvalT::default();
+        f_getftype(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"file".to_vec())));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn getftype_identifies_a_directory() {
+        let tmp = std::env::temp_dir();
+        let mut rettv = TypvalT::default();
+        f_getftype(&[string(tmp.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"dir".to_vec())));
+    }
+
+    #[test]
+    fn getftype_returns_null_string_for_a_nonexistent_path() {
+        let mut rettv = TypvalT::default();
+        f_getftype(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 }
