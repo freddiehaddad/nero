@@ -215,6 +215,13 @@
 //! counted substring extraction), and `strtrans()` (unprintable-
 //! character escaping, via the already-translated
 //! [`crate::charset::transstr`]).
+//!
+//! Also `byteidx()`/`byteidxcomp()` (the byte index of the Nth
+//! character, composing folded-in vs. separate), `charidx()` (inverse:
+//! character index of a given byte), `strcharpart()` (like `strpart()`
+//! but character- rather than byte-counted), and `getpid()` (the
+//! process ID, via the already-existing
+//! [`crate::os::env::os_get_pid`]).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -326,6 +333,11 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"strgetchar"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strgetchar });
         m.insert(&b"strpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strpart });
         m.insert(&b"strtrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strtrans });
+        m.insert(&b"byteidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidx });
+        m.insert(&b"byteidxcomp"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidxcomp });
+        m.insert(&b"charidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_charidx });
+        m.insert(&b"strcharpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strcharpart });
+        m.insert(&b"getpid"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getpid });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2878,6 +2890,225 @@ unsafe fn f_strtrans(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(out));
 }
 
+/// Shared core of `byteidx()`/`byteidxcomp()` (`byteidx_common`,
+/// `strings.c`): the byte index of the `{nr}`th character of
+/// `{string}`. `comp = true` (`byteidxcomp()`) counts composing
+/// characters SEPARATELY (via [`crate::mbyte::utf_ptr2len`]);
+/// `comp = false` (`byteidx()`) folds them into the preceding base
+/// character (via [`crate::mbyte::utfc_ptr2len`]).
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `comp` is `false` (forwarded from
+/// [`crate::mbyte::utfc_ptr2len`]'s own safety doc).
+unsafe fn byteidx_common(argvars: &[TypvalT], rettv: &mut TypvalT, comp: bool) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut idx = crate::eval::typval::tv_get_number(&argvars[1]);
+    if idx < 0 {
+        return;
+    }
+
+    let utf16idx = argvars.len() > 2 && crate::eval::typval::tv_get_bool(&argvars[2]) != 0;
+
+    let mut t = 0usize;
+    while idx > 0 {
+        if t >= s.len() || s[t] == 0 {
+            return;
+        }
+        let clen = if comp {
+            crate::mbyte::utf_ptr2len(&s[t..])
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mbyte::utfc_ptr2len(&s[t..]) }
+        };
+        if utf16idx {
+            let c = if clen > 1 { crate::mbyte::utf_ptr2char(&s[t..]) } else { i32::from(s[t]) };
+            if c > 0xFFFF {
+                idx -= 1;
+            }
+            if idx > 0 {
+                t += usize::try_from(clen).unwrap_or(1).max(1);
+            }
+        } else {
+            t += usize::try_from(clen).unwrap_or(1).max(1);
+        }
+        idx -= 1;
+    }
+    rettv.value = TypvalValue::Number(t as i64);
+}
+
+/// `byteidx({string}, {nr} [, {utf16}])` - the byte index of the
+/// `{nr}`th character of `{string}`, composing characters folded into
+/// the preceding base character (`f_byteidx`, `strings.c`).
+///
+/// # Safety
+/// Forwarded from [`byteidx_common`]'s own safety doc.
+unsafe fn f_byteidx(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { byteidx_common(argvars, rettv, false) };
+}
+
+/// `byteidxcomp({string}, {nr} [, {utf16}])` - like [`f_byteidx`], but
+/// composing characters are counted SEPARATELY (`f_byteidxcomp`,
+/// `strings.c`).
+///
+/// # Safety
+/// Forwarded from [`byteidx_common`]'s own safety doc.
+unsafe fn f_byteidxcomp(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { byteidx_common(argvars, rettv, true) };
+}
+
+/// `charidx({string}, {idx} [, {countcc} [, {utf16}]])` - the
+/// character index of the byte at `{idx}` in `{string}` (`f_charidx`,
+/// `strings.c`).
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `{countcc}` is falsy (forwarded from
+/// [`crate::mbyte::utfc_ptr2len`]'s own safety doc).
+unsafe fn f_charidx(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut idx = crate::eval::typval::tv_get_number(&argvars[1]);
+    if idx < 0 {
+        return;
+    }
+
+    let mut countcc = false;
+    let mut utf16idx = false;
+    if argvars.len() > 2 {
+        countcc = crate::eval::typval::tv_get_bool(&argvars[2]) != 0;
+        if argvars.len() > 3 {
+            utf16idx = crate::eval::typval::tv_get_bool(&argvars[3]) != 0;
+        }
+    }
+
+    let mut p = 0usize;
+    let mut len = 0i64;
+    loop {
+        let keep_going = if utf16idx { idx >= 0 } else { p as i64 <= idx };
+        if !keep_going {
+            break;
+        }
+
+        if p >= s.len() || s[p] == 0 {
+            let matched = if utf16idx { idx == 0 } else { p as i64 == idx };
+            if matched {
+                rettv.value = TypvalValue::Number(len);
+            }
+            return;
+        }
+
+        let clen = if countcc {
+            crate::mbyte::utf_ptr2len(&s[p..])
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) }
+        };
+        if utf16idx {
+            idx -= 1;
+            let c = if clen > 1 { crate::mbyte::utf_ptr2char(&s[p..]) } else { i32::from(s[p]) };
+            if c > 0xFFFF {
+                idx -= 1;
+            }
+        }
+        p += usize::try_from(clen).unwrap_or(1).max(1);
+        len += 1;
+    }
+
+    rettv.value = TypvalValue::Number(if len > 0 { len - 1 } else { 0 });
+}
+
+/// `strcharpart({src}, {start} [, {len} [, {skipcc}]])` - like
+/// [`f_strpart`], but `{start}`/`{len}` count characters instead of
+/// bytes (`f_strcharpart`, `strings.c`). `{skipcc}` (only consulted
+/// when `{len}` is ALSO given) selects composing-aware
+/// ([`crate::mbyte::utfc_ptr2len`]) vs. composing-separate
+/// ([`crate::mbyte::utf_ptr2len`]) character widths, matching the
+/// original's own exact gating.
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `{skipcc}` is truthy (forwarded from
+/// [`crate::mbyte::utfc_ptr2len`]'s own safety doc).
+unsafe fn f_strcharpart(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let p = crate::eval::typval::tv_get_string(&argvars[0]);
+    let slen = p.len() as i64;
+
+    let mut nbyte: i64 = 0;
+    let mut skipcc = false;
+    let mut error = false;
+    let nchar = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error));
+    if !error {
+        if argvars.len() > 3 {
+            skipcc = crate::eval::typval::tv_get_bool(&argvars[3]) != 0;
+        }
+
+        if nchar > 0 {
+            let mut nchar = nchar;
+            while nchar > 0 && nbyte < slen {
+                let clen = if skipcc {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::mbyte::utfc_ptr2len(&p[nbyte as usize..]) }
+                } else {
+                    crate::mbyte::utf_ptr2len(&p[nbyte as usize..])
+                };
+                nbyte += i64::from(clen);
+                nchar -= 1;
+            }
+        } else {
+            nbyte = nchar;
+        }
+    }
+
+    let mut len: i64;
+    if argvars.len() > 2 {
+        let mut charlen = crate::eval::typval::tv_get_number(&argvars[2]);
+        len = 0;
+        while charlen > 0 && nbyte + len < slen {
+            let off = nbyte + len;
+            if off < 0 {
+                len += 1;
+            } else {
+                let clen = if skipcc {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::mbyte::utfc_ptr2len(&p[off as usize..]) }
+                } else {
+                    crate::mbyte::utf_ptr2len(&p[off as usize..])
+                };
+                len += i64::from(clen);
+            }
+            charlen -= 1;
+        }
+    } else {
+        len = slen - nbyte;
+    }
+
+    if nbyte < 0 {
+        len += nbyte;
+        nbyte = 0;
+    } else if nbyte > slen {
+        nbyte = slen;
+    }
+    if len < 0 {
+        len = 0;
+    } else if nbyte + len > slen {
+        len = slen - nbyte;
+    }
+
+    let nbyte = nbyte as usize;
+    let len = len as usize;
+    rettv.value = TypvalValue::String(Some(p[nbyte..nbyte + len].to_vec()));
+}
+
+/// `getpid()` - the process ID of this Nvim process (`f_getpid`,
+/// `funcs.c`), via the already-existing
+/// [`crate::os::env::os_get_pid`].
+fn f_getpid(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(crate::os::env::os_get_pid());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3628,6 +3859,11 @@ mod tests {
             "strgetchar",
             "strpart",
             "strtrans",
+            "byteidx",
+            "byteidxcomp",
+            "charidx",
+            "strcharpart",
+            "getpid",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6104,5 +6340,121 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_strtrans(&[string(b"\x01")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"^A".to_vec())));
+    }
+
+    // --- f_byteidx / f_byteidxcomp ---
+
+    #[test]
+    fn byteidx_ascii_matches_the_character_index() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_byteidx(&[string(b"hello"), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn byteidx_skips_past_a_multibyte_character() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_byteidx(&[string("a一b".as_bytes()), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn byteidx_out_of_range_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_byteidx(&[string(b"ab"), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn byteidx_folds_a_composing_mark_into_the_base_character() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // "e" + COMBINING ACUTE ACCENT + "x": byteidx (composing
+        // folded into the base) skips the whole 3-byte cluster to
+        // land on "x" at byte 3.
+        let s = "e\u{0301}x".as_bytes();
+        unsafe { f_byteidx(&[string(s), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn byteidxcomp_counts_a_composing_mark_as_its_own_character() {
+        // byteidxcomp (composing counted separately) lands on the
+        // combining mark itself, right after "e", at byte 1.
+        let s = "e\u{0301}x".as_bytes();
+        let mut rettv = TypvalT::default();
+        unsafe { f_byteidxcomp(&[string(s), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    // --- f_charidx ---
+
+    #[test]
+    fn charidx_multibyte_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // "a一b": byte 4 is where "b" starts (char index 2).
+        unsafe { f_charidx(&[string("a一b".as_bytes()), num(4)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn charidx_exactly_at_the_string_length_returns_the_character_length() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_charidx(&[string(b"abc"), num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn charidx_past_the_string_length_is_negative_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_charidx(&[string(b"abc"), num(4)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn charidx_negative_index_is_negative_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_charidx(&[string(b"abc"), num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_strcharpart ---
+
+    #[test]
+    fn strcharpart_extracts_a_multibyte_character_by_char_index() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strcharpart(&[string("a一b".as_bytes()), num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some("一".as_bytes().to_vec())));
+    }
+
+    #[test]
+    fn strcharpart_without_len_takes_the_rest_of_the_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strcharpart(&[string("a一b".as_bytes()), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some("一b".as_bytes().to_vec())));
+    }
+
+    #[test]
+    fn strcharpart_clamps_a_negative_start() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strcharpart(&[string(b"hello"), num(-2), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hel".to_vec())));
+    }
+
+    // --- f_getpid ---
+
+    #[test]
+    fn getpid_is_a_positive_number() {
+        let mut rettv = TypvalT::default();
+        f_getpid(&[], &mut rettv);
+        let TypvalValue::Number(n) = rettv.value else { panic!("expected a Number") };
+        assert!(n > 0);
     }
 }
