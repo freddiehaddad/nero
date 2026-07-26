@@ -242,6 +242,12 @@
 //! `getcharsearch()` (via the already-existing
 //! [`crate::search::last_csearch_str`]/`last_csearch_forward`/
 //! `last_csearch_until`).
+//!
+//! Also `mode([{expr}])`, via the already-translated
+//! [`crate::state::get_mode`] (re-investigated: `state.c`'s `get_mode`
+//! is a pure state-to-string formatter, NOT genuinely event-loop-bound
+//! like `state_enter` - see `get_mode`'s own doc comment for exactly
+//! which of its branches are decidable today vs. still unreachable).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -369,6 +375,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
+        m.insert(&b"mode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_mode });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3309,6 +3316,38 @@ fn f_getcharsearch(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
 }
 
+/// Whether `argvars[0]` (if present) is a nonzero `Number`/truthy
+/// `Bool`/nonempty `String` (`non_zero_arg`, `funcs.c`) - used by
+/// `mode()` to decide whether to report the full mode string or just
+/// its first character. Missing entirely (`argvars` shorter than 1)
+/// is treated the same as the original's own `VAR_UNKNOWN` case:
+/// `false`.
+fn non_zero_arg(argvars: &[TypvalT]) -> bool {
+    match argvars.first().map(|tv| &tv.value) {
+        Some(TypvalValue::Number(n)) => *n != 0,
+        Some(TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True)) => true,
+        Some(TypvalValue::String(Some(s))) => !s.is_empty(),
+        _ => false,
+    }
+}
+
+/// `mode([{expr}])` - a short string describing the current mode
+/// (`f_mode`, `funcs.c`), via the already-translated
+/// [`crate::state::get_mode`]. Reports only the first character
+/// unless `{expr}` is a nonzero `Number`/truthy `Bool`/nonempty
+/// `String` (checked via [`non_zero_arg`]).
+///
+/// # Safety
+/// Forwarded from [`crate::state::get_mode`]'s own safety doc.
+unsafe fn f_mode(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut buf = unsafe { crate::state::get_mode() };
+    if !non_zero_arg(argvars) {
+        buf.truncate(1);
+    }
+    rettv.value = TypvalValue::String(Some(buf));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4075,6 +4114,7 @@ mod tests {
             "did_filetype",
             "garbagecollect",
             "getcharsearch",
+            "mode",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6847,5 +6887,54 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_get_number(&(*until_item).di_tv), 0);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // --- f_mode / non_zero_arg ---
+
+    #[test]
+    fn non_zero_arg_missing_is_false() {
+        assert!(!non_zero_arg(&[]));
+    }
+
+    #[test]
+    fn non_zero_arg_nonzero_number_is_true() {
+        assert!(non_zero_arg(&[num(1)]));
+        assert!(!non_zero_arg(&[num(0)]));
+    }
+
+    #[test]
+    fn non_zero_arg_nonempty_string_is_true() {
+        assert!(non_zero_arg(&[string(b"x")]));
+        assert!(!non_zero_arg(&[string(b"")]));
+    }
+
+    #[test]
+    fn mode_default_reports_only_the_first_character() {
+        let mut b = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut b as *mut crate::buffer_defs::BufT);
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::REPLACE as i32;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mode(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"R".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+    }
+
+    #[test]
+    fn mode_with_nonzero_arg_reports_the_full_string() {
+        let mut b = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut b as *mut crate::buffer_defs::BufT);
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::REPLACE as i32;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mode(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"R".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::VREPLACE as i32;
+        unsafe { f_mode(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"Rv".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
     }
 }
