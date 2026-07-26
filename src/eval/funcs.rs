@@ -338,6 +338,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"charidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_charidx });
         m.insert(&b"strcharpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strcharpart });
         m.insert(&b"getpid"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getpid });
+        m.insert(&b"tr"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_tr });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3109,6 +3110,95 @@ fn f_getpid(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(crate::os::env::os_get_pid());
 }
 
+/// `tr({src}, {fromstr}, {tostr})` - `{src}` with every character
+/// that appears in `{fromstr}` replaced by the character at the same
+/// POSITION in `{tostr}` (`f_tr`, `strings.c`). A character not found
+/// in `{fromstr}` is copied through unchanged. `{fromstr}`/`{tostr}`
+/// must have the same number of (multi-byte) characters, and this is
+/// checked exactly once: the first time a `{src}` character is found
+/// that does NOT match `{fromstr}` (matching the original's own
+/// `first`-gated check exactly, including its real quirk: if every
+/// `{src}` character happens to match `{fromstr}`, the length
+/// mismatch is never detected at all). On a real mismatch, the result
+/// is an empty String (`None`), matching the original's own error
+/// path (its `semsg` display omitted, matching this module's
+/// established "skip the message, keep the state" policy).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`crate::mbyte::utfc_ptr2len`]).
+unsafe fn f_tr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+
+    let in_str = crate::eval::typval::tv_get_string(&argvars[0]);
+    let fromstr = crate::eval::typval::tv_get_string(&argvars[1]);
+    let tostr = crate::eval::typval::tv_get_string(&argvars[2]);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let char_len = |s: &[u8]| -> usize { usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(s) }).unwrap_or(1).max(1) };
+
+    let mut out = Vec::new();
+    let mut first = true;
+    let mut pos = 0usize;
+
+    while pos < in_str.len() && in_str[pos] != 0 {
+        let inlen = char_len(&in_str[pos..]);
+        let inlen = inlen.min(in_str.len() - pos);
+        let mut matched = false;
+        let mut copy_from_to: Option<(usize, usize)> = None;
+        let mut idx: i64 = 0;
+        let mut fpos = 0usize;
+
+        while fpos < fromstr.len() && fromstr[fpos] != 0 {
+            let fromlen = char_len(&fromstr[fpos..]).min(fromstr.len() - fpos);
+            if fromlen == inlen && in_str[pos..pos + inlen] == fromstr[fpos..fpos + inlen] {
+                matched = true;
+                let mut tpos = 0usize;
+                let mut tidx = idx;
+                while tpos < tostr.len() && tostr[tpos] != 0 {
+                    let tolen = char_len(&tostr[tpos..]).min(tostr.len() - tpos);
+                    if tidx == 0 {
+                        copy_from_to = Some((tpos, tolen));
+                        break;
+                    }
+                    tidx -= 1;
+                    tpos += tolen;
+                }
+                if copy_from_to.is_none() {
+                    // tostr is shorter than fromstr.
+                    rettv.value = TypvalValue::String(None);
+                    return;
+                }
+                break;
+            }
+            idx += 1;
+            fpos += fromlen;
+        }
+
+        if first && !matched {
+            first = false;
+            let mut tpos = 0usize;
+            while tpos < tostr.len() && tostr[tpos] != 0 {
+                let tolen = char_len(&tostr[tpos..]).min(tostr.len() - tpos);
+                idx -= 1;
+                tpos += tolen;
+            }
+            if idx != 0 {
+                rettv.value = TypvalValue::String(None);
+                return;
+            }
+        }
+
+        match copy_from_to {
+            Some((tp, tl)) => out.extend_from_slice(&tostr[tp..tp + tl]),
+            None => out.extend_from_slice(&in_str[pos..pos + inlen]),
+        }
+
+        pos += inlen;
+    }
+
+    rettv.value = TypvalValue::String(Some(out));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3864,6 +3954,7 @@ mod tests {
             "charidx",
             "strcharpart",
             "getpid",
+            "tr",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6456,5 +6547,66 @@ mod tests {
         f_getpid(&[], &mut rettv);
         let TypvalValue::Number(n) = rettv.value else { panic!("expected a Number") };
         assert!(n > 0);
+    }
+
+    // --- f_tr ---
+
+    #[test]
+    fn tr_matches_the_official_docs_example() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_tr(&[string(b"hello there"), string(b"ht"), string(b"HT")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"Hello THere".to_vec())));
+    }
+
+    #[test]
+    fn tr_keeps_unmatched_characters_as_is() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_tr(&[string(b"abc"), string(b"xyz"), string(b"XYZ")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"abc".to_vec())));
+    }
+
+    #[test]
+    fn tr_detects_a_real_length_mismatch() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // "hello" contains no 'a'/'b', so the first character ('h')
+        // triggers the one-time fromstr/tostr length check: fromstr
+        // "ab" has 2 characters, tostr "c" has 1 - a real mismatch.
+        unsafe { f_tr(&[string(b"hello"), string(b"ab"), string(b"c")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn tr_does_not_detect_a_mismatch_when_every_character_matches() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // A faithfully-preserved original quirk: fromstr "ab" (2
+        // chars) vs tostr "x" (1 char) technically mismatch, but
+        // since "aa" only ever matches 'a' (never hits the
+        // first-unmatched-character check), the mismatch is NEVER
+        // detected - both 'a's map to tostr's own first (and only)
+        // character.
+        unsafe { f_tr(&[string(b"aa"), string(b"ab"), string(b"x")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"xx".to_vec())));
+    }
+
+    #[test]
+    fn tr_translates_a_multibyte_character() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_tr(&[string("a一b".as_bytes()), string("一".as_bytes()), string(b"X")], &mut rettv);
+        }
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"aXb".to_vec())));
+    }
+
+    #[test]
+    fn tr_empty_input_is_an_empty_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_tr(&[string(b""), string(b"ab"), string(b"xy")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
     }
 }
