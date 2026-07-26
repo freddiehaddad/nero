@@ -194,13 +194,15 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (15 functions so
-//! far - `len()`/`type()`/`empty()`/`and()`/`or()`/`xor()`/`abs()`/
-//! `max()`/`min()`/`char2nr()`/`nr2char()`/`str2float()`/`str2nr()`/
-//! `str2list()`/`list2str()` - the start of a long tail, `eval/funcs.c`
-//! itself implements ~641 builtins). A user-function-SHAPED name (not
-//! recognized as builtin) still correctly, gracefully `FAIL`s today
-//! (`find_func` finds nothing, since nothing parses `:function` yet) -
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (29 functions so
+//! far, including a full cluster of `float_op_wrapper`-style math
+//! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
+//! original handful - the start of a long tail, `eval/funcs.c` itself
+//! implements ~641 builtins; see `eval/funcs.rs`'s own module doc
+//! comment for the full current list). A user-function-SHAPED name
+//! (not recognized as builtin) still correctly, gracefully `FAIL`s
+//! today (`find_func` finds nothing, since nothing parses `:function`
+//! yet) -
 //! genuinely correct, not a stub; only if `find_func` somehow ever
 //! returned a real, non-null `UfuncT` would `call_func` reach its own
 //! `unimplemented!()` (needs `call_user_func_check`, the whole
@@ -6512,6 +6514,31 @@ mod tests {
             eval_str(b"list2str(str2list(\"hi\"))").1.value,
             TypvalValue::String(Some(b"hi".to_vec()))
         );
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_float_math_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"sqrt(100)").1.value, TypvalValue::Float(10.0));
+        assert_eq!(eval_str(b"floor(1.5)").1.value, TypvalValue::Float(1.0));
+        // Epsilon comparison, not exact equality: pow() is a
+        // libm-delegated transcendental function whose last-bit
+        // rounding can legitimately differ slightly between
+        // execution environments (e.g. Miri's own interpreter vs the
+        // native platform's libm) - see eval::funcs::tests's own
+        // pow_of_known_values comment for the concrete example this
+        // was caught from.
+        let TypvalValue::Float(pow_result) = eval_str(b"pow(2, 8)").1.value else { panic!("expected a Float") };
+        assert!((pow_result - 256.0).abs() < 1e-9, "{pow_result} not close to 256.0");
+        assert_eq!(eval_str(b"float2nr(3.9)").1.value, TypvalValue::Number(3));
+        // sqrt(sin(0) + 4) == 2.0 - proves a float builtin's result
+        // feeds correctly into an enclosing arithmetic expression AND
+        // into another builtin call's own argument position.
+        assert_eq!(eval_str(b"sqrt(sin(0) + 4)").1.value, TypvalValue::Float(2.0));
 
         reset_globals_for_test();
     }

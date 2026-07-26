@@ -46,13 +46,27 @@
 //! (`handle_subscript`'s own "->name()" real caller) isn't translated
 //! yet either.
 //!
-//! Pure-float builtins (`sin()`/`sqrt()`/`pow()`/etc., the original's
-//! own `float_op_wrapper`/`EvalFuncData.func_float` dispatch) are
-//! deliberately NOT started yet: `func: VimLFuncT` has no function-
-//! pointer-passing equivalent of `EvalFuncData` today, so adding even
-//! one such builtin would first need widening [`EvalFuncDefT`] itself -
-//! a small but real design decision better made once several such
-//! functions are being added together, not for just one.
+//! Also translated: a full cluster of `float_op_wrapper`-style pure-
+//! float builtins - `sin()`/`cos()`/`tan()`/`asin()`/`acos()`/`atan()`/
+//! `sinh()`/`cosh()`/`tanh()`/`sqrt()`/`exp()`/`log()`/`log10()`/
+//! `floor()`/`ceil()`/`round()`/`trunc()` (single-argument), `atan2()`/
+//! `pow()`/`fmod()` (two-argument), and `float2nr()`. The original
+//! dispatches ALL of these through ONE shared C function
+//! (`float_op_wrapper`), selected per-entry via an `EvalFuncData
+//! .func_float` function pointer stored directly in the generated
+//! `functions[]` table itself - contrary to this module's own earlier
+//! doc comment (since corrected), this does NOT actually require
+//! widening [`EvalFuncDefT`]/[`VimLFuncT`] at all: each `f_sin`/
+//! `f_cos`/etc. below is instead its own tiny function that already
+//! "bakes in" which specific `f64` method to call, delegating to a
+//! shared private `float_op_wrapper`/`float_op2_wrapper` helper pair
+//! that only need a plain function-pointer parameter - same data (a
+//! name maps to a specific float transform), a different but
+//! functionally-identical mechanism, matching this module's own
+//! already-established `FUNCTIONS`-table-vs-perfect-hash precedent.
+//! Needed a new [`crate::eval::typval::tv_get_float_chk`] (the
+//! original's own `tv_get_float_chk`, an explicit-success/failure
+//! sibling of the already-translated [`crate::eval::typval::tv_get_float`]).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -107,6 +121,27 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"str2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_str2nr });
         m.insert(&b"str2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_str2list });
         m.insert(&b"list2str"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_list2str });
+        m.insert(&b"sin"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sin });
+        m.insert(&b"cos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_cos });
+        m.insert(&b"tan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_tan });
+        m.insert(&b"asin"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_asin });
+        m.insert(&b"acos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_acos });
+        m.insert(&b"atan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_atan });
+        m.insert(&b"sinh"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sinh });
+        m.insert(&b"cosh"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_cosh });
+        m.insert(&b"tanh"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_tanh });
+        m.insert(&b"sqrt"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sqrt });
+        m.insert(&b"exp"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exp });
+        m.insert(&b"log"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_log });
+        m.insert(&b"log10"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_log10 });
+        m.insert(&b"floor"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_floor });
+        m.insert(&b"ceil"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_ceil });
+        m.insert(&b"round"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_round });
+        m.insert(&b"trunc"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_trunc });
+        m.insert(&b"atan2"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_atan2 });
+        m.insert(&b"pow"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_pow });
+        m.insert(&b"fmod"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_fmod });
+        m.insert(&b"float2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_float2nr });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -574,6 +609,181 @@ unsafe fn f_list2str(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(result));
 }
 
+/// Apply a single-argument `f64` math function to `argvars[0]`,
+/// storing the result as a `Float` (`float_op_wrapper`).
+///
+/// The original dispatches EVERY one of `sin()`/`cos()`/`sqrt()`/etc.
+/// through this ONE shared C function, selected via a `func_float`
+/// function pointer stored in each entry of the generated `functions[]`
+/// table itself (`EvalFuncData.func_float`). This crate's own
+/// `VimLFuncT` has no such extra per-entry payload - instead, each
+/// `f_sin`/`f_cos`/etc. below is its own tiny function that already
+/// "bakes in" which `f64` method to call, so `float_op_wrapper` only
+/// needs `argvars`/`rettv` plus a plain function pointer parameter,
+/// not a whole widened table-entry shape. Same data (a name maps to a
+/// specific one-argument float transform), a different but
+/// functionally-identical mechanism - matching this module's own
+/// established `FUNCTIONS`-table-vs-perfect-hash precedent.
+///
+/// Returns `0.0` if `argvars[0]` isn't Number/Float-shaped, matching
+/// the original's own fallback exactly (its own `E808` message is
+/// omitted, see `tv_get_float_chk`'s own doc comment).
+fn float_op_wrapper(argvars: &[TypvalT], rettv: &mut TypvalT, f: fn(f64) -> f64) {
+    let result = crate::eval::typval::tv_get_float_chk(&argvars[0]).map_or(0.0, f);
+    rettv.value = TypvalValue::Float(result);
+}
+
+/// Apply a two-argument `f64` math function to `argvars[0]`/
+/// `argvars[1]`, storing the result as a `Float` - shared by
+/// `atan2()`/`pow()`/`fmod()`, each of which hand-expands the
+/// equivalent of [`float_op_wrapper`] inline in the original (there is
+/// no separate, named 2-argument sibling of `float_op_wrapper` in the
+/// original itself).
+fn float_op2_wrapper(argvars: &[TypvalT], rettv: &mut TypvalT, f: fn(f64, f64) -> f64) {
+    use crate::eval::typval::tv_get_float_chk;
+    let result = match (tv_get_float_chk(&argvars[0]), tv_get_float_chk(&argvars[1])) {
+        (Some(fx), Some(fy)) => f(fx, fy),
+        _ => 0.0,
+    };
+    rettv.value = TypvalValue::Float(result);
+}
+
+/// `sin({expr})` (`f_sin`).
+fn f_sin(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::sin);
+}
+
+/// `cos({expr})` (`f_cos`).
+fn f_cos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::cos);
+}
+
+/// `tan({expr})` (`f_tan`).
+fn f_tan(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::tan);
+}
+
+/// `asin({expr})` (`f_asin`).
+fn f_asin(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::asin);
+}
+
+/// `acos({expr})` (`f_acos`).
+fn f_acos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::acos);
+}
+
+/// `atan({expr})` (`f_atan`).
+fn f_atan(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::atan);
+}
+
+/// `sinh({expr})` (`f_sinh`).
+fn f_sinh(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::sinh);
+}
+
+/// `cosh({expr})` (`f_cosh`).
+fn f_cosh(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::cosh);
+}
+
+/// `tanh({expr})` (`f_tanh`).
+fn f_tanh(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::tanh);
+}
+
+/// `sqrt({expr})` (`f_sqrt`).
+fn f_sqrt(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::sqrt);
+}
+
+/// `exp({expr})` (`f_exp`).
+fn f_exp(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::exp);
+}
+
+/// `log({expr})` - natural logarithm (`f_log`).
+fn f_log(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::ln);
+}
+
+/// `log10({expr})` - base-10 logarithm (`f_log10`).
+fn f_log10(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::log10);
+}
+
+/// `floor({expr})` (`f_floor`).
+fn f_floor(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::floor);
+}
+
+/// `ceil({expr})` (`f_ceil`).
+fn f_ceil(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::ceil);
+}
+
+/// `round({expr})` - round half away from zero (`f_round`). Rust's own
+/// `f64::round` uses the identical "round half away from zero" rule as
+/// the original's own C `round()`, unlike `f64::round_ties_even`.
+fn f_round(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::round);
+}
+
+/// `trunc({expr})` (`f_trunc`).
+fn f_trunc(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op_wrapper(argvars, rettv, f64::trunc);
+}
+
+/// `atan2({expr1}, {expr2})` (`f_atan2`).
+fn f_atan2(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op2_wrapper(argvars, rettv, f64::atan2);
+}
+
+/// `pow({x}, {y})` (`f_pow`).
+fn f_pow(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op2_wrapper(argvars, rettv, f64::powf);
+}
+
+/// `fmod({expr1}, {expr2})` (`f_fmod`). Rust's own `%` operator on
+/// `f64` is specified to match C's `fmod()` exactly (truncating
+/// division's remainder, sign matching the dividend) - NOT the
+/// distinct, round-to-nearest-even IEEE 754 `remainder()` operation
+/// (`f64::rem_euclid`'s own always-nonnegative result is a third,
+/// again-different operation) - verified directly with a dedicated
+/// test using a negative dividend, the one input shape where all
+/// three would disagree.
+fn f_fmod(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    float_op2_wrapper(argvars, rettv, |a, b| a % b);
+}
+
+/// `float2nr({expr})` - convert a Float to a Number, clamping to the
+/// representable `Number` range rather than following the original's
+/// own `(varnumber_T)f` cast for a wildly out-of-range Float, which is
+/// real (if effectively unreachable given the explicit clamp checks
+/// immediately before it) signed-overflow UB in C (`f_float2nr`).
+///
+/// A `NaN` input reaches the final `f as VarnumberT` branch (both
+/// clamp comparisons are false for `NaN`, matching the original's own
+/// identical fallthrough) - Rust's own `as` cast saturates `NaN` to
+/// `0` (well-defined, unlike the original's own UB for this exact
+/// input), which this translation keeps rather than inventing new
+/// behavior to paper over a case the original itself never defines.
+fn f_float2nr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let Some(f) = crate::eval::typval::tv_get_float_chk(&argvars[0]) else {
+        return;
+    };
+    let max = crate::eval::typval_defs::VARNUMBER_MAX as f64;
+    let n = if f <= -max + f64::EPSILON {
+        -crate::eval::typval_defs::VARNUMBER_MAX
+    } else if f >= max - f64::EPSILON {
+        crate::eval::typval_defs::VARNUMBER_MAX
+    } else {
+        f as crate::eval::typval_defs::VarnumberT
+    };
+    rettv.value = TypvalValue::Number(n);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +794,10 @@ mod tests {
 
     fn string(s: &[u8]) -> TypvalT {
         TypvalT { value: TypvalValue::String(Some(s.to_vec())), ..Default::default() }
+    }
+
+    fn float(f: f64) -> TypvalT {
+        TypvalT { value: TypvalValue::Float(f), ..Default::default() }
     }
 
     // --- find_internal_func / call_internal_func ---
@@ -1236,8 +1450,229 @@ mod tests {
             "str2nr",
             "str2list",
             "list2str",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "sinh",
+            "cosh",
+            "tanh",
+            "sqrt",
+            "exp",
+            "log",
+            "log10",
+            "floor",
+            "ceil",
+            "round",
+            "trunc",
+            "atan2",
+            "pow",
+            "fmod",
+            "float2nr",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
+    }
+
+    // --- single-argument float math builtins ---
+
+    #[test]
+    fn sin_cos_tan_of_zero() {
+        let mut rettv = TypvalT::default();
+        f_sin(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+        f_cos(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+        f_tan(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    #[test]
+    fn asin_acos_atan_of_known_values() {
+        let mut rettv = TypvalT::default();
+        f_asin(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+        f_acos(&[num(1)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+        f_atan(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    #[test]
+    fn sinh_cosh_tanh_of_zero() {
+        let mut rettv = TypvalT::default();
+        f_sinh(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+        f_cosh(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+        f_tanh(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    #[test]
+    fn sqrt_of_a_perfect_square() {
+        let mut rettv = TypvalT::default();
+        f_sqrt(&[num(100)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(10.0));
+    }
+
+    #[test]
+    fn sqrt_of_a_negative_number_is_nan() {
+        let mut rettv = TypvalT::default();
+        f_sqrt(&[float(-4.0)], &mut rettv);
+        let TypvalValue::Float(f) = rettv.value else { panic!("expected a Float") };
+        assert!(f.is_nan());
+    }
+
+    #[test]
+    fn exp_of_zero_is_one() {
+        let mut rettv = TypvalT::default();
+        f_exp(&[num(0)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+    }
+
+    #[test]
+    fn log_is_the_natural_logarithm() {
+        let mut rettv = TypvalT::default();
+        f_log(&[float(1.0_f64.exp())], &mut rettv);
+        let TypvalValue::Float(f) = rettv.value else { panic!("expected a Float") };
+        assert!((f - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn log10_of_known_powers_of_ten() {
+        // Epsilon comparison, not exact equality: log10 is a
+        // libm-delegated transcendental function whose last-bit
+        // rounding can legitimately differ slightly between Miri's
+        // interpreter and the native platform's own libm (confirmed:
+        // Miri gives log10(1000) as 2.9999999999999996, not exactly
+        // 3.0) - this is an execution-environment precision quirk, not
+        // a logic bug, so the test itself should tolerate it rather
+        // than assert bit-exact equality.
+        fn assert_close(actual: &TypvalValue, expected: f64) {
+            let TypvalValue::Float(f) = *actual else { panic!("expected a Float") };
+            assert!((f - expected).abs() < 1e-9, "{f} not close to {expected}");
+        }
+
+        let mut rettv = TypvalT::default();
+        f_log10(&[num(1000)], &mut rettv);
+        assert_close(&rettv.value, 3.0);
+        f_log10(&[float(0.01)], &mut rettv);
+        assert_close(&rettv.value, -2.0);
+    }
+
+    #[test]
+    fn floor_ceil_round_trunc_of_a_fraction() {
+        let mut rettv = TypvalT::default();
+        f_floor(&[float(1.856)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+        f_ceil(&[float(1.856)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(2.0));
+        f_round(&[float(4.5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(5.0));
+        f_trunc(&[float(1.856)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+    }
+
+    #[test]
+    fn floor_ceil_round_trunc_of_negative_numbers() {
+        // Matches the original's own documented examples exactly:
+        // ceil(-5.456) == -5.0, round(-4.5) == -5.0 (away from zero).
+        let mut rettv = TypvalT::default();
+        f_ceil(&[float(-5.456)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(-5.0));
+        f_floor(&[float(-5.456)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(-6.0));
+        f_round(&[float(-4.5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(-5.0));
+        f_trunc(&[float(-5.456)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(-5.0));
+    }
+
+    #[test]
+    fn float_op_wrapper_functions_return_zero_for_non_numeric_input() {
+        let mut rettv = TypvalT::default();
+        f_sin(&[string(b"not a number")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    // --- two-argument float math builtins ---
+
+    #[test]
+    fn atan2_of_known_values() {
+        let mut rettv = TypvalT::default();
+        f_atan2(&[num(0), num(1)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    #[test]
+    fn pow_of_known_values() {
+        // Epsilon comparison, not exact equality - see
+        // log10_of_known_powers_of_ten's own comment: pow(2, 10) is
+        // 1024.0000000000002 under Miri's own libm, not exactly
+        // 1024.0, a real (if tiny) execution-environment precision
+        // difference for this transcendental function, not a bug.
+        let mut rettv = TypvalT::default();
+        f_pow(&[num(2), num(10)], &mut rettv);
+        let TypvalValue::Float(f) = rettv.value else { panic!("expected a Float") };
+        assert!((f - 1024.0).abs() < 1e-9, "{f} not close to 1024.0");
+    }
+
+    #[test]
+    fn fmod_matches_truncating_c_style_remainder_not_ieee_remainder() {
+        // fmod(-5.0, 3.0) == -2.0 (truncating division, sign matches
+        // the dividend) - this is the ONE input shape that would
+        // distinguish fmod from f64::rem_euclid (which would give 1.0)
+        // and from the IEEE round-to-even `remainder()` operation
+        // (which would also give 1.0 here) - proves this crate's `%`
+        // really does match C's fmod, not a different remainder op.
+        let mut rettv = TypvalT::default();
+        f_fmod(&[float(-5.0), num(3)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(-2.0));
+        f_fmod(&[float(5.0), num(3)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(2.0));
+    }
+
+    #[test]
+    fn two_arg_float_functions_return_zero_when_either_argument_is_non_numeric() {
+        let mut rettv = TypvalT::default();
+        f_pow(&[num(2), string(b"x")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+        f_pow(&[string(b"x"), num(2)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    // --- f_float2nr ---
+
+    #[test]
+    fn float2nr_truncates_toward_zero() {
+        let mut rettv = TypvalT::default();
+        f_float2nr(&[float(3.9)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+        f_float2nr(&[float(-3.9)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-3));
+    }
+
+    #[test]
+    fn float2nr_clamps_a_huge_positive_float_to_varnumber_max() {
+        let mut rettv = TypvalT::default();
+        f_float2nr(&[float(1e300)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(crate::eval::typval_defs::VARNUMBER_MAX));
+    }
+
+    #[test]
+    fn float2nr_clamps_a_huge_negative_float_to_negative_varnumber_max() {
+        let mut rettv = TypvalT::default();
+        f_float2nr(&[float(-1e300)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-crate::eval::typval_defs::VARNUMBER_MAX));
+    }
+
+    #[test]
+    fn float2nr_non_numeric_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        f_float2nr(&[string(b"not a number")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(999));
     }
 }

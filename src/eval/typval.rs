@@ -419,6 +419,22 @@ pub fn tv_get_float(tv: &TypvalT) -> f64 {
     }
 }
 
+/// Get the float value of `tv`, with an explicit success/failure
+/// result (`tv_get_float_chk`). `None` for anything other than a
+/// `Number`/`Float` - the original's own `E808: Number or Float
+/// required` message is omitted, matching this module's established
+/// "skip the display, keep the state" policy (see [`tv_get_float`]'s
+/// own doc comment for the same note on its own silent `0.0`
+/// fallback).
+#[must_use]
+pub fn tv_get_float_chk(tv: &TypvalT) -> Option<f64> {
+    match tv.value {
+        TypvalValue::Number(n) => Some(n as f64),
+        TypvalValue::Float(f) => Some(f),
+        _ => None,
+    }
+}
+
 /// Get the string value of a "stringish" Vimscript object
 /// (`tv_get_string_chk`).
 ///
@@ -3694,6 +3710,19 @@ mod tests {
             let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value };
             assert_eq!(tv_get_float(&tv), 0.0);
         }
+    }
+
+    #[test]
+    fn tv_get_float_chk_number_and_float_succeed() {
+        assert_eq!(tv_get_float_chk(&number_tv(7)), Some(7.0));
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(2.5) };
+        assert_eq!(tv_get_float_chk(&tv), Some(2.5));
+    }
+
+    #[test]
+    fn tv_get_float_chk_everything_else_is_none() {
+        let tv = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::String(Some(b"1.5".to_vec())) };
+        assert_eq!(tv_get_float_chk(&tv), None);
     }
 
     #[test]
