@@ -219,9 +219,17 @@
 //! Also `byteidx()`/`byteidxcomp()` (the byte index of the Nth
 //! character, composing folded-in vs. separate), `charidx()` (inverse:
 //! character index of a given byte), `strcharpart()` (like `strpart()`
-//! but character- rather than byte-counted), and `getpid()` (the
+//! but character- rather than byte-counted), `getpid()` (the
 //! process ID, via the already-existing
-//! [`crate::os::env::os_get_pid`]).
+//! [`crate::os::env::os_get_pid`]), `tr()` (position-based character
+//! translation, `strings.c`), and `hostname()` (another Lua-
+//! implemented builtin like `environ()` - `func_lua = 'f_hostname'` in
+//! `eval.lua` - via the already-existing
+//! [`crate::os::env::os_get_hostname`]). `isdirectory()`/
+//! `isabsolutepath()`/`delete()`/`pathshorten()` (originating from
+//! `eval/fs.c`/`path.c`) live in their own mirrored files
+//! ([`crate::eval::fs`]/[`crate::path`]) but are registered in this
+//! module's own `FUNCTIONS` table.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -343,6 +351,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"isabsolutepath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_isabsolutepath });
         m.insert(&b"delete"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_delete });
         m.insert(&b"pathshorten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_pathshorten });
+        m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3203,6 +3212,15 @@ unsafe fn f_tr(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(out));
 }
 
+/// `hostname()` - the hostname of the machine Nvim is running on
+/// (`f_hostname`, no C implementation - `func_lua = 'f_hostname'` in
+/// `eval.lua`, delegating to `runtime/lua/vim/_core/vimfn.lua`'s own
+/// `M.f_hostname`, which calls `vim.uv.os_gethostname()`), via the
+/// already-existing [`crate::os::env::os_get_hostname`].
+fn f_hostname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(Some(crate::os::env::os_get_hostname()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3963,6 +3981,7 @@ mod tests {
             "isabsolutepath",
             "delete",
             "pathshorten",
+            "hostname",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6616,5 +6635,15 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_tr(&[string(b""), string(b"ab"), string(b"xy")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+    }
+
+    // --- f_hostname ---
+
+    #[test]
+    fn hostname_is_a_nonempty_string() {
+        let mut rettv = TypvalT::default();
+        f_hostname(&[], &mut rettv);
+        let TypvalValue::String(Some(s)) = rettv.value else { panic!("expected a String") };
+        assert!(!s.is_empty());
     }
 }
