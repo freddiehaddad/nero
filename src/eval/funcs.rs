@@ -130,6 +130,10 @@
 //! semantics exactly: a container referenced more than once is only
 //! copied once by default, or once per occurrence with
 //! `deepcopy({expr}, 1)`).
+//!
+//! Also translated (from `eval/list.c`, not `funcs.c` itself):
+//! `add()` (append one item to a `List`/`Blob`, returning the SAME
+//! container).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -218,6 +222,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
+        m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1677,6 +1682,55 @@ unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::eval::var_item_copy(std::ptr::null(), &argvars[0], rettv, true, copy_id) };
 }
 
+/// `add({object}, {expr})` - append `{expr}` to `{object}` (a `List`
+/// or `Blob`) (`f_add`, `eval/list.c`).
+///
+/// Returns the resulting `List`/`Blob` - the SAME container, mutated
+/// in place (not a copy) - or `1` ("failed") if `{object}` is neither
+/// (the original's own `emsg(_(e_listblobreq))` is omitted - message
+/// display, not tractable; the identical default `rettv` value is
+/// kept).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Blob`-typed with a non-null
+/// pointer, that pointer must be valid.
+unsafe fn f_add(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(1); // Default: failed.
+    match &argvars[0].value {
+        TypvalValue::List(l) => {
+            let l = *l;
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { crate::eval::typval::tv_list_locked(l) };
+            if !crate::eval::typval::value_check_lock(locked, None) {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::eval::typval::tv_list_append_tv(l, &argvars[1]);
+                    crate::eval::typval::tv_copy(&argvars[0], rettv);
+                }
+            }
+        }
+        TypvalValue::Blob(b) => {
+            let b = *b;
+            if !b.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                let locked = unsafe { (*b).bv_lock };
+                if !crate::eval::typval::value_check_lock(locked, None) {
+                    let mut error = false;
+                    let n = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error));
+                    if !error {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe {
+                            (*b).bv_ga.ga_append(n as u8);
+                            crate::eval::typval::tv_copy(&argvars[0], rettv);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2377,6 +2431,7 @@ mod tests {
             "count",
             "copy",
             "deepcopy",
+            "add",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -3586,5 +3641,122 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_deepcopy(&[num(7)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    // --- f_add ---
+
+    #[test]
+    fn add_appends_to_a_list_and_returns_the_same_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        // Not ref'd upfront - f_add's own successful-path tv_copy(&argvars[0],
+        // rettv) is the ONE reference this test needs to release at
+        // the end, matching f_reverse's own already-established test
+        // pattern (tv_list_set_ret/tv_copy both increment refcount
+        // exactly once on their own success path).
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(2)];
+        unsafe { f_add(&args, &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(l, list); // same list, mutated in place.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            let item2 = (*item).li_next;
+            assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn add_appends_a_list_as_a_single_nested_item_not_concatenated() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *list, 1) };
+        // `inner` is not ref'd upfront either - f_add's own
+        // tv_list_append_tv(l, &argvars[1]) internally tv_copy's
+        // argvars[1] (List(inner)), incrementing inner's refcount
+        // exactly once; unreffing `list` at the end (which then frees
+        // it, given `list` itself is also only ref'd via f_add's own
+        // rettv copy) cascades into releasing that same reference via
+        // tv_list_free_contents, so inner needs no separate unref here.
+        let inner = crate::eval::typval::tv_list_alloc(0);
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::List(list), ..Default::default() },
+            TypvalT { value: TypvalValue::List(inner), ..Default::default() },
+        ];
+        unsafe { f_add(&args, &mut rettv) };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(list), 2);
+            let item = crate::eval::typval::tv_list_first(list);
+            let item2 = (*item).li_next;
+            let TypvalValue::List(nested) = (*item2).li_tv.value else { panic!("expected a nested List") };
+            assert_eq!(nested, inner); // appended by reference, not flattened.
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn add_to_a_locked_list_leaves_it_untouched_and_returns_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            (*list).lv_lock = crate::eval::typval_defs::VarLockStatus::Locked;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1)];
+        unsafe { f_add(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1)); // failed.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(list), 0);
+            crate::eval::typval::tv_list_unref(list);
+        }
+    }
+
+    #[test]
+    fn add_appends_a_byte_to_a_blob_and_returns_the_same_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_refcount += 1;
+            (*blob).bv_ga.ga_data = vec![1, 2];
+            (*blob).bv_ga.ga_len = 2;
+            (*blob).bv_ga.ga_maxlen = 2;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(3)];
+        unsafe { f_add(&args, &mut rettv) };
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        assert_eq!(b, blob);
+        unsafe {
+            // ga_grow may over-allocate ga_data's own capacity beyond
+            // ga_len (matching the original growarray's own amortized-
+            // growth strategy) - tv_blob_len/tv_blob_get, not a raw
+            // ga_data comparison, are the correct way to inspect a
+            // blob's own LOGICAL contents.
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 3);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 0), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 1), 2);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 2), 3);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn add_to_a_null_blob_returns_1() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(std::ptr::null_mut()), ..Default::default() }, num(1)];
+        unsafe { f_add(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn add_to_a_non_list_non_blob_returns_1() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_add(&[num(5), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
     }
 }

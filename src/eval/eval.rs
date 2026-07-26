@@ -194,7 +194,7 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (49 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (50 functions so
 //! far, including a full cluster of `float_op_wrapper`-style math
 //! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
 //! original handful - the start of a long tail, `eval/funcs.c` itself
@@ -7023,6 +7023,24 @@ mod tests {
         }
 
         reset_globals_for_test(); // releases g:outer's own List reference.
+    }
+
+    #[test]
+    fn e2e_add_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let (ret, tv) = eval_str(b"add([1, 2], 3)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 3);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        assert_eq!(eval_str(b"add(5, 1)").1.value, TypvalValue::Number(1)); // not a List/Blob.
+
+        reset_globals_for_test();
     }
 
     // --- get_literal_key ---
