@@ -115,6 +115,11 @@
 //! existing `crate::mbyte::utfc_ptr2len`). `copy()`/`deepcopy()`
 //! (needing `tv_dict_copy`/`tv_blob_copy`, neither translated yet)
 //! remain deferred - a natural next candidate once those exist.
+//!
+//! Also translated: `count()` (occurrences of a value in a `String`/
+//! `List`/`Dict`, via three private helpers - `count_string`/
+//! `count_list`/`count_dict` - mirroring the original's own identical
+//! split exactly).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -200,6 +205,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"get"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_get });
         m.insert(&b"index"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_index });
         m.insert(&b"reverse"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reverse });
+        m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1393,6 +1399,170 @@ unsafe fn f_reverse(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Count the number of times `needle` occurs in `haystack`
+/// (`count_string`).
+///
+/// A `None` `haystack`/`needle`, or an empty `needle`, always counts
+/// as `0` - matches the original's own `p == NULL || needle == NULL
+/// || *needle == NUL` guard exactly. A NUL byte inside `haystack`
+/// ends the count early, matching the original's own NUL-terminated
+/// `strstr`/`while (*p != NUL)` scans - the same established
+/// "embedded NUL ends a C-string-modeled scan" idiom used elsewhere in
+/// this module.
+fn count_string(haystack: Option<&[u8]>, needle: Option<&[u8]>, ic: bool) -> crate::eval::typval_defs::VarnumberT {
+    let (Some(haystack), Some(needle)) = (haystack, needle) else {
+        return 0;
+    };
+    if needle.is_empty() {
+        return 0;
+    }
+    let len = haystack.iter().position(|&b| b == 0).unwrap_or(haystack.len());
+    let haystack = &haystack[..len];
+
+    let mut n = 0;
+    let mut pos = 0;
+    if ic {
+        while pos < haystack.len() {
+            if pos + needle.len() <= haystack.len()
+                && crate::mbyte::mb_strnicmp(&haystack[pos..], needle, needle.len()) == 0
+            {
+                n += 1;
+                pos += needle.len();
+            } else {
+                pos += crate::mbyte::utf_ptr2len(&haystack[pos..]).max(1) as usize;
+            }
+        }
+    } else {
+        while let Some(rel) = haystack[pos..].windows(needle.len()).position(|w| w == needle) {
+            n += 1;
+            pos += rel + needle.len();
+        }
+    }
+    n
+}
+
+/// Count the number of times `needle` occurs in `l`, starting at
+/// index `idx` (`count_list`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`.
+/// Forwards [`crate::eval::typval::tv_equal`]'s own safety doc for
+/// every item compared against `needle`.
+unsafe fn count_list(
+    l: *mut crate::eval::typval_defs::ListT,
+    needle: &TypvalT,
+    idx: i32,
+    ic: bool,
+) -> crate::eval::typval_defs::VarnumberT {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::eval::typval::tv_list_len(l) } == 0 {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { crate::eval::typval::tv_list_find(l, idx) };
+    if item.is_null() {
+        // Matches the original's own `E984: List index out of range`
+        // (message display omitted).
+        return 0;
+    }
+
+    let mut n = 0;
+    while !item.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_equal(&(*item).li_tv, needle, ic) } {
+            n += 1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+    }
+    n
+}
+
+/// Count the number of times `needle` occurs among `d`'s own values
+/// (`count_dict`).
+///
+/// # Safety
+/// `d`, if non-null, must be a valid pointer to a live `DictT`.
+/// Forwards [`crate::eval::typval::tv_equal`]'s own safety doc for
+/// every value compared against `needle`.
+unsafe fn count_dict(
+    d: *mut crate::eval::typval_defs::DictT,
+    needle: &TypvalT,
+    ic: bool,
+) -> crate::eval::typval_defs::VarnumberT {
+    if d.is_null() {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut crate::eval::typval_defs::DictitemT> = unsafe { &*d }.dv_index.values().copied().collect();
+    let mut n = 0;
+    for item in items {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_equal(&(*item).di_tv, needle, ic) } {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `count({comp}, {expr} [, {ic} [, {start}]])` - count the number of
+/// times `{expr}` occurs in `{comp}` (a `String`/`List`/`Dict`)
+/// (`f_count`).
+///
+/// `{start}` (the 4th argument) is only ever consulted for a `List`
+/// when `{ic}` (the 3rd argument) was ALSO passed, matching the
+/// original's own nested `argvars[2].v_type != VAR_UNKNOWN &&
+/// argvars[3].v_type != VAR_UNKNOWN` check exactly (the same "a
+/// trailing optional argument is only read when an EARLIER one was
+/// also given" shape [`f_trim`]'s own doc comment already explains).
+/// For a `Dict`, giving BOTH `{ic}` and `{start}` is the original's
+/// own `E118`-style error case (a start index makes no sense for a
+/// `Dict`) - message display omitted, `rettv` simply stays `0`.
+///
+/// Any type other than `String`/`List`/`Dict` (matching the original's
+/// own `semsg(...)` case) also leaves `rettv` at `0`.
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Dict`-typed with a non-null
+/// pointer, that pointer must be valid.
+unsafe fn f_count(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut error = false;
+    let mut ic = 0;
+    if argvars.len() > 2 {
+        ic = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) as i32;
+    }
+
+    let mut n: crate::eval::typval_defs::VarnumberT = 0;
+    if !error {
+        match &argvars[0].value {
+            TypvalValue::String(haystack) => {
+                let needle = crate::eval::typval::tv_get_string_chk(&argvars[1]);
+                n = count_string(haystack.as_deref(), needle.as_deref(), ic != 0);
+            }
+            TypvalValue::List(l) => {
+                let l = *l;
+                let mut idx = 0;
+                if argvars.len() > 3 {
+                    idx = crate::eval::typval::tv_get_number_chk(&argvars[3], Some(&mut error));
+                }
+                if !error {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    n = unsafe { count_list(l, &argvars[1], idx as i32, ic != 0) };
+                }
+            }
+            TypvalValue::Dict(d) => {
+                let d = *d;
+                if !d.is_null() && argvars.len() <= 3 {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    n = unsafe { count_dict(d, &argvars[1], ic != 0) };
+                }
+            }
+            _ => {}
+        }
+    }
+    rettv.value = TypvalValue::Number(n);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2090,6 +2260,7 @@ mod tests {
             "get",
             "index",
             "reverse",
+            "count",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -2896,5 +3067,122 @@ mod tests {
         let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
         unsafe { f_reverse(&[num(5)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- f_count ---
+
+    #[test]
+    fn count_in_a_string_case_sensitive_and_insensitive() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_count(&[string(b"ababab"), string(b"ab")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        unsafe { f_count(&[string(b"ABabAB"), string(b"ab")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { f_count(&[string(b"ABabAB"), string(b"ab"), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn count_in_a_string_with_an_empty_needle_is_zero() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_count(&[string(b"hello"), string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn count_in_a_string_stops_at_an_embedded_nul() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_count(&[string(b"ab\0abab"), string(b"ab")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn count_in_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(4);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1)];
+        unsafe { f_count(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn count_in_a_list_starting_at_an_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(4);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+        }
+        let mut rettv = TypvalT::default();
+        // ic=0, start=2 - both must be given for start to take effect.
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1), num(0), num(2)];
+        unsafe { f_count(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn count_in_a_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item_a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item_a).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_a);
+            let item_b = crate::eval::typval::tv_dict_item_alloc(b"b");
+            (*item_b).di_tv.value = TypvalValue::Number(2);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_b);
+            let item_c = crate::eval::typval::tv_dict_item_alloc(b"c");
+            (*item_c).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item_c);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, num(1)];
+        unsafe { f_count(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn count_in_a_dict_with_both_ic_and_start_is_an_error() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, num(1), num(0), num(0)];
+        unsafe { f_count(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn count_of_a_null_dict_is_zero() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }, num(1)];
+        unsafe { f_count(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn count_of_a_non_container_is_zero() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_count(&[num(5), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 }
