@@ -191,10 +191,18 @@
 //! rather than being misparsed as a dict literal, needs closure/
 //! lambda compilation), a `$VAR` whose value `vim_getenv` can't
 //! resolve directly (needs `expand_env_save`'s own `~`/`~user`/
-//! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment),
-//! and function calls (`eval_func`, needs either the
-//! whole Ex-command execution engine for user-defined functions or
-//! `eval/funcs.c`'s own huge builtin-dispatch table). A byte that
+//! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
+//! Function calls (`eval_func`) are now real for BUILTIN functions only:
+//! `call_func` dispatches through `builtin_function`/`find_internal_func`
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (`len()`/`type()`/
+//! `empty()` so far - the start of a long tail, `eval/funcs.c` itself
+//! implements ~641 builtins). A user-function-SHAPED name (not
+//! recognized as builtin) still correctly, gracefully `FAIL`s today
+//! (`find_func` finds nothing, since nothing parses `:function` yet) -
+//! genuinely correct, not a stub; only if `find_func` somehow ever
+//! returned a real, non-null `UfuncT` would `call_func` reach its own
+//! `unimplemented!()` (needs `call_user_func_check`, the whole
+//! Ex-command execution engine, still unattempted). A byte that
 //! would make `get_name_len` itself report "no name here at all" (e.g.
 //! trailing garbage or an unbalanced closing delimiter) is instead a
 //! real, graceful `FAIL` - exactly matching `get_name_len`'s own
@@ -2800,6 +2808,56 @@ pub unsafe fn eval_env_var(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (
     (OK, consumed)
 }
 
+/// Evaluate a function call: `name(args)` (`eval_func`).
+///
+/// `arg` must point to the `(` itself. `name` is the already-scanned
+/// function/variable name ([`get_name_len`]'s own result).
+///
+/// Only the path reachable from [`eval7`]'s own real call site is
+/// modeled: `basetv` (the base of an `expr->method()` call) is always
+/// implicitly absent here - only method-call syntax
+/// (`handle_subscript`'s own "->name()" case, not yet translated)
+/// would ever supply one. `aborting()` (stopping evaluation early on
+/// an uncaught exception/interrupt, needing the whole exception-
+/// handling subsystem, `ex_eval.c`) is omitted - the identical
+/// `OK`/`FAIL` status from `get_func_tv` is kept regardless, matching
+/// this crate's established "skip the display/early-stop refinement,
+/// keep the underlying state" policy for similar untranslated checks
+/// (e.g. `eval0`'s own dropped `did_emsg`/`called_emsg` gating).
+///
+/// Also omitted: the original's own "if evaluate is false, rettv->v_type
+/// was not set by get_func_tv, but handle_subscript() needs it set to
+/// parse a further v:lua-Partial chain" fix-up - moot here, since
+/// nero's own `handle_subscript` doesn't inspect `rettv`'s type this
+/// way (it already `unimplemented!()`s for any real chained-call
+/// parsing regardless of what `rettv` holds beforehand).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::check_vars`]/
+/// [`crate::eval::userfunc::deref_func_name`]/
+/// [`crate::eval::userfunc::get_func_tv`]'s own safety docs.
+#[must_use]
+pub unsafe fn eval_func(
+    arg: &[u8],
+    evalarg: Option<&mut EvalargT>,
+    name: &[u8],
+    rettv: &mut TypvalT,
+    evaluate: bool,
+) -> (i32, usize) {
+    if !evaluate {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::vars::check_vars(name) };
+    }
+
+    // If "name" is a variable of type Funcref/Partial, use its
+    // contents instead.
+    // SAFETY: forwarded from this function's own safety doc.
+    let (resolved_name, _found_var) = unsafe { crate::eval::userfunc::deref_func_name(name, !evaluate) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::userfunc::get_func_tv(&resolved_name, rettv, arg, evalarg, evaluate) }
+}
+
 /// Recursion depth counter for [`eval7`] - the original's own
 /// function-local `static int recurse = 0`, translated as a
 /// `GlobalCell`, matching `eval/typval.rs`'s `tv_equal`'s established
@@ -2991,12 +3049,11 @@ pub unsafe fn eval7(
                 pos += name_consumed;
 
                 if arg.get(pos) == Some(&b'(') {
-                    // "name(..."  recursive! - needs the whole
-                    // function-call machinery (eval_func/call_func/
-                    // call_user_func/the funccall-frame lifecycle),
-                    // a substantial separate undertaking, not yet
-                    // translated.
-                    unimplemented!("eval7: function calls (eval_func) not yet translated");
+                    // "name(..."  recursive!
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let (r, consumed) = unsafe { eval_func(&arg[pos..], evalarg.as_deref_mut(), name, rettv, evaluate) };
+                    ret = r;
+                    pos += consumed;
                 } else if evaluate {
                     // get value of variable
                     // SAFETY: forwarded from this function's own safety doc.
@@ -6276,12 +6333,105 @@ mod tests {
     }
 
     #[test]
-    fn e2e_function_call_syntax_is_unimplemented() {
+    fn e2e_undefined_function_call_fails_gracefully() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        crate::eval::userfunc::func_init();
+
+        // "Foo" is user-function-shaped (starts uppercase) - find_func
+        // finds nothing (nothing can define a function yet), so this
+        // correctly, gracefully FAILs rather than panicking.
+        let (ret, _) = eval_str(b"Foo()");
+        assert_eq!(ret, FAIL);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_user_defined_function_call_is_unimplemented_when_actually_found() {
+        // Register a bare UfuncT directly in the function hash table
+        // to prove the (currently unreachable in practice, since
+        // nothing parses `:function`) "found a real user function"
+        // branch panics rather than silently doing the wrong thing.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+        crate::eval::userfunc::func_init();
+
+        let mut fp = Box::new(crate::eval::typval_defs::UfuncT {
+            uf_name: b"TestUserFunc\0".to_vec(),
+            ..Default::default()
+        });
+        let fp_ptr = fp.as_mut() as *mut crate::eval::typval_defs::UfuncT;
+        assert_eq!(unsafe { crate::eval::userfunc::func_hashtab_add(fp_ptr) }, OK);
+
+        let result = std::panic::catch_unwind(|| eval_str(b"TestUserFunc()"));
+        assert!(result.is_err(), "expected a panic (call_user_func_check not yet translated)");
+
+        crate::eval::userfunc::func_init();
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_len_builtin_function_call_on_a_string() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();
 
-        let result = std::panic::catch_unwind(|| eval_str(b"Foo()"));
-        assert!(result.is_err(), "expected a panic (eval_func not yet translated)");
+        let (ret, tv) = eval_str(b"len(\"hello\")");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(5));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_type_builtin_function_call_on_a_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let (ret, tv) = eval_str(b"type(42)");
+        assert_eq!(ret, OK);
+        assert_eq!(
+            tv.value,
+            TypvalValue::Number(crate::eval::typval_defs::var_type_result::NUMBER.into())
+        );
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_empty_builtin_function_call_on_strings() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"empty(\"\")").1.value, TypvalValue::Number(1));
+        assert_eq!(eval_str(b"empty(\"x\")").1.value, TypvalValue::Number(0));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_builtin_function_call_used_inside_a_larger_expression() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // len("hello") + 1 == 6 - proves a builtin call's result feeds
+        // straight back into the enclosing eval5/eval6 arithmetic chain,
+        // not just standing alone as a top-level expression.
+        assert_eq!(eval_str(b"len(\"hello\") + 1").1.value, TypvalValue::Number(6));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_builtin_function_call_with_wrong_argument_count_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // len() takes exactly one argument.
+        let (ret, _) = eval_str(b"len()");
+        assert_eq!(ret, FAIL);
+        let (ret, _) = eval_str(b"len(1, 2)");
+        assert_eq!(ret, FAIL);
 
         reset_globals_for_test();
     }

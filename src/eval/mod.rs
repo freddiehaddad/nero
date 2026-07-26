@@ -10,6 +10,7 @@
 #[allow(clippy::module_inception)]
 pub mod eval;
 pub mod executor;
+pub mod funcs;
 pub mod typval;
 pub mod typval_defs;
 pub mod userfunc;

@@ -246,7 +246,7 @@ use crate::eval::typval_defs::{
 use crate::globals::GlobalCell;
 use crate::hashtab::hashitem_empty;
 use crate::hashtab_defs::{HashitemT, HashtabT};
-use crate::vim_defs::OK;
+use crate::vim_defs::{FAIL, OK};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -665,6 +665,191 @@ pub fn check_user_func_argcount(fp: &UfuncT, argcount: i32) -> FnameTransError {
     } else {
         FnameTransError::Unknown
     }
+}
+
+/// Deref a function name if it's a variable holding a `Funcref`/
+/// `Partial` value (`deref_func_name`).
+///
+/// Returns `(name, found_var)`: `name` is an owned copy of the
+/// ORIGINAL bytes when `name` doesn't resolve to such a variable, or
+/// the underlying function name when it does.
+///
+/// Drops the original's `partialp` out-parameter (a `Partial`'s own
+/// bound arguments/dictionary self-binding, `pt_argc`/`pt_dict`) -
+/// nothing in this crate can construct a `Partial` with those set yet
+/// (needs `function()`/`funcref()`, not yet translated), so there is
+/// no observable difference yet between "this call went through a
+/// partial" and "this call used the resolved name directly"; add the
+/// out-parameter back if/when a real caller needs it.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::find_var`]'s own safety doc.
+#[must_use]
+pub unsafe fn deref_func_name(name: &[u8], no_autoload: bool) -> (Vec<u8>, bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (item, _ht) = unsafe { crate::eval::vars::find_var(name, false, no_autoload) };
+    let Some(variant) = item else {
+        return (name.to_vec(), false);
+    };
+    let tv_ptr: *const TypvalT = match variant {
+        crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe { &(*p).di_tv },
+        crate::eval::typval_defs::DictitemVariant::Scope(p) => unsafe { &(*p).di_tv },
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let resolved = match unsafe { &(*tv_ptr).value } {
+        TypvalValue::Func(Some(s)) => s.clone(),
+        TypvalValue::Func(None) => Vec::new(),
+        // SAFETY: forwarded from this function's own safety doc.
+        TypvalValue::Partial(p) => unsafe { crate::eval::eval::partial_name(*p) }.unwrap_or_default(),
+        _ => name.to_vec(),
+    };
+    (resolved, true)
+}
+
+/// Parse a function-call's argument list: `(arg1, arg2, ...)`
+/// (`get_func_arguments`).
+///
+/// `arg` must point to the opening `(`. Returns `(status, consumed,
+/// argvars)` - `argvars` never holds more than `MAX_FUNC_ARGS`
+/// `- partial_argc` entries, matching the original's own fixed-size
+/// limit (`partial_argc` is always `0` from every real caller in this
+/// crate today - nothing can construct a `Partial` with bound
+/// arguments yet, see [`deref_func_name`]'s own doc comment).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::eval1`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_func_arguments(
+    arg: &[u8],
+    mut evalarg: Option<&mut crate::eval::eval::EvalargT>,
+    partial_argc: usize,
+) -> (i32, usize, Vec<TypvalT>) {
+    use crate::eval::typval_defs::MAX_FUNC_ARGS;
+
+    let mut argvars = Vec::new();
+    let mut pos = 0;
+
+    while argvars.len() < MAX_FUNC_ARGS.saturating_sub(partial_argc) {
+        pos += 1; // skip the '(' or ','
+        pos += crate::charset::skipwhite(&arg[pos..]);
+
+        match arg.get(pos) {
+            Some(&b')') | Some(&b',') | None => break,
+            _ => {}
+        }
+
+        let mut tv = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, consumed) = unsafe { crate::eval::eval::eval1(&arg[pos..], &mut tv, evalarg.as_deref_mut()) };
+        pos += consumed;
+        if ret == FAIL {
+            return (FAIL, pos, argvars);
+        }
+        argvars.push(tv);
+        if arg.get(pos) != Some(&b',') {
+            break;
+        }
+    }
+
+    pos += crate::charset::skipwhite(&arg[pos..]);
+    if arg.get(pos) == Some(&b')') {
+        pos += 1;
+    } else {
+        return (FAIL, pos, argvars);
+    }
+    (OK, pos, argvars)
+}
+
+/// Call a function and put the result in `rettv` (`call_func`).
+///
+/// Only the path reachable from [`crate::eval::eval::eval_func`]'s own
+/// real call site is modeled: no `partial` (a bound closure/method
+/// value - only method-call syntax, `handle_subscript`'s own
+/// "->name()" case, would ever pass one; not yet translated), no
+/// `basetv` (ditto). Given this, a REAL user-defined function is
+/// unreachable in practice: [`find_func`] only ever finds something if
+/// a function was previously defined, and nothing in this crate parses
+/// `:function`/defines one yet - so the "found a user function"
+/// branch `unimplemented!()`s if ever reached (kept for structural
+/// fidelity rather than silently ignored, documented as unreachable
+/// today), while the ACTUAL always-taken path for any user-function-
+/// shaped name (not found, and `apply_autocmds`/`script_autoload`
+/// can't find one either, since neither subsystem exists) correctly,
+/// faithfully resolves to "unknown function" - not a stub, but the
+/// genuinely correct answer given neither could ever locate one today.
+///
+/// Lua functions (`is_luafunc`) are entirely out of scope - this crate
+/// has no Lua host integration (phase 13).
+///
+/// # Safety
+/// Forwarded from [`find_func`]/`crate::eval::funcs::call_internal_func`'s
+/// own safety docs.
+#[must_use]
+pub unsafe fn call_func(funcname: &[u8], rettv: &mut TypvalT, argvars: &[TypvalT], evaluate: bool) -> FnameTransError {
+    rettv.value = TypvalValue::Unknown;
+
+    if !evaluate {
+        return FnameTransError::None;
+    }
+
+    let Ok(name) = fname_trans_sid(funcname) else {
+        return FnameTransError::Script;
+    };
+
+    // Skip "g:" before a function name.
+    let is_global = name.first() == Some(&b'g') && name.get(1) == Some(&b':');
+    let rfname: &[u8] = if is_global { &name[2..] } else { &name[..] };
+
+    rettv.value = TypvalValue::Number(0); // default rettv is number zero.
+
+    if !builtin_function(rfname) {
+        let fp = find_func(rfname);
+        if !fp.is_null() {
+            unimplemented!(
+                "call_func: a real user-defined function needs call_user_func_check, not yet \
+                 translated"
+            );
+        }
+        // Matches the original's own FCERR_UNKNOWN: find_func found
+        // nothing, and apply_autocmds/script_autoload (not translated)
+        // couldn't have found one either, since neither subsystem
+        // exists to define one in the first place.
+        return FnameTransError::Unknown;
+    }
+
+    // Find the function name in the table, call its implementation.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::funcs::call_internal_func(rfname, argvars, rettv) }
+}
+
+/// Call a function and put the result in `rettv` (`get_func_tv`).
+///
+/// `arg` must point to the opening `(`. Returns `(status, consumed)`.
+///
+/// # Safety
+/// Forwarded from [`get_func_arguments`]/[`call_func`]'s own safety
+/// docs.
+#[must_use]
+pub unsafe fn get_func_tv(
+    name: &[u8],
+    rettv: &mut TypvalT,
+    arg: &[u8],
+    evalarg: Option<&mut crate::eval::eval::EvalargT>,
+    evaluate: bool,
+) -> (i32, usize) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, mut pos, argvars) = unsafe { get_func_arguments(arg, evalarg, 0) };
+
+    let ret = if ret == OK {
+        // SAFETY: forwarded from this function's own safety doc.
+        let error = unsafe { call_func(name, rettv, &argvars, evaluate) };
+        if error == FnameTransError::None { OK } else { FAIL }
+    } else {
+        FAIL
+    };
+
+    pos += crate::charset::skipwhite(&arg[pos..]);
+    (ret, pos)
 }
 
 /// Whether a function name is genuinely refcounted BY NAME
@@ -3673,6 +3858,196 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(check_user_func_argcount(&fp, 10), FnameTransError::Unknown);
+    }
+
+    // ---- deref_func_name / get_func_arguments / call_func / get_func_tv --
+
+    #[test]
+    fn deref_func_name_unchanged_when_no_variable_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let (resolved, found_var) = unsafe { deref_func_name(b"g:NoSuchVar", false) };
+        assert_eq!(resolved, b"g:NoSuchVar");
+        assert!(!found_var);
+    }
+
+    #[test]
+    fn deref_func_name_resolves_a_funcref_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"MyFuncRef");
+        unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"len".to_vec())) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let (resolved, found_var) = unsafe { deref_func_name(b"g:MyFuncRef", false) };
+        assert_eq!(resolved, b"len");
+        assert!(found_var);
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn deref_func_name_empty_funcref_variable_resolves_to_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"EmptyRef");
+        unsafe { (*item).di_tv.value = TypvalValue::Func(None) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let (resolved, found_var) = unsafe { deref_func_name(b"g:EmptyRef", false) };
+        assert_eq!(resolved, Vec::<u8>::new());
+        assert!(found_var);
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn deref_func_name_non_funcref_variable_returns_name_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"NotAFunc");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(5) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let (resolved, found_var) = unsafe { deref_func_name(b"g:NotAFunc", false) };
+        assert_eq!(resolved, b"g:NotAFunc");
+        assert!(found_var);
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn get_func_arguments_empty_list() {
+        let (ret, consumed, args) = unsafe { get_func_arguments(b"()", None, 0) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 2);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn get_func_arguments_parses_multiple_args() {
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let (ret, consumed, args) = unsafe { get_func_arguments(b"(1, 2)", Some(&mut evalarg), 0) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 6);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].value, TypvalValue::Number(1));
+        assert_eq!(args[1].value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn get_func_arguments_tolerates_a_trailing_comma() {
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let (ret, consumed, args) = unsafe { get_func_arguments(b"(1,)", Some(&mut evalarg), 0) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 4);
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn get_func_arguments_missing_close_paren_fails() {
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let (ret, _consumed, args) = unsafe { get_func_arguments(b"(1", Some(&mut evalarg), 0) };
+        assert_eq!(ret, FAIL);
+        // The one parsed argument is still returned even on failure.
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn call_func_dispatches_to_a_builtin() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::String(Some(b"hello".to_vec())), ..Default::default() }];
+        let error = unsafe { call_func(b"len", &mut rettv, &args, true) };
+        assert_eq!(error, FnameTransError::None);
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn call_func_strips_a_leading_g_colon_before_builtin_dispatch() {
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::String(Some(b"hi".to_vec())), ..Default::default() }];
+        let error = unsafe { call_func(b"g:len", &mut rettv, &args, true) };
+        assert_eq!(error, FnameTransError::None);
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn call_func_unknown_user_shaped_name_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+
+        let mut rettv = TypvalT::default();
+        let error = unsafe { call_func(b"NoSuchUserFunc", &mut rettv, &[], true) };
+        assert_eq!(error, FnameTransError::Unknown);
+
+        func_init();
+    }
+
+    #[test]
+    fn call_func_not_evaluating_returns_none_without_calling() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let error = unsafe { call_func(b"len", &mut rettv, &[], false) };
+        assert_eq!(error, FnameTransError::None);
+        // rettv is reset to Unknown, not left at its old value nor
+        // populated by an actual len() call - evaluate=false returns
+        // before ever reaching the builtin dispatch.
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn get_func_tv_parses_arguments_and_calls_the_function() {
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) =
+            unsafe { get_func_tv(b"len", &mut rettv, b"(\"hello\")", Some(&mut evalarg), true) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 9);
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn get_func_tv_fails_when_argument_parsing_fails() {
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+        let (ret, _consumed) = unsafe { get_func_tv(b"len", &mut rettv, b"(1", Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn get_func_tv_fails_for_an_unknown_function_even_with_valid_arguments() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+
+        let mut evalarg = crate::eval::eval::EvalargT {
+            eval_flags: crate::eval::eval::EVAL_EVALUATE,
+            ..Default::default()
+        };
+        let mut rettv = TypvalT::default();
+        let (ret, _consumed) =
+            unsafe { get_func_tv(b"NoSuchFunc", &mut rettv, b"()", Some(&mut evalarg), true) };
+        assert_eq!(ret, FAIL);
+
+        func_init();
     }
 
     // ---- save_funccal / restore_funccal / get_current_funccal / --------
