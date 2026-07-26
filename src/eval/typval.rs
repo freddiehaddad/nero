@@ -1904,6 +1904,22 @@ pub fn tv_list_alloc(_len: isize) -> *mut crate::eval::typval_defs::ListT {
     list
 }
 
+/// Allocate an empty list and put it in `ret_tv`, incrementing its
+/// reference count and unlocking `ret_tv` (`tv_list_alloc_ret`).
+///
+/// # Safety
+/// None beyond [`tv_list_alloc`]'s own (always-safe) contract - this
+/// function only ever writes into `ret_tv`, a plain `&mut TypvalT`.
+#[must_use]
+pub unsafe fn tv_list_alloc_ret(ret_tv: &mut TypvalT, len: isize) -> *mut crate::eval::typval_defs::ListT {
+    let l = tv_list_alloc(len);
+    // SAFETY: `l` was just allocated above, a fresh pointer not shared
+    // with anything yet.
+    unsafe { tv_list_set_ret(ret_tv, l) };
+    ret_tv.v_lock = VarLockStatus::Unlocked;
+    l
+}
+
 /// Allocate a list item. The type/value of the item (`.li_tv`) still
 /// need to be initialized by the caller (`tv_list_item_alloc`).
 ///
@@ -4228,6 +4244,19 @@ mod tests {
             assert_eq!((*l).lv_len, 0);
             assert!((*l).lv_first.is_null());
             tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_alloc_ret_sets_rettv_and_refs_the_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT { v_lock: VarLockStatus::Locked, ..Default::default() };
+        let l = unsafe { tv_list_alloc_ret(&mut rettv, 0) };
+        assert_eq!(rettv.value, TypvalValue::List(l));
+        assert_eq!(rettv.v_lock, VarLockStatus::Unlocked);
+        unsafe {
+            assert_eq!((*l).lv_refcount, 1);
+            tv_list_unref(l);
         }
     }
 

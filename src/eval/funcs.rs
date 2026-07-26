@@ -21,7 +21,14 @@
 //! `char2nr()`/`nr2char()`, and the string-to-number/float conversions
 //! `str2nr()`/`str2float()` (the former, unusually, lives in
 //! `strings.c` in the original rather than `funcs.c` itself - noted on
-//! `f_str2nr`'s own doc comment).
+//! `f_str2nr`'s own doc comment) - plus a third batch: `str2list()`/
+//! `list2str()` (character-codepoint `List` <-> `String` conversion;
+//! `str2list` lives in `strings.c`, `list2str` in `eval/typval.c` -
+//! neither in `funcs.c` itself, also noted on their own doc comments).
+//! `list2str`/`str2list` needed a new [`crate::eval::typval::tv_list_alloc_ret`]
+//! (allocate a list directly into a `rettv`, used pervasively - 83
+//! call sites - by the real, untranslated `funcs.c`, so translated as
+//! its own genuine function rather than inlined for this one caller).
 //!
 //! The real `functions[]` table is machine-generated from every
 //! `f_*` function's own doc comment (`gen_eval.lua` scanning for
@@ -98,6 +105,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"nr2char"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_nr2char });
         m.insert(&b"str2float"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_str2float });
         m.insert(&b"str2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_str2nr });
+        m.insert(&b"str2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_str2list });
+        m.insert(&b"list2str"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_list2str });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -487,6 +496,82 @@ fn f_str2nr(argvars: &[TypvalT], rettv: &mut TypvalT) {
     crate::charset::vim_str2nr(p, None, None, what, Some(&mut n), None, 0, false, None);
     // Text after the number is silently ignored.
     rettv.value = TypvalValue::Number(if isneg { -n } else { n });
+}
+
+/// `str2list({string} [, {utf8}])` - convert `{string}` into a `List`
+/// of character codepoints (`f_str2list`). Unusually lives in
+/// `strings.c` in the original, like [`f_str2nr`] (see its own doc
+/// comment).
+///
+/// A NUL byte inside `{string}` ends the conversion early, matching
+/// the original's own `for (; *p != NUL; ...)` loop exactly - not a
+/// shortcut: `tv_get_string` can return a `Vec<u8>` containing an
+/// embedded NUL (unlike the original's own NUL-terminated `char *`,
+/// which could never represent one to begin with), so this crate's
+/// translation must check for it explicitly to reproduce the
+/// identical stopping behavior (and to avoid an infinite loop:
+/// `utf_ptr2len` itself returns `0` for a NUL byte, matching how the
+/// original's loop condition would never even call it on one).
+///
+/// # Safety
+/// `rettv`'s own value must not (yet) hold a `List`/`Dict`/`Blob`/
+/// `Partial` pointer that anything else still depends on - this
+/// function unconditionally overwrites it.
+unsafe fn f_str2list(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::Unknown as isize)
+    };
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut pos = 0;
+    while pos < s.len() && s[pos] != 0 {
+        let c = crate::mbyte::utf_ptr2char(&s[pos..]);
+        // SAFETY: `l` was just allocated above by this same function.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(c)) };
+        pos += crate::mbyte::utf_ptr2len(&s[pos..]) as usize;
+    }
+}
+
+/// `list2str({list} [, {utf8}])` - convert a `List` of character
+/// codepoints into a `String` (`f_list2str`). Unusually lives in
+/// `eval/typval.c` in the original, neither `strings.c` nor
+/// `funcs.c` (see [`f_str2nr`]'s own doc comment for the general
+/// note).
+///
+/// The original's own `E475: Invalid argument` (a non-`List` argument)
+/// is omitted, matching this crate's established "skip the display,
+/// keep an otherwise-harmless default" policy - `rettv` is simply left
+/// as an empty `String`, matching the original's own pre-set
+/// `rettv->vval.v_string = NULL` default for this exact error path
+/// too.
+///
+/// # Safety
+/// If `argvars[0].value` is `List`-typed with a non-null pointer, that
+/// pointer must be valid.
+unsafe fn f_list2str(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+    let TypvalValue::List(l) = &argvars[0].value else {
+        return;
+    };
+    let l = *l;
+    if l.is_null() {
+        return; // empty list results in empty string
+    }
+
+    let mut result = Vec::new();
+    let mut buf = [0u8; crate::mbyte_defs::MB_MAXBYTES];
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { crate::eval::typval::tv_list_first(l) };
+    while !item.is_null() {
+        // SAFETY: `item` is a live node reached by walking the list
+        // just validated above.
+        let n = crate::eval::typval::tv_get_number(unsafe { &(*item).li_tv });
+        let buflen = crate::mbyte::utf_char2bytes(n as i32, &mut buf);
+        result.extend_from_slice(&buf[..buflen as usize]);
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+    }
+    rettv.value = TypvalValue::String(Some(result));
 }
 
 #[cfg(test)]
@@ -1047,6 +1132,93 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(1));
     }
 
+    // --- f_str2list ---
+
+    #[test]
+    fn str2list_of_ascii_and_multibyte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_str2list(&[string("AB日".as_bytes())], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 3);
+        unsafe {
+            let mut item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(i64::from(b'A')));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(i64::from(b'B')));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(0x65E5));
+        }
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn str2list_of_an_empty_string_is_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_str2list(&[string(b"")], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn str2list_stops_at_an_embedded_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_str2list(&[string(b"AB\0CD")], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    // --- f_list2str ---
+
+    #[test]
+    fn list2str_of_ascii_and_multibyte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, i64::from(b'A'));
+            crate::eval::typval::tv_list_append_number(&mut *list, i64::from(b'B'));
+            crate::eval::typval::tv_list_append_number(&mut *list, 0x65E5);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }];
+        unsafe { f_list2str(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some("AB日".as_bytes().to_vec())));
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn list2str_of_a_null_list_is_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_list2str(&[TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn list2str_of_a_non_list_is_an_empty_string() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_list2str(&[string(b"not a list")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn str2list_and_list2str_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_str2list(&[string("hello 世界".as_bytes())], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+
+        let mut rettv2 = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }];
+        unsafe { f_list2str(&args, &mut rettv2) };
+        assert_eq!(rettv2.value, TypvalValue::String(Some("hello 世界".as_bytes().to_vec())));
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
     // --- new-builtin table registration ---
 
     #[test]
@@ -1062,6 +1234,8 @@ mod tests {
             "nr2char",
             "str2float",
             "str2nr",
+            "str2list",
+            "list2str",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }

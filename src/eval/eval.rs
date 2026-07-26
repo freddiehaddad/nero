@@ -194,12 +194,12 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (13 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (15 functions so
 //! far - `len()`/`type()`/`empty()`/`and()`/`or()`/`xor()`/`abs()`/
-//! `max()`/`min()`/`char2nr()`/`nr2char()`/`str2float()`/`str2nr()` -
-//! the start of a long tail, `eval/funcs.c` itself implements ~641
-//! builtins). A user-function-SHAPED name (not recognized as builtin)
-//! still correctly, gracefully `FAIL`s today
+//! `max()`/`min()`/`char2nr()`/`nr2char()`/`str2float()`/`str2nr()`/
+//! `str2list()`/`list2str()` - the start of a long tail, `eval/funcs.c`
+//! itself implements ~641 builtins). A user-function-SHAPED name (not
+//! recognized as builtin) still correctly, gracefully `FAIL`s today
 //! (`find_func` finds nothing, since nothing parses `:function` yet) -
 //! genuinely correct, not a stub; only if `find_func` somehow ever
 //! returned a real, non-null `UfuncT` would `call_func` reach its own
@@ -6493,6 +6493,25 @@ mod tests {
         assert_eq!(eval_str(b"str2float(\"2.5\")").1.value, TypvalValue::Float(2.5));
         assert_eq!(eval_str(b"str2nr(\"42\")").1.value, TypvalValue::Number(42));
         assert_eq!(eval_str(b"str2nr(\"0x1A\", 16)").1.value, TypvalValue::Number(26));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_str2list_and_list2str_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let (ret, tv) = eval_str(b"str2list(\"AB\")");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        assert_eq!(
+            eval_str(b"list2str(str2list(\"hi\"))").1.value,
+            TypvalValue::String(Some(b"hi".to_vec()))
+        );
 
         reset_globals_for_test();
     }
