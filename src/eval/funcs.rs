@@ -248,6 +248,17 @@
 //! is a pure state-to-string formatter, NOT genuinely event-loop-bound
 //! like `state_enter` - see `get_mode`'s own doc comment for exactly
 //! which of its branches are decidable today vs. still unreachable).
+//!
+//! Also `visualmode([{expr}])` (via the already-real
+//! `BufT.b_visual_mode_eval`), `wildmenumode()` (via the already-real
+//! `GLOBALS.wild_menu_showing`, short-circuiting away its own
+//! `MODE_CMDLINE`-dependent second operand exactly like the original
+//! does, since nothing can currently set that `State` bit), and
+//! `windowsversion()` (via the already-real
+//! `GLOBALS.windowsVersion`, zero-initialized/empty until `main.c`'s
+//! own version-detection code runs - not yet translated, so this
+//! matches the original's real "non-MS-Windows" behavior exactly on
+//! every platform today, not an approximation).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -376,6 +387,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
         m.insert(&b"mode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_mode });
+        m.insert(&b"visualmode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_visualmode });
+        m.insert(&b"wildmenumode"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_wildmenumode });
+        m.insert(&b"windowsversion"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_windowsversion });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3348,6 +3362,68 @@ unsafe fn f_mode(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(buf));
 }
 
+/// `visualmode([{expr}])` - the last Visual mode used in the current
+/// buffer (`""`/`"v"`/`"V"`/Ctrl-V), via the already-real
+/// `BufT.b_visual_mode_eval` (`f_visualmode`, `funcs.c`). A nonzero
+/// `{expr}` (checked via [`non_zero_arg`]) resets it to empty
+/// afterward.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+unsafe fn f_visualmode(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    let c = curbuf.b_visual_mode_eval;
+    let s = if c == 0 { Vec::new() } else { vec![c as u8] };
+    rettv.value = TypvalValue::String(Some(s));
+
+    if non_zero_arg(argvars) {
+        curbuf.b_visual_mode_eval = 0;
+    }
+}
+
+/// `wildmenumode()` - whether the wildmenu is currently active
+/// (`f_wildmenumode`, `funcs.c`), via the already-real
+/// `GLOBALS.wild_menu_showing`. The original's own second OR operand
+/// (`(State & MODE_CMDLINE) && cmdline_pum_active()`, `ex_getln.c`,
+/// not translated) is short-circuited away exactly like it is in the
+/// original: nothing in this crate can currently set the `MODE_CMDLINE`
+/// bit on `State` at all, so it's never actually reached.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`.
+#[allow(clippy::diverging_sub_expression)]
+unsafe fn f_wildmenumode(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let active = g.wild_menu_showing != 0
+        || (g.State & crate::state_defs::mode::CMDLINE as i32 != 0
+            && unimplemented!(
+                "wildmenumode: MODE_CMDLINE's pum-active state needs ex_getln.c's cmdline_pum_active, not yet translated"
+            ));
+    if active {
+        rettv.value = TypvalValue::Number(1);
+    }
+    // Matches the original exactly: rettv is left at its DEFAULT
+    // value (not explicitly set to 0) when not active - the original
+    // never assigns rettv->vval.v_number in that case either, relying
+    // on the caller's own zero-initialized rettv.
+}
+
+/// `windowsversion()` - the Windows OS version as a String, or empty
+/// on non-Windows systems (`f_windowsversion`, `funcs.c`), via the
+/// already-real `GLOBALS.windowsVersion` (a fixed `[u8; 20]` buffer,
+/// zero-initialized until `main.c`'s own real version-detection code
+/// runs - not yet translated, so this is always empty today, matching
+/// the original's own real "non-MS-Windows" behavior exactly, not an
+/// approximation).
+fn f_windowsversion(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let raw = unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion;
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    rettv.value = TypvalValue::String(Some(raw[..end].to_vec()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4115,6 +4191,9 @@ mod tests {
             "garbagecollect",
             "getcharsearch",
             "mode",
+            "visualmode",
+            "wildmenumode",
+            "windowsversion",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6936,5 +7015,102 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::String(Some(b"Rv".to_vec())));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+    }
+
+    // --- f_visualmode ---
+
+    #[test]
+    fn visualmode_reflects_b_visual_mode_eval() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_visual_mode_eval: i32::from(b'v'), ..Default::default() };
+        let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_visualmode(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"v".to_vec())));
+        // Not reset without a nonzero argument.
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_visual_mode_eval }, i32::from(b'v'));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = previous;
+    }
+
+    #[test]
+    fn visualmode_empty_before_any_visual_mode_used() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_visualmode(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = previous;
+    }
+
+    #[test]
+    fn visualmode_nonzero_arg_resets_it() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_visual_mode_eval: i32::from(b'V'), ..Default::default() };
+        let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_visualmode(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"V".to_vec())));
+        assert_eq!(unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_visual_mode_eval }, 0);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = previous;
+    }
+
+    // --- f_wildmenumode ---
+
+    #[test]
+    fn wildmenumode_reflects_wild_menu_showing() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing = 0;
+        let mut rettv = TypvalT::default();
+        unsafe { f_wildmenumode(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::default());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing = 1;
+        let mut rettv = TypvalT::default();
+        unsafe { f_wildmenumode(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.wild_menu_showing = saved;
+    }
+
+    // --- f_windowsversion ---
+
+    #[test]
+    fn windowsversion_reads_the_null_terminated_buffer() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion;
+
+        let mut version = [0u8; 20];
+        version[..3].copy_from_slice(b"10\0");
+        unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = version;
+        let mut rettv = TypvalT::default();
+        f_windowsversion(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"10".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = saved;
+    }
+
+    #[test]
+    fn windowsversion_is_empty_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion;
+        unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = [0; 20];
+
+        let mut rettv = TypvalT::default();
+        f_windowsversion(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.windowsVersion = saved;
     }
 }
