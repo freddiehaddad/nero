@@ -173,6 +173,9 @@
 //! `List` item, in place or into a new copy, up to an optional
 //! `{maxdepth}`), which needed a new
 //! [`crate::eval::typval::tv_list_flatten`] (`eval/typval.c`).
+//!
+//! Also `localtime()` (the current Unix timestamp, via the already-
+//! existing [`crate::os::time::os_time`]).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -271,6 +274,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"join"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_join });
         m.insert(&b"flatten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flatten });
         m.insert(&b"flattennew"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flattennew });
+        m.insert(&b"localtime"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_localtime });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2397,6 +2401,12 @@ unsafe fn f_flattennew(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { flatten_common(argvars, true, rettv) };
 }
 
+/// `localtime()` - the current time, measured in seconds since 1970-01-01
+/// (`f_localtime`, `funcs.c`).
+fn f_localtime(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(crate::os::time::os_time() as crate::eval::typval_defs::VarnumberT);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3107,6 +3117,7 @@ mod tests {
             "join",
             "flatten",
             "flattennew",
+            "localtime",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -5253,5 +5264,18 @@ mod tests {
             crate::eval::typval::tv_list_unref(list);
             crate::eval::typval::tv_list_unref(new_list);
         }
+    }
+
+    // --- f_localtime ---
+
+    #[test]
+    fn localtime_returns_a_positive_unix_timestamp() {
+        let mut rettv = TypvalT::default();
+        f_localtime(&[], &mut rettv);
+        let TypvalValue::Number(n) = rettv.value else { panic!("expected a Number") };
+        // Any real wall-clock time is comfortably past 2020-01-01
+        // (1577836800) - a loose sanity bound, not a flaky exact-time
+        // check.
+        assert!(n > 1_577_836_800);
     }
 }
