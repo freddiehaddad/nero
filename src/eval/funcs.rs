@@ -407,6 +407,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"isinf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isinf });
         m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
+        m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2697,6 +2698,74 @@ unsafe fn f_sha256(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(hash.into_bytes()));
 }
 
+/// `exists({expr})` - check the existence of various kinds of things,
+/// dispatched on `{expr}`'s own leading character (`f_exists`,
+/// `funcs.c`).
+///
+/// Only 2 of the original's 6 branches are translated:
+/// - `&option`/`+option`: fully faithful, via the already-existing
+///   [`crate::eval::eval::eval_option`] (called with `rettv = None`,
+///   matching the original's own "just check existence" idiom) plus
+///   the same "no trailing garbage after the name" check.
+/// - the default "plain variable name" case: fully faithful, via the
+///   newly-translated [`crate::eval::vars::var_exists`].
+///
+/// `$env` is a DELIBERATE, narrower gap (not a panic): only the
+/// original's own fast path is modeled (a literal, already-set
+/// environment variable, via the already-existing
+/// [`crate::os::env::os_env_exists`]) - the original's fallback
+/// (`expand_env_save`, a substantial general-purpose `$VAR`/`${VAR}`/
+/// `~`/`` `=expr` ``-in-the-middle-of-an-arbitrary-string expander,
+/// used throughout the original for path expansion generally, not
+/// just this one narrow check) is NOT modeled, so this returns
+/// `false` rather than `true` for the rare case of a variable only
+/// resolvable through that indirect machinery (e.g. `$VIM`/
+/// `$VIMRUNTIME` when not literally exported, the same already-
+/// accepted gap `vim_getenv`/`f_getenv` themselves have) - chosen
+/// deliberately over panicking, since `exists()` is overwhelmingly
+/// used defensively in real scripts specifically to AVOID errors.
+///
+/// `*func` (needs `function_exists`/`nlua_func_exists`), `:cmd`
+/// (needs `cmd_exists`), and `#autocmd`/`##event` (needs `au_exists`/
+/// `autocmd_supported`) each need a substantial not-yet-translated
+/// subsystem and panic via `unimplemented!()` if actually reached -
+/// matching this crate's established "translate the common path,
+/// panic loudly on a genuinely untranslated-but-reached path"
+/// convention (unlike `$env` above, none of these have an existing,
+/// already-tractable fast path to fall back on).
+///
+/// # Safety
+/// Forwards [`crate::eval::vars::var_exists`]'s own safety doc for the
+/// default branch, and [`crate::eval::eval::eval_option`]'s own safety
+/// doc for the `&`/`+` branch.
+unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let p = crate::eval::typval::tv_get_string(&argvars[0]);
+    let n = match p.first() {
+        Some(b'$') => crate::os::env::os_env_exists(&p[1..], false),
+        Some(b'&' | b'+') => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (status, consumed) = unsafe { crate::eval::eval::eval_option(&p, None, true) };
+            let rest = &p[consumed.min(p.len())..];
+            let ws = crate::charset::skipwhite(rest);
+            status == crate::vim_defs::OK && rest[ws..].is_empty()
+        }
+        Some(b'*') => {
+            unimplemented!("exists(): '*func' branch needs function_exists/nlua_func_exists, not yet translated");
+        }
+        Some(b':') => {
+            unimplemented!("exists(): ':cmd' branch needs cmd_exists, not yet translated");
+        }
+        Some(b'#') => {
+            unimplemented!("exists(): '#autocmd'/'##event' branch needs au_exists/autocmd_supported, not yet translated");
+        }
+        _ => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::vars::var_exists(&p) }
+        }
+    };
+    rettv.value = TypvalValue::Number(i64::from(n));
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4394,6 +4463,7 @@ mod tests {
             "isinf",
             "isnan",
             "sha256",
+            "exists",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6817,6 +6887,101 @@ mod tests {
         let mut rettv2 = TypvalT::default();
         unsafe { f_sha256(&[string(b"")], &mut rettv2) };
         assert_eq!(rettv2.value, TypvalValue::String(Some(hash)));
+    }
+
+    // --- f_exists ---
+
+    #[test]
+    fn exists_true_for_a_defined_option() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"&ignorecase")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn exists_false_for_an_unknown_option() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"&notarealoption")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn exists_false_for_an_option_with_trailing_garbage() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"&ignorecase extra")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn exists_true_for_a_defined_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_exists_var");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"g:nero_test_exists_var")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn exists_false_for_an_undefined_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"g:definitely_not_defined")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn exists_true_for_a_set_environment_variable() {
+        // SAFETY: unique test-only variable name.
+        unsafe { crate::os::env::os_setenv(b"NERO_TEST_EXISTS_ENV_VAR", b"hello", 1) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"$NERO_TEST_EXISTS_ENV_VAR")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::os::env::os_unsetenv(b"NERO_TEST_EXISTS_ENV_VAR") };
+    }
+
+    #[test]
+    fn exists_false_for_an_unset_environment_variable() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_exists(&[string(b"$NERO_TEST_EXISTS_DEFINITELY_UNSET")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn exists_function_branch_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_exists(&[string(b"*Foo")], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (function_exists not yet translated)");
+    }
+
+    #[test]
+    fn exists_command_branch_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_exists(&[string(b":Foo")], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (cmd_exists not yet translated)");
+    }
+
+    #[test]
+    fn exists_autocmd_branch_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_exists(&[string(b"#BufEnter")], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (au_exists not yet translated)");
     }
 
     // --- f_has ---

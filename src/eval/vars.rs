@@ -1439,6 +1439,53 @@ pub unsafe fn eval_variable(name: &[u8], rettv: Option<&mut TypvalT>, _verbose: 
     }
 }
 
+/// Check if variable `var` exists (`var_exists`).
+///
+/// Only the common "plain name, no subscript" case is modeled -
+/// mirrors the original's own call to `get_name_len(&var, &tofree,
+/// true, false)` with `evaluate = true` exactly (so magic-brace name
+/// expansion, e.g. `exists('foo{expr}bar')`, correctly panics via
+/// [`crate::eval::eval::get_name_len`]'s own `unimplemented!()`,
+/// rather than silently giving a wrong answer), followed by
+/// [`crate::eval::eval::handle_subscript`] for any `.`/`[`/`(`/`->`
+/// continuation (which similarly panics for anything beyond "nothing
+/// follows" - see its own doc comment). Both panics match this
+/// crate's established "translate the common path faithfully, panic
+/// loudly on a genuinely untranslated-but-reached path" convention.
+///
+/// # Safety
+/// Forwarded from [`eval_variable`]'s own safety doc.
+#[must_use]
+pub unsafe fn var_exists(var: &[u8]) -> bool {
+    let (name_len, consumed) = crate::eval::eval::get_name_len(var, true);
+    let mut n = false;
+    let mut rest = &var[consumed.min(var.len())..];
+
+    if name_len > 0 {
+        let name = &var[..name_len];
+        let mut tv = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        n = unsafe { eval_variable(name, Some(&mut tv), false, true) } == crate::vim_defs::OK;
+        if n {
+            let evalarg = crate::eval::eval::EvalargT { eval_flags: crate::eval::eval::EVAL_EVALUATE, ..Default::default() };
+            let (status, sub_consumed) = crate::eval::eval::handle_subscript(rest, &tv, Some(&evalarg), false);
+            n = status == crate::vim_defs::OK;
+            if n {
+                // SAFETY: tv was just filled in by eval_variable above,
+                // a fresh copy not shared with anything else yet.
+                unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+            }
+            rest = &rest[sub_consumed.min(rest.len())..];
+        }
+    }
+
+    if !rest.is_empty() {
+        n = false;
+    }
+
+    n
+}
+
 /// Convert an option value to a Vimscript value (`optval_as_tv`).
 ///
 /// `numbool`, if `true`, converts a `Boolean` value to a plain number
@@ -3573,6 +3620,77 @@ mod find_var_ht_dict_tests {
         let ret = unsafe { eval_variable(b"g:", Some(&mut rettv), true, false) };
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(rettv.value, TypvalValue::Dict(get_globvar_dict()));
+
+        reset_shared_state();
+    }
+
+    // ---- var_exists ----
+
+    #[test]
+    fn var_exists_true_for_a_defined_global_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"count");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
+
+        assert!(unsafe { var_exists(b"g:count") });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn var_exists_false_for_an_undefined_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        assert!(!unsafe { var_exists(b"g:definitely_not_defined") });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn var_exists_false_for_trailing_garbage_after_the_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"count");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *get_globvar_dict(), item) };
+
+        // A subscript chain after the name (` .foo`) is trailing
+        // garbage for a Number value (`.` only continues for a
+        // Dict, per handle_subscript's own doc) - handle_subscript's
+        // fast path correctly reports nothing consumed, and the
+        // final "anything left over" check makes this false rather
+        // than panicking.
+        assert!(!unsafe { var_exists(b"g:count extra") });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn var_exists_true_for_a_defined_option() {
+        // Not var_exists itself (options are a completely different
+        // f_exists() branch, "&"/"+" prefixed) - included here only
+        // to double check get_name_len/get_id_len don't misparse an
+        // ordinary bare word used as a plain (undefined) variable
+        // name that happens to also be a real option name.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        assert!(!unsafe { var_exists(b"number") });
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn var_exists_false_for_an_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        assert!(!unsafe { var_exists(b"") });
 
         reset_shared_state();
     }
