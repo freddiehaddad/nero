@@ -974,6 +974,67 @@ pub unsafe fn path_try_shorten_fname(full_path: &[u8]) -> &[u8] {
     }
 }
 
+/// Shorten the name of every path component except the last (the
+/// "tail") to at most `trim_len` non-`~`/`.` characters
+/// (`shorten_dir_len`) - e.g. `"~/foo/../.bar/fname"` with
+/// `trim_len = 1` becomes `"~/f/../.b/fname"`.
+///
+/// Returns a freshly-built `Vec<u8>` rather than mutating in place
+/// (this crate's own established idiom for pure string
+/// transformations - the original's in-place `char *str` mutation has
+/// no aliasing significance here, since every real caller just wants
+/// the transformed result).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`crate::mbyte::utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn shorten_dir_len(str_: &[u8], trim_len: i32) -> Vec<u8> {
+    let tail = path_tail(str_);
+    let mut out = Vec::with_capacity(str_.len());
+    let mut skip = false;
+    let mut dirchunk_len = 0i32;
+    let mut s = 0usize;
+
+    loop {
+        if s >= tail {
+            out.extend_from_slice(&str_[s..]);
+            break;
+        } else if vim_ispathsep(i32::from(str_[s])) {
+            out.push(str_[s]);
+            skip = false;
+            dirchunk_len = 0;
+            s += 1;
+        } else if !skip {
+            if str_[s] != b'~' && str_[s] != b'.' {
+                dirchunk_len += 1;
+                if dirchunk_len >= trim_len {
+                    skip = true;
+                }
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&str_[s..]) }).unwrap_or(1).max(1);
+            out.extend_from_slice(&str_[s..s + l]);
+            s += l;
+        } else {
+            s += 1;
+        }
+    }
+
+    out
+}
+
+/// Shorten the path of a file from `"~/foo/../.bar/fname"` to
+/// `"~/f/../.b/fname"` (`shorten_dir`) - [`shorten_dir_len`] with
+/// `trim_len = 1`.
+///
+/// # Safety
+/// Forwarded from [`shorten_dir_len`]'s own safety doc.
+#[must_use]
+pub unsafe fn shorten_dir(str_: &[u8]) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { shorten_dir_len(str_, 1) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,5 +1528,38 @@ mod tests {
         assert!(append_path(&mut f2, b"b.txt", MAXPATHL as usize));
 
         assert!(!unsafe { same_directory(Some(&f1), Some(&f2)) });
+    }
+
+    #[test]
+    fn shorten_dir_len_trims_non_tail_components() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { shorten_dir_len(b"~/foo/../.bar/fname", 1) },
+            b"~/f/../.b/fname".to_vec()
+        );
+    }
+
+    #[test]
+    fn shorten_dir_len_keeps_the_tail_intact() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { shorten_dir_len(b"foo/bar/baz.txt", 1) }, b"f/b/baz.txt".to_vec());
+    }
+
+    #[test]
+    fn shorten_dir_len_respects_a_wider_trim_len() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { shorten_dir_len(b"foo/bar/baz.txt", 2) }, b"fo/ba/baz.txt".to_vec());
+    }
+
+    #[test]
+    fn shorten_dir_len_no_path_separator_returns_the_tail_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { shorten_dir_len(b"justafile.txt", 1) }, b"justafile.txt".to_vec());
+    }
+
+    #[test]
+    fn shorten_dir_is_shorten_dir_len_with_trim_len_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { shorten_dir(b"foo/bar/baz.txt") }, unsafe { shorten_dir_len(b"foo/bar/baz.txt", 1) });
     }
 }

@@ -89,6 +89,29 @@ pub(crate) unsafe fn f_delete(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // at the very start and no branch above re-touches it).
 }
 
+/// `pathshorten({path} [, {len}])` - shorten each non-tail path
+/// component of `{path}` to at most `{len}` (default `1`) characters
+/// (`f_pathshorten`, `eval/fs.c`), via the already-translated
+/// [`crate::path::shorten_dir_len`].
+///
+/// # Safety
+/// Forwarded from [`crate::path::shorten_dir_len`]'s own safety doc.
+pub(crate) unsafe fn f_pathshorten(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut trim_len = 1;
+    if argvars.len() > 1 {
+        trim_len = crate::eval::typval::tv_get_number(&argvars[1]) as i32;
+        if trim_len < 1 {
+            trim_len = 1;
+        }
+    }
+
+    match crate::eval::typval::tv_get_string_chk(&argvars[0]) {
+        None => rettv.value = TypvalValue::String(None),
+        // SAFETY: forwarded from this function's own safety doc.
+        Some(p) => rettv.value = TypvalValue::String(Some(unsafe { crate::path::shorten_dir_len(&p, trim_len) })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +245,35 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(-1));
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    // --- f_pathshorten ---
+
+    fn num(n: crate::eval::typval_defs::VarnumberT) -> TypvalT {
+        TypvalT { value: TypvalValue::Number(n), ..Default::default() }
+    }
+
+    #[test]
+    fn pathshorten_default_trim_len_is_one() {
+        let _guard = globals_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_pathshorten(&[string(b"foo/bar/baz.txt")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"f/b/baz.txt".to_vec())));
+    }
+
+    #[test]
+    fn pathshorten_explicit_trim_len() {
+        let _guard = globals_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_pathshorten(&[string(b"foo/bar/baz.txt"), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"fo/ba/baz.txt".to_vec())));
+    }
+
+    #[test]
+    fn pathshorten_clamps_a_trim_len_below_one() {
+        let _guard = globals_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_pathshorten(&[string(b"foo/bar/baz.txt"), num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"f/b/baz.txt".to_vec())));
     }
 }
