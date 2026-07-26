@@ -95,6 +95,13 @@
 //! the exact string CONTENTS, not just the list's own length) during
 //! this function's own development, fixed using the same established
 //! stripping idiom `eval/typval.rs`'s own `tv_dict_equal` already uses.
+//!
+//! Also translated: `get()` (a generic getter for `Blob`/`List`/
+//! `Dict` with an optional default for a missing/out-of-range entry).
+//! Only those three container types are handled - the original also
+//! accepts a `Funcref`/`Partial` (returning `"func"`/`"name"`/`"dict"`/
+//! `"args"`/`"arity"` introspection sub-fields via `get_func_arity`,
+//! not yet translated), which `f_get` declines explicitly.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -177,6 +184,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"keys"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_keys });
         m.insert(&b"values"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_values });
         m.insert(&b"items"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_items });
+        m.insert(&b"get"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_get });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1102,6 +1110,105 @@ unsafe fn f_items(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `get({list}, {idx} [, {default}])` / `get({blob}, {idx} [,
+/// {default}])` / `get({dict}, {key} [, {default}])` - a generic
+/// getter with an optional default for a missing/out-of-range entry
+/// (`f_get`).
+///
+/// Only the `Blob`/`List`/`Dict` cases are translated - the original
+/// also accepts a `Funcref`/`Partial` (returning its own `"func"`/
+/// `"name"`/`"dict"`/`"args"`/`"arity"` introspection sub-fields, via
+/// `get_func_arity`, not yet translated); panics via `unimplemented!()`
+/// for that case rather than silently mishandling it. Any other type
+/// (matching the original's own `semsg(_(e_listdictblobarg), ...)`
+/// case) falls through to the shared "not found" tail below, exactly
+/// like the original's own `tv` staying `NULL`.
+///
+/// The original's own Blob-success path sets `tv = rettv` (a
+/// self-alias, then a same-value `tv_copy(tv, rettv)` at the very
+/// end; `tv_copy`'s own doc comment explicitly permits `from`/`to`
+/// pointing at the same location), then this translation instead
+/// returns directly after setting `rettv`, an observably identical
+/// outcome (a plain `Number` has no shared/refcounted state a self-
+/// copy could otherwise matter for) without needing to alias a
+/// `*const` pointer against the same `&mut TypvalT` still used later.
+///
+/// # Safety
+/// If `argvars[0].value` is `Blob`/`List`/`Dict`-typed with a non-null
+/// pointer, that pointer must be valid. Forwards [`tv_copy`]'s own
+/// safety doc for `argvars[2]` (the default, if given).
+unsafe fn f_get(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut found: Option<*const TypvalT> = None;
+
+    match &argvars[0].value {
+        TypvalValue::Blob(b) => {
+            let b = *b;
+            let mut error = false;
+            let idx = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error)) as i32;
+            if !error {
+                // SAFETY: forwarded from this function's own safety doc.
+                let len = unsafe { crate::eval::typval::tv_blob_len(b) };
+                let idx = if idx < 0 { len + idx } else { idx };
+                if idx < 0 || idx >= len {
+                    rettv.value = TypvalValue::Number(-1);
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    rettv.value =
+                        TypvalValue::Number(i64::from(unsafe { crate::eval::typval::tv_blob_get(b, idx) }));
+                    return;
+                }
+            }
+        }
+        TypvalValue::List(l) => {
+            let l = *l;
+            if !l.is_null() {
+                let mut error = false;
+                let idx = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error)) as i32;
+                if !error {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let li = unsafe { crate::eval::typval::tv_list_find(l, idx) };
+                    if !li.is_null() {
+                        // SAFETY: `li` is a live node just returned by
+                        // `tv_list_find` above.
+                        found = Some(unsafe { std::ptr::addr_of!((*li).li_tv) });
+                    }
+                }
+            }
+        }
+        TypvalValue::Dict(d) => {
+            let d = *d;
+            if !d.is_null() {
+                let key = crate::eval::typval::tv_get_string(&argvars[1]);
+                // SAFETY: forwarded from this function's own safety doc.
+                if let Some(di) = crate::eval::typval::tv_dict_find(unsafe { d.as_mut() }, &key) {
+                    // SAFETY: `di` is a live item just returned by
+                    // `tv_dict_find` above.
+                    found = Some(unsafe { std::ptr::addr_of!((*di).di_tv) });
+                }
+            }
+        }
+        TypvalValue::Func(_) | TypvalValue::Partial(_) => {
+            unimplemented!(
+                "f_get: a Funcref/Partial argument needs get_func_arity and partial \
+                 introspection, not yet translated"
+            );
+        }
+        _ => {}
+    }
+
+    match found {
+        None => {
+            if argvars.len() > 2 {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_copy(&argvars[2], rettv) };
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc; `tv`
+        // was just derived above from a live List/Dict item.
+        Some(tv) => unsafe { crate::eval::typval::tv_copy(&*tv, rettv) },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1796,6 +1903,7 @@ mod tests {
             "keys",
             "values",
             "items",
+            "get",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -2270,5 +2378,118 @@ mod tests {
         }));
         assert!(result.is_err(), "expected a panic (tv_list2items not yet translated)");
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    // --- f_get ---
+
+    #[test]
+    fn get_from_a_list_in_range_and_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+            crate::eval::typval::tv_list_append_number(&mut *list, 30);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(1)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(20));
+
+        // Negative index counts from the end.
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(-1)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(30));
+
+        // Out of range with a default.
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(99), string(b"missing")];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"missing".to_vec())));
+
+        // Out of range without a default.
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(99)];
+        rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn get_from_a_null_list_uses_the_default() {
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() },
+            num(0),
+            num(42),
+        ];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn get_from_a_dict_present_and_missing_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let item = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*item).di_tv.value = TypvalValue::Number(7);
+            crate::eval::typval::tv_dict_add(&mut *dict, item);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string(b"a")];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+
+        let args =
+            [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string(b"missing"), num(-1)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn get_from_a_blob_in_range_and_out_of_range() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(1)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(20));
+
+        // Out of range with no default -> -1 (blob's own sentinel).
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(99)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        // Out of range WITH a default -> the default overrides the -1
+        // sentinel, matching the original's own shared tail exactly.
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(99), num(77)];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(77));
+
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn get_of_a_non_container_falls_back_to_the_default() {
+        let mut rettv = TypvalT::default();
+        let args = [num(5), num(0), string(b"fallback")];
+        unsafe { f_get(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"fallback".to_vec())));
+    }
+
+    #[test]
+    fn get_of_a_funcref_is_unimplemented() {
+        let args = [TypvalT { value: TypvalValue::Func(Some(b"len".to_vec())), ..Default::default() }, string(b"name")];
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_get(&args, &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (get_func_arity/partial introspection not yet translated)");
     }
 }
