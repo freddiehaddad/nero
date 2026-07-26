@@ -85,6 +85,8 @@ pub mod plines;
 pub mod pos_defs;
 pub mod profile;
 pub mod regexp_defs;
+pub mod register;
+pub mod register_defs;
 pub mod runtime;
 pub mod runtime_defs;
 pub mod search;

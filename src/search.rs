@@ -47,11 +47,19 @@
 //! ONLY on `set_vv_searchforward` -> `set_vim_var_nr`/
 //! `VV_SEARCHFORWARD`, now real.
 //!
+//! Also translated: `last_search_pat` (`@/` in expressions) - despite
+//! this module's own earlier note lumping it in with the functions
+//! that need a COMPILED pattern, direct re-reading of the original
+//! found it's a one-line `return spats[last_idx].pat;` needing only
+//! the already-real `SearchPatterns` storage, not the regex engine at
+//! all (that earlier note was stale/overly conservative, corrected
+//! here).
+//!
 //! Deferred: everything else in the file - the functions actually
-//! building/using a COMPILED search pattern (`last_search_pat`,
-//! `do_search`, `searchit`, etc.) need the real regex engine, a
-//! separate, substantial undertaking from this file's own small
-//! tractable corner, left for a dedicated future pass.
+//! building/using a COMPILED search pattern (`do_search`, `searchit`,
+//! etc.) need the real regex engine, a separate, substantial
+//! undertaking from this file's own small tractable corner, left for
+//! a dedicated future pass.
 
 use crate::types_defs::MAX_SCHAR_SIZE;
 use crate::vim_defs::Direction;
@@ -305,6 +313,16 @@ pub fn get_search_pattern_timestamp(substitute: bool) -> crate::os::time_defs::T
 pub fn search_pattern_cleared(substitute: bool) -> bool {
     // SAFETY: see [`get_search_pattern`].
     unsafe { SEARCH_PATTERNS.get_mut() }.spats[usize::from(substitute)].pat.is_none()
+}
+
+/// Get the last used search pattern's own raw text, whichever of
+/// `spats[0]`/`spats[1]` `last_idx` currently points at (`@/` in
+/// expressions) (`last_search_pat`).
+#[must_use]
+pub fn last_search_pat() -> Option<Vec<u8>> {
+    // SAFETY: see [`get_search_pattern`].
+    let state = unsafe { SEARCH_PATTERNS.get_mut() };
+    state.spats[state.last_idx].pat.clone()
 }
 
 /// Set the last substitute pattern (`set_substitute_pattern`).
@@ -813,6 +831,27 @@ mod tests {
             set_last_used_pattern(true); // last_idx = 1
             set_last_search_pat(b"x", false, true, false);
             assert_eq!(SEARCH_PATTERNS.get_mut().last_idx, 1); // untouched
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn last_search_pat_is_none_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        assert_eq!(last_search_pat(), None);
+    }
+
+    #[test]
+    fn last_search_pat_returns_whichever_pattern_last_idx_points_at() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        unsafe {
+            set_last_search_pat(b"foo", true, true, true); // idx 1 (substitute), sets last_idx
+            assert_eq!(last_search_pat(), Some(b"foo".to_vec()));
+
+            set_last_search_pat(b"bar", false, true, true); // idx 0 (search), sets last_idx
+            assert_eq!(last_search_pat(), Some(b"bar".to_vec()));
         }
         reset_vv_searchforward();
     }

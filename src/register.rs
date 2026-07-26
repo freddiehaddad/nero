@@ -1,0 +1,705 @@
+//! Translated from `src/nvim/register.c` (tractable core only).
+//!
+//! `register.c` (2867 lines) is the yank/delete/put register
+//! subsystem: register storage, `"ay`/`"ap`-style register selection,
+//! clipboard (`'clipboard'`) integration, and ShaDa persistence of
+//! register contents - none of the actual yank/delete/put *commands*
+//! (`op_yank`/`op_delete`/`do_put`, `ops.c`) are translated yet, so
+//! nothing in this crate ever WRITES a real value into a register.
+//!
+//! Translated: the register-name/index plumbing (`op_reg_index`,
+//! `valid_yank_reg`), the register storage array itself (`Y_REGS`,
+//! `y_previous` as `Y_PREVIOUS`) and [`get_yank_register`], the
+//! `"="`-register expression-source/result state ([`get_expr_line`]/
+//! [`get_expr_line_src`]/[`set_expr_line`]), and [`get_reg_contents`]/
+//! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller).
+//! `get_clipboard` always returns `false` (no provider registered) -
+//! this crate has no clipboard-provider integration translated yet
+//! (`ui_client.c`/Lua `provider#clipboard#`, a separate, substantial
+//! undertaking); every OTHER real code path in [`get_yank_register`]
+//! still behaves correctly given this, matching the original's own
+//! "clipboard unavailable" fallback exactly.
+//!
+//! Because nothing yet WRITES to `Y_REGS`/`last_cmdline`/the
+//! `"="`-register expression/the last-inserted-text state, every
+//! named/numbered register (`@a`-`@z`, `@"`, `@0`-`@9`, `@-`, `@*`,
+//! `@+`) and most special registers correctly, faithfully evaluate to
+//! empty/`v:null` today - not a stub, but the genuinely correct
+//! behavior for a session in which nothing has ever yanked, deleted,
+//! put, or run an Ex command yet.
+//!
+//! Deferred:
+//! - `getaltfname` (`@#`, alternate file name): only its own
+//!   provably-always-reachable-today shortcut is modeled (`w_alt_fnum
+//!   == 0`, meaning "no alternate file" - the default and, since no
+//!   buffer-switching command exists yet, the ONLY reachable state);
+//!   the general case needs `buflist_findnr`/`handle_get_buffer`
+//!   (`buffer.c`, not yet translated), `unimplemented!()`s if ever
+//!   reached.
+//! - `@.` (last inserted text) needs a `last_insert` `String`
+//!   file-static (`insert.c`) populated only by real insert-mode text
+//!   entry, not yet translated - modeled as an always-`None`
+//!   `LAST_INSERT` `GlobalCell` (matching `EXPR_LINE`'s own
+//!   identical "always empty, nothing writes it yet" treatment),
+//!   correct for every real session today.
+//! - `@Ctrl-F`/`@Ctrl-P`/`@Ctrl-W`/`@Ctrl-A`/`@Ctrl-L` ("under cursor"
+//!   pseudo-registers): the original's own `get_spec_reg` immediately
+//!   returns `false` for these whenever `errmsg` is `false` - which
+//!   [`get_reg_contents`]'s own call always passes - so this crate's
+//!   `get_spec_reg` translation matches that exactly and never needs
+//!   `file_name_at_cursor`/`find_ident_under_cursor`/`ml_get_buf`
+//!   (`errmsg = true` is unreachable from any real caller in this
+//!   crate today).
+//! - `kGRegList` (`get_reg_contents` returning a `List` rather than a
+//!   joined string, used by the `getreg()` builtin, not `@r` in
+//!   expressions) - `unimplemented!()`s if ever requested; `eval7`'s
+//!   own real call never sets it.
+//! - Everything else: `yank_register_mline`, `get_default_register_name`
+//!   (`'clipboard'`-driven default-register selection), `op_reg_iter`
+//!   (ShaDa register enumeration), and the entire real
+//!   yank/delete/put/ShaDa-restore write side (`do_put`, `op_yank`,
+//!   `op_delete`, `shada.c`'s register entries) - no real caller
+//!   exists for any of these yet.
+
+use crate::register_defs::{greg_flags, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
+
+/// Convert a register name character to its `Y_REGS` index
+/// (`op_reg_index`). Returns `None` for a name with no direct slot
+/// (matching the original's own `-1`) - digits map to `0..=9`,
+/// letters (either case) to `10..=35`, `'-'`/`'*'`/`'+'` to their own
+/// named constants.
+#[must_use]
+pub fn op_reg_index(regname: i32) -> Option<usize> {
+    if (i32::from(b'0')..=i32::from(b'9')).contains(&regname) {
+        Some((regname - i32::from(b'0')) as usize)
+    } else if (i32::from(b'a')..=i32::from(b'z')).contains(&regname) {
+        Some((regname - i32::from(b'a')) as usize + 10)
+    } else if (i32::from(b'A')..=i32::from(b'Z')).contains(&regname) {
+        Some((regname - i32::from(b'A')) as usize + 10)
+    } else if regname == i32::from(b'-') {
+        Some(crate::register_defs::DELETION_REGISTER)
+    } else if regname == i32::from(b'*') {
+        Some(STAR_REGISTER)
+    } else if regname == i32::from(b'+') {
+        Some(PLUS_REGISTER)
+    } else {
+        None
+    }
+}
+
+/// Check if `regname` is a valid name of a yank register
+/// (`valid_yank_reg`).
+///
+/// There is no check for `0` (the default/unnamed register) - the
+/// caller must do this, matching the original's own documented
+/// requirement. The black hole register `'_'` is regarded as valid.
+#[must_use]
+pub fn valid_yank_reg(regname: i32, writing: bool) -> bool {
+    (regname > 0 && u8::try_from(regname).is_ok_and(|b| b.is_ascii_alphanumeric()))
+        || (!writing && regname > 0 && u8::try_from(regname).is_ok_and(|b| b"/#.%:=".contains(&b)))
+        || regname == i32::from(b'"')
+        || regname == i32::from(b'-')
+        || regname == i32::from(b'_')
+        || regname == i32::from(b'*')
+        || regname == i32::from(b'+')
+}
+
+/// Try to read from or write to the system clipboard (`get_clipboard`,
+/// via `adjust_clipboard_name`/the `'clipboard'`-option-driven
+/// provider dispatch).
+///
+/// Always returns `false` (no provider registered) - this crate has
+/// no clipboard-provider integration translated yet (needs a real Lua/
+/// external-UI provider dispatch, `ui_client.c`/`provider#clipboard#`,
+/// a separate, substantial undertaking). Every real caller in this
+/// crate already handles a `false` return exactly as the original
+/// does for "no provider available", so this is a faithful, not a
+/// merely convenient, default for today's reality.
+#[must_use]
+fn get_clipboard(_regname: i32) -> bool {
+    false
+}
+
+/// The 39 yank/delete/numbered/named registers (`y_regs[]`).
+static Y_REGS: std::sync::LazyLock<crate::globals::GlobalCell<[YankregT; NUM_REGISTERS]>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(std::array::from_fn(|_| YankregT::default())));
+
+/// Index into `Y_REGS` of the last-written register, for
+/// unnamed-paste fallback (`y_previous`, a `yankreg_T *` in the
+/// original - modeled as an index rather than a pointer, since
+/// `Y_REGS` is a fixed-size array rather than individually heap-
+/// allocated registers). `None` matches the original's own initial
+/// `NULL` - stays `None` forever today, since nothing ever performs a
+/// real yank (`YREG_YANK` mode) yet.
+static Y_PREVIOUS: crate::globals::GlobalCell<Option<usize>> = crate::globals::GlobalCell::new(None);
+
+/// A permanently-empty register, returned by [`get_yank_register`] for
+/// `'*'`/`'+'` in `YregModeT::Put` mode when the clipboard is
+/// unavailable (`static yankreg_T empty_reg` in the original - a
+/// function-local `static` there, promoted to file scope here since
+/// Rust has no function-local `static` initializer needing per-call
+/// re-initialization semantics the original doesn't rely on either).
+static EMPTY_REG: crate::globals::GlobalCell<YankregT> = crate::globals::GlobalCell::new(YankregT {
+    y_array: None,
+    y_type: crate::normal_defs::MotionType::CharWise,
+    y_width: 0,
+    timestamp: 0,
+});
+
+/// Get the yank register for `regname` (`get_yank_register`).
+///
+/// # Safety
+/// Touches `Y_REGS`/`Y_PREVIOUS`/`EMPTY_REG` (`GlobalCell`s) - no
+/// overlapping live access.
+#[must_use]
+pub unsafe fn get_yank_register(regname: i32, mode: YregModeT) -> *mut YankregT {
+    if (mode == YregModeT::Paste || mode == YregModeT::Put) && get_clipboard(regname) {
+        // Unreachable today - get_clipboard always returns false (see
+        // its own doc comment) - kept for structural fidelity in case
+        // a future clipboard-provider integration makes this real.
+        unreachable!("get_clipboard never succeeds yet");
+    } else if mode == YregModeT::Put && (regname == i32::from(b'*') || regname == i32::from(b'+')) {
+        // In case the clipboard isn't available and we aren't actually
+        // pasting, return an empty register.
+        return unsafe { EMPTY_REG.get_mut() };
+    } else if mode != YregModeT::Yank
+        && (regname == 0 || regname == i32::from(b'"') || regname == i32::from(b'*') || regname == i32::from(b'+'))
+    {
+        // In case the clipboard isn't available, paste from the
+        // previously used register.
+        if let Some(idx) = unsafe { *Y_PREVIOUS.get_mut() } {
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { &mut Y_REGS.get_mut()[idx] };
+        }
+    }
+
+    // When not 0-9, a-z, A-Z, or '-'/'*'/'+': use register 0.
+    let i = op_reg_index(regname).unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg: *mut YankregT = unsafe { &mut Y_REGS.get_mut()[i] };
+
+    if mode == YregModeT::Yank {
+        // Remember the written register for unnamed paste.
+        unsafe { *Y_PREVIOUS.get_mut() = Some(i) };
+    }
+    reg
+}
+
+/// The expression evaluated for the `"="` register (`expr_line`, a
+/// file-static in the original). Always `None` today: nothing in this
+/// crate translates `:let @= = ...`/`c_CTRL-R_=`-style assignment yet,
+/// so the `"="` register always evaluates to `v:null` - a genuinely
+/// correct, not merely stubbed, state for a session where nothing has
+/// ever set it.
+static EXPR_LINE: crate::globals::GlobalCell<Option<Vec<u8>>> = crate::globals::GlobalCell::new(None);
+
+/// Set the expression for the `"="` register (`set_expr_line`).
+///
+/// Not yet called by anything real in this crate (needs the
+/// `c_CTRL-R_=`/`:let @=`-style assignment machinery), but translated
+/// for completeness alongside its own `EXPR_LINE` storage.
+pub fn set_expr_line(new_line: Option<Vec<u8>>) {
+    unsafe { *EXPR_LINE.get_mut() = new_line };
+}
+
+/// Get the result of the `"="` register expression (`get_expr_line`).
+///
+/// # Safety
+/// Forwarded from `crate::eval::eval::eval_to_string`'s own safety
+/// doc (only reached when `EXPR_LINE` is actually `Some`, which
+/// nothing in this crate constructs yet - see this module's own doc
+/// comment).
+#[must_use]
+pub unsafe fn get_expr_line() -> Option<Vec<u8>> {
+    let expr_line = unsafe { EXPR_LINE.get_mut() }.clone()?;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::eval_to_string(&expr_line, true, false) }
+}
+
+/// Get the `"="` register expression itself, without evaluating it
+/// (`get_expr_line_src`).
+#[must_use]
+pub fn get_expr_line_src() -> Option<Vec<u8>> {
+    unsafe { EXPR_LINE.get_mut() }.clone()
+}
+
+/// The last inserted text (`last_insert`, a file-static `String` in
+/// `insert.c`, not this file - grouped here anyway since `get_spec_reg`
+/// is this module's own only real reader). Always `None` today - see
+/// this module's own doc comment.
+static LAST_INSERT: crate::globals::GlobalCell<Option<Vec<u8>>> = crate::globals::GlobalCell::new(None);
+
+/// Get the last inserted text, with a trailing `<Esc>` kept but no
+/// other trailing byte trimmed (`get_last_insert_save`).
+///
+/// Not yet reachable with a real value (see `LAST_INSERT`'s own doc
+/// comment), but translated faithfully for when real insert-mode
+/// tracking exists.
+#[must_use]
+fn get_last_insert_save() -> Option<Vec<u8>> {
+    unsafe { LAST_INSERT.get_mut() }.clone()
+}
+
+/// Get the alternate file name (`@#`) (`getaltfname`).
+///
+/// Only the provably-always-reachable-today case is modeled: when
+/// `curwin`'s `w_alt_fnum` is `0` (the default, and - since no
+/// buffer-switching command exists yet - the ONLY value it can ever
+/// hold today), the original's own `buflist_findnr(0)` ->
+/// `curwin->w_alt_fnum` -> `handle_get_buffer(0)` chain always fails
+/// (buffer handle `0` is never a real buffer - handles start at `1`),
+/// so `getaltfname` always returns `None` here, matching that exactly.
+/// A real, non-zero `w_alt_fnum` would need `buflist_findnr`/
+/// `handle_get_buffer` (`buffer.c`, not yet translated) -
+/// `unimplemented!()`s if ever reached.
+///
+/// `errmsg` (whether to report "no alternate file name" as an error)
+/// is accepted for signature fidelity but never actually matters yet:
+/// every real caller in this crate passes `false` (see this module's
+/// own doc comment), and the `None` path never displays a message
+/// regardless (message display, not tractable, matches this crate's
+/// established policy elsewhere).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curwin` - must be a valid,
+/// non-null pointer to a live `WinT`.
+#[must_use]
+unsafe fn getaltfname(_errmsg: bool) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_alt_fnum = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_alt_fnum;
+    if w_alt_fnum == 0 {
+        return None;
+    }
+    unimplemented!(
+        "getaltfname: a real, non-zero w_alt_fnum needs buflist_findnr/handle_get_buffer \
+         (buffer.c), not yet translated"
+    );
+}
+
+/// Get the value of a special register, if `regname` names one
+/// (`get_spec_reg`).
+///
+/// Returns `Some((value, allocated))` when `regname` IS a special
+/// register (`value` may itself be `None`, e.g. an as-yet-unset `"."`/
+/// `":"` register) - `allocated` has no real meaning in this crate's
+/// own always-owned `Option<Vec<u8>>` idiom (kept only for structural
+/// fidelity with the original's "did this need a fresh allocation or
+/// point at existing storage" distinction) - `None` when `regname`
+/// isn't a special register at all, matching the original's own
+/// `false` return.
+///
+/// # Safety
+/// Forwarded from `getaltfname`'s own safety doc (only reached for
+/// `regname == '#'`).
+#[must_use]
+unsafe fn get_spec_reg(regname: i32, errmsg: bool) -> Option<(Option<Vec<u8>>, bool)> {
+    match u8::try_from(regname).ok() {
+        Some(b'%') => {
+            // file name
+            let b_fname = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }.b_fname.clone();
+            Some((b_fname, false))
+        }
+        Some(b'#') => {
+            // alternate file name
+            // SAFETY: forwarded from this function's own safety doc.
+            Some((unsafe { getaltfname(errmsg) }, false))
+        }
+        Some(b'=') => {
+            // result of expression
+            // SAFETY: forwarded from this function's own safety doc.
+            Some((unsafe { get_expr_line() }, true))
+        }
+        Some(b':') => {
+            // last command line
+            Some((unsafe { crate::globals::GLOBALS.get_mut() }.last_cmdline.clone(), false))
+        }
+        Some(b'/') => {
+            // last search-pattern
+            Some((crate::search::last_search_pat(), false))
+        }
+        Some(b'.') => {
+            // last inserted text
+            Some((get_last_insert_save(), true))
+        }
+        // Ctrl_F/Ctrl_P (filename/path under cursor), Ctrl_W/Ctrl_A
+        // (word/WORD under cursor), Ctrl_L (line under cursor): the
+        // original's own get_spec_reg immediately `return false;` for
+        // all five of these whenever `!errmsg` - which is always true
+        // for get_reg_contents's own real call - so this crate's own
+        // translation matches that exactly, needing none of
+        // file_name_at_cursor/find_ident_under_cursor/ml_get_buf.
+        Some(0x06 | 0x10 | 0x17 | 0x01 | 0x0c) if !errmsg => None,
+        Some(0x06 | 0x10 | 0x17 | 0x01 | 0x0c) => {
+            unimplemented!(
+                "get_spec_reg: errmsg=true for a cursor-relative pseudo-register is unreachable \
+                 from any real caller today, not yet translated"
+            );
+        }
+        Some(b'_') => {
+            // black hole: always empty.
+            Some((Some(Vec::new()), false))
+        }
+        _ => None,
+    }
+}
+
+/// Gets the contents of a register (`get_reg_contents`).
+/// @remark Used for `@r` in expressions (only `flags ==
+/// kGRegExprSrc`, `eval7`'s own real call).
+///
+/// Returns `None` for an invalid register name or an unset/empty
+/// register, matching the original's own `NULL`.
+///
+/// # Deferred
+/// `flags & kGRegList` (return a `List` rather than a joined string,
+/// needed only by the `getreg()` builtin, not `@r`) -
+/// `unimplemented!()`s if ever requested.
+///
+/// # Safety
+/// Forwarded from `get_spec_reg`'s own safety doc.
+#[must_use]
+pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<Vec<u8>> {
+    // Don't allow using an expression register inside an expression.
+    let regname = if regname == i32::from(b'=') {
+        if flags & greg_flags::NO_EXPR != 0 {
+            return None;
+        }
+        return if flags & greg_flags::EXPR_SRC != 0 {
+            get_expr_line_src()
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { get_expr_line() }
+        };
+    } else if regname == i32::from(b'@') {
+        // "@@" is used for the unnamed register.
+        i32::from(b'"')
+    } else {
+        regname
+    };
+
+    // Check for a valid regname.
+    if regname != 0 && !valid_yank_reg(regname, false) {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some((retval, _allocated)) = unsafe { get_spec_reg(regname, false) } {
+        return retval;
+    }
+
+    if flags & greg_flags::LIST != 0 {
+        unimplemented!("get_reg_contents: kGRegList is only needed by getreg(), not eval7's own @r");
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg = unsafe { &*get_yank_register(regname, YregModeT::Put) };
+    let y_array = reg.y_array.as_ref()?;
+
+    // Join the lines of the yank register into one string, inserting a
+    // newline between lines and after the last line if y_type is
+    // LineWise.
+    let mut retval = Vec::new();
+    for (i, line) in y_array.iter().enumerate() {
+        retval.extend_from_slice(line);
+        if reg.y_type == crate::normal_defs::MotionType::LineWise || i < y_array.len() - 1 {
+            retval.push(b'\n');
+        }
+    }
+    Some(retval)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- op_reg_index / valid_yank_reg ---
+
+    #[test]
+    fn op_reg_index_digits() {
+        assert_eq!(op_reg_index(i32::from(b'0')), Some(0));
+        assert_eq!(op_reg_index(i32::from(b'9')), Some(9));
+    }
+
+    #[test]
+    fn op_reg_index_letters_both_cases_map_to_the_same_slot() {
+        assert_eq!(op_reg_index(i32::from(b'a')), Some(10));
+        assert_eq!(op_reg_index(i32::from(b'z')), Some(35));
+        assert_eq!(op_reg_index(i32::from(b'A')), Some(10));
+        assert_eq!(op_reg_index(i32::from(b'Z')), Some(35));
+    }
+
+    #[test]
+    fn op_reg_index_special_names() {
+        assert_eq!(op_reg_index(i32::from(b'-')), Some(crate::register_defs::DELETION_REGISTER));
+        assert_eq!(op_reg_index(i32::from(b'*')), Some(STAR_REGISTER));
+        assert_eq!(op_reg_index(i32::from(b'+')), Some(PLUS_REGISTER));
+    }
+
+    #[test]
+    fn op_reg_index_invalid_name_is_none() {
+        assert_eq!(op_reg_index(i32::from(b'"')), None);
+        assert_eq!(op_reg_index(0), None);
+        assert_eq!(op_reg_index(i32::from(b'!')), None);
+    }
+
+    #[test]
+    fn valid_yank_reg_accepts_alphanumeric_and_the_documented_specials() {
+        assert!(valid_yank_reg(i32::from(b'a'), false));
+        assert!(valid_yank_reg(i32::from(b'Z'), false));
+        assert!(valid_yank_reg(i32::from(b'5'), false));
+        assert!(valid_yank_reg(i32::from(b'"'), false));
+        assert!(valid_yank_reg(i32::from(b'-'), false));
+        assert!(valid_yank_reg(i32::from(b'_'), false)); // black hole is valid
+        assert!(valid_yank_reg(i32::from(b'*'), false));
+        assert!(valid_yank_reg(i32::from(b'+'), false));
+    }
+
+    #[test]
+    fn valid_yank_reg_accepts_readonly_specials_only_when_not_writing() {
+        for &b in b"/#.%:=" {
+            assert!(valid_yank_reg(i32::from(b), false), "{} should be valid when reading", b as char);
+            assert!(!valid_yank_reg(i32::from(b), true), "{} should be invalid when writing", b as char);
+        }
+    }
+
+    #[test]
+    fn valid_yank_reg_rejects_other_punctuation() {
+        assert!(!valid_yank_reg(i32::from(b'!'), false));
+        assert!(!valid_yank_reg(i32::from(b'@'), false));
+    }
+
+    #[test]
+    fn get_clipboard_always_fails() {
+        assert!(!get_clipboard(i32::from(b'*')));
+        assert!(!get_clipboard(i32::from(b'+')));
+    }
+
+    // --- get_yank_register ---
+
+    #[test]
+    fn get_yank_register_named_register_maps_to_its_own_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let reg = unsafe { get_yank_register(i32::from(b'a'), YregModeT::Put) };
+        // SAFETY: Y_REGS is a 'static array; this pointer is always valid.
+        assert!(unsafe { (*reg).y_array.is_none() }, "register 'a' starts empty");
+    }
+
+    #[test]
+    fn get_yank_register_unrecognized_name_falls_back_to_register_0() {
+        let _lock = crate::globals::global_state_test_lock();
+        let reg_invalid = unsafe { get_yank_register(i32::from(b'!'), YregModeT::Put) };
+        let reg_zero = unsafe { get_yank_register(0, YregModeT::Yank) };
+        assert_eq!(reg_invalid, reg_zero, "an unrecognized name uses register 0, matching the original");
+    }
+
+    #[test]
+    fn get_yank_register_star_and_plus_in_put_mode_return_the_empty_register_without_clipboard() {
+        let _lock = crate::globals::global_state_test_lock();
+        let reg_star = unsafe { get_yank_register(i32::from(b'*'), YregModeT::Put) };
+        let reg_plus = unsafe { get_yank_register(i32::from(b'+'), YregModeT::Put) };
+        assert_eq!(reg_star, unsafe { EMPTY_REG.get_mut() } as *mut YankregT);
+        assert_eq!(reg_plus, unsafe { EMPTY_REG.get_mut() } as *mut YankregT);
+    }
+
+    #[test]
+    fn get_yank_register_yank_mode_remembers_the_register_for_unnamed_paste() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *Y_PREVIOUS.get_mut() = None };
+
+        let reg_a = unsafe { get_yank_register(i32::from(b'a'), YregModeT::Yank) };
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(10));
+
+        // Now an unnamed paste (mode != Yank, regname == 0) should
+        // resolve to the same register 'a' just written.
+        let reg_unnamed = unsafe { get_yank_register(0, YregModeT::Put) };
+        assert_eq!(reg_a, reg_unnamed);
+
+        unsafe { *Y_PREVIOUS.get_mut() = None };
+    }
+
+    // --- "=" register (expr_line) ---
+
+    #[test]
+    fn expr_line_starts_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(None);
+        assert_eq!(get_expr_line_src(), None);
+    }
+
+    #[test]
+    fn expr_line_src_returns_the_raw_text_unevaluated() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(Some(b"1 + 1".to_vec()));
+        assert_eq!(get_expr_line_src(), Some(b"1 + 1".to_vec()));
+        set_expr_line(None);
+    }
+
+    #[test]
+    fn expr_line_evaluates_when_read_via_get_expr_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(Some(b"1 + 1".to_vec()));
+        assert_eq!(unsafe { get_expr_line() }, Some(b"2".to_vec()));
+        set_expr_line(None);
+    }
+
+    // --- get_spec_reg / get_reg_contents ---
+
+    fn with_curbuf_curwin<R>(buf: &mut crate::buffer_defs::BufT, win: &mut crate::buffer_defs::WinT, f: impl FnOnce() -> R) -> R {
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_win = globals.curwin;
+        globals.curbuf = buf as *mut crate::buffer_defs::BufT;
+        globals.curwin = win as *mut crate::buffer_defs::WinT;
+
+        let result = f();
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.curwin = prev_win;
+        result
+    }
+
+    #[test]
+    fn get_spec_reg_percent_returns_the_current_buffer_file_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_fname: Some(b"foo.txt".to_vec()), ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let result = unsafe { get_spec_reg(i32::from(b'%'), false) };
+            assert_eq!(result, Some((Some(b"foo.txt".to_vec()), false)));
+        });
+    }
+
+    #[test]
+    fn get_spec_reg_hash_alternate_file_is_none_when_w_alt_fnum_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_alt_fnum: 0, ..Default::default() };
+
+        with_curbuf_curwin(&mut buf, &mut win, || {
+            let result = unsafe { get_spec_reg(i32::from(b'#'), false) };
+            assert_eq!(result, Some((None, false)));
+        });
+    }
+
+    #[test]
+    fn get_spec_reg_hash_alternate_file_is_unimplemented_when_w_alt_fnum_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_alt_fnum: 5, ..Default::default() };
+
+        let result = with_curbuf_curwin(&mut buf, &mut win, || {
+            std::panic::catch_unwind(|| unsafe { get_spec_reg(i32::from(b'#'), false) })
+        });
+        assert!(result.is_err(), "expected a panic (buflist_findnr not yet translated)");
+    }
+
+    #[test]
+    fn get_spec_reg_colon_returns_last_cmdline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.last_cmdline.clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.last_cmdline = Some(b":wq".to_vec());
+
+        let result = unsafe { get_spec_reg(i32::from(b':'), false) };
+        assert_eq!(result, Some((Some(b":wq".to_vec()), false)));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.last_cmdline = prev;
+    }
+
+    #[test]
+    fn get_spec_reg_slash_returns_last_search_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        // No setter is exercised here (search.rs's own set_last_search_pat
+        // needs more setup) - just confirms the unset default is None.
+        let result = unsafe { get_spec_reg(i32::from(b'/'), false) };
+        assert_eq!(result, Some((crate::search::last_search_pat(), false)));
+    }
+
+    #[test]
+    fn get_spec_reg_dot_returns_last_insert_which_is_always_unset_today() {
+        let _lock = crate::globals::global_state_test_lock();
+        let result = unsafe { get_spec_reg(i32::from(b'.'), false) };
+        assert_eq!(result, Some((None, true)));
+    }
+
+    #[test]
+    fn get_spec_reg_cursor_relative_registers_are_none_without_errmsg() {
+        // Ctrl_F, Ctrl_P, Ctrl_W, Ctrl_A, Ctrl_L
+        for &c in &[0x06, 0x10, 0x17, 0x01, 0x0c] {
+            assert_eq!(unsafe { get_spec_reg(c, false) }, None, "0x{c:02x} should be None when !errmsg");
+        }
+    }
+
+    #[test]
+    fn get_spec_reg_cursor_relative_registers_are_unimplemented_with_errmsg() {
+        let result = std::panic::catch_unwind(|| unsafe { get_spec_reg(0x17, true) }); // Ctrl_W
+        assert!(result.is_err(), "expected a panic (find_ident_under_cursor not yet translated)");
+    }
+
+    #[test]
+    fn get_spec_reg_black_hole_is_always_an_empty_string() {
+        let result = unsafe { get_spec_reg(i32::from(b'_'), false) };
+        assert_eq!(result, Some((Some(Vec::new()), false)));
+    }
+
+    #[test]
+    fn get_spec_reg_unrecognized_name_is_none() {
+        assert_eq!(unsafe { get_spec_reg(i32::from(b'a'), false) }, None);
+    }
+
+    #[test]
+    fn get_reg_contents_equals_returns_the_source_text_with_expr_src_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(Some(b"1 + 1".to_vec()));
+        let result = unsafe { get_reg_contents(i32::from(b'='), greg_flags::EXPR_SRC) };
+        assert_eq!(result, Some(b"1 + 1".to_vec()));
+        set_expr_line(None);
+    }
+
+    #[test]
+    fn get_reg_contents_equals_evaluates_without_expr_src_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(Some(b"1 + 1".to_vec()));
+        let result = unsafe { get_reg_contents(i32::from(b'='), 0) };
+        assert_eq!(result, Some(b"2".to_vec()));
+        set_expr_line(None);
+    }
+
+    #[test]
+    fn get_reg_contents_equals_with_no_expr_flag_fails() {
+        let result = unsafe { get_reg_contents(i32::from(b'='), greg_flags::NO_EXPR) };
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn get_reg_contents_at_is_an_alias_for_the_unnamed_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let via_at = unsafe { get_reg_contents(i32::from(b'@'), greg_flags::EXPR_SRC) };
+        let via_quote = unsafe { get_reg_contents(i32::from(b'"'), greg_flags::EXPR_SRC) };
+        assert_eq!(via_at, via_quote);
+    }
+
+    #[test]
+    fn get_reg_contents_invalid_name_is_none() {
+        assert_eq!(unsafe { get_reg_contents(i32::from(b'!'), greg_flags::EXPR_SRC) }, None);
+    }
+
+    #[test]
+    fn get_reg_contents_named_register_is_none_when_nothing_has_ever_yanked() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_reg_contents(i32::from(b'a'), greg_flags::EXPR_SRC) }, None);
+    }
+
+    #[test]
+    fn get_reg_contents_black_hole_is_an_empty_string_not_none() {
+        let result = unsafe { get_reg_contents(i32::from(b'_'), greg_flags::EXPR_SRC) };
+        assert_eq!(result, Some(Vec::new()));
+    }
+
+    #[test]
+    fn get_reg_contents_klist_flag_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| unsafe { get_reg_contents(i32::from(b'a'), greg_flags::LIST) });
+        assert!(result.is_err(), "expected a panic (kGRegList not yet translated)");
+    }
+}

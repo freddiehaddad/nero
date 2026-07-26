@@ -175,20 +175,24 @@
 //! (`get_name_len`/`eval_variable`/`check_vars`), option values
 //! (`eval_option`/`find_option_var_end`, now that `option.rs`'s real
 //! `options[]` table/`find_option`/`get_option_value`/`get_varp_from`
-//! engine all exist), and environment variables (`eval_env_var`/
+//! engine all exist), environment variables (`eval_env_var`/
 //! `get_env_len`, now that `charset.rs`'s `vim_isidc` exists and
 //! `os/env.rs`'s `vim_getenv` covers the common "real OS environment
-//! variable" case) are all real. Only genuinely substantial remaining
-//! pieces still panic via `unimplemented!()`, each with its own
-//! specific, documented reason: lambda expressions (`get_lambda_tv`,
-//! detected via the new `crate::eval::userfunc::is_lambda_start` and
-//! declined cleanly, rather than being misparsed as a dict literal,
-//! needs closure/lambda compilation), interpolated strings
-//! (`eval_interp_string`, `$"..."`/`$'...'`), a `$VAR` whose value
-//! `vim_getenv` can't resolve directly (needs `expand_env_save`'s own
-//! `~`/`~user`/`` `=expr` ``-handling fallback, see `os/env.rs`'s own
-//! doc comment), register contents (`get_reg_contents`, needs
-//! `register.c`), and function calls (`eval_func`, needs either the
+//! variable" case), interpolated strings (`eval_interp_string`,
+//! `$"..."`/`$'...'`, including embedded `{expr}` via
+//! `crate::eval::vars::eval_one_expr_in_str`), and register contents
+//! (`get_reg_contents`, now that `register.rs` exists - every named/
+//! numbered register is genuinely empty today since nothing yanks/
+//! deletes/puts yet, not a stub) are all real. Only genuinely
+//! substantial remaining pieces still panic via `unimplemented!()`,
+//! each with its own specific, documented reason: lambda expressions
+//! (`get_lambda_tv`, detected via the new
+//! `crate::eval::userfunc::is_lambda_start` and declined cleanly,
+//! rather than being misparsed as a dict literal, needs closure/
+//! lambda compilation), a `$VAR` whose value `vim_getenv` can't
+//! resolve directly (needs `expand_env_save`'s own `~`/`~user`/
+//! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment),
+//! and function calls (`eval_func`, needs either the
 //! whole Ex-command execution engine for user-defined functions or
 //! `eval/funcs.c`'s own huge builtin-dispatch table). A byte that
 //! would make `get_name_len` itself report "no name here at all" (e.g.
@@ -2941,7 +2945,18 @@ pub unsafe fn eval7(
         }
         // Register contents: @r.
         Some(b'@') => {
-            unimplemented!("eval7: register contents (@r) need register.c, not yet translated");
+            pos += 1;
+            let regname = arg.get(pos).copied().map_or(0, i32::from);
+            if evaluate {
+                // SAFETY: forwarded from this function's own safety doc.
+                let contents =
+                    unsafe { crate::register::get_reg_contents(regname, crate::register_defs::greg_flags::EXPR_SRC) };
+                rettv.value = TypvalValue::String(contents);
+            }
+            if arg.get(pos).is_some() {
+                pos += 1;
+            }
+            ret = OK;
         }
         // Nested expression: (expression).
         Some(b'(') => {
@@ -6620,6 +6635,56 @@ mod tests {
     fn e2e_option_value_unknown_name_fails() {
         let (ret, _) = eval_str(b"&notarealoption");
         assert_eq!(ret, FAIL);
+    }
+
+    // --- register contents: @r ---
+
+    #[test]
+    fn e2e_register_black_hole_is_an_empty_string() {
+        let (ret, tv) = eval_str(b"@_");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    #[test]
+    fn e2e_register_unnamed_is_null_when_nothing_has_ever_yanked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"@\"");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn e2e_register_expr_register_returns_source_text_unevaluated() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::register::set_expr_line(Some(b"1 + 1".to_vec()));
+        let (ret, tv) = eval_str(b"@=");
+        assert_eq!(ret, OK);
+        // eval7's own real call always uses kGRegExprSrc - "@=" in an
+        // expression yields the last @= assignment's own SOURCE TEXT,
+        // not its evaluated result (a real, if surprising, upstream
+        // quirk - verified directly against eval.c's own case '@').
+        assert_eq!(tv.value, TypvalValue::String(Some(b"1 + 1".to_vec())));
+        crate::register::set_expr_line(None);
+    }
+
+    #[test]
+    fn e2e_register_invalid_name_still_succeeds_with_a_null_string() {
+        // Unlike eval_option/eval_env_var, eval7's own '@' case never
+        // sets `ret = FAIL` at all - an invalid register name still
+        // reports OK, just with a null string value (matching the
+        // original's own unconditional `break` with no FAIL path).
+        let (ret, tv) = eval_str(b"@!");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn e2e_register_bare_at_with_nothing_following() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"@");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(None));
     }
 
     // --- skip_expr ---
