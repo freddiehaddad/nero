@@ -203,6 +203,18 @@
 //! contract, unlike e.g. `join()` where a specific argument type has
 //! one well-defined correct stringification that must not be silently
 //! wrong.
+//!
+//! Also a batch of `strings.c`-hosted string-inspection/extraction
+//! builtins: `strlen()` (byte length), `strcharlen()`/`strchars()`
+//! (character count, composing-aware via the new
+//! [`crate::mbyte::mb_ptr2char_adv`]/[`crate::mbyte::mb_cptr2char_adv`]),
+//! `strwidth()` (display cells, via the new
+//! [`crate::mbyte::mb_string2cells`]), `stridx()`/`strridx()`
+//! (forward/reverse substring search), `strgetchar()` (character at a
+//! character index), `strpart()` (byte or, with `{chars}`, character-
+//! counted substring extraction), and `strtrans()` (unprintable-
+//! character escaping, via the already-translated
+//! [`crate::charset::transstr`]).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -305,6 +317,15 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getenv"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getenv });
         m.insert(&b"environ"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_environ });
         m.insert(&b"has"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_has });
+        m.insert(&b"strlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strlen });
+        m.insert(&b"strcharlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strcharlen });
+        m.insert(&b"strchars"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strchars });
+        m.insert(&b"strwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strwidth });
+        m.insert(&b"stridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_stridx });
+        m.insert(&b"strridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_strridx });
+        m.insert(&b"strgetchar"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strgetchar });
+        m.insert(&b"strpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strpart });
+        m.insert(&b"strtrans"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strtrans });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2623,6 +2644,240 @@ fn f_has(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(found));
 }
 
+/// `strlen({string})` - the length of `{string}` in BYTES (`f_strlen`,
+/// `strings.c`).
+fn f_strlen(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    rettv.value = TypvalValue::Number(s.len() as i64);
+}
+
+/// Shared core of `strcharlen()`/`strchars()` (`strchar_common`,
+/// `strings.c`): count characters, one advance at a time - composing
+/// marks are folded into the base character (not counted separately)
+/// when `skipcc` is `true`, matching
+/// [`crate::mbyte::mb_ptr2char_adv`]; counted as their own separate
+/// characters when `false`, matching
+/// [`crate::mbyte::mb_cptr2char_adv`].
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `skipcc` is `true` (forwarded from
+/// [`crate::mbyte::mb_ptr2char_adv`]'s own safety doc).
+unsafe fn strchar_common(s: &[u8], skipcc: bool) -> i64 {
+    let mut len = 0i64;
+    let mut p = 0usize;
+    while p < s.len() {
+        let adv = if skipcc {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mbyte::mb_ptr2char_adv(&s[p..]) }.1
+        } else {
+            crate::mbyte::mb_cptr2char_adv(&s[p..]).1
+        };
+        p += adv.max(1);
+        len += 1;
+    }
+    len
+}
+
+/// `strcharlen({string})` - the number of characters in `{string}`,
+/// composing characters ignored (`f_strcharlen`, `strings.c`) -
+/// equivalent to `strchars({string}, 1)`.
+///
+/// # Safety
+/// Forwarded from [`strchar_common`]'s own safety doc.
+unsafe fn f_strcharlen(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { strchar_common(&s, true) });
+}
+
+/// `strchars({string} [, {skipcc}])` - the number of characters in
+/// `{string}`; composing characters counted separately unless
+/// `{skipcc}` is set (`f_strchars`, `strings.c`).
+///
+/// # Safety
+/// Forwarded from [`strchar_common`]'s own safety doc.
+unsafe fn f_strchars(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let skipcc = argvars.len() > 1 && crate::eval::typval::tv_get_bool(&argvars[1]) != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { strchar_common(&s, skipcc) });
+}
+
+/// `strwidth({string})` - the number of display cells `{string}`
+/// occupies (`f_strwidth`, `strings.c`), via
+/// [`crate::mbyte::mb_string2cells`].
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::mb_string2cells`]'s own safety doc.
+unsafe fn f_strwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::mbyte::mb_string2cells(&s) } as i64);
+}
+
+/// Byte-level `strstr()` equivalent: the first index where `needle`
+/// occurs in `haystack`, or `None`. An empty `needle` matches at index
+/// `0`, matching C's own `strstr("", "")`/`strstr(anything, "")`
+/// contract.
+fn find_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `stridx({haystack}, {needle} [, {start}])` - the first byte index
+/// of `{needle}` in `{haystack}`, optionally starting the search at
+/// byte `{start}` (though the reported index is always relative to
+/// the very start of `{haystack}`), or `-1` if not found (`f_stridx`,
+/// `strings.c`).
+fn f_stridx(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+    let needle = crate::eval::typval::tv_get_string(&argvars[1]);
+    let haystack = crate::eval::typval::tv_get_string(&argvars[0]);
+
+    let mut search_start = 0usize;
+    if argvars.len() > 2 {
+        let start_idx = crate::eval::typval::tv_get_number(&argvars[2]);
+        if start_idx >= haystack.len() as i64 {
+            return;
+        }
+        if start_idx >= 0 {
+            search_start = start_idx as usize;
+        }
+    }
+
+    if let Some(pos) = find_substring(&haystack[search_start..], &needle) {
+        rettv.value = TypvalValue::Number((search_start + pos) as i64);
+    }
+}
+
+/// `strridx({haystack}, {needle} [, {start}])` - the LAST byte index
+/// of `{needle}` in `{haystack}` at or before byte `{start}` (defaults
+/// to the whole string), or `-1` if not found (`f_strridx`,
+/// `strings.c`). An empty `{needle}` matches at `{start}` itself
+/// (clamped into range), matching the original's own "empty string
+/// matches past the end" behavior.
+fn f_strridx(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+    let needle = crate::eval::typval::tv_get_string(&argvars[1]);
+    let haystack = crate::eval::typval::tv_get_string(&argvars[0]);
+
+    let end_idx = if argvars.len() > 2 {
+        let n = crate::eval::typval::tv_get_number(&argvars[2]);
+        if n < 0 {
+            return;
+        }
+        n as usize
+    } else {
+        haystack.len()
+    };
+
+    if needle.is_empty() {
+        rettv.value = TypvalValue::Number(end_idx.min(haystack.len()) as i64);
+        return;
+    }
+
+    let mut last_match = None;
+    let mut rest = 0usize;
+    while rest <= haystack.len() {
+        let Some(found) = find_substring(&haystack[rest..], &needle) else { break };
+        let abs = rest + found;
+        if abs > end_idx {
+            break;
+        }
+        last_match = Some(abs);
+        rest = abs + 1;
+    }
+
+    if let Some(m) = last_match {
+        rettv.value = TypvalValue::Number(m as i64);
+    }
+}
+
+/// `strgetchar({string}, {index})` - the character at (composing-
+/// unaware) character index `{index}` of `{string}`, or `-1` if out
+/// of range (`f_strgetchar`, `strings.c`).
+fn f_strgetchar(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut charidx = crate::eval::typval::tv_get_number(&argvars[1]);
+
+    let mut byteidx = 0usize;
+    while charidx >= 0 && byteidx < s.len() {
+        if charidx == 0 {
+            rettv.value = TypvalValue::Number(crate::mbyte::utf_ptr2char(&s[byteidx..]) as i64);
+            return;
+        }
+        charidx -= 1;
+        byteidx += usize::try_from(crate::mbyte::utf_ptr2len(&s[byteidx..])).unwrap_or(1).max(1);
+    }
+}
+
+/// `strpart({string}, {start} [, {len} [, {chars}]])` - a substring of
+/// `{string}`, clamped to the overlap with the actual string
+/// (`f_strpart`, `strings.c`). When `{chars}` is truthy, `{len}` (if
+/// given) counts characters (via `utfc_ptr2len`) instead of bytes.
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `{chars}` is truthy (forwarded from
+/// [`crate::mbyte::utfc_ptr2len`]'s own safety doc).
+unsafe fn f_strpart(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let p = crate::eval::typval::tv_get_string(&argvars[0]);
+    let slen = p.len() as i64;
+
+    let n = crate::eval::typval::tv_get_number(&argvars[1]);
+    let mut len = if argvars.len() > 2 { crate::eval::typval::tv_get_number(&argvars[2]) } else { slen - n };
+
+    let mut n = n;
+    if n < 0 {
+        len += n;
+        n = 0;
+    } else if n > slen {
+        n = slen;
+    }
+    if len < 0 {
+        len = 0;
+    } else if n + len > slen {
+        len = slen - n;
+    }
+
+    if argvars.len() > 3 {
+        let mut off = n;
+        while off < slen && len > 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            off += i64::from(unsafe { crate::mbyte::utfc_ptr2len(&p[off as usize..]) });
+            len -= 1;
+        }
+        len = off - n;
+    }
+
+    let n = n as usize;
+    let len = len as usize;
+    rettv.value = TypvalValue::String(Some(p[n..n + len].to_vec()));
+}
+
+/// `strtrans({string})` - `{string}` with every unprintable character
+/// replaced by a printable representation (`f_strtrans`, `strings.c`),
+/// via the already-translated [`crate::charset::transstr`] (`untab =
+/// true`, matching the original's own call). `transstr` always
+/// appends its own trailing NUL (matching this crate's line-storage
+/// convention); stripped here since Vimscript `String` values carry
+/// no such terminator.
+///
+/// # Safety
+/// Forwarded from [`crate::charset::transstr`]'s own safety doc.
+unsafe fn f_strtrans(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut out = unsafe { crate::charset::transstr(&s, true) };
+    out.pop();
+    rettv.value = TypvalValue::String(Some(out));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2637,6 +2892,33 @@ mod tests {
 
     fn float(f: f64) -> TypvalT {
         TypvalT { value: TypvalValue::Float(f), ..Default::default() }
+    }
+
+    /// RAII guard temporarily installing a real `GLOBALS.curbuf`, for
+    /// functions that transitively read it (e.g. `f_strtrans` ->
+    /// [`crate::charset::transstr`] -> `transchar_byte`). Self-locking
+    /// (holds `global_state_test_lock()` for its whole lifetime),
+    /// matching `charset.rs`'s own established `CurbufGuard` - each
+    /// file keeps its own private copy rather than sharing one across
+    /// modules, per this crate's established convention.
+    struct CurbufGuard {
+        previous: *mut crate::buffer_defs::BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut crate::buffer_defs::BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous, _lock }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
     }
 
     // --- find_internal_func / call_internal_func ---
@@ -3337,6 +3619,15 @@ mod tests {
             "getenv",
             "environ",
             "has",
+            "strlen",
+            "strcharlen",
+            "strchars",
+            "strwidth",
+            "stridx",
+            "strridx",
+            "strgetchar",
+            "strpart",
+            "strtrans",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -5602,5 +5893,216 @@ mod tests {
         f_has(&[string(b"win64")], &mut rettv);
         let expect_true = cfg!(all(windows, target_pointer_width = "64"));
         assert_eq!(rettv.value, TypvalValue::Number(i64::from(expect_true)));
+    }
+
+    // --- f_strlen / f_strcharlen / f_strchars / f_strwidth ---
+
+    #[test]
+    fn strlen_counts_bytes_not_characters() {
+        let mut rettv = TypvalT::default();
+        // "一" (U+4E00) is 3 UTF-8 bytes, 1 character.
+        f_strlen(&[string("一".as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn strlen_empty_string_is_zero() {
+        let mut rettv = TypvalT::default();
+        f_strlen(&[string(b"")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn strcharlen_ignores_composing_characters() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // "e" + COMBINING ACUTE ACCENT is 1 character (composing
+        // ignored), unlike strlen's own byte count (3) or strchars'
+        // own default (2, composing counted separately).
+        let s = "e\u{0301}".as_bytes();
+        unsafe { f_strcharlen(&[string(s)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn strchars_default_counts_composing_marks_separately() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let s = "e\u{0301}".as_bytes();
+        unsafe { f_strchars(&[string(s)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn strchars_skipcc_matches_strcharlen() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let s = "e\u{0301}".as_bytes();
+        unsafe { f_strchars(&[string(s), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn strwidth_counts_a_double_width_char_as_two() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strwidth(&[string("一".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    // --- f_stridx / f_strridx ---
+
+    #[test]
+    fn stridx_finds_the_first_occurrence() {
+        let mut rettv = TypvalT::default();
+        f_stridx(&[string(b"abcabc"), string(b"bc")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn stridx_not_found_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        f_stridx(&[string(b"abc"), string(b"xyz")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn stridx_start_offset_still_reports_index_from_the_beginning() {
+        let mut rettv = TypvalT::default();
+        f_stridx(&[string(b"abcabc"), string(b"bc"), num(2)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn stridx_start_at_or_past_length_fails() {
+        let mut rettv = TypvalT::default();
+        f_stridx(&[string(b"abc"), string(b"a"), num(3)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn stridx_negative_start_behaves_like_no_start() {
+        let mut rettv = TypvalT::default();
+        f_stridx(&[string(b"abc"), string(b"a"), num(-5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn strridx_finds_the_last_occurrence() {
+        let mut rettv = TypvalT::default();
+        f_strridx(&[string(b"abcabc"), string(b"bc")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn strridx_respects_the_end_index() {
+        let mut rettv = TypvalT::default();
+        f_strridx(&[string(b"abcabc"), string(b"bc"), num(3)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn strridx_not_found_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        f_strridx(&[string(b"abc"), string(b"xyz")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn strridx_empty_needle_matches_past_the_end() {
+        let mut rettv = TypvalT::default();
+        f_strridx(&[string(b"abc"), string(b"")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    // --- f_strgetchar ---
+
+    #[test]
+    fn strgetchar_returns_the_character_at_a_character_index() {
+        let mut rettv = TypvalT::default();
+        f_strgetchar(&[string("a一b".as_bytes()), num(1)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0x4E00));
+    }
+
+    #[test]
+    fn strgetchar_out_of_range_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        f_strgetchar(&[string(b"ab"), num(5)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn strgetchar_negative_index_is_negative_one() {
+        let mut rettv = TypvalT::default();
+        f_strgetchar(&[string(b"ab"), num(-1)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_strpart ---
+
+    #[test]
+    fn strpart_extracts_a_byte_range() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_strpart(&[string(b"Neovim"), num(2), num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"ovi".to_vec())));
+    }
+
+    #[test]
+    fn strpart_without_len_takes_everything_after_start() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_strpart(&[string(b"Neovim"), num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"vim".to_vec())));
+    }
+
+    #[test]
+    fn strpart_clamps_a_negative_start() {
+        let mut rettv = TypvalT::default();
+        // start = -2, len = 5 -> len becomes 3, start becomes 0.
+        unsafe { f_strpart(&[string(b"hello"), num(-2), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hel".to_vec())));
+    }
+
+    #[test]
+    fn strpart_clamps_an_overlong_length() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_strpart(&[string(b"hi"), num(0), num(100)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hi".to_vec())));
+    }
+
+    #[test]
+    fn strpart_chars_true_counts_characters_not_bytes() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // "一二三" is 3 chars, 9 bytes; asking for 2 "characters"
+        // starting at byte 0 with chars=true should return the first
+        // 2 characters (6 bytes), not the first 2 bytes.
+        let tv_true = TypvalT {
+            value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True),
+            ..Default::default()
+        };
+        unsafe {
+            f_strpart(&[string("一二三".as_bytes()), num(0), num(2), tv_true], &mut rettv);
+        }
+        assert_eq!(rettv.value, TypvalValue::String(Some("一二".as_bytes().to_vec())));
+    }
+
+    // --- f_strtrans ---
+
+    #[test]
+    fn strtrans_leaves_printable_ascii_unchanged() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        let mut rettv = TypvalT::default();
+        unsafe { f_strtrans(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn strtrans_escapes_a_control_character() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        let mut rettv = TypvalT::default();
+        unsafe { f_strtrans(&[string(b"\x01")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"^A".to_vec())));
     }
 }

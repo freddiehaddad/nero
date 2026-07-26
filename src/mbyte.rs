@@ -1439,6 +1439,53 @@ pub unsafe fn utf_head_off(base: &[u8], p_idx: usize) -> i32 {
     0
 }
 
+/// Get the character at the start of `s` plus the byte length to
+/// advance past it - composing characters are SKIPPED (folded into
+/// the base character's own advance), matching the original's
+/// `mb_ptr2char_adv` (a `const char **pp` in/out pointer there;
+/// `(codepoint, bytes_consumed)` here, since a Rust slice already
+/// carries its own length).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn mb_ptr2char_adv(s: &[u8]) -> (i32, usize) {
+    let c = utf_ptr2char(s);
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = usize::try_from(unsafe { utfc_ptr2len(s) }).unwrap_or(0);
+    (c, len)
+}
+
+/// Get the character at the start of `s` plus the byte length to
+/// advance past it - composing characters are returned as SEPARATE
+/// characters on the next call (`mb_cptr2char_adv`).
+#[must_use]
+pub fn mb_cptr2char_adv(s: &[u8]) -> (i32, usize) {
+    let c = utf_ptr2char(s);
+    let len = usize::try_from(utf_ptr2len(s)).unwrap_or(0);
+    (c, len)
+}
+
+/// The number of display cells `str` (a whole, NUL-free Vimscript
+/// string) occupies, one composing-aware character at a time
+/// (`mb_string2cells`).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`utfc_ptr2len`]/[`utf_ptr2cells`]).
+#[must_use]
+pub unsafe fn mb_string2cells(str: &[u8]) -> usize {
+    let mut clen = 0usize;
+    let mut p = 0usize;
+    while p < str.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        clen += usize::try_from(unsafe { utf_ptr2cells(&str[p..]) }).unwrap_or(0);
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { utfc_ptr2len(&str[p..]) }).unwrap_or(0);
+        p += adv.max(1);
+    }
+    clen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2041,5 +2088,57 @@ mod tests {
         // ("p must be part of an illegal sequence").
         let base = [0x80u8, 0x00];
         assert_eq!(unsafe { utf_head_off(&base, 0) }, 0);
+    }
+
+    #[test]
+    fn mb_ptr2char_adv_skips_a_following_combining_mark() {
+        let _guard = option_vars_test_lock();
+        // "e" + COMBINING ACUTE ACCENT (U+0301): composing-aware advance
+        // treats the whole cluster as one unit.
+        let s = "e\u{0301}x".as_bytes();
+        let (c, len) = unsafe { mb_ptr2char_adv(s) };
+        assert_eq!(c, 'e' as i32);
+        assert_eq!(len, "e\u{0301}".len());
+        assert_eq!(s[len], b'x');
+    }
+
+    #[test]
+    fn mb_ptr2char_adv_plain_ascii() {
+        let _guard = option_vars_test_lock();
+        let (c, len) = unsafe { mb_ptr2char_adv(b"hi") };
+        assert_eq!(c, 'h' as i32);
+        assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn mb_cptr2char_adv_returns_a_combining_mark_as_its_own_character() {
+        // Composing-unaware: advances by utf_ptr2len only, so the
+        // combining mark is its OWN separate character on the next
+        // call, unlike mb_ptr2char_adv's own composing-aware skip.
+        let s = "e\u{0301}".as_bytes();
+        let (c1, len1) = mb_cptr2char_adv(s);
+        assert_eq!(c1, 'e' as i32);
+        assert_eq!(len1, 1);
+        let (c2, _len2) = mb_cptr2char_adv(&s[len1..]);
+        assert_eq!(c2, 0x0301);
+    }
+
+    #[test]
+    fn mb_string2cells_sums_ascii_widths() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_string2cells(b"hello") }, 5);
+    }
+
+    #[test]
+    fn mb_string2cells_counts_a_double_width_char_as_two() {
+        let _guard = option_vars_test_lock();
+        // CJK ideograph U+4E00 is double-width.
+        assert_eq!(unsafe { mb_string2cells("一".as_bytes()) }, 2);
+    }
+
+    #[test]
+    fn mb_string2cells_empty_string_is_zero() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_string2cells(b"") }, 0);
     }
 }
