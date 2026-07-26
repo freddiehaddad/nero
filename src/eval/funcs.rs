@@ -411,6 +411,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
+        m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
+        m.insert(&b"getwinposx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposx });
+        m.insert(&b"getwinposy"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getwinposy });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2769,6 +2772,41 @@ unsafe fn f_exists(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(n));
 }
 
+/// `getwinpos([{timeout}])` - the `[x, y]` screen position of the
+/// Nvim GUI window (`f_getwinpos`, `eval/window.c`). This crate never
+/// runs a GUI, so this always returns the original's own "not
+/// available" result: `[-1, -1]` (the real implementation
+/// unconditionally returns this, ignoring `{timeout}` entirely).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_alloc_ret`]'s own
+/// safety doc.
+unsafe fn f_getwinpos(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+    // SAFETY: `l` was just allocated above by this same call.
+    unsafe {
+        crate::eval::typval::tv_list_append_number(l, -1);
+        crate::eval::typval::tv_list_append_number(l, -1);
+    }
+}
+
+/// `getwinposx()` - the X coordinate of the Nvim GUI window, or `-1`
+/// if not available (`f_getwinposx`, `eval/window.c`). Always `-1`
+/// here - see [`f_getwinpos`]'s own doc comment (no GUI ever runs in
+/// this crate).
+fn f_getwinposx(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+}
+
+/// `getwinposy()` - the Y coordinate of the Nvim GUI window, or `-1`
+/// if not available (`f_getwinposy`, `eval/window.c`). Always `-1`
+/// here - see [`f_getwinpos`]'s own doc comment (no GUI ever runs in
+/// this crate).
+fn f_getwinposy(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4470,6 +4508,9 @@ mod tests {
             "isnan",
             "sha256",
             "exists",
+            "getwinpos",
+            "getwinposx",
+            "getwinposy",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6988,6 +7029,37 @@ mod tests {
             f_exists(&[string(b"#BufEnter")], &mut rettv);
         }));
         assert!(result.is_err(), "expected a panic (au_exists not yet translated)");
+    }
+
+    // --- f_getwinpos / f_getwinposx / f_getwinposy ---
+
+    #[test]
+    fn getwinpos_always_returns_minus_1_minus_1() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_getwinpos(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let first = crate::eval::typval::tv_list_find(l, 0);
+            let second = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(-1));
+            assert_eq!((*second).li_tv.value, TypvalValue::Number(-1));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getwinposx_always_returns_minus_1() {
+        let mut rettv = TypvalT::default();
+        f_getwinposx(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn getwinposy_always_returns_minus_1() {
+        let mut rettv = TypvalT::default();
+        f_getwinposy(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 
     // --- f_has ---
