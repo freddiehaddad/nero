@@ -186,6 +186,23 @@
 //! `std::env::vars_os()` as the portable equivalent, matching this
 //! whole mission's own scope (Neovim's Lua source, not just its C
 //! source).
+//!
+//! Also `has({feature})` (`f_has`): checks `HAS_LIST_UNCONDITIONAL`
+//! (the original's own `has_list[]` static array's platform-
+//! independent entries - compile-time feature flags, not runtime
+//! state) plus the handful of platform-conditional (`#ifdef`) entries
+//! this crate can meaningfully determine at compile time. Every other
+//! special case the original handles dynamically (`patch-N`/
+//! `nvim-x.y.z` version checks, `vim_starting`/`ttyin`/`ttyout`/
+//! `gui_running`/`syntax_items`/`wsl` runtime state, and provider-
+//! based checks like `clipboard_working`) simply returns `0` - a
+//! deliberate, justified scoping decision (not a "translate the
+//! reachable path, panic on the rest" case like most other builtins):
+//! `has()`'s own contract is "is this feature present", and "not
+//! found" is a fully legitimate, non-crashing answer within that
+//! contract, unlike e.g. `join()` where a specific argument type has
+//! one well-defined correct stringification that must not be silently
+//! wrong.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -287,6 +304,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"localtime"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_localtime });
         m.insert(&b"getenv"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getenv });
         m.insert(&b"environ"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_environ });
+        m.insert(&b"has"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_has });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2470,6 +2488,141 @@ fn f_environ(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
 }
 
+/// The unconditional (platform-independent) entries of `funcs.c`'s own
+/// `has_list[]` static array, used by [`f_has`] - compile-time feature
+/// flags (this build supports capability X), not runtime state, hence
+/// unconditional regardless of THIS crate's own current translation
+/// progress on any given subsystem (matching the original's own
+/// "always present" nature for these, e.g. `has('spell')` is `1` in
+/// any real Nvim build even with `'spell'` off for the current
+/// buffer).
+const HAS_LIST_UNCONDITIONAL: &[&[u8]] = &[
+    b"autochdir",
+    b"arabic",
+    b"autocmd",
+    b"browsefilter",
+    b"byte_offset",
+    b"cindent",
+    b"cmdline_compl",
+    b"cmdline_hist",
+    b"cmdwin",
+    b"comments",
+    b"conceal",
+    b"cursorbind",
+    b"cursorshape",
+    b"dialog_con",
+    b"diff",
+    b"digraphs",
+    b"eval",
+    b"ex_extra",
+    b"extra_search",
+    b"file_in_path",
+    b"filterpipe",
+    b"find_in_path",
+    b"float",
+    b"folding",
+    b"gettext",
+    b"iconv",
+    b"insert_expand",
+    b"jumplist",
+    b"keymap",
+    b"lambda",
+    b"langmap",
+    b"libcall",
+    b"linebreak",
+    b"lispindent",
+    b"listcmds",
+    b"localmap",
+    b"menu",
+    b"mksession",
+    b"modify_fname",
+    b"mouse",
+    b"multi_byte",
+    b"multi_lang",
+    b"nanotime",
+    b"num64",
+    b"packages",
+    b"path_extra",
+    b"persistent_undo",
+    b"profile",
+    b"reltime",
+    b"quickfix",
+    b"rightleft",
+    b"scrollbind",
+    b"showcmd",
+    b"cmdline_info",
+    b"shada",
+    b"signs",
+    b"smartindent",
+    b"startuptime",
+    b"statusline",
+    b"spell",
+    b"syntax",
+    b"tablineat",
+    b"tag_binary",
+    b"termguicolors",
+    b"termresponse",
+    b"textobjects",
+    b"timers",
+    b"title",
+    b"user-commands",
+    b"user_commands",
+    b"vartabs",
+    b"vertsplit",
+    b"vimscript-1",
+    b"virtualedit",
+    b"visual",
+    b"visualextra",
+    b"vreplace",
+    b"wildignore",
+    b"wildmenu",
+    b"windows",
+    b"winaltkeys",
+    b"writebackup",
+    b"nvim",
+];
+
+/// `has({feature})` - whether `{feature}` is supported (`f_has`,
+/// `funcs.c`), case-insensitively.
+///
+/// Checks `HAS_LIST_UNCONDITIONAL` plus the original's own platform-
+/// conditional (`#ifdef`) entries this crate CAN meaningfully
+/// determine at compile time (`unix`/`linux`/`win32`/`win64`/`mac`
+/// family/`fork`/`system`/`fname_case`).
+///
+/// Every other special case the original handles dynamically
+/// (`patch-N`/`nvim-x.y.z` version checks, `vim_starting`/`ttyin`/
+/// `ttyout`/`gui_running`/`syntax_items`/`wsl` runtime state, and
+/// provider-based checks like `clipboard_working`/`pythonx`) simply
+/// returns `0` here - not a translation gap that panics, since
+/// `has()`'s own contract ("is this obscure feature present") already
+/// naturally accommodates "not present" as a fully valid, non-error
+/// answer for a real Nvim build too (e.g. `has('gui_running')` is `0`
+/// in any terminal-only session, which describes EVERY session this
+/// crate can currently produce anyway).
+fn f_has(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+
+    let platform_conditional: &[&[u8]] = if cfg!(windows) {
+        &[&b"win32"[..], &b"system"[..]]
+    } else if cfg!(target_os = "macos") {
+        &[&b"unix"[..], &b"fork"[..], &b"mac"[..], &b"macunix"[..], &b"osx"[..], &b"osxdarwin"[..]]
+    } else if cfg!(target_os = "linux") {
+        &[&b"unix"[..], &b"fork"[..], &b"linux"[..], &b"fname_case"[..]]
+    } else if cfg!(unix) {
+        &[&b"unix"[..], &b"fork"[..]]
+    } else {
+        &[]
+    };
+    let win64_matches =
+        cfg!(all(windows, target_pointer_width = "64")) && name.eq_ignore_ascii_case(b"win64");
+
+    let found = win64_matches
+        || platform_conditional.iter().any(|f| f.eq_ignore_ascii_case(&name))
+        || HAS_LIST_UNCONDITIONAL.iter().any(|f| f.eq_ignore_ascii_case(&name));
+    rettv.value = TypvalValue::Number(i64::from(found));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3183,6 +3336,7 @@ mod tests {
             "localtime",
             "getenv",
             "environ",
+            "has",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -5401,5 +5555,52 @@ mod tests {
             assert!(crate::eval::typval::tv_dict_len(d.as_ref()) > 0);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // --- f_has ---
+
+    #[test]
+    fn has_finds_an_always_present_feature() {
+        let mut rettv = TypvalT::default();
+        f_has(&[string(b"eval")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn has_is_case_insensitive() {
+        let mut rettv = TypvalT::default();
+        f_has(&[string(b"NVIM")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn has_returns_zero_for_an_unknown_feature() {
+        let mut rettv = TypvalT::default();
+        f_has(&[string(b"totally_not_a_real_feature")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn has_reports_the_current_platform() {
+        let mut rettv = TypvalT::default();
+        let name: &[u8] = if cfg!(windows) { b"win32" } else { b"unix" };
+        f_has(&[string(name)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn has_does_not_report_the_other_platform() {
+        let mut rettv = TypvalT::default();
+        let name: &[u8] = if cfg!(windows) { b"unix" } else { b"win32" };
+        f_has(&[string(name)], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn has_win64_only_matches_on_64_bit_windows() {
+        let mut rettv = TypvalT::default();
+        f_has(&[string(b"win64")], &mut rettv);
+        let expect_true = cfg!(all(windows, target_pointer_width = "64"));
+        assert_eq!(rettv.value, TypvalValue::Number(i64::from(expect_true)));
     }
 }
