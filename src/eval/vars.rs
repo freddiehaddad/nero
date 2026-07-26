@@ -1469,6 +1469,56 @@ pub fn optval_as_tv(value: crate::option_defs::OptVal, numbool: bool) -> TypvalT
     TypvalT { v_lock: VarLockStatus::Unlocked, value }
 }
 
+/// Evaluate a single embedded `{expr}` inside an interpolated string
+/// and append its stringified result to `gap` (`eval_one_expr_in_str`).
+///
+/// `p` must point to the `{` itself. Returns the number of bytes of
+/// `p` consumed (one past the matching `}`) on success, matching this
+/// crate's own "return consumed bytes from start" idiom (the
+/// original's own returned pointer, offset from `p`'s own start);
+/// `None` on any error (an empty `{}`, an invalid expression, a
+/// missing `}`, or - only when `evaluate` - a failed stringification).
+///
+/// Bounds the expression evaluator to exactly `[block_start,
+/// block_end)` by slicing, rather than the original's own "temporarily
+/// overwrite the `}` with a `NUL`, evaluate, then restore it" trick -
+/// this crate's own byte-slice idiom already prevents the evaluator
+/// from ever seeing anything past the intended end, with no mutation
+/// (or restoration) of the input needed.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::skip_expr`]/
+/// [`crate::eval::eval::eval_to_string`]'s own safety docs.
+#[must_use]
+pub unsafe fn eval_one_expr_in_str(p: &[u8], gap: &mut Vec<u8>, evaluate: bool) -> Option<usize> {
+    let block_start = 1 + crate::charset::skipwhite(&p[1..]); // skip the opening '{'
+
+    // semsg(_(e_missing_close_curly_str), p) omitted on this and every
+    // other error path below - message display, not tractable; the
+    // identical None/FAIL is kept.
+    p.get(block_start)?;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (res, consumed) = unsafe { crate::eval::eval::skip_expr(&p[block_start..], None) };
+    if res == crate::vim_defs::FAIL {
+        return None;
+    }
+    let expr_end = block_start + consumed;
+    let block_end = expr_end + crate::charset::skipwhite(&p[expr_end..]);
+
+    if p.get(block_end) != Some(&b'}') {
+        return None;
+    }
+
+    if evaluate {
+        // SAFETY: forwarded from this function's own safety doc.
+        let expr_val = unsafe { crate::eval::eval::eval_to_string(&p[block_start..block_end], false, false) }?;
+        gap.extend_from_slice(&expr_val);
+    }
+
+    Some(block_end + 1)
+}
+
 /// Out-flag for the not-yet-translated lambda-compilation code: when
 /// `Some`, [`check_vars`] sets the pointed-to `bool` to `true` upon
 /// finding that a checked name resolves to a local variable or
@@ -3658,5 +3708,64 @@ mod optval_as_tv_tests {
         // Rust representation.
         let tv = optval_as_tv(OptVal::String(Vec::new()), true);
         assert_eq!(tv.value, TypvalValue::String(Some(Vec::new())));
+    }
+}
+
+#[cfg(test)]
+mod eval_one_expr_in_str_tests {
+    use super::*;
+
+    #[test]
+    fn simple_number_expression() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{42}rest", &mut gap, true) };
+        assert_eq!(consumed, Some(4));
+        assert_eq!(gap, b"42");
+    }
+
+    #[test]
+    fn whitespace_around_the_expression_is_skipped() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{ 42 }", &mut gap, true) };
+        assert_eq!(consumed, Some(6));
+        assert_eq!(gap, b"42");
+    }
+
+    #[test]
+    fn string_concatenation_expression() {
+        let mut gap = b"prefix-".to_vec();
+        let consumed = unsafe { eval_one_expr_in_str(b"{1 + 1}", &mut gap, true) };
+        assert_eq!(consumed, Some(7));
+        assert_eq!(gap, b"prefix-2");
+    }
+
+    #[test]
+    fn missing_closing_curly_fails() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{42", &mut gap, true) };
+        assert_eq!(consumed, None);
+        assert!(gap.is_empty());
+    }
+
+    #[test]
+    fn invalid_expression_fails() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{}", &mut gap, true) };
+        assert_eq!(consumed, None);
+    }
+
+    #[test]
+    fn evaluate_false_still_validates_but_does_not_append() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{42}rest", &mut gap, false) };
+        assert_eq!(consumed, Some(4));
+        assert!(gap.is_empty(), "evaluate=false must not append anything to gap");
+    }
+
+    #[test]
+    fn evaluate_false_still_fails_on_missing_closing_curly() {
+        let mut gap = Vec::new();
+        let consumed = unsafe { eval_one_expr_in_str(b"{42", &mut gap, false) };
+        assert_eq!(consumed, None);
     }
 }

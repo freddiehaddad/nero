@@ -137,7 +137,7 @@
 //!   directly. `bytes_consumed` is well-defined as `0` on `FAIL`,
 //!   matching the original's own "`*arg` only advances on success"
 //!   structure.
-//! - [`eval_lit_string`] (+ a private `find_lit_string_close_quote`
+//! - [`eval_lit_string`] (+ a private `find_lit_string_end`
 //!   helper): parses a `'str''ing'` literal
 //!   (single-quoted, `''` reducing to a literal `'`). Deliberately
 //!   scans/copies at the byte level rather than replicating the
@@ -1462,15 +1462,22 @@ pub fn eval_number(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, want_string:
 
 /// Evaluate a double-quoted string constant (`eval_string`).
 ///
-/// Only the `interpolate = false` case (`eval7`'s own only call site)
-/// is modeled - matching [`eval_lit_string`]'s own established
-/// precedent for the exact same reason (`interpolate = true` needs
-/// `eval_interp_string`, not yet translated, anyway).
+/// `interpolate`, when `true`, means `arg` already points PAST the
+/// opening quote (the caller - [`eval_interp_string`] - already
+/// consumed it) and reduces `"{{"`/`"}}"` to `"{"`/`"}"` in the output
+/// while stopping the scan at a bare (non-doubled) `"{"`, leaving
+/// `arg`'s consumed offset pointing AT whichever of `"`/`"{"` stopped
+/// it - the caller decides what to do next (advance past the quote,
+/// or recurse for an embedded expression), matching the original's own
+/// division of responsibility exactly. `false` (`eval7`'s own direct
+/// call site) is the simpler, already-well-tested case: `arg` points
+/// AT the opening quote itself, and the scan only ever stops at the
+/// closing quote.
 ///
 /// Scans/copies at the BYTE level rather than the original's own
 /// multi-byte-character-aware `MB_PTR_ADV`/`mb_copy_char` walk - same
-/// "no ASCII test byte (`\`, `"`, or any recognized escape letter) can
-/// appear as part of a multi-byte UTF-8 sequence" reasoning
+/// "no ASCII test byte (`\`, `"`, `{`, `}`, or any recognized escape
+/// letter) can appear as part of a multi-byte UTF-8 sequence" reasoning
 /// [`eval_lit_string`]'s own doc comment already establishes: copying
 /// one raw byte at a time in the "not a recognized escape"/"plain
 /// character" cases produces byte-identical output to the original's
@@ -1495,15 +1502,17 @@ pub fn eval_number(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, want_string:
 /// Every OTHER escape form (`\b`/`\e`/`\f`/`\n`/`\r`/`\t`, hex/Unicode/
 /// octal, and the literal default fallback) is translated in full.
 #[must_use]
-pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
+pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, interpolate: bool) -> (i32, usize) {
     use crate::ascii_defs::{ascii_isxdigit, BS, CAR, ESC, FF, NL, TAB};
     use crate::charset::hex2nr;
     use crate::mbyte::utf_char2bytes;
 
-    // First pass: find the end of the string (this crate's own
-    // Vec<u8>-based output never needs the original's own pre-
-    // computed allocation size, so nothing else is tracked here).
-    let mut p = 1;
+    // First pass: find the end of the string, or (when interpolating)
+    // the start of an embedded {expr} (this crate's own Vec<u8>-based
+    // output never needs the original's own pre-computed allocation
+    // size, so nothing else is tracked here).
+    let off = usize::from(!interpolate);
+    let mut p = off;
     while arg.get(p).is_some_and(|&c| c != b'"') {
         if arg[p] == b'\\' && arg.get(p + 1).is_some() {
             p += 1;
@@ -1513,23 +1522,33 @@ pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usi
                      trans_special, the whole keycodes.c subsystem - not yet translated"
                 );
             }
+        } else if interpolate && matches!(arg[p], b'{' | b'}') {
+            if arg[p] == b'{' && arg.get(p + 1) != Some(&b'{') {
+                // start of an embedded expression.
+                break;
+            }
+            p += 1;
+            if arg[p - 1] == b'}' && arg.get(p) != Some(&b'}') {
+                // a stray, unescaped single '}' is an error.
+                return (FAIL, 0);
+            }
         }
         p += 1;
     }
 
-    if arg.get(p) != Some(&b'"') {
+    if arg.get(p) != Some(&b'"') && !(interpolate && arg.get(p) == Some(&b'{')) {
         // semsg(_("E114: Missing quote: %s"), *arg) omitted - message
         // display, not tractable; the identical FAIL is kept.
         return (FAIL, 0);
     }
 
     if !evaluate {
-        return (OK, p + 1);
+        return (OK, p + off);
     }
 
     // Second pass: copy the string, handling backslashed characters.
     let mut s = Vec::new();
-    let mut q = 1;
+    let mut q = off;
     while arg.get(q).is_some_and(|&c| c != b'"') {
         if arg[q] == b'\\' {
             q += 1;
@@ -1637,28 +1656,67 @@ pub fn eval_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usi
                     }
                 }
             }
+        } else if interpolate && matches!(arg[q], b'{' | b'}') {
+            if arg[q] == b'{' && arg.get(q + 1) != Some(&b'{') {
+                // start of an embedded expression - the first pass
+                // already validated a stray '}' can't reach here.
+                break;
+            }
+            q += 1; // reduce "{{" to "{" and "}}" to "}".
+            if let Some(&c) = arg.get(q) {
+                s.push(c);
+                q += 1;
+            }
         } else if let Some(&c) = arg.get(q) {
             s.push(c);
             q += 1;
         }
     }
     rettv.value = TypvalValue::String(Some(s));
-    (OK, q + 1)
+    let mut end = q;
+    if arg.get(end) == Some(&b'"') && !interpolate {
+        end += 1;
+    }
+    (OK, end)
 }
 
-/// Scans `arg` (assumed to start at the opening `'`) for the byte
-/// offset of the closing, un-escaped `'`, treating `''` as an escaped
-/// literal quote - shared by both of [`eval_lit_string`]'s own passes
-/// (first: "is this a valid, closed literal string, and how long is
-/// it"; second, only when `evaluate`: "copy its content"). Returns
-/// `None` if no closing quote is found before the end of `arg`.
-fn find_lit_string_close_quote(arg: &[u8]) -> Option<usize> {
-    let mut p = 1;
+/// Scans `arg` for the byte offset where a `'literal'` string ends:
+/// either the closing, un-escaped `'` (treating `''` as an escaped
+/// literal quote), or - when `interpolate` is `true` - a bare
+/// (non-doubled) `'{'` marking the start of an embedded expression
+/// (with `'{{'`/`'}}'` reduced to a single `{`/`}` along the way).
+/// `arg` starts at the opening `'` itself when `!interpolate`
+/// (matching [`eval_lit_string`]'s own `off` convention), or already
+/// past it when `interpolate`.
+///
+/// Shared by both of [`eval_lit_string`]'s own passes (first: "is this
+/// a valid, closed literal string, and how long is it"; second, only
+/// when `evaluate`: "copy its content", relying on this function's own
+/// returned stop position as the copy loop's upper bound). Returns
+/// `None` on any error: running off the end of `arg` without finding a
+/// closing `'` (or, interpolating, a `{`), or (interpolating only) a
+/// stray, unescaped single `}` - both collapse to the same `None`/
+/// `FAIL` here, matching this crate's established "skip the display,
+/// keep the state" policy (the original reports two different
+/// messages for these, neither of which is tractable to display).
+fn find_lit_string_end(arg: &[u8], interpolate: bool) -> Option<usize> {
+    let mut p = usize::from(!interpolate);
     loop {
-        match arg.get(p)? {
+        match *arg.get(p)? {
             b'\'' => {
                 if arg.get(p + 1) != Some(&b'\'') {
                     return Some(p);
+                }
+                p += 2;
+            }
+            c @ (b'{' | b'}') if interpolate => {
+                if c == b'{' {
+                    if arg.get(p + 1) != Some(&b'{') {
+                        return Some(p);
+                    }
+                } else if arg.get(p + 1) != Some(&b'}') {
+                    // a stray, unescaped single '}' is an error.
+                    return None;
                 }
                 p += 2;
             }
@@ -1669,19 +1727,23 @@ fn find_lit_string_close_quote(arg: &[u8]) -> Option<usize> {
 
 /// Allocate a variable for a `'str''ing'` constant (`eval_lit_string`).
 ///
-/// Only the `interpolate = false` case (`eval7`'s own only call site)
-/// is translated - the original's `interpolate = true` branches
-/// (handling `{`/`}` for string interpolation) are dead code for that
-/// caller and aren't modeled here; a real caller needing
-/// `interpolate = true` would need `eval_interp_string`, not yet
-/// translated, anyway.
+/// `interpolate`, when `true`, means `arg` already points PAST the
+/// opening quote (the caller - [`eval_interp_string`] - already
+/// consumed it) and reduces `"{{"`/`"}}"` to `"{"`/`"}"` in the output
+/// while stopping the scan at a bare (non-doubled) `"{"`, leaving the
+/// consumed offset pointing AT whichever of `'`/`{` stopped it - the
+/// caller decides what to do next, matching [`eval_string`]'s own
+/// identical division of responsibility (see its own doc comment).
+/// `false` (`eval7`'s own direct call site) is the simpler,
+/// already-well-tested case: `arg` points AT the opening quote itself,
+/// and the scan only ever stops at the closing quote.
 ///
-/// Scans/copies at the BYTE level (see `find_lit_string_close_quote`)
+/// Scans/copies at the BYTE level (see `find_lit_string_end`)
 /// rather than replicating the original's own multi-byte-character-
-/// aware `MB_PTR_ADV`/`mb_copy_char` walk: `'` (0x27) is a plain ASCII
-/// byte, and valid UTF-8 continuation/lead bytes are always `>= 0x80`,
-/// so a raw `'` byte can never appear as part of a multi-byte
-/// sequence - a byte-level scan finds the exact same quote positions,
+/// aware `MB_PTR_ADV`/`mb_copy_char` walk: `'`/`{`/`}` are all plain
+/// ASCII bytes, and valid UTF-8 continuation/lead bytes are always
+/// `>= 0x80`, so none of them can ever appear as part of a multi-byte
+/// sequence - a byte-level scan finds the exact same stop positions,
 /// and a byte-level copy produces byte-identical output, as the
 /// original's character-aware walk would for any well-formed UTF-8
 /// input.
@@ -1698,30 +1760,34 @@ fn find_lit_string_close_quote(arg: &[u8]) -> Option<usize> {
 /// matching this crate's established "skip the display, keep the
 /// state" policy.
 #[must_use]
-pub fn eval_lit_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
-    let Some(close) = find_lit_string_close_quote(arg) else {
+pub fn eval_lit_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool, interpolate: bool) -> (i32, usize) {
+    let Some(close) = find_lit_string_end(arg, interpolate) else {
         return (crate::vim_defs::FAIL, 0);
     };
 
+    let off = usize::from(!interpolate);
     if !evaluate {
-        return (crate::vim_defs::OK, close + 1);
+        return (crate::vim_defs::OK, close + off);
     }
 
-    let mut s = Vec::with_capacity(close.saturating_sub(1));
-    let mut q = 1;
+    let mut s = Vec::with_capacity(close.saturating_sub(off));
+    let mut q = off;
     while q < close {
-        // Any `'` seen here (before reaching `close`, the position of
-        // the real closing quote) must be the first half of an
-        // escaped "''" pair - skip it, keeping only the second `'` as
-        // a literal character.
-        if arg[q] == b'\'' {
+        // Any `'` (or, interpolating, `{`/`}`) seen here (before
+        // reaching `close`, the position of the real stop point) must
+        // be the first half of an escaped "''"/"{{"/"}}" pair - skip
+        // it, keeping only the second character as a literal one
+        // (`find_lit_string_end`'s own construction guarantees this:
+        // any non-doubled occurrence would already have been the stop
+        // point itself, or an error).
+        if arg[q] == b'\'' || (interpolate && matches!(arg[q], b'{' | b'}')) {
             q += 1;
         }
         s.push(arg[q]);
         q += 1;
     }
     rettv.value = TypvalValue::String(Some(s));
-    (crate::vim_defs::OK, close + 1)
+    (crate::vim_defs::OK, close + off)
 }
 
 /// `eval.h`'s `AUTOLOAD_CHAR` (`'#'`) - the separator marking an
@@ -2809,13 +2875,13 @@ pub unsafe fn eval7(
         }
         // String constant: "string".
         Some(b'"') => {
-            let (r, consumed) = eval_string(&arg[pos..], rettv, evaluate);
+            let (r, consumed) = eval_string(&arg[pos..], rettv, evaluate, false);
             ret = r;
             pos += consumed;
         }
         // Literal string constant: 'str''ing'.
         Some(b'\'') => {
-            let (r, consumed) = eval_lit_string(&arg[pos..], rettv, evaluate);
+            let (r, consumed) = eval_lit_string(&arg[pos..], rettv, evaluate, false);
             ret = r;
             pos += consumed;
         }
@@ -2862,15 +2928,16 @@ pub unsafe fn eval7(
         // Environment variable: $VAR. Interpolated string: $"..."/$'...'.
         Some(b'$') => {
             if matches!(arg.get(pos + 1), Some(&b'"') | Some(&b'\'')) {
-                unimplemented!(
-                    "eval7: interpolated strings ($\"...\"/$'...') need eval_interp_string, \
-                     not yet translated"
-                );
+                // SAFETY: forwarded from this function's own safety doc.
+                let (r, consumed) = unsafe { eval_interp_string(&arg[pos..], rettv, evaluate) };
+                ret = r;
+                pos += consumed;
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                let (r, consumed) = unsafe { eval_env_var(&arg[pos..], rettv, evaluate) };
+                ret = r;
+                pos += consumed;
             }
-            // SAFETY: forwarded from this function's own safety doc.
-            let (r, consumed) = unsafe { eval_env_var(&arg[pos..], rettv, evaluate) };
-            ret = r;
-            pos += consumed;
         }
         // Register contents: @r.
         Some(b'@') => {
@@ -3519,6 +3586,186 @@ pub unsafe fn eval0(
     }
 
     ret
+}
+
+/// Skip over an expression at `arg`, without evaluating it
+/// (`skip_expr`).
+///
+/// Temporarily clears `EVAL_EVALUATE` in `evalarg` (if present),
+/// restoring the original flags afterward - matches the original's own
+/// save/restore of `evalarg->eval_flags`. This is actually a no-op in
+/// EVERY real call within this crate today: the original's own inner
+/// `eval1(pp, &rettv, NULL)` call always passes a bare `NULL` for its
+/// OWN `evalarg`, never the (possibly just-cleared) one this function
+/// received - so the clear/restore dance here never affects the
+/// nested `eval1` call at all (translated faithfully anyway, exactly
+/// matching the original's own apparently-vestigial structure, in case
+/// a future change ever threads `evalarg` through to the inner call).
+///
+/// Returns `(status, bytes_consumed)`, matching this module's own
+/// established idiom.
+///
+/// # Safety
+/// Forwarded from [`eval1`]'s own safety doc.
+#[must_use]
+pub unsafe fn skip_expr(arg: &[u8], mut evalarg: Option<&mut EvalargT>) -> (i32, usize) {
+    let save_flags = evalarg.as_deref().map_or(0, |e| e.eval_flags);
+    if let Some(e) = &mut evalarg {
+        e.eval_flags &= !EVAL_EVALUATE;
+    }
+
+    let start = skipwhite(arg);
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let (res, consumed) = unsafe { eval1(&arg[start..], &mut rettv, None) };
+
+    if let Some(e) = &mut evalarg {
+        e.eval_flags = save_flags;
+    }
+
+    (res, start + consumed)
+}
+
+/// Convert `tv` to a string (`typval2string`).
+///
+/// # Safety
+/// If `tv`'s value is `List`/`Dict`/`Blob`/`Partial`/`Func`-typed with
+/// a non-null pointer, that pointer must be valid (forwarded from
+/// [`crate::eval::typval::tv_get_string`]'s own implicit requirement,
+/// same as every other function in this crate touching those types).
+///
+/// # Deferred
+/// `join_list = true` with a real `List` value needs `tv_list_join`
+/// (join a list's items into newline-separated lines) - not yet
+/// translated, `unimplemented!()`s only when actually reached. A
+/// `List`/`Dict` value with `join_list = false` needs `encode_tv2string`
+/// (`eval/encode.c`'s ~970-line JSON-like stringification engine, a
+/// substantial separate undertaking) - `unimplemented!()`s there too.
+/// Every other value type uses [`crate::eval::typval::tv_get_string`],
+/// already real.
+unsafe fn typval2string(tv: &TypvalT, join_list: bool) -> Vec<u8> {
+    if join_list && matches!(tv.value, TypvalValue::List(_)) {
+        unimplemented!(
+            "typval2string: join_list=true with a List value needs tv_list_join, not yet translated"
+        );
+    }
+    if matches!(tv.value, TypvalValue::List(_) | TypvalValue::Dict(_)) {
+        unimplemented!(
+            "typval2string: List/Dict stringification needs encode_tv2string (eval/encode.c), \
+             a substantial separate undertaking, not yet translated"
+        );
+    }
+    crate::eval::typval::tv_get_string(tv)
+}
+
+/// Top level evaluation function, returning a string, with an
+/// optional `exarg_T` for multi-line-`:source` context
+/// (`eval_to_string_eap`).
+///
+/// Only `eap = None`/`use_simple_function = false` are modeled - this
+/// crate's only real caller ([`crate::eval::vars::eval_one_expr_in_str`])
+/// always calls it that way; `use_simple_function = true` would need
+/// `eval0_simple_funccal` (a fast-path shortcut for a bare function
+/// call), not yet translated, `unimplemented!()`s if ever requested.
+///
+/// Returns `None` on evaluation failure, matching the original's own
+/// `NULL` return (the message-display difference for an E-numbered
+/// parse error is dropped, per this crate's established policy).
+///
+/// # Safety
+/// Forwarded from [`eval0`]'s own safety doc.
+#[must_use]
+pub unsafe fn eval_to_string_eap(
+    arg: &[u8],
+    join_list: bool,
+    eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+    use_simple_function: bool,
+) -> Option<Vec<u8>> {
+    if use_simple_function {
+        unimplemented!(
+            "eval_to_string_eap: use_simple_function=true needs eval0_simple_funccal, not yet \
+             translated"
+        );
+    }
+
+    let mut tv = TypvalT::default();
+    let mut evalarg = EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let ret = unsafe { eval0(arg, &mut tv, eap, Some(&mut evalarg)) };
+    if ret == FAIL {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc (tv was
+    // just populated by eval0 above).
+    let retval = unsafe { typval2string(&tv, join_list) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_clear_simple(&tv) };
+    Some(retval)
+}
+
+/// [`eval_to_string_eap`] with `eap = None` (`eval_to_string`).
+///
+/// # Safety
+/// Forwarded from [`eval_to_string_eap`]'s own safety doc.
+#[must_use]
+pub unsafe fn eval_to_string(arg: &[u8], join_list: bool, use_simple_function: bool) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval_to_string_eap(arg, join_list, None, use_simple_function) }
+}
+
+/// Evaluate a single or double quoted string possibly containing
+/// expressions: `$"..."`/`$'...'` (`eval_interp_string`).
+///
+/// `arg` must point to the `$` itself - the leading byte is skipped
+/// unconditionally, matching the original's own `(*arg)++` (never
+/// inspected, only skipped, same treatment as [`eval_env_var`]'s own
+/// leading `$`). The byte right after that is the quote character
+/// itself (`"` or `'`), which is ALSO skipped unconditionally before
+/// the loop begins - matching the original's own second `(*arg)++`.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::eval_one_expr_in_str`]'s own
+/// safety doc.
+#[must_use]
+pub unsafe fn eval_interp_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (i32, usize) {
+    let quote = arg[1];
+    let mut pos = 2;
+    let mut ga: Vec<u8> = Vec::new();
+
+    let ret = loop {
+        let mut tv = TypvalT::default();
+        // Get the string up to the matching quote or to a single '{'.
+        let (r, consumed) = if quote == b'"' {
+            eval_string(&arg[pos..], &mut tv, evaluate, true)
+        } else {
+            eval_lit_string(&arg[pos..], &mut tv, evaluate, true)
+        };
+        pos += consumed;
+        if r == FAIL {
+            break FAIL;
+        }
+        if evaluate {
+            let TypvalValue::String(Some(s)) = &tv.value else {
+                unreachable!("eval_string/eval_lit_string always set a String value on OK");
+            };
+            ga.extend_from_slice(s);
+        }
+
+        if arg.get(pos) != Some(&b'{') {
+            // found terminating quote.
+            pos += 1;
+            break OK;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let Some(new_pos) = (unsafe { crate::eval::vars::eval_one_expr_in_str(&arg[pos..], &mut ga, evaluate) })
+        else {
+            break FAIL;
+        };
+        pos += new_pos;
+    };
+
+    rettv.value = TypvalValue::String((ret != FAIL && evaluate).then_some(ga));
+    (OK, pos)
 }
 
 #[cfg(test)]
@@ -4391,7 +4638,7 @@ mod tests {
     #[test]
     fn eval_string_plain_no_escapes() {
         let mut tv = TypvalT::default();
-        let (ret, consumed) = eval_string(b"\"hello\"", &mut tv, true);
+        let (ret, consumed) = eval_string(b"\"hello\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(consumed, 7);
         assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
@@ -4400,7 +4647,7 @@ mod tests {
     #[test]
     fn eval_string_common_control_escapes() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\n\\t\\r\\b\\e\\f\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\n\\t\\r\\b\\e\\f\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(
             tv.value,
@@ -4418,7 +4665,7 @@ mod tests {
     #[test]
     fn eval_string_hex_escape() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\x41\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\x41\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
     }
@@ -4428,12 +4675,12 @@ mod tests {
         // "\x1" - only 1 hex digit given, max for \x is 2, so it stops
         // early rather than consuming a 2nd non-hex character.
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\x1\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\x1\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(vec![1])));
 
         let mut tv2 = TypvalT::default();
-        let (ret2, _) = eval_string(b"\"\\x1g\"", &mut tv2, true);
+        let (ret2, _) = eval_string(b"\"\\x1g\"", &mut tv2, true, false);
         assert_eq!(ret2, OK);
         assert_eq!(tv2.value, TypvalValue::String(Some(vec![1, b'g'])));
     }
@@ -4441,7 +4688,7 @@ mod tests {
     #[test]
     fn eval_string_unicode_escape_4_digit() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\u0041\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\u0041\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
     }
@@ -4449,7 +4696,7 @@ mod tests {
     #[test]
     fn eval_string_unicode_escape_8_digit() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\U00000041\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\U00000041\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
     }
@@ -4458,7 +4705,7 @@ mod tests {
     fn eval_string_unicode_escape_multibyte_output() {
         let mut tv = TypvalT::default();
         // U+00E9 (é) encodes as 2 UTF-8 bytes.
-        let (ret, _) = eval_string(b"\"\\u00e9\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\u00e9\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some("é".as_bytes().to_vec())));
     }
@@ -4467,7 +4714,7 @@ mod tests {
     fn eval_string_octal_escape() {
         let mut tv = TypvalT::default();
         // Octal 101 == decimal 65 == 'A'.
-        let (ret, _) = eval_string(b"\"\\101\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\101\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"A".to_vec())));
     }
@@ -4475,7 +4722,7 @@ mod tests {
     #[test]
     fn eval_string_octal_escape_single_digit() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\7\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\7\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(vec![7])));
     }
@@ -4483,7 +4730,7 @@ mod tests {
     #[test]
     fn eval_string_default_escape_copies_literal_char() {
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"\\q\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"\\q\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"q".to_vec())));
     }
@@ -4495,7 +4742,7 @@ mod tests {
         // qualify): the backslash is dropped and the escape letter
         // itself becomes a plain character.
         let mut tv = TypvalT::default();
-        let (ret, _) = eval_string(b"\"a\\xg\"", &mut tv, true);
+        let (ret, _) = eval_string(b"\"a\\xg\"", &mut tv, true, false);
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"axg".to_vec())));
     }
@@ -4503,7 +4750,7 @@ mod tests {
     #[test]
     fn eval_string_missing_quote_fails() {
         let mut tv = TypvalT::default();
-        let (ret, consumed) = eval_string(b"\"abc", &mut tv, true);
+        let (ret, consumed) = eval_string(b"\"abc", &mut tv, true, false);
         assert_eq!(ret, FAIL);
         assert_eq!(consumed, 0);
     }
@@ -4511,7 +4758,7 @@ mod tests {
     #[test]
     fn eval_string_parse_only_mode_still_computes_length() {
         let mut tv = TypvalT::default();
-        let (ret, consumed) = eval_string(b"\"hello\\nworld\"", &mut tv, false);
+        let (ret, consumed) = eval_string(b"\"hello\\nworld\"", &mut tv, false, false);
         assert_eq!(ret, OK);
         assert_eq!(consumed, 14);
         assert_eq!(tv.value, TypvalValue::Unknown);
@@ -4521,7 +4768,7 @@ mod tests {
     fn eval_string_special_key_escape_is_unimplemented() {
         let mut tv = TypvalT::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            eval_string(b"\"\\<C-W>\"", &mut tv, true)
+            eval_string(b"\"\\<C-W>\"", &mut tv, true, false)
         }));
         assert!(result.is_err(), "expected a panic (find_special_key/trans_special not yet translated)");
     }
@@ -4533,7 +4780,7 @@ mod tests {
         // mode - matching the original exactly.
         let mut tv = TypvalT::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            eval_string(b"\"\\<C-W>\"", &mut tv, false)
+            eval_string(b"\"\\<C-W>\"", &mut tv, false, false)
         }));
         assert!(result.is_err());
     }
@@ -4541,7 +4788,7 @@ mod tests {
     #[test]
     fn eval_lit_string_parses_simple_literal() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'hello'", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"'hello'", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 7);
         assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"hello"));
@@ -4550,7 +4797,7 @@ mod tests {
     #[test]
     fn eval_lit_string_reduces_escaped_quote_pair() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 8);
         assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"ab'cd"));
@@ -4559,7 +4806,7 @@ mod tests {
     #[test]
     fn eval_lit_string_handles_multiple_escaped_quote_pairs() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"''''''", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"''''''", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 6);
         assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"''"));
@@ -4568,7 +4815,7 @@ mod tests {
     #[test]
     fn eval_lit_string_empty_literal() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"''", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"''", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 2);
         assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s.is_empty()));
@@ -4577,7 +4824,7 @@ mod tests {
     #[test]
     fn eval_lit_string_stops_at_first_unescaped_quote_leaving_trailer() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'abc' . 'def'", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"'abc' . 'def'", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 5);
         assert!(matches!(tv.value, TypvalValue::String(Some(ref s)) if s == b"abc"));
@@ -4586,7 +4833,7 @@ mod tests {
     #[test]
     fn eval_lit_string_missing_closing_quote_fails() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'abc", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"'abc", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::FAIL);
         assert_eq!(len, 0);
         assert!(matches!(tv.value, TypvalValue::Unknown));
@@ -4595,7 +4842,7 @@ mod tests {
     #[test]
     fn eval_lit_string_missing_closing_quote_after_escaped_pair_fails() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'ab''", &mut tv, true);
+        let (ret, len) = eval_lit_string(b"'ab''", &mut tv, true, false);
         assert_eq!(ret, crate::vim_defs::FAIL);
         assert_eq!(len, 0);
     }
@@ -4603,7 +4850,7 @@ mod tests {
     #[test]
     fn eval_lit_string_evaluate_false_still_computes_length_but_not_value() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, false);
+        let (ret, len) = eval_lit_string(b"'ab''cd'", &mut tv, false, false);
         assert_eq!(ret, crate::vim_defs::OK);
         assert_eq!(len, 8);
         assert!(matches!(tv.value, TypvalValue::Unknown));
@@ -4612,9 +4859,105 @@ mod tests {
     #[test]
     fn eval_lit_string_evaluate_false_on_unclosed_string_still_fails() {
         let mut tv = TypvalT::default();
-        let (ret, len) = eval_lit_string(b"'abc", &mut tv, false);
+        let (ret, len) = eval_lit_string(b"'abc", &mut tv, false, false);
         assert_eq!(ret, crate::vim_defs::FAIL);
         assert_eq!(len, 0);
+    }
+
+    // ---- eval_string / eval_lit_string with interpolate = true ------
+
+    #[test]
+    fn eval_string_interpolate_plain_no_braces() {
+        // arg is already PAST the opening quote (interpolate's own
+        // calling convention).
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"hello\"", &mut tv, true, true);
+        assert_eq!(ret, OK);
+        // Stops AT the closing quote, does not skip past it.
+        assert_eq!(consumed, 5);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_interpolate_reduces_doubled_braces() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"a{{b}}c\"", &mut tv, true, true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 7); // position of the closing quote
+        assert_eq!(tv.value, TypvalValue::String(Some(b"a{b}c".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_interpolate_stops_at_embedded_expression() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"abc{expr}\"", &mut tv, true, true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3); // position of the '{'
+        assert_eq!(tv.value, TypvalValue::String(Some(b"abc".to_vec())));
+    }
+
+    #[test]
+    fn eval_string_interpolate_stray_closing_curly_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"abc}def\"", &mut tv, true, true);
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_string_interpolate_missing_quote_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_string(b"abc", &mut tv, true, true);
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_string_interpolate_parse_only_mode_stops_at_brace_too() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_string(b"abc{expr}\"", &mut tv, false, true);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(tv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn eval_lit_string_interpolate_plain_no_braces() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_lit_string(b"hello'", &mut tv, true, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(consumed, 5);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn eval_lit_string_interpolate_reduces_doubled_braces() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_lit_string(b"a{{b}}c'", &mut tv, true, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(consumed, 7);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"a{b}c".to_vec())));
+    }
+
+    #[test]
+    fn eval_lit_string_interpolate_stops_at_embedded_expression() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = eval_lit_string(b"abc{expr}'", &mut tv, true, true);
+        assert_eq!(ret, crate::vim_defs::OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"abc".to_vec())));
+    }
+
+    #[test]
+    fn eval_lit_string_interpolate_stray_closing_curly_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_lit_string(b"abc}def'", &mut tv, true, true);
+        assert_eq!(ret, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn eval_lit_string_interpolate_missing_quote_fails() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = eval_lit_string(b"abc", &mut tv, true, true);
+        assert_eq!(ret, crate::vim_defs::FAIL);
     }
 
     // ---- eval_isnamec / eval_isnamec1 --------------------------------
@@ -5858,9 +6201,10 @@ mod tests {
     }
 
     #[test]
-    fn e2e_interpolated_string_syntax_is_unimplemented() {
-        let result = std::panic::catch_unwind(|| eval_str(b"$\"foo\""));
-        assert!(result.is_err(), "expected a panic (eval_interp_string not yet translated)");
+    fn e2e_interpolated_string_no_embedded_expression() {
+        let (ret, tv) = eval_str(b"$\"plain\"");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"plain".to_vec())));
     }
 
     // --- eval0-eval7 end-to-end: variables ---
@@ -6276,6 +6620,147 @@ mod tests {
     fn e2e_option_value_unknown_name_fails() {
         let (ret, _) = eval_str(b"&notarealoption");
         assert_eq!(ret, FAIL);
+    }
+
+    // --- skip_expr ---
+
+    #[test]
+    fn skip_expr_skips_a_simple_number() {
+        // 3, not 2: eval7's own trailing-whitespace lookahead for a
+        // possible subscript ('['/'('/'.') unconditionally consumes
+        // the space after "42" too, whether or not one actually
+        // follows - a pre-existing eval7 behavior, not specific to
+        // skip_expr itself.
+        let (ret, consumed) = unsafe { skip_expr(b"42 rest", None) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn skip_expr_does_not_evaluate() {
+        // &notarealoption FAILs when actually evaluated (eval_option's
+        // own validity check), but skip_expr always evaluates with
+        // EVAL_EVALUATE cleared (forwarded as a bare None to eval1,
+        // regardless of what's passed in) - proving it never reaches
+        // that check.
+        let (ret, _) = unsafe { skip_expr(b"&notarealoption", None) };
+        assert_eq!(ret, OK);
+    }
+
+    #[test]
+    fn skip_expr_restores_evalarg_flags_afterward() {
+        let mut evalarg = EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() };
+        let (ret, _) = unsafe { skip_expr(b"42", Some(&mut evalarg)) };
+        assert_eq!(ret, OK);
+        assert_eq!(evalarg.eval_flags, EVAL_EVALUATE);
+    }
+
+    // --- eval_to_string / typval2string ---
+
+    #[test]
+    fn eval_to_string_number() {
+        assert_eq!(unsafe { eval_to_string(b"42", false, false) }, Some(b"42".to_vec()));
+    }
+
+    #[test]
+    fn eval_to_string_string_literal() {
+        assert_eq!(unsafe { eval_to_string(b"\"hello\"", false, false) }, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn eval_to_string_expression() {
+        assert_eq!(unsafe { eval_to_string(b"1 + 1", false, false) }, Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn eval_to_string_failure_returns_none() {
+        assert_eq!(unsafe { eval_to_string(b"&notarealoption", false, false) }, None);
+    }
+
+    #[test]
+    fn eval_to_string_use_simple_function_is_unimplemented() {
+        let result = std::panic::catch_unwind(|| unsafe { eval_to_string(b"42", false, true) });
+        assert!(result.is_err(), "expected a panic (eval0_simple_funccal not yet translated)");
+    }
+
+    #[test]
+    fn eval_to_string_list_value_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Tests typval2string directly (rather than through the full
+        // eval_to_string/eval0 pipeline that would evaluate "[1, 2]"
+        // as a real expression) so the allocated list can be cleanly
+        // released regardless of the panic below - going through
+        // eval_to_string would leak the list into GC_FIRST_LIST
+        // forever, since the panic unwinds past any point where this
+        // test could reach eval_to_string's own internal `tv` to clean
+        // it up, corrupting every later GC-linked-list test in this
+        // process.
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let tv = TypvalT { value: TypvalValue::List(list), ..Default::default() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { typval2string(&tv, false) }));
+        assert!(result.is_err(), "expected a panic (encode_tv2string not yet translated)");
+        // SAFETY: list was freshly allocated above and never shared
+        // with anything else; typval2string never takes ownership.
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    // --- eval_interp_string ---
+
+    #[test]
+    fn eval_interp_string_no_embedded_expression() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_interp_string(b"$\"hello\"", &mut tv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn eval_interp_string_literal_quote_variant() {
+        let mut tv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_interp_string(b"$'hello'", &mut tv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn eval_interp_string_single_embedded_expression() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = unsafe { eval_interp_string(b"$\"value: {1+1}\"", &mut tv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"value: 2".to_vec())));
+    }
+
+    #[test]
+    fn eval_interp_string_doubled_braces_reduce() {
+        let mut tv = TypvalT::default();
+        let (ret, _) = unsafe { eval_interp_string(b"$\"a{{b}}c\"", &mut tv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"a{b}c".to_vec())));
+    }
+
+    #[test]
+    fn eval_interp_string_missing_quote_still_reports_ok_but_null_string() {
+        // Matches the original's own surprising-but-literal behavior:
+        // eval_interp_string() always `return OK;` at its very end,
+        // even when the inner parsing loop hit FAIL - only the
+        // resulting STRING becomes null (this crate's own None) rather
+        // than the original's own not-NUL-terminated partial buffer.
+        let mut tv = TypvalT::default();
+        let (ret, _) = unsafe { eval_interp_string(b"$\"abc", &mut tv, true) };
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn e2e_interpolated_string_with_embedded_expression() {
+        assert_eq!(eval_str(b"$\"1 + 1 = {1 + 1}\"").1.value, TypvalValue::String(Some(b"1 + 1 = 2".to_vec())));
+    }
+
+    #[test]
+    fn e2e_interpolated_string_single_quoted_with_embedded_expression() {
+        assert_eq!(eval_str(b"$'val={40 + 2}'").1.value, TypvalValue::String(Some(b"val=42".to_vec())));
     }
 }
 
