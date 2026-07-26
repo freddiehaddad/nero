@@ -67,6 +67,19 @@
 //! Needed a new [`crate::eval::typval::tv_get_float_chk`] (the
 //! original's own `tv_get_float_chk`, an explicit-success/failure
 //! sibling of the already-translated [`crate::eval::typval::tv_get_float`]).
+//!
+//! Also translated: `tolower()`/`toupper()` (via the already-existing
+//! `crate::strings::strcase_save`) and `trim()` (leading/trailing
+//! character trimming with an optional mask and direction, via a
+//! by-hand backward-multibyte-walk using the already-existing
+//! `crate::mbyte::utf_head_off`). `strcase_save`'s own trailing NUL
+//! terminator (added for its own, differently-shaped C-string-flavored
+//! callers) is stripped before building this crate's own `String`
+//! typval. `utf_head_off` requires its own `base` argument to include
+//! a trailing NUL byte - `f_trim` builds one once, up front, rather
+//! than threading that requirement through its own established
+//! "embedded NUL ends a C-string-modeled scan" byte-length-bounded
+//! idiom used everywhere else in this module.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -142,6 +155,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"pow"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_pow });
         m.insert(&b"fmod"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_fmod });
         m.insert(&b"float2nr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_float2nr });
+        m.insert(&b"tolower"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_tolower });
+        m.insert(&b"toupper"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_toupper });
+        m.insert(&b"trim"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_trim });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -782,6 +798,140 @@ fn f_float2nr(argvars: &[TypvalT], rettv: &mut TypvalT) {
         f as crate::eval::typval_defs::VarnumberT
     };
     rettv.value = TypvalValue::Number(n);
+}
+
+/// `tolower({string})` - convert to lowercase (`f_tolower`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (forwarded from
+/// `crate::strings::strcase_save`'s own safety doc).
+unsafe fn f_tolower(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut result = unsafe { crate::strings::strcase_save(&s, false) };
+    result.pop(); // strip strcase_save's own trailing NUL terminator.
+    rettv.value = TypvalValue::String(Some(result));
+}
+
+/// `toupper({string})` - convert to uppercase (`f_toupper`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (forwarded from
+/// `crate::strings::strcase_save`'s own safety doc).
+unsafe fn f_toupper(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut result = unsafe { crate::strings::strcase_save(&s, true) };
+    result.pop();
+    rettv.value = TypvalValue::String(Some(result));
+}
+
+/// `trim({text} [, {mask} [, {dir}]])` - trim characters from the
+/// start and/or end of `{text}` (`f_trim`).
+///
+/// `{mask}` defaults to trimming ASCII whitespace plus the
+/// non-breaking space U+00A0 (`c > ' ' && c != 0xa0` in the original -
+/// "not trim-worthy" exactly when a character is neither ASCII
+/// whitespace nor NBSP, matching Vim's own documented default).
+/// `{dir}`: `0` (default) trims both ends, `1` leading only, `2`
+/// trailing only - like the original, only ever read when `{mask}`
+/// was ACTUALLY passed as a real `String` (an omitted `{mask}` means
+/// `{dir}` is never consulted even if somehow present, exactly
+/// mirroring the original's own nested
+/// `if (argvars[1].v_type == VAR_STRING) { ... if (argvars[2]...) }`
+/// structure).
+///
+/// A NUL byte inside `{text}`/`{mask}` ends each string early,
+/// matching the original's own NUL-terminated `strlen`/`*head != NUL`
+/// loop conditions exactly - the same established "embedded NUL ends
+/// a C-string-modeled scan" translation `f_str2list`'s own doc comment
+/// explains in more detail.
+///
+/// The original's own `E475: Invalid argument` (`{dir}` out of the
+/// `0..=2` range) is omitted, matching this crate's established "skip
+/// the display, keep an otherwise-harmless default" policy - `rettv`
+/// is simply left as an empty `String`, matching the original's own
+/// pre-set `rettv->vval.v_string = NULL` default for this exact error
+/// path too.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (forwarded from
+/// `crate::mbyte::utf_head_off`'s own safety doc).
+unsafe fn f_trim(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let end = s.iter().position(|&b| b == 0).unwrap_or(s.len());
+
+    if argvars.len() > 1 && !matches!(argvars[1].value, TypvalValue::String(_)) {
+        return;
+    }
+
+    let mut mask: Option<Vec<u8>> = None;
+    let mut dir: crate::eval::typval_defs::VarnumberT = 0;
+    if argvars.len() > 1 {
+        let m = crate::eval::typval::tv_get_string(&argvars[1]);
+        mask = if m.first() == Some(&0) || m.is_empty() { None } else { Some(m) };
+
+        if argvars.len() > 2 {
+            let mut error = false;
+            dir = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error));
+            if error || !(0..=2).contains(&dir) {
+                return;
+            }
+        }
+    }
+
+    let is_trim_worthy = |c: i32, mask: &Option<Vec<u8>>| -> bool {
+        match mask {
+            None => !(c > i32::from(b' ') && c != 0xa0),
+            Some(m) => {
+                let mend = m.iter().position(|&b| b == 0).unwrap_or(m.len());
+                let mut p = 0;
+                while p < mend {
+                    if crate::mbyte::utf_ptr2char(&m[p..mend]) == c {
+                        return true;
+                    }
+                    p += crate::mbyte::utf_ptr2len(&m[p..mend]) as usize;
+                }
+                false
+            }
+        }
+    };
+
+    let mut head = 0usize;
+    if dir == 0 || dir == 1 {
+        while head < end {
+            let c1 = crate::mbyte::utf_ptr2char(&s[head..end]);
+            if !is_trim_worthy(c1, &mask) {
+                break;
+            }
+            head += crate::mbyte::utf_ptr2len(&s[head..end]) as usize;
+        }
+    }
+
+    // utf_head_off requires its own `base` to include a trailing NUL
+    // byte - build one once, up front, for the trailing-trim walk
+    // below (the only place this function needs it).
+    let mut nul_terminated = s[..end].to_vec();
+    nul_terminated.push(0);
+
+    let mut tail = end;
+    if dir == 0 || dir == 2 {
+        while tail > head {
+            let mut prev = tail - 1;
+            // SAFETY: forwarded from this function's own safety doc.
+            let head_off = unsafe { crate::mbyte::utf_head_off(&nul_terminated, prev) };
+            prev -= head_off as usize;
+            let c1 = crate::mbyte::utf_ptr2char(&s[prev..end]);
+            if !is_trim_worthy(c1, &mask) {
+                break;
+            }
+            tail = prev;
+        }
+    }
+
+    rettv.value = TypvalValue::String(Some(s[head..tail].to_vec()));
 }
 
 #[cfg(test)]
@@ -1471,6 +1621,9 @@ mod tests {
             "pow",
             "fmod",
             "float2nr",
+            "tolower",
+            "toupper",
+            "trim",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -1674,5 +1827,111 @@ mod tests {
         let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
         f_float2nr(&[string(b"not a number")], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- f_tolower / f_toupper ---
+
+    #[test]
+    fn tolower_converts_ascii_and_multibyte() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_tolower(&[string(b"Hello WORLD")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello world".to_vec())));
+
+        unsafe { f_tolower(&[string("HÉLLO".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some("héllo".as_bytes().to_vec())));
+    }
+
+    #[test]
+    fn toupper_converts_ascii_and_multibyte() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_toupper(&[string(b"Hello world")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"HELLO WORLD".to_vec())));
+
+        unsafe { f_toupper(&[string("héllo".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some("HÉLLO".as_bytes().to_vec())));
+    }
+
+    #[test]
+    fn tolower_toupper_of_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_tolower(&[string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+        unsafe { f_toupper(&[string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    // --- f_trim ---
+
+    #[test]
+    fn trim_default_mask_trims_both_ends() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string(b"  hello world  ")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello world".to_vec())));
+    }
+
+    #[test]
+    fn trim_default_mask_trims_non_breaking_space_too() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string("\u{a0}hi\u{a0}".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hi".to_vec())));
+    }
+
+    #[test]
+    fn trim_leading_only() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string(b"  hello  "), string(b" "), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello  ".to_vec())));
+    }
+
+    #[test]
+    fn trim_trailing_only() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string(b"  hello  "), string(b" "), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"  hello".to_vec())));
+    }
+
+    #[test]
+    fn trim_custom_mask() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string(b"xxhelloxx"), string(b"x")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn trim_empty_mask_falls_back_to_default() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string(b"  hi  "), string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hi".to_vec())));
+    }
+
+    #[test]
+    fn trim_invalid_dir_resets_rettv_to_an_empty_string() {
+        // Unlike most other builtins here (which leave rettv at its
+        // caller-provided default on error), f_trim's own C original
+        // unconditionally resets rettv to an empty String BEFORE any
+        // argument validation (`rettv->v_type = VAR_STRING; rettv->
+        // vval.v_string = NULL;` at the very top) - so an invalid dir
+        // still leaves rettv String(None), not the pre-call value.
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        unsafe { f_trim(&[string(b"hi"), string(b" "), num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn trim_dir_is_ignored_when_mask_argument_is_absent() {
+        // dir is only ever consulted when mask was ACTUALLY passed as a
+        // real String - this can't literally be exercised with a 3rd
+        // positional arg without a 2nd (max_argc requires args in
+        // order), so this documents the invariant via the table's own
+        // arity instead: trim() cannot be called with a dir but no
+        // mask at all, matching the original's own argument order.
+        assert_eq!(find_internal_func(b"trim").unwrap().min_argc, 1);
+    }
+
+    #[test]
+    fn trim_multibyte_text_and_mask() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_trim(&[string("日日hello日日".as_bytes()), string("日".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
     }
 }
