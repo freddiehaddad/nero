@@ -230,6 +230,18 @@
 //! `eval/fs.c`/`path.c`) live in their own mirrored files
 //! ([`crate::eval::fs`]/[`crate::path`]) but are registered in this
 //! module's own `FUNCTIONS` table.
+//!
+//! Also 5 more small, self-contained builtins: `foreground()` (a true
+//! no-op even in the original - empty function body), `eventhandler()`
+//! (via the already-real `GLOBALS.vgetc_busy`), `did_filetype()` (via
+//! the already-real `BufT.b_did_filetype`), `garbagecollect()` (sets
+//! the already-real `GLOBALS.want_garbage_collect`/
+//! `garbage_collect_at_exit` flags faithfully - the actual collection
+//! pass itself is deferred to the toplevel execution loop in the
+//! original too, not yet translated here either), and
+//! `getcharsearch()` (via the already-existing
+//! [`crate::search::last_csearch_str`]/`last_csearch_forward`/
+//! `last_csearch_until`).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -352,6 +364,11 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"delete"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_delete });
         m.insert(&b"pathshorten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_pathshorten });
         m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
+        m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
+        m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
+        m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
+        m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
+        m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3221,6 +3238,77 @@ fn f_hostname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(crate::os::env::os_get_hostname()));
 }
 
+/// `foreground()` - move the Nvim window to the foreground; a no-op
+/// in the original itself (empty function body - useful only when
+/// sent from a client to a real GUI/terminal server, `f_foreground`,
+/// `funcs.c`).
+fn f_foreground(_argvars: &[TypvalT], _rettv: &mut TypvalT) {}
+
+/// `eventhandler()` - whether Nvim is currently inside an event
+/// handler (`f_eventhandler`, `funcs.c`), via the already-real
+/// `GLOBALS.vgetc_busy`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`.
+unsafe fn f_eventhandler(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let vgetc_busy = unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy;
+    rettv.value = TypvalValue::Number(i64::from(vgetc_busy));
+}
+
+/// `did_filetype()` - whether the `FileType` autocommand event has
+/// been triggered at least once for the current buffer
+/// (`f_did_filetype`, `funcs.c`), via the already-real
+/// `BufT.b_did_filetype`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+unsafe fn f_did_filetype(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    rettv.value = TypvalValue::Number(i64::from(curbuf.b_did_filetype));
+}
+
+/// `garbagecollect([{atexit}])` - request garbage collection at the
+/// next opportunity, optionally also at exit (`f_garbagecollect`,
+/// `funcs.c`), via the already-real `GLOBALS.want_garbage_collect`/
+/// `garbage_collect_at_exit`. The actual collection is postponed to
+/// the toplevel by the original itself (it may be running from inside
+/// a List/Dict-using expression), matching this crate's own current
+/// scope: nothing yet triggers a collection pass in response to this
+/// flag, since the toplevel execution loop isn't translated yet - the
+/// flag itself is set faithfully regardless.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`.
+unsafe fn f_garbagecollect(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.want_garbage_collect = true;
+
+    if !argvars.is_empty() && crate::eval::typval::tv_get_number(&argvars[0]) == 1 {
+        globals.garbage_collect_at_exit = true;
+    }
+}
+
+/// `getcharsearch()` - the current character-search
+/// (`f`/`F`/`t`/`T`) state as a `Dict` with `"char"`/`"forward"`/
+/// `"until"` entries (`f_getcharsearch`, `funcs.c`), via the already-
+/// existing [`crate::search::last_csearch_str`]/
+/// [`crate::search::last_csearch_forward`]/
+/// [`crate::search::last_csearch_until`].
+fn f_getcharsearch(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let d = crate::eval::typval::tv_dict_alloc();
+    // SAFETY: `d` was just allocated above and is uniquely owned here.
+    let dict = unsafe { &mut *d };
+    crate::eval::typval::tv_dict_add_str(dict, b"char", Some(&crate::search::last_csearch_str()));
+    crate::eval::typval::tv_dict_add_nr(dict, b"forward", i64::from(crate::search::last_csearch_forward()));
+    crate::eval::typval::tv_dict_add_nr(dict, b"until", i64::from(crate::search::last_csearch_until()));
+    // SAFETY: `d` is a live, uniquely-owned allocation from tv_dict_alloc above.
+    unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3982,6 +4070,11 @@ mod tests {
             "delete",
             "pathshorten",
             "hostname",
+            "foreground",
+            "eventhandler",
+            "did_filetype",
+            "garbagecollect",
+            "getcharsearch",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -6645,5 +6738,114 @@ mod tests {
         f_hostname(&[], &mut rettv);
         let TypvalValue::String(Some(s)) = rettv.value else { panic!("expected a String") };
         assert!(!s.is_empty());
+    }
+
+    // --- f_foreground ---
+
+    #[test]
+    fn foreground_is_a_no_op() {
+        let mut rettv = TypvalT::default();
+        f_foreground(&[], &mut rettv);
+        // Matches the original's own empty function body: rettv is
+        // left completely untouched (still its Default value).
+        assert_eq!(rettv.value, TypvalValue::default());
+    }
+
+    // --- f_eventhandler ---
+
+    #[test]
+    fn eventhandler_reflects_vgetc_busy() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy = 0;
+        let mut rettv = TypvalT::default();
+        unsafe { f_eventhandler(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy = 1;
+        unsafe { f_eventhandler(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy = saved;
+    }
+
+    // --- f_did_filetype ---
+
+    #[test]
+    fn did_filetype_reflects_b_did_filetype() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_did_filetype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_did_filetype = true };
+        unsafe { f_did_filetype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = previous;
+    }
+
+    // --- f_garbagecollect ---
+
+    #[test]
+    fn garbagecollect_sets_want_garbage_collect() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.want_garbage_collect = false;
+        globals.garbage_collect_at_exit = false;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_garbagecollect(&[], &mut rettv) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(globals.want_garbage_collect);
+        assert!(!globals.garbage_collect_at_exit);
+
+        globals.want_garbage_collect = false;
+    }
+
+    #[test]
+    fn garbagecollect_atexit_true_also_sets_garbage_collect_at_exit() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.want_garbage_collect = false;
+        globals.garbage_collect_at_exit = false;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_garbagecollect(&[num(1)], &mut rettv) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(globals.want_garbage_collect);
+        assert!(globals.garbage_collect_at_exit);
+
+        globals.want_garbage_collect = false;
+        globals.garbage_collect_at_exit = false;
+    }
+
+    // --- f_getcharsearch ---
+
+    #[test]
+    fn getcharsearch_returns_a_dict_with_the_expected_entries() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(0, b"", 0);
+        crate::search::set_last_csearch(i32::from(b'x'), b"x", 1);
+        crate::search::set_csearch_direction(crate::vim_defs::Direction::Forward);
+        crate::search::set_csearch_until(false);
+
+        let mut rettv = TypvalT::default();
+        f_getcharsearch(&[], &mut rettv);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            let char_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"char").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_string(&(*char_item).di_tv), b"x".to_vec());
+            let forward_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"forward").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*forward_item).di_tv), 1);
+            let until_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"until").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*until_item).di_tv), 0);
+            crate::eval::typval::tv_dict_unref(d);
+        }
     }
 }

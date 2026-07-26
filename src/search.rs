@@ -115,6 +115,20 @@ pub fn last_csearch() -> [u8; MAX_SCHAR_SIZE + 1] {
     unsafe { LAST_CSEARCH.get_mut() }.bytes
 }
 
+/// The meaningful (`bytes[..bytelen]`) portion of [`last_csearch`]'s
+/// own fixed-size buffer, as an owned, NUL-free `Vec<u8>` - the exact
+/// form `getcharsearch()`'s own `f_getcharsearch` needs for its
+/// `"char"` dictionary entry (the original's own `last_csearch()`
+/// returns a NUL-terminated `const char *`, which `tv_dict_add_str`
+/// treats as exactly this same meaningful-length string).
+#[must_use]
+pub fn last_csearch_str() -> Vec<u8> {
+    // SAFETY: see [`last_csearch_forward`].
+    let state = unsafe { LAST_CSEARCH.get_mut() };
+    let len = usize::try_from(state.bytelen).unwrap_or(0).min(state.bytes.len());
+    state.bytes[..len].to_vec()
+}
+
 /// @return `true` if the last character search direction was forward
 /// (`last_csearch_forward`).
 #[must_use]
@@ -602,6 +616,21 @@ mod tests {
         assert_eq!(bytes.len(), MAX_SCHAR_SIZE + 1);
         assert_eq!(bytes[0], b'z');
         assert!(bytes[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn last_csearch_str_returns_only_the_meaningful_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_last_csearch(0, b"", 0);
+        set_last_csearch(i32::from(b'z'), b"z", 1);
+        assert_eq!(last_csearch_str(), b"z".to_vec());
+    }
+
+    #[test]
+    fn last_csearch_str_of_a_cleared_state_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_last_csearch(0, b"", 0);
+        assert_eq!(last_csearch_str(), Vec::<u8>::new());
     }
 
     /// Resets `SEARCH_PATTERNS` to its default state. Callers must
