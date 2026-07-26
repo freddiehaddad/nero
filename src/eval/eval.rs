@@ -194,7 +194,7 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (51 functions so
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (52 functions so
 //! far, including a full cluster of `float_op_wrapper`-style math
 //! functions (`sin()`/`cos()`/`sqrt()`/`pow()`/etc.) alongside the
 //! original handful - the start of a long tail, `eval/funcs.c` itself
@@ -7066,6 +7066,37 @@ mod tests {
             assert_eq!((*item2).li_tv.value, TypvalValue::Number(2));
             crate::eval::typval::tv_list_unref(l);
         }
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_remove_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"remove([1, 2, 3], 1)").1.value, TypvalValue::Number(2));
+
+        let (ret, tv) = eval_str(b"remove([1, 2, 3], 0, 1)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        assert_eq!(eval_str(b"remove(#{a: 1, b: 2}, 'a')").1.value, TypvalValue::Number(1));
+
+        let blob_item = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob_item).bv_ga.ga_data = vec![10, 20];
+            (*blob_item).bv_ga.ga_len = 2;
+            (*blob_item).bv_refcount += 1;
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myblob");
+        unsafe { (*item).di_tv.value = TypvalValue::Blob(blob_item) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+        assert_eq!(eval_str(b"remove(g:myblob, 0)").1.value, TypvalValue::Number(10));
 
         reset_globals_for_test();
     }

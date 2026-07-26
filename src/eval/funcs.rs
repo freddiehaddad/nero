@@ -135,6 +135,13 @@
 //! `add()` (append one item to a `List`/`Blob`, returning the SAME
 //! container) and `insert()` (insert one item before a given index,
 //! or at the start by default, also returning the SAME container).
+//! Also `remove()` (delete an item/range from a `List`/`Blob`, or a
+//! key from a `Dict`), which needed 2 new `typval.rs` helpers of its
+//! own: [`crate::eval::typval::tv_list_move_items`] (`eval/typval.c`'s
+//! own function, moving a range of items from one list to the end of
+//! another) and the whole `tv_list_remove`/`tv_blob_remove`/
+//! `tv_dict_remove` trio (also `eval/typval.c`, one real function per
+//! container type, exactly matching the original's own 3-way split).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -225,6 +232,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
         m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
         m.insert(&b"insert"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_insert });
+        m.insert(&b"remove"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_remove });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -1844,6 +1852,39 @@ unsafe fn f_insert(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `remove({object}, {idx} [, {end}])` - remove an item (or a range)
+/// from a `List`/`Blob` at `{idx}` (`{end}`, if given), or
+/// `remove({dict}, {key})` - remove the entry `{key}` from a `Dict`
+/// (`f_remove`, `eval/list.c`). Dispatches to
+/// [`crate::eval::typval::tv_list_remove`]/
+/// [`crate::eval::typval::tv_blob_remove`]/
+/// [`crate::eval::typval::tv_dict_remove`] by `argvars[0]`'s own type -
+/// every other type leaves `rettv` at its caller-provided default
+/// (the original's own `semsg(_(e_listdictblobarg), "remove()")` is
+/// omitted, message display not tractable).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`/`Dict`/`Blob`-typed with a
+/// non-null pointer, that pointer must be valid, with every item
+/// genuinely allocated via the matching `_alloc` helper.
+unsafe fn f_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    match &argvars[0].value {
+        TypvalValue::Dict(_) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_dict_remove(argvars, rettv) };
+        }
+        TypvalValue::Blob(_) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_blob_remove(argvars, rettv) };
+        }
+        TypvalValue::List(_) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_list_remove(argvars, rettv) };
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2546,6 +2587,7 @@ mod tests {
             "deepcopy",
             "add",
             "insert",
+            "remove",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -4043,6 +4085,68 @@ mod tests {
     fn insert_into_a_non_list_non_blob_leaves_rettv_at_default() {
         let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
         unsafe { f_insert(&[num(5), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_remove ---
+    //
+    // f_remove is a thin dispatch wrapper over
+    // crate::eval::typval::tv_list_remove/tv_blob_remove/tv_dict_remove,
+    // each already thoroughly tested directly in typval.rs's own test
+    // module - these tests focus on confirming the dispatch itself
+    // routes to the right one, not re-covering every edge case again.
+
+    #[test]
+    fn remove_dispatches_to_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *list, 1);
+            crate::eval::typval::tv_list_append_number(&mut *list, 2);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(0)];
+        unsafe { f_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(list), 1);
+            crate::eval::typval::tv_list_free(list);
+        }
+    }
+
+    #[test]
+    fn remove_dispatches_to_a_blob() {
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20];
+            (*blob).bv_ga.ga_len = 2;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, num(0)];
+        unsafe { f_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(10));
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(blob), 1);
+            crate::eval::typval::tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn remove_dispatches_to_a_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"a", 42) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string(b"a")];
+        unsafe { f_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn remove_on_a_non_list_non_dict_non_blob_leaves_rettv_at_default() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        unsafe { f_remove(&[num(5), num(0)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 }

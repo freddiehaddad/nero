@@ -1278,6 +1278,68 @@ pub unsafe fn tv_dict_item_remove(dict: &mut DictT, item: *mut DictitemT) {
     unsafe { tv_dict_item_free(item) };
 }
 
+/// `remove({dict}, {key})` - the `Dict` case of `remove()`
+/// (`tv_dict_remove`).
+///
+/// Removes and returns the value for `{key}`, moving it directly
+/// into `rettv` (matching the original's own plain `*rettv =
+/// di->di_tv` struct assignment - NOT a [`tv_copy`], so no refcount
+/// change happens for a `List`/`Dict`/`Blob`-valued item) before
+/// freeing the now-blanked dict item via [`tv_dict_item_remove`]
+/// (whose own `tv_dict_item_free` call harmlessly no-ops on the
+/// blanked value left behind by the `std::mem::take` above).
+///
+/// The original's own too-many-arguments check
+/// (`argvars[2].v_type != VAR_UNKNOWN`) is naturally unreachable here,
+/// since this function's own `max_argc` (2) already makes
+/// `call_internal_func` reject a 3rd argument before this function is
+/// ever reached, matching this crate's own already-established
+/// "`call_internal_func` enforces `min_argc`/`max_argc` before
+/// dispatch" convention.
+///
+/// The original's own `tv_dict_watcher_notify` call (only reachable
+/// if `tv_dict_is_watched(d)`) is omitted - nothing in this crate ever
+/// sets up a dict watcher (`dictwatcheradd()`/the whole watcher
+/// feature aren't translated, and `DictT` has no watcher-list field
+/// at all), so `tv_dict_is_watched` would always be false; matches
+/// this crate's established "omit a provably-unreachable branch"
+/// policy.
+///
+/// # Safety
+/// `argvars[0].value` must be `Dict`-typed; if its pointer is
+/// non-null, it must be valid, with every item genuinely allocated
+/// via `tv_dict_item_alloc`/`Box::into_raw`.
+pub unsafe fn tv_dict_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let TypvalValue::Dict(d) = argvars[0].value else { unreachable!() };
+    if d.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if value_check_lock(unsafe { (*d).dv_lock }, None) {
+        return;
+    }
+
+    let Some(key) = tv_get_string_chk(&argvars[1]) else {
+        return; // type error; errmsg already given in the original.
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(di) = (unsafe { tv_dict_find(Some(&mut *d), &key) }) else {
+        return; // semsg(_(e_dictkey), ...) omitted.
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let flags = unsafe { (*di).di_flags };
+    if crate::eval::vars::var_check_fixed(flags) || crate::eval::vars::var_check_ro(flags) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *rettv = std::mem::take(&mut (*di).di_tv);
+        tv_dict_item_remove(&mut *d, di);
+    }
+}
+
 /// Allocate an empty dictionary. Caller should take care of the
 /// reference count (`tv_dict_alloc`).
 #[must_use]
@@ -2007,6 +2069,103 @@ pub unsafe fn tv_blob_copy(from: *const crate::eval::typval_defs::BlobT, to: &mu
     to.v_lock = VarLockStatus::Unlocked;
 }
 
+/// `remove({blob}, {idx} [, {end}])` - the `Blob` case of `remove()`
+/// (`tv_blob_remove`).
+///
+/// Removes and returns a single byte at `{idx}` (as a `Number`), or,
+/// when `{end}` is also given, removes and returns every byte from
+/// `{idx}` to `{end}` (inclusive) as a NEW blob. Both `{idx}`/`{end}`
+/// may be negative (counting from the end), matching the original's
+/// own `idx = len + idx` adjustment exactly.
+///
+/// A null `b` is never dereferenced for its own lock check (matching
+/// the original's own short-circuiting `b != NULL && value_check_lock(...)`)
+/// but otherwise flows through the SAME logic as any other blob -
+/// [`tv_blob_len`] already returns `0` for a null blob, which makes
+/// every possible `{idx}` fail the immediately-following range check
+/// naturally, without a separate special case.
+///
+/// # Safety
+/// `argvars[0].value` must be `Blob`-typed; if its pointer is
+/// non-null, it must be valid.
+pub unsafe fn tv_blob_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let TypvalValue::Blob(b) = argvars[0].value else { unreachable!() };
+
+    if !b.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let locked = unsafe { (*b).bv_lock };
+        if value_check_lock(locked, None) {
+            return;
+        }
+    }
+
+    let mut error = false;
+    let mut idx = tv_get_number_chk(&argvars[1], Some(&mut error));
+    if error {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = i64::from(unsafe { tv_blob_len(b) });
+    if idx < 0 {
+        idx += len; // count from the end.
+    }
+    if idx < 0 || idx >= len {
+        return; // semsg(_(e_blobidx), idx) omitted.
+    }
+
+    if argvars.len() <= 2 {
+        // Remove one item, return its value.
+        // SAFETY: forwarded from this function's own safety doc.
+        let byte = unsafe { tv_blob_get(b, idx as i32) };
+        rettv.value = TypvalValue::Number(i64::from(byte));
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            let ga_data = &mut (*b).bv_ga.ga_data;
+            for i in idx..len - 1 {
+                ga_data[i as usize] = ga_data[(i + 1) as usize];
+            }
+            (*b).bv_ga.ga_len -= 1;
+        }
+        return;
+    }
+
+    // Remove range of items, return blob with values.
+    let mut error2 = false;
+    let mut end = tv_get_number_chk(&argvars[2], Some(&mut error2));
+    if error2 {
+        return;
+    }
+    if end < 0 {
+        end += len; // count from the end.
+    }
+    if end >= len || idx > end {
+        return; // semsg(_(e_blobidx), end) omitted.
+    }
+
+    let cnt = (end - idx + 1) as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let copied: Vec<u8> = unsafe { (&(*b).bv_ga.ga_data)[idx as usize..idx as usize + cnt].to_vec() };
+    let blob = tv_blob_alloc();
+    // SAFETY: `blob` was just allocated above, a fresh pointer not
+    // shared with anything yet.
+    unsafe {
+        (*blob).bv_ga.ga_data = copied;
+        (*blob).bv_ga.ga_len = cnt as i32;
+        (*blob).bv_ga.ga_maxlen = cnt as i32;
+        tv_blob_set_ret(rettv, blob);
+    }
+    // Shift the remaining tail (after `end`) left to fill the gap.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        let ga_data = &mut (*b).bv_ga.ga_data;
+        for i in (end + 1)..len {
+            ga_data[(idx + i - end - 1) as usize] = ga_data[i as usize];
+        }
+        (*b).bv_ga.ga_len -= cnt as i32;
+    }
+}
+
 /// `gc_first_list`: head of the linked list of all live lists (via
 /// `lv_used_next`/`lv_used_prev`), maintained for a future
 /// `:garbagecollect` implementation - same reasoning as
@@ -2447,6 +2606,130 @@ pub unsafe fn tv_list_remove_items(
         }
         li = nli;
     }
+}
+
+/// Move items `item` to `item2` from list `l` to the end of list
+/// `tgt_l` (`tv_list_move_items`).
+///
+/// # Safety
+/// Same as [`tv_list_drop_items`], plus `tgt_l` must be a valid,
+/// non-null pointer to a live `ListT`.
+pub unsafe fn tv_list_move_items(
+    l: *mut crate::eval::typval_defs::ListT,
+    item: *mut crate::eval::typval_defs::ListitemT,
+    item2: *mut crate::eval::typval_defs::ListitemT,
+    tgt_l: *mut crate::eval::typval_defs::ListT,
+    cnt: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_drop_items(l, item, item2) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let tgt_last = unsafe { (*tgt_l).lv_last };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*item).li_prev = tgt_last;
+        (*item2).li_next = std::ptr::null_mut();
+    }
+    if tgt_last.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*tgt_l).lv_first = item };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*tgt_last).li_next = item };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*tgt_l).lv_last = item2;
+        (*tgt_l).lv_len += cnt;
+    }
+}
+
+/// `remove({list}, {idx} [, {end}])` - the `List` case of `remove()`
+/// (`tv_list_remove`).
+///
+/// Removes and returns a single item at `{idx}` (moving its own
+/// value into `rettv` directly, matching the original's own plain
+/// `*rettv = *TV_LIST_ITEM_TV(item)` struct assignment - NOT a
+/// [`tv_copy`], so no refcount change happens for a `List`/`Dict`/
+/// `Blob`-valued item), or, when `{end}` is also given, removes and
+/// returns every item from `{idx}` to `{end}` (inclusive) as a NEW
+/// list built via [`tv_list_alloc_ret`]/[`tv_list_move_items`].
+///
+/// Every error path (locked list, a type error reading `{idx}`/
+/// `{end}`, either index out of range, or `{end}` before `{idx}`) is a
+/// bare early return leaving `rettv` at its caller-provided default -
+/// matching the original's own `semsg`/`emsg`-then-`return` structure
+/// exactly (message display itself omitted, see this module's own
+/// doc comment).
+///
+/// # Safety
+/// `argvars[0].value` must be `List`-typed with a valid, non-null
+/// pointer whose items are all genuinely allocated via
+/// `tv_list_item_alloc`/`Box::into_raw`.
+pub unsafe fn tv_list_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let TypvalValue::List(l) = argvars[0].value else { unreachable!() };
+    // SAFETY: forwarded from this function's own safety doc.
+    if value_check_lock(unsafe { tv_list_locked(l) }, None) {
+        return;
+    }
+
+    let mut error = false;
+    let idx = tv_get_number_chk(&argvars[1], Some(&mut error));
+    if error {
+        return; // type error; errmsg already given in the original.
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let item = unsafe { tv_list_find(l, idx as i32) };
+    if item.is_null() {
+        return; // semsg(_(e_list_index_out_of_range_nr), ...) omitted.
+    }
+
+    if argvars.len() <= 2 {
+        // Remove one item, return its value.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            tv_list_drop_items(l, item, item);
+            *rettv = std::mem::take(&mut (*item).li_tv);
+            drop(Box::from_raw(item));
+        }
+        return;
+    }
+
+    let mut error2 = false;
+    let end = tv_get_number_chk(&argvars[2], Some(&mut error2));
+    if error2 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let item2 = unsafe { tv_list_find(l, end as i32) };
+    if item2.is_null() {
+        return; // semsg(_(e_list_index_out_of_range_nr), ...) omitted.
+    }
+
+    let mut cnt: i32 = 0;
+    let mut li = item;
+    let mut found = false;
+    loop {
+        cnt += 1;
+        if li == item2 {
+            found = true;
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        li = unsafe { (*li).li_next };
+        if li.is_null() {
+            break;
+        }
+    }
+    if !found {
+        return; // emsg(_(e_invrange)) omitted - item2 wasn't found after item.
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let tgt = unsafe { tv_list_alloc_ret(rettv, cnt as isize) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_move_items(l, item, item2, tgt, cnt) };
 }
 
 /// Remove a list item from a list and free it (also clears the
@@ -6269,5 +6552,278 @@ mod tests {
 
             tv_dict_unref(d);
         }
+    }
+
+    // --- tv_list_move_items / tv_list_remove ---
+
+    #[test]
+    fn tv_list_move_items_moves_a_range_to_the_end_of_the_target() {
+        let _lock = crate::globals::global_state_test_lock();
+        let src = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(&mut *src, 1);
+            tv_list_append_number(&mut *src, 2);
+            tv_list_append_number(&mut *src, 3);
+        }
+        let tgt = tv_list_alloc(1);
+        unsafe { tv_list_append_number(&mut *tgt, 99) };
+        unsafe {
+            let item = tv_list_find(src, 1); // the "2" item.
+            tv_list_move_items(src, item, item, tgt, 1);
+            assert_eq!(tv_list_len(src), 2);
+            assert_eq!(tv_list_len(tgt), 2);
+            let first = tv_list_first(src);
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*(*first).li_next).li_tv.value, TypvalValue::Number(3));
+            let tfirst = tv_list_first(tgt);
+            assert_eq!((*tfirst).li_tv.value, TypvalValue::Number(99));
+            assert_eq!((*(*tfirst).li_next).li_tv.value, TypvalValue::Number(2));
+            tv_list_free(src);
+            tv_list_free(tgt);
+        }
+    }
+
+    #[test]
+    fn tv_list_remove_removes_a_single_item_and_returns_its_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(&mut *list, 1);
+            tv_list_append_number(&mut *list, 2);
+            tv_list_append_number(&mut *list, 3);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, number_tv(1)];
+        unsafe { tv_list_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe {
+            assert_eq!(tv_list_len(list), 2);
+            let item = tv_list_first(list);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*(*item).li_next).li_tv.value, TypvalValue::Number(3));
+            tv_list_free(list);
+        }
+    }
+
+    #[test]
+    fn tv_list_remove_removes_a_range_and_returns_a_new_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = tv_list_alloc(4);
+        unsafe {
+            tv_list_append_number(&mut *list, 1);
+            tv_list_append_number(&mut *list, 2);
+            tv_list_append_number(&mut *list, 3);
+            tv_list_append_number(&mut *list, 4);
+        }
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::List(list), ..Default::default() }, number_tv(1), number_tv(2)];
+        unsafe { tv_list_remove(&args, &mut rettv) };
+        let TypvalValue::List(removed) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(tv_list_len(list), 2);
+            let item = tv_list_first(list);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*(*item).li_next).li_tv.value, TypvalValue::Number(4));
+
+            assert_eq!(tv_list_len(removed), 2);
+            let ritem = tv_list_first(removed);
+            assert_eq!((*ritem).li_tv.value, TypvalValue::Number(2));
+            assert_eq!((*(*ritem).li_next).li_tv.value, TypvalValue::Number(3));
+
+            tv_list_free(list);
+            tv_list_unref(removed);
+        }
+    }
+
+    #[test]
+    fn tv_list_remove_on_a_locked_list_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_number(&mut *list, 1);
+            (*list).lv_lock = VarLockStatus::Locked;
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, number_tv(0)];
+        unsafe { tv_list_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { tv_list_free(list) };
+    }
+
+    #[test]
+    fn tv_list_remove_with_an_out_of_range_index_leaves_rettv_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = tv_list_alloc(0);
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, number_tv(5)];
+        unsafe { tv_list_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { tv_list_free(list) };
+    }
+
+    #[test]
+    fn tv_list_remove_with_end_before_idx_leaves_rettv_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(&mut *list, 1);
+            tv_list_append_number(&mut *list, 2);
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args =
+            [TypvalT { value: TypvalValue::List(list), ..Default::default() }, number_tv(1), number_tv(0)];
+        unsafe { tv_list_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { tv_list_free(list) };
+    }
+
+    // --- tv_blob_remove ---
+
+    #[test]
+    fn tv_blob_remove_removes_a_single_byte_and_returns_it() {
+        let blob = tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, number_tv(1)];
+        unsafe { tv_blob_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(20));
+        unsafe {
+            assert_eq!(tv_blob_len(blob), 2);
+            assert_eq!(tv_blob_get(blob, 0), 10);
+            assert_eq!(tv_blob_get(blob, 1), 30);
+            tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn tv_blob_remove_with_a_negative_index_counts_from_the_end() {
+        let blob = tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, number_tv(-1)];
+        unsafe { tv_blob_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(30));
+        unsafe {
+            assert_eq!(tv_blob_len(blob), 2);
+            tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn tv_blob_remove_removes_a_range_and_returns_a_new_blob() {
+        let blob = tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3, 4];
+            (*blob).bv_ga.ga_len = 4;
+        }
+        let mut rettv = TypvalT::default();
+        let args =
+            [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, number_tv(1), number_tv(2)];
+        unsafe { tv_blob_remove(&args, &mut rettv) };
+        let TypvalValue::Blob(removed) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(tv_blob_len(blob), 2);
+            assert_eq!(tv_blob_get(blob, 0), 1);
+            assert_eq!(tv_blob_get(blob, 1), 4);
+
+            assert_eq!(tv_blob_len(removed), 2);
+            assert_eq!(tv_blob_get(removed, 0), 2);
+            assert_eq!(tv_blob_get(removed, 1), 3);
+
+            tv_blob_free(blob);
+            tv_blob_free(removed);
+        }
+    }
+
+    #[test]
+    fn tv_blob_remove_on_a_locked_blob_leaves_it_untouched() {
+        let blob = tv_blob_alloc();
+        unsafe {
+            (*blob).bv_lock = VarLockStatus::Locked;
+            (*blob).bv_ga.ga_data = vec![1];
+            (*blob).bv_ga.ga_len = 1;
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, number_tv(0)];
+        unsafe { tv_blob_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            assert_eq!(tv_blob_len(blob), 1);
+            tv_blob_free(blob);
+        }
+    }
+
+    #[test]
+    fn tv_blob_remove_of_a_null_blob_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Blob(std::ptr::null_mut()), ..Default::default() }, number_tv(0)];
+        unsafe { tv_blob_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+    }
+
+    // --- tv_dict_remove ---
+
+    #[test]
+    fn tv_dict_remove_removes_a_key_and_returns_its_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *dict, b"a", 1);
+            tv_dict_add_nr(&mut *dict, b"b", 2);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string_tv(b"a")];
+        unsafe { tv_dict_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        unsafe {
+            assert_eq!(tv_dict_len(dict.as_ref()), 1);
+            assert!(tv_dict_find(dict.as_mut(), b"a").is_none());
+            tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn tv_dict_remove_of_a_missing_key_leaves_rettv_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string_tv(b"missing")];
+        unsafe { tv_dict_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe { tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn tv_dict_remove_on_a_locked_dict_leaves_it_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dict = tv_dict_alloc();
+        unsafe {
+            tv_dict_add_nr(&mut *dict, b"a", 1);
+            (*dict).dv_lock = VarLockStatus::Locked;
+        }
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }, string_tv(b"a")];
+        unsafe { tv_dict_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
+        unsafe {
+            assert_eq!(tv_dict_len(dict.as_ref()), 1);
+            tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn tv_dict_remove_of_a_null_dict_leaves_rettv_untouched() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(999), ..Default::default() };
+        let args =
+            [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }, string_tv(b"a")];
+        unsafe { tv_dict_remove(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(999));
     }
 }
