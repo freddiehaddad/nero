@@ -14,7 +14,12 @@
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
 //! `os_isrealdir`, `os_mkdir`, `os_rmdir`, `os_remove`, `os_rename`,
-//! `os_realpath`, `os_fsync`, `os_open`.
+//! `os_realpath`, `os_fsync`, `os_open`, `os_file_is_readable`,
+//! `os_file_is_writable` (the latter two via `libc::access`, the
+//! same underlying syscall the original's own `uv_fs_access` wraps -
+//! needs a `Path` -> `CString` conversion, requiring valid UTF-8, a
+//! narrow, documented gap matching `path.rs`'s own established
+//! `path_full_dir_name` precedent for the same reason).
 //! Functions that in the original return a raw libuv error code
 //! (`os_chdir`/`os_mkdir`/`os_rmdir`/`os_remove`/`os_fsync`) are
 //! translated to return `0` on success and `-1` on any failure: this
@@ -214,6 +219,50 @@ pub fn os_dirname() -> Option<Vec<u8>> {
 #[must_use]
 pub fn os_path_exists(path: &Path) -> bool {
     std::fs::metadata(path).is_ok()
+}
+
+/// Convert a `Path` to a `CString` for a `libc` call, matching this
+/// crate's established (documented, narrow) "requires valid UTF-8"
+/// convention already used by `path.rs`'s own `path_full_dir_name`
+/// for the same reason (`std::path::Path` on Windows is natively
+/// UTF-16; `libc::access` needs a narrow, NUL-terminated C string).
+fn path_to_cstring(path: &Path) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(path.to_str()?).ok()
+}
+
+// The `libc` crate doesn't export R_OK/W_OK for the Windows target
+// (its own `_access` from the MSVC CRT uses the identical, POSIX-
+// inherited values - confirmed against Microsoft's own `_access`
+// documentation), so they're defined here directly rather than via
+// `libc::R_OK`/`libc::W_OK` (available on Unix only).
+const R_OK: i32 = 4;
+const W_OK: i32 = 2;
+
+/// Check if a file is readable (`os_file_is_readable`), via
+/// [`libc::access`] with `R_OK` - the same underlying syscall the
+/// original's own `uv_fs_access` wraps.
+#[must_use]
+pub fn os_file_is_readable(path: &Path) -> bool {
+    let Some(cpath) = path_to_cstring(path) else { return false };
+    // SAFETY: cpath is a valid, NUL-terminated C string for its own
+    // lifetime, which outlives this call.
+    unsafe { libc::access(cpath.as_ptr(), R_OK) == 0 }
+}
+
+/// Check if a file is writable (`os_file_is_writable`), via
+/// [`libc::access`] with `W_OK`.
+///
+/// @return `0` if `path` is not writable, `1` if it's a writable
+///         file, `2` if it's a directory with write access.
+#[must_use]
+pub fn os_file_is_writable(path: &Path) -> i32 {
+    let Some(cpath) = path_to_cstring(path) else { return 0 };
+    // SAFETY: forwarded from os_file_is_readable's own safety doc.
+    let writable = unsafe { libc::access(cpath.as_ptr(), W_OK) == 0 };
+    if !writable {
+        return 0;
+    }
+    if os_isdir(path) { 2 } else { 1 }
 }
 
 /// Check if the given path exists and is a directory (`os_isdir`).
@@ -643,5 +692,87 @@ mod tests {
         assert_eq!(os_chdir(&original), 0);
 
         assert_eq!(os_chdir(&scratch.path.join("does_not_exist")), -1);
+    }
+
+    #[test]
+    fn os_file_is_readable_true_for_an_existing_file() {
+        let scratch = TempScratch::new("readable_existing");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(os_file_is_readable(&path));
+    }
+
+    #[test]
+    fn os_file_is_readable_false_for_a_nonexistent_path() {
+        let scratch = TempScratch::new("readable_missing");
+        let path = scratch.path.join("does_not_exist.txt");
+        assert!(!os_file_is_readable(&path));
+    }
+
+    #[test]
+    fn os_file_is_readable_true_for_a_directory() {
+        let scratch = TempScratch::new("readable_dir");
+        assert!(os_file_is_readable(&scratch.path));
+    }
+
+    #[test]
+    fn os_file_is_writable_returns_1_for_a_writable_file() {
+        let scratch = TempScratch::new("writable_file");
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        assert_eq!(os_file_is_writable(&path), 1);
+    }
+
+    #[test]
+    fn os_file_is_writable_returns_2_for_a_writable_directory() {
+        let scratch = TempScratch::new("writable_dir");
+        assert_eq!(os_file_is_writable(&scratch.path), 2);
+    }
+
+    #[test]
+    fn os_file_is_writable_returns_0_for_a_nonexistent_path() {
+        let scratch = TempScratch::new("writable_missing");
+        let path = scratch.path.join("does_not_exist.txt");
+        assert_eq!(os_file_is_writable(&path), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    // set_readonly(false) is flagged by clippy because on Unix it'd
+    // make the file world-writable - but this test is cfg(windows)
+    // only, where set_readonly toggles just the DOS read-only
+    // attribute (the exact thing this test is exercising).
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn os_file_is_writable_returns_0_for_a_readonly_file() {
+        let scratch = TempScratch::new("writable_readonly");
+        let path = scratch.path.join("ro.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        assert_eq!(os_file_is_writable(&path), 0);
+        assert!(os_file_is_readable(&path));
+
+        // Restore write access so TempScratch's own Drop-based cleanup
+        // (remove_dir_all) can actually delete this file afterward.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_file_is_writable_returns_0_for_a_readonly_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = TempScratch::new("writable_readonly_unix");
+        let path = scratch.path.join("ro.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        assert_eq!(os_file_is_writable(&path), 0);
+        assert!(os_file_is_readable(&path));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 }

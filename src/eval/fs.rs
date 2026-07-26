@@ -11,17 +11,20 @@
 //!
 //! Translated: `isdirectory()` (via the already-existing
 //! [`crate::os::fs::os_isdir`]), `isabsolutepath()` (via the already-
-//! existing [`crate::path::path_is_absolute`]), and `delete()` for its
+//! existing [`crate::path::path_is_absolute`]), `delete()` for its
 //! two tractable flag values (`""` - delete a file, via
 //! [`crate::os::fs::os_remove`]; `"d"` - delete an empty directory,
-//! via [`crate::os::fs::os_rmdir`]). The `"rf"` (recursive delete)
-//! flag needs `delete_recursive` (a directory-tree walk, not yet
-//! translated) and panics via `unimplemented!()` if actually reached.
-//! `delete()`/`isdirectory()`/`isabsolutepath()` all need a byte
-//! string to be valid UTF-8 to build a `Path` from (this crate's
-//! established `path_full_dir_name`-style convention - see that
-//! function's own body in `path.rs`), gracefully treating invalid
-//! UTF-8 the same as a nonexistent path/name rather than panicking.
+//! via [`crate::os::fs::os_rmdir`]), and `filereadable()`/
+//! `filewritable()` (via the already-existing
+//! [`crate::os::fs::os_file_is_readable`]/
+//! [`crate::os::fs::os_file_is_writable`]). The `"rf"` (recursive
+//! delete) flag needs `delete_recursive` (a directory-tree walk, not
+//! yet translated) and panics via `unimplemented!()` if actually
+//! reached. Every function taking a path/name needs the byte string
+//! to be valid UTF-8 to build a `Path` from (this crate's established
+//! `path_full_dir_name`-style convention - see that function's own
+//! body in `path.rs`), gracefully treating invalid UTF-8 the same as
+//! a nonexistent path/name rather than panicking.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -48,6 +51,29 @@ pub(crate) fn f_isdirectory(argvars: &[TypvalT], rettv: &mut TypvalT) {
 pub(crate) fn f_isabsolutepath(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let name = crate::eval::typval::tv_get_string(&argvars[0]);
     rettv.value = TypvalValue::Number(i64::from(crate::path::path_is_absolute(&name)));
+}
+
+/// `filereadable({file})` - whether `{file}` exists, can be read, and
+/// is not a directory (`f_filereadable`, `eval/fs.c`), via the
+/// already-existing [`crate::os::fs::os_isdir`]/
+/// [`crate::os::fs::os_file_is_readable`].
+pub(crate) fn f_filereadable(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let readable = !name.is_empty()
+        && bytes_to_path(&name).is_some_and(|p| {
+            !crate::os::fs::os_isdir(p) && crate::os::fs::os_file_is_readable(p)
+        });
+    rettv.value = TypvalValue::Number(i64::from(readable));
+}
+
+/// `filewritable({file})` - `0` if `{file}` doesn't exist or isn't
+/// writable, `1` for a writable file, `2` for a writable directory
+/// (`f_filewritable`, `eval/fs.c`), via the already-existing
+/// [`crate::os::fs::os_file_is_writable`].
+pub(crate) fn f_filewritable(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let writable = bytes_to_path(&name).map_or(0, crate::os::fs::os_file_is_writable);
+    rettv.value = TypvalValue::Number(i64::from(writable));
 }
 
 /// `delete({name} [, {flags}])` - delete a file (`{flags}` omitted or
@@ -275,5 +301,66 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_pathshorten(&[string(b"foo/bar/baz.txt"), num(0)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"f/b/baz.txt".to_vec())));
+    }
+
+    // --- f_filereadable ---
+
+    #[test]
+    fn filereadable_true_for_an_existing_file() {
+        let path = std::env::temp_dir().join("nero_test_filereadable.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let mut rettv = TypvalT::default();
+        f_filereadable(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn filereadable_false_for_a_nonexistent_path() {
+        let mut rettv = TypvalT::default();
+        f_filereadable(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn filereadable_false_for_a_directory() {
+        let tmp = std::env::temp_dir();
+        let mut rettv = TypvalT::default();
+        f_filereadable(&[string(tmp.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn filereadable_false_for_an_empty_name() {
+        let mut rettv = TypvalT::default();
+        f_filereadable(&[string(b"")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_filewritable ---
+
+    #[test]
+    fn filewritable_returns_1_for_a_writable_file() {
+        let path = std::env::temp_dir().join("nero_test_filewritable.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let mut rettv = TypvalT::default();
+        f_filewritable(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn filewritable_returns_2_for_a_writable_directory() {
+        let tmp = std::env::temp_dir();
+        let mut rettv = TypvalT::default();
+        f_filewritable(&[string(tmp.to_str().unwrap().as_bytes())], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn filewritable_returns_0_for_a_nonexistent_path() {
+        let mut rettv = TypvalT::default();
+        f_filewritable(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 }
