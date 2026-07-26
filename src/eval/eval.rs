@@ -194,10 +194,12 @@
 //! `` `=expr` ``-handling fallback, see `os/env.rs`'s own doc comment).
 //! Function calls (`eval_func`) are now real for BUILTIN functions only:
 //! `call_func` dispatches through `builtin_function`/`find_internal_func`
-//! into `crate::eval::funcs`'s new `FUNCTIONS` table (`len()`/`type()`/
-//! `empty()` so far - the start of a long tail, `eval/funcs.c` itself
-//! implements ~641 builtins). A user-function-SHAPED name (not
-//! recognized as builtin) still correctly, gracefully `FAIL`s today
+//! into `crate::eval::funcs`'s new `FUNCTIONS` table (13 functions so
+//! far - `len()`/`type()`/`empty()`/`and()`/`or()`/`xor()`/`abs()`/
+//! `max()`/`min()`/`char2nr()`/`nr2char()`/`str2float()`/`str2nr()` -
+//! the start of a long tail, `eval/funcs.c` itself implements ~641
+//! builtins). A user-function-SHAPED name (not recognized as builtin)
+//! still correctly, gracefully `FAIL`s today
 //! (`find_func` finds nothing, since nothing parses `:function` yet) -
 //! genuinely correct, not a stub; only if `find_func` somehow ever
 //! returned a real, non-null `UfuncT` would `call_func` reach its own
@@ -6432,6 +6434,65 @@ mod tests {
         assert_eq!(ret, FAIL);
         let (ret, _) = eval_str(b"len(1, 2)");
         assert_eq!(ret, FAIL);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_and_or_xor_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"and(0x0C, 0x0A)").1.value, TypvalValue::Number(0x08));
+        assert_eq!(eval_str(b"or(0x0C, 0x0A)").1.value, TypvalValue::Number(0x0E));
+        assert_eq!(eval_str(b"xor(0x0C, 0x0A)").1.value, TypvalValue::Number(0x06));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_abs_builtin_function_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"abs(-5)").1.value, TypvalValue::Number(5));
+        assert_eq!(eval_str(b"abs(5)").1.value, TypvalValue::Number(5));
+        assert_eq!(eval_str(b"abs(-5.5)").1.value, TypvalValue::Float(5.5));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_max_min_builtin_function_calls_on_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"max([3, 7, 1])").1.value, TypvalValue::Number(7));
+        assert_eq!(eval_str(b"min([3, 7, 1])").1.value, TypvalValue::Number(1));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_char2nr_and_nr2char_builtin_function_calls_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"char2nr(\"A\")").1.value, TypvalValue::Number(65));
+        assert_eq!(eval_str(b"nr2char(65)").1.value, TypvalValue::String(Some(b"A".to_vec())));
+        assert_eq!(eval_str(b"char2nr(nr2char(char2nr(\"Z\")))").1.value, TypvalValue::Number(90));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn e2e_str2float_and_str2nr_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        assert_eq!(eval_str(b"str2float(\"2.5\")").1.value, TypvalValue::Float(2.5));
+        assert_eq!(eval_str(b"str2nr(\"42\")").1.value, TypvalValue::Number(42));
+        assert_eq!(eval_str(b"str2nr(\"0x1A\", 16)").1.value, TypvalValue::Number(26));
 
         reset_globals_for_test();
     }

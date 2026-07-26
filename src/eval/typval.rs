@@ -4266,6 +4266,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn get_func_tv_releases_a_list_argument_after_the_call() {
+        // Regression test: crate::eval::userfunc::get_func_tv must
+        // clear every parsed argument after call_func returns, matching
+        // the original's own `while (--argcount >= 0)
+        // tv_clear(&argvars[argcount]);`. Discovered via an end-to-end
+        // `max([3, 7, 1])` test leaking a list into this same
+        // GC_FIRST_LIST forever (deterministically breaking
+        // multiple_lists_maintain_the_gc_linked_list_correctly's own
+        // "GC list starts empty" assumption whenever it happened to run
+        // afterward) - this pins the fix directly, checking
+        // GC_FIRST_LIST's own state before/after instead of relying on
+        // an unrelated test's own assertions to notice a regression.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { *GC_FIRST_LIST.get_mut() }.is_null(), "no list should be live before this test");
+
+        let mut evalarg =
+            crate::eval::eval::EvalargT { eval_flags: crate::eval::eval::EVAL_EVALUATE, ..Default::default() };
+        let mut rettv = TypvalT::default();
+        let (ret, _consumed) = unsafe {
+            crate::eval::userfunc::get_func_tv(b"max", &mut rettv, b"([3, 7, 1])", Some(&mut evalarg), true)
+        };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+
+        // The list literal's own list must have been fully released -
+        // nothing else in the whole call holds a reference to it, so a
+        // leak would leave it dangling here, still linked into
+        // GC_FIRST_LIST despite being unreachable by any name.
+        assert!(unsafe { *GC_FIRST_LIST.get_mut() }.is_null(), "max()'s own list argument must be released");
+    }
+
     fn number_tv(n: crate::eval::typval_defs::VarnumberT) -> TypvalT {
         TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Number(n) }
     }

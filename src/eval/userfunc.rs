@@ -826,6 +826,19 @@ pub unsafe fn call_func(funcname: &[u8], rettv: &mut TypvalT, argvars: &[TypvalT
 ///
 /// `arg` must point to the opening `(`. Returns `(status, consumed)`.
 ///
+/// Every successfully-parsed argument is released after the call
+/// (`while (--argcount >= 0) tv_clear(&argvars[argcount]);` in the
+/// original) - this runs UNCONDITIONALLY, regardless of whether the
+/// call itself succeeded: argument parsing may have partially
+/// succeeded before failing (e.g. a missing closing paren after 2
+/// valid arguments), and those already hold real allocated values that
+/// still need releasing. None of today's builtins keep a List/Dict
+/// argument's own pointer inside `rettv` without first incrementing
+/// its reference count themselves (matching how e.g.
+/// `tv_list_append_list` calls `tv_list_ref` internally) - the
+/// original's own ownership model always assumes the caller (here)
+/// does this final release, so this is safe for every builtin so far.
+///
 /// # Safety
 /// Forwarded from [`get_func_arguments`]/[`call_func`]'s own safety
 /// docs.
@@ -847,6 +860,11 @@ pub unsafe fn get_func_tv(
     } else {
         FAIL
     };
+
+    for tv in argvars.iter().rev() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(tv) };
+    }
 
     pos += crate::charset::skipwhite(&arg[pos..]);
     (ret, pos)
