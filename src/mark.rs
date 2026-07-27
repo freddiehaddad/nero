@@ -37,12 +37,19 @@
 //! handler translated in this crate, re-checked directly against the
 //! real source rather than assumed blocked alongside its sibling
 //! `ex_*` functions below, which each have their OWN additional,
-//! separate blockers).
+//! separate blockers); `setmark_pos` (partial - only the `` ' ``/
+//! `` ` `` "previous context mark" branch, since every other mark
+//! needs `buflist_findnr` unconditionally, see the Deferred list
+//! below).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `setmark`/`setmark_pos`/`mark_set_global`/`mark_set_local`: need
+//! - `setmark`/`mark_set_global`/`mark_set_local`: need
 //!   `buflist_findnr` (`buffer.c`) and the `MarkSet` autocmd
 //!   (`autocmd.c`).
+//! - `setmark_pos`: now PARTIALLY tractable - only its `` ' ``/`` ` ``
+//!   ("previous context mark") branch is translated, since every
+//!   other mark needs `buflist_findnr` unconditionally as its very
+//!   first step.
 //! - `mark_jumplist_iter`/`mark_global_iter`: only consumed by
 //!   `shada.c` (not yet translated); their C-style "raw pointer as an
 //!   opaque continuation token" API doesn't have an urgent caller yet.
@@ -633,6 +640,51 @@ pub unsafe fn pos_to_mark(buf: &BufT, fmp: Option<&mut FmarkT>, pos: PosT) -> *m
     fm_ref.fnum = buf.handle;
     fm_ref.mark = pos;
     fm
+}
+
+/// Set the position of mark `c` (`setmark_pos`).
+///
+/// Only the `` ' `` / `` ` `` case (the "previous context mark") is
+/// translated: every other mark needs `buflist_findnr` (`buffer.c`,
+/// not yet translated) as its very first step, unconditionally,
+/// regardless of which mark character is being set -
+/// `unimplemented!()`s if reached (this crate's only current caller,
+/// `eval/funcs.rs`'s `set_position`, calls this with `name[1]` from a
+/// `'x`-shaped `{expr}` string - `name = "''"`/`` "'`" `` reach this
+/// tractable branch for real, e.g. `setpos("''", ...)`; any other
+/// single mark letter, like `setpos("'a", ...)`, hits the
+/// `unimplemented!()`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`, with the usual "no overlapping
+/// live access" requirement. `pos` must be valid to read; `view_pt`,
+/// if `Some`, likewise (though the tractable branch never reads it -
+/// only later, still-deferred branches do).
+pub unsafe fn setmark_pos(c: i32, pos: *const PosT, fnum: i32, view_pt: Option<&FmarkvT>) -> i32 {
+    // Check for a special key (may cause islower() to crash).
+    if c < 0 {
+        return crate::vim_defs::FAIL;
+    }
+
+    if c == i32::from(b'\'') || c == i32::from(b'`') {
+        // SAFETY: forwarded from this function's own safety doc.
+        let globals = unsafe { GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { &mut *globals.curwin };
+        if std::ptr::eq(pos, std::ptr::addr_of!(curwin.w_cursor)) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { setpcmark() };
+            // keep it even when the cursor doesn't move
+            curwin.w_prev_pcmark = curwin.w_pcmark;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            curwin.w_pcmark = unsafe { *pos };
+        }
+        return crate::vim_defs::OK;
+    }
+
+    let _ = (fnum, view_pt);
+    unimplemented!("setmark_pos: needs buflist_findnr (buffer.c), not yet translated");
 }
 
 /// Get visual marks `'<'`/`'>'` (`mark_get_visual`).

@@ -4186,6 +4186,94 @@ pub unsafe fn var2fpos(
     None
 }
 
+/// Convert a `List` `tv` argument into a file position, buffer number,
+/// and `curswant` (`list2fpos`).
+///
+/// `arg` must be `[fnum, lnum, col, coladd, curswant]` (`fnum` present
+/// only when `fnump` is `Some`; `coladd`/`curswant` optional).
+///
+/// The `charcol=true` (character-position, used by `setcharpos()`)
+/// path needs `buflist_findnr`/`buf_charidx_to_byteidx`, neither
+/// translated yet - `unimplemented!()`s if actually reached (this
+/// crate's only current caller, `set_position`, always passes
+/// `charcol=false` for `setpos()`; `setcharpos()` itself is not yet
+/// registered as a builtin for exactly this reason).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_find_nr`]'s own
+/// safety doc, plus [`crate::globals::GLOBALS`]'s usual "no
+/// overlapping live access" requirement when `fnump` is `Some` and the
+/// list's own `fnum` entry is `0` (current buffer).
+pub unsafe fn list2fpos(
+    arg: &TypvalT,
+    posp: &mut crate::pos_defs::PosT,
+    fnump: Option<&mut i32>,
+    curswantp: Option<&mut crate::pos_defs::ColnrT>,
+    charcol: bool,
+) -> i32 {
+    let TypvalValue::List(l) = arg.value else { return FAIL };
+    if l.is_null() {
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let list_len = i64::from(unsafe { crate::eval::typval::tv_list_len(l) });
+    let min_len = if fnump.is_some() { 3 } else { 2 };
+    let max_len = if fnump.is_some() { 5 } else { 4 };
+    if list_len < min_len || list_len > max_len {
+        return FAIL;
+    }
+
+    let mut i = 0i32;
+    if let Some(fnump) = fnump {
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe { crate::eval::typval::tv_list_find_nr(l, i, None) };
+        i += 1;
+        if n < 0 {
+            return FAIL;
+        }
+        let n = if n == 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            i64::from(unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }.handle)
+        } else {
+            n
+        };
+        *fnump = n as i32;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::eval::typval::tv_list_find_nr(l, i, None) };
+    i += 1;
+    if n < 0 {
+        return FAIL;
+    }
+    posp.lnum = n as crate::pos_defs::LinenrT;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::eval::typval::tv_list_find_nr(l, i, None) };
+    i += 1;
+    if n < 0 {
+        return FAIL;
+    }
+    if charcol {
+        unimplemented!(
+            "list2fpos: character-position conversion needs buflist_findnr/\
+             buf_charidx_to_byteidx (setcharpos()), not yet translated"
+        );
+    }
+    posp.col = n as crate::pos_defs::ColnrT;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::eval::typval::tv_list_find_nr(l, i, None) };
+    posp.coladd = if n < 0 { 0 } else { n as crate::pos_defs::ColnrT };
+
+    if let Some(curswantp) = curswantp {
+        // SAFETY: forwarded from this function's own safety doc.
+        *curswantp = unsafe { crate::eval::typval::tv_list_find_nr(l, i + 1, None) } as crate::pos_defs::ColnrT;
+    }
+
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8002,6 +8090,122 @@ mod tests {
     #[test]
     fn e2e_interpolated_string_single_quoted_with_embedded_expression() {
         assert_eq!(eval_str(b"$'val={40 + 2}'").1.value, TypvalValue::String(Some(b"val=42".to_vec())));
+    }
+
+    // --- list2fpos ---
+
+    #[test]
+    fn list2fpos_resolves_fnum_lnum_col_coladd_and_curswant() {
+        let l = crate::eval::typval::tv_list_alloc(5);
+        for n in [7, 3, 2, 1, 10] {
+            unsafe { crate::eval::typval::tv_list_append_number(l, n) };
+        }
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut pos = crate::pos_defs::PosT::default();
+        let mut fnum = 0;
+        let mut curswant = -1;
+        let rc = unsafe { list2fpos(&tv, &mut pos, Some(&mut fnum), Some(&mut curswant), false) };
+        assert_eq!(rc, OK);
+        assert_eq!(fnum, 7);
+        assert_eq!(pos, crate::pos_defs::PosT { lnum: 3, col: 2, coladd: 1 });
+        assert_eq!(curswant, 10);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn list2fpos_fnum_zero_resolves_to_current_buffer() {
+        let mut buf = crate::buffer_defs::BufT { handle: 42, ..Default::default() };
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let l = crate::eval::typval::tv_list_alloc(3);
+        for n in [0, 5, 1] {
+            unsafe { crate::eval::typval::tv_list_append_number(l, n) };
+        }
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut pos = crate::pos_defs::PosT::default();
+        let mut fnum = 0;
+        let rc = unsafe { list2fpos(&tv, &mut pos, Some(&mut fnum), None, false) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(rc, OK);
+        assert_eq!(fnum, 42);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn list2fpos_too_short_list_fails() {
+        let l = crate::eval::typval::tv_list_alloc(2);
+        for n in [1, 2] {
+            unsafe { crate::eval::typval::tv_list_append_number(l, n) };
+        }
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut pos = crate::pos_defs::PosT::default();
+        let mut fnum = 0;
+        let rc = unsafe { list2fpos(&tv, &mut pos, Some(&mut fnum), None, false) };
+        assert_eq!(rc, FAIL);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn list2fpos_non_list_arg_fails() {
+        let tv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut pos = crate::pos_defs::PosT::default();
+        let rc = unsafe { list2fpos(&tv, &mut pos, None, None, false) };
+        assert_eq!(rc, FAIL);
+    }
+
+    #[test]
+    #[should_panic(expected = "buflist_findnr")]
+    fn list2fpos_charcol_true_panics_needs_buflist_findnr() {
+        // fnum=1 (nonzero) so GLOBALS.curbuf is never touched - this
+        // test intentionally exercises ONLY the charcol=true panic,
+        // not fnum-zero resolution (which needs a real buffer set up).
+        let l = crate::eval::typval::tv_list_alloc(3);
+        for n in [1, 5, 3] {
+            unsafe { crate::eval::typval::tv_list_append_number(l, n) };
+        }
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut pos = crate::pos_defs::PosT::default();
+        let mut fnum = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            list2fpos(&tv, &mut pos, Some(&mut fnum), None, true)
+        }));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        match result {
+            Ok(_) => panic!("expected a panic, but list2fpos returned normally"),
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    // --- setmark_pos ---
+
+    #[test]
+    fn setmark_pos_negative_char_fails() {
+        let pos = crate::pos_defs::PosT::default();
+        let rc = unsafe { crate::mark::setmark_pos(-1, &pos, 0, None) };
+        assert_eq!(rc, FAIL);
+    }
+
+    #[test]
+    fn setmark_pos_quote_char_sets_pcmark_directly_for_a_non_cursor_pointer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = globals.curwin;
+        globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        let pos = crate::pos_defs::PosT { lnum: 4, col: 1, coladd: 0 };
+        let rc = unsafe { crate::mark::setmark_pos(i32::from(b'\''), &pos, 0, None) };
+
+        let w = unsafe { &*globals.curwin };
+        assert_eq!(rc, OK);
+        assert_eq!(w.w_pcmark, pos);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 }
 
