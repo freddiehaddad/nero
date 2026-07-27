@@ -443,6 +443,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
+        m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
         m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
@@ -4307,6 +4308,100 @@ unsafe fn f_win_gettype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(type_str.to_vec()));
 }
 
+/// Recursive frame-tree walk building `winlayout()`'s own nested
+/// return value (`get_framelayout`, `eval/window.c`). `fr` may be
+/// null (the original's own early-return no-op). `outer == true`
+/// (only for the very first, top-level call from [`f_winlayout`])
+/// appends directly into `l`; every recursive call instead allocates
+/// its own fresh 2-element list and appends THAT into `l`.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::ListT`] with no other live mutable
+/// reference to it. `fr`, if non-null, must be a valid pointer to a
+/// live [`crate::buffer_defs::FrameT`] tree - every
+/// `fr_child`/`fr_next`/`fr_win` pointer reachable from it must
+/// itself be null or valid.
+unsafe fn get_framelayout(
+    fr: *const crate::buffer_defs::FrameT,
+    l: *mut crate::eval::typval_defs::ListT,
+    outer: bool,
+) {
+    if fr.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let f = unsafe { &*fr };
+
+    let fr_list = if outer {
+        l
+    } else {
+        let sub = crate::eval::typval::tv_list_alloc(2);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_list(l, sub) };
+        sub
+    };
+
+    if f.fr_layout == crate::buffer_defs::FR_LEAF {
+        if !f.fr_win.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_list_append_string(fr_list, Some(b"leaf")) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let handle = unsafe { &*f.fr_win }.handle;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_list_append_number(fr_list, i64::from(handle)) };
+        }
+    } else {
+        let kind: &[u8] = if f.fr_layout == crate::buffer_defs::FR_ROW { b"row" } else { b"col" };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_string(fr_list, Some(kind)) };
+
+        let win_list =
+            crate::eval::typval::tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::Unknown as isize);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_list(fr_list, win_list) };
+        let mut child = f.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { get_framelayout(child, win_list, false) };
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+    }
+}
+
+/// `winlayout([{tabnr}])` - the current (or `{tabnr}`'s) window
+/// layout as a nested `[type, ...]` list: `["leaf", {winid}]` for a
+/// single window, or `["row"/"col", [child, child, ...]]` for a split
+/// (`f_winlayout`, `eval/window.c`), via [`get_framelayout`]. An empty
+/// list if `{tabnr}` doesn't resolve to a real tab page.
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_tabpage`]/
+/// [`get_framelayout`]'s own safety docs.
+unsafe fn f_winlayout(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+
+    let tp = if argvars.is_empty() || matches!(argvars[0].value, TypvalValue::Unknown) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab
+    } else {
+        let n = crate::eval::typval::tv_get_number(&argvars[0]);
+        // SAFETY: forwarded from this function's own safety doc.
+        let found = unsafe { crate::window::find_tabpage(n as i32) };
+        if found.is_null() {
+            return;
+        }
+        found
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let topframe = unsafe { &*tp }.tp_topframe;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_framelayout(topframe, l, true) };
+}
+
 /// `escape({string}, {chars})` - escape every character in
 /// `{chars}` that occurs in `{string}` with a backslash
 /// (`f_escape`, `funcs.c`), via the newly-added
@@ -5450,6 +5545,7 @@ mod tests {
             "winwidth",
             "win_screenpos",
             "win_gettype",
+            "winlayout",
             "escape",
             "fnameescape",
             "argc",
@@ -9652,6 +9748,197 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_win_gettype(&[num(1234)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"popup".to_vec())));
+    }
+
+    // --- f_winlayout / get_framelayout ---
+
+    #[test]
+    fn winlayout_no_args_reports_a_single_leaf_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(42);
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_win: &mut win as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        };
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_topframe: &mut frame as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::String(Some(b"leaf".to_vec())));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(42));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn winlayout_row_split_reports_nested_leaves() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = focusable_win(1);
+        let mut win2 = focusable_win(2);
+        let mut leaf2 = crate::buffer_defs::FrameT {
+            fr_win: &mut win2 as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        };
+        let mut leaf1 = crate::buffer_defs::FrameT {
+            fr_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            fr_next: &mut leaf2 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf1 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut curwin = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_topframe: &mut row as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let _guard = WinGlobalsGuard::set(&mut curwin, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let kind_item = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*kind_item).li_tv.value, TypvalValue::String(Some(b"row".to_vec())));
+
+            let children_item = crate::eval::typval::tv_list_find(l, 1);
+            let TypvalValue::List(children) = (*children_item).li_tv.value else {
+                panic!("expected a nested List of children")
+            };
+            assert_eq!(crate::eval::typval::tv_list_len(children), 2);
+
+            let child0 = crate::eval::typval::tv_list_find(children, 0);
+            let TypvalValue::List(child0_list) = (*child0).li_tv.value else { panic!("expected a leaf List") };
+            let c0i0 = crate::eval::typval::tv_list_find(child0_list, 0);
+            let c0i1 = crate::eval::typval::tv_list_find(child0_list, 1);
+            assert_eq!((*c0i0).li_tv.value, TypvalValue::String(Some(b"leaf".to_vec())));
+            assert_eq!((*c0i1).li_tv.value, TypvalValue::Number(1));
+
+            let child1 = crate::eval::typval::tv_list_find(children, 1);
+            let TypvalValue::List(child1_list) = (*child1).li_tv.value else { panic!("expected a leaf List") };
+            let c1i0 = crate::eval::typval::tv_list_find(child1_list, 0);
+            let c1i1 = crate::eval::typval::tv_list_find(child1_list, 1);
+            assert_eq!((*c1i0).li_tv.value, TypvalValue::String(Some(b"leaf".to_vec())));
+            assert_eq!((*c1i1).li_tv.value, TypvalValue::Number(2));
+
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn winlayout_col_split_reports_col_kind() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(7);
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: &mut win as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        };
+        let mut col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &mut leaf as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut curwin = focusable_win(7);
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_topframe: &mut col as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let _guard = WinGlobalsGuard::set(&mut curwin, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let kind_item = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*kind_item).li_tv.value, TypvalValue::String(Some(b"col".to_vec())));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn winlayout_explicit_tabnr_resolves_the_correct_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = focusable_win(1);
+        let mut win2 = focusable_win(2);
+        let mut frame1 = crate::buffer_defs::FrameT {
+            fr_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        };
+        let mut frame2 = crate::buffer_defs::FrameT {
+            fr_win: &mut win2 as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        };
+        let mut tp2 = crate::buffer_defs::TabpageT {
+            tp_topframe: &mut frame2 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut tp1 = crate::buffer_defs::TabpageT {
+            tp_topframe: &mut frame1 as *mut crate::buffer_defs::FrameT,
+            tp_next: &mut tp2 as *mut crate::buffer_defs::TabpageT,
+            ..Default::default()
+        };
+        // WinGlobalsGuard::set(win, tp) sets curtab/first_tabpage to
+        // the SAME tp - fine here, since find_tabpage(2) walks
+        // first_tabpage/tp_next and ignores curtab entirely; tp1's own
+        // tp_next chain (built above) is what actually matters.
+        let _guard = WinGlobalsGuard::set(&mut win1, &mut tp1);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[num(2)], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::String(Some(b"leaf".to_vec())));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn winlayout_unknown_tabnr_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[num(99)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn winlayout_null_topframe_yields_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        // A default TabpageT has a null tp_topframe.
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winlayout(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
     }
 
     // --- f_escape ---
