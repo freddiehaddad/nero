@@ -435,6 +435,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_tabpagenr });
         m.insert(&b"tabpagewinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_tabpagewinnr });
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
+        m.insert(&b"gettabinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettabinfo });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -447,6 +448,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winbufnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winbufnr });
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
+        m.insert(&b"winsaveview"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winsaveview });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
@@ -3059,6 +3061,98 @@ unsafe fn f_tabpagebuflist(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Build a `Dict` describing tab page `tp` (`get_tabpage_info`,
+/// `eval/window.c`'s own `static` helper - kept private here too,
+/// its only real caller is [`f_gettabinfo`], in this same file).
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live `TabpageT`.
+unsafe fn get_tabpage_info(tp: *mut crate::buffer_defs::TabpageT, tp_idx: i32) -> *mut crate::eval::typval_defs::DictT {
+    let d = crate::eval::typval::tv_dict_alloc();
+    // SAFETY: `d` was just allocated above, uniquely owned here.
+    let dict = unsafe { &mut *d };
+    crate::eval::typval::tv_dict_add_nr(dict, b"tabnr", i64::from(tp_idx));
+
+    let l = crate::eval::typval::tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::MayKnow as isize);
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = if is_curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_firstwin
+    };
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: `l` was just allocated above by this same call.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(w.handle)) };
+        wp = w.w_next;
+    }
+    // SAFETY: `dict`/`l` are both valid, freshly-obtained live pointers
+    // (forwarded from this function's own safety doc for `dict`;
+    // `tv_list_alloc` never returns null).
+    unsafe { crate::eval::typval::tv_dict_add_list(dict, b"windows", l) };
+
+    // Make a reference to tabpage variables.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_dict_add_dict(dict, b"variables", (*tp).tp_vars) };
+
+    d
+}
+
+/// `gettabinfo([{arg}])` - information about tab page(s) as a `List`
+/// of `Dict`s: every tab page when `{arg}` is omitted, or just the
+/// one identified by `{arg}` (`f_gettabinfo`, `eval/window.c`), via
+/// [`get_tabpage_info`].
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_tabpage`]/
+/// [`get_tabpage_info`]'s own safety docs.
+unsafe fn f_gettabinfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let has_arg = !argvars.is_empty();
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(
+            rettv,
+            if has_arg { crate::eval::typval_defs::ListLenSpecials::MayKnow as isize } else { 1 },
+        )
+    };
+
+    let tparg: *mut crate::buffer_defs::TabpageT = if has_arg {
+        // SAFETY: forwarded from this function's own safety doc.
+        let tp = unsafe {
+            crate::window::find_tabpage(crate::eval::typval::tv_get_number_chk(&argvars[0], None) as i32)
+        };
+        if tp.is_null() {
+            return;
+        }
+        tp
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let mut tpnr = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        tpnr += 1;
+        if tparg.is_null() || std::ptr::eq(tp, tparg) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let d = unsafe { get_tabpage_info(tp, tpnr) };
+            // SAFETY: `l`/`d` are both valid, freshly-obtained live pointers.
+            unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+            if !tparg.is_null() {
+                return;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4497,6 +4591,55 @@ unsafe fn f_winwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
     rettv.value =
         TypvalValue::Number(if wp.is_null() { -1 } else { i64::from(unsafe { &*wp }.w_view_width) });
+}
+
+/// `winsaveview()` - a `Dict` capturing the current window's cursor
+/// position and view state (`lnum`/`col`/`coladd`/`curswant`/
+/// `topline`/`topfill`/`leftcol`/`skipcol`), for later restoration via
+/// `winrestview()` (`f_winsaveview`, `eval/window.c`), via the
+/// already-existing [`crate::r#move::update_curswant`].
+///
+/// `winrestview()` itself remains deferred: its own real, unconditional
+/// `win_new_width`/`win_set_inner_size` call (window-layout
+/// recomputation, `window.c`, not translated) is a genuine state
+/// change (not a skippable pure-redraw side effect - other already-
+/// translated code reads `w_view_width`/`w_view_height` and would see
+/// stale values if this were silently omitted), so it isn't a narrow
+/// gap that can be faithfully elided.
+///
+/// # Safety
+/// Touches `GLOBALS.curwin` - same requirement as every other function
+/// that does so.
+unsafe fn f_winsaveview(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+    // SAFETY: `d` is a live, uniquely-owned allocation from
+    // tv_dict_alloc_ret above, not yet shared beyond `rettv`.
+    let dict = unsafe { &mut *d };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*curwin_ptr };
+    crate::eval::typval::tv_dict_add_nr(dict, b"lnum", i64::from(curwin.w_cursor.lnum));
+    crate::eval::typval::tv_dict_add_nr(dict, b"col", i64::from(curwin.w_cursor.col));
+    crate::eval::typval::tv_dict_add_nr(dict, b"coladd", i64::from(curwin.w_cursor.coladd));
+
+    // update_curswant() internally re-derives its own GLOBALS.curwin
+    // pointer - the `curwin` reference above is never held across
+    // this call (would otherwise be a Tree Borrows hazard, matching
+    // this crate's established "derive the pointer once, dereference
+    // fresh each time" discipline).
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::update_curswant() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*curwin_ptr };
+    crate::eval::typval::tv_dict_add_nr(dict, b"curswant", i64::from(curwin.w_curswant));
+    crate::eval::typval::tv_dict_add_nr(dict, b"topline", i64::from(curwin.w_topline));
+    crate::eval::typval::tv_dict_add_nr(dict, b"topfill", i64::from(curwin.w_topfill));
+    crate::eval::typval::tv_dict_add_nr(dict, b"leftcol", i64::from(curwin.w_leftcol));
+    crate::eval::typval::tv_dict_add_nr(dict, b"skipcol", i64::from(curwin.w_skipcol));
 }
 
 /// `win_screenpos({nr})` - the screen position `[row, col]` (both
@@ -5983,6 +6126,7 @@ mod tests {
             "tabpagenr",
             "tabpagewinnr",
             "tabpagebuflist",
+            "gettabinfo",
             "eval",
             "gettext",
             "nextnonblank",
@@ -5995,6 +6139,7 @@ mod tests {
             "winbufnr",
             "winheight",
             "winwidth",
+            "winsaveview",
             "win_screenpos",
             "screenpos",
             "win_gettype",
@@ -8920,6 +9065,130 @@ mod tests {
         unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
     }
 
+    // --- f_gettabinfo ---
+
+    /// Sets up 2 tabpages: tab 1 (curtab, windows via `GLOBALS.firstwin`,
+    /// one window handle 10) and tab 2 (not curtab, windows via its own
+    /// `tp_firstwin`, one window handle 20) - exercising BOTH halves of
+    /// `get_tabpage_info`'s own `is_curtab` ternary in one setup.
+    fn two_tab_fixture() -> (
+        crate::buffer_defs::WinT,
+        crate::buffer_defs::TabpageT,
+        crate::buffer_defs::WinT,
+        crate::buffer_defs::TabpageT,
+    ) {
+        let win1 = crate::buffer_defs::WinT { handle: 10, ..Default::default() };
+        let win2 = crate::buffer_defs::WinT { handle: 20, ..Default::default() };
+        let tab1 = crate::buffer_defs::TabpageT::default();
+        let tab2 = crate::buffer_defs::TabpageT::default();
+        (win1, tab1, win2, tab2)
+    }
+
+    #[test]
+    fn gettabinfo_no_args_returns_all_tabs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win1, mut tab1, mut win2, mut tab2) = two_tab_fixture();
+        tab2.tp_firstwin = &mut win2 as *mut crate::buffer_defs::WinT;
+        tab1.tp_next = &mut tab2 as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        let prev_curtab = globals.curtab;
+        let prev_firstwin = globals.firstwin;
+        globals.first_tabpage = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+        globals.curtab = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+        globals.firstwin = &mut win1 as *mut crate::buffer_defs::WinT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettabinfo(&[], &mut rettv) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = prev_first_tabpage;
+        globals.curtab = prev_curtab;
+        globals.firstwin = prev_firstwin;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d0) = (*item0).li_tv.value else { panic!("expected a Dict") };
+            let tabnr0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"tabnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*tabnr0).di_tv), 1);
+            let windows0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"windows").unwrap();
+            let TypvalValue::List(wl0) = (*windows0).di_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(wl0), 1);
+            let w0 = crate::eval::typval::tv_list_find(wl0, 0);
+            assert_eq!((*w0).li_tv.value, TypvalValue::Number(10));
+
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            let TypvalValue::Dict(d1) = (*item1).li_tv.value else { panic!("expected a Dict") };
+            let tabnr1 = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"tabnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*tabnr1).di_tv), 2);
+            let windows1 = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"windows").unwrap();
+            let TypvalValue::List(wl1) = (*windows1).di_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(wl1), 1);
+            let w1 = crate::eval::typval::tv_list_find(wl1, 0);
+            assert_eq!((*w1).li_tv.value, TypvalValue::Number(20));
+
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn gettabinfo_with_arg_returns_only_that_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win1, mut tab1, mut win2, mut tab2) = two_tab_fixture();
+        tab2.tp_firstwin = &mut win2 as *mut crate::buffer_defs::WinT;
+        tab1.tp_next = &mut tab2 as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        let prev_curtab = globals.curtab;
+        let prev_firstwin = globals.firstwin;
+        globals.first_tabpage = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+        globals.curtab = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+        globals.firstwin = &mut win1 as *mut crate::buffer_defs::WinT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettabinfo(&[num(2)], &mut rettv) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = prev_first_tabpage;
+        globals.curtab = prev_curtab;
+        globals.firstwin = prev_firstwin;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d0) = (*item0).li_tv.value else { panic!("expected a Dict") };
+            let tabnr0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"tabnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*tabnr0).di_tv), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn gettabinfo_unknown_tab_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tab1 = crate::buffer_defs::TabpageT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        globals.first_tabpage = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettabinfo(&[num(99)], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
     // --- f_has ---
 
     #[test]
@@ -10458,6 +10727,77 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_winwidth(&[num(9999)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_winsaveview ---
+
+    #[test]
+    fn winsaveview_returns_a_dict_with_the_expected_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 3, col: 4, coladd: 1 },
+            w_topline: 2,
+            w_topfill: 1,
+            w_leftcol: 5,
+            w_skipcol: 6,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winsaveview(&[], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            let lnum = crate::eval::typval::tv_dict_find(Some(&mut *d), b"lnum").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*lnum).di_tv), 3);
+            let col = crate::eval::typval::tv_dict_find(Some(&mut *d), b"col").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*col).di_tv), 4);
+            let coladd = crate::eval::typval::tv_dict_find(Some(&mut *d), b"coladd").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*coladd).di_tv), 1);
+            // w_set_curswant defaults to false, so update_curswant()
+            // leaves w_curswant untouched at its own Default (0).
+            let curswant = crate::eval::typval::tv_dict_find(Some(&mut *d), b"curswant").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*curswant).di_tv), 0);
+            let topline = crate::eval::typval::tv_dict_find(Some(&mut *d), b"topline").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*topline).di_tv), 2);
+            let topfill = crate::eval::typval::tv_dict_find(Some(&mut *d), b"topfill").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*topfill).di_tv), 1);
+            let leftcol = crate::eval::typval::tv_dict_find(Some(&mut *d), b"leftcol").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*leftcol).di_tv), 5);
+            let skipcol = crate::eval::typval::tv_dict_find(Some(&mut *d), b"skipcol").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*skipcol).di_tv), 6);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn winsaveview_updates_curswant_when_w_set_curswant_is_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT { w_set_curswant: true, ..focusable_win(1) };
+        // w_cursor/w_valid_cursor/w_leftcol/w_valid_leftcol/w_skipcol/
+        // w_valid_skipcol all stay at their shared zero Default, so
+        // check_cursor_moved (called internally by update_curswant via
+        // validate_virtcol) is a no-op - VALID_VIRTCOL (set by
+        // set_valid_virtcol below) stays set, avoiding
+        // validate_virtcol's own getvvcol fallback, which would need
+        // a real buffer.
+        crate::r#move::set_valid_virtcol(&mut win, 7);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winsaveview(&[], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            // update_curswant_force() (via update_curswant()) copies
+            // w_virtcol into w_curswant since w_set_curswant was true.
+            let curswant = crate::eval::typval::tv_dict_find(Some(&mut *d), b"curswant").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*curswant).di_tv), 7);
+            crate::eval::typval::tv_dict_unref(d);
+        }
     }
 
     // --- f_win_screenpos ---
