@@ -473,6 +473,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         m.insert(&b"winsaveview"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winsaveview });
+        m.insert(&b"winrestview"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winrestview });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
@@ -5428,6 +5429,89 @@ unsafe fn f_winsaveview(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     crate::eval::typval::tv_dict_add_nr(dict, b"skipcol", i64::from(curwin.w_skipcol));
 }
 
+/// `winrestview({dict})` - restore the current window's view as
+/// previously returned by `winsaveview()` (`f_winrestview`,
+/// `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::cursor::check_cursor`]/
+/// [`crate::window::win_new_height`]/[`crate::window::win_new_width`]/
+/// [`crate::move::changed_window_setting`]/
+/// [`crate::move::check_topfill`]'s own safety docs.
+pub unsafe fn f_winrestview(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_nonnull_dict_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let TypvalValue::Dict(dict) = argvars[0].value else { return };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"lnum") {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_cursor.lnum = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::LinenrT;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"col") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_cursor.col = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::ColnrT;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"coladd") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_cursor.coladd =
+            crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::ColnrT;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"curswant") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_curswant = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::ColnrT;
+        curwin.w_set_curswant = false;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"topline") {
+        let n = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::LinenrT;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::set_topline(curwin_ptr, n) };
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"topfill") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_topfill = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as i32;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"leftcol") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_leftcol = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::ColnrT;
+    }
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *dict }), b"skipcol") {
+        let curwin = unsafe { &mut *curwin_ptr };
+        curwin.w_skipcol = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv) as crate::pos_defs::ColnrT;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::check_cursor(curwin_ptr) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (w_height, w_width) = {
+        let curwin = unsafe { &*curwin_ptr };
+        (curwin.w_height, curwin.w_width)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::window::win_new_height(curwin_ptr, w_height) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::window::win_new_width(curwin_ptr, w_width) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::changed_window_setting(curwin_ptr) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *curwin_ptr };
+    if curwin.w_topline <= 0 {
+        curwin.w_topline = 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*curwin.w_buffer }.b_ml.ml_line_count;
+    if curwin.w_topline > line_count {
+        curwin.w_topline = line_count;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::check_topfill(curwin_ptr, true) };
+}
+
 /// `win_screenpos({nr})` - the screen position `[row, col]` (both
 /// 1-based) of window `{nr}` (a window number or window ID), `[0, 0]`
 /// if not found (`f_win_screenpos`, `eval/window.c`).
@@ -6950,6 +7034,7 @@ mod tests {
             "winheight",
             "winwidth",
             "winsaveview",
+            "winrestview",
             "win_screenpos",
             "screenpos",
             "win_gettype",
@@ -12601,6 +12686,157 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_get_number(&(*curswant).di_tv), 7);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // --- f_winrestview ---
+
+    #[test]
+    fn winrestview_restores_all_fields() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three", b"four", b"five"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let d = &mut *dict;
+            crate::eval::typval::tv_dict_add_nr(d, b"lnum", 3);
+            crate::eval::typval::tv_dict_add_nr(d, b"col", 1);
+            crate::eval::typval::tv_dict_add_nr(d, b"coladd", 2);
+            crate::eval::typval::tv_dict_add_nr(d, b"curswant", 9);
+            crate::eval::typval::tv_dict_add_nr(d, b"topline", 2);
+            crate::eval::typval::tv_dict_add_nr(d, b"topfill", 0);
+            crate::eval::typval::tv_dict_add_nr(d, b"leftcol", 4);
+            crate::eval::typval::tv_dict_add_nr(d, b"skipcol", 5);
+        }
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        let w = unsafe { &*win_ptr };
+        assert_eq!(w.w_cursor, crate::pos_defs::PosT { lnum: 3, col: 1, coladd: 2 });
+        assert_eq!(w.w_curswant, 9);
+        assert!(!w.w_set_curswant);
+        assert_eq!(w.w_topline, 2);
+        assert_eq!(w.w_topfill, 0);
+        assert_eq!(w.w_leftcol, 4);
+        assert_eq!(w.w_skipcol, 5);
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn winrestview_clamps_topline_beyond_line_count() {
+        let mut buf = buf_with_lines(&[b"one", b"two"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"topline", 99) };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 2);
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn winrestview_clamps_topline_below_one() {
+        let mut buf = buf_with_lines(&[b"one", b"two"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"topline", 0) };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 1);
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn winrestview_missing_keys_leave_those_fields_untouched() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 },
+            w_leftcol: 7,
+            ..focusable_win(1)
+        };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        // An empty dict - every field should be left exactly as-is
+        // (aside from the unconditional check_cursor()/
+        // changed_window_setting() tail, which don't move the cursor
+        // on their own for an already-valid position).
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        let w = unsafe { &*win_ptr };
+        assert_eq!(w.w_cursor, crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 });
+        assert_eq!(w.w_leftcol, 7);
+
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn winrestview_non_dict_arg_is_a_no_op() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let args = [num(42)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 });
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn winrestview_null_dict_is_a_no_op() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let args = [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestview(&args, &mut rettv) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 });
+
+        close_test_buf(buf);
     }
 
     // --- f_win_screenpos ---

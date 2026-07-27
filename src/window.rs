@@ -778,6 +778,80 @@ pub unsafe fn is_bottom_win(wp: &WinT) -> bool {
     }
 }
 
+/// Set the width/height that a window will occupy, other than what's
+/// used for the 'winbar'/status/vertical-separator lines
+/// (`win_set_inner_size`).
+///
+/// Only the "no real size change" fast path (both branches' own guard
+/// conditions - `height != prev_height`/`width != wp.w_view_width` -
+/// false) is translated: the "real work" bodies each need substantial
+/// additional machinery not yet translated (`validate_cursor`/
+/// `set_fraction`/`win_comp_scroll`/`scroll_to_fraction` for the
+/// height branch; `curs_columns` for the width branch - beyond the
+/// pure `redraw_later` scheduling omitted per this crate's established
+/// policy) - `unimplemented!()`s if either is actually reached. This
+/// crate's own real caller, `winrestview()` (via [`win_new_height`]/
+/// [`win_new_width`]), always calls with the window's OWN current
+/// height/width, which - for any window whose `w_view_height`/
+/// `w_view_width` are already consistent with its `w_height`/`w_width`
+/// (the normal, already-configured case) - never triggers either
+/// branch.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn win_set_inner_size(wp: *mut WinT, _valid_cursor: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let width = if w.w_width_request == 0 { w.w_width } else { w.w_width_request };
+
+    let prev_height = w.w_view_height;
+    let height = if w.w_height_request == 0 { (w.w_height - w.w_winbar_height).max(0) } else { w.w_height_request };
+
+    if height != prev_height {
+        unimplemented!(
+            "win_set_inner_size: a real height change needs validate_cursor/set_fraction/\
+             win_comp_scroll/scroll_to_fraction, not yet translated"
+        );
+    }
+
+    if width != w.w_view_width {
+        unimplemented!(
+            "win_set_inner_size: a real width change needs curs_columns, not yet translated"
+        );
+    }
+}
+
+/// Set the width of window `wp` (`win_new_width`).
+///
+/// # Safety
+/// Forwarded from [`win_set_inner_size`]'s own safety doc.
+pub unsafe fn win_new_width(wp: *mut WinT, width: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_width = width.max(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_pos_changed = true;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_set_inner_size(wp, true) };
+}
+
+/// Set the height of window `wp` (`win_new_height`).
+///
+/// # Safety
+/// Forwarded from [`win_set_inner_size`]'s own safety doc.
+pub unsafe fn win_new_height(wp: *mut WinT, height: i32) {
+    let height = height.max(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    if w.w_height == height {
+        // nothing to do
+        return;
+    }
+    w.w_height = height;
+    w.w_pos_changed = true;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_set_inner_size(wp, true) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

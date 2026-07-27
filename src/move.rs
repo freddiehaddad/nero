@@ -627,6 +627,54 @@ pub unsafe fn set_topline(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) {
     // Don't set VALID_TOPLINE here, 'scrolloff' needs to be checked.
 }
 
+/// Don't end up with too many filler lines in the window
+/// (`check_topfill`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Forwarded from
+/// [`crate::plines::plines_win_nofill`]'s/
+/// [`crate::winfloat::win_check_anchored_floats`]'s own safety docs.
+pub unsafe fn check_topfill(wp: *mut WinT, down: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    if w.w_topfill > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe { crate::plines::plines_win_nofill(wp, w.w_topline, true) };
+        if w.w_topfill + n > w.w_view_height {
+            if down && w.w_topline > 1 {
+                w.w_topline -= 1;
+                w.w_topfill = 0;
+            } else {
+                w.w_topfill = (w.w_view_height - n).max(0);
+            }
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::winfloat::win_check_anchored_floats(wp) };
+}
+
+/// Call this whenever a window-local setting changes that could
+/// affect the whole window (e.g. an option or the window's own size)
+/// (`changed_window_setting`).
+///
+/// Omits the original's own `redraw_later(wp, UPD_NOT_VALID)` call at
+/// the end (a pure redraw-scheduling side effect, matching this
+/// crate's established policy for `redraw_later` throughout).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn changed_window_setting(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    w.w_lines_valid = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_line_abv_curs_win(wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *wp }.w_valid &=
+        !(i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP) | i32::from(w_valid::VALID_TOPLINE));
+}
+
 /// Convert a virtual (screen) column to a character column. The first
 /// column is zero (`vcol2col`, `mouse.c`).
 ///
