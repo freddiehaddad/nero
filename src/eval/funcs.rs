@@ -418,6 +418,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_id2win"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2win });
         m.insert(&b"win_id2tabwin"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_id2tabwin });
         m.insert(&b"win_findbuf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_findbuf });
+        m.insert(&b"winnr"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winnr });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2876,6 +2877,22 @@ unsafe fn f_win_findbuf(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `winnr([{arg}])` - the number of the current window (`f_winnr`,
+/// `eval/window.c`), via the already-existing
+/// [`crate::window::get_winnr`], called with `GLOBALS.curtab`
+/// (matching the original's own `get_winnr(curtab, &argvars[0])`).
+///
+/// # Safety
+/// Forwarded from `crate::window::get_winnr`'s own safety doc.
+unsafe fn f_winnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let arg = if argvars.is_empty() { None } else { Some(crate::eval::typval::tv_get_string(&argvars[0])) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::window::get_winnr(curtab, arg.as_deref()) };
+    rettv.value = TypvalValue::Number(i64::from(n));
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4584,6 +4601,7 @@ mod tests {
             "win_id2win",
             "win_id2tabwin",
             "win_findbuf",
+            "winnr",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -7294,6 +7312,48 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_list_len(l), 0);
             crate::eval::typval::tv_list_unref(l);
         }
+    }
+
+    #[test]
+    fn winnr_with_no_args_returns_the_current_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winnr(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn winnr_with_dollar_arg_returns_the_last_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut crate::buffer_defs::WinT;
+        let mut first = crate::buffer_defs::WinT { w_next: second_ptr, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut crate::buffer_defs::WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        let prev_curtab = globals.curtab;
+        let prev_curwin = globals.curwin;
+        let prev_lastwin = globals.lastwin;
+        globals.firstwin = first_ptr;
+        globals.curtab = tp_ptr;
+        globals.curwin = first_ptr;
+        globals.lastwin = second_ptr;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winnr(&[string(b"$")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_firstwin;
+        globals.curtab = prev_curtab;
+        globals.curwin = prev_curwin;
+        globals.lastwin = prev_lastwin;
     }
 
     // --- f_has ---

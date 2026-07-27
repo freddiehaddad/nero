@@ -26,16 +26,20 @@
 //! outer tabpage loop.
 //!
 //! Also translated: `win_has_winnr`/`win_get_tabwin`/`win_findbuf`
-//! (all real `window.c` functions), plus `win_id2win`/`win_getid`
-//! (originally `static` helpers in `eval/window.c`, hosted here
-//! alongside their own `window.c` dependencies rather than in
-//! `eval/funcs.rs` - same "helper logic lives near its own
+//! (all real `window.c` functions), plus `win_id2win`/`win_getid`/
+//! `get_winnr` (originally `static` helpers in `eval/window.c`,
+//! hosted here alongside their own `window.c` dependencies rather
+//! than in `eval/funcs.rs` - same "helper logic lives near its own
 //! dependencies, the builtin Vimscript-facing wrapper lives in
 //! `funcs.rs`" precedent as `state.rs`'s `get_mode`/`funcs.rs`'s
-//! `f_mode`). All 5 need the same window/tabpage-list walk already
+//! `f_mode`). All 6 need the same window/tabpage-list walk already
 //! established above, plus `WinT.w_config`'s already-translated
 //! `hide`/`focusable` fields for `win_has_winnr`'s own floating-
-//! window-aware numbering check.
+//! window-aware numbering check. `get_winnr`'s own digit+direction
+//! argument form (e.g. `winnr("3j")`) needs `win_vert_neighbor`/
+//! `win_horz_neighbor` (real window-layout geometry, not yet
+//! translated) and panics via `unimplemented!()` if actually reached -
+//! the common no-argument, `"$"`, and `"#"` cases are fully modeled.
 //!
 //! Also translated: `check_can_set_curbuf_disabled`/
 //! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
@@ -365,6 +369,101 @@ pub unsafe fn win_findbuf(bufnr: i32) -> Vec<crate::types_defs::HandleT> {
         tp = unsafe { &*tp }.tp_next;
     }
     found
+}
+
+/// Get the window number for `arg` in tab page `tp` (`get_winnr`,
+/// `eval/window.c`). `arg == None` means no argument was given (the
+/// common case - the CURRENT window's own number, `0` for a hidden/
+/// non-focusable window unless it IS the current window).
+///
+/// Only `arg == None`, `b"$"` (last window), and `b"#"` (previous
+/// window) are modeled - the digit+direction form (e.g. `b"3j"`)
+/// needs `win_vert_neighbor`/`win_horz_neighbor` (real window-layout
+/// geometry, not yet translated) and panics via `unimplemented!()` if
+/// actually reached; any other unrecognized `arg` returns `0`
+/// (matching the original's own `invalid_arg` path, whose real
+/// `semsg` display is omitted - message display, not tractable).
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live `TabpageT`, and
+/// its own window list (`tp_firstwin`/`w_next`, or
+/// `GLOBALS.firstwin`/`w_next` when `tp == GLOBALS.curtab`) must
+/// consist of valid, live pointers.
+#[must_use]
+pub unsafe fn get_winnr(tp: *const crate::buffer_defs::TabpageT, arg: Option<&[u8]>) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+    let mut twin = if is_curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_curwin
+    };
+
+    let mut nr = 1;
+    if let Some(arg) = arg {
+        if arg == b"$" {
+            twin = if is_curtab {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::globals::GLOBALS.get_mut() }.lastwin
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &*tp }.tp_lastwin
+            };
+        } else if arg == b"#" {
+            twin = if is_curtab {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::globals::GLOBALS.get_mut() }.prevwin
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &*tp }.tp_prevwin
+            };
+            if twin.is_null() {
+                nr = 0;
+            }
+        } else {
+            let (count, consumed) = crate::charset::getdigits_int(arg, false, 0);
+            let _count = if count <= 0 { 1 } else { count };
+            let dir = &arg[consumed..];
+            if dir == b"j" || dir == b"k" || dir == b"h" || dir == b"l" {
+                unimplemented!(
+                    "get_winnr: digit+direction form (e.g. \"3j\") needs \
+                     win_vert_neighbor/win_horz_neighbor, not yet translated"
+                );
+            }
+            nr = 0;
+        }
+    // SAFETY: forwarded from this function's own safety doc.
+    } else if !unsafe { win_has_winnr(twin, tp) } {
+        nr = 0;
+    }
+
+    if nr <= 0 {
+        return 0;
+    }
+
+    nr = 0;
+    let mut wp = if is_curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_firstwin
+    };
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        nr += i32::from(unsafe { win_has_winnr(wp, tp) });
+        if std::ptr::eq(wp, twin) {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    if wp.is_null() {
+        nr = 0;
+    }
+    nr
 }
 
 /// Return the width, in columns, of `wp`'s `'foldcolumn'`
@@ -1167,5 +1266,134 @@ mod tests {
         let _guard = CurwinListGuard::set(cur_win_ptr, cur_tp_ptr);
 
         assert_eq!(unsafe { win_findbuf(30) }, vec![7]);
+    }
+
+    // ---- get_winnr ----
+
+    /// Points `GLOBALS.firstwin`/`curtab`/`curwin`/`lastwin`/`prevwin`
+    /// at the given values for the guard's lifetime, restoring all
+    /// previous values on drop - a `get_winnr`-specific fixture since
+    /// (unlike every other function tested above) it needs `firstwin`
+    /// and `curwin` to legitimately be TWO DIFFERENT windows (to prove
+    /// the counting walk finds a non-head current window).
+    struct WinnrGlobalsGuard {
+        prev_firstwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_curwin: *mut WinT,
+        prev_lastwin: *mut WinT,
+        prev_prevwin: *mut WinT,
+    }
+
+    impl WinnrGlobalsGuard {
+        fn set(firstwin: *mut WinT, tp: *mut crate::buffer_defs::TabpageT, curwin: *mut WinT, lastwin: *mut WinT, prevwin: *mut WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = WinnrGlobalsGuard {
+                prev_firstwin: globals.firstwin,
+                prev_curtab: globals.curtab,
+                prev_curwin: globals.curwin,
+                prev_lastwin: globals.lastwin,
+                prev_prevwin: globals.prevwin,
+            };
+            globals.firstwin = firstwin;
+            globals.curtab = tp;
+            globals.curwin = curwin;
+            globals.lastwin = lastwin;
+            globals.prevwin = prevwin;
+            guard
+        }
+    }
+
+    impl Drop for WinnrGlobalsGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = self.prev_firstwin;
+            globals.curtab = self.prev_curtab;
+            globals.curwin = self.prev_curwin;
+            globals.lastwin = self.prev_lastwin;
+            globals.prevwin = self.prev_prevwin;
+        }
+    }
+
+    #[test]
+    fn get_winnr_no_arg_returns_the_current_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = focusable_win(3);
+        let third_ptr = &mut third as *mut WinT;
+        let mut second = WinT { w_next: third_ptr, ..focusable_win(2) };
+        let second_ptr = &mut second as *mut WinT;
+        let mut first = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(first_ptr, tp_ptr, second_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(unsafe { get_winnr(tp_ptr, None) }, 2);
+    }
+
+    #[test]
+    fn get_winnr_dollar_arg_returns_the_last_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = focusable_win(3);
+        let third_ptr = &mut third as *mut WinT;
+        let mut second = WinT { w_next: third_ptr, ..focusable_win(2) };
+        let mut first = WinT { w_next: &mut second as *mut WinT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(first_ptr, tp_ptr, first_ptr, third_ptr, std::ptr::null_mut());
+
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"$")) }, 3);
+    }
+
+    #[test]
+    fn get_winnr_hash_arg_returns_the_previous_window_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        let mut first = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first_ptr = &mut first as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(first_ptr, tp_ptr, first_ptr, std::ptr::null_mut(), second_ptr);
+
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"#")) }, 2);
+    }
+
+    #[test]
+    fn get_winnr_hash_arg_returns_0_when_no_previous_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"#")) }, 0);
+    }
+
+    #[test]
+    fn get_winnr_unrecognized_arg_returns_0() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"xyz")) }, 0);
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"3")) }, 0);
+    }
+
+    #[test]
+    fn get_winnr_digit_direction_form_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        let result = std::panic::catch_unwind(|| unsafe { get_winnr(tp_ptr, Some(b"3j")) });
+        assert!(result.is_err(), "expected a panic (win_vert_neighbor not yet translated)");
     }
 }
