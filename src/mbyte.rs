@@ -1486,6 +1486,26 @@ pub unsafe fn mb_string2cells(str: &[u8]) -> usize {
     clen
 }
 
+/// Count the number of characters in a NUL-terminated Vimscript
+/// string byte slice - composing marks are grouped with their base
+/// character into one unit, matching [`utfc_ptr2len`]'s own grouping
+/// (`mb_charlen`).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn mb_charlen(s: &[u8]) -> i32 {
+    let mut count = 0i32;
+    let mut p = 0usize;
+    while p < s.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { utfc_ptr2len(&s[p..]) }).unwrap_or(0).max(1);
+        p += adv;
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2140,5 +2160,32 @@ mod tests {
     fn mb_string2cells_empty_string_is_zero() {
         let _guard = option_vars_test_lock();
         assert_eq!(unsafe { mb_string2cells(b"") }, 0);
+    }
+
+    #[test]
+    fn mb_charlen_counts_ascii_bytes() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_charlen(b"hello") }, 5);
+    }
+
+    #[test]
+    fn mb_charlen_empty_is_zero() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_charlen(b"") }, 0);
+    }
+
+    #[test]
+    fn mb_charlen_groups_a_composing_mark_with_its_base() {
+        let _guard = option_vars_test_lock();
+        // "e" + COMBINING ACUTE ACCENT (U+0301) - one grouped character.
+        let mut s = b"e".to_vec();
+        s.extend_from_slice("\u{0301}".as_bytes());
+        assert_eq!(unsafe { mb_charlen(&s) }, 1);
+    }
+
+    #[test]
+    fn mb_charlen_counts_multibyte_characters() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_charlen("一二三".as_bytes()) }, 3);
     }
 }

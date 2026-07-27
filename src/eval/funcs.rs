@@ -430,6 +430,10 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_tabpagenr });
         m.insert(&b"tabpagewinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_tabpagewinnr });
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
+        m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
+        m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
+        m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
+        m.insert(&b"prevnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_prevnonblank });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -3939,6 +3943,117 @@ unsafe fn f_getreg(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `eval({string})` - evaluate `{string}` and return the result
+/// (`f_eval`, `eval.c`), via the already-existing
+/// [`crate::eval::eval::eval1`].
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::eval1`]'s own safety doc.
+unsafe fn f_eval(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let Some(s) = crate::eval::typval::tv_get_string_chk(&argvars[0]) else {
+        return;
+    };
+    let skip = crate::charset::skipwhite(&s);
+    let mut evalarg = crate::eval::eval::EvalargT {
+        eval_flags: crate::eval::eval::EVAL_EVALUATE,
+        ..Default::default()
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, consumed) = unsafe { crate::eval::eval::eval1(&s[skip..], rettv, Some(&mut evalarg)) };
+    if ret == crate::vim_defs::FAIL {
+        rettv.value = TypvalValue::Number(0);
+        return;
+    }
+    // A trailing non-whitespace remainder is a real error in the
+    // original (`e_trailing_arg`) - message display is skipped, per
+    // this crate's established policy, but the successfully-parsed
+    // `rettv` is still kept (matching the original's own control flow,
+    // which only *warns* about trailing garbage, not FAILs).
+    let _ = crate::charset::skipwhite(&s[skip + consumed..]);
+}
+
+/// `gettext({text})` - translate `{text}` if possible (`f_gettext`,
+/// `funcs.c`). This crate has no `.po`-file translation catalog
+/// loaded, so `_()` is always the identity function - `{text}` is
+/// returned unchanged, matching the correct, faithful behavior for
+/// any untranslated (e.g. default "C"/"en") locale.
+fn f_gettext(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let Some(s) = crate::eval::typval::tv_get_string_chk(&argvars[0]) else {
+        return;
+    };
+    if s.is_empty() {
+        return;
+    }
+    rettv.value = TypvalValue::String(Some(s));
+}
+
+/// `nextnonblank({lnum})` - the line number of the first line at or
+/// below `{lnum}` that is not blank, or `0` if there is none
+/// (`f_nextnonblank`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_get_lnum`]/
+/// [`crate::memline::ml_get`]'s own safety docs.
+unsafe fn f_nextnonblank(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    let line_count = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*g.curbuf }.b_ml.ml_line_count
+    };
+    loop {
+        if lnum < 0 || lnum > line_count {
+            lnum = 0;
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get(lnum) };
+        let skip = crate::charset::skipwhite(&line);
+        if line.get(skip).copied().unwrap_or(0) != 0 {
+            break;
+        }
+        lnum += 1;
+    }
+    rettv.value = TypvalValue::Number(i64::from(lnum));
+}
+
+/// `prevnonblank({lnum})` - the line number of the first line at or
+/// above `{lnum}` that is not blank, or `0` if there is none
+/// (`f_prevnonblank`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_get_lnum`]/
+/// [`crate::memline::ml_get`]'s own safety docs.
+unsafe fn f_prevnonblank(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    let line_count = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*g.curbuf }.b_ml.ml_line_count
+    };
+    if lnum < 1 || lnum > line_count {
+        lnum = 0;
+    } else {
+        loop {
+            if lnum < 1 {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let line = unsafe { crate::memline::ml_get(lnum) };
+            let skip = crate::charset::skipwhite(&line);
+            if line.get(skip).copied().unwrap_or(0) != 0 {
+                break;
+            }
+            lnum -= 1;
+        }
+    }
+    rettv.value = TypvalValue::Number(i64::from(lnum));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4743,6 +4858,10 @@ mod tests {
             "tabpagenr",
             "tabpagewinnr",
             "tabpagebuflist",
+            "eval",
+            "gettext",
+            "nextnonblank",
+            "prevnonblank",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -8401,5 +8520,189 @@ mod tests {
         // via a real test failure, not assumed).
         let mut rettv = TypvalT::default();
         unsafe { f_getreg(&[string(b"a"), num(0), num(1)], &mut rettv) };
+    }
+
+    // --- f_eval ---
+
+    #[test]
+    fn eval_evaluates_a_number_literal() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"42")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn eval_evaluates_an_arithmetic_expression() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"1 + 2 * 3")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn eval_skips_leading_whitespace() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"   9")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(9));
+    }
+
+    #[test]
+    fn eval_of_a_string_literal() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"\"hi\"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hi".to_vec())));
+    }
+
+    #[test]
+    fn eval_of_invalid_syntax_returns_zero() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"+")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn eval_with_trailing_garbage_still_returns_the_parsed_value() {
+        // Matches the original's own control flow: trailing garbage
+        // after a successfully-parsed expression only warns
+        // (`e_trailing_arg`), it does not FAIL the whole call.
+        let mut rettv = TypvalT::default();
+        unsafe { f_eval(&[string(b"5 extra")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    // --- f_gettext ---
+
+    #[test]
+    fn gettext_returns_text_unchanged() {
+        let mut rettv = TypvalT::default();
+        f_gettext(&[string(b"hello world")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello world".to_vec())));
+    }
+
+    #[test]
+    fn gettext_empty_string_leaves_rettv_untouched() {
+        let mut rettv = TypvalT::default();
+        f_gettext(&[string(b"")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::default());
+    }
+
+    // --- f_nextnonblank / f_prevnonblank ---
+
+    /// Build a real, `ml_open`ed buffer with exactly `lines.len()`
+    /// lines (byte content, no trailing NUL needed - it's added here),
+    /// for `f_nextnonblank`/`f_prevnonblank` tests that need to walk a
+    /// real memline via `ml_get`.
+    fn buf_with_lines(lines: &[&[u8]]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+        }
+        for (i, line) in lines.iter().enumerate() {
+            let mut owned = line.to_vec();
+            owned.push(0);
+            let lnum = (i + 1) as crate::pos_defs::LinenrT;
+            unsafe {
+                if i == 0 {
+                    assert_eq!(crate::memline::ml_replace_buf_len(&mut buf, 1, &owned), crate::vim_defs::OK);
+                } else {
+                    assert_eq!(
+                        crate::memline::ml_append_buf(&mut buf, lnum - 1, &owned, owned.len() as i32, false),
+                        crate::vim_defs::OK
+                    );
+                }
+            }
+        }
+        buf
+    }
+
+    fn close_test_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn nextnonblank_skips_leading_blank_lines() {
+        // line1="", line2="", line3="hello", line4="  ", line5="world"
+        // NOTE: buf_with_lines (ml_open/ml_append_buf) must run under
+        // the SAME lock CurbufGuard itself acquires - CurbufGuard is
+        // self-locking, so it is deliberately created FIRST (with a
+        // dummy null curbuf) and buffer construction happens inside
+        // its scope, avoiding the "self-locking guard + an extra
+        // explicit global_state_test_lock() deadlocks" mistake.
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"", b"", b"hello", b"  ", b"world"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_nextnonblank(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn nextnonblank_at_an_already_nonblank_line_returns_it() {
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"hello", b"world"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_nextnonblank(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn nextnonblank_no_nonblank_line_found_returns_zero() {
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"", b"  ", b""]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_nextnonblank(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn nextnonblank_out_of_range_lnum_returns_zero() {
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"hello"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_nextnonblank(&[num(99)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn prevnonblank_skips_blank_lines_backward() {
+        // line1="", line2="", line3="hello", line4="  ", line5="world"
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"", b"", b"hello", b"  ", b"world"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_prevnonblank(&[num(4)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn prevnonblank_no_nonblank_line_above_returns_zero() {
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"", b"", b"hello"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_prevnonblank(&[num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn prevnonblank_out_of_range_lnum_returns_zero() {
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        let mut buf = buf_with_lines(&[b"hello"]);
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut rettv = TypvalT::default();
+        unsafe { f_prevnonblank(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        close_test_buf(buf);
     }
 }

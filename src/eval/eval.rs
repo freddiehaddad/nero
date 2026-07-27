@@ -4006,6 +4006,186 @@ pub unsafe fn eval_interp_string(arg: &[u8], rettv: &mut TypvalT, evaluate: bool
     (OK, pos)
 }
 
+/// Convert a byte index within line `lnum` of `buf` to a character
+/// index - `-1` on failure (an unloaded buffer, matching the
+/// original) (`buf_byteidx_to_charidx`).
+///
+/// # Safety
+/// Forwarded from [`crate::memline::ml_get_buf`]'s own safety doc.
+#[must_use]
+pub unsafe fn buf_byteidx_to_charidx(
+    buf: &mut crate::buffer_defs::BufT,
+    lnum: crate::pos_defs::LinenrT,
+    byteidx: i32,
+) -> i32 {
+    if buf.b_ml.ml_mfp.is_null() {
+        return -1;
+    }
+    let lnum = lnum.min(buf.b_ml.ml_line_count);
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    if s.first().copied().unwrap_or(0) == 0 {
+        return 0;
+    }
+
+    let byteidx = usize::try_from(byteidx.max(0)).unwrap_or(0);
+    let mut t = 0usize;
+    let mut count = 0i32;
+    while s.get(t).copied().unwrap_or(0) != 0 && t <= byteidx {
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&s[t..]) }).unwrap_or(0).max(1);
+        t += adv;
+        count += 1;
+    }
+
+    // In insert mode, when the cursor is at the end of a non-empty
+    // line, byteidx points to the NUL character immediately past the
+    // end of the string. In this case, add one to the character count.
+    if s.get(t).copied().unwrap_or(0) == 0 && byteidx != 0 && t == byteidx {
+        count += 1;
+    }
+
+    count - 1
+}
+
+/// Convert `tv` into a file position for window `wp`
+/// (`var2fpos`).
+///
+/// Supports the `[lnum, col, coladd]` `List` form and the `.`
+/// (cursor)/`v` (Visual start)/`$` (last line or column, depending on
+/// `dollar_lnum`) special strings. The `'x` mark form needs
+/// `mark_get` (`mark.c`, not yet translated) and the `w0`/`w$`
+/// (first/last visible line) forms need `update_topline`/
+/// `validate_botline_win` (the redraw pipeline, not yet translated) -
+/// both `unimplemented!()` if actually reached (neither is reachable
+/// from any currently-translated caller).
+///
+/// # Safety
+/// `wp` must point to a valid, live `WinT` whose `w_buffer` is also
+/// valid and live. Forwarded from [`crate::memline::ml_get_buf`]'s own
+/// safety doc.
+#[must_use]
+pub unsafe fn var2fpos(
+    tv: &TypvalT,
+    dollar_lnum: bool,
+    charcol: bool,
+    wp: *mut crate::buffer_defs::WinT,
+) -> Option<crate::pos_defs::PosT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    // SAFETY: forwarded from this function's own safety doc.
+    let bp = unsafe { &mut *w.w_buffer };
+
+    if let TypvalValue::List(l) = &tv.value {
+        if l.is_null() {
+            return None;
+        }
+        let mut error = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let lnum = unsafe { crate::eval::typval::tv_list_find_nr(*l, 0, Some(&mut error)) };
+        if error || lnum <= 0 || lnum > i64::from(bp.b_ml.ml_line_count) {
+            return None;
+        }
+        let lnum = lnum as crate::pos_defs::LinenrT;
+
+        let mut error2 = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut col = unsafe { crate::eval::typval::tv_list_find_nr(*l, 1, Some(&mut error2)) };
+        if error2 {
+            return None;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(bp, lnum) };
+        let content = if line.last().copied() == Some(0) { &line[..line.len() - 1] } else { &line[..] };
+        let len = if charcol {
+            // SAFETY: forwarded from this function's own safety doc.
+            i64::from(unsafe { crate::mbyte::mb_charlen(content) })
+        } else {
+            content.len() as i64
+        };
+
+        // We accept "$" for the column number: last column.
+        // SAFETY: forwarded from this function's own safety doc.
+        let li = unsafe { crate::eval::typval::tv_list_find(*l, 1) };
+        if !li.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if let TypvalValue::String(Some(s)) = &unsafe { &*li }.li_tv.value {
+                if s == b"$" {
+                    col = len + 1;
+                }
+            }
+        }
+
+        // Accept a position up to the NUL after the line.
+        if col == 0 || col > len + 1 {
+            return None;
+        }
+        col -= 1;
+
+        // Get the virtual offset.  Defaults to zero.
+        let mut error3 = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let coladd = unsafe { crate::eval::typval::tv_list_find_nr(*l, 2, Some(&mut error3)) };
+        let coladd = if error3 { 0 } else { coladd as crate::pos_defs::ColnrT };
+
+        return Some(crate::pos_defs::PosT { lnum, col: col as crate::pos_defs::ColnrT, coladd });
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let name = crate::eval::typval::tv_get_string_chk(tv)?;
+
+    let mut pos = crate::pos_defs::PosT { lnum: 0, col: 0, coladd: 0 };
+    if name.first() == Some(&b'.') {
+        // cursor
+        pos = w.w_cursor;
+    } else if name.as_slice() == b"v" {
+        // Visual start
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        pos = if g.Visual.active && std::ptr::eq(wp, g.curwin) { g.Visual.start } else { w.w_cursor };
+    } else if name.first() == Some(&b'\'') {
+        unimplemented!(
+            "var2fpos: mark ({name:?}) needs mark_get (mark.c), not yet translated",
+        );
+    }
+
+    if pos.lnum != 0 {
+        if charcol {
+            // SAFETY: forwarded from this function's own safety doc.
+            pos.col = unsafe { buf_byteidx_to_charidx(bp, pos.lnum, pos.col) };
+        }
+        return Some(pos);
+    }
+
+    pos.coladd = 0;
+
+    if name.first() == Some(&b'w') && dollar_lnum {
+        unimplemented!(
+            "var2fpos: \"w0\"/\"w$\" need update_topline/validate_botline_win (the redraw \
+             pipeline), not yet translated"
+        );
+    } else if name.first() == Some(&b'$') {
+        // last column or line
+        if dollar_lnum {
+            pos.lnum = bp.b_ml.ml_line_count;
+            pos.col = 0;
+        } else {
+            pos.lnum = w.w_cursor.lnum;
+            // SAFETY: forwarded from this function's own safety doc.
+            let line = unsafe { crate::memline::ml_get_buf(bp, w.w_cursor.lnum) };
+            let content = if line.last().copied() == Some(0) { &line[..line.len() - 1] } else { &line[..] };
+            pos.col = if charcol {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::mbyte::mb_charlen(content) }
+            } else {
+                content.len() as crate::pos_defs::ColnrT
+            };
+        }
+        return Some(pos);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

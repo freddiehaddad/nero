@@ -386,6 +386,48 @@ pub fn tv_get_number(tv: &TypvalT) -> crate::eval::typval_defs::VarnumberT {
     tv_get_number_chk(tv, Some(&mut error))
 }
 
+/// Get the line number from a Vimscript object, using `GLOBALS.curwin`
+/// for any non-numeric position-string fallback (e.g. `"."`/`"v"`/
+/// `"$"`) (`tv_get_lnum`).
+///
+/// # Safety
+/// Touches `GLOBALS.curwin` (via [`crate::eval::eval::var2fpos`]) -
+/// `GLOBALS.curwin` must be a valid, live `WinT` pointer whose
+/// `w_buffer` is also valid and live.
+#[must_use]
+pub unsafe fn tv_get_lnum(tv: &TypvalT) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let did_emsg_before = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+    let mut lnum = tv_get_number_chk(tv, None) as crate::pos_defs::LinenrT;
+    // SAFETY: forwarded from this function's own safety doc.
+    let did_emsg_now = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+    if lnum <= 0 && did_emsg_before == did_emsg_now && !matches!(tv.value, TypvalValue::Number(_)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        if let Some(fp) = unsafe { crate::eval::eval::var2fpos(tv, true, false, curwin) } {
+            lnum = fp.lnum;
+        }
+    }
+    lnum
+}
+
+/// Get the line number from a Vimscript object - unlike
+/// [`tv_get_lnum`], only supports the `"$"` special string (resolved
+/// via `buf`, which may be `None`, in which case `"$"` yields `0`),
+/// no other position-string fallback (`tv_get_lnum_buf`).
+#[must_use]
+pub fn tv_get_lnum_buf(tv: &TypvalT, buf: Option<&crate::buffer_defs::BufT>) -> crate::pos_defs::LinenrT {
+    if let TypvalValue::String(Some(s)) = &tv.value {
+        if s.as_slice() == b"$" {
+            if let Some(b) = buf {
+                return b.b_ml.ml_line_count;
+            }
+        }
+    }
+    tv_get_number_chk(tv, None) as crate::pos_defs::LinenrT
+}
+
 /// Get the number value of a Vimscript object, interpreted as a
 /// boolean (`tv_get_bool`) - literally the same computation as
 /// [`tv_get_number_chk`] in the original (not a separate `bool`
