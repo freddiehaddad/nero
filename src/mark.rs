@@ -62,7 +62,11 @@
 //! tractable given `pos_to_mark`/`mark_get_visual`/`bt_prompt`/
 //! `fname2fnum` all exist - only `mark_get_local`'s own final `else`
 //! branch, `mark_get_motion`, remains `unimplemented!()`, needing
-//! `findpar`/`findsent`, `search.c`/`textobject.c`).
+//! `findpar`/`findsent`, `search.c`/`textobject.c`); `get_jumplist`
+//! (the real `` <C-O> ``/`` <C-I> `` jumplist-navigation entry point,
+//! distinct from `f_getjumplist`/`getjumplist()`, already translated
+//! in `eval/funcs.rs` - now tractable given `cleanup_jumplist`/
+//! `fname2fnum`/`buflist_findnr`/`setpcmark` all exist).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
@@ -91,14 +95,7 @@
 //!   precise reason than the stale note this replaces.
 //! - `ex_jumps`/`ex_changes`: need the real message-display pipeline
 //!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
-//!   tractable) - `cleanup_jumplist` (below) is no longer their
-//!   blocker.
-//! - `get_jumplist` (the `` <C-O> ``/`` <C-I> `` jumplist-navigation
-//!   entry point, distinct from `f_getjumplist`/`getjumplist()`,
-//!   already translated in `eval/funcs.rs`): now precisely scoped as
-//!   tractable given `cleanup_jumplist`/`fname2fnum`/`buflist_findnr`/
-//!   `setpcmark` all exist - not yet attempted, a reasonable next
-//!   target.
+//!   tractable) - `cleanup_jumplist` is no longer their blocker.
 
 use crate::buffer_defs::{BufT, TaggyT, WinT};
 use crate::ex_cmds_defs::cmod;
@@ -515,6 +512,102 @@ pub unsafe fn cleanup_jumplist(wp: &mut crate::buffer_defs::WinT, loadfiles: boo
             wp.w_jumplistidx -= 1;
         }
     }
+}
+
+/// Get the mark at `count` position in the |jumplist| relative to the
+/// current index (`get_jumplist`).
+///
+/// If the mark is in a different buffer, it is skipped unless that
+/// buffer exists. Runs [`cleanup_jumplist`] first (`loadfiles=true`),
+/// which deduplicates the jumplist and may itself adjust
+/// `win.w_jumplistidx` - matching the original's own documented
+/// behavior exactly.
+///
+/// The original's own [`setpcmark`] call (reached when
+/// `win.w_jumplistidx == win.w_jumplistlen`, i.e. right after a fresh
+/// jump with nothing pushed onto the jumplist yet) operates on the
+/// GLOBAL `curwin`, NOT this function's own `win` parameter - a
+/// genuine, faithful mismatch preserved exactly if the two ever
+/// diverge (this crate has no real caller yet to observe whether that
+/// happens in practice - `win` and `GLOBALS.curwin` are the SAME
+/// object for every real call site in the original).
+///
+/// Takes `win` as a raw pointer (matching the original's own plain
+/// `win_T *win` C parameter) rather than a Rust reference: every
+/// access below is a FRESH dereference, never a reference held across
+/// the `setpcmark()` call - `setpcmark` itself internally reborrows
+/// `GLOBALS.curwin`, which is the SAME underlying object as `win` at
+/// every real call site, and holding an outstanding `&mut WinT`
+/// across that call would be Tree-Borrows UB (the same class of bug
+/// caught and fixed in `setmark_pos`'s own `` ' ``/`` ` `` branch).
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT`. Forwarded
+/// from [`cleanup_jumplist`]/[`setpcmark`]/
+/// [`crate::buffer::buflist_findnr`]'s own safety docs.
+pub unsafe fn get_jumplist(win: *mut WinT, mut count: i32) -> *mut FmarkT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { cleanup_jumplist(&mut *win, true) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*win).w_jumplistlen } == 0 {
+        // nothing to jump to
+        return std::ptr::null_mut();
+    }
+
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (idx, len) = unsafe { ((*win).w_jumplistidx, (*win).w_jumplistlen) };
+        if idx + count < 0 || idx + count >= len {
+            return std::ptr::null_mut();
+        }
+
+        // if first CTRL-O or CTRL-I command after a jump, add cursor
+        // position to list. Careful: If there are duplicates (CTRL-O
+        // immediately after starting Vim on a file), another entry
+        // may have been removed.
+        if idx == len {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { setpcmark() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*win).w_jumplistidx -= 1 }; // skip the new entry
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*win).w_jumplistidx } + count < 0 {
+                return std::ptr::null_mut();
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*win).w_jumplistidx += count };
+        // SAFETY: forwarded from this function's own safety doc.
+        let cur_idx = unsafe { (*win).w_jumplistidx } as usize;
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let jmp_fnum = unsafe { (*win).w_jumplist[cur_idx].fmark.fnum };
+        if jmp_fnum == 0 {
+            // Resolve the fnum (buffer number) in the mark before
+            // returning it (ShaDa).
+            // SAFETY: forwarded from this function's own safety doc.
+            fname2fnum(unsafe { &mut (*win).w_jumplist[cur_idx] });
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let resolved_fnum = unsafe { (*win).w_jumplist[cur_idx].fmark.fnum };
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf_handle = unsafe { &*GLOBALS.get_mut().curbuf }.handle;
+        if resolved_fnum != curbuf_handle {
+            // Needs to switch buffer, if it can't find it skip the mark.
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::buffer::buflist_findnr(resolved_fnum) }.is_null() {
+                count += if count < 0 { -1 } else { 1 };
+                continue;
+            }
+        }
+        break;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur_idx = unsafe { (*win).w_jumplistidx } as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { std::ptr::addr_of_mut!((*win).w_jumplist[cur_idx].fmark) }
 }
 
 /// `":clearjumps"`: clear the jumplist (`ex_clearjumps`). Now tractable
@@ -1717,6 +1810,162 @@ mod tests {
 
         assert_eq!(win.w_jumplistlen, 1);
         assert_eq!(win.w_jumplist[0].fmark.mark.lnum, 10);
+    }
+
+    // --- get_jumplist ---
+
+    #[test]
+    fn get_jumplist_empty_returns_null() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let mark = unsafe { get_jumplist(&mut win as *mut WinT, -1) };
+        assert!(mark.is_null());
+    }
+
+    #[test]
+    fn get_jumplist_navigates_back_within_bounds() {
+        let mut buf = BufT { handle: 30, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 2,
+            w_jumplistidx: 1,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 30;
+        win.w_jumplist[1].fmark.mark = PosT { lnum: 9, col: 0, coladd: 0 };
+        win.w_jumplist[1].fmark.fnum = 30;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let mark = unsafe { get_jumplist(&mut win as *mut WinT, -1) };
+        assert!(!mark.is_null());
+        assert_eq!(unsafe { &*mark }.mark.lnum, 5);
+        assert_eq!(win.w_jumplistidx, 0);
+    }
+
+    #[test]
+    fn get_jumplist_out_of_bounds_count_returns_null() {
+        let mut buf = BufT { handle: 31, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 2,
+            w_jumplistidx: 0,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 1, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 31;
+        win.w_jumplist[1].fmark.mark = PosT { lnum: 2, col: 0, coladd: 0 };
+        win.w_jumplist[1].fmark.fnum = 31;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        // idx=0, count=-1 -> idx+count = -1 < 0 -> out of bounds.
+        let mark = unsafe { get_jumplist(&mut win as *mut WinT, -1) };
+        assert!(mark.is_null());
+    }
+
+    #[test]
+    fn get_jumplist_fresh_jump_pushes_via_setpcmark_and_navigates_back() {
+        let mut buf = BufT { handle: 20, ..Default::default() };
+        let mut win = WinT {
+            w_cursor: PosT { lnum: 50, col: 0, coladd: 0 },
+            w_jumplistlen: 1,
+            w_jumplistidx: 1, // idx == len: the "fresh jump" state
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 20;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        // From here, access `win` ONLY via GLOBALS.curwin's own
+        // already-stored pointer (never re-derive a second, separate
+        // reference from the local `win` variable directly) -
+        // get_jumplist itself calls setpcmark() internally, which
+        // reborrows through GLOBALS.curwin (the SAME object) - see
+        // get_jumplist's own doc comment for why this matters.
+        let win_ptr = unsafe { GLOBALS.get_mut() }.curwin;
+        let mark = unsafe { get_jumplist(win_ptr, -1) };
+
+        assert!(!mark.is_null());
+        // setpcmark() pushed a new entry for the cursor (lnum 50),
+        // making w_jumplistlen=2; idx starts at 2 (==len), gets
+        // decremented to 1 (skip the new entry), then count=-1 lands
+        // on idx=0 - the ORIGINAL entry (lnum 5), not the new one.
+        let w = unsafe { &*win_ptr };
+        assert_eq!(w.w_jumplistlen, 2);
+        assert_eq!(w.w_jumplistidx, 0);
+        assert_eq!(unsafe { &*mark }.mark.lnum, 5);
+    }
+
+    #[test]
+    fn get_jumplist_skip_retry_running_out_of_bounds_returns_null() {
+        // The retry mechanism (`count += count < 0 ? -1 : 1;`) re-
+        // checks bounds from the ALREADY-FAILED position with the
+        // more-extreme count, not from the original start - with only
+        // 2 entries, a single failed skip has nowhere left to retry
+        // to, so this correctly returns null rather than looping
+        // forever or reading out of bounds. Hand-traced against the
+        // real algorithm before trusting this expectation.
+        let mut buf = BufT { handle: 40, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 2,
+            w_jumplistidx: 1,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 1, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 999; // a buffer that no longer exists
+        win.w_jumplist[1].fmark.mark = PosT { lnum: 2, col: 0, coladd: 0 };
+        win.w_jumplist[1].fmark.fnum = 40;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        // buflist_findnr walks GLOBALS.lastbuf/b_prev - only `buf`
+        // (handle 40) is registered, so looking up 999 correctly fails.
+        let prev_lastbuf = unsafe { GLOBALS.get_mut() }.lastbuf;
+        unsafe { GLOBALS.get_mut() }.lastbuf = &mut buf as *mut BufT;
+
+        // idx=1, count=-1 -> lands on entry 0 (fnum=999, missing) ->
+        // retry with count=-2 from the now-updated idx=0 -> -2 < 0 ->
+        // null (no valid entry left to retry to).
+        let mark = unsafe { get_jumplist(&mut win as *mut WinT, -1) };
+
+        unsafe { GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        assert!(mark.is_null());
+    }
+
+    #[test]
+    fn get_jumplist_skips_past_a_missing_buffer_to_reach_a_valid_one() {
+        // The retry mechanism re-checks bounds using the ALREADY-
+        // FAILED position plus the more-extreme count - this means a
+        // single retry lands 2 positions past the failed one (not 1),
+        // skipping the position immediately before it entirely. Hand-
+        // traced against the real algorithm (not assumed) before
+        // trusting these exact indices: starting at idx=3, count=-1
+        // lands on index 2 (fails), then retries with idx=2, count=-2,
+        // landing on index 0 (succeeds) - index 1 is never examined.
+        let mut buf = BufT { handle: 50, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 4,
+            w_jumplistidx: 3,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 100, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 50; // valid - the eventual target
+        // win.w_jumplist[1] stays at its Default (fnum=0, lnum=0) -
+        // never examined by this trace, deliberately left untouched.
+        win.w_jumplist[2].fmark.mark = PosT { lnum: 200, col: 0, coladd: 0 };
+        win.w_jumplist[2].fmark.fnum = 888; // a missing buffer
+        // win.w_jumplist[3] also stays at Default - only used for the
+        // idx==len/bounds bookkeeping, its own contents are never read.
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let prev_lastbuf = unsafe { GLOBALS.get_mut() }.lastbuf;
+        unsafe { GLOBALS.get_mut() }.lastbuf = &mut buf as *mut BufT;
+
+        let mark = unsafe { get_jumplist(&mut win as *mut WinT, -1) };
+
+        unsafe { GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        assert!(!mark.is_null());
+        assert_eq!(unsafe { &*mark }.mark.lnum, 100);
+        assert_eq!(win.w_jumplistidx, 0);
     }
 
     #[test]
