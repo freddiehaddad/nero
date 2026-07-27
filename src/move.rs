@@ -55,6 +55,18 @@
 //! original, since Rust's module system needs that for their
 //! cross-module callers.
 //!
+//! Also translated: **`textpos2screenpos`** - computes the screen
+//! position of a text character, needing only already-real
+//! `fold.c`'s `has_folding`, `plines.c`'s `plines_m_win`/
+//! `win_get_fill`/`getvcol`, and this file's own
+//! `adjust_plines_for_skipcol`/`win_col_off`/`win_col_off2`. Unlike
+//! `vcol2col`/`virtcol2col`, kept `pub` for the SAME reason the
+//! original itself is non-`static`: real callers exist in both
+//! `move.c` (`f_screenpos`) and `window.c`/`winfloat.c` (neither of
+//! the latter two translated yet, but the original's own visibility
+//! choice is preserved regardless of whether every real caller
+//! exists yet). Its `f_screenpos` wrapper lives in `eval/funcs.rs`.
+//!
 //! Also translated: **`sms_marker_overlap`/`skipcol_from_plines`/
 //! `reset_skipcol`/`use_scrolloffpad`/`scrolloffpad_eof_pressure`** -
 //! five small, self-contained functions sitting near the top of
@@ -707,6 +719,124 @@ pub unsafe fn virtcol2col(wp: *mut WinT, lnum: crate::pos_defs::LinenrT, vcol: i
         p -= 1 + unsafe { crate::mbyte::utf_head_off(&line, p - 1) } as usize;
     }
     (p + 1) as i32
+}
+
+/// Compute the screen position of the text character at `pos` in
+/// window `wp`. The resulting values are one-based, zero when the
+/// character is not visible (`textpos2screenpos`).
+///
+/// Kept `pub` (not a plain top-level function with external linkage
+/// only within this file, unlike `virtcol2col`/`vcol2col` - the
+/// original itself is already non-`static`, called from both
+/// `move.c`'s own `f_screenpos` and `window.c`/`winfloat.c`, neither
+/// of the latter two translated yet).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn textpos2screenpos(
+    wp: *mut WinT,
+    pos: &mut crate::pos_defs::PosT,
+    rowp: &mut i32,
+    scolp: &mut crate::pos_defs::ColnrT,
+    ccolp: &mut crate::pos_defs::ColnrT,
+    ecolp: &mut crate::pos_defs::ColnrT,
+    local: bool,
+) {
+    let mut scol: crate::pos_defs::ColnrT = 0;
+    let mut ccol: crate::pos_defs::ColnrT = 0;
+    let mut ecol: crate::pos_defs::ColnrT = 0;
+    let mut coloff: crate::pos_defs::ColnrT = 0;
+    let mut visible_row = false;
+    let mut is_folded = false;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let mut lnum = pos.lnum;
+    // `row` is unconditionally assigned by exactly one of these three
+    // branches (matching the original's own `int row = 0;` followed
+    // by an if/else-if/else covering every case) - written as an
+    // if-expression instead of a dead `= 0` initializer plus 3 later
+    // assignments, avoiding a real `unused_assignments` warning while
+    // keeping identical behavior.
+    let mut row: i32 = if lnum >= w.w_topline && lnum <= w.w_botline {
+        // SAFETY: forwarded from this function's own safety doc.
+        is_folded = unsafe { crate::fold::has_folding(w, lnum, Some(&mut lnum), None) };
+        // "row" should be the screen line where line "lnum" begins,
+        // which can be negative if "lnum" is "w_topline" and
+        // "w_skipcol" is non-zero.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut row = unsafe { crate::plines::plines_m_win(wp, w.w_topline, lnum - 1, i32::MAX) };
+        // SAFETY: forwarded from this function's own safety doc.
+        row -= unsafe { adjust_plines_for_skipcol(w) };
+        // Add filler lines above this buffer line.
+        row += if lnum == w.w_topline {
+            w.w_topfill
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::plines::win_get_fill(w, lnum) }
+        };
+        visible_row = true;
+        row
+    } else if !local || lnum < w.w_topline {
+        0
+    } else {
+        w.w_view_height - 1
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let existing_row = lnum > 0 && lnum <= unsafe { &*w.w_buffer }.b_ml.ml_line_count;
+
+    if (local || visible_row) && existing_row {
+        // SAFETY: forwarded from this function's own safety doc.
+        let off = unsafe { win_col_off(w) };
+        if is_folded {
+            row += (if local { 0 } else { w.w_winrow + w.w_winrow_off }) + 1;
+            coloff = (if local { 0 } else { w.w_wincol + w.w_wincol_off }) + 1 + off;
+        } else {
+            debug_assert_eq!(lnum, pos.lnum);
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::plines::getvcol(wp, pos, Some(&mut scol), Some(&mut ccol), Some(&mut ecol), 0);
+            }
+
+            // similar to what is done in validate_cursor_col()
+            let mut col = scol;
+            col += off;
+            // SAFETY: forwarded from this function's own safety doc.
+            let width = w.w_view_width - off + unsafe { win_col_off2(w) };
+
+            // long line wrapping, adjust row
+            if w.w_onebuf_opt.wo_wrap != 0 && col >= w.w_view_width && width > 0 {
+                // use same formula as what is used in curs_columns()
+                let rowoff = if visible_row { (col - w.w_view_width) / width + 1 } else { 0 };
+                col -= rowoff * width;
+                row += rowoff;
+            }
+
+            col -= w.w_leftcol;
+
+            if col >= 0 && col < w.w_view_width && row >= 0 && row < w.w_view_height {
+                coloff = col - scol + (if local { 0 } else { w.w_wincol + w.w_wincol_off }) + 1;
+                row += (if local { 0 } else { w.w_winrow + w.w_winrow_off }) + 1;
+            } else {
+                // character is left, right or below of the window
+                scol = 0;
+                ccol = 0;
+                ecol = 0;
+                if local {
+                    coloff = if col < 0 { -1 } else { w.w_view_width + 1 };
+                } else {
+                    row = 0;
+                }
+            }
+        }
+    }
+    *rowp = row;
+    *scolp = scol + coloff;
+    *ccolp = ccol + coloff;
+    *ecolp = ecol + coloff;
 }
 
 #[cfg(test)]
@@ -1668,6 +1798,110 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
 
         assert_eq!(unsafe { virtcol2col(&mut win as *mut WinT, 1, 1) }, 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    // --- textpos2screenpos ---
+
+    #[test]
+    fn textpos2screenpos_top_left_character_reports_row_one_col_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        buf.b_ml.ml_line_count = 1;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_botline = 5;
+        win.w_view_width = 80;
+        win.w_view_height = 24;
+
+        let mut pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let mut row = -99;
+        let mut scol = -99;
+        let mut ccol = -99;
+        let mut ecol = -99;
+        unsafe {
+            textpos2screenpos(&mut win as *mut WinT, &mut pos, &mut row, &mut scol, &mut ccol, &mut ecol, false);
+        }
+
+        // Top-left character of the window with zero winrow/wincol/
+        // number-column offsets: every reported value is 1 (the
+        // 1-based screen coordinate of the window's own top-left
+        // corner).
+        assert_eq!((row, scol, ccol, ecol), (1, 1, 1, 1));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn textpos2screenpos_line_outside_visible_range_not_local_reports_all_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3; // lnum 10 below doesn't exist either
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_botline = 5;
+        win.w_view_width = 80;
+        win.w_view_height = 24;
+
+        let mut pos = crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 };
+        let mut row = -99;
+        let mut scol = -99;
+        let mut ccol = -99;
+        let mut ecol = -99;
+        unsafe {
+            textpos2screenpos(&mut win as *mut WinT, &mut pos, &mut row, &mut scol, &mut ccol, &mut ecol, false);
+        }
+
+        // lnum 10 is beyond w_botline(5) AND beyond the buffer's own
+        // line count(3) - neither "visible_row" nor "existing_row"
+        // hold, so the whole coloff-computing block is skipped
+        // entirely; row stays at the initial if/else-if/else's own
+        // "not local, not visible" result (0), and scol/ccol/ecol
+        // never get touched past their own zero initializers.
+        assert_eq!((row, scol, ccol, ecol), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn textpos2screenpos_column_beyond_window_width_not_local_reports_row_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello world\0") },
+            crate::vim_defs::OK
+        );
+        buf.b_ml.ml_line_count = 1;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_botline = 5;
+        win.w_view_width = 5; // narrower than the resolved column (8)
+        win.w_view_height = 24;
+        win.w_onebuf_opt.wo_wrap = 0;
+
+        // Column 8 (0-based) = the 'r' in "world" - well past the
+        // 5-column-wide window.
+        let mut pos = crate::pos_defs::PosT { lnum: 1, col: 8, coladd: 0 };
+        let mut row = -99;
+        let mut scol = -99;
+        let mut ccol = -99;
+        let mut ecol = -99;
+        unsafe {
+            textpos2screenpos(&mut win as *mut WinT, &mut pos, &mut row, &mut scol, &mut ccol, &mut ecol, false);
+        }
+
+        assert_eq!((row, scol, ccol, ecol), (0, 0, 0, 0));
 
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);

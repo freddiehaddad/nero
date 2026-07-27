@@ -448,6 +448,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
+        m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
@@ -4523,6 +4524,54 @@ unsafe fn f_win_screenpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_list_append_number(l, col) };
 }
 
+/// `screenpos({winid}, {lnum}, {col})` - the screen position of text
+/// character `{col}` at buffer line `{lnum}` in window `{winid}`, as
+/// a `Dict` with `row`/`col`/`curscol`/`endcol` entries (`f_screenpos`,
+/// `move.c`), via [`crate::r#move::textpos2screenpos`].
+///
+/// The original's own `semsg` for an out-of-range `{lnum}` is omitted
+/// (message display, not tractable) - the early return (leaving
+/// `rettv` as the already-allocated, still-empty `Dict`) is kept.
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]/
+/// [`crate::r#move::textpos2screenpos`]'s own safety docs.
+unsafe fn f_screenpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    if wp.is_null() {
+        return;
+    }
+
+    let mut pos = crate::pos_defs::PosT {
+        lnum: crate::eval::typval::tv_get_number(&argvars[1]) as crate::pos_defs::LinenrT,
+        col: crate::eval::typval::tv_get_number(&argvars[2]) as crate::pos_defs::ColnrT - 1,
+        coladd: 0,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if pos.lnum > unsafe { &*(*wp).w_buffer }.b_ml.ml_line_count {
+        return;
+    }
+    pos.col = pos.col.max(0);
+    let mut row = 0;
+    let mut scol = 0;
+    let mut ccol = 0;
+    let mut ecol = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::textpos2screenpos(wp, &mut pos, &mut row, &mut scol, &mut ccol, &mut ecol, false) };
+
+    // SAFETY: `d` is a live, uniquely-owned allocation from
+    // tv_dict_alloc_ret above, not yet shared beyond `rettv`.
+    let dict = unsafe { &mut *d };
+    crate::eval::typval::tv_dict_add_nr(dict, b"row", i64::from(row));
+    crate::eval::typval::tv_dict_add_nr(dict, b"col", i64::from(scol));
+    crate::eval::typval::tv_dict_add_nr(dict, b"curscol", i64::from(ccol));
+    crate::eval::typval::tv_dict_add_nr(dict, b"endcol", i64::from(ecol));
+}
+
 /// `win_gettype([{nr}])` - the type of window `{nr}` (default the
 /// current window): `""` (normal), `"autocmd"`, `"preview"`,
 /// `"popup"`, `"command"`, `"loclist"`, or `"quickfix"`
@@ -5947,6 +5996,7 @@ mod tests {
             "winheight",
             "winwidth",
             "win_screenpos",
+            "screenpos",
             "win_gettype",
             "winlayout",
             "winrestcmd",
@@ -10451,6 +10501,83 @@ mod tests {
             assert_eq!((*item1).li_tv.value, TypvalValue::Number(0));
             crate::eval::typval::tv_list_unref(l);
         }
+    }
+
+    // --- f_screenpos ---
+
+    #[test]
+    fn screenpos_returns_a_dict_with_the_expected_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_topline: 1,
+            w_botline: 5,
+            w_view_width: 80,
+            w_view_height: 24,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        // Top-left character (line 1, column 1) of a window with zero
+        // winrow/wincol offsets - matches move.rs's own
+        // textpos2screenpos_top_left_character_reports_row_one_col_one
+        // trace exactly.
+        unsafe { f_screenpos(&[num(0), num(1), num(1)], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            let row_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"row").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*row_item).di_tv), 1);
+            let col_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"col").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*col_item).di_tv), 1);
+            let curscol_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"curscol").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*curscol_item).di_tv), 1);
+            let endcol_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"endcol").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*endcol_item).di_tv), 1);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn screenpos_unknown_winid_returns_an_empty_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_screenpos(&[num(9999), num(1), num(1)], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert!(crate::eval::typval::tv_dict_find(Some(&mut *d), b"row").is_none());
+            crate::eval::typval::tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn screenpos_invalid_lnum_returns_an_empty_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_screenpos(&[num(0), num(999), num(1)], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert!(crate::eval::typval::tv_dict_find(Some(&mut *d), b"row").is_none());
+            crate::eval::typval::tv_dict_unref(d);
+        }
+
+        close_test_buf(buf);
     }
 
     // --- f_win_gettype ---

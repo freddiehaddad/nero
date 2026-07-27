@@ -1519,6 +1519,21 @@ pub unsafe fn tv_dict_set_ret(tv: &mut TypvalT, d: *mut DictT) {
     }
 }
 
+/// Allocate an empty dict and put it in `ret_tv`, incrementing its
+/// reference count (`tv_dict_alloc_ret`) - the dict counterpart of
+/// [`tv_list_alloc_ret`].
+///
+/// # Safety
+/// None beyond [`tv_dict_alloc`]'s own (always-safe) contract - this
+/// function only ever writes into `ret_tv`, a plain `&mut TypvalT`.
+pub unsafe fn tv_dict_alloc_ret(ret_tv: &mut TypvalT) -> *mut DictT {
+    let d = tv_dict_alloc();
+    // SAFETY: `d` was just allocated above, a fresh pointer not shared
+    // anywhere else yet.
+    unsafe { tv_dict_set_ret(ret_tv, d) };
+    d
+}
+
 /// Set all existing keys in `dict` as read-only. Does not protect
 /// against adding new keys to the dictionary
 /// (`tv_dict_set_keys_readonly`).
