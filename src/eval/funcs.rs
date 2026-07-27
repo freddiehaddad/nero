@@ -409,6 +409,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
+        m.insert(&b"getjumplist"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_getjumplist });
         m.insert(&b"getmarklist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getmarklist });
         m.insert(&b"getchangelist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getchangelist });
         m.insert(&b"mode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_mode });
@@ -4705,6 +4706,82 @@ fn f_getcharsearch(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
 }
 
+/// `getjumplist([{winnr} [, {tabnr}]])` - a 2-element `List` of
+/// `[entries, index]` for the given window's jumplist: `entries` is a
+/// `List` of `{lnum, col, coladd, bufnr[, filename]}` dicts and
+/// `index` is the current position within it (`f_getjumplist`,
+/// `funcs.c`), via the already-existing
+/// [`crate::window::find_tabwin`] and the newly-real
+/// [`crate::mark::cleanup_jumplist`] (deduplicating the jumplist
+/// exactly as the original does before reporting it).
+///
+/// The `filename` entry (present only when `fname` is set, which the
+/// original's own `xfmark_T` field doc reserves for `fnum == 0` -
+/// i.e. a mark resolved from ShaDa whose buffer isn't known yet) is
+/// translated faithfully but is currently DEAD CODE, not just narrow:
+/// `cleanup_jumplist`'s own `loadfiles=true` call here (matching the
+/// original exactly) unconditionally panics via `unimplemented!()` for
+/// any entry with `fnum == 0` and a nonzero `lnum` (needing
+/// `fname2fnum`, not yet translated) - and an entry with `lnum == 0`
+/// is skipped from the dict list below regardless. So there is no
+/// `fnum == 0` entry that could ever reach the `filename` line without
+/// first panicking in `cleanup_jumplist` - this becomes live the
+/// moment `fname2fnum`/`buflist_new()` exist.
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_tabwin`]/
+/// [`crate::mark::cleanup_jumplist`]'s own safety docs.
+unsafe fn f_getjumplist(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let outer = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize)
+    };
+
+    let unknown = TypvalT::default();
+    let wvp = argvars.first().unwrap_or(&unknown);
+    let tvp = argvars.get(1).unwrap_or(&unknown);
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_tabwin(wvp, tvp) };
+    if wp.is_null() {
+        return;
+    }
+    // SAFETY: `wp` is non-null (just checked) and forwarded from this
+    // function's own safety doc.
+    let win = unsafe { &mut *wp };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::cleanup_jumplist(win, true) };
+
+    let entries = crate::eval::typval::tv_list_alloc(i64::from(win.w_jumplistlen) as isize);
+    // SAFETY: `outer`/`entries` are both valid, freshly-obtained live
+    // pointers (forwarded from this function's own safety doc for
+    // `outer`; `tv_list_alloc` never returns null).
+    unsafe { crate::eval::typval::tv_list_append_list(outer, entries) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(outer, i64::from(win.w_jumplistidx)) };
+
+    for entry in &win.w_jumplist[..win.w_jumplistlen as usize] {
+        if entry.fmark.mark.lnum == 0 {
+            continue;
+        }
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `entries` is a live, uniquely-owned allocation; `d`
+        // was just allocated above.
+        unsafe { crate::eval::typval::tv_list_append_dict(entries, d) };
+        // SAFETY: `d` was just returned by `tv_dict_alloc` above, not
+        // yet shared beyond `entries` (which only holds a refcounted
+        // reference).
+        let dict = unsafe { &mut *d };
+        crate::eval::typval::tv_dict_add_nr(dict, b"lnum", i64::from(entry.fmark.mark.lnum));
+        crate::eval::typval::tv_dict_add_nr(dict, b"col", i64::from(entry.fmark.mark.col));
+        crate::eval::typval::tv_dict_add_nr(dict, b"coladd", i64::from(entry.fmark.mark.coladd));
+        crate::eval::typval::tv_dict_add_nr(dict, b"bufnr", i64::from(entry.fmark.fnum));
+        if let Some(fname) = &entry.fname {
+            crate::eval::typval::tv_dict_add_str(dict, b"filename", Some(fname));
+        }
+    }
+}
+
 /// `getmarklist([{buf}])` - a `List` of marks: global marks (`'A'`-
 /// `'Z'`/`'0'`-`'9'`) when `{buf}` is omitted, or buffer-local marks
 /// for `{buf}` otherwise (`f_getmarklist`, `funcs.c`), via the
@@ -7073,6 +7150,7 @@ mod tests {
             "did_filetype",
             "garbagecollect",
             "getcharsearch",
+            "getjumplist",
             "getmarklist",
             "getchangelist",
             "mode",
@@ -11970,6 +12048,136 @@ mod tests {
         let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
         unsafe {
             assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    // --- f_getjumplist ---
+
+    #[test]
+    fn getjumplist_no_args_uses_curwin_and_returns_entries_plus_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 3, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        win.w_jumplistlen = 2;
+        win.w_jumplistidx = 2;
+        win.w_jumplist[0].fmark.mark = crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 3;
+        win.w_jumplist[1].fmark.mark = crate::pos_defs::PosT { lnum: 9, col: 0, coladd: 1 };
+        win.w_jumplist[1].fmark.fnum = 3;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        // cleanup_jumplist's trailing "phantom jump" check reads
+        // GLOBALS.curbuf directly - WinGlobalsGuard doesn't manage
+        // curbuf, so it's set manually here, derived from
+        // GLOBALS.curwin's own already-stored w_buffer value (never
+        // independently re-derived from `buf` directly, avoiding the
+        // Tree Borrows double-reborrow hazard).
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getjumplist(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let entries_item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::List(entries) = (*entries_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(entries), 2);
+            let first = crate::eval::typval::tv_list_find(entries, 0);
+            let TypvalValue::Dict(d) = (*first).li_tv.value else { panic!("expected a Dict") };
+            let lnum_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"lnum").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*lnum_item).di_tv), 5);
+            let bufnr_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"bufnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*bufnr_item).di_tv), 3);
+
+            let index_item = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!(crate::eval::typval::tv_get_number(&(*index_item).li_tv), 2);
+
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getjumplist_skips_entries_with_zero_lnum() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 4, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        win.w_jumplistlen = 2;
+        // Entry 0 stays at its Default (lnum == 0) - skipped from the
+        // dict list, but still counted for w_jumplistlen's own bounds.
+        win.w_jumplist[1].fmark.mark = crate::pos_defs::PosT { lnum: 12, col: 0, coladd: 0 };
+        win.w_jumplist[1].fmark.fnum = 4;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getjumplist(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let entries_item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::List(entries) = (*entries_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(entries), 1);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getjumplist_unknown_window_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getjumplist(&[num(999)], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getjumplist_deduplicates_adjacent_entries_via_cleanup_jumplist() {
+        // Confirms cleanup_jumplist is genuinely invoked (not just
+        // passed through) - 2 adjacent duplicate entries collapse
+        // into 1 in the returned dict list.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 7, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        win.w_jumplistlen = 2;
+        win.w_jumplist[0].fmark.mark = crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 };
+        win.w_jumplist[0].fmark.fnum = 7;
+        win.w_jumplist[1].fmark.mark = crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 };
+        win.w_jumplist[1].fmark.fnum = 7;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getjumplist(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let entries_item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::List(entries) = (*entries_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(entries), 1);
             crate::eval::typval::tv_list_unref(l);
         }
     }

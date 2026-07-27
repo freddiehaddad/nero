@@ -40,7 +40,13 @@
 //! separate blockers); `setmark_pos` (partial - only the `` ' ``/
 //! `` ` `` "previous context mark" branch, since every other mark
 //! needs `buflist_findnr` unconditionally, see the Deferred list
-//! below).
+//! below); `cleanup_jumplist` (re-investigated and found genuinely
+//! tractable - a previous session's own deferral note claiming it
+//! needed `win_valid`/buffer-list validity checks was simply wrong,
+//! not reflecting the real function's actual body - only its own
+//! `fname2fnum` call, reached only for a ShaDa-restoration-shaped
+//! entry no currently-translated code path can construct, remains
+//! `unimplemented!()`).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `setmark`/`mark_set_global`/`mark_set_local`: need
@@ -76,8 +82,8 @@
 //!   isn't enough to unblock this one as a whole.
 //! - `ex_jumps`/`ex_changes`: need the real message-display pipeline
 //!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
-//!   tractable) and (`ex_jumps` specifically) `cleanup_jumplist`.
-//! - `cleanup_jumplist`: needs `win_valid`/buffer-list validity checks.
+//!   tractable) - `cleanup_jumplist` (below) is no longer their
+//!   blocker.
 
 use crate::buffer_defs::{BufT, TaggyT, WinT};
 use crate::ex_cmds_defs::cmod;
@@ -383,6 +389,102 @@ pub fn free_jumplist(wp: &mut crate::buffer_defs::WinT) {
         free_xfmark(std::mem::take(&mut wp.w_jumplist[i]));
     }
     wp.w_jumplistlen = 0;
+}
+
+/// Remove duplicate entries from `wp`'s jumplist, keeping
+/// `w_jumplistidx` pointing at the same logical entry it did before
+/// (`cleanup_jumplist`).
+///
+/// The original's own `if (fmark.fnum == 0 && mark.lnum != 0)
+/// fname2fnum(fm);` branch (reached only when `loadfiles` is set - the
+/// real ShaDa-restoration case, resolving a mark whose buffer wasn't
+/// known yet) is translated as the real condition check, panicking
+/// via `unimplemented!()` only if it is genuinely reached: nothing in
+/// this crate can currently construct a jumplist entry with
+/// `fmark.fnum == 0` (a real buffer handle is always nonzero) AND a
+/// nonzero `mark.lnum` at the same time - [`setpcmark`]'s own
+/// construction always sets `fnum` to the current buffer's own real
+/// handle - so this branch is provably unreachable via any currently-
+/// translated code path, matching this crate's own established
+/// "translate the real check, don't hardcode a shortcut" policy.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (needed for the trailing "remove a phantom jump at
+/// the current line" check, which reads the GLOBAL `curbuf`, not
+/// `wp`'s own buffer - matching the original's own exact
+/// `curbuf->b_fnum` reference).
+pub unsafe fn cleanup_jumplist(wp: &mut crate::buffer_defs::WinT, loadfiles: bool) {
+    if loadfiles {
+        for i in 0..(wp.w_jumplistlen as usize) {
+            if wp.w_jumplist[i].fmark.fnum == 0 && wp.w_jumplist[i].fmark.mark.lnum != 0 {
+                unimplemented!(
+                    "cleanup_jumplist: fname2fnum needs buflist_new(), not yet translated \
+                     (provably unreachable via any currently-translated code path - \
+                     setpcmark always sets a nonzero fmark.fnum)"
+                );
+            }
+        }
+    }
+
+    let mut to = 0usize;
+    let mut from = 0usize;
+    while from < wp.w_jumplistlen as usize {
+        if wp.w_jumplistidx as usize == from {
+            wp.w_jumplistidx = to as i32;
+        }
+        let mut i = from + 1;
+        while i < wp.w_jumplistlen as usize {
+            if wp.w_jumplist[i].fmark.fnum == wp.w_jumplist[from].fmark.fnum
+                && wp.w_jumplist[from].fmark.fnum != 0
+                && wp.w_jumplist[i].fmark.mark.lnum == wp.w_jumplist[from].fmark.mark.lnum
+            {
+                break;
+            }
+            i += 1;
+        }
+
+        let must_free = if i >= wp.w_jumplistlen as usize {
+            false // not a duplicate
+        } else if i > from + 1 {
+            // jumpoptions=stack: remove duplicates only when adjacent.
+            unsafe { OPTION_VARS.get_mut() }.jop_flags & opt_jop_flag::STACK == 0
+        } else {
+            true // adjacent duplicate
+        };
+
+        if must_free {
+            // xfree(wp->w_jumplist[from].fname) - drop just the file
+            // name field, matching the original's exact scope (not
+            // the whole entry - though nothing else in it is ever
+            // read again either way, since it's left beyond the new
+            // logical w_jumplistlen bound below).
+            let _ = std::mem::take(&mut wp.w_jumplist[from].fname);
+        } else {
+            if to != from {
+                let moved = std::mem::take(&mut wp.w_jumplist[from]);
+                wp.w_jumplist[to] = moved;
+            }
+            to += 1;
+        }
+        from += 1;
+    }
+    if wp.w_jumplistidx as usize == wp.w_jumplistlen as usize {
+        wp.w_jumplistidx = to as i32;
+    }
+    wp.w_jumplistlen = to as i32;
+
+    // When pointer is below last jump, remove the jump if it matches the
+    // current line. This avoids useless/phantom jumps. #9805
+    if loadfiles && wp.w_jumplistlen != 0 && wp.w_jumplistidx == wp.w_jumplistlen {
+        let last = &wp.w_jumplist[(wp.w_jumplistlen - 1) as usize];
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf_handle = unsafe { &*GLOBALS.get_mut().curbuf }.handle;
+        if last.fmark.fnum == curbuf_handle && last.fmark.mark.lnum == wp.w_cursor.lnum {
+            wp.w_jumplistlen -= 1;
+            wp.w_jumplistidx -= 1;
+        }
+    }
 }
 
 /// `":clearjumps"`: clear the jumplist (`ex_clearjumps`). Now tractable
@@ -1113,6 +1215,177 @@ mod tests {
         };
         free_jumplist(&mut wp);
         assert_eq!(wp.w_jumplistlen, 0);
+    }
+
+    #[test]
+    fn cleanup_jumplist_no_duplicates_leaves_everything_unchanged() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 1,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[0].fmark.mark.lnum = 10;
+        win.w_jumplist[1].fmark.fnum = 2;
+        win.w_jumplist[1].fmark.mark.lnum = 20;
+        win.w_jumplist[2].fmark.fnum = 3;
+        win.w_jumplist[2].fmark.mark.lnum = 30;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { cleanup_jumplist(&mut win, false) };
+
+        assert_eq!(win.w_jumplistlen, 3);
+        assert_eq!(win.w_jumplistidx, 1);
+        assert_eq!(win.w_jumplist[0].fmark.fnum, 1);
+        assert_eq!(win.w_jumplist[1].fmark.fnum, 2);
+        assert_eq!(win.w_jumplist[2].fmark.fnum, 3);
+    }
+
+    #[test]
+    fn cleanup_jumplist_removes_an_adjacent_duplicate() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 3,
+            ..Default::default()
+        };
+        // Entries 0 and 1 are adjacent duplicates (same fnum+lnum);
+        // entry 2 is distinct.
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[0].fmark.mark.lnum = 10;
+        win.w_jumplist[1].fmark.fnum = 1;
+        win.w_jumplist[1].fmark.mark.lnum = 10;
+        win.w_jumplist[2].fmark.fnum = 2;
+        win.w_jumplist[2].fmark.mark.lnum = 20;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { cleanup_jumplist(&mut win, false) };
+
+        // The earlier (index-0) duplicate is freed; entry 1 shifts
+        // down to index 0.
+        assert_eq!(win.w_jumplistlen, 2);
+        assert_eq!(win.w_jumplistidx, 2);
+        assert_eq!(win.w_jumplist[0].fmark.fnum, 1);
+        assert_eq!(win.w_jumplist[0].fmark.mark.lnum, 10);
+        assert_eq!(win.w_jumplist[1].fmark.fnum, 2);
+    }
+
+    #[test]
+    fn cleanup_jumplist_keeps_non_adjacent_duplicates_when_jumpoptions_stack() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 3,
+            ..Default::default()
+        };
+        // Entries 0 and 2 are duplicates, but NOT adjacent (entry 1
+        // sits between them) - with jumpoptions=stack, non-adjacent
+        // duplicates are kept as-is.
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[0].fmark.mark.lnum = 10;
+        win.w_jumplist[1].fmark.fnum = 2;
+        win.w_jumplist[1].fmark.mark.lnum = 20;
+        win.w_jumplist[2].fmark.fnum = 1;
+        win.w_jumplist[2].fmark.mark.lnum = 10;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let prev_jop = unsafe { OPTION_VARS.get_mut() }.jop_flags;
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = opt_jop_flag::STACK;
+
+        unsafe { cleanup_jumplist(&mut win, false) };
+
+        assert_eq!(win.w_jumplistlen, 3);
+
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = prev_jop;
+    }
+
+    #[test]
+    fn cleanup_jumplist_removes_non_adjacent_duplicates_without_stack() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 3,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[0].fmark.mark.lnum = 10;
+        win.w_jumplist[1].fmark.fnum = 2;
+        win.w_jumplist[1].fmark.mark.lnum = 20;
+        win.w_jumplist[2].fmark.fnum = 1;
+        win.w_jumplist[2].fmark.mark.lnum = 10;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let prev_jop = unsafe { OPTION_VARS.get_mut() }.jop_flags;
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = 0; // default: not "stack"
+
+        unsafe { cleanup_jumplist(&mut win, false) };
+
+        assert_eq!(win.w_jumplistlen, 2);
+        assert_eq!(win.w_jumplist[0].fmark.fnum, 2);
+        assert_eq!(win.w_jumplist[1].fmark.fnum, 1);
+
+        unsafe { OPTION_VARS.get_mut() }.jop_flags = prev_jop;
+    }
+
+    #[test]
+    fn cleanup_jumplist_removes_a_phantom_jump_at_the_current_line() {
+        let mut buf = BufT { handle: 5, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 1,
+            w_jumplistidx: 1,
+            w_cursor: PosT { lnum: 42, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 5;
+        win.w_jumplist[0].fmark.mark.lnum = 42;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { cleanup_jumplist(&mut win, true) };
+
+        // The only entry matches curbuf + the cursor's current line,
+        // so it's removed as a "phantom jump".
+        assert_eq!(win.w_jumplistlen, 0);
+        assert_eq!(win.w_jumplistidx, 0);
+    }
+
+    #[test]
+    fn cleanup_jumplist_keeps_a_phantom_jump_when_loadfiles_is_false() {
+        // Matches the ShaDa-restoration call shape (loadfiles=false):
+        // the trailing "remove a phantom jump" step is only performed
+        // when loadfiles is set.
+        let mut buf = BufT { handle: 5, ..Default::default() };
+        let mut win = WinT {
+            w_jumplistlen: 1,
+            w_jumplistidx: 1,
+            w_cursor: PosT { lnum: 42, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 5;
+        win.w_jumplist[0].fmark.mark.lnum = 42;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { cleanup_jumplist(&mut win, false) };
+
+        assert_eq!(win.w_jumplistlen, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "fname2fnum")]
+    fn cleanup_jumplist_panics_on_an_unresolved_shada_style_entry() {
+        // fmark.fnum == 0 with a nonzero lnum is the real ShaDa-
+        // restoration shape nothing currently-translated can
+        // construct via a real code path (setpcmark always sets a
+        // nonzero fnum) - deliberately constructed here to prove the
+        // real check fires (not silently skipped) when it IS reached.
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_jumplistlen: 1,
+            ..Default::default()
+        };
+        win.w_jumplist[0].fmark.fnum = 0;
+        win.w_jumplist[0].fmark.mark.lnum = 10;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { cleanup_jumplist(&mut win, true) };
     }
 
     #[test]

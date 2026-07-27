@@ -8179,6 +8179,7 @@ mod tests {
 
     #[test]
     fn list2fpos_resolves_fnum_lnum_col_coladd_and_curswant() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = crate::eval::typval::tv_list_alloc(5);
         for n in [7, 3, 2, 1, 10] {
             unsafe { crate::eval::typval::tv_list_append_number(l, n) };
@@ -8221,6 +8222,7 @@ mod tests {
 
     #[test]
     fn list2fpos_too_short_list_fails() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = crate::eval::typval::tv_list_alloc(2);
         for n in [1, 2] {
             unsafe { crate::eval::typval::tv_list_append_number(l, n) };
@@ -8247,6 +8249,7 @@ mod tests {
         // fnum=1 (nonzero) so GLOBALS.curbuf is never touched - this
         // test intentionally exercises ONLY the charcol=true panic,
         // not fnum-zero resolution (which needs a real buffer set up).
+        let _lock = crate::globals::global_state_test_lock();
         let l = crate::eval::typval::tv_list_alloc(3);
         for n in [1, 5, 3] {
             unsafe { crate::eval::typval::tv_list_append_number(l, n) };
