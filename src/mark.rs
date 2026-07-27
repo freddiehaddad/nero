@@ -1997,6 +1997,9 @@ mod tests {
         use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
         use crate::eval::typval_defs::TypvalValue;
 
+        // tv_list_alloc touches the shared GC_FIRST_LIST linked list -
+        // must hold the lock like every other test that does.
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(0);
         let pos = PosT { lnum: 3, col: 4, coladd: 0 };
         let rc = unsafe { add_mark(l, b"'a", pos, 7, Some(b"/tmp/foo")) };
@@ -2044,6 +2047,7 @@ mod tests {
     fn add_mark_skips_marks_with_non_positive_lnum() {
         use crate::eval::typval::{tv_list_alloc, tv_list_free};
 
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(0);
         let pos = PosT { lnum: 0, col: 0, coladd: 0 };
         let rc = unsafe { add_mark(l, b"'a", pos, 1, None) };
@@ -2059,6 +2063,7 @@ mod tests {
         use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
         use crate::eval::typval_defs::TypvalValue;
 
+        let _lock = crate::globals::global_state_test_lock();
         let l = tv_list_alloc(0);
         let pos = PosT { lnum: 1, col: 0, coladd: 0 };
         let rc = unsafe { add_mark(l, b"'a", pos, 1, None) };

@@ -436,6 +436,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagewinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_tabpagewinnr });
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
         m.insert(&b"gettabinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettabinfo });
+        m.insert(&b"getbufinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getbufinfo });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -3150,6 +3151,178 @@ unsafe fn f_gettabinfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
         // SAFETY: forwarded from this function's own safety doc.
         tp = unsafe { &*tp }.tp_next;
+    }
+}
+
+/// Build a `Dict` describing buffer options, variables and other
+/// attributes (`get_buffer_info`, `eval/buffer.c`'s own `static`
+/// helper - kept private here too, its only real caller is
+/// [`f_getbufinfo`], in this same file).
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+unsafe fn get_buffer_info(buf: *mut crate::buffer_defs::BufT) -> *mut crate::eval::typval_defs::DictT {
+    let d = crate::eval::typval::tv_dict_alloc();
+    // SAFETY: `d` was just allocated above, uniquely owned here.
+    let dict = unsafe { &mut *d };
+    // SAFETY: forwarded from this function's own safety doc.
+    let bufref = unsafe { &mut *buf };
+
+    crate::eval::typval::tv_dict_add_nr(dict, b"bufnr", i64::from(bufref.handle));
+    crate::eval::typval::tv_dict_add_str(dict, b"name", bufref.b_ffname.as_deref());
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    let lnum = if std::ptr::eq(buf, curbuf) {
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.lnum)
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { crate::buffer::buflist_findlnum(bufref) })
+    };
+    crate::eval::typval::tv_dict_add_nr(dict, b"lnum", lnum);
+    crate::eval::typval::tv_dict_add_nr(dict, b"linecount", i64::from(bufref.b_ml.ml_line_count));
+    crate::eval::typval::tv_dict_add_nr(dict, b"loaded", i64::from(!bufref.b_ml.ml_mfp.is_null()));
+    crate::eval::typval::tv_dict_add_nr(dict, b"listed", i64::from(bufref.b_p_bl));
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::eval::typval::tv_dict_add_nr(dict, b"changed", i64::from(unsafe { crate::undo::buf_is_changed(bufref) }));
+    crate::eval::typval::tv_dict_add_nr(dict, b"changedtick", crate::buffer::buf_get_changedtick(bufref));
+    crate::eval::typval::tv_dict_add_nr(
+        dict,
+        b"hidden",
+        i64::from(!bufref.b_ml.ml_mfp.is_null() && bufref.b_nwindows == 0),
+    );
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::eval::typval::tv_dict_add_nr(dict, b"command", i64::from(unsafe { crate::buffer::bt_cmdwin(Some(bufref)) }));
+
+    // Get a reference to buffer variables.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_dict_add_dict(dict, b"variables", bufref.b_vars) };
+
+    // List of windows displaying this buffer.
+    let windows = crate::eval::typval::tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::MayKnow as isize);
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &*wp };
+            if std::ptr::eq(w.w_buffer, buf) {
+                // SAFETY: `windows` was just allocated above by this same call.
+                unsafe { crate::eval::typval::tv_list_append_number(windows, i64::from(w.handle)) };
+            }
+            wp = w.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    // SAFETY: `dict`/`windows` are both valid, freshly-obtained live pointers.
+    unsafe { crate::eval::typval::tv_dict_add_list(dict, b"windows", windows) };
+
+    // List of signs placed in this buffer (always empty today - see
+    // crate::buffer::buf_has_signs's own doc comment).
+    if crate::buffer::buf_has_signs(bufref) {
+        unimplemented!("get_buffer_info: get_buffer_signs, sign.c, not yet translated");
+    }
+
+    crate::eval::typval::tv_dict_add_nr(dict, b"lastused", bufref.b_last_used as i64);
+
+    d
+}
+
+/// `getbufinfo([{arg}])` - information about buffers as a `List` of
+/// `Dict`s. Without `{arg}`, information about all buffers; with a
+/// `Dict` `{arg}`, filtered by `buflisted`/`bufloaded`/`bufmodified`;
+/// with a `String`/`Number` `{arg}`, information about just that one
+/// buffer (`f_getbufinfo`, `eval/buffer.c`), via [`get_buffer_info`].
+///
+/// # Safety
+/// Forwarded from [`crate::eval::buffer::tv_get_buf_from_arg`]/
+/// [`get_buffer_info`]'s own safety docs.
+unsafe fn f_getbufinfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut sel_buflisted = false;
+    let mut sel_bufloaded = false;
+    let mut sel_bufmodified = false;
+    let mut filtered = false;
+
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize)
+    };
+
+    let argbuf: *mut crate::buffer_defs::BufT = if matches!(argvars.first().map(|tv| &tv.value), Some(TypvalValue::Dict(_))) {
+        let TypvalValue::Dict(sel_d) = &argvars[0].value else { unreachable!() };
+        if !sel_d.is_null() {
+            filtered = true;
+            // SAFETY: `sel_d` is a live pointer (non-null, checked above).
+            let d = unsafe { &mut **sel_d };
+            if let Some(di) = crate::eval::typval::tv_dict_find(Some(d), b"buflisted") {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { crate::eval::typval::tv_get_number(&(*di).di_tv) } != 0 {
+                    sel_buflisted = true;
+                }
+            }
+            if let Some(di) = crate::eval::typval::tv_dict_find(Some(d), b"bufloaded") {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { crate::eval::typval::tv_get_number(&(*di).di_tv) } != 0 {
+                    sel_bufloaded = true;
+                }
+            }
+            if let Some(di) = crate::eval::typval::tv_dict_find(Some(d), b"bufmodified") {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { crate::eval::typval::tv_get_number(&(*di).di_tv) } != 0 {
+                    sel_bufmodified = true;
+                }
+            }
+        }
+        std::ptr::null_mut()
+    } else if !argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { crate::eval::buffer::tv_get_buf_from_arg(&argvars[0]) };
+        if buf.is_null() {
+            return;
+        }
+        buf
+    } else {
+        std::ptr::null_mut()
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut buf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+    while !buf.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &*buf };
+        let next = b.b_next;
+        if !argbuf.is_null() && !std::ptr::eq(argbuf, buf) {
+            buf = next;
+            continue;
+        }
+        if filtered
+            && ((sel_bufloaded && b.b_ml.ml_mfp.is_null())
+                || (sel_buflisted && b.b_p_bl == 0)
+                || (sel_bufmodified && b.b_changed != 0))
+        {
+            buf = next;
+            continue;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let d = unsafe { get_buffer_info(buf) };
+        // SAFETY: `l`/`d` are both valid, freshly-obtained live pointers.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+        if !argbuf.is_null() {
+            return;
+        }
+        buf = next;
     }
 }
 
@@ -6127,6 +6300,7 @@ mod tests {
             "tabpagewinnr",
             "tabpagebuflist",
             "gettabinfo",
+            "getbufinfo",
             "eval",
             "gettext",
             "nextnonblank",
@@ -8265,6 +8439,9 @@ mod tests {
 
     #[test]
     fn flatten_with_a_negative_maxdepth_leaves_rettv_at_default() {
+        // tv_list_alloc touches the shared GC_FIRST_LIST linked list -
+        // must hold the lock like every other test that does.
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
         let list = crate::eval::typval::tv_list_alloc(0);
         let args = [TypvalT { value: TypvalValue::List(list), ..Default::default() }, num(-1)];
@@ -9181,6 +9358,193 @@ mod tests {
         unsafe { f_gettabinfo(&[num(99)], &mut rettv) };
 
         unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    // --- f_getbufinfo ---
+
+    /// Sets up 2 buffers (handles 1/2, linked via `b_next`), one
+    /// window (handle 10) showing buffer 1, and one tabpage as both
+    /// `first_tabpage`/`curtab` - enough for `get_buffer_info`'s own
+    /// "windows displaying this buffer" walk plus `GLOBALS.firstbuf`'s
+    /// own buffer-list walk.
+    struct BufInfoFixture {
+        buf1: crate::buffer_defs::BufT,
+        buf2: crate::buffer_defs::BufT,
+        win1: crate::buffer_defs::WinT,
+        tab1: crate::buffer_defs::TabpageT,
+        prev_firstbuf: *mut crate::buffer_defs::BufT,
+        prev_lastbuf: *mut crate::buffer_defs::BufT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl BufInfoFixture {
+        fn new() -> Box<Self> {
+            let mut fx = Box::new(BufInfoFixture {
+                buf1: crate::buffer_defs::BufT { handle: 1, b_p_bl: 1, ..Default::default() },
+                buf2: crate::buffer_defs::BufT { handle: 2, ..Default::default() },
+                win1: crate::buffer_defs::WinT::default(),
+                tab1: crate::buffer_defs::TabpageT::default(),
+                prev_firstbuf: std::ptr::null_mut(),
+                prev_lastbuf: std::ptr::null_mut(),
+                prev_curbuf: std::ptr::null_mut(),
+                prev_firstwin: std::ptr::null_mut(),
+                prev_curwin: std::ptr::null_mut(),
+                prev_first_tabpage: std::ptr::null_mut(),
+                prev_curtab: std::ptr::null_mut(),
+            });
+            // Take every raw pointer into `fx`'s own fields
+            // IMMEDIATELY, before any further mutation - all
+            // subsequent writes to buf1/buf2/win1/tab1 go THROUGH
+            // these pointers, never again via `fx.buf1`/etc. field
+            // access, to avoid a real Tree Borrows violation (caught
+            // via `cargo miri test`: a later `fx.buf1.field = ...`
+            // write invalidates a pointer taken from `fx.buf1` earlier).
+            let buf1_ptr = &mut fx.buf1 as *mut crate::buffer_defs::BufT;
+            let buf2_ptr = &mut fx.buf2 as *mut crate::buffer_defs::BufT;
+            let win1_ptr = &mut fx.win1 as *mut crate::buffer_defs::WinT;
+            let tab1_ptr = &mut fx.tab1 as *mut crate::buffer_defs::TabpageT;
+
+            // get_buffer_info walks GLOBALS.firstbuf/b_next; tv_get_buf
+            // (via buflist_findnr, used by tv_get_buf_from_arg to
+            // resolve a Number argument) walks GLOBALS.lastbuf/b_prev
+            // instead - both directions must be wired up.
+            unsafe {
+                (*buf1_ptr).b_next = buf2_ptr;
+                (*buf2_ptr).b_prev = buf1_ptr;
+                (*win1_ptr).w_buffer = buf1_ptr;
+                (*win1_ptr).handle = 10;
+            }
+
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            fx.prev_firstbuf = globals.firstbuf;
+            fx.prev_lastbuf = globals.lastbuf;
+            fx.prev_curbuf = globals.curbuf;
+            fx.prev_firstwin = globals.firstwin;
+            fx.prev_curwin = globals.curwin;
+            fx.prev_first_tabpage = globals.first_tabpage;
+            fx.prev_curtab = globals.curtab;
+            globals.firstbuf = buf1_ptr;
+            globals.lastbuf = buf2_ptr;
+            globals.curbuf = buf1_ptr;
+            globals.firstwin = win1_ptr;
+            globals.curwin = win1_ptr;
+            globals.first_tabpage = tab1_ptr;
+            globals.curtab = tab1_ptr;
+            fx
+        }
+    }
+
+    impl Drop for BufInfoFixture {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstbuf = self.prev_firstbuf;
+            globals.lastbuf = self.prev_lastbuf;
+            globals.curbuf = self.prev_curbuf;
+            globals.firstwin = self.prev_firstwin;
+            globals.curwin = self.prev_curwin;
+            globals.first_tabpage = self.prev_first_tabpage;
+            globals.curtab = self.prev_curtab;
+        }
+    }
+
+    #[test]
+    fn getbufinfo_no_args_returns_info_for_all_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = BufInfoFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufinfo(&[], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d0) = (*item0).li_tv.value else { panic!("expected a Dict") };
+            let bufnr0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"bufnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*bufnr0).di_tv), 1);
+            let windows0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"windows").unwrap();
+            let TypvalValue::List(wl0) = (*windows0).di_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(wl0), 1);
+            let w0 = crate::eval::typval::tv_list_find(wl0, 0);
+            assert_eq!((*w0).li_tv.value, TypvalValue::Number(10));
+
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            let TypvalValue::Dict(d1) = (*item1).li_tv.value else { panic!("expected a Dict") };
+            let bufnr1 = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"bufnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*bufnr1).di_tv), 2);
+            let windows1 = crate::eval::typval::tv_dict_find(Some(&mut *d1), b"windows").unwrap();
+            let TypvalValue::List(wl1) = (*windows1).di_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(wl1), 0);
+
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getbufinfo_with_buf_arg_returns_only_that_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = BufInfoFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufinfo(&[num(2)], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d0) = (*item0).li_tv.value else { panic!("expected a Dict") };
+            let bufnr0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"bufnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*bufnr0).di_tv), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getbufinfo_with_dict_filter_selects_only_listed_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = BufInfoFixture::new(); // buf1 (handle 1) is listed, buf2 isn't
+
+        let sel_d = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *sel_d, b"buflisted", 1) };
+
+        let mut rettv = TypvalT::default();
+        let mut sel_tv = TypvalT::default();
+        unsafe { crate::eval::typval::tv_dict_set_ret(&mut sel_tv, sel_d) };
+        unsafe { f_getbufinfo(&[sel_tv], &mut rettv) };
+        // `sel_tv` (a plain local, not a TypvalT with Drop semantics)
+        // holds its own reference to `sel_d` - release it explicitly
+        // to avoid leaking into the shared GC_FIRST_DICT list.
+        unsafe { crate::eval::typval::tv_dict_unref(sel_d) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d0) = (*item0).li_tv.value else { panic!("expected a Dict") };
+            let bufnr0 = crate::eval::typval::tv_dict_find(Some(&mut *d0), b"bufnr").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*bufnr0).di_tv), 1);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getbufinfo_unknown_buf_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = BufInfoFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufinfo(&[num(999)], &mut rettv) };
 
         let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
         unsafe {
@@ -11696,6 +12060,7 @@ mod tests {
 
     #[test]
     fn list2proftime_wrong_length_list_fails() {
+        let _lock = crate::globals::global_state_test_lock();
         let l = crate::eval::typval::tv_list_alloc(1);
         unsafe { crate::eval::typval::tv_list_append_number(l, 1) };
         unsafe { crate::eval::typval::tv_list_ref(l) };

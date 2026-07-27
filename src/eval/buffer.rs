@@ -101,6 +101,19 @@ pub(crate) unsafe fn tv_get_buf(tv: &TypvalT) -> *mut crate::buffer_defs::BufT {
     }
 }
 
+/// Like [`tv_get_buf`], but only accepts a `String`/`Number` argument,
+/// returning null for anything else (`tv_get_buf_from_arg`).
+///
+/// # Safety
+/// Forwarded from [`tv_get_buf`]'s own safety doc.
+pub(crate) unsafe fn tv_get_buf_from_arg(tv: &TypvalT) -> *mut crate::buffer_defs::BufT {
+    if !crate::eval::typval::tv_check_str_or_nr(tv) {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_get_buf(tv) }
+}
+
 /// `bufexists({expr})` - whether a buffer for `{expr}` exists
 /// (`f_bufexists`, `eval/buffer.c`), via [`tv_get_buf`].
 ///

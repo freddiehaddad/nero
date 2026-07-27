@@ -332,6 +332,156 @@ pub fn buf_meta_total(buf: &BufT, m: crate::marktree_defs::MetaIndex) -> u32 {
     buf.b_marktree.meta_root[m as usize]
 }
 
+/// Whether `buf` has any signs placed (`buf_has_signs`, `sign.c`).
+///
+/// Nothing translated in this crate can currently place a sign (no
+/// `:sign place` command, no extmark-with-sign-properties support),
+/// so [`buf_meta_total`] for both sign-related [`crate::marktree_defs::MetaIndex`]
+/// variants is always 0 today - this is the real check (not a
+/// hardcoded stub), matching the established "always-real-fast-path"
+/// pattern (e.g. `has_any_folding`), correct and complete as written
+/// for every buffer this crate can currently construct.
+#[must_use]
+pub fn buf_has_signs(buf: &BufT) -> bool {
+    buf_meta_total(buf, crate::marktree_defs::MetaIndex::SignHl) != 0
+        || buf_meta_total(buf, crate::marktree_defs::MetaIndex::SignText) != 0
+}
+
+/// Check that `wip` has `'diff'` set and the diff is only for another
+/// tab page - a diff is local to a tab page (`wininfo_other_tab_diff`).
+///
+/// The original's own `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` always
+/// resolves to `GLOBALS.firstwin` here (comparing `curtab` to itself),
+/// matching the same simplification already established elsewhere in
+/// this crate (e.g. `mark.rs`'s `fmarks_check_names`).
+///
+/// # Safety
+/// `wip.wi_win`, if non-null, must be a valid pointer to a live
+/// `WinT`. Touches `GLOBALS.firstwin`/`w_next` - same requirement as
+/// every other function that walks the window list.
+#[must_use]
+pub unsafe fn wininfo_other_tab_diff(wip: &crate::buffer_defs::WinInfo) -> bool {
+    if wip.wi_opt.wo_diff == 0 {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        if std::ptr::eq(wip.wi_win, wp) {
+            // It's a window in the current tab page, so the buffer
+            // was in diff mode here.
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    true
+}
+
+/// Find info for the current window in buffer `buf`. If not found,
+/// return the info for the most recently used window
+/// (`find_wininfo`).
+///
+/// `need_options`: when true, skip entries where `wi_optset` is
+/// false. `skip_diff_buffer`: when true, avoid windows with
+/// `'diff'` set that is in another tab page.
+///
+/// # Safety
+/// Every entry in `buf.b_wininfo` must be a valid, non-null pointer to
+/// a live `WinInfo`. Touches `GLOBALS.curwin`/`firstwin` - same
+/// requirement as every other function that does so.
+#[must_use]
+pub unsafe fn find_wininfo(
+    buf: &BufT,
+    need_options: bool,
+    skip_diff_buffer: bool,
+) -> *mut crate::buffer_defs::WinInfo {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { GLOBALS.get_mut() }.curwin;
+    for &wip_ptr in &buf.b_wininfo {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wip = unsafe { &*wip_ptr };
+        if std::ptr::eq(wip.wi_win, curwin)
+            // SAFETY: forwarded from this function's own safety doc.
+            && (!skip_diff_buffer || !unsafe { wininfo_other_tab_diff(wip) })
+            && (!need_options || wip.wi_optset)
+        {
+            return wip_ptr;
+        }
+    }
+
+    // If no wininfo for curwin, use the first in the list (that
+    // doesn't have 'diff' set and is in another tab page). If
+    // "need_options" is true skip entries that don't have options
+    // set, unless the window is editing "buf", so we can copy from
+    // the window itself.
+    if skip_diff_buffer {
+        for &wip_ptr in &buf.b_wininfo {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wip = unsafe { &*wip_ptr };
+            // SAFETY: forwarded from this function's own safety doc.
+            if !unsafe { wininfo_other_tab_diff(wip) }
+                && (!need_options
+                    || wip.wi_optset
+                    || (!wip.wi_win.is_null()
+                        // SAFETY: forwarded from this function's own safety doc.
+                        && std::ptr::eq(unsafe { &*wip.wi_win }.w_buffer, buf as *const BufT as *mut BufT)))
+            {
+                return wip_ptr;
+            }
+        }
+    } else if let Some(&first) = buf.b_wininfo.first() {
+        return first;
+    }
+    std::ptr::null_mut()
+}
+
+/// The original's own function-local `static fmark_T no_position`
+/// fallback in [`buflist_findfmark`] - line 1, matching a sensible
+/// "no recorded position" default (deliberately NOT `FmarkT::default()`,
+/// which would report line 0, an invalid position).
+fn no_position_fmark() -> crate::mark_defs::FmarkT {
+    crate::mark_defs::FmarkT {
+        mark: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+        ..crate::mark_defs::FmarkT::default()
+    }
+}
+
+/// Get the file mark for `buf` (`buflist_findfmark`).
+///
+/// Returns an owned [`crate::mark_defs::FmarkT`] rather than the
+/// original's `fmark_T *` (a pointer either into `buf`'s own
+/// `b_wininfo` entries or to a function-local `static` fallback) -
+/// nothing currently in this crate needs to mutate through the
+/// returned value, and a `'static`-lifetime pointer to a genuinely
+/// per-call fallback value has no sound direct Rust equivalent
+/// anyway.
+///
+/// # Safety
+/// Forwarded from [`find_wininfo`]'s own safety doc.
+#[must_use]
+pub unsafe fn buflist_findfmark(buf: &BufT) -> crate::mark_defs::FmarkT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wip = unsafe { find_wininfo(buf, false, false) };
+    if wip.is_null() {
+        return no_position_fmark();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*wip }.wi_mark.clone()
+}
+
+/// Find the line number for buffer `buf` for the current window
+/// (`buflist_findlnum`).
+///
+/// # Safety
+/// Forwarded from [`buflist_findfmark`]'s own safety doc.
+#[must_use]
+pub unsafe fn buflist_findlnum(buf: &BufT) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buflist_findfmark(buf) }.mark.lnum
+}
+
 /// Get `b:changedtick` value. Faster than querying `b:`
 /// (`buf_get_changedtick`, `buffer.h`'s own `static inline`).
 #[must_use]
@@ -724,5 +874,167 @@ mod tests {
         unsafe { set_buflisted(false) };
 
         assert_eq!(buf.b_p_bl, 0);
+    }
+
+    // --- wininfo_other_tab_diff / find_wininfo / buflist_findfmark / buflist_findlnum ---
+
+    #[test]
+    fn wininfo_other_tab_diff_false_when_wo_diff_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let win = crate::buffer_defs::WinInfo::default(); // wi_opt.wo_diff == 0
+        assert!(!unsafe { wininfo_other_tab_diff(&win) });
+    }
+
+    #[test]
+    fn wininfo_other_tab_diff_false_when_window_is_in_current_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut w = crate::buffer_defs::WinT::default();
+        let w_ptr = &mut w as *mut crate::buffer_defs::WinT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = w_ptr;
+
+        let wi = crate::buffer_defs::WinInfo {
+            wi_win: w_ptr,
+            wi_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!unsafe { wininfo_other_tab_diff(&wi) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn wininfo_other_tab_diff_true_when_diff_set_and_window_not_in_current_tab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut current_win = crate::buffer_defs::WinT::default();
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = &mut current_win as *mut crate::buffer_defs::WinT;
+
+        // A separate window (never linked into GLOBALS.firstwin's own
+        // w_next chain) with 'diff' set - the diff must be for another
+        // tab page.
+        let mut other_win = crate::buffer_defs::WinT::default();
+        let wi = crate::buffer_defs::WinInfo {
+            wi_win: &mut other_win as *mut crate::buffer_defs::WinT,
+            wi_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(unsafe { wininfo_other_tab_diff(&wi) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn find_wininfo_returns_curwin_entry_when_present() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = crate::buffer_defs::WinT::default();
+        let mut win2 = crate::buffer_defs::WinT::default();
+        let win2_ptr = &mut win2 as *mut crate::buffer_defs::WinT;
+        let _guard = CurwinGuard::set(win2_ptr);
+
+        let wi1 = Box::into_raw(Box::new(crate::buffer_defs::WinInfo {
+            wi_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        }));
+        let wi2 = Box::into_raw(Box::new(crate::buffer_defs::WinInfo { wi_win: win2_ptr, ..Default::default() }));
+        let buf = BufT { b_wininfo: vec![wi1, wi2], ..Default::default() };
+
+        let found = unsafe { find_wininfo(&buf, false, false) };
+        assert_eq!(found, wi2);
+
+        unsafe {
+            drop(Box::from_raw(wi1));
+            drop(Box::from_raw(wi2));
+        }
+    }
+
+    #[test]
+    fn find_wininfo_falls_back_to_first_entry_when_curwin_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = crate::buffer_defs::WinT::default();
+        let mut unrelated_curwin = crate::buffer_defs::WinT::default();
+        let _guard = CurwinGuard::set(&mut unrelated_curwin as *mut crate::buffer_defs::WinT);
+
+        let wi1 = Box::into_raw(Box::new(crate::buffer_defs::WinInfo {
+            wi_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            ..Default::default()
+        }));
+        let buf = BufT { b_wininfo: vec![wi1], ..Default::default() };
+
+        // skip_diff_buffer == false -> falls back to the first entry.
+        let found = unsafe { find_wininfo(&buf, false, false) };
+        assert_eq!(found, wi1);
+
+        unsafe {
+            drop(Box::from_raw(wi1));
+        }
+    }
+
+    #[test]
+    fn find_wininfo_returns_null_when_b_wininfo_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curwin = crate::buffer_defs::WinT::default();
+        let _guard = CurwinGuard::set(&mut curwin as *mut crate::buffer_defs::WinT);
+
+        let buf = BufT::default();
+        assert!(unsafe { find_wininfo(&buf, false, false) }.is_null());
+    }
+
+    #[test]
+    fn buflist_findfmark_returns_no_position_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curwin = crate::buffer_defs::WinT::default();
+        let _guard = CurwinGuard::set(&mut curwin as *mut crate::buffer_defs::WinT);
+
+        let buf = BufT::default();
+        let fm = unsafe { buflist_findfmark(&buf) };
+        // The original's own `no_position` static: line 1, not 0.
+        assert_eq!(fm.mark.lnum, 1);
+    }
+
+    #[test]
+    fn buflist_findlnum_returns_the_wininfo_mark_lnum() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        let wi = Box::into_raw(Box::new(crate::buffer_defs::WinInfo {
+            wi_win: win_ptr,
+            wi_mark: crate::mark_defs::FmarkT {
+                mark: crate::pos_defs::PosT { lnum: 42, col: 0, coladd: 0 },
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let buf = BufT { b_wininfo: vec![wi], ..Default::default() };
+
+        assert_eq!(unsafe { buflist_findlnum(&buf) }, 42);
+
+        unsafe {
+            drop(Box::from_raw(wi));
+        }
+    }
+
+    /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching this file's own `CurbufGuard`).
+    struct CurwinGuard {
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl CurwinGuard {
+        fn set(new_curwin: *mut crate::buffer_defs::WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = new_curwin;
+            CurwinGuard { previous }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+        }
     }
 }
