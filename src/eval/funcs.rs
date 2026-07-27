@@ -453,6 +453,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getcharpos });
         m.insert(&b"getcurpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcurpos });
         m.insert(&b"getcursorcharpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcursorcharpos });
+        m.insert(&b"setcharsearch"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_setcharsearch });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -4139,6 +4140,57 @@ pub unsafe fn f_getcursorcharpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { getpos_both(argvars, rettv, true, true) };
 }
 
+/// `"setcharsearch({dict})"` function (`f_setcharsearch`).
+///
+/// The original's `csearch` is a NUL-terminated C string, so
+/// `utf_ptr2char("")`/`utfc_ptr2len("")` safely read the terminator
+/// byte itself (yielding `0`/consuming 0 bytes) for an EMPTY `'char'`
+/// value - this crate's own `Vec<u8>` String values carry no such
+/// terminator, so an empty `csearch` is handled explicitly here
+/// (treated the same as the original's own NUL-terminated-empty-
+/// string case) rather than indexing an empty slice.
+///
+/// # Safety
+/// If `argvars[0]` holds a `Dict` value, its pointer must either be
+/// null or point at a live, valid `DictT` allocation.
+pub unsafe fn f_setcharsearch(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_dict_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let TypvalValue::Dict(d) = argvars[0].value else { return };
+    if d.is_null() {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(csearch) = unsafe { crate::eval::typval::tv_dict_get_string(Some(&mut *d), b"char") } {
+        let (c, len) = if csearch.is_empty() {
+            (0, 0)
+        } else {
+            (crate::mbyte::utf_ptr2char(&csearch), unsafe { crate::mbyte::utfc_ptr2len(&csearch) })
+        };
+        crate::search::set_last_csearch(c, &csearch, len);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"forward") {
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv);
+        crate::search::set_csearch_direction(if n != 0 {
+            crate::vim_defs::Direction::Forward
+        } else {
+            crate::vim_defs::Direction::Backward
+        });
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(di) = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"until") {
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = crate::eval::typval::tv_get_number(&unsafe { &*di }.di_tv);
+        crate::search::set_csearch_until(n != 0);
+    }
+}
+
 /// `tr({src}, {fromstr}, {tostr})` - `{src}` with every character
 /// that appears in `{fromstr}` replaced by the character at the same
 /// POSITION in `{tostr}` (`f_tr`, `strings.c`). A character not found
@@ -6542,6 +6594,7 @@ mod tests {
             "getcharpos",
             "getcurpos",
             "getcursorcharpos",
+            "setcharsearch",
             "eval",
             "gettext",
             "nextnonblank",
@@ -10448,6 +10501,126 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_get_number(&(*until_item).di_tv), 0);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // --- f_setcharsearch ---
+
+    #[test]
+    fn setcharsearch_updates_char_forward_and_until_together() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(0, b"", 0);
+        crate::search::set_csearch_direction(crate::vim_defs::Direction::Backward);
+        crate::search::set_csearch_until(false);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            let dref = &mut *dict;
+            crate::eval::typval::tv_dict_add_str(dref, b"char", Some(b"x"));
+            crate::eval::typval::tv_dict_add_nr(dref, b"forward", 1);
+            crate::eval::typval::tv_dict_add_nr(dref, b"until", 1);
+        }
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), b"x".to_vec());
+        assert!(crate::search::last_csearch_forward());
+        assert!(crate::search::last_csearch_until());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setcharsearch_forward_false_sets_backward_direction() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_csearch_direction(crate::vim_defs::Direction::Forward);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"forward", 0) };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert!(!crate::search::last_csearch_forward());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setcharsearch_empty_char_clears_the_search_character() {
+        // The original relies on a NUL-terminated `csearch` so
+        // `utf_ptr2char("")` safely reads the terminator itself; this
+        // crate's own `Vec<u8>` has no such byte, so the empty-string
+        // case needs its own explicit test to prove no panic occurs
+        // and the state is cleared exactly like the original.
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(i32::from(b'q'), b"q", 1);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *dict, b"char", Some(b"")) };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), Vec::<u8>::new());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setcharsearch_multi_byte_char_decodes_the_first_character_only() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(0, b"", 0);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        // U+00E9 ('é') encodes as 2 UTF-8 bytes; only its own 2 bytes
+        // should be captured, not anything past it.
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *dict, b"char", Some("é".as_bytes())) };
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), "é".as_bytes().to_vec());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setcharsearch_missing_keys_leave_state_untouched() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(i32::from(b'z'), b"z", 1);
+        crate::search::set_csearch_direction(crate::vim_defs::Direction::Forward);
+        crate::search::set_csearch_until(true);
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        let args = [TypvalT { value: TypvalValue::Dict(dict), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), b"z".to_vec());
+        assert!(crate::search::last_csearch_forward());
+        assert!(crate::search::last_csearch_until());
+        unsafe { crate::eval::typval::tv_dict_unref(dict) };
+    }
+
+    #[test]
+    fn setcharsearch_null_dict_is_a_no_op() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(i32::from(b'n'), b"n", 1);
+
+        let args = [TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() }];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), b"n".to_vec());
+    }
+
+    #[test]
+    fn setcharsearch_non_dict_arg_is_a_no_op() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::search::set_last_csearch(i32::from(b'm'), b"m", 1);
+
+        let args = [num(42)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcharsearch(&args, &mut rettv) };
+
+        assert_eq!(crate::search::last_csearch_str(), b"m".to_vec());
     }
 
     // --- f_getmarklist / f_getchangelist ---
