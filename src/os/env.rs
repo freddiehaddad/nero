@@ -482,8 +482,177 @@ pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Expand environment variables (`$VAR`, and Unix `${VAR}`) and a
+/// leading `~`/`~user` in `srcp`, escaping any character in
+/// `esc_chars` found in an expanded value with a backslash
+/// (`expand_env_esc`).
+///
+/// Returns the expanded byte string directly as an owned `Vec<u8>`
+/// rather than writing into a caller-provided, `dstlen`-bounded fixed
+/// buffer - Rust's own growable buffer needs no pre-sizing dance,
+/// matching this crate's established simplification for this exact
+/// category of C function (e.g. `winrestcmd`/`vim_strsave_shellescape`).
+///
+/// `one`: treat `srcp` as a single file name (only expand `~` at the
+/// very start, and don't treat a space/comma as a new-name boundary).
+///
+/// `prefix`: after copying a byte immediately following an expansion,
+/// if the `prefix.len()` bytes of `srcp` just consumed end in
+/// `prefix`, treat the position right after as a fresh "start of
+/// name" too - not exercised by any real caller in this crate yet
+/// (needs `ex_docmd.c`/`option.c`/`file_search.c`, none translated),
+/// translated for structural fidelity anyway since it adds no real
+/// complexity.
+///
+/// The Unix-only `~user` form (`~someone/...`, needing
+/// `os_get_userdir`, not yet translated) `unimplemented!()`s if ever
+/// reached - a real, if less common, gap (`~` alone, and every
+/// `$VAR` form, both work for real).
+///
+/// # Safety
+/// Forwarded from [`vim_getenv`]/[`os_homedir`]'s own safety docs.
+#[must_use]
+pub unsafe fn expand_env_esc(srcp: &[u8], esc_chars: Option<&[u8]>, one: bool, prefix: Option<&[u8]>) -> Vec<u8> {
+    let mut dst: Vec<u8> = Vec::new();
+    let mut at_start = true;
+    let mut pos = crate::charset::skipwhite(srcp);
+
+    while pos < srcp.len() {
+        // Skip over `=expr` verbatim (not evaluated here - the
+        // original's own comment: this just measures/copies the raw
+        // text, matching skip_expr's own "parse only" contract).
+        if srcp[pos] == b'`' && srcp.get(pos + 1) == Some(&b'=') {
+            let var_start = pos;
+            pos += 2;
+            // SAFETY: forwarded from this function's own safety doc.
+            let (_, consumed) = unsafe { crate::eval::eval::skip_expr(&srcp[pos..], None) };
+            pos += consumed;
+            if srcp.get(pos) == Some(&b'`') {
+                pos += 1;
+            }
+            dst.extend_from_slice(&srcp[var_start..pos]);
+            continue;
+        }
+
+        let mut copy_char = true;
+        if srcp[pos] == b'$' || (srcp[pos] == b'~' && at_start) {
+            let mut var: Option<Vec<u8>>;
+            let mut tail: usize;
+
+            if srcp[pos] != b'~' {
+                // Environment variable.
+                let mut name_start = pos + 1;
+                let braced = cfg!(unix) && srcp.get(name_start) == Some(&b'{');
+                if braced {
+                    name_start += 1;
+                }
+                let mut p = name_start;
+                if braced {
+                    while p < srcp.len() && srcp[p] != b'}' {
+                        p += 1;
+                    }
+                } else {
+                    while p < srcp.len() && crate::charset::vim_isidc(i32::from(srcp[p])) {
+                        p += 1;
+                    }
+                }
+                // Unix ${VAR} form requires the closing brace to
+                // actually be present - matches the original's own
+                // "verify we found the end" check.
+                if braced && srcp.get(p) != Some(&b'}') {
+                    var = None;
+                    tail = p;
+                } else {
+                    // SAFETY: forwarded from this function's own
+                    // safety doc.
+                    var = unsafe { vim_getenv(&srcp[name_start..p]) };
+                    if let Some(v) = &mut var {
+                        // Expanded env vars represent paths, so their
+                        // backslashes can be safely normalized -
+                        // TO_SLASH's own real, Windows-only nature.
+                        if cfg!(windows) {
+                            crate::path::path_to_slash(v);
+                        }
+                    }
+                    tail = if braced { p + 1 } else { p };
+                }
+            } else if srcp.get(pos + 1).is_none_or(|&b| {
+                b == crate::ascii_defs::NUL || crate::path::vim_ispathsep(i32::from(b)) || b" ,\t\n".contains(&b)
+            }) {
+                // Home directory.
+                // SAFETY: forwarded from this function's own safety doc.
+                var = unsafe { os_homedir() };
+                tail = pos + 1;
+            } else {
+                // ~user - needs os_get_userdir (Unix-only, not yet
+                // translated). Only reached for a genuine ~name form,
+                // never for a bare ~ (handled above).
+                unimplemented!(
+                    "expand_env_esc: a real ~user form needs os_get_userdir, not yet translated"
+                );
+            }
+
+            if let (Some(ec), Some(v)) = (esc_chars, &var) {
+                if v.iter().any(|b| ec.contains(b)) {
+                    // SAFETY: forwarded from this function's own
+                    // safety doc.
+                    var = Some(unsafe { crate::strings::vim_strsave_escaped(v, ec) });
+                }
+            }
+
+            if let Some(v) = &var {
+                if !v.is_empty() {
+                    dst.extend_from_slice(v);
+                    if crate::path::after_pathsep(v, v.len())
+                        && srcp.get(tail).is_some_and(|&b| crate::path::vim_ispathsep(i32::from(b)))
+                    {
+                        tail += 1;
+                    }
+                    pos = tail;
+                    copy_char = false;
+                }
+            }
+        }
+
+        if copy_char {
+            // Recognize the start of a new name, for '~'. Don't do
+            // this when "one" is true, to avoid expanding "~" in
+            // ":edit foo ~ foo".
+            at_start = false;
+            if srcp[pos] == b'\\' && srcp.get(pos + 1).is_some() {
+                dst.push(srcp[pos]);
+                pos += 1;
+            } else if !one && (srcp[pos] == b' ' || srcp[pos] == b',') {
+                at_start = true;
+            }
+            if pos < srcp.len() {
+                dst.push(srcp[pos]);
+                pos += 1;
+                if let Some(pfx) = prefix {
+                    if pos >= pfx.len() && &srcp[pos - pfx.len()..pos] == pfx {
+                        at_start = true;
+                    }
+                }
+            }
+        }
+    }
+
+    dst
+}
+
+/// [`expand_env_esc`] with `esc_chars = None`/`one = false`/
+/// `prefix = None` (`expand_env_save`).
+///
+/// # Safety
+/// Forwarded from [`expand_env_esc`]'s own safety doc.
+#[must_use]
+pub unsafe fn expand_env_save(src: &[u8]) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { expand_env_esc(src, None, false, None) }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Environment variables are process-global state shared by all
@@ -495,7 +664,11 @@ mod tests {
     /// (real, well-known environment variable names that can't be
     /// namespaced per-test the way arbitrary `NERO_TEST_ENV_*` names
     /// can), since Rust's multi-threaded test runner would otherwise
-    /// let these tests race against each other.
+    /// let these tests race against each other. `pub(crate)` (module
+    /// and function both) since `os::stdpaths`'s own tests also touch
+    /// `HOMEDIR` transitively (via `init_homedir`/`os_homedir`, for
+    /// `stdpath()`'s `~`-expanding fallback defaults) and must
+    /// serialize against this exact same lock, not a separate one.
     static HOMEDIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Acquires [`HOMEDIR_TEST_LOCK`], tolerating a poisoned lock (one
@@ -507,7 +680,7 @@ mod tests {
     /// `#[cfg(windows)]`) failed and poisoned this same
     /// `std::sync::Mutex`, cascading into an unrelated homedir test's
     /// failure purely due to `.lock().unwrap()` not tolerating that.
-    fn homedir_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn homedir_test_lock() -> std::sync::MutexGuard<'static, ()> {
         HOMEDIR_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -961,5 +1134,92 @@ mod tests {
         }
         assert!(unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim);
         unsafe { crate::globals::GLOBALS.get_mut() }.didset_vim = false;
+    }
+
+    // --- expand_env_esc / expand_env_save ---
+
+    #[test]
+    fn expand_env_save_expands_a_dollar_var_and_keeps_the_tail() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_VAR1", Some("/home/alice"))]);
+        let result = unsafe { expand_env_save(b"$NERO_TEST_EXPAND_ENV_VAR1/foo") };
+        assert_eq!(result, b"/home/alice/foo");
+    }
+
+    #[test]
+    fn expand_env_save_unset_var_is_left_as_is() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_UNSET1", None)]);
+        // An unset variable makes vim_getenv return None, so the "$NAME"
+        // text is copied through byte-by-byte, unchanged.
+        let result = unsafe { expand_env_save(b"$NERO_TEST_EXPAND_ENV_UNSET1/foo") };
+        assert_eq!(result, b"$NERO_TEST_EXPAND_ENV_UNSET1/foo");
+    }
+
+    #[test]
+    fn expand_env_save_avoids_a_doubled_path_separator() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_VAR2", Some("/home/alice/"))]);
+        let result = unsafe { expand_env_save(b"$NERO_TEST_EXPAND_ENV_VAR2/foo") };
+        assert_eq!(result, b"/home/alice/foo", "the var's own trailing slash absorbs the leading one in the tail");
+    }
+
+    #[test]
+    fn expand_env_save_bare_tilde_expands_the_home_directory() {
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        let result = unsafe { expand_env_save(b"~/foo") };
+        assert_eq!(result, b"/home/alice/foo");
+    }
+
+    #[test]
+    fn expand_env_save_tilde_not_at_start_is_left_alone() {
+        // Only a leading '~' (at_start) is eligible for home-dir
+        // expansion - one appearing later in the string is not.
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        let result = unsafe { expand_env_save(b"foo~bar") };
+        assert_eq!(result, b"foo~bar");
+    }
+
+    #[test]
+    fn expand_env_esc_escapes_matching_characters_in_the_expanded_value() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_VAR3", Some("/has space/dir"))]);
+        let result = unsafe { expand_env_esc(b"$NERO_TEST_EXPAND_ENV_VAR3/f", Some(b" "), false, None) };
+        assert_eq!(result, b"/has\\ space/dir/f");
+    }
+
+    #[test]
+    fn expand_env_esc_leaves_a_backtick_expr_verbatim() {
+        // The `=expr` form is measured via skip_expr but copied through
+        // UNEVALUATED - matching the original's own real behavior
+        // exactly (it is later re-evaluated by a genuinely different
+        // mechanism, not by this function).
+        let result = unsafe { expand_env_esc(b"`=1+1`/foo", None, false, None) };
+        assert_eq!(result, b"`=1+1`/foo");
+    }
+
+    #[test]
+    fn expand_env_esc_one_true_does_not_treat_space_as_a_name_boundary() {
+        // With one=true, a leading '~' followed by a space is still
+        // eligible for expansion (it's the space/comma-as-boundary
+        // behavior that's suppressed, not '~' recognition itself).
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        let result = unsafe { expand_env_esc(b"~ foo ~ bar", None, true, None) };
+        // Only the LEADING '~' expands; the second '~' (after a space)
+        // is not treated as a fresh name start since one=true.
+        assert_eq!(result, b"/home/alice foo ~ bar");
+    }
+
+    #[test]
+    fn expand_env_esc_backslash_escapes_the_next_character_verbatim() {
+        let result = unsafe { expand_env_esc(b"foo\\$bar", None, false, None) };
+        // The backslash is copied through as-is (not stripped), and it
+        // suppresses '$' from being treated as a fresh name boundary
+        // for THIS iteration - but $ recognition itself still happens
+        // normally on the very next loop iteration, so this traces
+        // through as a plain "no expansion happened" case either way.
+        assert_eq!(result, b"foo\\$bar");
     }
 }

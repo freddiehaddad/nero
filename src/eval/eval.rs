@@ -2949,21 +2949,27 @@ pub unsafe fn eval_env_var(arg: &[u8], rettv: &mut TypvalT, evaluate: bool) -> (
         let name = &arg[name_start..name_start + len];
 
         // First try vim_getenv(), fast for normal environment vars -
-        // its own None already covers the original's combined "NULL
-        // or empty" check (os_getenv's own established treatment).
+        // matches the original's own combined "NULL or empty" check
+        // exactly (a real, SET-but-empty variable also falls through
+        // to the expand_env_save attempt below, not just an unset
+        // one).
         // SAFETY: forwarded from this function's own safety doc.
         let string = match unsafe { crate::os::env::vim_getenv(name) } {
-            Some(s) => Some(s),
-            None => {
+            Some(s) if !s.is_empty() => Some(s),
+            _ => {
                 // Next try expanding things like $VIM and ${HOME} -
-                // needs expand_env_save/expand_env_esc (~/, ~user/,
-                // `=expr`, Unix-style ${VAR} braces), a substantial
-                // separate undertaking beyond vim_getenv's own scope,
-                // not yet translated.
-                unimplemented!(
-                    "eval_env_var: expand_env_save (the $VIM/${{HOME}}-style path-expansion \
-                     fallback for a name vim_getenv couldn't resolve) not yet translated"
-                );
+                // via the already-real expand_env_save, called on the
+                // ORIGINAL "$NAME" text (including the leading '$'
+                // itself, matching the original's own `name - 1`) so
+                // a bare, unresolvable name is left as literal "$NAME"
+                // text by expand_env_esc's own fallback-copy behavior
+                // - which is then discarded here exactly as the
+                // original does (a leading '$' in the "expanded"
+                // result means nothing was really expanded).
+                // SAFETY: forwarded from this function's own safety
+                // doc.
+                let expanded = unsafe { crate::os::env::expand_env_save(&arg[..consumed]) };
+                if expanded.first() == Some(&b'$') { None } else { Some(expanded) }
             }
         };
 
@@ -6832,16 +6838,25 @@ mod tests {
     }
 
     #[test]
-    fn eval_env_var_unset_variable_hits_the_expand_env_save_gap() {
+    fn eval_env_var_unset_variable_falls_back_to_expand_env_save_and_yields_null() {
+        // Now that expand_env_save is real: an unset variable's "$NAME"
+        // text gets copied through verbatim by expand_env_esc's own
+        // fallback-copy behavior (nothing to expand), and a leading
+        // '$' in that "expanded" result is discarded (matches the
+        // original's own `if (string != NULL && *string == '$')
+        // XFREE_CLEAR(string);`) - so the net result is a null string,
+        // not a panic (this exact scenario used to hit the
+        // not-yet-translated expand_env_save gap; it doesn't anymore).
         let _lock = env_test_lock();
         // SAFETY: serialized via env_test_lock.
         unsafe { std::env::remove_var("NERO_TEST_EVAL_ENV_VAR_UNSET") };
 
-        let result = std::panic::catch_unwind(|| {
-            let mut rettv = TypvalT::default();
-            unsafe { eval_env_var(b"$NERO_TEST_EVAL_ENV_VAR_UNSET", &mut rettv, true) }
-        });
-        assert!(result.is_err(), "expected a panic (expand_env_save not yet translated)");
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval_env_var(b"$NERO_TEST_EVAL_ENV_VAR_UNSET", &mut rettv, true) };
+
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, b"$NERO_TEST_EVAL_ENV_VAR_UNSET".len());
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 
     #[test]

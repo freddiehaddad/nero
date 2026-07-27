@@ -482,6 +482,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"getscriptinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::runtime::f_getscriptinfo });
         m.insert(&b"undotree"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::undo::f_undotree });
+        m.insert(&b"stdpath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_stdpath });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
@@ -6248,6 +6249,48 @@ unsafe fn f_arglistid(argvars: &[TypvalT], rettv: &mut TypvalT) {
     });
 }
 
+/// `stdpath({what})` - a |standard-path| location (`f_stdpath`,
+/// `funcs.c`), via the already-existing
+/// `crate::os::stdpaths::get_xdg_home`.
+///
+/// Only the 5 single-path variants (`"config"`/`"data"`/`"cache"`/
+/// `"state"`/`"log"`) are modeled - `"run"` needs `vim_mktempdir` (a
+/// persistent session-lifetime temp-directory subsystem) and
+/// `"config_dirs"`/`"data_dirs"` need `xdg_remove_duplicate` plus a
+/// real `List`-returning `get_xdg_var_list`, neither yet translated;
+/// both `unimplemented!()` if requested. An unrecognized `{what}`
+/// value leaves `rettv` at its default null string - the original's
+/// own `semsg` for this case is omitted (message display, not
+/// tractable).
+///
+/// # Safety
+/// Forwarded from `crate::os::stdpaths::get_xdg_home`'s own safety doc.
+unsafe fn f_stdpath(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    use crate::os::stdpaths::{concat_fnames, get_xdg_home, XdgVarType};
+
+    rettv.value = TypvalValue::String(None);
+
+    let Some(what) = crate::eval::typval::tv_get_string_chk(&argvars[0]) else {
+        return; // Type error; errmsg already given.
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let dir = match what.as_slice() {
+        b"config" => unsafe { get_xdg_home(XdgVarType::ConfigHome) },
+        b"data" => unsafe { get_xdg_home(XdgVarType::DataHome) },
+        b"cache" => unsafe { get_xdg_home(XdgVarType::CacheHome) },
+        b"state" => unsafe { get_xdg_home(XdgVarType::StateHome) },
+        b"log" => unsafe { get_xdg_home(XdgVarType::StateHome) }.map(|base| concat_fnames(base, b"logs")),
+        b"run" => unimplemented!("f_stdpath: 'run' needs vim_mktempdir, not yet translated"),
+        b"config_dirs" | b"data_dirs" => {
+            unimplemented!("f_stdpath: a real List-returning get_xdg_var_list is not yet translated")
+        }
+        _ => None,
+    };
+
+    rettv.value = TypvalValue::String(dir);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7103,6 +7146,7 @@ mod tests {
             "gettagstack",
             "getscriptinfo",
             "undotree",
+            "stdpath",
             "winlayout",
             "winrestcmd",
             "escape",
@@ -14046,6 +14090,66 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_arglistid(&[num(1), num(-1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_stdpath ---
+
+    #[test]
+    fn stdpath_config_is_consistent_with_get_xdg_home() {
+        // Whatever the ambient XDG_CONFIG_HOME/$NVIM_APPNAME happen to
+        // be, f_stdpath("config") must agree with directly calling
+        // get_xdg_home - matching this crate's own established
+        // "check consistency with the real function, don't assert a
+        // hardcoded value depending on unowned ambient env state"
+        // precedent (e.g. os/stdpaths.rs's own
+        // appname_is_valid_is_consistent_with_get_appname). Holds
+        // os/stdpaths.rs's own shared XDG env-var test lock, since
+        // this reads the exact same ambient $XDG_* state its own
+        // tests mutate.
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
+        let expected = unsafe { crate::os::stdpaths::get_xdg_home(crate::os::stdpaths::XdgVarType::ConfigHome) };
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"config")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(expected));
+    }
+
+    #[test]
+    fn stdpath_log_appends_logs_to_the_state_home() {
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
+        let expected_base = unsafe { crate::os::stdpaths::get_xdg_home(crate::os::stdpaths::XdgVarType::StateHome) };
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"log")], &mut rettv) };
+        let expected = expected_base.map(|base| crate::os::stdpaths::concat_fnames(base, b"logs"));
+        assert_eq!(rettv.value, TypvalValue::String(expected));
+    }
+
+    #[test]
+    fn stdpath_unrecognized_value_is_a_null_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"not_a_real_stdpath")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn stdpath_type_error_is_a_null_string() {
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[list_tv], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "vim_mktempdir")]
+    fn stdpath_run_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"run")], &mut rettv) };
+    }
+
+    #[test]
+    #[should_panic(expected = "get_xdg_var_list")]
+    fn stdpath_config_dirs_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"config_dirs")], &mut rettv) };
     }
 
     // --- f_getpos / f_getcharpos / f_getcurpos / f_getcursorcharpos ---
