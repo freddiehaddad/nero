@@ -165,6 +165,83 @@ pub fn script_autoload(name: &[u8], reload: bool) -> bool {
     );
 }
 
+/// `getscriptinfo([{opts}])` - a `List` of currently sourced
+/// Vimscript/Lua scripts (`f_getscriptinfo`, `runtime.c`), via the
+/// already-existing script-item registry ([`script_item_count`]).
+///
+/// Since nothing in this crate can currently source a real script
+/// (`:source`/this file's own script-loading pipeline isn't
+/// translated), [`script_item_count`] is always `0` today - the
+/// original's own per-script loop is therefore always zero-iteration
+/// here, matching the "always-real-fast-path" pattern already
+/// established elsewhere in this crate (e.g. `autocmd.rs`'s empty
+/// `AUTOCMDS`). This will start returning real script entries, with
+/// zero changes needed here, the moment a future session translates
+/// `:source`.
+///
+/// `{opts}.sid` is parsed and validated for real, matching the
+/// original exactly (including its own "must be > 0" check, message
+/// display omitted per this crate's established policy). `{opts}.name`
+/// (a pattern filter) needs `vim_regcomp` (the real regex engine, not
+/// yet translated) - `unimplemented!()`s only when a real, non-empty
+/// `name` string is actually present; an absent/empty dict, or one
+/// with only `sid`, never reaches this (matches the original's own
+/// structure precisely: `tv_dict_get_string` returns `None` for a
+/// missing key, so no regex compilation is ever attempted then
+/// either).
+///
+/// # Safety
+/// Forwarded from `crate::eval::typval`'s own safety docs.
+pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], rettv: &mut crate::eval::typval_defs::TypvalT) {
+    use crate::eval::typval::{tv_check_for_opt_dict_arg, tv_dict_find, tv_dict_get_string, tv_get_number_chk, tv_list_alloc_ret};
+    use crate::eval::typval_defs::TypvalValue;
+    use crate::vim_defs::FAIL;
+
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let _ = unsafe { tv_list_alloc_ret(rettv, script_item_count() as isize) };
+
+    if !argvars.is_empty() && tv_check_for_opt_dict_arg(argvars, 0) == FAIL {
+        return;
+    }
+
+    if let Some(crate::eval::typval_defs::TypvalT { value: TypvalValue::Dict(d), .. }) = argvars.first() {
+        let d = *d;
+        // SAFETY: `d`, if non-null, is a live Dict owned by the
+        // caller's own argument typval for the duration of this call.
+        let sid_item = tv_dict_find(if d.is_null() { None } else { Some(unsafe { &mut *d }) }, b"sid");
+        if let Some(sid_ptr) = sid_item {
+            // SAFETY: `sid_ptr` was just returned by `tv_dict_find`
+            // above as a live item of `d`.
+            let sid_tv = unsafe { &(*sid_ptr).di_tv };
+            let mut error = false;
+            let sid = tv_get_number_chk(sid_tv, Some(&mut error));
+            // Skips the per-script loop below - a genuine no-op today
+            // (that loop is unconditionally zero-iteration, see this
+            // function's own doc comment), so clippy flags this early
+            // `return` as needless - kept anyway, matching the
+            // original's own real structure, so this stays correct
+            // the moment a future session adds the real loop.
+            #[allow(clippy::needless_return)]
+            if error || sid <= 0 {
+                return;
+            }
+        } else {
+            // SAFETY: forwarded above.
+            let name = unsafe { tv_dict_get_string(if d.is_null() { None } else { Some(&mut *d) }, b"name") };
+            if name.is_some_and(|n| !n.is_empty()) {
+                unimplemented!(
+                    "f_getscriptinfo: a real {{name}} pattern filter needs vim_regcomp, the \
+                     real regex engine, not yet translated"
+                );
+            }
+        }
+    }
+
+    // The per-script loop (over script IDs 1..=script_item_count())
+    // is always zero-iteration today - see this function's own doc
+    // comment.
+}
+
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
 /// each test (in this module, or `eval::vars`'s own tests exercising
 /// [`new_script_item`]/`new_script_vars` together) starts from a clean
@@ -284,5 +361,167 @@ mod tests {
         // "foo#bar" - a genuine package name (# after the first byte) -
         // reaches the not-yet-translated substantive path.
         script_autoload(b"foo#bar", false);
+    }
+
+    // --- f_getscriptinfo ---
+
+    #[test]
+    fn getscriptinfo_no_args_returns_an_empty_list() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getscriptinfo(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn getscriptinfo_still_empty_even_after_registering_a_script() {
+        // The per-script loop is always zero-iteration TODAY regardless
+        // of script_item_count(), since nothing real ever reaches this
+        // function through a genuine :source - but registering one
+        // directly (as this test does) still shouldn't change the
+        // observable result, since f_getscriptinfo's own loop bound
+        // (script_item_count()) simply becomes non-zero without any
+        // change to its own logic - proving the "always empty" claim
+        // isn't an artifact of script_item_count() staying at 0.
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        new_script_item(Some(b"foo.vim".to_vec()));
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getscriptinfo(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn getscriptinfo_valid_sid_succeeds() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        let opts = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `opts` was just allocated above, exclusively owned.
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *opts }, b"sid", 1);
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Dict(opts),
+            ..Default::default()
+        };
+        unsafe { f_getscriptinfo(std::slice::from_ref(&arg), &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l`/`opts` are each still exclusively owned; nothing
+        // else references either.
+        unsafe {
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_free(opts);
+        }
+    }
+
+    #[test]
+    fn getscriptinfo_sid_zero_or_negative_fails() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        for bad_sid in [0, -1] {
+            let opts = crate::eval::typval::tv_dict_alloc();
+            // SAFETY: `opts` was just allocated above, exclusively
+            // owned.
+            crate::eval::typval::tv_dict_add_nr(unsafe { &mut *opts }, b"sid", bad_sid);
+            let mut rettv = crate::eval::typval_defs::TypvalT::default();
+            let arg = crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Dict(opts),
+                ..Default::default()
+            };
+            unsafe { f_getscriptinfo(std::slice::from_ref(&arg), &mut rettv) };
+
+            // On this early-return path, rettv is left at whatever
+            // tv_list_alloc_ret already set it to (an empty list) -
+            // the original's own equivalent early `return;` likewise
+            // never touches rettv again after its own initial
+            // tv_list_alloc_ret call.
+            let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+            assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+            // SAFETY: `l`/`opts` are each still exclusively owned;
+            // nothing else references either.
+            unsafe {
+                crate::eval::typval::tv_list_unref(l);
+                crate::eval::typval::tv_dict_free(opts);
+            }
+        }
+    }
+
+    #[test]
+    fn getscriptinfo_empty_dict_argument_needs_no_regex() {
+        // No "sid" key and no "name" key at all - tv_dict_get_string
+        // returns None for the missing "name" key, so this never
+        // reaches the not-yet-translated vim_regcomp path, matching
+        // the original's own exact structure.
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        let opts = crate::eval::typval::tv_dict_alloc();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Dict(opts),
+            ..Default::default()
+        };
+        unsafe { f_getscriptinfo(std::slice::from_ref(&arg), &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l`/`opts` are each still exclusively owned; nothing
+        // else references either.
+        unsafe {
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_free(opts);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "vim_regcomp")]
+    fn getscriptinfo_name_pattern_filter_is_unimplemented() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        let opts = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `opts` was just allocated above, exclusively owned.
+        crate::eval::typval::tv_dict_add_str(unsafe { &mut *opts }, b"name", Some(b"foo"));
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Dict(opts),
+            ..Default::default()
+        };
+        unsafe { f_getscriptinfo(std::slice::from_ref(&arg), &mut rettv) };
+    }
+
+    #[test]
+    fn getscriptinfo_type_error_leaves_the_list_empty() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+
+        let bad_arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::List(std::ptr::null_mut()),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getscriptinfo(std::slice::from_ref(&bad_arg), &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 }

@@ -480,6 +480,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
+        m.insert(&b"getscriptinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::runtime::f_getscriptinfo });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
@@ -7099,6 +7100,7 @@ mod tests {
             "screenpos",
             "win_gettype",
             "gettagstack",
+            "getscriptinfo",
             "winlayout",
             "winrestcmd",
             "escape",
