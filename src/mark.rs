@@ -53,7 +53,16 @@
 //! `has_event(EventT::MarkSet)` is always `false` today, matching
 //! this crate's own established "always-empty autocmd registry"
 //! precedent, `unimplemented!()`s if genuinely reached rather than
-//! hardcoding the always-taken branch).
+//! hardcoding the always-taken branch); `fname2fnum` (`static` in the
+//! original, kept private here too - a real, always-taken-early-
+//! return translation for the same reason as `do_markset_autocmd`:
+//! its own first statement, `if (fname == NULL) return;`, is always
+//! taken today, since nothing translated can ever set `fname` to
+//! `Some(...)`); `mark_get_local`/`mark_get_global`/`mark_get` (now
+//! tractable given `pos_to_mark`/`mark_get_visual`/`bt_prompt`/
+//! `fname2fnum` all exist - only `mark_get_local`'s own final `else`
+//! branch, `mark_get_motion`, remains `unimplemented!()`, needing
+//! `findpar`/`findsent`, `search.c`/`textobject.c`).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
@@ -62,37 +71,39 @@
 //! - `mark_jumplist_iter`/`mark_global_iter`: only consumed by
 //!   `shada.c` (not yet translated); their C-style "raw pointer as an
 //!   opaque continuation token" API doesn't have an urgent caller yet.
-//! - `get_jumplist`/`mark_get`/`mark_get_global`/`mark_get_local`/
-//!   `mark_get_motion`/`switch_to_mark_buf`/`mark_move_to`: need
+//! - `mark_get_motion`/`switch_to_mark_buf`/`mark_move_to`: need
 //!   window switching (`ctx_switch`, not the bypass-only
 //!   `ctx_restore`) or `findpar`/`findsent` (`search.c`/
-//!   `textobject.c`) - `buflist_findnr` alone existing now isn't
-//!   enough to unblock these as a whole, re-verified directly.
-//! - `fname2fnum`: needs `expand_env` (`~/` expansion) and
-//!   `buflist_new()` (`buffer.c`, itself needing the eval engine's
-//!   `dict_T` and `apply_autocmds` - re-checked this session by reading
-//!   the real function, genuinely phase-5 material, not close) -
-//!   `path_shorten_fname`/`os_dirname` existing now isn't enough to
-//!   unblock this specific function as a whole (unlike
-//!   `fmarks_check_one`/`fmarks_check_names` above, which needed only
-//!   `path_fnamecmp`).
+//!   `textobject.c`).
 //! - `ex_marks`: the real, current upstream source is just a thin
 //!   `nlua_call_excmd(...)` wrapper delegating to a Lua implementation
 //!   (`vim._core.marks`) - needs the Lua host (`lua/executor.c`, phase
 //!   13), not just `exarg_T`.
-//! - `ex_delmarks`: needs `do_markset_autocmd` (-> `apply_autocmds`,
-//!   `autocmd.c`), `emsg`/`semsg` (`message.c`'s display pipeline, not
-//!   tractable), and `buflist_findnr` (`buffer.c`) - `exarg_T` existing
-//!   isn't enough to unblock this one as a whole.
+//! - `ex_delmarks`: re-checked directly now that `do_markset_autocmd`/
+//!   `clrallmarks`/`buflist_findnr` all exist - its own real,
+//!   reachable `emsg(_(e_invarg))`/`emsg(_(e_argreq))` calls for
+//!   genuinely invalid arguments need the actual message-display
+//!   pipeline (`message.c`, still not tractable) for real user-facing
+//!   correctness (unlike the narrower "skip the display, keep the
+//!   state" pattern used elsewhere - this function's own control flow
+//!   depends on parsing `eap->arg` into ranges, not a single
+//!   independent state change) - still genuinely blocked, for a more
+//!   precise reason than the stale note this replaces.
 //! - `ex_jumps`/`ex_changes`: need the real message-display pipeline
 //!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
 //!   tractable) - `cleanup_jumplist` (below) is no longer their
 //!   blocker.
+//! - `get_jumplist` (the `` <C-O> ``/`` <C-I> `` jumplist-navigation
+//!   entry point, distinct from `f_getjumplist`/`getjumplist()`,
+//!   already translated in `eval/funcs.rs`): now precisely scoped as
+//!   tractable given `cleanup_jumplist`/`fname2fnum`/`buflist_findnr`/
+//!   `setpcmark` all exist - not yet attempted, a reasonable next
+//!   target.
 
 use crate::buffer_defs::{BufT, TaggyT, WinT};
 use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
-use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS};
+use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, MarkGet, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS, NMARK_LOCAL_MAX};
 use crate::option_vars::{opt_jop_flag, OPTION_VARS};
 use crate::os::time::os_time;
 use crate::os::time_defs::Timestamp;
@@ -961,6 +972,162 @@ pub unsafe fn mark_get_visual(buf: &BufT, name: u8) -> *mut FmarkT {
         mark_ref.mark.coladd = 0;
     }
     mark
+}
+
+/// Get a local mark - lowercase letters and symbols
+/// (`mark_get_local`).
+///
+/// Some marks are not actually marks, but positions that are never
+/// adjusted, or motions presented as marks.
+///
+/// The `` ' ``/`` ` `` branch's own `pos_to_mark(curbuf, ...)` call
+/// (using the GLOBAL `curbuf`, not this function's own `buf`
+/// parameter) is a genuine, deliberate quirk already present in the
+/// original itself (marked there with its own `TODO(muniter)`
+/// comment) - preserved exactly, not "fixed" to use `buf`.
+///
+/// The final `else` branch (`mark_get_motion`, for the `{`/`}`/`(`/`)`
+/// "motion marks") needs `findpar`/`findsent` (`search.c`/
+/// `textobject.c`, neither translated) - `unimplemented!()`s if
+/// genuinely reached.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via its own `` ' ``/`` ` ``
+/// branch) and forwards [`pos_to_mark`]/[`mark_get_visual`]'s own
+/// requirements - same requirement as every other function that
+/// touches a `GlobalCell`: no overlapping live access.
+pub unsafe fn mark_get_local(buf: &mut BufT, win: &WinT, name: i32) -> *mut FmarkT {
+    let buf_handle = buf.handle;
+
+    let mark: *mut FmarkT = if crate::macros_defs::ascii_islower(name) {
+        &mut buf.b_namedm[(name - i32::from(b'a')) as usize] as *mut FmarkT
+    } else if name == i32::from(b'[') {
+        let op_start = buf.b_op_start;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { pos_to_mark(&*buf, None, op_start) }
+    } else if name == i32::from(b']') {
+        let op_end = buf.b_op_end;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { pos_to_mark(&*buf, None, op_end) }
+    } else if name == i32::from(b'<') || name == i32::from(b'>') {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { mark_get_visual(&*buf, name as u8) }
+    } else if name == i32::from(b'\'') || name == i32::from(b'`') {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { pos_to_mark(curbuf, None, win.w_pcmark) }
+    } else if name == i32::from(b'"') {
+        &mut buf.b_last_cursor as *mut FmarkT
+    } else if name == i32::from(b'^') {
+        &mut buf.b_last_insert as *mut FmarkT
+    } else if name == i32::from(b'.') {
+        &mut buf.b_last_change as *mut FmarkT
+    } else if name == i32::from(b':') && crate::buffer::bt_prompt(Some(&*buf)) {
+        &mut buf.b_prompt_start as *mut FmarkT
+    } else {
+        unimplemented!(
+            "mark_get_local: mark_get_motion needs findpar/findsent \
+             (search.c/textobject.c), not yet translated"
+        );
+    };
+
+    if !mark.is_null() {
+        // SAFETY: `mark` is non-null (just checked): either a valid
+        // pointer into `buf`'s own fields, or `pos_to_mark`/
+        // `mark_get_visual`'s own transient scratch/caller-provided
+        // pointer - both guaranteed writable once (forwarded from
+        // this function's own safety doc).
+        unsafe { &mut *mark }.fnum = buf_handle;
+    }
+    mark
+}
+
+/// Get a global mark, `` 'A' ``-`` 'Z' ``/`` '0' ``-`` '9' ``
+/// (`mark_get_global`).
+///
+/// `resolve` controls whether to try resolving the mark's file name to
+/// a real buffer number (a ShaDa-restoration-only concern, via
+/// `fname2fnum` - see that function's own doc comment for why this
+/// is currently always a real no-op).
+///
+/// The original's own `assert(false)` for an invalid `name` (neither a
+/// digit nor an uppercase letter) is translated as a `debug_assert!`
+/// returning a null pointer - every real call site (via [`mark_get`]'s
+/// own `ASCII_ISUPPER(name) || ascii_isdigit(name)` guard) already
+/// guarantees this precondition, so a release build here is provably
+/// safe rather than replicating the original's own genuine (if
+/// unreachable) out-of-bounds-array-index risk in that configuration.
+///
+/// # Safety
+/// Touches [`NAMEDFM`] (a `GlobalCell`) - same requirement as every
+/// other function that touches one: no overlapping live access.
+#[must_use]
+pub unsafe fn mark_get_global(resolve: bool, name: i32) -> *mut XfmarkT {
+    let idx = if crate::ascii_defs::ascii_isdigit(name) {
+        name - i32::from(b'0') + NMARKS
+    } else if crate::macros_defs::ascii_isupper(name) {
+        name - i32::from(b'A')
+    } else {
+        debug_assert!(false, "mark_get_global: name must be a digit or uppercase letter");
+        return std::ptr::null_mut();
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    let mark = &mut namedfm[idx as usize];
+    if resolve && mark.fmark.fnum == 0 {
+        fname2fnum(mark);
+    }
+    mark as *mut XfmarkT
+}
+
+/// Get any mark: resolves global marks (`` 'A' ``-`` 'Z' ``/
+/// `` '0' ``-`` '9' ``) via [`mark_get_global`] and local marks via
+/// [`mark_get_local`] (`mark_get`).
+///
+/// # Safety
+/// Forwarded from [`mark_get_global`]/[`mark_get_local`]/
+/// [`pos_to_mark`]'s own safety docs.
+pub unsafe fn mark_get(
+    buf: &mut BufT,
+    win: &WinT,
+    fmp: Option<&mut FmarkT>,
+    flag: MarkGet,
+    name: i32,
+) -> *mut FmarkT {
+    let mut fm: *mut FmarkT = std::ptr::null_mut();
+    if crate::macros_defs::ascii_isupper(name) || crate::ascii_defs::ascii_isdigit(name) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let xfm = unsafe { mark_get_global(!matches!(flag, MarkGet::AllNoResolve), name) };
+        // SAFETY: `xfm` is non-null (`mark_get_global` never returns
+        // null for a real digit/uppercase name, matching this
+        // function's own guard just above).
+        fm = unsafe { std::ptr::addr_of_mut!((*xfm).fmark) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if matches!(flag, MarkGet::BufLocal) && unsafe { (*xfm).fmark.fnum } != buf.handle {
+            let empty = crate::pos_defs::PosT { lnum: 0, col: 0, coladd: 0 };
+            // SAFETY: forwarded from this function's own safety doc.
+            return unsafe { pos_to_mark(buf, None, empty) };
+        }
+    } else if name > 0 && name < NMARK_LOCAL_MAX {
+        // SAFETY: forwarded from this function's own safety doc.
+        fm = unsafe { mark_get_local(buf, win, name) };
+    }
+
+    if let Some(fmp) = fmp {
+        if !fm.is_null() {
+            // SAFETY: `fm` is non-null (just checked). `FmarkT` owns
+            // heap data (`additional_data`), so this needs a real
+            // deep clone, not a bitwise copy, matching the original's
+            // own `*fmp = *fm;` struct-copy semantics faithfully
+            // (a shallow bitwise copy here would alias/double-free
+            // `additional_data`).
+            *fmp = unsafe { (*fm).clone() };
+            return fmp as *mut FmarkT;
+        }
+    }
+    fm
 }
 
 /// Return the line at mark `mp`, truncated to fit in the window. The
@@ -2238,6 +2405,224 @@ mod tests {
         let end_mark = unsafe { mark_get_visual(&buf, b'>') };
         assert_eq!(unsafe { &*end_mark }.mark.col, MAXCOL);
         assert_eq!(unsafe { &*end_mark }.mark.coladd, 0);
+    }
+
+    // --- mark_get_local / mark_get_global / mark_get ---
+
+    #[test]
+    fn mark_get_local_lowercase_returns_buffer_local_named_mark() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT { handle: 3, ..Default::default() };
+        let win = WinT::default();
+        let mark = unsafe { mark_get_local(&mut buf, &win, i32::from(b'q')) };
+        assert!(!mark.is_null());
+        assert_eq!(unsafe { &*mark }.fnum, 3);
+        assert!(std::ptr::eq(mark, std::ptr::addr_of!(buf.b_namedm[(b'q' - b'a') as usize])));
+    }
+
+    #[test]
+    fn mark_get_local_square_brackets_use_pos_to_mark() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT { handle: 4, ..Default::default() };
+        buf.b_op_start = PosT { lnum: 2, col: 0, coladd: 0 };
+        buf.b_op_end = PosT { lnum: 9, col: 3, coladd: 0 };
+        let win = WinT::default();
+
+        let start = unsafe { mark_get_local(&mut buf, &win, i32::from(b'[')) };
+        assert_eq!(unsafe { &*start }.mark, buf.b_op_start);
+        assert_eq!(unsafe { &*start }.fnum, 4);
+
+        let end = unsafe { mark_get_local(&mut buf, &win, i32::from(b']')) };
+        assert_eq!(unsafe { &*end }.mark, buf.b_op_end);
+    }
+
+    #[test]
+    fn mark_get_local_angle_brackets_delegate_to_mark_get_visual() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT { handle: 5, ..Default::default() };
+        buf.b_visual.vi_start = PosT { lnum: 1, col: 0, coladd: 0 };
+        buf.b_visual.vi_end = PosT { lnum: 3, col: 2, coladd: 0 };
+        let win = WinT::default();
+
+        let mark = unsafe { mark_get_local(&mut buf, &win, i32::from(b'<')) };
+        assert_eq!(unsafe { &*mark }.mark, buf.b_visual.vi_start);
+        assert_eq!(unsafe { &*mark }.fnum, 5);
+    }
+
+    #[test]
+    fn mark_get_local_apostrophe_uses_curbuf_position_but_buf_param_fnum() {
+        let mut curbuf = BufT { handle: 6, ..Default::default() };
+        let mut buf = BufT { handle: 7, ..Default::default() };
+        let mut win = WinT {
+            w_pcmark: PosT { lnum: 4, col: 1, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut curbuf as *mut BufT);
+
+        // The POSITION comes from GLOBALS.curbuf (via win.w_pcmark,
+        // pos_to_mark's own curbuf-using call) - a genuine, deliberate
+        // quirk in the original itself, preserved exactly. But
+        // mark_get_local's own TRAILING `mark->fnum = buf->b_fnum;`
+        // step ALWAYS uses the function's own `buf` PARAMETER (7),
+        // unconditionally overwriting whatever fnum pos_to_mark itself
+        // just computed from curbuf (6) - also a real, faithfully-
+        // preserved quirk, not a bug in this translation (confirmed by
+        // re-reading the original source directly: this final
+        // overwrite is NOT gated on which branch was taken).
+        let mark = unsafe { mark_get_local(&mut buf, &win, i32::from(b'\'')) };
+        assert_eq!(unsafe { &*mark }.mark, PosT { lnum: 4, col: 1, coladd: 0 });
+        assert_eq!(unsafe { &*mark }.fnum, 7);
+    }
+
+    #[test]
+    fn mark_get_local_double_quote_caret_dot_return_the_respective_fields() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT { handle: 8, ..Default::default() };
+        buf.b_last_cursor.mark = PosT { lnum: 1, col: 0, coladd: 0 };
+        buf.b_last_insert.mark = PosT { lnum: 2, col: 0, coladd: 0 };
+        buf.b_last_change.mark = PosT { lnum: 3, col: 0, coladd: 0 };
+        let win = WinT::default();
+
+        let quote = unsafe { mark_get_local(&mut buf, &win, i32::from(b'"')) };
+        assert_eq!(unsafe { &*quote }.mark.lnum, 1);
+        let caret = unsafe { mark_get_local(&mut buf, &win, i32::from(b'^')) };
+        assert_eq!(unsafe { &*caret }.mark.lnum, 2);
+        let dot = unsafe { mark_get_local(&mut buf, &win, i32::from(b'.')) };
+        assert_eq!(unsafe { &*dot }.mark.lnum, 3);
+    }
+
+    #[test]
+    fn mark_get_local_colon_on_prompt_buffer_returns_prompt_start() {
+        let _guard = globals_test_lock();
+        let mut buf = BufT { handle: 9, b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        buf.b_prompt_start.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        let win = WinT::default();
+
+        let mark = unsafe { mark_get_local(&mut buf, &win, i32::from(b':')) };
+        assert_eq!(unsafe { &*mark }.mark.lnum, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "mark_get_motion")]
+    fn mark_get_local_colon_on_non_prompt_buffer_panics() {
+        let mut buf = BufT { handle: 10, ..Default::default() };
+        let win = WinT::default();
+        unsafe { mark_get_local(&mut buf, &win, i32::from(b':')) };
+    }
+
+    #[test]
+    #[should_panic(expected = "mark_get_motion")]
+    fn mark_get_local_unrecognized_character_panics() {
+        let mut buf = BufT { handle: 11, ..Default::default() };
+        let win = WinT::default();
+        unsafe { mark_get_local(&mut buf, &win, i32::from(b'{')) };
+    }
+
+    #[test]
+    fn mark_get_global_uppercase_letter_resolves_via_namedfm() {
+        let _lock = globals_test_lock();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        namedfm[mark_global_index(b'B') as usize].fmark.mark = PosT { lnum: 7, col: 0, coladd: 0 };
+        namedfm[mark_global_index(b'B') as usize].fmark.fnum = 0;
+
+        let mark = unsafe { mark_get_global(true, i32::from(b'B')) };
+        assert_eq!(unsafe { &*mark }.fmark.mark.lnum, 7);
+        // resolve=true called fname2fnum, which is a real no-op today
+        // (fname is always None) - fnum stays 0, not panicking.
+        assert_eq!(unsafe { &*mark }.fmark.fnum, 0);
+
+        *unsafe { NAMEDFM.get_mut() } = prev_namedfm;
+    }
+
+    #[test]
+    fn mark_get_global_digit_resolves_via_namedfm() {
+        let _lock = globals_test_lock();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        namedfm[mark_global_index(b'3') as usize].fmark.mark = PosT { lnum: 9, col: 0, coladd: 0 };
+
+        let mark = unsafe { mark_get_global(false, i32::from(b'3')) };
+        assert_eq!(unsafe { &*mark }.fmark.mark.lnum, 9);
+
+        *unsafe { NAMEDFM.get_mut() } = prev_namedfm;
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "digit or uppercase")]
+    fn mark_get_global_debug_panics_on_invalid_name() {
+        let _lock = globals_test_lock();
+        let _ = unsafe { mark_get_global(false, i32::from(b'x')) };
+    }
+
+    #[test]
+    fn mark_get_uppercase_delegates_to_mark_get_global() {
+        let _lock = globals_test_lock();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        let mut buf = BufT { handle: 12, ..Default::default() };
+        namedfm[mark_global_index(b'C') as usize].fmark.mark = PosT { lnum: 11, col: 0, coladd: 0 };
+        namedfm[mark_global_index(b'C') as usize].fmark.fnum = 12;
+        let win = WinT::default();
+
+        let mark = unsafe { mark_get(&mut buf, &win, None, MarkGet::All, i32::from(b'C')) };
+        assert_eq!(unsafe { &*mark }.mark.lnum, 11);
+
+        *unsafe { NAMEDFM.get_mut() } = prev_namedfm;
+    }
+
+    #[test]
+    fn mark_get_buf_local_flag_returns_pos_to_mark_when_fnum_mismatches() {
+        let _lock = globals_test_lock();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        let mut buf = BufT { handle: 13, ..Default::default() };
+        // Global mark 'D' belongs to a DIFFERENT buffer (99).
+        namedfm[mark_global_index(b'D') as usize].fmark.mark = PosT { lnum: 1, col: 0, coladd: 0 };
+        namedfm[mark_global_index(b'D') as usize].fmark.fnum = 99;
+        let win = WinT::default();
+
+        let mark = unsafe { mark_get(&mut buf, &win, None, MarkGet::BufLocal, i32::from(b'D')) };
+        // A real, distinct fallback mark (via pos_to_mark's own
+        // scratch slot) with lnum == 0 - not the global mark itself.
+        assert_eq!(unsafe { &*mark }.mark.lnum, 0);
+
+        *unsafe { NAMEDFM.get_mut() } = prev_namedfm;
+    }
+
+    #[test]
+    fn mark_get_lowercase_delegates_to_mark_get_local() {
+        let _lock = globals_test_lock();
+        let mut buf = BufT { handle: 14, ..Default::default() };
+        let win = WinT::default();
+
+        let mark = unsafe { mark_get(&mut buf, &win, None, MarkGet::All, i32::from(b'm')) };
+        assert!(std::ptr::eq(mark, std::ptr::addr_of!(buf.b_namedm[(b'm' - b'a') as usize])));
+        assert_eq!(unsafe { &*mark }.fnum, 14);
+    }
+
+    #[test]
+    fn mark_get_with_fmp_copies_into_the_provided_slot() {
+        let _lock = globals_test_lock();
+        let mut buf = BufT { handle: 15, ..Default::default() };
+        buf.b_namedm[(b'n' - b'a') as usize].mark = PosT { lnum: 20, col: 1, coladd: 0 };
+        let win = WinT::default();
+        let mut scratch = FmarkT::default();
+
+        let mark = unsafe { mark_get(&mut buf, &win, Some(&mut scratch), MarkGet::All, i32::from(b'n')) };
+        assert!(std::ptr::eq(mark, &scratch as *const FmarkT as *mut FmarkT));
+        assert_eq!(scratch.mark.lnum, 20);
+        assert_eq!(scratch.fnum, 15);
+    }
+
+    #[test]
+    fn mark_get_out_of_range_name_returns_null() {
+        let _lock = globals_test_lock();
+        let mut buf = BufT::default();
+        let win = WinT::default();
+        let mark = unsafe { mark_get(&mut buf, &win, None, MarkGet::All, 0) };
+        assert!(mark.is_null());
     }
 
     /// RAII guard restoring `GLOBALS.firstwin` on drop. Unlike
