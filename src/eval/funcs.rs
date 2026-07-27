@@ -441,6 +441,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
+        m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4254,6 +4255,47 @@ unsafe fn f_win_screenpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_list_append_number(l, col) };
 }
 
+/// `win_gettype([{nr}])` - the type of window `{nr}` (default the
+/// current window): `""` (normal), `"autocmd"`, `"preview"`,
+/// `"popup"`, `"command"`, `"loclist"`, or `"quickfix"`
+/// (`f_win_gettype`, `eval/window.c`). An explicit, not-found `{nr}`
+/// yields `"unknown"`.
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]'s own
+/// safety doc.
+unsafe fn f_win_gettype(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if !argvars.is_empty() && !matches!(argvars[0].value, TypvalValue::Unknown) {
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+        if wp.is_null() {
+            rettv.value = TypvalValue::String(Some(b"unknown".to_vec()));
+            return;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    let type_str: &[u8] = if crate::context::is_ctx_win(wp) {
+        b"autocmd"
+    } else if w.w_onebuf_opt.wo_pvw != 0 {
+        b"preview"
+    } else if w.w_floating {
+        b"popup"
+    // SAFETY: forwarded from this function's own safety doc.
+    } else if unsafe { crate::buffer::bt_cmdwin(Some(&*w.w_buffer)) } {
+        b"command"
+    // SAFETY: forwarded from this function's own safety doc.
+    } else if crate::buffer::bt_quickfix(Some(unsafe { &*w.w_buffer })) {
+        if w.w_llist_ref.is_null() { b"quickfix" } else { b"loclist" }
+    } else {
+        b""
+    };
+    rettv.value = TypvalValue::String(Some(type_str.to_vec()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5069,6 +5111,7 @@ mod tests {
             "winheight",
             "winwidth",
             "win_screenpos",
+            "win_gettype",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9164,5 +9207,101 @@ mod tests {
             assert_eq!((*item1).li_tv.value, TypvalValue::Number(0));
             crate::eval::typval::tv_list_unref(l);
         }
+    }
+
+    // --- f_win_gettype ---
+
+    #[test]
+    fn win_gettype_normal_window_is_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_preview_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_pvw: 1, ..Default::default() },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"preview".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_floating_window_is_popup() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_floating: true,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"popup".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_quickfix_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: Some(b"quickfix".to_vec()), ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[], &mut rettv) };
+        // w_llist_ref is null by default, so this is a quickfix window,
+        // not a loclist one (the only distinction between the two -
+        // QfInfoT is an opaque placeholder with no public constructor,
+        // so the "loclist" branch isn't separately tested here, only
+        // this one-line null-check itself is worth noting as trivial).
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"quickfix".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_unknown_window_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"unknown".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_by_real_window_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_floating: true,
+            ..focusable_win(1234)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[num(1234)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"popup".to_vec())));
     }
 }
