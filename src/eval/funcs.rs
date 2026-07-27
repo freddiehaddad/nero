@@ -449,6 +449,10 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"reg_recording"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recording });
         m.insert(&b"reg_recorded"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recorded });
         m.insert(&b"getcmdwintype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcmdwintype });
+        m.insert(&b"getpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getpos });
+        m.insert(&b"getcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getcharpos });
+        m.insert(&b"getcurpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcurpos });
+        m.insert(&b"getcursorcharpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcursorcharpos });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -3984,6 +3988,157 @@ fn f_getcmdwintype(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     }));
 }
 
+/// Shared implementation for `getpos()`/`getcharpos()`/`getcurpos()`/
+/// `getcursorcharpos()` (`getpos_both`, `funcs.c`).
+///
+/// `getcurpos` selects the cursor-position family (`{winid}` argument,
+/// current position, plus a trailing `curswant`) vs. the mark/
+/// expression-position family (`{expr}` argument, via
+/// [`crate::eval::eval::var2fpos`]). `charcol` selects the
+/// character-column (`getcharpos`/`getcursorcharpos`) vs. byte-column
+/// (`getpos`/`getcurpos`) variants.
+///
+/// The original's own `ret_fnum` out-parameter (`fnum`) is only ever
+/// set inside `var2fpos`'s own `'m`-mark branch, which is not yet
+/// translated there (panics if reached) - every path this function
+/// can actually complete leaves it at its own initial `-1`, so this
+/// translation just uses a fixed `-1` rather than threading a mutable
+/// out-parameter through.
+///
+/// # Safety
+/// `GLOBALS.curwin` must be a valid, live `WinT` whose `w_buffer` is
+/// also valid and live.
+unsafe fn getpos_both(argvars: &[TypvalT], rettv: &mut TypvalT, getcurpos: bool, charcol: bool) {
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let mut wp = curwin;
+    let mut fp: Option<crate::pos_defs::PosT> = None;
+    let fnum: i64 = -1;
+
+    if getcurpos {
+        if argvars.first().is_some_and(|tv| !matches!(tv.value, TypvalValue::Unknown)) {
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+            if !wp.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                fp = Some(unsafe { &*wp }.w_cursor);
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            fp = Some(unsafe { &*curwin }.w_cursor);
+        }
+        if let Some(ref mut pos) = fp {
+            if charcol {
+                // SAFETY: forwarded from this function's own safety doc.
+                let buf = unsafe { &*wp }.w_buffer;
+                // SAFETY: forwarded from this function's own safety doc.
+                pos.col = unsafe {
+                    crate::eval::eval::buf_byteidx_to_charidx(&mut *buf, pos.lnum, pos.col)
+                };
+            }
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, charcol, curwin) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, 4 + isize::from(getcurpos))
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, if fnum != -1 { fnum } else { 0 }) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, fp.map_or(0, |p| i64::from(p.lnum))) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::typval::tv_list_append_number(
+            l,
+            fp.map_or(0, |p| {
+                if p.col == crate::pos_defs::MAXCOL {
+                    i64::from(crate::pos_defs::MAXCOL)
+                } else {
+                    i64::from(p.col) + 1
+                }
+            }),
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, fp.map_or(0, |p| i64::from(p.coladd))) };
+
+    if getcurpos {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        let save_set_curswant = w.w_set_curswant;
+        let save_curswant = w.w_curswant;
+        let save_virtcol = w.w_virtcol;
+
+        if std::ptr::eq(wp, curwin) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::update_curswant() };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::eval::typval::tv_list_append_number(
+                l,
+                if w.w_curswant == crate::pos_defs::MAXCOL {
+                    i64::from(crate::pos_defs::MAXCOL)
+                } else {
+                    i64::from(w.w_curswant) + 1
+                },
+            );
+        }
+
+        // Do not change "curswant", as it is unexpected that a get
+        // function has a side effect.
+        if std::ptr::eq(wp, curwin) && save_set_curswant {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            w.w_set_curswant = save_set_curswant;
+            w.w_curswant = save_curswant;
+            w.w_virtcol = save_virtcol;
+            w.w_valid &= !i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+        }
+    }
+}
+
+/// `"getpos({expr})"` function (`f_getpos`).
+///
+/// # Safety
+/// Forwarded from `getpos_both`'s own safety doc.
+pub unsafe fn f_getpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getpos_both(argvars, rettv, false, false) };
+}
+
+/// `"getcharpos({expr})"` function (`f_getcharpos`).
+///
+/// # Safety
+/// Forwarded from `getpos_both`'s own safety doc.
+pub unsafe fn f_getcharpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getpos_both(argvars, rettv, false, true) };
+}
+
+/// `"getcurpos([{winid}])"` function (`f_getcurpos`).
+///
+/// # Safety
+/// Forwarded from `getpos_both`'s own safety doc.
+pub unsafe fn f_getcurpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getpos_both(argvars, rettv, true, false) };
+}
+
+/// `"getcursorcharpos([{winid}])"` function (`f_getcursorcharpos`).
+///
+/// # Safety
+/// Forwarded from `getpos_both`'s own safety doc.
+pub unsafe fn f_getcursorcharpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getpos_both(argvars, rettv, true, true) };
+}
+
 /// `tr({src}, {fromstr}, {tostr})` - `{src}` with every character
 /// that appears in `{fromstr}` replaced by the character at the same
 /// POSITION in `{tostr}` (`f_tr`, `strings.c`). A character not found
@@ -6383,6 +6538,10 @@ mod tests {
             "reg_recording",
             "reg_recorded",
             "getcmdwintype",
+            "getpos",
+            "getcharpos",
+            "getcurpos",
+            "getcursorcharpos",
             "eval",
             "gettext",
             "nextnonblank",
@@ -12365,5 +12524,168 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_arglistid(&[num(1), num(-1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_getpos / f_getcharpos / f_getcurpos / f_getcursorcharpos ---
+
+    fn list_numbers(l: *mut crate::eval::typval_defs::ListT) -> Vec<i64> {
+        let len = unsafe { crate::eval::typval::tv_list_len(l) };
+        (0..len)
+            .map(|i| {
+                let item = unsafe { crate::eval::typval::tv_list_find(l, i) };
+                let TypvalValue::Number(n) = (unsafe { &*item }).li_tv.value else {
+                    panic!("expected a Number item")
+                };
+                n
+            })
+            .collect()
+    }
+
+    #[test]
+    fn getpos_dot_returns_the_cursor_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getpos(&[string(b".")], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        // [bufnum, lnum, col, off] - bufnum always 0 (fnum stays -1
+        // for every non-mark path), lnum=1, col=3 (1-based), off=0.
+        assert_eq!(list_numbers(l), vec![0, 1, 3, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getpos_invalid_expr_returns_all_zeros() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getpos(&[string(b"bogus")], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_numbers(l), vec![0, 0, 0, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getcharpos_reports_a_character_column_for_multibyte_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "\xE4\xB8\xAD" is U+4E2D (中), a 3-byte UTF-8 character.
+        // Cursor sits at byte offset 3 (right after 中, before "h").
+        let mut buf = buf_with_lines(&[b"\xE4\xB8\xADhello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        // The "." (cursor) form is the one that actually converts
+        // byte->character columns (via var2fpos's own STRING branch,
+        // buf_byteidx_to_charidx) - unlike the [lnum, col, coladd]
+        // LIST form, which the original leaves as-is regardless of
+        // `charcol` (only using `charcol` to pick the right bounds-
+        // check length, matching eval.c's own var2fpos exactly).
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcharpos(&[string(b".")], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        // Byte column 3 (0-based) is character column 1 (0-based,
+        // i.e. the 2nd character) - one character (中) precedes it -
+        // reported 1-based as 2.
+        assert_eq!(list_numbers(l), vec![0, 1, 2, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getcurpos_returns_the_current_windows_cursor_plus_curswant() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcurpos(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        // [bufnum, lnum, col, off, curswant] - 5 elements for getcurpos.
+        let nums = list_numbers(l);
+        assert_eq!(nums.len(), 5);
+        assert_eq!(&nums[..4], &[0, 1, 3, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getcurpos_with_winid_resolves_a_different_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win1 = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut win2 = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 },
+            ..focusable_win(2)
+        };
+        win1.w_next = &mut win2 as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win1, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcurpos(&[num(2)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        let nums = list_numbers(l);
+        assert_eq!(&nums[..4], &[0, 1, 5, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getcursorcharpos_reports_a_character_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"\xE4\xB8\xADhello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcursorcharpos(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        let nums = list_numbers(l);
+        // Byte column 3 (cursor sits right after 中) is character
+        // column 2 (1-based).
+        assert_eq!(&nums[..4], &[0, 1, 2, 0]);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        close_test_buf(buf);
     }
 }
