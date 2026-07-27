@@ -448,6 +448,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"argidx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_argidx });
         m.insert(&b"rand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_rand });
         m.insert(&b"srand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_srand });
+        m.insert(&b"reltime"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_reltime });
+        m.insert(&b"reltimestr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimestr });
+        m.insert(&b"reltimefloat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimefloat });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4509,6 +4512,103 @@ unsafe fn f_srand(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// Combine a `[high, low]` 2-`Number` `List` (as produced by
+/// [`f_reltime`]'s own split) back into a [`crate::types_defs::ProftimeT`]
+/// (`list2proftime`). `FAIL` if `arg` isn't a 2-element `List`.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_find_nr`]'s own
+/// safety doc.
+unsafe fn list2proftime(arg: &TypvalT) -> Option<crate::types_defs::ProftimeT> {
+    let TypvalValue::List(l) = &arg.value else {
+        return None;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::eval::typval::tv_list_len(*l) } != 2 {
+        return None;
+    }
+    let mut error = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    let n1 = unsafe { crate::eval::typval::tv_list_find_nr(*l, 0, Some(&mut error)) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let n2 = unsafe { crate::eval::typval::tv_list_find_nr(*l, 1, Some(&mut error)) };
+    if error {
+        return None;
+    }
+    // `struct { int32_t low, high; }` reinterpreted as one 64-bit
+    // value - `low` occupies the first (least-significant) 4 bytes on
+    // this crate's little-endian target platforms, `high` the last 4.
+    let high = n1 as i32 as u32;
+    let low = n2 as i32 as u32;
+    Some((u64::from(high) << 32) | u64::from(low))
+}
+
+/// `reltime([{start} [, {end}]])` - a value representing the current
+/// time, or the elapsed time since `{start}` (optionally until
+/// `{end}`) (`f_reltime`, `funcs.c`), as a 2-`Number` `[high, low]`
+/// `List` splitting the underlying 64-bit
+/// [`crate::types_defs::ProftimeT`] (`varnumber_T` is only guaranteed
+/// 32-bit, matching the original's own documented reason for this
+/// split).
+///
+/// # Safety
+/// Forwarded from [`list2proftime`]'s own safety doc.
+unsafe fn f_reltime(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let res = if argvars.is_empty() {
+        crate::profile::profile_start()
+    } else if argvars.len() < 2 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let Some(start) = (unsafe { list2proftime(&argvars[0]) }) else {
+            return;
+        };
+        crate::profile::profile_end(start)
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (Some(start), Some(end)) = (unsafe { list2proftime(&argvars[0]) }, unsafe { list2proftime(&argvars[1]) })
+        else {
+            return;
+        };
+        crate::profile::profile_sub(end, start)
+    };
+
+    let high = (res >> 32) as i32;
+    let low = res as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(high)) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(low)) };
+}
+
+/// `reltimestr({time})` - a human-readable `String` for the value
+/// returned by [`f_reltime`] (`f_reltimestr`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`list2proftime`]'s own safety doc.
+unsafe fn f_reltimestr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(tm) = (unsafe { list2proftime(&argvars[0]) }) else {
+        return;
+    };
+    rettv.value = TypvalValue::String(Some(crate::profile::profile_msg(tm).into_bytes()));
+}
+
+/// `reltimefloat({time})` - a `Float` number of seconds for the value
+/// returned by [`f_reltime`] (`f_reltimefloat`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`list2proftime`]'s own safety doc.
+unsafe fn f_reltimefloat(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Float(0.0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(tm) = (unsafe { list2proftime(&argvars[0]) }) else {
+        return;
+    };
+    rettv.value = TypvalValue::Float(crate::profile::profile_signed(tm) as f64 / 1_000_000_000.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5331,6 +5431,9 @@ mod tests {
             "argidx",
             "rand",
             "srand",
+            "reltime",
+            "reltimestr",
+            "reltimefloat",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9740,5 +9843,127 @@ mod tests {
         // Both calls use the same shared global seed, which advances
         // each call - two consecutive calls must differ.
         assert_ne!(r1.value, r2.value);
+    }
+
+    // --- list2proftime / f_reltime / f_reltimestr / f_reltimefloat ---
+
+    fn proftime_list(high: i32, low: i32) -> TypvalT {
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(high)) };
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(low)) };
+        unsafe { crate::eval::typval::tv_list_ref(l) };
+        TypvalT { value: TypvalValue::List(l), ..Default::default() }
+    }
+
+    #[test]
+    fn list2proftime_roundtrips_through_f_reltime_split() {
+        // A value with the high 32 bits' own sign bit set, to verify
+        // the i32-cast-then-reinterpret-as-u32 roundtrip works for
+        // negative halves too, not just small positive ones.
+        let original: u64 = 0xFFFF_FFFF_1234_5678;
+        let high = (original >> 32) as i32;
+        let low = original as i32;
+        let l = proftime_list(high, low);
+        let tm = unsafe { list2proftime(&l) }.expect("valid 2-element list");
+        assert_eq!(tm, original);
+        let TypvalValue::List(list) = l.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn list2proftime_wrong_length_list_fails() {
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(l, 1) };
+        unsafe { crate::eval::typval::tv_list_ref(l) };
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        assert_eq!(unsafe { list2proftime(&tv) }, None);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn list2proftime_non_list_fails() {
+        assert_eq!(unsafe { list2proftime(&num(5)) }, None);
+    }
+
+    #[test]
+    fn reltime_no_args_returns_a_2_element_list() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltime(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn reltime_one_arg_computes_elapsed_time_since_start() {
+        let mut start_rettv = TypvalT::default();
+        unsafe { f_reltime(&[], &mut start_rettv) };
+        let TypvalValue::List(start_l) = &start_rettv.value else { panic!("expected a List") };
+        let start_l = *start_l;
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltime(&[start_rettv], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_list_unref(start_l);
+        }
+    }
+
+    #[test]
+    fn reltime_two_args_computes_difference() {
+        let start = proftime_list(0, 0);
+        let end = proftime_list(0, 1_000_000_000);
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltime(&[start.clone(), end.clone()], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::Number(0));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(1_000_000_000));
+            crate::eval::typval::tv_list_unref(l);
+        }
+        let (TypvalValue::List(sl), TypvalValue::List(el)) = (start.value, end.value) else { unreachable!() };
+        unsafe {
+            crate::eval::typval::tv_list_unref(sl);
+            crate::eval::typval::tv_list_unref(el);
+        }
+    }
+
+    #[test]
+    fn reltimestr_of_zero_matches_profile_msg() {
+        let zero = proftime_list(0, 0);
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltimestr(std::slice::from_ref(&zero), &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(crate::profile::profile_msg(0).into_bytes())));
+        let TypvalValue::List(l) = zero.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn reltimestr_invalid_arg_defaults_to_null_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltimestr(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn reltimefloat_of_one_second() {
+        let one_sec = proftime_list(0, 1_000_000_000);
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltimefloat(std::slice::from_ref(&one_sec), &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Float(1.0));
+        let TypvalValue::List(l) = one_sec.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn reltimefloat_invalid_arg_defaults_to_zero() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_reltimefloat(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Float(0.0));
     }
 }
