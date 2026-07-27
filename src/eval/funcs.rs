@@ -440,6 +440,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"line"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_line });
         m.insert(&b"col"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_col });
         m.insert(&b"charcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_charcol });
+        m.insert(&b"virtcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_virtcol });
         m.insert(&b"winbufnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winbufnr });
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
@@ -4199,6 +4200,89 @@ unsafe fn f_charcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { get_col(argvars, rettv, true) };
 }
 
+/// `virtcol({expr} [, {list} [, {winid}]])` - the virtual (screen)
+/// column of file position `{expr}` (`f_virtcol`, `funcs.c`), via
+/// [`crate::eval::eval::var2fpos`]/[`crate::plines::getvvcol`]. A
+/// truthy `{list}` returns `[startcol, endcol]` instead of just the
+/// end column (relevant when `{expr}` lands on a double-width/tab
+/// character).
+///
+/// The original's own `fnum == bp->b_fnum` cross-buffer-mark check is
+/// omitted: this crate's own `var2fpos` never resolves a position to
+/// any buffer OTHER than `wp.w_buffer` (it doesn't yet support the
+/// `'x` mark form, the only form that could - see `var2fpos`'s own
+/// doc comment), so that check is unconditionally true given what
+/// `var2fpos` can currently return.
+///
+/// # Safety
+/// Forwarded from [`crate::window::win_id2wp_tp`]/
+/// [`crate::cursor::check_cursor`]/[`crate::eval::eval::var2fpos`]/
+/// [`crate::memline::ml_get_buf_len`]/[`crate::plines::getvvcol`]'s
+/// own safety docs.
+unsafe fn f_virtcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut vcol_start: crate::pos_defs::ColnrT = 0;
+    let mut vcol_end: crate::pos_defs::ColnrT = 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp: *mut crate::buffer_defs::WinT = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    'theend: {
+        if argvars.len() > 2
+            && !matches!(argvars[1].value, TypvalValue::Unknown)
+            && !matches!(argvars[2].value, TypvalValue::Unknown)
+        {
+            // use the window specified in the third argument
+            let id = crate::eval::typval::tv_get_number(&argvars[2]) as i32;
+            // SAFETY: forwarded from this function's own safety doc.
+            let (found_wp, found_tp) = unsafe { crate::window::win_id2wp_tp(id) };
+            if found_wp.is_null() || found_tp.is_null() {
+                break 'theend;
+            }
+            wp = found_wp;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::check_cursor(wp) };
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let bp: *mut crate::buffer_defs::BufT = unsafe { (*wp).w_buffer };
+        // SAFETY: forwarded from this function's own safety doc.
+        let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], false, false, wp) };
+        let Some(mut fp) = fp else { break 'theend };
+        // SAFETY: forwarded from this function's own safety doc.
+        if fp.lnum > unsafe { &*bp }.b_ml.ml_line_count {
+            break 'theend;
+        }
+
+        // Limit the column to a valid value, getvvcol() doesn't check.
+        if fp.col < 0 {
+            fp.col = 0;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let len = unsafe { crate::memline::ml_get_buf_len(&mut *bp, fp.lnum) };
+            if fp.col > len {
+                fp.col = len;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::plines::getvvcol(wp, &mut fp, Some(&mut vcol_start), None, Some(&mut vcol_end), 0);
+        }
+        vcol_start += 1;
+        vcol_end += 1;
+    }
+
+    if argvars.len() > 1 && non_zero_arg(&argvars[1..]) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(vcol_start)) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(vcol_end)) };
+    } else {
+        rettv.value = TypvalValue::Number(i64::from(vcol_end));
+    }
+}
+
 /// `winbufnr({nr})` - the buffer number of window `{nr}` (a window
 /// number or window ID; `-1` if not found) (`f_winbufnr`,
 /// `eval/window.c`).
@@ -5690,6 +5774,7 @@ mod tests {
             "line",
             "col",
             "charcol",
+            "virtcol",
             "winbufnr",
             "winheight",
             "winwidth",
@@ -9672,6 +9757,86 @@ mod tests {
         // genuine, graceful var2fpos failure - not a mark reference
         // (which would panic, needing mark_get, not yet translated).
         unsafe { f_col(&[string(b"bogus")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        close_test_buf(buf);
+    }
+
+    // --- f_virtcol ---
+
+    #[test]
+    fn virtcol_dot_returns_the_cursor_column_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol_list_arg_returns_start_and_end_columns() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol(&[string(b"."), num(1)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::Number(3));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(3));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol_dollar_returns_one_past_the_line_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol(&[string(b"$")], &mut rettv) };
+        // "hello" is 5 bytes; $ (dollar_lnum=false) resolves to the
+        // one-past-the-end column (byte index 5), 1-based -> 6.
+        assert_eq!(rettv.value, TypvalValue::Number(6));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol_invalid_position_returns_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol(&[string(b"bogus")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
 
         close_test_buf(buf);
