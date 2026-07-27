@@ -445,6 +445,10 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"setwinvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_LAST, func: crate::eval::vars::f_setwinvar });
         m.insert(&b"settabwinvar"[..], EvalFuncDefT { min_argc: 4, max_argc: 4, base_arg: BASE_LAST, func: crate::eval::vars::f_settabwinvar });
         m.insert(&b"indent"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::indent::f_indent });
+        m.insert(&b"reg_executing"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_executing });
+        m.insert(&b"reg_recording"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recording });
+        m.insert(&b"reg_recorded"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recorded });
+        m.insert(&b"getcmdwintype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcmdwintype });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -3922,6 +3926,64 @@ fn f_getpid(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(crate::os::env::os_get_pid());
 }
 
+/// Builds the single-letter-register-name `String` return value
+/// shared by `reg_executing()`/`reg_recording()`/`reg_recorded()`
+/// (`return_register`, `funcs.c`) - an empty string when `regname` is
+/// `0` (no register), else the single character `regname` itself.
+/// Matches the original's own `xmemdupz(buf, buf[0] == NUL ? 0 : 1)`
+/// exactly (a genuine 0-length vs 1-byte allocation), not just a
+/// stylistic simplification.
+fn return_register(regname: i32, rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(Some(if regname == 0 {
+        Vec::new()
+    } else {
+        vec![regname as u8]
+    }));
+}
+
+/// `reg_executing()` - the single-letter name of the register
+/// currently being executed, or an empty string (`f_reg_executing`,
+/// `funcs.c`).
+fn f_reg_executing(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let reg = unsafe { crate::globals::GLOBALS.get_mut() }.reg_executing;
+    return_register(reg, rettv);
+}
+
+/// `reg_recording()` - the single-letter name of the register
+/// currently being recorded into, or an empty string
+/// (`f_reg_recording`, `funcs.c`).
+fn f_reg_recording(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let reg = unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording;
+    return_register(reg, rettv);
+}
+
+/// `reg_recorded()` - the single-letter name of the last-recorded
+/// register, or an empty string (`f_reg_recorded`, `funcs.c`).
+fn f_reg_recorded(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let reg = unsafe { crate::globals::GLOBALS.get_mut() }.reg_recorded;
+    return_register(reg, rettv);
+}
+
+/// `getcmdwintype()` - the current |command-line-window| type
+/// character, or an empty string when no command-line window is
+/// active (`f_getcmdwintype`, `eval/window.c`). The original's own
+/// `xmallocz(1)` unconditionally allocates 1 byte (even when
+/// `cmdwin_type == 0`), but that 1-byte-holding-just-a-NUL result is
+/// OBSERVABLY the empty string in Vimscript (a NUL-terminated C
+/// string's own `strlen` is 0 either way) - translated to produce the
+/// same observable "empty vs. one-char" `String` value as
+/// [`return_register`]'s own already-established, analogous
+/// `0`-means-empty convention, rather than a literal always-1-byte
+/// `Vec`.
+fn f_getcmdwintype(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let cmdwin_type = unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type;
+    rettv.value = TypvalValue::String(Some(if cmdwin_type == 0 {
+        Vec::new()
+    } else {
+        vec![cmdwin_type as u8]
+    }));
+}
+
 /// `tr({src}, {fromstr}, {tostr})` - `{src}` with every character
 /// that appears in `{fromstr}` replaced by the character at the same
 /// POSITION in `{tostr}` (`f_tr`, `strings.c`). A character not found
@@ -6317,6 +6379,10 @@ mod tests {
             "setwinvar",
             "settabwinvar",
             "indent",
+            "reg_executing",
+            "reg_recording",
+            "reg_recorded",
+            "getcmdwintype",
             "eval",
             "gettext",
             "nextnonblank",
@@ -9941,6 +10007,108 @@ mod tests {
         f_getpid(&[], &mut rettv);
         let TypvalValue::Number(n) = rettv.value else { panic!("expected a Number") };
         assert!(n > 0);
+    }
+
+    // --- return_register / reg_executing / reg_recording / reg_recorded ---
+
+    #[test]
+    fn return_register_zero_is_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        return_register(0, &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    #[test]
+    fn return_register_nonzero_is_the_single_character() {
+        let mut rettv = TypvalT::default();
+        return_register(b'q' as i32, &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"q".to_vec())));
+    }
+
+    #[test]
+    fn reg_executing_reflects_globals_reg_executing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.reg_executing;
+        g.reg_executing = b'a' as i32;
+
+        let mut rettv = TypvalT::default();
+        f_reg_executing(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"a".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.reg_executing = prev;
+    }
+
+    #[test]
+    fn reg_executing_empty_when_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.reg_executing;
+        g.reg_executing = 0;
+
+        let mut rettv = TypvalT::default();
+        f_reg_executing(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.reg_executing = prev;
+    }
+
+    #[test]
+    fn reg_recording_reflects_globals_reg_recording() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.reg_recording;
+        g.reg_recording = b'z' as i32;
+
+        let mut rettv = TypvalT::default();
+        f_reg_recording(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"z".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording = prev;
+    }
+
+    #[test]
+    fn reg_recorded_reflects_globals_reg_recorded() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.reg_recorded;
+        g.reg_recorded = b'x' as i32;
+
+        let mut rettv = TypvalT::default();
+        f_reg_recorded(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"x".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.reg_recorded = prev;
+    }
+
+    // --- f_getcmdwintype ---
+
+    #[test]
+    fn getcmdwintype_empty_when_not_in_a_cmdwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.cmdwin_type;
+        g.cmdwin_type = 0;
+
+        let mut rettv = TypvalT::default();
+        f_getcmdwintype(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type = prev;
+    }
+
+    #[test]
+    fn getcmdwintype_reflects_globals_cmdwin_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.cmdwin_type;
+        g.cmdwin_type = b':' as i32;
+
+        let mut rettv = TypvalT::default();
+        f_getcmdwintype(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b":".to_vec())));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdwin_type = prev;
     }
 
     // --- f_tr ---
