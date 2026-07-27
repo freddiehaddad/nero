@@ -446,6 +446,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
         m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
         m.insert(&b"argidx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_argidx });
+        m.insert(&b"rand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_rand });
+        m.insert(&b"srand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_srand });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4377,6 +4379,136 @@ fn f_argidx(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(unsafe { &*curwin }.w_arg_idx));
 }
 
+/// Initialize a fresh random seed (`init_srand`). The original's own
+/// primary path (`uv_random`, a real OS cryptographic-randomness
+/// source) needs a libuv/FFI decision not yet made for this crate -
+/// this always takes the original's OWN documented fallback instead
+/// (`os_hrtime()` XOR `os_get_pid()`, used whenever the system RNG
+/// doesn't work), a legitimate, real behavior of the original, not an
+/// approximation - Vimscript's `rand()`/`srand()` are for scripted
+/// shuffling/randomization effects, not cryptography, so this is a
+/// reasonable simplification.
+fn init_srand(x: &mut u32) {
+    *x = crate::os::time::os_hrtime() as u32;
+    *x ^= crate::os::env::os_get_pid() as u32;
+}
+
+/// One round of the `splitmix32` PRNG, also used to derive the 4
+/// `xoshiro128**` seed words from a single 32-bit seed (`splitmix32`).
+fn splitmix32(x: &mut u32) -> u32 {
+    *x = x.wrapping_add(0x9e37_79b9);
+    let mut z = *x;
+    z = (z ^ (z >> 16)).wrapping_mul(0x85eb_ca6b);
+    z = (z ^ (z >> 13)).wrapping_mul(0xc2b2_ae35);
+    z ^ (z >> 16)
+}
+
+/// One round of the `xoshiro128**` PRNG, advancing the 4-word state
+/// in place and returning the next pseudo-random value
+/// (`shuffle_xoshiro128starstar`).
+fn shuffle_xoshiro128starstar(x: &mut u32, y: &mut u32, z: &mut u32, w: &mut u32) -> u32 {
+    let result = (y.wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
+    let t = *y << 9;
+    *z ^= *x;
+    *w ^= *y;
+    *y ^= *z;
+    *x ^= *w;
+    *z ^= t;
+    *w = w.rotate_left(11);
+    result
+}
+
+/// `rand([{expr}])` - a pseudo-random `Number` (`f_rand`, `funcs.c`).
+/// No argument uses a shared, lazily-initialized global seed;
+/// `{expr}` (a 4-`Number` `List`, e.g. from [`f_srand`]) is
+/// advanced/mutated in place and its own new state is reused as the
+/// result - matching the original's own byref semantics exactly.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_find`]'s own safety
+/// doc.
+unsafe fn f_rand(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    static GLOBAL_SEED: crate::globals::GlobalCell<Option<(u32, u32, u32, u32)>> =
+        crate::globals::GlobalCell::new(None);
+
+    let result = if argvars.is_empty() {
+        // SAFETY: no overlapping live access - see this crate's
+        // established GlobalCell::get_mut convention.
+        let seed = unsafe { GLOBAL_SEED.get_mut() };
+        let (mut gx, mut gy, mut gz, mut gw) = seed.unwrap_or_else(|| {
+            let mut x = 0u32;
+            init_srand(&mut x);
+            (splitmix32(&mut x), splitmix32(&mut x), splitmix32(&mut x), splitmix32(&mut x))
+        });
+        let r = shuffle_xoshiro128starstar(&mut gx, &mut gy, &mut gz, &mut gw);
+        *seed = Some((gx, gy, gz, gw));
+        Some(r)
+    } else if let TypvalValue::List(l) = &argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_list_len(*l) } != 4 {
+            None
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let items: Vec<_> = (0..4).map(|i| unsafe { crate::eval::typval::tv_list_find(*l, i) }).collect();
+            // SAFETY: forwarded from this function's own safety doc.
+            if items.iter().any(|&li| !matches!(unsafe { &*li }.li_tv.value, TypvalValue::Number(_))) {
+                None
+            } else {
+                let mut vals: [u32; 4] = [0; 4];
+                for (i, &li) in items.iter().enumerate() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let TypvalValue::Number(n) = unsafe { &*li }.li_tv.value else { unreachable!() };
+                    vals[i] = n as u32;
+                }
+                let [mut vx, mut vy, mut vz, mut vw] = vals;
+                let r = shuffle_xoshiro128starstar(&mut vx, &mut vy, &mut vz, &mut vw);
+                vals = [vx, vy, vz, vw];
+                for (i, &li) in items.iter().enumerate() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { &mut *li }.li_tv.value = TypvalValue::Number(i64::from(vals[i]));
+                }
+                Some(r)
+            }
+        }
+    } else {
+        None
+    };
+
+    rettv.value = TypvalValue::Number(match result {
+        Some(r) => i64::from(r),
+        None => -1,
+    });
+}
+
+/// `srand([{seed}])` - a fresh, 4-`Number` `List` seed for [`f_rand`]
+/// (`f_srand`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_list_alloc_ret`]'s own
+/// safety doc.
+unsafe fn f_srand(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut x = if argvars.is_empty() {
+        let mut x = 0u32;
+        init_srand(&mut x);
+        x
+    } else {
+        let mut error = false;
+        let n = crate::eval::typval::tv_get_number_chk(&argvars[0], Some(&mut error));
+        if error {
+            return;
+        }
+        n as u32
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 4) };
+    for _ in 0..4 {
+        let v = splitmix32(&mut x);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(v)) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5197,6 +5329,8 @@ mod tests {
             "fnameescape",
             "argc",
             "argidx",
+            "rand",
+            "srand",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9490,5 +9624,121 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_argidx(&[], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    // --- f_rand / f_srand ---
+
+    #[test]
+    fn splitmix32_is_deterministic_given_the_same_seed() {
+        let mut x1 = 42u32;
+        let mut x2 = 42u32;
+        assert_eq!(splitmix32(&mut x1), splitmix32(&mut x2));
+        assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn splitmix32_advances_the_seed_each_call() {
+        let mut x = 1u32;
+        let a = splitmix32(&mut x);
+        let b = splitmix32(&mut x);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn shuffle_xoshiro128starstar_is_deterministic() {
+        let (mut x1, mut y1, mut z1, mut w1) = (1u32, 2u32, 3u32, 4u32);
+        let (mut x2, mut y2, mut z2, mut w2) = (1u32, 2u32, 3u32, 4u32);
+        let r1 = shuffle_xoshiro128starstar(&mut x1, &mut y1, &mut z1, &mut w1);
+        let r2 = shuffle_xoshiro128starstar(&mut x2, &mut y2, &mut z2, &mut w2);
+        assert_eq!(r1, r2);
+        assert_eq!((x1, y1, z1, w1), (x2, y2, z2, w2));
+    }
+
+    #[test]
+    fn srand_with_a_seed_is_deterministic() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv1 = TypvalT::default();
+        unsafe { f_srand(&[num(42)], &mut rettv1) };
+        let mut rettv2 = TypvalT::default();
+        unsafe { f_srand(&[num(42)], &mut rettv2) };
+        let TypvalValue::List(l1) = rettv1.value else { panic!("expected a List") };
+        let TypvalValue::List(l2) = rettv2.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l1), 4);
+            for i in 0..4 {
+                let item1 = crate::eval::typval::tv_list_find(l1, i);
+                let item2 = crate::eval::typval::tv_list_find(l2, i);
+                assert_eq!((*item1).li_tv.value, (*item2).li_tv.value);
+            }
+            crate::eval::typval::tv_list_unref(l1);
+            crate::eval::typval::tv_list_unref(l2);
+        }
+    }
+
+    #[test]
+    fn srand_no_args_produces_a_4_element_list() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_srand(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 4);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn rand_with_a_seed_list_advances_it_in_place_and_is_deterministic() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut seed_rettv = TypvalT::default();
+        unsafe { f_srand(&[num(7)], &mut seed_rettv) };
+        let TypvalValue::List(l) = seed_rettv.value else { panic!("expected a List") };
+        let seed_before: Vec<TypvalValue> =
+            unsafe { (0..4).map(|i| (*crate::eval::typval::tv_list_find(l, i)).li_tv.value.clone()).collect() };
+
+        let seed_arg = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut r1 = TypvalT::default();
+        unsafe { f_rand(std::slice::from_ref(&seed_arg), &mut r1) };
+        let seed_after: Vec<TypvalValue> =
+            unsafe { (0..4).map(|i| (*crate::eval::typval::tv_list_find(l, i)).li_tv.value.clone()).collect() };
+        // The seed list must have been mutated (advanced) in place.
+        assert_ne!(seed_before, seed_after);
+
+        // Calling rand() again on the (already-advanced) same list must
+        // produce a DIFFERENT result than the first call, since the
+        // seed itself keeps advancing.
+        let mut r2 = TypvalT::default();
+        unsafe { f_rand(&[seed_arg], &mut r2) };
+        assert_ne!(r1.value, r2.value);
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn rand_with_wrong_length_list_returns_minus_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe { crate::eval::typval::tv_list_append_number(l, 1) };
+        unsafe { crate::eval::typval::tv_list_append_number(l, 2) };
+        unsafe { crate::eval::typval::tv_list_append_number(l, 3) };
+        unsafe { crate::eval::typval::tv_list_ref(l) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_rand(&[TypvalT { value: TypvalValue::List(l), ..Default::default() }], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn rand_no_args_returns_deterministic_repeatable_values() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut r1 = TypvalT::default();
+        unsafe { f_rand(&[], &mut r1) };
+        let mut r2 = TypvalT::default();
+        unsafe { f_rand(&[], &mut r2) };
+        // Both calls use the same shared global seed, which advances
+        // each call - two consecutive calls must differ.
+        assert_ne!(r1.value, r2.value);
     }
 }
