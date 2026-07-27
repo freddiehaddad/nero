@@ -444,6 +444,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
+        m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
+        m.insert(&b"argidx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_argidx });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4328,6 +4330,53 @@ unsafe fn f_fnameescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(escaped));
 }
 
+/// `argc([{winid}])` - the number of files in the argument list
+/// (`f_argc`, `arglist.c`). No argument means the current window's
+/// arglist; `-1` means the global arglist; otherwise a window number
+/// or window ID.
+///
+/// # Safety
+/// `wp.w_alist` (for every window this could resolve to) must be a
+/// valid, live `AlistT` pointer - true for any real, fully-initialized
+/// window, matching the original's own lack of a NULL check here.
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]'s own
+/// safety doc.
+unsafe fn f_argc(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let count = if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*curwin };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*w.w_alist }.al_ga.ga_len
+    } else if matches!(argvars[0].value, TypvalValue::Number(-1)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+        if wp.is_null() {
+            -1
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &*wp };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*w.w_alist }.al_ga.ga_len
+        }
+    };
+    rettv.value = TypvalValue::Number(i64::from(count));
+}
+
+/// `argidx()` - the current index in the argument list (`f_argidx`,
+/// `arglist.c`). `0` is the first file.
+fn f_argidx(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: no overlapping live access - see this crate's
+    // established GlobalCell::get_mut convention.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(i64::from(unsafe { &*curwin }.w_arg_idx));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5146,6 +5195,8 @@ mod tests {
             "win_gettype",
             "escape",
             "fnameescape",
+            "argc",
+            "argidx",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9381,5 +9432,63 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_fnameescape(&[string(b"hello.txt")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"hello.txt".to_vec())));
+    }
+
+    // --- f_argc / f_argidx ---
+
+    #[test]
+    fn argc_no_args_uses_curwin_alist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist = crate::arglist_defs::AlistT {
+            al_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argc(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn argc_minus_one_uses_global_alist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let prev_len = unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len;
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len = 5;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argc(&[num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len = prev_len;
+    }
+
+    #[test]
+    fn argc_unknown_window_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argc(&[num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn argidx_returns_curwin_arg_idx() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT { w_arg_idx: 2, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        f_argidx(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(2));
     }
 }
