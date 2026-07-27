@@ -688,7 +688,7 @@ pub unsafe fn tv_check_lock(tv: &TypvalT, name: Option<&[u8]>) -> bool {
 }
 
 /// Maximum nesting of lists and dicts for [`tv_item_lock`] (`DICT_MAXNEST`).
-const DICT_MAXNEST: i32 = 100;
+pub(crate) const DICT_MAXNEST: i32 = 100;
 
 /// Recursion depth counter for [`tv_item_lock`] - matches the
 /// original's own function-local `static int recurse`.
@@ -6349,6 +6349,7 @@ mod tests {
 
     #[test]
     fn tv_equal_number_string_and_float_are_mutually_distinct_types() {
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert!(!tv_equal(&number_tv(1), &string_tv(b"1"), false));
             assert!(!tv_equal(
@@ -6361,6 +6362,7 @@ mod tests {
 
     #[test]
     fn tv_equal_number_compares_value() {
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert!(tv_equal(&number_tv(5), &number_tv(5), false));
             assert!(!tv_equal(&number_tv(5), &number_tv(6), false));
@@ -6369,6 +6371,7 @@ mod tests {
 
     #[test]
     fn tv_equal_string_respects_ignorecase_flag() {
+        let _lock = crate::globals::global_state_test_lock();
         unsafe {
             assert!(!tv_equal(&string_tv(b"FOO"), &string_tv(b"foo"), false));
             assert!(tv_equal(&string_tv(b"FOO"), &string_tv(b"foo"), true));
@@ -6377,6 +6380,7 @@ mod tests {
 
     #[test]
     fn tv_equal_float_and_bool_and_special_compare_value() {
+        let _lock = crate::globals::global_state_test_lock();
         let f1 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.5) };
         let f2 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(1.5) };
         let f3 = TypvalT { v_lock: VarLockStatus::Unlocked, value: TypvalValue::Float(2.5) };
@@ -6398,6 +6402,7 @@ mod tests {
 
     #[test]
     fn tv_equal_unknown_never_equals_anything_not_even_self() {
+        let _lock = crate::globals::global_state_test_lock();
         let u = unknown_tv();
         assert!(!unsafe { tv_equal(&u, &u, false) });
     }
@@ -6444,6 +6449,7 @@ mod tests {
 
     #[test]
     fn tv_equal_blob_delegates_to_tv_blob_equal() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut b1 = crate::eval::typval_defs::BlobT::default();
         b1.bv_ga.ga_data = vec![1, 2];
         b1.bv_ga.ga_len = 2;
@@ -6458,6 +6464,7 @@ mod tests {
 
     #[test]
     fn tv_equal_func_and_partial_can_cross_compare() {
+        let _lock = crate::globals::global_state_test_lock();
         // A VAR_FUNC and a VAR_PARTIAL (with no dict/args, matching a
         // plain function reference) ARE allowed to compare equal when
         // their names match - matches the original's own
@@ -6478,6 +6485,7 @@ mod tests {
 
     #[test]
     fn tv_equal_null_partial_never_equals_anything() {
+        let _lock = crate::globals::global_state_test_lock();
         let p1 = TypvalT {
             v_lock: VarLockStatus::Unlocked,
             value: TypvalValue::Partial(std::ptr::null_mut()),
