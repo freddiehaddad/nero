@@ -450,6 +450,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
         m.insert(&b"shellescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_shellescape });
+        m.insert(&b"foldlevel"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_foldlevel });
         m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
         m.insert(&b"argidx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_argidx });
         m.insert(&b"rand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_rand });
@@ -4494,6 +4495,32 @@ unsafe fn f_shellescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(escaped));
 }
 
+/// `foldlevel({lnum})` - the fold nesting level of line `{lnum}` in
+/// the current buffer (`f_foldlevel`, `fold.c`), via
+/// [`crate::fold::fold_level`]. `0` if `{lnum}` is out of range (also
+/// matching what `fold_level` itself always currently returns, given
+/// this crate's fold subsystem only translates the "no folds exist"
+/// fast path - see that function's own doc comment).
+///
+/// # Safety
+/// Touches `GLOBALS.curbuf`/`curwin`; forwarded from
+/// [`crate::eval::typval::tv_get_lnum`]/[`crate::fold::fold_level`]'s
+/// own safety docs.
+unsafe fn f_foldlevel(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    if lnum >= 1 && lnum <= curbuf.b_ml.ml_line_count {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        let level = unsafe { crate::fold::fold_level(&mut *curwin, lnum) };
+        rettv.value = TypvalValue::Number(i64::from(level));
+    }
+}
+
 /// `argc([{winid}])` - the number of files in the argument list
 /// (`f_argc`, `arglist.c`). No argument means the current window's
 /// arglist; `-1` means the global arglist; otherwise a window number
@@ -5614,6 +5641,7 @@ mod tests {
             "escape",
             "fnameescape",
             "shellescape",
+            "foldlevel",
             "argc",
             "argidx",
             "rand",
@@ -10153,6 +10181,95 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::String(Some(b"'abc!'".to_vec())));
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev_ssl;
+    }
+
+    // --- f_foldlevel ---
+
+    /// RAII guard restoring `GLOBALS.curbuf`/`curwin` on drop (even on
+    /// panic) - self-locking, matching `CurbufGuard`'s own precedent.
+    struct CurbufCurwinGuard {
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurbufCurwinGuard {
+        fn set(buf: *mut crate::buffer_defs::BufT, win: *mut crate::buffer_defs::WinT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard =
+                CurbufCurwinGuard { prev_curbuf: globals.curbuf, prev_curwin: globals.curwin, _lock };
+            globals.curbuf = buf;
+            globals.curwin = win;
+            guard
+        }
+    }
+
+    impl Drop for CurbufCurwinGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_curbuf;
+            globals.curwin = self.prev_curwin;
+        }
+    }
+
+    #[test]
+    fn foldlevel_returns_zero_when_no_folds_and_lnum_in_range() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 10, ..Default::default() },
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _guard = CurbufCurwinGuard::set(buf_ptr, &mut win as *mut crate::buffer_defs::WinT);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_foldlevel(&[num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn foldlevel_returns_zero_for_lnum_beyond_the_last_line() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 5, ..Default::default() },
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        // The bounds check fails before fold_level is ever called, so
+        // curwin's own fold settings are irrelevant here.
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..Default::default() };
+        let _guard = CurbufCurwinGuard::set(buf_ptr, &mut win as *mut crate::buffer_defs::WinT);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_foldlevel(&[num(99)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn foldlevel_returns_zero_for_lnum_zero_or_negative() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 5, ..Default::default() },
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..Default::default() };
+        let _guard = CurbufCurwinGuard::set(buf_ptr, &mut win as *mut crate::buffer_defs::WinT);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_foldlevel(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_foldlevel(&[num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     // --- f_argc / f_argidx ---

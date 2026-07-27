@@ -36,11 +36,21 @@
 //! for the common no-folds case, and (via [`line_folded`])
 //! `plines.c`'s `plines_win_nofill`.
 //!
+//! Also translated: `foldLevel` (as [`fold_level`], used by
+//! `foldlevel()`) - re-examined and found its own two early-exit
+//! branches (a same-line cache hit, an "undefined, mid-update"
+//! sentinel) both depend on file-static variables that are ONLY ever
+//! mutated by the not-yet-translated `foldUpdateIEMS`, so they
+//! permanently sit at their own C static-zero-init defaults here,
+//! making the ORIGINAL's own `if (invalid_top == 0) { checkupdate(...);
+//! }` branch unconditionally taken - see [`fold_level`]'s own doc
+//! comment for the full reasoning.
+//!
 //! Deferred: everything else (fold creation/opening/closing, the
-//! `foldUpdateIEMS` scanning engine, `foldtext`, level computation,
-//! `:fold`-family ex-commands), `get_cursor_rel_lnum` (`cursor.c` -
-//! its own "no folds" fast path is a one-liner given `hasAnyFolding`
-//! now exists, left for `cursor.rs` itself to pick up alongside
+//! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
+//! ex-commands), `get_cursor_rel_lnum` (`cursor.c` - its own "no
+//! folds" fast path is a one-liner given `hasAnyFolding` now exists,
+//! left for `cursor.rs` itself to pick up alongside
 //! `check_cursor_lnum`/`check_cursor`).
 
 use crate::buffer_defs::WinT;
@@ -186,6 +196,42 @@ pub unsafe fn line_folded(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> boo
     unsafe { fold_info(win, lnum) }.fi_lines != 0
 }
 
+/// The fold level of line `lnum` in the CURRENT window (`foldLevel`,
+/// used by `foldlevel()`). `wp` stands in for `curwin` (the original
+/// itself hard-codes `curwin`, never takes a parameter) - callers
+/// pass `GLOBALS.curwin` directly.
+///
+/// The original's own two early-exit branches
+/// (`lnum == prev_lnum && prev_lnum_lvl >= 0` - a same-line cache hit;
+/// `lnum >= invalid_top && lnum <= invalid_bot` - "undefined, mid-
+/// update" sentinel `-1`) are never modeled: both depend on file-static
+/// `prev_lnum`/`prev_lnum_lvl`/`invalid_top`/`invalid_bot` variables
+/// that are ONLY ever mutated by `foldUpdateIEMS` (the real fold-tree
+/// recomputation engine, not translated) - they permanently sit at
+/// their own C static-zero-init defaults (`prev_lnum = 0`,
+/// `prev_lnum_lvl = -1`, `invalid_top = 0`) in this crate today, which
+/// means the ORIGINAL's own `if (invalid_top == 0) { checkupdate(...);
+/// }` branch (not the two `else if`s) is unconditionally taken every
+/// time - exactly what calling [`checkupdate`] unconditionally here
+/// already achieves. `_lnum` is accepted (matching this module's own
+/// `has_folding_win`-family precedent for signature fidelity) but
+/// genuinely unused on this fast path - the real fold-tree level
+/// search past `hasAnyFolding` needs `lnum` for real, but that whole
+/// branch is `unimplemented!()` here.
+///
+/// # Safety
+/// Same as [`has_any_folding`].
+#[must_use]
+pub unsafe fn fold_level(wp: &mut WinT, _lnum: crate::pos_defs::LinenrT) -> i32 {
+    checkupdate(wp);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { has_any_folding(wp) } {
+        return 0;
+    }
+    unimplemented!("fold::fold_level: the real fold-tree level search is not yet translated");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +361,44 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { line_folded(&mut win, 5) });
+    }
+
+    #[test]
+    fn fold_level_is_zero_when_no_folds() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            // 'foldenable' on but 'foldmethod'=manual with an empty
+            // w_folds - matches has_any_folding_false_for_manual_with_no_folds's
+            // own established setup for a genuine "no folds" case
+            // (wo_fen=1 alone, with the default non-"manual"
+            // foldmethod, would make has_any_folding return true).
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { fold_level(&mut win, 1) }, 0);
+    }
+
+    #[test]
+    fn fold_level_is_zero_regardless_of_lnum() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        // _lnum is genuinely unused on this fast path (see fold_level's
+        // own doc comment) - any value yields the same 0 result.
+        assert_eq!(unsafe { fold_level(&mut win, 9999) }, 0);
     }
 }
