@@ -10,7 +10,12 @@
 //! the original keeps it as a file-static, not an `EXTERN` global -
 //! same treatment as `memfile.c`'s own per-file statics), `set_bufref`/
 //! `bufref_valid`/`buf_valid` (+ its own `buf_free_count` private
-//! counter, `BUF_FREE_COUNT`), the `'buftype'`-testing predicate
+//! counter, `BUF_FREE_COUNT`), `buflist_findnr` (an O(n)
+//! `lastbuf`/`b_prev` walk in place of the original's O(1)
+//! `buffer_handles` hash-map lookup, `handle_get_buffer` - the same
+//! "linked-list walk replaces an untranslated hash map" treatment
+//! already established by `window.rs`'s own `win_find_by_handle`),
+//! the `'buftype'`-testing predicate
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
 //! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`/
 //! `bt_dontwrite_msg` (the latter's real `emsg()` display omitted,
@@ -155,6 +160,42 @@ pub unsafe fn buf_valid(buf: *const BufT) -> bool {
         bp = unsafe { &*bp }.b_prev;
     }
     false
+}
+
+/// Find a buffer in the buffer list by its number (buffer handle)
+/// (`buflist_findnr`). `nr == 0` means the alternate buffer for the
+/// current window (`curwin.w_alt_fnum`).
+///
+/// The original looks this up in O(1) via a `buffer_handles` hash map
+/// (`handle_get_buffer`); that map itself isn't translated, so this
+/// walks `GLOBALS.lastbuf`/`b_prev` instead - the exact same
+/// "linked-list walk replaces an untranslated hash map" translation
+/// already established by `window.rs`'s own `win_find_by_handle`
+/// (walking `firstwin`/`w_next` in place of a similar handle lookup).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`; its own `lastbuf`/`b_prev` chain
+/// and `curwin` must consist of valid, live pointers.
+#[must_use]
+pub unsafe fn buflist_findnr(nr: i32) -> *mut BufT {
+    let nr = if nr == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*GLOBALS.get_mut().curwin }.w_alt_fnum
+    } else {
+        nr
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut bp: *mut BufT = unsafe { GLOBALS.get_mut() }.lastbuf;
+    while !bp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*bp }.handle == nr {
+            return bp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        bp = unsafe { &*bp }.b_prev;
+    }
+    std::ptr::null_mut()
 }
 
 /// `true` if `buf` is a prompt buffer (`bt_prompt`).

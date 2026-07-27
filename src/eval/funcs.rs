@@ -393,6 +393,11 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getftype"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_getftype });
         m.insert(&b"pathshorten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_pathshorten });
         m.insert(&b"mkdir"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: crate::eval::fs::f_mkdir });
+        m.insert(&b"bufexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufexists });
+        m.insert(&b"buflisted"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_buflisted });
+        m.insert(&b"bufloaded"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufloaded });
+        m.insert(&b"bufname"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufname });
+        m.insert(&b"bufnr"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_bufnr });
         m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
         m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
         m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
@@ -4642,6 +4647,11 @@ mod tests {
             "getftype",
             "pathshorten",
             "mkdir",
+            "bufexists",
+            "buflisted",
+            "bufloaded",
+            "bufname",
+            "bufnr",
             "hostname",
             "foreground",
             "eventhandler",
