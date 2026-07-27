@@ -4719,14 +4719,12 @@ fn f_getcharsearch(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// original's own `xfmark_T` field doc reserves for `fnum == 0` -
 /// i.e. a mark resolved from ShaDa whose buffer isn't known yet) is
 /// translated faithfully but is currently DEAD CODE, not just narrow:
-/// `cleanup_jumplist`'s own `loadfiles=true` call here (matching the
-/// original exactly) unconditionally panics via `unimplemented!()` for
-/// any entry with `fnum == 0` and a nonzero `lnum` (needing
-/// `fname2fnum`, not yet translated) - and an entry with `lnum == 0`
-/// is skipped from the dict list below regardless. So there is no
-/// `fnum == 0` entry that could ever reach the `filename` line without
-/// first panicking in `cleanup_jumplist` - this becomes live the
-/// moment `fname2fnum`/`buflist_new()` exist.
+/// nothing currently translated can ever set `fname` to `Some(...)`
+/// (only ShaDa restoration would; every real caller that sets it,
+/// e.g. `setpcmark`'s own jumplist-entry construction, always passes
+/// `None`) - so there is no `fnum == 0` entry reachable via any real
+/// code path whose `fname` could ever be anything but `None`. This
+/// becomes live the moment ShaDa restoration exists.
 ///
 /// # Safety
 /// Forwarded from [`crate::window::find_tabwin`]/
@@ -11613,19 +11611,37 @@ mod tests {
     }
 
     #[test]
-    fn setpos_named_mark_panics_needs_buflist_findnr() {
+    fn setpos_named_mark_sets_the_buffer_local_mark() {
+        // setmark_pos is now tractable in full (buflist_findnr exists) -
+        // setpos("'a", ...) genuinely sets buf.b_namedm['a' - 'a'], not
+        // just the ''/'` "previous context mark" case.
         let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
         let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
         let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
         let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
         let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        // buflist_findnr walks GLOBALS.lastbuf/b_prev - not managed by
+        // CurbufCurwinGuard, so wired up manually here, derived from
+        // GLOBALS.curwin's own already-stored w_buffer value (never
+        // independently re-derived from `buf` directly).
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_lastbuf = globals.lastbuf;
+        globals.lastbuf = unsafe { &*globals.curwin }.w_buffer;
 
+        // fnum=0 in the list resolves to GLOBALS.curbuf's own handle.
         let (list_tv, l) = num_list(&[0, 3, 2, 0]);
         let args = [string(b"'a"), list_tv];
         let mut rettv = TypvalT::default();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { f_setpos(&args, &mut rettv) }));
-        assert!(result.is_err());
+        unsafe { f_setpos(&args, &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        let b = unsafe { &*buf_ptr };
+        assert_eq!(b.b_namedm[0].mark, crate::pos_defs::PosT { lnum: 3, col: 1, coladd: 0 });
+        assert_eq!(b.b_namedm[0].fnum, b.handle);
+        // No cursor movement occurred - only the mark itself moved.
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT::default());
 
         unsafe { crate::eval::typval::tv_list_unref(l) };
         close_test_buf(buf);
