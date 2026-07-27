@@ -444,6 +444,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
+        m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
         m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
@@ -4402,6 +4403,47 @@ unsafe fn f_winlayout(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { get_framelayout(topframe, l, true) };
 }
 
+/// `winrestcmd()` - a sequence of `:resize`/`:vertical resize`
+/// commands that would restore the CURRENT tab page's window sizes
+/// (`f_winrestcmd`, `eval/window.c`). Only searches the current tab
+/// page, matching the original's own `FOR_ALL_WINDOWS_IN_TAB(wp,
+/// curtab)` walk - since `tp == curtab` always holds here, that macro
+/// always resolves to `GLOBALS.firstwin` (matching this crate's own
+/// established simplification for this exact macro, see
+/// `crate::eval::buffer::buf_win_common`). Builds the result directly
+/// via `format!`/`Vec<u8>::extend_from_slice` rather than the
+/// original's bounded `vim_snprintf_safelen`/`ga_concat_len` -
+/// Rust's own growable buffer has no fixed-size overflow risk to
+/// guard against.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`; every `WinT` reachable via
+/// `GLOBALS.firstwin`/`w_next` must be a valid, live pointer.
+unsafe fn f_winrestcmd(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut out = Vec::new();
+    // Do this twice to handle some window layouts properly (matching
+    // the original's own comment/loop exactly).
+    for _ in 0..2 {
+        let mut winnr: i64 = 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &*wp };
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::window::win_has_winnr(wp, curtab) } {
+                out.extend_from_slice(format!(":{winnr}resize {}|", w.w_height).as_bytes());
+                out.extend_from_slice(format!("vert :{winnr}resize {}|", w.w_width).as_bytes());
+                winnr += 1;
+            }
+            wp = w.w_next;
+        }
+    }
+    rettv.value = TypvalValue::String(Some(out));
+}
+
 /// `escape({string}, {chars})` - escape every character in
 /// `{chars}` that occurs in `{string}` with a backslash
 /// (`f_escape`, `funcs.c`), via the newly-added
@@ -5546,6 +5588,7 @@ mod tests {
             "win_screenpos",
             "win_gettype",
             "winlayout",
+            "winrestcmd",
             "escape",
             "fnameescape",
             "argc",
@@ -9939,6 +9982,75 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_list_len(l), 0);
             crate::eval::typval::tv_list_unref(l);
         }
+    }
+
+    // --- f_winrestcmd ---
+
+    #[test]
+    fn winrestcmd_single_window_reports_its_size_twice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT { w_height: 20, w_width: 80, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestcmd(&[], &mut rettv) };
+        // The original's own loop runs twice ("to handle some window
+        // layouts properly"), so the whole sequence is duplicated.
+        let once = b":1resize 20|vert :1resize 80|".to_vec();
+        let mut expected = once.clone();
+        expected.extend_from_slice(&once);
+        assert_eq!(rettv.value, TypvalValue::String(Some(expected)));
+    }
+
+    #[test]
+    fn winrestcmd_two_windows_numbers_them_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win2 = crate::buffer_defs::WinT { w_height: 15, w_width: 35, ..focusable_win(2) };
+        let win2_ptr = &mut win2 as *mut crate::buffer_defs::WinT;
+        let mut win1 =
+            crate::buffer_defs::WinT { w_height: 10, w_width: 40, w_next: win2_ptr, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win1, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestcmd(&[], &mut rettv) };
+        let once = b":1resize 10|vert :1resize 40|:2resize 15|vert :2resize 35|".to_vec();
+        let mut expected = once.clone();
+        expected.extend_from_slice(&once);
+        assert_eq!(rettv.value, TypvalValue::String(Some(expected)));
+    }
+
+    #[test]
+    fn winrestcmd_skips_windows_that_dont_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A non-curwin, explicitly non-focusable window should be
+        // skipped entirely by win_has_winnr - winnr doesn't increment
+        // for it and no text is emitted (WinConfig::default(),
+        // matching WIN_CONFIG_INIT, is actually focusable/non-hidden
+        // by default - a plain WinT::default() alone would NOT be
+        // skipped, hence the explicit override here).
+        let mut win3 = crate::buffer_defs::WinT {
+            w_height: 99,
+            w_width: 99,
+            w_config: crate::buffer_defs::WinConfig { focusable: false, ..Default::default() },
+            ..Default::default()
+        };
+        let win3_ptr = &mut win3 as *mut crate::buffer_defs::WinT;
+        let mut win2 =
+            crate::buffer_defs::WinT { w_height: 15, w_width: 35, w_next: win3_ptr, ..focusable_win(2) };
+        let win2_ptr = &mut win2 as *mut crate::buffer_defs::WinT;
+        let mut win1 =
+            crate::buffer_defs::WinT { w_height: 10, w_width: 40, w_next: win2_ptr, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win1, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winrestcmd(&[], &mut rettv) };
+        let once = b":1resize 10|vert :1resize 40|:2resize 15|vert :2resize 35|".to_vec();
+        let mut expected = once.clone();
+        expected.extend_from_slice(&once);
+        assert_eq!(rettv.value, TypvalValue::String(Some(expected)));
     }
 
     // --- f_escape ---
