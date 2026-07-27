@@ -494,6 +494,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"reltimestr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimestr });
         m.insert(&b"reltimefloat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimefloat });
         m.insert(&b"arglistid"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: BASE_NONE, func: f_arglistid });
+        m.insert(&b"clearmatches"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::r#match::f_clearmatches });
+        m.insert(&b"getmatches"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::r#match::f_getmatches });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -7057,6 +7059,8 @@ mod tests {
             "reltimefloat",
             "arglistid",
             "swapname",
+            "clearmatches",
+            "getmatches",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }

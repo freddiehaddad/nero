@@ -63,6 +63,8 @@ pub mod mark;
 pub mod mark_defs;
 pub mod marktree;
 pub mod marktree_defs;
+#[path = "match.rs"]
+pub mod r#match;
 pub mod math;
 pub mod mbyte;
 pub mod mbyte_defs;
