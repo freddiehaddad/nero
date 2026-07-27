@@ -552,6 +552,51 @@ pub unsafe fn valid_tabpage(tpc: *const crate::buffer_defs::TabpageT) -> bool {
     false
 }
 
+/// Get the 1-based index of tab page `ftp` (`tabpage_index`). When
+/// `ftp` is not found in the list (including `ftp` being null, which
+/// never matches any real tab page), returns the total number of tab
+/// pages plus one - matching the original's own documented contract
+/// exactly (used by `tabpagenr("$")`'s own `tabpage_index(NULL) - 1`
+/// idiom to get a plain tab page COUNT).
+///
+/// # Safety
+/// Same as [`valid_tabpage`].
+#[must_use]
+pub unsafe fn tabpage_index(ftp: *const crate::buffer_defs::TabpageT) -> i32 {
+    let mut i = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() && !std::ptr::eq(tp, ftp) {
+        i += 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    i
+}
+
+/// Find tab page number `n` (first one is `1`), or the current tab
+/// page when `n == 0`. Returns a null pointer when not found
+/// (`find_tabpage`).
+///
+/// # Safety
+/// Same as [`valid_tabpage`].
+#[must_use]
+pub unsafe fn find_tabpage(n: i32) -> *mut crate::buffer_defs::TabpageT {
+    if n == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    }
+    let mut i = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() && i != n {
+        i += 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    tp
+}
+
 /// Check if `wp` is at the bottom of its column of windows - i.e.
 /// there are no windows below it (`is_bottom_win`).
 ///
@@ -668,6 +713,84 @@ mod tests {
 
         let stray = crate::buffer_defs::TabpageT::default();
         assert!(!unsafe { valid_tabpage(&stray as *const crate::buffer_defs::TabpageT) });
+    }
+
+    // ---- tabpage_index / find_tabpage ----
+
+    #[test]
+    fn tabpage_index_finds_head_of_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = FirstTabpageGuard::set(tp_ptr);
+
+        assert_eq!(unsafe { tabpage_index(tp_ptr) }, 1);
+    }
+
+    #[test]
+    fn tabpage_index_finds_a_later_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = crate::buffer_defs::TabpageT::default();
+        let third_ptr = &mut third as *mut crate::buffer_defs::TabpageT;
+        let mut second = crate::buffer_defs::TabpageT { tp_next: third_ptr, ..Default::default() };
+        let second_ptr = &mut second as *mut crate::buffer_defs::TabpageT;
+        let mut first = crate::buffer_defs::TabpageT { tp_next: second_ptr, ..Default::default() };
+        let first_ptr = &mut first as *mut crate::buffer_defs::TabpageT;
+        let _guard = FirstTabpageGuard::set(first_ptr);
+
+        assert_eq!(unsafe { tabpage_index(first_ptr) }, 1);
+        assert_eq!(unsafe { tabpage_index(second_ptr) }, 2);
+        assert_eq!(unsafe { tabpage_index(third_ptr) }, 3);
+    }
+
+    #[test]
+    fn tabpage_index_returns_count_plus_one_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = crate::buffer_defs::TabpageT::default();
+        let mut first =
+            crate::buffer_defs::TabpageT { tp_next: &mut second as *mut crate::buffer_defs::TabpageT, ..Default::default() };
+        let first_ptr = &mut first as *mut crate::buffer_defs::TabpageT;
+        let _guard = FirstTabpageGuard::set(first_ptr);
+
+        // A null pointer never matches any real tab page - same as
+        // the original's own tabpagenr("$") = tabpage_index(NULL) - 1
+        // idiom (2 tabs -> index 3 -> "$" = 2).
+        assert_eq!(unsafe { tabpage_index(std::ptr::null()) }, 3);
+    }
+
+    #[test]
+    fn find_tabpage_zero_returns_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = tp_ptr;
+
+        assert_eq!(unsafe { find_tabpage(0) }, tp_ptr);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn find_tabpage_finds_by_1_based_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = crate::buffer_defs::TabpageT::default();
+        let second_ptr = &mut second as *mut crate::buffer_defs::TabpageT;
+        let mut first = crate::buffer_defs::TabpageT { tp_next: second_ptr, ..Default::default() };
+        let first_ptr = &mut first as *mut crate::buffer_defs::TabpageT;
+        let _guard = FirstTabpageGuard::set(first_ptr);
+
+        assert_eq!(unsafe { find_tabpage(1) }, first_ptr);
+        assert_eq!(unsafe { find_tabpage(2) }, second_ptr);
+    }
+
+    #[test]
+    fn find_tabpage_returns_null_when_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        assert!(unsafe { find_tabpage(99) }.is_null());
     }
 
     #[test]

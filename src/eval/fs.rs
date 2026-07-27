@@ -17,18 +17,24 @@
 //! via [`crate::os::fs::os_rmdir`]), `filereadable()`/
 //! `filewritable()` (via the already-existing
 //! [`crate::os::fs::os_file_is_readable`]/
-//! [`crate::os::fs::os_file_is_writable`]), and `getfsize()`/
+//! [`crate::os::fs::os_file_is_writable`]), `getfsize()`/
 //! `getftime()`/`getftype()` (via the already-existing
 //! [`crate::os::fs::os_fileinfo`]/[`crate::os::fs::os_fileinfo_link`]
 //! narrow-subset `FileInfo` - see that module's own doc comment for
 //! what's NOT modeled; `getfperm()`, needing the still-deferred
-//! `os_getperm` permission bits, is not translated here). The `"rf"`
-//! (recursive delete) flag needs `delete_recursive` (a directory-tree
-//! walk, not yet translated) and panics via `unimplemented!()` if
-//! actually reached. Every function taking a path/name needs the byte
-//! string to be valid UTF-8 to build a `Path` from (this crate's
-//! established `path_full_dir_name`-style convention - see that
-//! function's own body in `path.rs`), gracefully treating invalid UTF-8
+//! `os_getperm` permission bits, is not translated here), and
+//! `mkdir()` for its plain, single-directory case (via the already-
+//! existing [`crate::os::fs::os_mkdir`]) - the `"p"` (recursive
+//! create) flag needs `os_mkdir_recurse` (not yet translated) and
+//! `"D"`/`"R"` (deferred deletion) need the `:defer` subsystem (not
+//! yet translated), both panicking via `unimplemented!()` if actually
+//! reached. The `"rf"` (recursive delete) flag needs
+//! `delete_recursive` (a directory-tree walk, not yet translated) and
+//! panics via `unimplemented!()` if actually reached. Every function
+//! taking a path/name needs the byte string to be valid UTF-8 to
+//! build a `Path` from (this crate's established
+//! `path_full_dir_name`-style convention - see that function's own
+//! body in `path.rs`), gracefully treating invalid UTF-8
 //! the same as
 //! a nonexistent path/name rather than panicking.
 
@@ -168,6 +174,66 @@ pub(crate) unsafe fn f_delete(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // Any other flags value: rettv stays -1 (matching the original's
     // own semsg-then-fallthrough - v_number was already set to -1
     // at the very start and no branch above re-touches it).
+}
+
+/// `mkdir({name} [, {flags} [, {prot}]])` - create directory `{name}`
+/// (`f_mkdir`, `eval/fs.c`), via the already-existing
+/// [`crate::os::fs::os_mkdir`]. Returns `1` on success, `0` on
+/// failure (matching the original's own `OK`/`FAIL`, which are `1`/`0`,
+/// its own `semsg` display on failure omitted, matching this module's
+/// established "skip the message, keep the state" policy).
+///
+/// Only the plain, single-directory case (no `{flags}`, or `{flags}`
+/// not containing `"p"`/`"D"`/`"R"`) is modeled. `"p"` (create
+/// intermediate directories) needs `os_mkdir_recurse` (not yet
+/// translated) and `"D"`/`"R"` (schedule deferred deletion) need the
+/// `:defer` subsystem (`can_add_defer`/`defer_add`, not yet
+/// translated) - both panic via `unimplemented!()` if actually
+/// reached.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`]).
+pub(crate) unsafe fn f_mkdir(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(i64::from(crate::vim_defs::FAIL));
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let mut dir = crate::eval::typval::tv_get_string(&argvars[0]);
+    if dir.is_empty() {
+        return;
+    }
+
+    // Remove trailing slashes (`*path_tail(dir) == NUL` in the
+    // original - i.e. the whole string is consumed by trailing path
+    // separators).
+    if crate::path::path_tail(&dir) == dir.len() {
+        dir.truncate(crate::path::path_tail_with_sep(&dir));
+    }
+
+    let mut prot = 0o755;
+    if argvars.len() > 1 {
+        if argvars.len() > 2 {
+            let p = crate::eval::typval::tv_get_number(&argvars[2]);
+            if p == -1 {
+                return;
+            }
+            prot = p as i32;
+        }
+        let flags = crate::eval::typval::tv_get_string(&argvars[1]);
+        if flags.contains(&b'D') || flags.contains(&b'R') {
+            unimplemented!("mkdir(): \"D\"/\"R\" flags need the :defer subsystem, not yet translated");
+        }
+        if flags.contains(&b'p') {
+            unimplemented!("mkdir(): \"p\" flag needs os_mkdir_recurse, not yet translated");
+        }
+    }
+
+    let Some(path) = bytes_to_path(&dir) else { return };
+    let ok = crate::os::fs::os_mkdir(path, prot) == 0;
+    rettv.value = TypvalValue::Number(i64::from(if ok { crate::vim_defs::OK } else { crate::vim_defs::FAIL }));
 }
 
 /// `pathshorten({path} [, {len}])` - shorten each non-tail path
@@ -326,6 +392,108 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(-1));
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    // --- f_mkdir ---
+
+    #[test]
+    fn mkdir_creates_a_new_directory() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = std::env::temp_dir().join("nero_test_mkdir_new_dir");
+        let _ = std::fs::remove_dir(&path);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mkdir(&[string(path.to_str().unwrap().as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(path.is_dir());
+
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn mkdir_strips_trailing_slashes() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = std::env::temp_dir().join("nero_test_mkdir_trailing_slash");
+        let _ = std::fs::remove_dir(&path);
+        let mut with_slash = path.to_str().unwrap().as_bytes().to_vec();
+        with_slash.push(b'/');
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mkdir(&[string(&with_slash)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(path.is_dir());
+
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn mkdir_fails_when_parent_is_missing() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = std::env::temp_dir().join("nero_test_mkdir_missing_parent").join("child");
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mkdir(&[string(path.to_str().unwrap().as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn mkdir_fails_for_an_empty_name() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mkdir(&[string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn mkdir_fails_and_secure_is_bumped_when_secure_is_set() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_mkdir(&[string(b"irrelevant")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    #[test]
+    fn mkdir_p_flag_is_unimplemented() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_mkdir(&[string(b"irrelevant/deep/path"), string(b"p")], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (os_mkdir_recurse not yet translated)");
+    }
+
+    #[test]
+    fn mkdir_d_flag_is_unimplemented() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_mkdir(&[string(b"irrelevant"), string(b"D")], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (:defer subsystem not yet translated)");
     }
 
     // --- f_pathshorten ---
