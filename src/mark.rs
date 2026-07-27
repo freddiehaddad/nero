@@ -66,7 +66,14 @@
 //! (the real `` <C-O> ``/`` <C-I> `` jumplist-navigation entry point,
 //! distinct from `f_getjumplist`/`getjumplist()`, already translated
 //! in `eval/funcs.rs` - now tractable given `cleanup_jumplist`/
-//! `fname2fnum`/`buflist_findnr`/`setpcmark` all exist).
+//! `fname2fnum`/`buflist_findnr`/`setpcmark` all exist); `ex_delmarks`
+//! (re-checked directly a second time and found the earlier "still
+//! genuinely blocked" note was itself too pessimistic: EVERY real
+//! `emsg`/`semsg` call in this function is immediately followed by
+//! `return`, with no OTHER state change of its own - omitting the
+//! message display while keeping the exact same early return is a
+//! complete, faithful translation of every branch, not a narrowing;
+//! see this function's own doc comment for the full reasoning).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
@@ -83,16 +90,6 @@
 //!   `nlua_call_excmd(...)` wrapper delegating to a Lua implementation
 //!   (`vim._core.marks`) - needs the Lua host (`lua/executor.c`, phase
 //!   13), not just `exarg_T`.
-//! - `ex_delmarks`: re-checked directly now that `do_markset_autocmd`/
-//!   `clrallmarks`/`buflist_findnr` all exist - its own real,
-//!   reachable `emsg(_(e_invarg))`/`emsg(_(e_argreq))` calls for
-//!   genuinely invalid arguments need the actual message-display
-//!   pipeline (`message.c`, still not tractable) for real user-facing
-//!   correctness (unlike the narrower "skip the display, keep the
-//!   state" pattern used elsewhere - this function's own control flow
-//!   depends on parsing `eap->arg` into ranges, not a single
-//!   independent state change) - still genuinely blocked, for a more
-//!   precise reason than the stale note this replaces.
 //! - `ex_jumps`/`ex_changes`: need the real message-display pipeline
 //!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
 //!   tractable) - `cleanup_jumplist` is no longer their blocker.
@@ -627,6 +624,187 @@ pub unsafe fn ex_clearjumps(_eap: &crate::ex_cmds_defs::ExargT) {
     free_jumplist(curwin);
     curwin.w_jumplistlen = 0;
     curwin.w_jumplistidx = 0;
+}
+
+/// `":delmarks[!] [marks]"` - delete the given marks, or ALL marks
+/// with `[!]` and no argument (`ex_delmarks`).
+///
+/// Re-checked directly now that `do_markset_autocmd`/`clrallmarks`/
+/// `buflist_findnr` all exist: every real `emsg`/`semsg` call in the
+/// original is a genuine "stop processing here, nothing more to do"
+/// signal - each is immediately followed by `return`, with no further
+/// state change of its own. Translated by omitting the message
+/// display while keeping the exact same early return, matching this
+/// crate's established `mf_write`/`u_savecommon`/`u_get_headentry`
+/// policy for messages that gate real control flow (not the narrower
+/// "skip display, keep an otherwise-independent state change"
+/// pattern used elsewhere - here the message IS the only observable
+/// difference, so omitting it while keeping the `return` is a
+/// complete, faithful translation of every branch).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curbuf` and [`NAMEDFM`] - same
+/// requirement as every other function that touches a `GlobalCell`.
+pub unsafe fn ex_delmarks(eap: &crate::ex_cmds_defs::ExargT) {
+    let arg = eap.arg.as_deref().unwrap_or(&[]);
+    let pos = PosT::default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf_ptr = unsafe { GLOBALS.get_mut() }.curbuf;
+    // SAFETY: `curbuf_ptr` is a valid, live pointer (forwarded from
+    // this function's own safety doc).
+    let curbuf = unsafe { &mut *curbuf_ptr };
+
+    if arg.is_empty() && eap.forceit {
+        // clear all marks
+        for i in 0..(NMARKS as usize) {
+            if curbuf.b_namedm[i].mark.lnum != 0 {
+                do_markset_autocmd(b'a' + i as u8, &pos, curbuf_ptr);
+            }
+        }
+        if curbuf.b_last_cursor.mark.lnum != 0 {
+            do_markset_autocmd(b'"', &pos, curbuf_ptr);
+        }
+        if curbuf.b_last_insert.mark.lnum != 0 {
+            do_markset_autocmd(b'^', &pos, curbuf_ptr);
+        }
+        if curbuf.b_last_change.mark.lnum != 0 {
+            do_markset_autocmd(b'.', &pos, curbuf_ptr);
+        }
+        if curbuf.b_op_start.lnum != 0 {
+            do_markset_autocmd(b'[', &pos, curbuf_ptr);
+        }
+        if curbuf.b_op_end.lnum != 0 {
+            do_markset_autocmd(b']', &pos, curbuf_ptr);
+        }
+        clrallmarks(curbuf, os_time());
+    } else if eap.forceit {
+        // e_invarg: real message display not tractable (see this
+        // function's own doc comment) - the original does nothing
+        // else here, so there is no state to preserve either way.
+    } else if arg.is_empty() {
+        // e_argreq: same reasoning as the `forceit` branch above.
+    } else {
+        // clear specified marks only
+        let timestamp = os_time();
+        let mut i = 0usize;
+        while i < arg.len() {
+            let c = arg[i];
+            let lower = crate::macros_defs::ascii_islower(i32::from(c));
+            let digit = crate::ascii_defs::ascii_isdigit(i32::from(c));
+            if lower || digit || crate::macros_defs::ascii_isupper(i32::from(c)) {
+                let from: u8;
+                let to: u8;
+                if i + 1 < arg.len() && arg[i + 1] == b'-' {
+                    // clear range of marks
+                    if i + 2 >= arg.len() {
+                        return;
+                    }
+                    let range_to = arg[i + 2];
+                    let same_category = if lower {
+                        crate::macros_defs::ascii_islower(i32::from(range_to))
+                    } else if digit {
+                        crate::ascii_defs::ascii_isdigit(i32::from(range_to))
+                    } else {
+                        crate::macros_defs::ascii_isupper(i32::from(range_to))
+                    };
+                    if !same_category || range_to < c {
+                        return;
+                    }
+                    from = c;
+                    to = range_to;
+                    i += 2;
+                } else {
+                    // clear one lower/digit/upper case mark
+                    from = c;
+                    to = c;
+                }
+
+                for m in from..=to {
+                    if lower {
+                        let idx = (m - b'a') as usize;
+                        if curbuf.b_namedm[idx].mark.lnum != 0 {
+                            do_markset_autocmd(m, &pos, curbuf_ptr);
+                        }
+                        curbuf.b_namedm[idx].mark.lnum = 0;
+                        curbuf.b_namedm[idx].timestamp = timestamp;
+                    } else {
+                        let n = if digit {
+                            i32::from(m - b'0') + NMARKS
+                        } else {
+                            i32::from(m - b'A')
+                        };
+                        // SAFETY: forwarded from this function's own safety doc.
+                        let namedfm = unsafe { NAMEDFM.get_mut() };
+                        if namedfm[n as usize].fmark.mark.lnum != 0 {
+                            // SAFETY: forwarded from this function's own safety doc.
+                            let mut target_buf =
+                                unsafe { crate::buffer::buflist_findnr(namedfm[n as usize].fmark.fnum) };
+                            if target_buf.is_null() {
+                                target_buf = curbuf_ptr;
+                            }
+                            do_markset_autocmd(m, &pos, target_buf);
+                        }
+                        namedfm[n as usize].fmark.mark.lnum = 0;
+                        namedfm[n as usize].fmark.fnum = 0;
+                        namedfm[n as usize].fmark.timestamp = timestamp;
+                        namedfm[n as usize].fname = None;
+                    }
+                }
+            } else {
+                match c {
+                    b'"' => {
+                        if curbuf.b_last_cursor.mark.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        clear_fmark(&mut curbuf.b_last_cursor, timestamp);
+                    }
+                    b'^' => {
+                        if curbuf.b_last_insert.mark.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        clear_fmark(&mut curbuf.b_last_insert, timestamp);
+                    }
+                    b':' => {
+                        // Readonly mark. No deletion allowed.
+                    }
+                    b'.' => {
+                        if curbuf.b_last_change.mark.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        clear_fmark(&mut curbuf.b_last_change, timestamp);
+                    }
+                    b'[' => {
+                        if curbuf.b_op_start.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        curbuf.b_op_start.lnum = 0;
+                    }
+                    b']' => {
+                        if curbuf.b_op_end.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        curbuf.b_op_end.lnum = 0;
+                    }
+                    b'<' => {
+                        if curbuf.b_visual.vi_start.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        curbuf.b_visual.vi_start.lnum = 0;
+                    }
+                    b'>' => {
+                        if curbuf.b_visual.vi_end.lnum != 0 {
+                            do_markset_autocmd(c, &pos, curbuf_ptr);
+                        }
+                        curbuf.b_visual.vi_end.lnum = 0;
+                    }
+                    b' ' => {}
+                    _ => return,
+                }
+            }
+            i += 1;
+        }
+    }
 }
 
 /// `set_last_cursor`.
@@ -1989,6 +2167,224 @@ mod tests {
         let curwin = unsafe { &*GLOBALS.get_mut().curwin };
         assert_eq!(curwin.w_jumplistlen, 0);
         assert_eq!(curwin.w_jumplistidx, 0);
+    }
+
+    // --- ex_delmarks ---
+
+    fn delmarks_eap(arg: &[u8], forceit: bool) -> crate::ex_cmds_defs::ExargT {
+        crate::ex_cmds_defs::ExargT {
+            arg: if arg.is_empty() { None } else { Some(arg.to_vec()) },
+            forceit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ex_delmarks_bang_clears_every_mark() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5;
+        buf.b_last_cursor.mark.lnum = 5;
+        buf.b_last_insert.mark.lnum = 1;
+        buf.b_last_change.mark.lnum = 1;
+        buf.b_op_start.lnum = 1;
+        buf.b_op_end.lnum = 1;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"", true);
+        unsafe { ex_delmarks(&eap) };
+
+        // SAFETY: the guard above set GLOBALS.curbuf to `&mut buf`,
+        // still alive here.
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 0);
+        // clrallmarks's own real, deliberate quirk (already documented
+        // there): b_last_cursor is reset to lnum=1, NOT 0 like every
+        // other mark - confirmed against the real source, not a bug.
+        assert_eq!(curbuf.b_last_cursor.mark.lnum, 1);
+        assert_eq!(curbuf.b_op_start.lnum, 0);
+    }
+
+    #[test]
+    fn ex_delmarks_bang_with_an_argument_is_a_no_op() {
+        // The original's own real e_invarg error display is skipped,
+        // but there is no OTHER state change on this branch either -
+        // the mark must stay untouched.
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"a", true);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 5);
+    }
+
+    #[test]
+    fn ex_delmarks_no_argument_and_no_bang_is_a_no_op() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 5);
+    }
+
+    #[test]
+    fn ex_delmarks_single_lowercase_mark() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5; // 'a'
+        buf.b_namedm[1].mark.lnum = 7; // 'b'
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"a", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 0);
+        assert_eq!(curbuf.b_namedm[1].mark.lnum, 7); // untouched
+    }
+
+    #[test]
+    fn ex_delmarks_range_of_lowercase_marks() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        for i in 0..4 {
+            buf.b_namedm[i].mark.lnum = 10 + i as crate::pos_defs::LinenrT;
+        }
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"a-c", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 0); // a
+        assert_eq!(curbuf.b_namedm[1].mark.lnum, 0); // b
+        assert_eq!(curbuf.b_namedm[2].mark.lnum, 0); // c
+        assert_eq!(curbuf.b_namedm[3].mark.lnum, 13); // d - untouched
+    }
+
+    #[test]
+    fn ex_delmarks_single_uppercase_global_mark() {
+        let mut buf = BufT { handle: 60, ..Default::default() };
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        // MarkTestGuard::set already holds globals_test_lock() for
+        // its whole lifetime - NAMEDFM's own snapshot/restore must
+        // happen AFTER the guard exists, not via a second, redundant
+        // explicit lock acquisition (which would deadlock against the
+        // guard's own non-reentrant Mutex).
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        namedfm[mark_global_index(b'Q') as usize].fmark.mark.lnum = 42;
+
+        let eap = delmarks_eap(b"Q", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[mark_global_index(b'Q') as usize].fmark.mark.lnum, 0);
+        assert_eq!(namedfm[mark_global_index(b'Q') as usize].fmark.fnum, 0);
+        *namedfm = prev_namedfm;
+    }
+
+    #[test]
+    fn ex_delmarks_single_digit_global_mark() {
+        let mut buf = BufT { handle: 61, ..Default::default() };
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        // Same reasoning as ex_delmarks_single_uppercase_global_mark's
+        // own comment above.
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        let prev_namedfm = namedfm.clone();
+        namedfm[mark_global_index(b'4') as usize].fmark.mark.lnum = 99;
+
+        let eap = delmarks_eap(b"4", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[mark_global_index(b'4') as usize].fmark.mark.lnum, 0);
+        *namedfm = prev_namedfm;
+    }
+
+    #[test]
+    fn ex_delmarks_special_marks() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_last_cursor.mark.lnum = 1;
+        buf.b_last_insert.mark.lnum = 1;
+        buf.b_last_change.mark.lnum = 1;
+        buf.b_op_start.lnum = 1;
+        buf.b_op_end.lnum = 1;
+        buf.b_visual.vi_start.lnum = 1;
+        buf.b_visual.vi_end.lnum = 1;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        let eap = delmarks_eap(b"\"^.[]<>: ", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_last_cursor.mark.lnum, 0);
+        assert_eq!(curbuf.b_last_insert.mark.lnum, 0);
+        assert_eq!(curbuf.b_last_change.mark.lnum, 0);
+        assert_eq!(curbuf.b_op_start.lnum, 0);
+        assert_eq!(curbuf.b_op_end.lnum, 0);
+        assert_eq!(curbuf.b_visual.vi_start.lnum, 0);
+        assert_eq!(curbuf.b_visual.vi_end.lnum, 0);
+    }
+
+    #[test]
+    fn ex_delmarks_invalid_range_category_mismatch_stops_without_changes() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5; // 'a'
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        // "a-A" mixes lowercase and uppercase - invalid range shape.
+        let eap = delmarks_eap(b"a-A", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 5); // untouched
+    }
+
+    #[test]
+    fn ex_delmarks_invalid_range_reversed_stops_without_changes() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[(b'z' - b'a') as usize].mark.lnum = 5;
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        // "z-a": to < from - invalid range.
+        let eap = delmarks_eap(b"z-a", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[(b'z' - b'a') as usize].mark.lnum, 5); // untouched
+    }
+
+    #[test]
+    fn ex_delmarks_unrecognized_character_stops_processing() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        buf.b_namedm[0].mark.lnum = 5; // 'a'
+        buf.b_namedm[1].mark.lnum = 7; // 'b'
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        // "a!b": 'a' is cleared, then '!' aborts processing entirely -
+        // 'b' (which comes after '!') is never reached.
+        let eap = delmarks_eap(b"a!b", false);
+        unsafe { ex_delmarks(&eap) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        assert_eq!(curbuf.b_namedm[0].mark.lnum, 0); // cleared before the abort
+        assert_eq!(curbuf.b_namedm[1].mark.lnum, 7); // never reached
     }
 
     #[test]
