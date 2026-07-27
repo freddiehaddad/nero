@@ -399,6 +399,12 @@ mod tests {
 
     #[test]
     fn has_event_is_false_for_every_event_when_autocmds_are_always_empty() {
+        // AUTOCMDS is a shared GlobalCell - a sibling test elsewhere in
+        // this module temporarily populates AUTOCMDS[BufEnter] (under
+        // this same lock) to prove has_event's own "found" branch, so
+        // this test must hold the lock too, or it can observe that
+        // sibling's mid-flight mutation under parallel execution.
+        let _lock = crate::globals::global_state_test_lock();
         assert!(!has_event(EventT::BufEnter));
         assert!(!has_event(EventT::VimEnter));
         assert!(!has_event(EventT::WinScrolled));

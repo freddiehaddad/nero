@@ -3887,3 +3887,589 @@ mod eval_one_expr_in_str_tests {
         assert_eq!(consumed, None);
     }
 }
+
+/// Implements the logic to retrieve local variable and option values.
+/// Used by `getwinvar()`/`gettabvar()`/`gettabwinvar()`/`getbufvar()`
+/// (`get_var_from`).
+///
+/// `varname` is `None` for a caller whose own `tv_get_string_chk` call
+/// already failed (matching the original's own nullable `const char
+/// *varname`). `tp`/`win`/`buf` may each be null, matching the
+/// original's own nullable pointers - `buf` is ignored unless
+/// `htname == b'b'`.
+///
+/// # Safety
+/// `tp`/`win`/`buf` (whichever are non-null) must be valid, live
+/// pointers; `GLOBALS.curtab`/`curwin`/`curbuf` must be valid.
+///
+/// # Panics
+/// Panics if a real window/tabpage switch away from the current one
+/// is genuinely needed (`tp != curtab` or `win != curwin`, whenever
+/// `do_change_curbuf` doesn't already sidestep it for `htname ==
+/// b'b'`) - needs the real `ctx_switch` (`context.c`), which itself
+/// needs window/tabpage-switching machinery (`goto_tabpage_tp`,
+/// `use_tabpage`/`unuse_tabpage`) not yet translated. Also panics if
+/// the bare `"&"` (whole window/buffer-local-options-dict) form is
+/// requested - needs `get_winbuf_options`, not yet translated.
+/// Neither panic is reachable via `getbufvar({buf}, "&optname")` (any
+/// `{buf}`, since `do_change_curbuf` always sidesteps the switch for
+/// `htname == b'b'`) or `getwinvar(0, ...)`/`gettabvar(tabnr-of-
+/// curtab, ...)` (the current window/tab, the overwhelmingly common
+/// invocation shape).
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_var_from(
+    varname: Option<&[u8]>,
+    rettv: &mut TypvalT,
+    deftv: &TypvalT,
+    htname: u8,
+    tp: *mut crate::buffer_defs::TabpageT,
+    win: *mut crate::buffer_defs::WinT,
+    buf: *mut crate::buffer_defs::BufT,
+) {
+    let mut done = false;
+    let do_change_curbuf = !buf.is_null() && htname == b'b';
+
+    rettv.value = TypvalValue::String(None);
+
+    if let Some(varname) = varname {
+        if !tp.is_null() && !win.is_null() && (htname != b'b' || !buf.is_null()) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let need_switch_win =
+                !(std::ptr::eq(tp, g.curtab) && std::ptr::eq(win, g.curwin)) && !do_change_curbuf;
+
+            if need_switch_win {
+                unimplemented!(
+                    "get_var_from: switching to a different window/tabpage needs the real \
+                     ctx_switch (context.c), not yet translated - see this function's own doc \
+                     comment"
+                );
+            }
+
+            if varname.first() == Some(&b'&') && htname != b't' {
+                // SAFETY: forwarded from this function's own safety doc.
+                let save_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+                if do_change_curbuf {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = buf;
+                }
+
+                if varname.len() == 1 {
+                    unimplemented!(
+                        "get_var_from: the bare \"&\" whole-options-dict form needs \
+                         get_winbuf_options, not yet translated"
+                    );
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let (r, _) =
+                        unsafe { crate::eval::eval::eval_option(varname, Some(rettv), true) };
+                    if r == crate::vim_defs::OK {
+                        done = true;
+                    }
+                }
+
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = save_curbuf;
+            } else if varname.is_empty() {
+                let v: *const ScopeDictDictItem = if htname == b'b' {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { &(*buf).b_bufvar }
+                } else if htname == b'w' {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { &(*win).w_winvar }
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { &(*tp).tp_winvar }
+                };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_copy(&(*v).di_tv, rettv) };
+                done = true;
+            } else {
+                let d: *mut DictT = if htname == b'b' {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*buf).b_vars }
+                } else if htname == b'w' {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*win).w_vars }
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*tp).tp_vars }
+                };
+                // SAFETY: forwarded from this function's own safety doc.
+                let found = unsafe { find_var_in_ht(d, htname, varname, false) };
+                if let Some(variant) = found {
+                    let src: *const TypvalT = match variant {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        DictitemVariant::Dict(p) => unsafe { &(*p).di_tv },
+                        // SAFETY: forwarded from this function's own safety doc.
+                        DictitemVariant::Scope(p) => unsafe { &(*p).di_tv },
+                    };
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { crate::eval::typval::tv_copy(&*src, rettv) };
+                    done = true;
+                }
+            }
+        }
+    }
+
+    if !done && !matches!(deftv.value, TypvalValue::Unknown) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_copy(deftv, rettv) };
+    }
+}
+
+/// `getwinvar()`/`gettabwinvar()` (`getwinvar`).
+///
+/// `off == 1` selects `gettabwinvar()`'s extra leading `{tabnr}`
+/// argument; `off == 0` is plain `getwinvar()`.
+///
+/// # Safety
+/// Forwarded from `get_var_from`'s own safety doc.
+unsafe fn getwinvar(argvars: &[TypvalT], rettv: &mut TypvalT, off: usize) {
+    let tp = if off == 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::window::find_tabpage(
+                crate::eval::typval::tv_get_number_chk(&argvars[0], None) as i32,
+            )
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { crate::window::find_win_by_nr(&argvars[off], tp) };
+    let varname = crate::eval::typval::tv_get_string_chk(&argvars[off + 1]);
+
+    // The optional trailing {def} argument may simply be absent from
+    // this crate's own exactly-sized argvars slice (unlike the
+    // original's fixed-size, VAR_UNKNOWN-padded array) - fall back to
+    // a plain default (VAR_UNKNOWN) TypvalT in that case, matching
+    // get_var_from's own "deftv.v_type == VAR_UNKNOWN" no-default
+    // check.
+    let default_tv = TypvalT::default();
+    let deftv = argvars.get(off + 2).unwrap_or(&default_tv);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        get_var_from(varname.as_deref(), rettv, deftv, b'w', tp, win, std::ptr::null_mut());
+    }
+}
+
+/// `"gettabvar()"` function (`f_gettabvar`).
+///
+/// # Safety
+/// Forwarded from `get_var_from`'s own safety doc.
+pub unsafe fn f_gettabvar(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let varname = crate::eval::typval::tv_get_string_chk(&argvars[1]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let tp = unsafe {
+        crate::window::find_tabpage(crate::eval::typval::tv_get_number_chk(&argvars[0], None) as i32)
+    };
+    let win = if tp.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc; tp
+        // was just null-checked above.
+        if std::ptr::eq(tp, g.curtab) || unsafe { &*tp }.tp_firstwin.is_null() {
+            g.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc;
+            // tp was just null-checked above.
+            unsafe { &*tp }.tp_firstwin
+        }
+    };
+
+    let default_tv = TypvalT::default();
+    let deftv = argvars.get(2).unwrap_or(&default_tv);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        get_var_from(varname.as_deref(), rettv, deftv, b't', tp, win, std::ptr::null_mut());
+    }
+}
+
+/// `"gettabwinvar()"` function (`f_gettabwinvar`).
+///
+/// # Safety
+/// Forwarded from `get_var_from`'s own safety doc.
+pub unsafe fn f_gettabwinvar(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getwinvar(argvars, rettv, 1) };
+}
+
+/// `"getwinvar()"` function (`f_getwinvar`).
+///
+/// # Safety
+/// Forwarded from `get_var_from`'s own safety doc.
+pub unsafe fn f_getwinvar(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getwinvar(argvars, rettv, 0) };
+}
+
+/// `"getbufvar()"` function (`f_getbufvar`).
+///
+/// # Safety
+/// Forwarded from `get_var_from`'s own safety doc.
+pub unsafe fn f_getbufvar(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let varname = crate::eval::typval::tv_get_string_chk(&argvars[1]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { crate::eval::buffer::tv_get_buf_from_arg(&argvars[0]) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let default_tv = TypvalT::default();
+    let deftv = argvars.get(2).unwrap_or(&default_tv);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        get_var_from(varname.as_deref(), rettv, deftv, b'b', g.curtab, g.curwin, buf);
+    }
+}
+
+#[cfg(test)]
+mod get_var_from_tests {
+    use super::*;
+
+    fn reset_shared_state() {
+        crate::eval::userfunc::set_current_funccal(std::ptr::null_mut());
+        unsafe { vars_clear(GLOBVARDICT.get_mut()) };
+        crate::runtime::tests_reset_for_test();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = Default::default();
+    }
+
+    struct TestFixture {
+        buf: Box<crate::buffer_defs::BufT>,
+        win: Box<crate::buffer_defs::WinT>,
+        tab: Box<crate::buffer_defs::TabpageT>,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_lastbuf: *mut crate::buffer_defs::BufT,
+    }
+
+    impl TestFixture {
+        fn new() -> Self {
+            reset_shared_state();
+            let mut buf = Box::new(crate::buffer_defs::BufT::default());
+            let mut win = Box::new(crate::buffer_defs::WinT::default());
+            let mut tab = Box::new(crate::buffer_defs::TabpageT::default());
+            let buf_ptr = buf.as_mut() as *mut crate::buffer_defs::BufT;
+            let win_ptr = win.as_mut() as *mut crate::buffer_defs::WinT;
+            let tab_ptr = tab.as_mut() as *mut crate::buffer_defs::TabpageT;
+
+            // Wire up b_vars/w_vars/tp_vars + b_bufvar/w_winvar/
+            // tp_winvar exactly like the real buflist_new/win_alloc/
+            // alloc_tabpage do: tv_dict_alloc() the scope dict, then
+            // init_var_dict() to link the ScopeDictDictItem to it -
+            // never a bare Default (which would leave di_tv at
+            // Unknown, a state a real, fully-constructed buffer/
+            // window/tabpage can never actually be in).
+            unsafe {
+                (*buf_ptr).b_vars = crate::eval::typval::tv_dict_alloc();
+                init_var_dict(&mut *(*buf_ptr).b_vars, &mut (*buf_ptr).b_bufvar, ScopeType::Scope);
+                (*win_ptr).w_vars = crate::eval::typval::tv_dict_alloc();
+                init_var_dict(&mut *(*win_ptr).w_vars, &mut (*win_ptr).w_winvar, ScopeType::Scope);
+                (*tab_ptr).tp_vars = crate::eval::typval::tv_dict_alloc();
+                init_var_dict(&mut *(*tab_ptr).tp_vars, &mut (*tab_ptr).tp_winvar, ScopeType::Scope);
+                (*win_ptr).w_buffer = buf_ptr;
+                (*win_ptr).handle = 1;
+                (*buf_ptr).handle = 1;
+            }
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_curbuf = g.curbuf;
+            let prev_curwin = g.curwin;
+            let prev_curtab = g.curtab;
+            let prev_firstwin = g.firstwin;
+            let prev_first_tabpage = g.first_tabpage;
+            let prev_lastbuf = g.lastbuf;
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            g.curtab = tab_ptr;
+            g.firstwin = win_ptr;
+            g.first_tabpage = tab_ptr;
+            g.lastbuf = buf_ptr;
+            Self {
+                buf,
+                win,
+                tab,
+                prev_curbuf,
+                prev_curwin,
+                prev_curtab,
+                prev_firstwin,
+                prev_first_tabpage,
+                prev_lastbuf,
+            }
+        }
+
+        fn buf_ptr(&mut self) -> *mut crate::buffer_defs::BufT {
+            self.buf.as_mut() as *mut crate::buffer_defs::BufT
+        }
+
+        fn win_ptr(&mut self) -> *mut crate::buffer_defs::WinT {
+            self.win.as_mut() as *mut crate::buffer_defs::WinT
+        }
+
+        fn tab_ptr(&mut self) -> *mut crate::buffer_defs::TabpageT {
+            self.tab.as_mut() as *mut crate::buffer_defs::TabpageT
+        }
+    }
+
+    impl Drop for TestFixture {
+        fn drop(&mut self) {
+            // Restore GLOBALS.curbuf/curwin/curtab/firstwin/
+            // first_tabpage/lastbuf to their PRE-fixture values before
+            // this fixture's own buf/win/tab Boxes are freed below -
+            // otherwise these shared globals are left dangling,
+            // pointing at freed memory, for whichever unrelated test
+            // runs next (matching TestCurBufWinTab's own established
+            // save/restore pattern in this same file).
+            unsafe {
+                let g = crate::globals::GLOBALS.get_mut();
+                g.curbuf = self.prev_curbuf;
+                g.curwin = self.prev_curwin;
+                g.curtab = self.prev_curtab;
+                g.firstwin = self.prev_firstwin;
+                g.first_tabpage = self.prev_first_tabpage;
+                g.lastbuf = self.prev_lastbuf;
+            }
+            // Free the real tv_dict_alloc()-backed b_vars/w_vars/
+            // tp_vars dicts (unlinking them from GC_FIRST_DICT) before
+            // the Boxes themselves drop - otherwise these leak into
+            // the shared GC list forever, corrupting other tests that
+            // assert on its contents (the exact leak class this
+            // session has repeatedly caught and fixed elsewhere).
+            unsafe {
+                if !self.buf.b_vars.is_null() {
+                    crate::eval::typval::tv_dict_free(self.buf.b_vars);
+                }
+                if !self.win.w_vars.is_null() {
+                    crate::eval::typval::tv_dict_free(self.win.w_vars);
+                }
+                if !self.tab.tp_vars.is_null() {
+                    crate::eval::typval::tv_dict_free(self.tab.tp_vars);
+                }
+            }
+            reset_shared_state();
+        }
+    }
+
+    #[test]
+    fn get_var_from_finds_a_buffer_local_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(42) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *(*bp).b_vars, item) };
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        unsafe { get_var_from(Some(b"myvar"), &mut rettv, &deftv, b'b', tp, wp, bp) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn get_var_from_uses_default_when_variable_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT { value: TypvalValue::Number(99), ..TypvalT::default() };
+        unsafe { get_var_from(Some(b"nope"), &mut rettv, &deftv, b'b', tp, wp, bp) };
+        assert_eq!(rettv.value, TypvalValue::Number(99));
+    }
+
+    #[test]
+    fn get_var_from_null_buf_with_htname_b_uses_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT { value: TypvalValue::Number(7), ..TypvalT::default() };
+        unsafe {
+            get_var_from(Some(b"myvar"), &mut rettv, &deftv, b'b', tp, wp, std::ptr::null_mut());
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn get_var_from_empty_varname_returns_the_whole_scope_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        unsafe { get_var_from(Some(b""), &mut rettv, &deftv, b'b', tp, wp, bp) };
+        assert_eq!(rettv.value, unsafe { (*bp).b_bufvar.di_tv.value.clone() });
+    }
+
+    #[test]
+    fn get_var_from_option_name_reads_a_real_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        // "&ignorecase" is global-only (option::get_varp_from resolves
+        // it independent of curbuf/curwin), so this exercises the real
+        // eval_option call without needing any option table wiring on
+        // the test fixture's own buf/win.
+        unsafe { get_var_from(Some(b"&ignorecase"), &mut rettv, &deftv, b'b', tp, wp, bp) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn get_var_from_tabname_option_prefix_is_not_treated_as_an_option() {
+        // htname == 't' skips the "&option" special case entirely,
+        // per get_var_from's own real control flow - "&foo" is looked
+        // up as a literal (never-found) variable name instead.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT { value: TypvalValue::Number(5), ..TypvalT::default() };
+        unsafe {
+            get_var_from(Some(b"&ignorecase"), &mut rettv, &deftv, b't', tp, wp, std::ptr::null_mut());
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "get_winbuf_options")]
+    fn get_var_from_bare_ampersand_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let wp = fx.win_ptr();
+        let tp = fx.tab_ptr();
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        unsafe { get_var_from(Some(b"&"), &mut rettv, &deftv, b'b', tp, wp, bp) };
+    }
+
+    #[test]
+    #[should_panic(expected = "ctx_switch")]
+    fn get_var_from_a_different_window_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let mut other_win = crate::buffer_defs::WinT::default();
+        let tp = fx.tab_ptr();
+        let other_ptr = &mut other_win as *mut crate::buffer_defs::WinT;
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        unsafe {
+            get_var_from(Some(b"myvar"), &mut rettv, &deftv, b'w', tp, other_ptr, std::ptr::null_mut());
+        }
+    }
+
+    // ---- getwinvar/gettabvar/gettabwinvar/getbufvar (the real
+    // "f_*" entry points) ----
+
+    #[test]
+    fn f_getwinvar_reads_the_current_windows_own_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let wp = fx.win_ptr();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(3) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *(*wp).w_vars, item) };
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(0), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"myvar".to_vec())), ..TypvalT::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_getwinvar(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn f_gettabvar_reads_the_current_tabpages_own_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let tp = fx.tab_ptr();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(9) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *(*tp).tp_vars, item) };
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"myvar".to_vec())), ..TypvalT::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettabvar(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(9));
+    }
+
+    #[test]
+    fn f_gettabwinvar_reads_the_current_tab_and_windows_own_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let wp = fx.win_ptr();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(11) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *(*wp).w_vars, item) };
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"myvar".to_vec())), ..TypvalT::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettabwinvar(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(11));
+    }
+
+    #[test]
+    fn f_getbufvar_reads_a_buffer_local_variable_by_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fx = TestFixture::new();
+        let bp = fx.buf_ptr();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myvar");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(13) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *(*bp).b_vars, item) };
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"myvar".to_vec())), ..TypvalT::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufvar(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(13));
+    }
+
+    #[test]
+    fn f_getbufvar_falls_back_to_the_default_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = TestFixture::new();
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(999), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::String(Some(b"myvar".to_vec())), ..TypvalT::default() },
+            TypvalT { value: TypvalValue::Number(-1), ..TypvalT::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufvar(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+}

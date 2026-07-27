@@ -437,6 +437,10 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
         m.insert(&b"gettabinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettabinfo });
         m.insert(&b"getbufinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getbufinfo });
+        m.insert(&b"getbufvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_getbufvar });
+        m.insert(&b"getwinvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_getwinvar });
+        m.insert(&b"gettabvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_gettabvar });
+        m.insert(&b"gettabwinvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 4, base_arg: 1, func: crate::eval::vars::f_gettabwinvar });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -6301,6 +6305,10 @@ mod tests {
             "tabpagebuflist",
             "gettabinfo",
             "getbufinfo",
+            "getbufvar",
+            "getwinvar",
+            "gettabvar",
+            "gettabwinvar",
             "eval",
             "gettext",
             "nextnonblank",
