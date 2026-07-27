@@ -4048,6 +4048,40 @@ pub unsafe fn buf_byteidx_to_charidx(
     count - 1
 }
 
+/// Convert a character index within line `lnum` of `buf` to a byte
+/// index (`buf_charidx_to_byteidx`).
+///
+/// # Safety
+/// Forwarded from [`crate::memline::ml_get_buf`]'s own safety doc.
+#[must_use]
+pub unsafe fn buf_charidx_to_byteidx(
+    buf: &mut crate::buffer_defs::BufT,
+    lnum: crate::pos_defs::LinenrT,
+    charidx: i32,
+) -> i32 {
+    if buf.b_ml.ml_mfp.is_null() {
+        return -1;
+    }
+    let lnum = lnum.min(buf.b_ml.ml_line_count);
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+
+    // Convert the character offset to a byte offset.
+    let mut t = 0usize;
+    let mut charidx = charidx;
+    while s.get(t).copied().unwrap_or(0) != 0 {
+        charidx -= 1;
+        if charidx <= 0 {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&s[t..]) }).unwrap_or(0).max(1);
+        t += adv;
+    }
+
+    t as i32
+}
+
 /// Convert `tv` into a file position for window `wp`
 /// (`var2fpos`).
 ///
@@ -4192,18 +4226,29 @@ pub unsafe fn var2fpos(
 /// `arg` must be `[fnum, lnum, col, coladd, curswant]` (`fnum` present
 /// only when `fnump` is `Some`; `coladd`/`curswant` optional).
 ///
-/// The `charcol=true` (character-position, used by `setcharpos()`)
-/// path needs `buflist_findnr`/`buf_charidx_to_byteidx`, neither
-/// translated yet - `unimplemented!()`s if actually reached (this
-/// crate's only current caller, `set_position`, always passes
-/// `charcol=false` for `setpos()`; `setcharpos()` itself is not yet
-/// registered as a builtin for exactly this reason).
+/// The `charcol=true` (character-position, used by `setcharpos()`/
+/// `setcursorcharpos()`) path is tractable ONLY when `fnump` is
+/// `None`: the original resolves the target buffer via
+/// `buflist_findnr(fnump == NULL ? curbuf->b_fnum : *fnump)`, and
+/// looking up your OWN buffer number always finds `curbuf` itself, so
+/// this case substitutes `GLOBALS.curbuf` directly, skipping the
+/// not-yet-translated `buflist_findnr` lookup entirely (provably
+/// equivalent for this specific sub-case, via
+/// [`buf_charidx_to_byteidx`]). When `fnump` is `Some` (an EXPLICIT
+/// buffer number, possibly a DIFFERENT buffer than `curbuf`), this
+/// same shortcut does not apply - `unimplemented!()`s if reached
+/// (`set_position`'s own call for `setpos()`/`setcharpos()` always
+/// passes `fnump = Some`, so `setcharpos()` itself is still not
+/// registered as a builtin for this reason; `set_cursorpos`'s own
+/// List-argument call for `cursor()`/`setcursorcharpos()` always
+/// passes `fnump = None`, so THAT call site works for both).
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::typval::tv_list_find_nr`]'s own
 /// safety doc, plus [`crate::globals::GLOBALS`]'s usual "no
 /// overlapping live access" requirement when `fnump` is `Some` and the
-/// list's own `fnum` entry is `0` (current buffer).
+/// list's own `fnum` entry is `0` (current buffer), or when
+/// `charcol` is `true` and `fnump` is `None`.
 pub unsafe fn list2fpos(
     arg: &TypvalT,
     posp: &mut crate::pos_defs::PosT,
@@ -4217,8 +4262,9 @@ pub unsafe fn list2fpos(
     }
     // SAFETY: forwarded from this function's own safety doc.
     let list_len = i64::from(unsafe { crate::eval::typval::tv_list_len(l) });
-    let min_len = if fnump.is_some() { 3 } else { 2 };
-    let max_len = if fnump.is_some() { 5 } else { 4 };
+    let fnump_was_some = fnump.is_some();
+    let min_len = if fnump_was_some { 3 } else { 2 };
+    let max_len = if fnump_was_some { 5 } else { 4 };
     if list_len < min_len || list_len > max_len {
         return FAIL;
     }
@@ -4254,12 +4300,34 @@ pub unsafe fn list2fpos(
     if n < 0 {
         return FAIL;
     }
-    if charcol {
-        unimplemented!(
-            "list2fpos: character-position conversion needs buflist_findnr/\
-             buf_charidx_to_byteidx (setcharpos()), not yet translated"
-        );
-    }
+    let n = if charcol {
+        if fnump_was_some {
+            unimplemented!(
+                "list2fpos: character-position conversion for an explicit fnum needs \
+                 buflist_findnr, not yet translated"
+            );
+        }
+        // fnump == NULL means the original resolves via
+        // `buflist_findnr(curbuf->b_fnum)`, which always finds curbuf
+        // itself (looking up your own buffer number always succeeds) -
+        // substitute GLOBALS.curbuf directly, skipping the not-yet-
+        // translated buflist_findnr lookup entirely (provably
+        // equivalent for this specific, fnump-absent case).
+        // SAFETY: forwarded from this function's own safety doc.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &mut *globals.curbuf };
+        let lnum = if posp.lnum == 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*globals.curwin }.w_cursor.lnum
+        } else {
+            posp.lnum
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { buf_charidx_to_byteidx(buf, lnum, n as i32) }) + 1
+    } else {
+        n
+    };
     posp.col = n as crate::pos_defs::ColnrT;
 
     // SAFETY: forwarded from this function's own safety doc.

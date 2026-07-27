@@ -455,6 +455,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcursorcharpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcursorcharpos });
         m.insert(&b"setcharsearch"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_setcharsearch });
         m.insert(&b"setpos"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 2, func: f_setpos });
+        m.insert(&b"cursor"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_cursor });
+        m.insert(&b"setcursorcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_setcursorcharpos });
         m.insert(&b"eval"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_eval });
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
@@ -4268,6 +4270,123 @@ pub unsafe fn f_setpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { set_position(argvars, rettv, false) };
 }
 
+/// `cursor({lnum}, {col} [, {off}])`/`cursor({list})`/
+/// `setcursorcharpos({lnum}, {col} [, {off}])`/
+/// `setcursorcharpos({list})` shared engine (`set_cursorpos`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::list2fpos`]'s/
+/// [`crate::cursor::check_cursor`]'s/[`crate::mbyte::mb_adjust_cursor`]'s
+/// own safety docs.
+unsafe fn set_cursorpos(argvars: &[TypvalT], rettv: &mut TypvalT, charcol: bool) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let mut lnum;
+    let mut col;
+    let mut coladd = 0;
+    let mut set_curswant = true;
+
+    if matches!(argvars[0].value, TypvalValue::List(_)) {
+        let mut pos = crate::pos_defs::PosT::default();
+        let mut curswant: crate::pos_defs::ColnrT = -1;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::eval::list2fpos(&argvars[0], &mut pos, None, Some(&mut curswant), charcol) }
+            != crate::vim_defs::OK
+        {
+            // the original's own emsg(_(e_invarg)) display is skipped
+            // (message.c's pipeline, not tractable).
+            return;
+        }
+        lnum = pos.lnum;
+        col = pos.col;
+        coladd = pos.coladd;
+        if curswant >= 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
+            curwin.w_curswant = curswant - 1;
+            set_curswant = false;
+        }
+    } else if matches!(argvars[0].value, TypvalValue::Number(_) | TypvalValue::String(_))
+        && argvars.len() > 1
+        && matches!(argvars[1].value, TypvalValue::Number(_) | TypvalValue::String(_))
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+        if lnum == 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            lnum = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.lnum;
+        }
+        // the original's own semsg(_(e_invarg2), ...) display for
+        // lnum < 0 is skipped (message.c's pipeline, not tractable) -
+        // lnum stays negative, caught by the shared bail-out below.
+        col = crate::eval::typval::tv_get_number_chk(&argvars[1], None) as crate::pos_defs::ColnrT;
+        if charcol {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+            // SAFETY: forwarded from this function's own safety doc.
+            col = i64::from(unsafe { crate::eval::eval::buf_charidx_to_byteidx(curbuf, lnum, col) }) as crate::pos_defs::ColnrT
+                + 1;
+        }
+        if argvars.len() > 2 {
+            coladd = crate::eval::typval::tv_get_number_chk(&argvars[2], None) as crate::pos_defs::ColnrT;
+        }
+    } else {
+        // invalid argument - the original's own emsg(_(e_invarg))
+        // display is skipped (message.c's pipeline, not tractable).
+        return;
+    }
+
+    if lnum < 0 || col < 0 || coladd < 0 {
+        return; // type error; errmsg already given (skipped here)
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *curwin_ptr };
+    if lnum > 0 {
+        curwin.w_cursor.lnum = lnum;
+    }
+    if col != crate::pos_defs::MAXCOL {
+        col = col.wrapping_sub(1);
+        if col < 0 {
+            col = 0;
+        }
+    }
+    curwin.w_cursor.col = col;
+    curwin.w_cursor.coladd = coladd;
+
+    // Make sure the cursor is in a valid position.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::check_cursor(curwin_ptr) };
+    // Correct cursor for multi-byte character.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+
+    curwin.w_set_curswant = set_curswant;
+    rettv.value = TypvalValue::Number(0);
+}
+
+/// `"cursor({lnum}, {col} [, {off}])"`/`"cursor({list})"` function
+/// (`f_cursor`).
+///
+/// # Safety
+/// Forwarded from `set_cursorpos`'s own safety doc.
+pub unsafe fn f_cursor(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_cursorpos(argvars, rettv, false) };
+}
+
+/// `"setcursorcharpos({lnum}, {col} [, {off}])"`/
+/// `"setcursorcharpos({list})"` function (`f_setcursorcharpos`).
+///
+/// # Safety
+/// Forwarded from `set_cursorpos`'s own safety doc.
+pub unsafe fn f_setcursorcharpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_cursorpos(argvars, rettv, true) };
+}
+
 /// `tr({src}, {fromstr}, {tostr})` - `{src}` with every character
 /// that appears in `{fromstr}` replaced by the character at the same
 /// POSITION in `{tostr}` (`f_tr`, `strings.c`). A character not found
@@ -6673,6 +6792,8 @@ mod tests {
             "getcursorcharpos",
             "setcharsearch",
             "setpos",
+            "cursor",
+            "setcursorcharpos",
             "eval",
             "gettext",
             "nextnonblank",
@@ -10911,6 +11032,153 @@ mod tests {
         assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT::default());
 
         unsafe { crate::eval::typval::tv_list_unref(l) };
+        close_test_buf(buf);
+    }
+
+    // --- f_cursor / f_setcursorcharpos ---
+
+    #[test]
+    fn cursor_lnum_col_sets_the_cursor_position() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let args = [num(3), num(2)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_cursor(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        // 1-based col 2 -> 0-based col 1.
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 3, col: 1, coladd: 0 });
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn cursor_lnum_col_off_sets_coladd() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let args = [num(2), num(1), num(4)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_cursor(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.coladd, 4);
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn cursor_lnum_zero_uses_the_current_cursor_line() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let args = [num(0), num(1)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_cursor(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 2);
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn cursor_list_form_sets_position_via_byte_column() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let (list_tv, l) = num_list(&[3, 2, 0]);
+        let args = [list_tv];
+        let mut rettv = TypvalT::default();
+        unsafe { f_cursor(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 3, col: 1, coladd: 0 });
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn setcursorcharpos_converts_a_character_column_to_a_byte_column() {
+        // U+4E2D (中) is a 3-byte UTF-8 character; "hello" follows it.
+        let mut buf = buf_with_lines(&[b"\xE4\xB8\xADhello"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        // Character column 2 (1-based) is 'h', the 2nd character -
+        // byte offset 3 (0-based), i.e. right after the 3-byte 中.
+        let args = [num(1), num(2)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcursorcharpos(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 });
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn setcursorcharpos_list_form_converts_a_character_column_to_a_byte_column() {
+        // Same scenario as above, but through the List-argument form -
+        // this specifically exercises list2fpos's own charcol=true,
+        // fnump=None path (via buf_charidx_to_byteidx and the
+        // GLOBALS.curbuf substitution for buflist_findnr).
+        let mut buf = buf_with_lines(&[b"\xE4\xB8\xADhello"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let (list_tv, l) = num_list(&[1, 2, 0]);
+        let args = [list_tv];
+        let mut rettv = TypvalT::default();
+        unsafe { f_setcursorcharpos(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 });
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn cursor_invalid_single_number_argument_is_a_no_op() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        // A single Number isn't a List, and there's no argvars[1] to
+        // pair it with - must not panic (out-of-bounds), and must
+        // leave the cursor untouched.
+        let args = [num(5)];
+        let mut rettv = TypvalT::default();
+        unsafe { f_cursor(&args, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        assert_eq!(unsafe { &*win_ptr }.w_cursor, crate::pos_defs::PosT::default());
+
         close_test_buf(buf);
     }
 

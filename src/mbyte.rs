@@ -1506,6 +1506,25 @@ pub unsafe fn mb_charlen(s: &[u8]) -> i32 {
     count
 }
 
+/// Adjust the cursor to a multi-byte character's head byte, and reset
+/// `coladd` when it sits on the right half of a double-wide character
+/// (`mb_adjust_cursor`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`, with the usual "no overlapping
+/// live access" requirement. Forwarded from
+/// [`crate::mark::mark_mb_adjustpos`]'s own safety doc.
+pub unsafe fn mb_adjust_cursor() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *globals.curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &mut *globals.curwin };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::mark_mb_adjustpos(buf, &mut curwin.w_cursor) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
