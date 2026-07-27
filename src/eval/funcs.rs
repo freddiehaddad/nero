@@ -437,6 +437,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"line"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_line });
         m.insert(&b"col"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_col });
         m.insert(&b"charcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_charcol });
+        m.insert(&b"winbufnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winbufnr });
+        m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
+        m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4175,6 +4178,56 @@ unsafe fn f_charcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { get_col(argvars, rettv, true) };
 }
 
+/// `winbufnr({nr})` - the buffer number of window `{nr}` (a window
+/// number or window ID; `-1` if not found) (`f_winbufnr`,
+/// `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]'s own
+/// safety doc.
+unsafe fn f_winbufnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    rettv.value = TypvalValue::Number(if wp.is_null() {
+        -1
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { &*w.w_buffer }.handle)
+    });
+}
+
+/// `winheight({nr})` - the height of window `{nr}` (a window number
+/// or window ID, `0` meaning the current window; `-1` if not found),
+/// excluding `'winbar'`/`'statusline'` (`f_winheight`,
+/// `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]'s own
+/// safety doc.
+unsafe fn f_winheight(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    rettv.value =
+        TypvalValue::Number(if wp.is_null() { -1 } else { i64::from(unsafe { &*wp }.w_view_height) });
+}
+
+/// `winwidth({nr})` - the width of window `{nr}` (a window number or
+/// window ID, `0` meaning the current window; `-1` if not found),
+/// including `'signcolumn'`/`'statuscolumn'`/`'foldcolumn'`
+/// (`f_winwidth`, `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]'s own
+/// safety doc.
+unsafe fn f_winwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    rettv.value =
+        TypvalValue::Number(if wp.is_null() { -1 } else { i64::from(unsafe { &*wp }.w_view_width) });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4986,6 +5039,9 @@ mod tests {
             "line",
             "col",
             "charcol",
+            "winbufnr",
+            "winheight",
+            "winwidth",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -8949,5 +9005,94 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(0));
 
         close_test_buf(buf);
+    }
+
+    // --- f_winbufnr / f_winheight / f_winwidth ---
+
+    #[test]
+    fn winbufnr_zero_returns_curwin_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 42, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winbufnr(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+    }
+
+    #[test]
+    fn winbufnr_by_real_window_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 7, ..Default::default() };
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1234) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winbufnr(&[num(1234)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn winbufnr_unknown_window_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winbufnr(&[num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn winheight_zero_returns_curwin_view_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT { w_view_height: 23, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winheight(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(23));
+    }
+
+    #[test]
+    fn winheight_unknown_window_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winheight(&[num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn winwidth_zero_returns_curwin_view_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT { w_view_width: 80, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winwidth(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(80));
+    }
+
+    #[test]
+    fn winwidth_unknown_window_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_winwidth(&[num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 }

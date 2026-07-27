@@ -54,6 +54,7 @@
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
+use crate::eval::typval_defs::TypvalT;
 
 /// minimal columns for screen (`MIN_COLUMNS`).
 pub const MIN_COLUMNS: i32 = 12;
@@ -595,6 +596,128 @@ pub unsafe fn find_tabpage(n: i32) -> *mut crate::buffer_defs::TabpageT {
         tp = unsafe { &*tp }.tp_next;
     }
     tp
+}
+
+/// Lowest real window handle used as a genuine window ID rather than
+/// a window NUMBER within the current tab page (`LOWEST_WIN_ID`,
+/// `window.h`).
+pub const LOWEST_WIN_ID: i32 = 1000;
+
+/// Find window number `nr` in tabpage `tp` (`NULL` meaning `curtab`)
+/// (`find_win_by_nr`, `eval/window.c`). `nr == 0` means `curwin`;
+/// `nr >= `[`LOWEST_WIN_ID`] is treated as a real window ID (handle)
+/// instead of a plain window number.
+///
+/// # Safety
+/// `tp` (if non-null) must be a valid, live `TabpageT` pointer, and
+/// its own `tp_firstwin`/`w_next` chain must consist of valid, live
+/// pointers - same for `GLOBALS.firstwin`/`curtab`/`curwin` when `tp`
+/// is null.
+#[must_use]
+pub unsafe fn find_win_by_nr(vp: &TypvalT, tp: *mut crate::buffer_defs::TabpageT) -> *mut WinT {
+    let mut error = false;
+    let mut nr = crate::eval::typval::tv_get_number_chk(vp, Some(&mut error));
+    if error || nr < 0 {
+        return std::ptr::null_mut();
+    }
+    if nr == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    }
+
+    // This method accepts NULL as an alias for curtab.
+    // SAFETY: forwarded from this function's own safety doc.
+    let tp = if tp.is_null() { unsafe { crate::globals::GLOBALS.get_mut() }.curtab } else { tp };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+    let mut wp = if is_curtab {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_firstwin
+    };
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let handle = i64::from(unsafe { &*wp }.handle);
+        if nr >= i64::from(LOWEST_WIN_ID) {
+            if handle == nr {
+                return wp;
+            }
+        } else {
+            nr -= 1;
+            if nr <= 0 {
+                return wp;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    std::ptr::null_mut()
+}
+
+/// Return the window and tab pointer of window handle `id`, `NULL`
+/// when not found (`win_id2wp_tp`, `eval/window.c`).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// own `tp_firstwin`/`w_next` chain, must consist of valid, live
+/// pointers.
+#[must_use]
+pub unsafe fn win_id2wp_tp(id: i32) -> (*mut WinT, *mut crate::buffer_defs::TabpageT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*wp }.handle == id {
+                return (wp, tp);
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    (std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+/// [`win_id2wp_tp`] without the tabpage out-value (`win_id2wp`,
+/// `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`win_id2wp_tp`]'s own safety doc.
+#[must_use]
+pub unsafe fn win_id2wp(id: i32) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_id2wp_tp(id) }.0
+}
+
+/// Find a window: using a Window ID in any tab page, or using a
+/// number in the current tab page (`find_win_by_nr_or_id`,
+/// `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`win_id2wp`]/[`find_win_by_nr`]'s own safety docs.
+#[must_use]
+pub unsafe fn find_win_by_nr_or_id(vp: &TypvalT) -> *mut WinT {
+    let nr = crate::eval::typval::tv_get_number_chk(vp, None);
+    if nr >= i64::from(LOWEST_WIN_ID) {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { win_id2wp(crate::eval::typval::tv_get_number(vp) as i32) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { find_win_by_nr(vp, std::ptr::null_mut()) }
 }
 
 /// Check if `wp` is at the bottom of its column of windows - i.e.
