@@ -429,6 +429,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winnr"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winnr });
         m.insert(&b"tabpagenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_tabpagenr });
         m.insert(&b"tabpagewinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_tabpagewinnr });
+        m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -2966,6 +2967,62 @@ unsafe fn f_tabpagewinnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(nr));
 }
 
+/// `tabpagebuflist([{arg}])` - a `List` of buffer numbers, one for
+/// each window in tab page `{arg}` (the current tab page if omitted)
+/// (`f_tabpagebuflist`, `funcs.c`), via the already-existing
+/// [`crate::window::find_tabpage`]. `0` (matching the original's own
+/// documented "when `{arg}` is invalid, `0` is returned" - the real
+/// implementation achieves this by simply leaving `rettv` untouched
+/// when it can't resolve a window list, relying on its caller's own
+/// `Number(0)` pre-initialization convention; this function instead
+/// sets it explicitly up front, matching this crate's own established
+/// convention for the same "untouched-by-default" idiom, e.g.
+/// `f_delete`) if `{arg}` doesn't resolve to a real tab page.
+///
+/// # Safety
+/// Forwarded from `crate::window::find_tabpage`'s own safety doc, plus
+/// [`crate::eval::typval::tv_list_alloc_ret`]'s own safety doc.
+unsafe fn f_tabpagebuflist(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(0);
+
+    let mut wp = if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+    } else {
+        let tabnr = crate::eval::typval::tv_get_number(&argvars[0]) as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        let tp = unsafe { crate::window::find_tabpage(tabnr) };
+        if tp.is_null() {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        }
+    };
+
+    if wp.is_null() {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize) };
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let bufnr = unsafe { &*w.w_buffer }.handle;
+        // SAFETY: `l` was just allocated above by this same call.
+        unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(bufnr)) };
+        wp = w.w_next;
+    }
+}
+
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
 /// `has_list[]` static array, used by [`f_has`] - compile-time feature
 /// flags (this build supports capability X), not runtime state, hence
@@ -4685,6 +4742,7 @@ mod tests {
             "winnr",
             "tabpagenr",
             "tabpagewinnr",
+            "tabpagebuflist",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -7542,6 +7600,49 @@ mod tests {
 
         let mut rettv = TypvalT::default();
         unsafe { f_tabpagewinnr(&[num(99)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+    }
+
+    #[test]
+    fn tabpagebuflist_with_no_args_lists_current_tab_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let mut buf2 = crate::buffer_defs::BufT { handle: 2, ..Default::default() };
+        let mut second = crate::buffer_defs::WinT { w_buffer: &mut buf2 as *mut crate::buffer_defs::BufT, ..Default::default() };
+        let second_ptr = &mut second as *mut crate::buffer_defs::WinT;
+        let mut first =
+            crate::buffer_defs::WinT { w_buffer: &mut buf1 as *mut crate::buffer_defs::BufT, w_next: second_ptr, ..Default::default() };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        globals.firstwin = &mut first as *mut crate::buffer_defs::WinT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_tabpagebuflist(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn tabpagebuflist_with_an_invalid_tabpage_returns_0() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        globals.first_tabpage = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_tabpagebuflist(&[num(99)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
