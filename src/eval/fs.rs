@@ -6,8 +6,8 @@
 //! more. Most need substantial not-yet-translated machinery
 //! (`vim_rename`'s cross-device-safe rename, `delete_recursive`'s
 //! directory-tree walk, `find_file_in_path_option`'s `'path'`-option
-//! search, per-window/tab local-cwd tracking for `getcwd()`) - this
-//! file starts with the smallest, most self-contained subset.
+//! search) - this file starts with the smallest, most self-contained
+//! subset.
 //!
 //! Translated: `isdirectory()` (via the already-existing
 //! [`crate::os::fs::os_isdir`]), `isabsolutepath()` (via the already-
@@ -22,12 +22,12 @@
 //! [`crate::os::fs::os_fileinfo`]/[`crate::os::fs::os_fileinfo_link`]
 //! narrow-subset `FileInfo` - see that module's own doc comment for
 //! what's NOT modeled; `getfperm()`, needing the still-deferred
-//! `os_getperm` permission bits, is not translated here), and
-//! `mkdir()` for its plain, single-directory case (via the already-
-//! existing [`crate::os::fs::os_mkdir`]) - the `"p"` (recursive
-//! create) flag needs `os_mkdir_recurse` (not yet translated) and
-//! `"D"`/`"R"` (deferred deletion) need the `:defer` subsystem (not
-//! yet translated), both panicking via `unimplemented!()` if actually
+//! `os_getperm` permission bits, is not translated here), `mkdir()`
+//! for its plain, single-directory case (via the already-existing
+//! [`crate::os::fs::os_mkdir`]) - the `"p"` (recursive create) flag
+//! needs `os_mkdir_recurse` (not yet translated) and `"D"`/`"R"`
+//! (deferred deletion) need the `:defer` subsystem (not yet
+//! translated), both panicking via `unimplemented!()` if actually
 //! reached. The `"rf"` (recursive delete) flag needs
 //! `delete_recursive` (a directory-tree walk, not yet translated) and
 //! panics via `unimplemented!()` if actually reached. Every function
@@ -37,6 +37,18 @@
 //! body in `path.rs`), gracefully treating invalid UTF-8
 //! the same as
 //! a nonexistent path/name rather than panicking.
+//!
+//! Also translated: `getcwd()`/`haslocaldir()` (via the shared
+//! `resolve_cd_scope` helper) - re-examined after this module doc's
+//! own earlier note flagged "per-window/tab local-cwd tracking" as a
+//! blocker, and found `WinT.w_localdir`/`TabpageT.tp_localdir`/
+//! `GLOBALS.globaldir` already existed (from an earlier session's
+//! `buffer_defs.rs`/`globals.rs` translation), along with
+//! `crate::vim_defs::CdScope` (phase-1 foundational headers) and
+//! `crate::window::find_tabpage`/`find_win_by_nr` - the blocker had
+//! simply never been re-verified since. `getcwd()`'s own Windows-only
+//! `slash_adjust()` post-processing step is translated alongside, in
+//! `path.rs`.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -257,6 +269,178 @@ pub(crate) unsafe fn f_pathshorten(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         Some(p) => rettv.value = TypvalValue::String(Some(unsafe { crate::path::shorten_dir_len(&p, trim_len) })),
     }
+}
+
+/// Shared "resolve `{winnr}[, {tabnr}]` into `(scope, tabpage,
+/// window)`" logic used by both `getcwd()`/`haslocaldir()` (their own
+/// duplicated "Pre-conditions and scope extraction together" loop,
+/// plus the tabpage/window lookup that follows it, `eval/fs.c`).
+/// `Err(())` on any of the original's own genuine argument-error paths
+/// (an invalid or out-of-range scope number, or an unresolvable
+/// `{tabnr}`/`{winnr}`) - message display (`emsg`) is omitted, matching
+/// this module's established "skip the message, keep the state/
+/// control-flow" policy, but the early-return/failure itself IS kept
+/// faithfully.
+///
+/// `scope_number[0]`/`[1]` mirror the original's own `int
+/// scope_number[]` array, indexed by `CdScope::Window` (0)/
+/// `CdScope::Tabpage` (1) - `{winnr}` is `argvars[0]`, `{tabnr}` is
+/// `argvars[1]`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`; forwards
+/// [`crate::window::find_tabpage`]/[`crate::window::find_win_by_nr`]'s
+/// own safety docs.
+unsafe fn resolve_cd_scope(
+    argvars: &[TypvalT],
+) -> Result<(crate::vim_defs::CdScope, *mut crate::buffer_defs::TabpageT, *mut crate::buffer_defs::WinT), ()> {
+    use crate::vim_defs::CdScope;
+
+    let mut scope = CdScope::Invalid;
+    let mut scope_number: [i32; 2] = [0, 0];
+
+    for i in 0..2usize {
+        if i >= argvars.len() || matches!(argvars[i].value, TypvalValue::Unknown) {
+            break;
+        }
+        if !matches!(argvars[i].value, TypvalValue::Number(_)) {
+            return Err(()); // E475: Invalid argument.
+        }
+        let n = crate::eval::typval::tv_get_number(&argvars[i]) as i32;
+        scope_number[i] = n;
+        if n < -1 {
+            return Err(()); // E475: Invalid argument.
+        }
+        // Use the narrowest scope the user requested.
+        if n >= 0 && scope == CdScope::Invalid {
+            scope = if i == 0 { CdScope::Window } else { CdScope::Tabpage };
+        } else if n < 0 {
+            scope = if i == 0 { CdScope::Tabpage } else { CdScope::Global };
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // Find the tabpage by number.
+    if scope_number[1] > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { crate::window::find_tabpage(scope_number[1]) };
+        if tp.is_null() {
+            return Err(()); // E5000: Cannot find tab number.
+        }
+    }
+
+    // Find the window in `tp` by number, null if none.
+    if scope_number[0] >= 0 {
+        if scope_number[1] < 0 {
+            return Err(()); // E5001: Higher scope cannot be -1 if lower scope is >= 0.
+        }
+        if scope_number[0] > 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            win = unsafe { crate::window::find_win_by_nr(&argvars[0], tp) };
+            if win.is_null() {
+                return Err(()); // E5002: Cannot find window number.
+            }
+        }
+    }
+
+    Ok((scope, tp, win))
+}
+
+/// `getcwd([{winnr} [, {tabnr}]])` - the effective |current-directory|
+/// for the given scope, falling back progressively to the broader
+/// enclosing scope (window -> tabpage -> global -> the real OS
+/// current directory) whenever a narrower scope has no local directory
+/// set of its own (`f_getcwd`, `eval/fs.c`), via [`resolve_cd_scope`].
+/// An empty string on any argument error, or if even
+/// [`crate::os::fs::os_dirname`] itself fails.
+///
+/// # Safety
+/// Forwarded from [`resolve_cd_scope`]'s own safety doc.
+pub(crate) unsafe fn f_getcwd(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let Ok((scope, tp, win)) = (unsafe { resolve_cd_scope(argvars) }) else {
+        return;
+    };
+
+    // Mirrors the original's own switch/fallthrough exactly: each
+    // narrower scope tries its own local directory first, falling
+    // through to the next broader scope whenever unset, all the way
+    // down to the real OS current directory.
+    use crate::vim_defs::CdScope;
+    let from: Option<Vec<u8>> = 'scope_fallthrough: {
+        if scope == CdScope::Window {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w_localdir = unsafe { &*win }.w_localdir.clone();
+            if w_localdir.is_some() {
+                break 'scope_fallthrough w_localdir;
+            }
+        }
+        if matches!(scope, CdScope::Window | CdScope::Tabpage) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let tp_localdir = unsafe { &*tp }.tp_localdir.clone();
+            if tp_localdir.is_some() {
+                break 'scope_fallthrough tp_localdir;
+            }
+        }
+        if matches!(scope, CdScope::Window | CdScope::Tabpage | CdScope::Global) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let globaldir = unsafe { crate::globals::GLOBALS.get_mut() }.globaldir.clone();
+            if globaldir.is_some() {
+                break 'scope_fallthrough globaldir;
+            }
+        }
+        crate::os::fs::os_dirname()
+    };
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cwd = from.unwrap_or_default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    #[cfg(windows)]
+    unsafe {
+        crate::path::slash_adjust(&mut cwd);
+    }
+
+    rettv.value = TypvalValue::String(Some(cwd));
+}
+
+/// `haslocaldir([{winnr} [, {tabnr}]])` - whether the given scope
+/// (defaults to window scope, `MIN_CD_SCOPE`, when no scope was
+/// requested at all) has its own local (`:lcd`/`:tcd`) working
+/// directory set (`f_haslocaldir`, `eval/fs.c`), via
+/// [`resolve_cd_scope`]. The global scope never has a local directory
+/// of its own, so it's always `0` there.
+///
+/// # Safety
+/// Forwarded from [`resolve_cd_scope`]'s own safety doc.
+pub(crate) unsafe fn f_haslocaldir(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let Ok((mut scope, tp, win)) = (unsafe { resolve_cd_scope(argvars) }) else {
+        return;
+    };
+    if scope == crate::vim_defs::CdScope::Invalid {
+        scope = crate::vim_defs::CdScope::MIN; // == Window
+    }
+
+    let has = match scope {
+        crate::vim_defs::CdScope::Window => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*win }.w_localdir.is_some()
+        }
+        crate::vim_defs::CdScope::Tabpage => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_localdir.is_some()
+        }
+        crate::vim_defs::CdScope::Global | crate::vim_defs::CdScope::Invalid => false,
+    };
+    rettv.value = TypvalValue::Number(i64::from(has));
 }
 
 #[cfg(test)]
@@ -659,5 +843,338 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_getftype(&[string(b"/definitely/does/not/exist/nero-test")], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    // --- resolve_cd_scope / f_getcwd / f_haslocaldir ---
+
+    /// RAII guard restoring `GLOBALS.curtab`/`curwin`/`first_tabpage`/
+    /// `firstwin`/`globaldir` on drop - callers must hold
+    /// `globals_test_lock()` for the guard's whole lifetime.
+    struct CdGlobalsGuard {
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_globaldir: Option<Vec<u8>>,
+    }
+
+    impl CdGlobalsGuard {
+        fn set(tab: *mut crate::buffer_defs::TabpageT, win: *mut crate::buffer_defs::WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CdGlobalsGuard {
+                prev_curtab: globals.curtab,
+                prev_curwin: globals.curwin,
+                prev_first_tabpage: globals.first_tabpage,
+                prev_firstwin: globals.firstwin,
+                prev_globaldir: globals.globaldir.take(),
+            };
+            globals.curtab = tab;
+            globals.curwin = win;
+            globals.first_tabpage = tab;
+            globals.firstwin = win;
+            guard
+        }
+    }
+
+    impl Drop for CdGlobalsGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curtab = self.prev_curtab;
+            globals.curwin = self.prev_curwin;
+            globals.first_tabpage = self.prev_first_tabpage;
+            globals.firstwin = self.prev_firstwin;
+            globals.globaldir = self.prev_globaldir.take();
+        }
+    }
+
+    /// Forces `'shellslash'` on for its whole lifetime, restoring the
+    /// previous value on drop (even on panic). On Windows,
+    /// `f_getcwd`'s own `slash_adjust()` post-processing step
+    /// otherwise converts every `/` in these tests' own forward-
+    /// slash-only expected paths into `\` (the real, correct default
+    /// behavior without `'shellslash'` set) - forcing it on instead
+    /// makes `slash_adjust` look for (nonexistent) backslashes in
+    /// these specific test inputs, a platform-independent no-op. Inert
+    /// on non-Windows (`slash_adjust` doesn't exist/isn't called
+    /// there), but harmless to use unconditionally.
+    struct ShellslashGuard(i32);
+
+    impl ShellslashGuard {
+        fn force_on() -> Self {
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let prev = ov.p_ssl;
+            ov.p_ssl = 1;
+            ShellslashGuard(prev)
+        }
+    }
+
+    impl Drop for ShellslashGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = self.0;
+        }
+    }
+
+    #[test]
+    fn resolve_cd_scope_no_args_is_invalid_scope_with_curtab_curwin() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let tab_ptr = &mut tab as *mut crate::buffer_defs::TabpageT;
+        let _guard = CdGlobalsGuard::set(tab_ptr, win_ptr);
+
+        let (scope, tp, w) = unsafe { resolve_cd_scope(&[]) }.unwrap();
+        assert_eq!(scope, crate::vim_defs::CdScope::Invalid);
+        assert_eq!(tp, tab_ptr);
+        assert_eq!(w, win_ptr);
+    }
+
+    #[test]
+    fn resolve_cd_scope_window_number_zero_is_window_scope() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let (scope, ..) = unsafe { resolve_cd_scope(&[num(0)]) }.unwrap();
+        assert_eq!(scope, crate::vim_defs::CdScope::Window);
+    }
+
+    #[test]
+    fn resolve_cd_scope_window_negative_one_widens_to_tabpage() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let (scope, ..) = unsafe { resolve_cd_scope(&[num(-1)]) }.unwrap();
+        assert_eq!(scope, crate::vim_defs::CdScope::Tabpage);
+    }
+
+    #[test]
+    fn resolve_cd_scope_both_negative_one_is_global() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let (scope, ..) = unsafe { resolve_cd_scope(&[num(-1), num(-1)]) }.unwrap();
+        assert_eq!(scope, crate::vim_defs::CdScope::Global);
+    }
+
+    #[test]
+    fn resolve_cd_scope_number_below_negative_one_errors() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        assert!(unsafe { resolve_cd_scope(&[num(-2)]) }.is_err());
+    }
+
+    #[test]
+    fn resolve_cd_scope_non_number_arg_errors() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        assert!(unsafe { resolve_cd_scope(&[string(b"x")]) }.is_err());
+    }
+
+    #[test]
+    fn resolve_cd_scope_unknown_tabnr_errors() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        // Only 1 real tabpage exists (the current one) - tabnr 99
+        // cannot be found.
+        assert!(unsafe { resolve_cd_scope(&[num(0), num(99)]) }.is_err());
+    }
+
+    #[test]
+    fn resolve_cd_scope_tabnr_negative_with_winnr_nonnegative_errors() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        // E5001: a real winnr (0 or higher) cannot be combined with
+        // tabnr == -1.
+        assert!(unsafe { resolve_cd_scope(&[num(0), num(-1)]) }.is_err());
+    }
+
+    #[test]
+    fn resolve_cd_scope_unknown_winnr_errors() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        // Only 1 real window exists (curwin) - winnr 99 cannot be
+        // found.
+        assert!(unsafe { resolve_cd_scope(&[num(99)]) }.is_err());
+    }
+
+    #[test]
+    fn getcwd_explicit_window_scope_uses_localdir_first() {
+        let _lock = globals_test_lock();
+        let _ssl_guard = ShellslashGuard::force_on();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: Some(b"/win/dir".to_vec()), ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: Some(b"/tab/dir".to_vec()), ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = Some(b"/global/dir".to_vec());
+
+        // getcwd(0): an EXPLICIT window-scope request (0 = current
+        // window) - unlike bare getcwd() (see
+        // getcwd_bare_no_args_always_uses_the_real_os_current_directory
+        // below), this genuinely resolves to CdScope::Window and
+        // consults w_localdir.
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"/win/dir".to_vec())));
+    }
+
+    #[test]
+    fn getcwd_falls_back_to_tabpage_localdir() {
+        let _lock = globals_test_lock();
+        let _ssl_guard = ShellslashGuard::force_on();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: None, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: Some(b"/tab/dir".to_vec()), ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = Some(b"/global/dir".to_vec());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"/tab/dir".to_vec())));
+    }
+
+    #[test]
+    fn getcwd_falls_back_to_globaldir() {
+        let _lock = globals_test_lock();
+        let _ssl_guard = ShellslashGuard::force_on();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: None, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: None, ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = Some(b"/global/dir".to_vec());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"/global/dir".to_vec())));
+    }
+
+    #[test]
+    fn getcwd_falls_back_to_the_real_os_current_directory() {
+        let _lock = globals_test_lock();
+        let _ssl_guard = ShellslashGuard::force_on();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: None, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: None, ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = None;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[num(0)], &mut rettv) };
+        let TypvalValue::String(Some(cwd)) = rettv.value else { panic!("expected a String") };
+        assert_eq!(Some(cwd), crate::os::fs::os_dirname());
+    }
+
+    #[test]
+    fn getcwd_bare_no_args_always_uses_the_real_os_current_directory() {
+        let _lock = globals_test_lock();
+        let _ssl_guard = ShellslashGuard::force_on();
+        // A genuine, easy-to-miss original behavior, verified by
+        // hand-tracing eval/fs.c's own f_getcwd: with ZERO arguments,
+        // argvars[0].v_type == VAR_UNKNOWN makes the scope-extraction
+        // loop `break` immediately, leaving `scope` at kCdScopeInvalid
+        // - which jumps STRAIGHT to the switch's LAST case
+        // (os_dirname()), WITHOUT ever consulting
+        // w_localdir/tp_localdir/globaldir at all, even though all
+        // three are set here. Only an EXPLICIT scope argument (e.g.
+        // getcwd(0), see getcwd_explicit_window_scope_uses_localdir_first
+        // above) exercises that fallback chain - matches real nvim's
+        // own documented distinction (bare getcwd() reports the real,
+        // already-synced OS current directory).
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: Some(b"/win/dir".to_vec()), ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: Some(b"/tab/dir".to_vec()), ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+        unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = Some(b"/global/dir".to_vec());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[], &mut rettv) };
+        let TypvalValue::String(Some(cwd)) = rettv.value else { panic!("expected a String") };
+        assert_eq!(Some(cwd), crate::os::fs::os_dirname());
+    }
+
+    #[test]
+    fn getcwd_argument_error_yields_a_null_string() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getcwd(&[string(b"x")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn haslocaldir_no_args_defaults_to_window_scope() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: Some(b"/win/dir".to_vec()), ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CdGlobalsGuard::set(&mut tab, win_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_haslocaldir(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        // Reuse the SAME pointer already stored in GLOBALS.curwin
+        // (not a freshly-derived one from `win` again) - deriving a
+        // second independent pointer from the same local would
+        // invalidate the one GLOBALS.curwin already holds under Tree
+        // Borrows.
+        unsafe { &mut *win_ptr }.w_localdir = None;
+        let mut rettv = TypvalT::default();
+        unsafe { f_haslocaldir(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn haslocaldir_tabpage_scope_via_negative_winnr() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: Some(b"/tab/dir".to_vec()), ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_haslocaldir(&[num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn haslocaldir_global_scope_is_always_false() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, w_localdir: Some(b"/win/dir".to_vec()), ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT { tp_localdir: Some(b"/tab/dir".to_vec()), ..Default::default() };
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_haslocaldir(&[num(-1), num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn haslocaldir_argument_error_yields_zero() {
+        let _lock = globals_test_lock();
+        let mut win = crate::buffer_defs::WinT { handle: 1, ..Default::default() };
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = CdGlobalsGuard::set(&mut tab, &mut win);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_haslocaldir(&[string(b"x")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 }

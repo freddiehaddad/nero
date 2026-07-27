@@ -363,6 +363,42 @@ pub fn path_to_slash_save(p: &[u8]) -> Vec<u8> {
     owned
 }
 
+/// Adjust path separators in `p` (in place) to match the current
+/// `'shellslash'` setting, unless `p` looks like a URL or is a
+/// backtick-quoted string (`slash_adjust`, Windows-only -
+/// `BACKSLASH_IN_FILENAME` is always defined on Windows, per
+/// `win_defs.h`). If `'shellslash'` is set, converts every `\` to `/`;
+/// otherwise converts every `/` to `\`. `PATHSEP` (the "from"/"to"
+/// value swapped by `'shellslash'`) is unconditionally `/` in this
+/// version of the original (`ascii_defs.h`), even on Windows - this
+/// function is what actually makes real Windows paths look like
+/// Windows paths when `'shellslash'` is off.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS`.
+#[cfg(windows)]
+pub unsafe fn slash_adjust(p: &mut [u8]) {
+    if path_with_url(p) != 0 {
+        return;
+    }
+    if p.first() == Some(&b'`') {
+        // Don't replace backslashes in backtick-quoted strings.
+        let len = p.len();
+        if len > 2 && p[len - 1] == b'`' {
+            return;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let shellslash = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl != 0;
+    let (from, to) = if shellslash { (b'\\', crate::ascii_defs::PATHSEP) } else { (crate::ascii_defs::PATHSEP, b'\\') };
+    for byte in p.iter_mut() {
+        if *byte == from {
+            *byte = to;
+        }
+    }
+}
+
 /// Append `to_append` to `path` with a slash in between, in place, up
 /// to `max_len` bytes total (`append_path`).
 ///
@@ -1154,6 +1190,79 @@ mod tests {
         let converted = path_to_slash_save(&original);
         assert_eq!(&converted, b"a/b/c");
         assert_eq!(&original, b"a\\b\\c"); // original untouched
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_adjust_converts_slashes_to_backslashes_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 0;
+
+        let mut p = b"a/b/c".to_vec();
+        unsafe { slash_adjust(&mut p) };
+        assert_eq!(&p, b"a\\b\\c");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_adjust_converts_backslashes_to_slashes_when_shellslash_set() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 1;
+
+        let mut p = b"a\\b\\c".to_vec();
+        unsafe { slash_adjust(&mut p) };
+        assert_eq!(&p, b"a/b/c");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_adjust_skips_urls() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 0;
+
+        let mut p = b"http://example.com/a/b".to_vec();
+        unsafe { slash_adjust(&mut p) };
+        assert_eq!(&p, b"http://example.com/a/b"); // untouched
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_adjust_skips_backtick_quoted_strings() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 0;
+
+        let mut p = b"`a/b/c`".to_vec();
+        unsafe { slash_adjust(&mut p) };
+        assert_eq!(&p, b"`a/b/c`"); // untouched - backtick-quoted
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_adjust_does_not_skip_a_lone_backtick() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 0;
+
+        // A single leading backtick with NO matching trailing
+        // backtick (len <= 2, or last char isn't itself a backtick)
+        // is NOT treated as a backtick-quoted string.
+        let mut p = b"`a/b".to_vec();
+        unsafe { slash_adjust(&mut p) };
+        assert_eq!(&p, b"`a\\b");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev;
     }
 
     #[test]
