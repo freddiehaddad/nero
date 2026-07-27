@@ -437,6 +437,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tabpagebuflist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_tabpagebuflist });
         m.insert(&b"gettabinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettabinfo });
         m.insert(&b"getbufinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getbufinfo });
+        m.insert(&b"getbufline"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_getbufline });
+        m.insert(&b"getbufoneline"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_getbufoneline });
+        m.insert(&b"getline"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_getline });
         m.insert(&b"getbufvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_getbufvar });
         m.insert(&b"getwinvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_getwinvar });
         m.insert(&b"gettabvar"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::vars::f_gettabvar });
@@ -3344,6 +3347,143 @@ unsafe fn f_getbufinfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
         buf = next;
     }
+}
+
+/// Get one or a range of lines from `buf` (`get_buffer_lines`,
+/// `eval/buffer.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::memline::ml_get_buf`]'s own safety doc.
+/// `rettv` must be default-initialized (matching this crate's own
+/// established `f_*` convention).
+unsafe fn get_buffer_lines(
+    buf: *mut crate::buffer_defs::BufT,
+    mut start: crate::pos_defs::LinenrT,
+    mut end: crate::pos_defs::LinenrT,
+    retlist: bool,
+    rettv: &mut TypvalT,
+) {
+    if buf.is_null() {
+        if retlist {
+            // SAFETY: `rettv` is default-initialized by the caller.
+            let _ = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 0) };
+        } else {
+            rettv.value = TypvalValue::String(None);
+        }
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let bufref = unsafe { &mut *buf };
+    if bufref.b_ml.ml_mfp.is_null() || start < 0 || end < start {
+        if retlist {
+            // SAFETY: `rettv` is default-initialized by the caller.
+            let _ = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 0) };
+        } else {
+            rettv.value = TypvalValue::String(None);
+        }
+        return;
+    }
+
+    if retlist {
+        if start < 1 {
+            start = 1;
+        }
+        if end > bufref.b_ml.ml_line_count {
+            end = bufref.b_ml.ml_line_count;
+        }
+        // SAFETY: `rettv` is default-initialized by the caller.
+        let l =
+            unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, i64::from(end - start + 1) as isize) };
+        while start <= end {
+            // SAFETY: forwarded from this function's own safety doc.
+            let line = unsafe { crate::memline::ml_get_buf(bufref, start) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let len = unsafe { crate::memline::ml_get_buf_len(bufref, start) } as usize;
+            // SAFETY: `l` was just allocated above, uniquely owned here.
+            unsafe { crate::eval::typval::tv_list_append_string(l, Some(&line[..len])) };
+            start += 1;
+        }
+    } else {
+        rettv.value = if start >= 1 && start <= bufref.b_ml.ml_line_count {
+            // SAFETY: forwarded from this function's own safety doc.
+            let line = unsafe { crate::memline::ml_get_buf(bufref, start) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let len = unsafe { crate::memline::ml_get_buf_len(bufref, start) } as usize;
+            TypvalValue::String(Some(line[..len].to_vec()))
+        } else {
+            TypvalValue::String(None)
+        };
+    }
+}
+
+/// `getbufline({buf}, {lnum} [, {end}])`/`getbufoneline({buf}, {lnum})`
+/// shared engine (`getbufline`, `eval/buffer.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::buffer::tv_get_buf_from_arg`]/
+/// [`get_buffer_lines`]'s own safety docs.
+unsafe fn getbufline(argvars: &[TypvalT], rettv: &mut TypvalT, retlist: bool) {
+    let mut lnum = 1;
+    let mut end = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let did_emsg_before = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { crate::eval::buffer::tv_get_buf_from_arg(&argvars[0]) };
+    if !buf.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let bufref = unsafe { &*buf };
+        lnum = crate::eval::typval::tv_get_lnum_buf(&argvars[1], Some(bufref));
+        // SAFETY: forwarded from this function's own safety doc.
+        let did_emsg_now = unsafe { crate::globals::GLOBALS.get_mut() }.did_emsg;
+        if did_emsg_now > did_emsg_before {
+            return;
+        }
+        end = if argvars.len() > 2 {
+            crate::eval::typval::tv_get_lnum_buf(&argvars[2], Some(bufref))
+        } else {
+            lnum
+        };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_buffer_lines(buf, lnum, end, retlist, rettv) };
+}
+
+/// `"getbufline({buf}, {lnum} [, {end}])"` function (`f_getbufline`).
+///
+/// # Safety
+/// Forwarded from `getbufline`'s own safety doc.
+pub unsafe fn f_getbufline(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getbufline(argvars, rettv, true) };
+}
+
+/// `"getbufoneline({buf}, {lnum})"` function (`f_getbufoneline`).
+///
+/// # Safety
+/// Forwarded from `getbufline`'s own safety doc.
+pub unsafe fn f_getbufoneline(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { getbufline(argvars, rettv, false) };
+}
+
+/// `"getline({lnum} [, {end}])"` function (`f_getline`).
+///
+/// # Safety
+/// Forwarded from `get_buffer_lines`'s own safety doc.
+pub unsafe fn f_getline(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    let (end, retlist) = if argvars.len() > 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        (unsafe { crate::eval::typval::tv_get_lnum(&argvars[1]) }, true)
+    } else {
+        (lnum, false)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_buffer_lines(curbuf, lnum, end, retlist, rettv) };
 }
 
 /// The unconditional (platform-independent) entries of `funcs.c`'s own
@@ -6774,6 +6914,9 @@ mod tests {
             "tabpagebuflist",
             "gettabinfo",
             "getbufinfo",
+            "getbufline",
+            "getbufoneline",
+            "getline",
             "getbufvar",
             "getwinvar",
             "gettabvar",
@@ -10408,6 +10551,227 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_strcharpart(&[string(b"hello"), num(-2), num(5)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"hel".to_vec())));
+    }
+
+    // --- f_getline / f_getbufline / f_getbufoneline ---
+
+    #[test]
+    fn getline_single_lnum_returns_a_string() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getline(&[num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"two".to_vec())));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getline_out_of_range_lnum_returns_an_empty_string() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getline(&[num(99)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getline_with_end_returns_a_list_of_lines() {
+        let mut buf = buf_with_lines(&[b"one", b"two", b"three"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getline(&[num(1), num(2)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*item0).li_tv.value, TypvalValue::String(Some(b"one".to_vec())));
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item1).li_tv.value, TypvalValue::String(Some(b"two".to_vec())));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn getline_end_beyond_line_count_is_clamped() {
+        let mut buf = buf_with_lines(&[b"one", b"two"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getline(&[num(1), num(99)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        close_test_buf(buf);
+    }
+
+    /// A pair of REAL (`ml_open`-backed) buffers linked via
+    /// `b_next`/`b_prev`, needed for both `get_buffer_info`'s own
+    /// forward buffer-list walk AND `buflist_findnr`'s backward walk
+    /// (used to resolve a `{buf}` Number argument) - see
+    /// `BufInfoFixture`'s own identical reasoning above, adapted here
+    /// to give each buffer real line content via `buf_with_lines`.
+    struct TwoRealBufsFixture {
+        buf1: crate::buffer_defs::BufT,
+        buf2: crate::buffer_defs::BufT,
+        win1: crate::buffer_defs::WinT,
+        prev_firstbuf: *mut crate::buffer_defs::BufT,
+        prev_lastbuf: *mut crate::buffer_defs::BufT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TwoRealBufsFixture {
+        fn new() -> Box<Self> {
+            let _lock = crate::globals::global_state_test_lock();
+            let mut buf1 = buf_with_lines(&[b"one", b"two", b"three"]);
+            buf1.handle = 1;
+            let mut buf2 = buf_with_lines(&[b"alpha", b"beta"]);
+            buf2.handle = 2;
+            let mut fx = Box::new(TwoRealBufsFixture {
+                buf1,
+                buf2,
+                win1: crate::buffer_defs::WinT::default(),
+                prev_firstbuf: std::ptr::null_mut(),
+                prev_lastbuf: std::ptr::null_mut(),
+                prev_curbuf: std::ptr::null_mut(),
+                prev_curwin: std::ptr::null_mut(),
+                _lock,
+            });
+            let buf1_ptr = &mut fx.buf1 as *mut crate::buffer_defs::BufT;
+            let buf2_ptr = &mut fx.buf2 as *mut crate::buffer_defs::BufT;
+            let win1_ptr = &mut fx.win1 as *mut crate::buffer_defs::WinT;
+            unsafe {
+                (*buf1_ptr).b_next = buf2_ptr;
+                (*buf2_ptr).b_prev = buf1_ptr;
+                (*win1_ptr).w_buffer = buf1_ptr;
+            }
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            fx.prev_firstbuf = globals.firstbuf;
+            fx.prev_lastbuf = globals.lastbuf;
+            fx.prev_curbuf = globals.curbuf;
+            fx.prev_curwin = globals.curwin;
+            globals.firstbuf = buf1_ptr;
+            globals.lastbuf = buf2_ptr;
+            globals.curbuf = buf1_ptr;
+            globals.curwin = win1_ptr;
+            fx
+        }
+    }
+
+    impl Drop for TwoRealBufsFixture {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstbuf = self.prev_firstbuf;
+            globals.lastbuf = self.prev_lastbuf;
+            globals.curbuf = self.prev_curbuf;
+            globals.curwin = self.prev_curwin;
+            // SAFETY: both buffers were opened via ml_open in
+            // buf_with_lines and must be closed the same way
+            // close_test_buf does, before their own Drop runs.
+            unsafe {
+                let mfp1 = Box::from_raw(self.buf1.b_ml.ml_mfp);
+                crate::memfile::mf_close(*mfp1, false);
+                let mfp2 = Box::from_raw(self.buf2.b_ml.ml_mfp);
+                crate::memfile::mf_close(*mfp2, false);
+            }
+        }
+    }
+
+    #[test]
+    fn getbufline_by_number_returns_lines_from_that_buffer() {
+        let fx = TwoRealBufsFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufline(&[num(2), num(1), num(2)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*item0).li_tv.value, TypvalValue::String(Some(b"alpha".to_vec())));
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item1).li_tv.value, TypvalValue::String(Some(b"beta".to_vec())));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        drop(fx);
+    }
+
+    #[test]
+    fn getbufline_without_end_returns_a_single_element_list() {
+        let fx = TwoRealBufsFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufline(&[num(1), num(3)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            assert_eq!((*item0).li_tv.value, TypvalValue::String(Some(b"three".to_vec())));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        drop(fx);
+    }
+
+    #[test]
+    fn getbufline_unknown_buffer_returns_an_empty_list() {
+        let fx = TwoRealBufsFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufline(&[num(999), num(1)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        drop(fx);
+    }
+
+    #[test]
+    fn getbufoneline_returns_a_single_string() {
+        let fx = TwoRealBufsFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufoneline(&[num(2), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"beta".to_vec())));
+
+        drop(fx);
+    }
+
+    #[test]
+    fn getbufoneline_out_of_range_returns_null_string() {
+        let fx = TwoRealBufsFixture::new();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getbufoneline(&[num(1), num(99)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+
+        drop(fx);
     }
 
     // --- f_getpid ---
