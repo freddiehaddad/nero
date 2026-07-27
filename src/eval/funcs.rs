@@ -441,6 +441,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"col"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_col });
         m.insert(&b"charcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_charcol });
         m.insert(&b"virtcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_virtcol });
+        m.insert(&b"virtcol2col"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_virtcol2col });
         m.insert(&b"winbufnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winbufnr });
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
@@ -4283,6 +4284,48 @@ unsafe fn f_virtcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `virtcol2col({winid}, {lnum}, {col})` - converts a virtual column
+/// to a byte index: the byte index of the character in window
+/// `{winid}` at buffer line `{lnum}` and virtual column `{col}`, via
+/// [`crate::window::find_win_by_nr_or_id`]/[`crate::r#move::virtcol2col`]
+/// (`f_virtcol2col`, `move.c`). Returns `-1` for any invalid argument.
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]/
+/// [`crate::r#move::virtcol2col`]'s own safety docs.
+unsafe fn f_virtcol2col(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    if crate::eval::typval::tv_check_for_number_arg(argvars, 0) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_number_arg(argvars, 1) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_number_arg(argvars, 2) == crate::vim_defs::FAIL
+    {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    if wp.is_null() {
+        return;
+    }
+
+    let mut error = false;
+    let lnum = crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error)) as crate::pos_defs::LinenrT;
+    // SAFETY: forwarded from this function's own safety doc.
+    if error || lnum < 0 || lnum > unsafe { &*(*wp).w_buffer }.b_ml.ml_line_count {
+        return;
+    }
+
+    let mut error = false;
+    let screencol = crate::eval::typval::tv_get_number_chk(&argvars[2], Some(&mut error)) as i32;
+    if error || screencol < 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(i64::from(unsafe { crate::r#move::virtcol2col(wp, lnum, screencol) }));
+}
+
 /// `winbufnr({nr})` - the buffer number of window `{nr}` (a window
 /// number or window ID; `-1` if not found) (`f_winbufnr`,
 /// `eval/window.c`).
@@ -5775,6 +5818,7 @@ mod tests {
             "col",
             "charcol",
             "virtcol",
+            "virtcol2col",
             "winbufnr",
             "winheight",
             "winwidth",
@@ -9838,6 +9882,85 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_virtcol(&[string(b"bogus")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        close_test_buf(buf);
+    }
+
+    // --- f_virtcol2col ---
+
+    #[test]
+    fn virtcol2col_returns_the_byte_index_for_a_valid_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol2col(&[num(0), num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol2col_clamps_to_the_last_character_when_col_exceeds_line_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol2col(&[num(0), num(1), num(100)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol2col_invalid_lnum_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol2col(&[num(0), num(999), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol2col_invalid_winid_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        // 99999 >= LOWEST_WIN_ID (1000), so this is treated as a
+        // window ID lookup - none registered with this handle.
+        unsafe { f_virtcol2col(&[num(99999), num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn virtcol2col_non_number_argument_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_virtcol2col(&[string(b"x"), num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
 
         close_test_buf(buf);
     }

@@ -43,6 +43,18 @@
 //! `plines_win_full`, all already real) - unblocked `cursor.c`'s
 //! `set_leftcol`.
 //!
+//! Also translated: **`vcol2col`** (`mouse.c`, not `move.c` - hosted
+//! here anyway since it's the direct dependency of `move.c`'s own
+//! `virtcol2col`/`f_virtcol2col`, and needed `plines.c`'s
+//! `init_charsize_arg`/`win_charsize` plus `mbyte.c`'s
+//! `utf_ptr2StrCharInfo`/`utfc_next`, all already real) and
+//! **`virtcol2col`** itself (the `virtcol2col({winid}, {lnum}, {col})`
+//! builtin's real logic - its `f_virtcol2col` wrapper lives in
+//! `eval/funcs.rs` alongside its sibling window-position builtins).
+//! Both are `pub` here despite being `static`/file-private in the
+//! original, since Rust's module system needs that for their
+//! cross-module callers.
+//!
 //! Also translated: **`sms_marker_overlap`/`skipcol_from_plines`/
 //! `reset_skipcol`/`use_scrolloffpad`/`scrolloffpad_eof_pressure`** -
 //! five small, self-contained functions sitting near the top of
@@ -601,6 +613,100 @@ pub unsafe fn set_topline(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) {
         | i32::from(w_valid::VALID_BOTLINE)
         | i32::from(w_valid::VALID_TOPLINE));
     // Don't set VALID_TOPLINE here, 'scrolloff' needs to be checked.
+}
+
+/// Convert a virtual (screen) column to a character column. The first
+/// column is zero (`vcol2col`, `mouse.c`).
+///
+/// Returns `(col, coladd)`: `col` is the byte offset within the line
+/// (matching the original's own `(colnr_T)(ci.ptr - line)` pointer-
+/// subtraction result - this crate's [`crate::mbyte_defs::StrCharInfo`]
+/// already tracks that same offset directly as `pos`, needing no
+/// arithmetic); `coladd` is the original's own `*coladdp` out-parameter,
+/// always computed here since every real caller in this crate wants it
+/// (unlike the original, which passes `NULL` from `virtcol2col`).
+///
+/// Kept `pub` (not `static`, unlike the original) since its real
+/// callers - [`virtcol2col`] here and `mouse.c`'s own `mouse.rs`
+/// counterpart, not yet translated - are expected to live in more than
+/// one module, matching this crate's established cross-module-helper
+/// convention (e.g. [`crate::eval::eval::var2fpos`]).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[must_use]
+pub unsafe fn vcol2col(
+    wp: *mut WinT,
+    lnum: crate::pos_defs::LinenrT,
+    vcol: crate::pos_defs::ColnrT,
+) -> (crate::pos_defs::ColnrT, crate::pos_defs::ColnrT) {
+    // try to advance to the specified column
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut csarg, cstype) = unsafe { crate::plines::init_charsize_arg(wp, lnum, &line) };
+    let mut ci = crate::mbyte::utf_ptr2str_char_info(&line);
+    let mut cur_vcol: crate::pos_defs::ColnrT = 0;
+    while cur_vcol < vcol && line.get(ci.pos).copied().unwrap_or(0) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next_vcol = cur_vcol
+            + unsafe {
+                crate::plines::win_charsize(
+                    cstype,
+                    cur_vcol,
+                    &line[ci.pos..],
+                    ci.pos as crate::pos_defs::ColnrT,
+                    ci.chr.value,
+                    &mut csarg,
+                )
+            }
+            .width;
+        if next_vcol > vcol {
+            break;
+        }
+        cur_vcol = next_vcol;
+        // SAFETY: forwarded from this function's own safety doc.
+        ci = unsafe { crate::mbyte::utfc_next(&line, ci) };
+    }
+
+    (ci.pos as crate::pos_defs::ColnrT, vcol - cur_vcol)
+}
+
+/// Convert a virtual (screen) column to a character column. The first
+/// column is one. For a multibyte character, the column number of the
+/// first byte is returned (`virtcol2col`, `move.c`'s own `static`
+/// helper).
+///
+/// Kept `pub` (not `static`, unlike the original) since its only real
+/// caller, `f_virtcol2col`, lives in
+/// [`crate::eval::funcs`] - a different module, matching
+/// [`vcol2col`]'s own visibility rationale above.
+///
+/// # Safety
+/// Same as [`vcol2col`].
+#[must_use]
+pub unsafe fn virtcol2col(wp: *mut WinT, lnum: crate::pos_defs::LinenrT, vcol: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (offset, _) = unsafe { vcol2col(wp, lnum, vcol - 1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+    let mut p = offset as usize;
+
+    if line.get(p).copied().unwrap_or(0) == 0 {
+        if p == 0 {
+            // empty line
+            return 0;
+        }
+        // Move to the first byte of the last char.
+        // SAFETY: forwarded from this function's own safety doc.
+        p -= 1 + unsafe { crate::mbyte::utf_head_off(&line, p - 1) } as usize;
+    }
+    (p + 1) as i32
 }
 
 #[cfg(test)]
@@ -1418,5 +1524,154 @@ mod tests {
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 8, 2) });
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    // --- vcol2col / virtcol2col ---
+
+    #[test]
+    fn vcol2col_ascii_returns_matching_byte_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 0) }, (0, 0));
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 3) }, (3, 0));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn vcol2col_past_end_of_line_reports_overshoot_coladd() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        // "hello" is 5 cells wide (0..5); requesting vcol 100 stops at
+        // the trailing NUL (byte offset 5), reporting the overshoot as
+        // coladd (matching the original's own unclamped `*coladdp`).
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 100) }, (5, 95));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn vcol2col_lands_inside_a_double_width_character_reports_coladd() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        // "a" + CJK "日" (U+65E5, double-width, 3 UTF-8 bytes) + "b".
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, "a日b\0".as_bytes()) },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        // vcol 1 lands exactly on the CJK char's own start byte.
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 1) }, (1, 0));
+        // vcol 2 lands in the *middle* of the double-width CJK char
+        // (which occupies vcols 1-2) - byte offset stays at its start
+        // (1), with coladd 1 reporting the one-cell overshoot into it.
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 2) }, (1, 1));
+        // vcol 3 lands on "b", right after the CJK char (3 UTF-8 bytes
+        // starting at offset 1, so "b" is at offset 4).
+        assert_eq!(unsafe { vcol2col(&mut win as *mut WinT, 1, 3) }, (4, 0));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn virtcol2col_first_column_returns_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        assert_eq!(unsafe { virtcol2col(&mut win as *mut WinT, 1, 1) }, 1);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn virtcol2col_past_end_of_line_returns_last_char_byte_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        // "hello" has 5 one-cell-wide characters (vcols 0-4, 1-based
+        // columns 1-5); asking for column 100 clamps to the LAST
+        // character's own byte index (5, 1-based - the 'o').
+        assert_eq!(unsafe { virtcol2col(&mut win as *mut WinT, 1, 100) }, 5);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn virtcol2col_lands_after_double_width_character_returns_correct_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, "a日b\0".as_bytes()) },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        // Column 4 (1-based) = vcol 3 (0-based), landing exactly on
+        // "b" (byte offset 4, 0-based) - 1-based byte index 5.
+        assert_eq!(unsafe { virtcol2col(&mut win as *mut WinT, 1, 4) }, 5);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn virtcol2col_empty_line_returns_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+
+        assert_eq!(unsafe { virtcol2col(&mut win as *mut WinT, 1, 1) }, 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 }
