@@ -317,6 +317,35 @@ pub fn vim_strchr(string: &[u8], c: i32) -> Option<usize> {
     string.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Escape every character in `string` that also appears in
+/// `esc_chars` with a backslash (`vim_strsave_escaped`, matching the
+/// original's own `cc = '\\'`/`bsl = false` default parameterization
+/// of `vim_strsave_escaped_ext` - the `bsl`-true variant, needing
+/// `rem_backslash`, is not modeled since nothing calls it that way).
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`crate::mbyte::utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn vim_strsave_escaped(string: &[u8], esc_chars: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(string.len());
+    let mut p = 0usize;
+    while p < string.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&string[p..]) }).unwrap_or(0);
+        if l > 1 {
+            out.extend_from_slice(&string[p..p + l]);
+            p += l;
+            continue;
+        }
+        if vim_strchr(esc_chars, i32::from(string[p])).is_some() {
+            out.push(b'\\');
+        }
+        out.push(string[p]);
+        p += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +504,45 @@ mod tests {
     #[test]
     fn vim_strchr_multibyte_not_found() {
         assert_eq!(vim_strchr("hello\0".as_bytes(), 0xe9), None);
+    }
+
+    #[test]
+    fn vim_strsave_escaped_escapes_matching_chars() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsave_escaped(b"a b c", b" ") }, b"a\\ b\\ c".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_no_matching_chars_is_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsave_escaped(b"hello", b" ") }, b"hello".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_empty_string_is_empty() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsave_escaped(b"", b" ") }, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_escapes_every_occurrence() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsave_escaped(b"a.b.c", b".") }, b"a\\.b\\.c".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_multiple_esc_chars() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { vim_strsave_escaped(b"a b.c", b" .") }, b"a\\ b\\.c".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_preserves_multibyte_characters_unescaped() {
+        let _guard = crate::globals::global_state_test_lock();
+        // A multibyte character is never itself a candidate for
+        // escaping (matching the original's own `if (l > 1) { ...
+        // continue; }` fast path skipping the esc_chars check
+        // entirely for multibyte sequences).
+        assert_eq!(unsafe { vim_strsave_escaped("a一b".as_bytes(), "一".as_bytes()) }, "a一b".as_bytes().to_vec());
     }
 }

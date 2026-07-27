@@ -442,6 +442,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
+        m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4296,6 +4297,22 @@ unsafe fn f_win_gettype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(type_str.to_vec()));
 }
 
+/// `escape({string}, {chars})` - escape every character in
+/// `{chars}` that occurs in `{string}` with a backslash
+/// (`f_escape`, `funcs.c`), via the newly-added
+/// [`crate::strings::vim_strsave_escaped`].
+///
+/// # Safety
+/// Forwarded from [`crate::strings::vim_strsave_escaped`]'s own
+/// safety doc.
+unsafe fn f_escape(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let chars = crate::eval::typval::tv_get_string(&argvars[1]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let escaped = unsafe { crate::strings::vim_strsave_escaped(&s, &chars) };
+    rettv.value = TypvalValue::String(Some(escaped));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5112,6 +5129,7 @@ mod tests {
             "winwidth",
             "win_screenpos",
             "win_gettype",
+            "escape",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9303,5 +9321,31 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_win_gettype(&[num(1234)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"popup".to_vec())));
+    }
+
+    // --- f_escape ---
+
+    #[test]
+    fn escape_escapes_matching_characters() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_escape(&[string(b"a b c"), string(b" ")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"a\\ b\\ c".to_vec())));
+    }
+
+    #[test]
+    fn escape_no_matching_characters_is_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_escape(&[string(b"hello"), string(b" ")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello".to_vec())));
+    }
+
+    #[test]
+    fn escape_with_a_number_argument_converts_to_string_first() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_escape(&[num(123), string(b"2")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"1\\23".to_vec())));
     }
 }
