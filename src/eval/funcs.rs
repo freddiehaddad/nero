@@ -443,6 +443,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
+        m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4313,6 +4314,20 @@ unsafe fn f_escape(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(escaped));
 }
 
+/// `fnameescape({fname})` - escape `{fname}` for use as a file name
+/// command argument (`f_fnameescape`, `funcs.c`), via the newly-added
+/// [`crate::ex_getln::vim_strsave_fnameescape`].
+///
+/// # Safety
+/// Forwarded from [`crate::ex_getln::vim_strsave_fnameescape`]'s own
+/// safety doc.
+unsafe fn f_fnameescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let escaped = unsafe { crate::ex_getln::vim_strsave_fnameescape(&s, crate::ex_getln::VseWhat::None) };
+    rettv.value = TypvalValue::String(Some(escaped));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5130,6 +5145,7 @@ mod tests {
             "win_screenpos",
             "win_gettype",
             "escape",
+            "fnameescape",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9347,5 +9363,23 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_escape(&[num(123), string(b"2")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"1\\23".to_vec())));
+    }
+
+    // --- f_fnameescape ---
+
+    #[test]
+    fn fnameescape_escapes_a_space() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_fnameescape(&[string(b"a b")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"a\\ b".to_vec())));
+    }
+
+    #[test]
+    fn fnameescape_plain_name_is_unchanged() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_fnameescape(&[string(b"hello.txt")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"hello.txt".to_vec())));
     }
 }
