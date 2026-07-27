@@ -479,6 +479,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
+        m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
@@ -5656,6 +5657,33 @@ unsafe fn f_win_gettype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(type_str.to_vec()));
 }
 
+/// `gettagstack([{winnr}])` - the tag stack of window `{winnr}`
+/// (|window-number| or |window-ID|, default the current window) as a
+/// `Dict` (`f_gettagstack`, `funcs.c`), via the already-existing
+/// [`crate::tag::get_tagstack`].
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]/
+/// [`crate::tag::get_tagstack`]'s own safety docs.
+unsafe fn f_gettagstack(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if !argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+        if wp.is_null() {
+            return;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc; `d` was
+    // just freshly allocated by `tv_dict_alloc_ret` above.
+    unsafe { crate::tag::get_tagstack(&*wp, d) };
+}
+
 /// Recursive frame-tree walk building `winlayout()`'s own nested
 /// return value (`get_framelayout`, `eval/window.c`). `fr` may be
 /// null (the original's own early-return no-op). `outer == true`
@@ -7070,6 +7098,7 @@ mod tests {
             "win_screenpos",
             "screenpos",
             "win_gettype",
+            "gettagstack",
             "winlayout",
             "winrestcmd",
             "escape",
@@ -13135,6 +13164,81 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_win_gettype(&[num(1234)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"popup".to_vec())));
+    }
+
+    // --- f_gettagstack ---
+
+    fn dict_find<'a>(d: &'a crate::eval::typval_defs::DictT, key: &[u8]) -> Option<&'a TypvalT> {
+        // SAFETY: `d.dv_index` only ever holds still-live `DictitemT`
+        // pointers owned by `d` itself.
+        unsafe {
+            d.dv_index
+                .values()
+                .map(|&p| &*p)
+                .find(|item: &&crate::eval::typval_defs::DictitemT| item.di_key.starts_with(key))
+        }
+        .map(|item| &item.di_tv)
+    }
+
+    #[test]
+    fn gettagstack_no_args_uses_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        win.w_tagstacklen = 0;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettagstack(&[], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        assert_eq!(dict_find(unsafe { &*d }, b"length").unwrap().value, TypvalValue::Number(0));
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn gettagstack_by_window_id_reports_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        win.w_tagstack[0] = crate::buffer_defs::TaggyT { tagname: b"foo".to_vec(), ..Default::default() };
+        win.w_tagstacklen = 1;
+        win.w_tagstackidx = 1;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettagstack(&[num(1)], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        let d_ref = unsafe { &*d };
+        assert_eq!(dict_find(d_ref, b"length").unwrap().value, TypvalValue::Number(1));
+        assert_eq!(dict_find(d_ref, b"curidx").unwrap().value, TypvalValue::Number(2));
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn gettagstack_unresolvable_window_returns_an_empty_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_gettagstack(&[num(9999)], &mut rettv) };
+
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        let d_ref = unsafe { &*d };
+        assert!(dict_find(d_ref, b"length").is_none(), "get_tagstack is never called for an unresolvable window");
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
     }
 
     // --- f_winlayout / get_framelayout ---
