@@ -434,6 +434,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"gettext"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_gettext });
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
         m.insert(&b"prevnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_prevnonblank });
+        m.insert(&b"line"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_line });
+        m.insert(&b"col"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_col });
+        m.insert(&b"charcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_charcol });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4054,6 +4057,124 @@ unsafe fn f_prevnonblank(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(lnum));
 }
 
+/// `line({expr} [, {winid}])` - the line number for the position given
+/// by `{expr}` (`f_line`, `funcs.c`), via [`crate::eval::eval::var2fpos`].
+/// Only the no-`{winid}` (current window) form is supported - the
+/// `{winid}` form needs `win_id2wp_tp` (not yet translated) and
+/// `check_cursor`'s own window-switch semantics; `unimplemented!()`s
+/// if reached.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::var2fpos`]'s own safety doc.
+unsafe fn f_line(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if argvars.len() > 1 {
+        unimplemented!("f_line: the {{winid}} form needs win_id2wp_tp, not yet translated");
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, curwin) };
+    rettv.value = TypvalValue::Number(i64::from(fp.map_or(0, |p| p.lnum)));
+}
+
+/// The shared implementation of `col()`/`charcol()` (`get_col`,
+/// `funcs.c`) - only the no-`{winid}` (current window) form is
+/// supported, matching [`f_line`]'s own scoping; `unimplemented!()`s
+/// if a second argument is given.
+///
+/// The original's own coladd-adjustment branch checks `fp ==
+/// &wp->w_cursor` (pointer identity against the SAME live
+/// `pos_T`, since `var2fpos` returns a pointer into its own static
+/// scratch variable there). [`crate::eval::eval::var2fpos`] returns an
+/// owned [`crate::pos_defs::PosT`] instead (no raw-pointer-based
+/// scratch variable to alias), so this compares by VALUE instead -
+/// practically equivalent for every case this crate's `var2fpos`
+/// subset can currently produce (only the `.`/cursor branch can ever
+/// match `w.w_cursor`'s current value, since nothing else that could
+/// coincidentally match is reachable here without also changing the
+/// cursor in between).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::var2fpos`]/
+/// [`crate::plines::win_chartabsize`]'s own safety docs.
+unsafe fn get_col(argvars: &[TypvalT], rettv: &mut TypvalT, charcol: bool) {
+    if crate::eval::typval::tv_check_for_string_or_list_arg(argvars, 0) == crate::vim_defs::FAIL
+        || (argvars.len() > 1
+            && crate::eval::typval::tv_check_for_opt_number_arg(argvars, 1) == crate::vim_defs::FAIL)
+    {
+        return;
+    }
+    if argvars.len() > 1 {
+        unimplemented!("get_col: the {{winid}} form needs win_id2wp_tp, not yet translated");
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    // SAFETY: forwarded from this function's own safety doc.
+    let bp = unsafe { &mut *w.w_buffer };
+    let mut col: crate::pos_defs::ColnrT = 0;
+    let fnum = bp.handle;
+    // SAFETY: forwarded from this function's own safety doc.
+    let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], false, charcol, wp) };
+    if let Some(fp) = fp {
+        if fnum == bp.handle {
+            if fp.col == crate::pos_defs::MAXCOL {
+                // '> can be MAXCOL, get the length of the line then
+                if fp.lnum <= bp.b_ml.ml_line_count {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    col = unsafe { crate::memline::ml_get_buf_len(bp, fp.lnum) } + 1;
+                } else {
+                    col = crate::pos_defs::MAXCOL;
+                }
+            } else {
+                col = fp.col + 1;
+                // col(".") when the cursor is on the NUL at the end of
+                // the line because of "coladd" can be seen as an extra
+                // column.
+                if crate::state::virtual_active(w) && fp == w.w_cursor {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let line = unsafe { crate::memline::ml_get_buf(bp, w.w_cursor.lnum) };
+                    let p = &line[(w.w_cursor.col as usize).min(line.len())..];
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let want = unsafe {
+                        crate::plines::win_chartabsize(w, p, w.w_virtcol - w.w_cursor.coladd)
+                    };
+                    if w.w_cursor.coladd >= want {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        let l = unsafe { crate::mbyte::utfc_ptr2len(p) };
+                        if p.first().copied().unwrap_or(0) != 0 && p.get(l as usize).copied().unwrap_or(0) == 0 {
+                            col += l;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rettv.value = TypvalValue::Number(i64::from(col));
+}
+
+/// `col({expr} [, {winid}])` - the byte index of the column position
+/// given by `{expr}` (`f_col`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`get_col`]'s own safety doc.
+unsafe fn f_col(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_col(argvars, rettv, false) };
+}
+
+/// `charcol({expr} [, {winid}])` - like [`f_col`] but returns the
+/// character index instead of the byte index (`f_charcol`, `funcs.c`).
+///
+/// # Safety
+/// Forwarded from [`get_col`]'s own safety doc.
+unsafe fn f_charcol(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_col(argvars, rettv, true) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4862,6 +4983,9 @@ mod tests {
             "gettext",
             "nextnonblank",
             "prevnonblank",
+            "line",
+            "col",
+            "charcol",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -8703,6 +8827,127 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_prevnonblank(&[num(0)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+        close_test_buf(buf);
+    }
+
+    // --- f_line / f_col / f_charcol ---
+
+    #[test]
+    fn line_dot_returns_the_cursor_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello", b"world"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn line_dollar_returns_the_last_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"a", b"b", b"c"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b"$")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn line_with_a_winid_argument_is_unimplemented() {
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_line(&[string(b"."), num(1000)], &mut rettv);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn col_dot_returns_the_byte_column_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_col(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn col_dollar_returns_the_line_length_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_col(&[string(b"$")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(6));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn charcol_dot_returns_the_character_column_plus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "一二三" - 3 CJK characters, each 3 bytes in UTF-8.
+        let mut buf = buf_with_lines(&["一二三".as_bytes()]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_charcol(&[string(b".")], &mut rettv) };
+        // byte col 3 is the 2nd character (0-indexed char 1) -> charcol 2.
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        // Meanwhile the byte-based col() should report byte offset + 1.
+        unsafe { f_col(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn col_invalid_position_returns_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        // An unrecognized position string (no ./v/'/w/$ prefix) is a
+        // genuine, graceful var2fpos failure - not a mark reference
+        // (which would panic, needing mark_get, not yet translated).
+        unsafe { f_col(&[string(b"bogus")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
         close_test_buf(buf);
     }
 }
