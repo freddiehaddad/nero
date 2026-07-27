@@ -409,6 +409,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
+        m.insert(&b"getmarklist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getmarklist });
+        m.insert(&b"getchangelist"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getchangelist });
         m.insert(&b"mode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_mode });
         m.insert(&b"visualmode"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_visualmode });
         m.insert(&b"wildmenumode"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_wildmenumode });
@@ -3813,6 +3815,126 @@ fn f_getcharsearch(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::tv_dict_set_ret(rettv, d) };
 }
 
+/// `getmarklist([{buf}])` - a `List` of marks: global marks (`'A'`-
+/// `'Z'`/`'0'`-`'9'`) when `{buf}` is omitted, or buffer-local marks
+/// for `{buf}` otherwise (`f_getmarklist`, `funcs.c`), via the
+/// already-existing [`crate::mark::get_global_marks`]/
+/// [`crate::mark::get_buf_local_marks`].
+///
+/// # Safety
+/// Forwarded from [`crate::eval::buffer::tv_get_buf`]/
+/// [`crate::mark::get_global_marks`]/
+/// [`crate::mark::get_buf_local_marks`]'s own safety docs.
+unsafe fn f_getmarklist(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize)
+    };
+
+    if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::mark::get_global_marks(l) };
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { crate::eval::buffer::tv_get_buf(&argvars[0]) };
+    if buf.is_null() {
+        return;
+    }
+    // SAFETY: `buf` is non-null (just checked) and forwarded from this
+    // function's own safety doc.
+    unsafe { crate::mark::get_buf_local_marks(&*buf, l) };
+}
+
+/// `getchangelist([{buf}])` - the |changelist| for buffer `{buf}` (or
+/// the current buffer): a 2-element `List` of `[changes, index]`,
+/// where `changes` is a `List` of `{lnum, col, coladd}` dicts and
+/// `index` is the current position within it (`f_getchangelist`,
+/// `funcs.c`), via [`crate::buffer_defs::BufT`]'s already-real
+/// `b_changelist`/`b_changelistlen`/`b_wininfo` fields.
+///
+/// The original's own `emsg_off`-wrapped `tv_get_number` call (issuing
+/// a type-error message for a bad `{buf}` argument while still letting
+/// [`crate::eval::buffer::tv_get_buf`] run regardless) has its message
+/// display omitted, matching this crate's established policy - the
+/// underlying buffer resolution itself is unaffected either way.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::buffer::tv_get_buf`]'s own safety
+/// doc. Touches `GLOBALS.curbuf`/`curwin` - same requirement as every
+/// other function that does so.
+unsafe fn f_getchangelist(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+
+    let buf: *mut crate::buffer_defs::BufT = if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::buffer::tv_get_buf(&argvars[0]) }
+    };
+    if buf.is_null() {
+        return;
+    }
+    // SAFETY: `buf` is non-null (just checked) and forwarded from this
+    // function's own safety doc.
+    let bufref = unsafe { &*buf };
+
+    let changelist = crate::eval::typval::tv_list_alloc(i64::from(bufref.b_changelistlen) as isize);
+    // SAFETY: `l`/`changelist` are both valid, freshly-obtained live
+    // pointers (forwarded from this function's own safety doc for
+    // `l`; `tv_list_alloc` never returns null).
+    unsafe { crate::eval::typval::tv_list_append_list(l, changelist) };
+
+    // The current window change list index tracks only the position
+    // for the current buffer. For other buffers use the stored index
+    // for the current window, or, if that's not available, the change
+    // list length.
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*curwin_ptr };
+    let changelistindex = if std::ptr::eq(buf, curwin.w_buffer) {
+        curwin.w_changelistidx
+    } else {
+        bufref
+            .b_wininfo
+            .iter()
+            .find_map(|&wi| {
+                // SAFETY: every entry in `b_wininfo` is a live, valid pointer.
+                let wi = unsafe { &*wi };
+                std::ptr::eq(wi.wi_win, curwin_ptr).then_some(wi.wi_changelistidx)
+            })
+            .unwrap_or(bufref.b_changelistlen)
+    };
+    // SAFETY: `l` is a live, uniquely-owned allocation from
+    // tv_list_alloc_ret above (already holds `changelist` as its
+    // first item; the index number is the outer list's SECOND item,
+    // matching the original's own `tv_list_append_number(rettv->
+    // vval.v_list, changelistindex)` - NOT appended to `changelist`
+    // itself).
+    unsafe { crate::eval::typval::tv_list_append_number(l, i64::from(changelistindex)) };
+
+    for entry in &bufref.b_changelist[..bufref.b_changelistlen as usize] {
+        if entry.mark.lnum == 0 {
+            continue;
+        }
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `changelist` is a live, uniquely-owned allocation;
+        // `d` was just allocated above.
+        unsafe { crate::eval::typval::tv_list_append_dict(changelist, d) };
+        // SAFETY: `d` was just returned by `tv_dict_alloc` above, not
+        // yet shared beyond `changelist` (which only holds a
+        // refcounted reference).
+        let dict = unsafe { &mut *d };
+        crate::eval::typval::tv_dict_add_nr(dict, b"lnum", i64::from(entry.mark.lnum));
+        crate::eval::typval::tv_dict_add_nr(dict, b"col", i64::from(entry.mark.col));
+        crate::eval::typval::tv_dict_add_nr(dict, b"coladd", i64::from(entry.mark.coladd));
+    }
+}
+
 /// Whether `argvars[0]` (if present) is a nonzero `Number`/truthy
 /// `Bool`/nonempty `String` (`non_zero_arg`, `funcs.c`) - used by
 /// `mode()` to decide whether to report the full mode string or just
@@ -5786,6 +5908,8 @@ mod tests {
             "did_filetype",
             "garbagecollect",
             "getcharsearch",
+            "getmarklist",
+            "getchangelist",
             "mode",
             "visualmode",
             "wildmenumode",
@@ -9297,6 +9421,238 @@ mod tests {
             let until_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"until").unwrap();
             assert_eq!(crate::eval::typval::tv_get_number(&(*until_item).di_tv), 0);
             crate::eval::typval::tv_dict_unref(d);
+        }
+    }
+
+    // --- f_getmarklist / f_getchangelist ---
+
+    #[test]
+    fn getmarklist_no_args_returns_global_marks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = crate::mark::mark_global_index(b'A') as usize;
+        let namedfm = unsafe { crate::mark::NAMEDFM.get_mut() };
+        let previous = namedfm[idx].clone();
+        namedfm[idx].fmark.mark = crate::pos_defs::PosT { lnum: 4, col: 0, coladd: 0 };
+        namedfm[idx].fname = Some(b"/tmp/a".to_vec());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getmarklist(&[], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 1);
+            let item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::Dict(d) = (*item).li_tv.value else { panic!("expected a Dict") };
+            let mark_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"mark").unwrap();
+            assert!(matches!(&(*mark_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"'A"));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        let namedfm_restore = unsafe { crate::mark::NAMEDFM.get_mut() };
+        namedfm_restore[idx] = previous;
+    }
+
+    #[test]
+    fn getmarklist_with_buf_arg_returns_buffer_local_marks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 7, ..Default::default() };
+        buf.b_namedm[0].mark = crate::pos_defs::PosT { lnum: 3, col: 1, coladd: 0 }; // mark 'a'
+        buf.b_op_start = crate::pos_defs::PosT { lnum: 7, col: 0, coladd: 0 }; // mark '['
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        // tv_get_buf's Number branch resolves via buflist_findnr,
+        // which walks GLOBALS.lastbuf/b_prev - not curwin.w_buffer
+        // directly - so it must be wired up too. get_buf_local_marks's
+        // own "''" mark also reads GLOBALS.curbuf directly (not just
+        // its own `buf: &BufT` parameter) - WinGlobalsGuard doesn't
+        // manage curbuf at all, so it's set manually here too. Both
+        // are derived from GLOBALS.curwin's own already-stored
+        // w_buffer value (not independently from `buf`/`win` again),
+        // matching this crate's established "don't re-derive a second
+        // raw pointer to the same object" discipline.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_lastbuf = globals.lastbuf;
+        let prev_curbuf = globals.curbuf;
+        let curwin_buf = unsafe { &*globals.curwin }.w_buffer;
+        globals.lastbuf = curwin_buf;
+        globals.curbuf = curwin_buf;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getmarklist(&[num(7)], &mut rettv) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.lastbuf = prev_lastbuf;
+        globals.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            // Only marks with a positive lnum are included
+            // (add_mark's own `pos.lnum <= 0` early return, matching
+            // mark.rs's own get_buf_local_marks_includes_only_marks_
+            // with_positive_lnum precedent) - every OTHER buffer/
+            // window mark stays at its Default (lnum == 0) here, so
+            // only 'a' and '[' (set above) survive.
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getmarklist_unknown_buf_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        // See getmarklist_with_buf_arg_returns_buffer_local_marks's
+        // own comment: buflist_findnr walks GLOBALS.lastbuf, which
+        // must be a valid pointer (not leftover/garbage state) for the
+        // "genuinely searched and found nothing" case to be faithful.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_lastbuf = globals.lastbuf;
+        globals.lastbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getmarklist(&[num(999)], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getchangelist_no_args_uses_curbuf_and_returns_entries_plus_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 3, ..Default::default() };
+        buf.b_changelist[0].mark = crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_changelist[1].mark = crate::pos_defs::PosT { lnum: 9, col: 0, coladd: 1 };
+        buf.b_changelistlen = 2;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_changelistidx: 2,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        // The no-args path reads GLOBALS.curbuf directly (matching the
+        // original's own `buf = curbuf`) - WinGlobalsGuard doesn't
+        // manage curbuf, so it's set manually here, derived from
+        // GLOBALS.curwin's own already-stored w_buffer value.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getchangelist(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let changes_item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::List(changes) = (*changes_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(changes), 2);
+            let first_change = crate::eval::typval::tv_list_find(changes, 0);
+            let TypvalValue::Dict(d) = (*first_change).li_tv.value else { panic!("expected a Dict") };
+            let lnum_item = crate::eval::typval::tv_dict_find(Some(&mut *d), b"lnum").unwrap();
+            assert_eq!(crate::eval::typval::tv_get_number(&(*lnum_item).di_tv), 5);
+
+            let index_item = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!(crate::eval::typval::tv_get_number(&(*index_item).li_tv), 2);
+
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getchangelist_skips_entries_with_zero_lnum() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 4, ..Default::default() };
+        // b_changelist[0] stays at its Default (lnum == 0) - skipped.
+        buf.b_changelist[1].mark = crate::pos_defs::PosT { lnum: 12, col: 0, coladd: 0 };
+        buf.b_changelistlen = 2;
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        globals.curbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getchangelist(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let changes_item = crate::eval::typval::tv_list_find(l, 0);
+            let TypvalValue::List(changes) = (*changes_item).li_tv.value else { panic!("expected a List") };
+            assert_eq!(crate::eval::typval::tv_list_len(changes), 1);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getchangelist_other_buffer_falls_back_to_wininfo_or_changelistlen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_buf = crate::buffer_defs::BufT { handle: 8, ..Default::default() };
+        other_buf.b_changelistlen = 3;
+        let mut cur_buf = crate::buffer_defs::BufT { handle: 9, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut cur_buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        // buflist_findnr (via tv_get_buf's Number branch) needs
+        // GLOBALS.lastbuf pointing at other_buf (a DIFFERENT object
+        // from curwin.w_buffer, so taking its own raw pointer here -
+        // exactly once - doesn't re-derive a pointer already stored
+        // elsewhere).
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_lastbuf = globals.lastbuf;
+        globals.lastbuf = &mut other_buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        // curwin.w_buffer != other_buf, and other_buf.b_wininfo is
+        // empty -> falls back to other_buf.b_changelistlen (3).
+        unsafe { f_getchangelist(&[num(8)], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let index_item = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!(crate::eval::typval::tv_get_number(&(*index_item).li_tv), 3);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn getchangelist_unknown_buf_returns_zero_entries_and_null_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_lastbuf = globals.lastbuf;
+        globals.lastbuf = unsafe { &*globals.curwin }.w_buffer;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getchangelist(&[num(999)], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = prev_lastbuf;
+
+        // No matching buffer: rettv stays the empty 0-length list
+        // tv_list_alloc_ret initialized it to (never appended to).
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
         }
     }
 
