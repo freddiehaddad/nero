@@ -440,6 +440,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winbufnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winbufnr });
         m.insert(&b"winheight"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winheight });
         m.insert(&b"winwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_winwidth });
+        m.insert(&b"win_screenpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_win_screenpos });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4228,6 +4229,31 @@ unsafe fn f_winwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
         TypvalValue::Number(if wp.is_null() { -1 } else { i64::from(unsafe { &*wp }.w_view_width) });
 }
 
+/// `win_screenpos({nr})` - the screen position `[row, col]` (both
+/// 1-based) of window `{nr}` (a window number or window ID), `[0, 0]`
+/// if not found (`f_win_screenpos`, `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]/
+/// [`crate::eval::typval::tv_list_alloc_ret`]'s own safety docs.
+unsafe fn f_win_screenpos(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, 2) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    let (row, col) = if wp.is_null() {
+        (0, 0)
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        (i64::from(w.w_winrow) + 1, i64::from(w.w_wincol) + 1)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, row) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_list_append_number(l, col) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5042,6 +5068,7 @@ mod tests {
             "winbufnr",
             "winheight",
             "winwidth",
+            "win_screenpos",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9094,5 +9121,48 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_winwidth(&[num(9999)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_win_screenpos ---
+
+    #[test]
+    fn win_screenpos_returns_1_based_row_and_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win =
+            crate::buffer_defs::WinT { w_winrow: 4, w_wincol: 9, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_screenpos(&[num(0)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::Number(5));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(10));
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn win_screenpos_unknown_window_returns_zero_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = focusable_win(1);
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_screenpos(&[num(9999)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 2);
+            let item0 = crate::eval::typval::tv_list_find(l, 0);
+            let item1 = crate::eval::typval::tv_list_find(l, 1);
+            assert_eq!((*item0).li_tv.value, TypvalValue::Number(0));
+            assert_eq!((*item1).li_tv.value, TypvalValue::Number(0));
+            crate::eval::typval::tv_list_unref(l);
+        }
     }
 }
