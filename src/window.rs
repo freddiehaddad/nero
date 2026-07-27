@@ -54,7 +54,7 @@
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
-use crate::eval::typval_defs::TypvalT;
+use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
 /// minimal columns for screen (`MIN_COLUMNS`).
 pub const MIN_COLUMNS: i32 = 12;
@@ -718,6 +718,40 @@ pub unsafe fn find_win_by_nr_or_id(vp: &TypvalT) -> *mut WinT {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { find_win_by_nr(vp, std::ptr::null_mut()) }
+}
+
+/// Find a window given by `wvp` (a window number or ID, `Unknown`
+/// meaning `curwin`) within tabpage `tvp` (a tab number, `Unknown`
+/// meaning `curtab`) (`find_tabwin`, `eval/window.c`).
+///
+/// # Safety
+/// Forwarded from [`find_tabpage`]/[`find_win_by_nr`]'s own safety
+/// docs.
+#[must_use]
+pub unsafe fn find_tabwin(wvp: &TypvalT, tvp: &TypvalT) -> *mut WinT {
+    if matches!(wvp.value, TypvalValue::Unknown) {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    }
+
+    let tp = if matches!(tvp.value, TypvalValue::Unknown) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab
+    } else {
+        let n = crate::eval::typval::tv_get_number(tvp) as i32;
+        if n >= 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { find_tabpage(n) }
+        } else {
+            std::ptr::null_mut()
+        }
+    };
+
+    if tp.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { find_win_by_nr(wvp, tp) }
 }
 
 /// Check if `wp` is at the bottom of its column of windows - i.e.
@@ -1641,5 +1675,67 @@ mod tests {
 
         let result = std::panic::catch_unwind(|| unsafe { get_winnr(tp_ptr, Some(b"3j")) });
         assert!(result.is_err(), "expected a panic (win_vert_neighbor not yet translated)");
+    }
+
+    // ---- find_tabwin ----
+
+    fn unknown_tv() -> TypvalT {
+        TypvalT::default()
+    }
+
+    fn num_tv(n: crate::eval::typval_defs::VarnumberT) -> TypvalT {
+        TypvalT { value: TypvalValue::Number(n), ..Default::default() }
+    }
+
+    #[test]
+    fn find_tabwin_no_args_returns_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(unsafe { find_tabwin(&unknown_tv(), &unknown_tv()) }, win_ptr);
+    }
+
+    #[test]
+    fn find_tabwin_window_number_only_uses_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        let mut first = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let first_ptr = &mut first as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(first_ptr, tp_ptr, first_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(unsafe { find_tabwin(&num_tv(2), &unknown_tv()) }, second_ptr);
+    }
+
+    #[test]
+    fn find_tabwin_with_a_negative_tabnr_returns_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert!(unsafe { find_tabwin(&num_tv(1), &num_tv(-1)) }.is_null());
+    }
+
+    #[test]
+    fn find_tabwin_tab_zero_means_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let win_ptr = &mut win as *mut WinT;
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        // Tab 0 -> find_tabpage(0) -> curtab, matching find_tabpage's
+        // own already-established "0 means curtab" convention.
+        assert_eq!(unsafe { find_tabwin(&num_tv(1), &num_tv(0)) }, win_ptr);
     }
 }

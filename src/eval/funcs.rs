@@ -451,6 +451,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"reltime"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_reltime });
         m.insert(&b"reltimestr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimestr });
         m.insert(&b"reltimefloat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimefloat });
+        m.insert(&b"arglistid"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: BASE_NONE, func: f_arglistid });
         crate::globals::GlobalCell::new(m)
     });
 
@@ -4609,6 +4610,29 @@ unsafe fn f_reltimefloat(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Float(crate::profile::profile_signed(tm) as f64 / 1_000_000_000.0);
 }
 
+/// `arglistid([{winnr} [, {tabnr}]])` - the argument list ID
+/// identifying which argument list is in use (`0` for the global
+/// list); `-1` if the window/tab can't be resolved (`f_arglistid`,
+/// `arglist.c`), via the newly-added [`crate::window::find_tabwin`].
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_tabwin`]'s own safety doc.
+unsafe fn f_arglistid(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let unknown = TypvalT::default();
+    let wvp = argvars.first().unwrap_or(&unknown);
+    let tvp = argvars.get(1).unwrap_or(&unknown);
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_tabwin(wvp, tvp) };
+    rettv.value = TypvalValue::Number(if wp.is_null() {
+        -1
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { &*w.w_alist }.id)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5434,6 +5458,7 @@ mod tests {
             "reltime",
             "reltimestr",
             "reltimefloat",
+            "arglistid",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
@@ -9965,5 +9990,32 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_reltimefloat(&[num(5)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Float(0.0));
+    }
+
+    // --- f_arglistid ---
+
+    #[test]
+    fn arglistid_no_args_uses_curwin_alist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist = crate::arglist_defs::AlistT { id: 7, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_arglistid(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn arglistid_unresolvable_window_returns_minus_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_arglistid(&[num(1), num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 }
