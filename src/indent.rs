@@ -5,16 +5,21 @@
 //! (`ml_replace`/`changed_bytes`) plus the C-indent (`indent_c.c`) and
 //! Lisp-indent engines.
 //!
-//! Translated: `tabstop_padding`, `indent_size_no_ts`/`indent_size_ts`
-//! (needed by `plines.c`'s tab-width calculations and by
-//! `get_breakindent_win` below); `get_breakindent_win` (needed
+//! Translated: `tabstop_padding`/`tabstop_at`, `indent_size_no_ts`/
+//! `indent_size_ts` (needed by `plines.c`'s tab-width calculations and
+//! by `get_breakindent_win` below); `get_breakindent_win` (needed
 //! `buffer.c`'s `buf_get_changedtick`, now tractable since
 //! `eval/typval_defs.rs`'s `TypvalT` is real - see that function's own
 //! doc comment for its one deliberate gap, `'breakindentopt'="list"`,
 //! which needs the real regex engine); `get_indent`/`get_indent_lnum`/
 //! `get_indent_buf` (thin wrappers around `indent_size_ts` - needed
 //! only `cursor.rs`'s `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/
-//! `ml_get_buf`, all already real).
+//! `ml_get_buf`, all already real); `get_sw_value`/`get_sw_value_col`
+//! (the effective `'shiftwidth'` value, needed by `eval/funcs.c`'s
+//! `shiftwidth()` - only the `col`-based overloads, not
+//! `get_sw_value_pos`/`get_sw_value_indent`, which need
+//! `curwin.w_cursor`/`get_nolist_virtcol`/`getwhitecols_curline`, none
+//! of `shiftwidth()`'s own 2 real call shapes need those).
 //!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
@@ -28,11 +33,12 @@
 //! earlier, before anything used them for real) are read the same way
 //! by this function, their first real consumer - established here as
 //! the fields' own convention going forward, not just a one-off
-//! choice for this call site.
+//! choice for this call site. `tabstop_at` follows the exact same
+//! convention.
 //!
 //! Deferred: everything else in the file.
 
-use crate::buffer_defs::WinT;
+use crate::buffer_defs::{BufT, WinT};
 use crate::globals::GlobalCell;
 use crate::pos_defs::ColnrT;
 use crate::types_defs::{HandleT, OptInt};
@@ -115,6 +121,68 @@ pub fn tabstop_padding(col: ColnrT, ts_arg: OptInt, vts: Option<&[ColnrT]>) -> i
     }
 
     padding
+}
+
+/// Find the size of the tab interval that covers column `col`
+/// (`tabstop_at`).
+///
+/// If this is being called as part of a shift operation, `col` is not
+/// the cursor column but the column number to the left of the first
+/// non-whitespace character in the line. If the shift is to the left
+/// (`left == true`), returns the size of the tab interval to the left
+/// of `col` instead of covering it.
+///
+/// See this module's own doc comment for how `vts` differs from the
+/// original's raw, self-counting `colnr_T *` array.
+#[must_use]
+pub fn tabstop_at(col: ColnrT, ts: OptInt, vts: Option<&[ColnrT]>, left: bool) -> i32 {
+    let Some(vts) = vts.filter(|v| !v.is_empty()) else {
+        return ts as i32;
+    };
+
+    let tabcount = vts.len();
+    let mut tabcol: i64 = 0;
+    let mut tab_size = 0i32;
+    let mut t = 1usize;
+    let mut matched = false;
+    while t <= tabcount {
+        tabcol += i64::from(vts[t - 1]);
+        if tabcol > i64::from(col) {
+            if left && t == 1 {
+                tab_size = col;
+            } else {
+                let idx = if left { t - 1 } else { t };
+                tab_size = vts[idx - 1];
+            }
+            matched = true;
+            break;
+        }
+        t += 1;
+    }
+    if !matched {
+        tab_size = vts[tabcount - 1];
+    }
+
+    tab_size
+}
+
+/// Return the effective `'shiftwidth'` value for `buf`, using virtual
+/// column `col` to select among `'vartabstop'` entries when
+/// `'shiftwidth'` is zero (`get_sw_value_col`).
+#[must_use]
+pub fn get_sw_value_col(buf: &BufT, col: ColnrT, left: bool) -> i32 {
+    if buf.b_p_sw != 0 {
+        buf.b_p_sw as i32
+    } else {
+        tabstop_at(col, buf.b_p_ts, buf.b_p_vts_array.as_deref(), left)
+    }
+}
+
+/// Return the effective `'shiftwidth'` value for `buf`, using the
+/// 'tabstop' value when `'shiftwidth'` is zero (`get_sw_value`).
+#[must_use]
+pub fn get_sw_value(buf: &BufT) -> i32 {
+    get_sw_value_col(buf, 0, false)
 }
 
 /// Compute the size of the indent (in window cells) in `ptr`, without
@@ -289,6 +357,32 @@ pub unsafe fn f_indent(argvars: &[crate::eval::typval_defs::TypvalT], rettv: &mu
     } else {
         -1
     });
+}
+
+/// `"shiftwidth([{col}])"` function (`f_shiftwidth`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a valid, live `BufT`.
+pub unsafe fn f_shiftwidth(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    use crate::eval::typval_defs::TypvalValue;
+
+    rettv.value = TypvalValue::Number(0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    if !argvars.is_empty() {
+        let col = crate::eval::typval::tv_get_number_chk(&argvars[0], None) as ColnrT;
+        if col < 0 {
+            // type error; errmsg already given (skipped here)
+            return;
+        }
+        rettv.value = TypvalValue::Number(i64::from(get_sw_value_col(curbuf, col, false)));
+        return;
+    }
+    rettv.value = TypvalValue::Number(i64::from(get_sw_value(curbuf)));
 }
 
 /// Return appropriate space number for `'breakindent'`, taking
@@ -768,5 +862,100 @@ mod tests {
 
         drop(guard);
         close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn tabstop_at_no_vts_returns_ts() {
+        assert_eq!(tabstop_at(0, 8, None, false), 8);
+        assert_eq!(tabstop_at(5, 4, None, false), 4);
+    }
+
+    #[test]
+    fn tabstop_at_within_explicit_stops() {
+        // vts = [4, 8]: tab stops at columns 4 and 4+8=12.
+        assert_eq!(tabstop_at(2, 8, Some(&[4, 8]), false), 4);
+        assert_eq!(tabstop_at(5, 8, Some(&[4, 8]), false), 8);
+    }
+
+    #[test]
+    fn tabstop_at_beyond_explicit_stops_repeats_last_width() {
+        assert_eq!(tabstop_at(15, 8, Some(&[4, 8]), false), 8);
+    }
+
+    #[test]
+    fn tabstop_at_left_true_at_column_zero_returns_col() {
+        // Shifting left from column 0 (before the first tabstop):
+        // the original returns `col` itself in this special case.
+        assert_eq!(tabstop_at(0, 8, Some(&[4, 8]), true), 0);
+    }
+
+    #[test]
+    fn tabstop_at_left_true_returns_the_previous_stop_width() {
+        // col=6 is between the stop at 4 and the stop at 12; shifting
+        // left returns the width of the PRECEDING interval (4).
+        assert_eq!(tabstop_at(6, 8, Some(&[4, 8]), true), 4);
+    }
+
+    #[test]
+    fn tabstop_at_empty_vts_falls_back_to_ts() {
+        assert_eq!(tabstop_at(10, 8, Some(&[]), false), 8);
+    }
+
+    #[test]
+    fn get_sw_value_col_uses_shiftwidth_when_nonzero() {
+        let buf = BufT { b_p_sw: 4, b_p_ts: 8, ..Default::default() };
+        // b_p_sw takes priority; col/left are ignored.
+        assert_eq!(get_sw_value_col(&buf, 99, true), 4);
+    }
+
+    #[test]
+    fn get_sw_value_col_falls_back_to_tabstop_at_when_shiftwidth_is_zero() {
+        let buf = BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        assert_eq!(get_sw_value_col(&buf, 2, false), 4);
+    }
+
+    #[test]
+    fn get_sw_value_matches_get_sw_value_col_at_column_zero() {
+        let buf = BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        assert_eq!(get_sw_value(&buf), get_sw_value_col(&buf, 0, false));
+        assert_eq!(get_sw_value(&buf), 4);
+    }
+
+    #[test]
+    fn shiftwidth_with_no_args_uses_get_sw_value() {
+        let mut buf = BufT { b_p_sw: 4, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_shiftwidth(&[], &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn shiftwidth_with_col_uses_get_sw_value_col() {
+        let mut buf = BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+
+        let argvars = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(2),
+            ..Default::default()
+        }];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_shiftwidth(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn shiftwidth_negative_col_leaves_rettv_at_zero() {
+        let mut buf = BufT { b_p_sw: 4, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+
+        let argvars = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(-1),
+            ..Default::default()
+        }];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_shiftwidth(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(0));
     }
 }

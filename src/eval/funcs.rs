@@ -448,6 +448,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"setwinvar"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: BASE_LAST, func: crate::eval::vars::f_setwinvar });
         m.insert(&b"settabwinvar"[..], EvalFuncDefT { min_argc: 4, max_argc: 4, base_arg: BASE_LAST, func: crate::eval::vars::f_settabwinvar });
         m.insert(&b"indent"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::indent::f_indent });
+        m.insert(&b"shiftwidth"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::indent::f_shiftwidth });
         m.insert(&b"reg_executing"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_executing });
         m.insert(&b"reg_recording"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recording });
         m.insert(&b"reg_recorded"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_reg_recorded });
@@ -7009,6 +7010,7 @@ mod tests {
             "setwinvar",
             "settabwinvar",
             "indent",
+            "shiftwidth",
             "reg_executing",
             "reg_recording",
             "reg_recorded",
