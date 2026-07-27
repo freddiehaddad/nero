@@ -270,6 +270,27 @@ pub unsafe fn get_indent_buf(buf: &mut crate::buffer_defs::BufT, lnum: crate::po
     indent_size_ts(&line, buf.b_p_ts, buf.b_p_vts_array.as_deref())
 }
 
+/// `"indent({lnum})"` function (`f_indent`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point to a valid, live `BufT`.
+pub unsafe fn f_indent(argvars: &[crate::eval::typval_defs::TypvalT], rettv: &mut crate::eval::typval_defs::TypvalT) {
+    use crate::eval::typval_defs::TypvalValue;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { (*curbuf).b_ml.ml_line_count };
+    rettv.value = TypvalValue::Number(if lnum >= 1 && lnum <= line_count {
+        // SAFETY: forwarded from this function's own safety doc.
+        i64::from(unsafe { get_indent_lnum(lnum) })
+    } else {
+        -1
+    });
+}
+
 /// Return appropriate space number for `'breakindent'`, taking
 /// influencing parameters into account (`get_breakindent_win`). `wp`
 /// must be specified since it's not necessarily always the current
@@ -690,6 +711,60 @@ mod tests {
         // vts=[4, 8]: first tab lands at column 4, second at 4+8=12.
         assert_eq!(unsafe { get_indent() }, 12);
         assert_eq!(unsafe { get_indent_lnum(1) }, 12);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn f_indent_reads_a_valid_lines_indent() {
+        let mut buf = BufT { b_p_ts: 4, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+
+        let argvars = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            ..Default::default()
+        }];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_indent(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(4));
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn f_indent_returns_minus_one_for_an_out_of_range_line() {
+        let mut buf = BufT { b_p_ts: 4, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"text\0");
+
+        let argvars = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(99),
+            ..Default::default()
+        }];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_indent(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(-1));
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn f_indent_returns_minus_one_for_line_zero() {
+        let mut buf = BufT { b_p_ts: 4, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"text\0");
+
+        let argvars = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(0),
+            ..Default::default()
+        }];
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_indent(&argvars, &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(-1));
 
         drop(guard);
         close_buf_with_memline(buf);
