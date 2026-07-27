@@ -30,11 +30,16 @@
 //! `buflist_new`, is NOT modeled and panics via `unimplemented!()` if
 //! actually reached - matching this module's own established
 //! "translate the common path, panic loudly on a genuinely
-//! untranslated-but-reached path" convention), and `bufwinid()`/
+//! untranslated-but-reached path" convention), `bufwinid()`/
 //! `bufwinnr()` (via `buf_win_common`, additionally using the
 //! already-existing `crate::window::win_has_winnr` - both only
 //! search the CURRENT tab page, matching the original's own
-//! `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` walk exactly).
+//! `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` walk exactly), and
+//! `swapname()` (another `eval/funcs.c`-originated `{buf}`-taking
+//! builtin, hosted here for the same reason as `tv_get_buf` itself) -
+//! `None` (Vimscript `v:null`) whenever `{buf}` doesn't resolve to a
+//! real buffer, has no memfile yet, or its memfile has no on-disk
+//! swap file name.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -250,6 +255,33 @@ pub(crate) unsafe fn f_bufwinid(argvars: &[TypvalT], rettv: &mut TypvalT) {
 pub(crate) unsafe fn f_bufwinnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { buf_win_common(argvars, rettv, true) };
+}
+
+/// `swapname({buf})` - the swap file path of buffer `{buf}`
+/// (`f_swapname`, `eval/funcs.c`), via [`tv_get_buf`]. `None`
+/// (Vimscript `v:null`) if `{buf}` doesn't resolve to a real buffer,
+/// has no memfile yet (`b_ml.ml_mfp` is null), or its memfile has no
+/// on-disk swap file name (`mf_fname` is `None`) - e.g. a memory-only
+/// buffer with no swap file at all.
+///
+/// # Safety
+/// Forwarded from [`tv_get_buf`]'s own safety doc.
+pub(crate) unsafe fn f_swapname(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { tv_get_buf(&argvars[0]) };
+    let name = if buf.is_null() {
+        None
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &*buf };
+        if b.b_ml.ml_mfp.is_null() {
+            None
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*b.b_ml.ml_mfp }.mf_fname.clone()
+        }
+    };
+    rettv.value = TypvalValue::String(name);
 }
 
 #[cfg(test)]
@@ -621,5 +653,101 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_bufwinid(&[num(5)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // ---- f_swapname ----
+
+    /// A `MemfileT` with no open file, no free list, no hash - only
+    /// `mf_fname` is ever set by these tests.
+    fn memfile_with_fname(fname: Option<&[u8]>) -> crate::memfile_defs::MemfileT {
+        crate::memfile_defs::MemfileT {
+            mf_fname: fname.map(<[u8]>::to_vec),
+            mf_ffname: None,
+            mf_fd: None,
+            mf_flags: 0,
+            mf_reopen: false,
+            mf_free_first: std::ptr::null_mut(),
+            mf_hash: crate::map::Map::default(),
+            mf_trans: crate::map::Map::default(),
+            mf_blocknr_max: 0,
+            mf_blocknr_min: -1,
+            mf_neg_count: 0,
+            mf_infile_count: 0,
+            mf_page_size: 4096,
+            mf_dirty: crate::memfile_defs::MfdirtyT::No,
+        }
+    }
+
+    #[test]
+    fn swapname_returns_the_memfile_fname_when_present() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut mfp = memfile_with_fname(Some(b".foo.txt.swp"));
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        buf.b_ml.ml_mfp = &mut mfp as *mut crate::memfile_defs::MemfileT;
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_swapname(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b".foo.txt.swp".to_vec())));
+    }
+
+    #[test]
+    fn swapname_returns_none_when_buffer_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, std::ptr::null_mut());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_swapname(&[num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn swapname_returns_none_when_buffer_has_no_memfile() {
+        let _lock = crate::globals::global_state_test_lock();
+        // `BufT::default()` leaves `b_ml.ml_mfp` null (matching a
+        // buffer whose memline was never opened via `ml_open`).
+        let mut buf = crate::buffer_defs::BufT { handle: 2, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_swapname(&[num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn swapname_returns_none_when_memfile_has_no_fname() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A memory-only memfile (e.g. `'swapfile'` off): a real
+        // memfile exists, but it was never given an on-disk name.
+        let mut mfp = memfile_with_fname(None);
+        let mut buf = crate::buffer_defs::BufT { handle: 3, ..Default::default() };
+        buf.b_ml.ml_mfp = &mut mfp as *mut crate::memfile_defs::MemfileT;
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_swapname(&[num(3)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn swapname_defaults_to_curbuf_via_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut mfp = memfile_with_fname(Some(b".cur.swp"));
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_mfp = &mut mfp as *mut crate::memfile_defs::MemfileT;
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(buf_ptr, &mut win, std::ptr::null_mut());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_swapname(&[string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b".cur.swp".to_vec())));
     }
 }
