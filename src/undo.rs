@@ -59,7 +59,10 @@
 //! no signal handler, no terminal input polling). Also added the
 //! thin `u_save_buf`/`u_save`/`u_save_cursor`/`u_savesub`/`u_inssub`/
 //! `u_savedel` wrapper family (all mechanical, no design freedom of
-//! their own) now that `u_savecommon` is real.
+//! their own) now that `u_savecommon` is real; `u_eval_tree`/
+//! `f_undotree` (`"undotree()"`), a recursive undo-tree-to-List-of-
+//! Dicts introspection walk, needing only already-existing `UHeader`/
+//! `BufT` fields and `UhLink::ptr()`.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -1126,6 +1129,102 @@ pub unsafe fn ex_undojoin(_eap: &crate::ex_cmds_defs::ExargT) {
         return; // no entries, nothing to do
     }
     curbuf.b_u_synced = false; // Append next change to last entry
+}
+
+/// Recursively convert an undo-tree branch into a `List` of `Dict`s
+/// (`u_eval_tree`), one per header, walking `uh_prev` and recursing
+/// into `uh_alt_next` for each header's own alternate-redo branch.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`. Every
+/// header reachable from `first_uhp` via `uh_prev`/`uh_alt_next` must
+/// be a valid, live `UHeader` (or the link must hold [`UhLink::Ptr`]
+/// with a null pointer, ending that branch).
+unsafe fn u_eval_tree(buf: &BufT, first_uhp: *const UHeader) -> *mut crate::eval::typval_defs::ListT {
+    use crate::eval::typval::{tv_dict_add_list, tv_dict_add_nr, tv_dict_alloc, tv_list_alloc, tv_list_append_dict};
+    use crate::eval::typval_defs::ListLenSpecials;
+
+    let list = tv_list_alloc(ListLenSpecials::MayKnow as isize);
+
+    let mut uhp = first_uhp;
+    while !uhp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let uh = unsafe { &*uhp };
+        let d = tv_dict_alloc();
+        // SAFETY: `d` was just allocated above, exclusively owned here.
+        let dict = unsafe { &mut *d };
+        tv_dict_add_nr(dict, b"seq", i64::from(uh.uh_seq));
+        tv_dict_add_nr(dict, b"time", uh.uh_time as i64);
+        if std::ptr::eq(uhp, buf.b_u_newhead) {
+            tv_dict_add_nr(dict, b"newhead", 1);
+        }
+        if std::ptr::eq(uhp, buf.b_u_curhead) {
+            tv_dict_add_nr(dict, b"curhead", 1);
+        }
+        if uh.uh_save_nr > 0 {
+            tv_dict_add_nr(dict, b"save", i64::from(uh.uh_save_nr));
+        }
+
+        let alt_next = uh.uh_alt_next.ptr();
+        if !alt_next.is_null() {
+            // Recursive call to add alternate undo tree.
+            // SAFETY: forwarded from this function's own safety doc.
+            let alt = unsafe { u_eval_tree(buf, alt_next) };
+            // SAFETY: `alt` was just returned by `u_eval_tree` above,
+            // not yet shared beyond `dict`.
+            unsafe { tv_dict_add_list(dict, b"alt", alt) };
+        }
+
+        // SAFETY: `d`/`list` are both valid, freshly-obtained live
+        // pointers (`list` just allocated above; `tv_dict_alloc`
+        // never returns null).
+        unsafe { tv_list_append_dict(list, d) };
+
+        uhp = uh.uh_prev.ptr();
+    }
+
+    list
+}
+
+/// `undotree([{buf}])` - the undo tree of `{buf}` (default the
+/// current buffer) as a `Dict` (`f_undotree`, `undo.c`), via the
+/// already-existing `u_eval_tree`.
+///
+/// # Safety
+/// Forwarded from `crate::eval::buffer::tv_get_buf`/`u_eval_tree`'s
+/// own safety docs.
+pub unsafe fn f_undotree(argvars: &[crate::eval::typval_defs::TypvalT], rettv: &mut crate::eval::typval_defs::TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+
+    let buf = if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::buffer::tv_get_buf(&argvars[0]) }
+    };
+    if buf.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf_ref = unsafe { &*buf };
+
+    // SAFETY: `d` was just freshly allocated by `tv_dict_alloc_ret`
+    // above, exclusively owned here.
+    let dict = unsafe { &mut *d };
+    crate::eval::typval::tv_dict_add_nr(dict, b"synced", i64::from(buf_ref.b_u_synced));
+    crate::eval::typval::tv_dict_add_nr(dict, b"seq_last", i64::from(buf_ref.b_u_seq_last));
+    crate::eval::typval::tv_dict_add_nr(dict, b"save_last", i64::from(buf_ref.b_u_save_nr_last));
+    crate::eval::typval::tv_dict_add_nr(dict, b"seq_cur", i64::from(buf_ref.b_u_seq_cur));
+    crate::eval::typval::tv_dict_add_nr(dict, b"time_cur", buf_ref.b_u_time_cur as i64);
+    crate::eval::typval::tv_dict_add_nr(dict, b"save_cur", i64::from(buf_ref.b_u_save_nr_cur));
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let entries = unsafe { u_eval_tree(buf_ref, buf_ref.b_u_oldhead) };
+    // SAFETY: `entries` was just returned by `u_eval_tree` above, not
+    // yet shared beyond `dict`.
+    unsafe { crate::eval::typval::tv_dict_add_list(dict, b"entries", entries) };
 }
 
 #[cfg(test)]
@@ -2608,5 +2707,173 @@ mod tests {
         unsafe {
             assert_eq!((&(*uhp).uh_entries)[0].ue_bot, 2);
         }
+    }
+
+    // ---- u_eval_tree / f_undotree ---------------------------------------
+
+    fn dict_find<'a>(d: &'a crate::eval::typval_defs::DictT, key: &[u8]) -> Option<&'a crate::eval::typval_defs::TypvalT> {
+        // SAFETY: `d.dv_index` only ever holds still-live `DictitemT`
+        // pointers owned by `d` itself.
+        unsafe {
+            d.dv_index
+                .values()
+                .map(|&p| &*p)
+                .find(|item: &&crate::eval::typval_defs::DictitemT| item.di_key.starts_with(key))
+        }
+        .map(|item| &item.di_tv)
+    }
+
+    fn list_items(l: *mut crate::eval::typval_defs::ListT) -> Vec<crate::eval::typval_defs::TypvalT> {
+        let mut out = Vec::new();
+        // SAFETY: `l` is a valid, live list pointer for the whole
+        // duration of this walk.
+        unsafe {
+            let mut item = (*l).lv_first;
+            while !item.is_null() {
+                out.push((*item).li_tv.clone());
+                item = (*item).li_next;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn undotree_empty_buffer_has_no_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut ctx = TestBufWin::new();
+        ctx.buf().b_p_ma = 1;
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undotree(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        let d_ref = unsafe { &*d };
+        assert_eq!(dict_find(d_ref, b"synced").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+        assert_eq!(dict_find(d_ref, b"seq_last").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(0));
+        let crate::eval::typval_defs::TypvalValue::List(entries) = dict_find(d_ref, b"entries").unwrap().value else {
+            panic!("expected a List")
+        };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(entries) }, 0);
+
+        // SAFETY: `rettv` owns its own dict exclusively; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn undotree_reports_a_single_entry_as_newhead() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut ctx = TestBufWin::new();
+        ctx.buf().b_p_ma = 1;
+        assert_eq!(unsafe { u_savecommon(ctx.buf(), 0, 1, 1, false) }, crate::vim_defs::OK);
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undotree(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        let d_ref = unsafe { &*d };
+        assert_eq!(dict_find(d_ref, b"seq_last").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+        assert_eq!(dict_find(d_ref, b"seq_cur").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+
+        let crate::eval::typval_defs::TypvalValue::List(entries) = dict_find(d_ref, b"entries").unwrap().value else {
+            panic!("expected a List")
+        };
+        let items = list_items(entries);
+        assert_eq!(items.len(), 1);
+        let crate::eval::typval_defs::TypvalValue::Dict(entry0) = items[0].value else { panic!("expected a Dict") };
+        // SAFETY: `entry0` is a still-live dict owned by `entries`.
+        let entry0_ref = unsafe { &*entry0 };
+        assert_eq!(dict_find(entry0_ref, b"seq").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+        assert_eq!(dict_find(entry0_ref, b"newhead").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+        // b_u_curhead only ever gets set by a real undo operation
+        // (u_undo/u_redo, not yet translated) - a plain u_savecommon
+        // call (recording a NEW change, never itself an undo) leaves
+        // it at its default null, so no header is ever reported as
+        // "curhead" here - verified directly against u_savecommon's
+        // own body rather than assumed.
+        assert!(dict_find(entry0_ref, b"curhead").is_none(), "b_u_curhead stays null after a plain save");
+        assert!(dict_find(entry0_ref, b"save").is_none(), "uh_save_nr starts at 0, so no 'save' key");
+        assert!(dict_find(entry0_ref, b"alt").is_none(), "no alternate branch was ever created");
+
+        // SAFETY: `rettv` owns its own dict exclusively; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn undotree_reports_multiple_entries_oldest_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut ctx = TestBufWin::new();
+        ctx.buf().b_p_ma = 1;
+        ctx.buf().b_p_ul = 1000; // keep both headers - undolevel defaults
+                                 // to 0, which would evict the first
+                                 // header the moment the second is
+                                 // created (numhead(1) > undolevel(0)),
+                                 // caught via a first failing run that
+                                 // showed numhead staying at 1 with
+                                 // seq_last advancing to 2 - a real
+                                 // eviction, not a missing header.
+        ctx.buf().b_u_synced = true;
+        assert_eq!(unsafe { u_savecommon(ctx.buf(), 0, 1, 1, false) }, crate::vim_defs::OK);
+        // Setting b_u_synced = true again (without touching b_u_curhead,
+        // which stays null throughout - matching u_savecommon_evicts_
+        // oldest_header_when_over_undolevel's own established pattern)
+        // forces the "create a new header" branch a second time -
+        // WITHOUT it, this second call would append to the FIRST
+        // header's own entries instead (u_savecommon_reuse_moves_older_
+        // matching_entry_to_front's own established behavior).
+        ctx.buf().b_u_synced = true;
+        assert_eq!(unsafe { u_savecommon(ctx.buf(), 0, 1, 1, false) }, crate::vim_defs::OK);
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undotree(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        let crate::eval::typval_defs::TypvalValue::List(entries) = dict_find(unsafe { &*d }, b"entries").unwrap().value
+        else {
+            panic!("expected a List")
+        };
+        let items = list_items(entries);
+        assert_eq!(items.len(), 2);
+        // u_eval_tree starts at b_u_oldhead and walks via uh_prev, which
+        // (per u_savecommon's own linking: the OLD b_u_newhead's own
+        // uh_prev is repointed at each brand-new header as it's
+        // created) moves from OLDER toward NEWER - so the result list
+        // is ordered oldest-first, newest-last, NOT the reverse.
+        let crate::eval::typval_defs::TypvalValue::Dict(entry0) = items[0].value else { panic!("expected a Dict") };
+        let crate::eval::typval_defs::TypvalValue::Dict(entry1) = items[1].value else { panic!("expected a Dict") };
+        // SAFETY: both are still-live dicts owned by `entries`.
+        unsafe {
+            assert_eq!(dict_find(&*entry0, b"seq").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+            assert_eq!(dict_find(&*entry1, b"seq").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(2));
+            assert!(dict_find(&*entry0, b"newhead").is_none(), "entry 1 is the OLDER header, not newhead");
+            assert_eq!(dict_find(&*entry1, b"newhead").unwrap().value, crate::eval::typval_defs::TypvalValue::Number(1));
+        }
+
+        // SAFETY: `rettv` owns its own dict exclusively; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn undotree_unresolvable_buffer_returns_an_empty_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(999_999),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undotree(std::slice::from_ref(&arg), &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        // SAFETY: `d` is still a valid, exclusively-held pointer.
+        assert!(dict_find(unsafe { &*d }, b"synced").is_none(), "get_buf_arg never resolves an unknown buffer number");
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
     }
 }
