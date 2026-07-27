@@ -449,6 +449,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
         m.insert(&b"escape"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_escape });
         m.insert(&b"fnameescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_fnameescape });
+        m.insert(&b"shellescape"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_shellescape });
         m.insert(&b"argc"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_argc });
         m.insert(&b"argidx"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_argidx });
         m.insert(&b"rand"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_rand });
@@ -4476,6 +4477,23 @@ unsafe fn f_fnameescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(escaped));
 }
 
+/// `shellescape({string} [, {special}])` - escape `{string}` for use
+/// as a shell command-line argument (`f_shellescape`, `funcs.c`), via
+/// [`crate::strings::vim_strsave_shellescape`]. A truthy `{special}`
+/// also escapes `'!'` and cmdline-special-variable sequences, and
+/// embedded newlines.
+///
+/// # Safety
+/// Forwarded from [`crate::strings::vim_strsave_shellescape`]'s own
+/// safety doc.
+unsafe fn f_shellescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let do_special = non_zero_arg(&argvars[1..]);
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let escaped = unsafe { crate::strings::vim_strsave_shellescape(&s, do_special, do_special) };
+    rettv.value = TypvalValue::String(Some(escaped));
+}
+
 /// `argc([{winid}])` - the number of files in the argument list
 /// (`f_argc`, `arglist.c`). No argument means the current window's
 /// arglist; `-1` means the global arglist; otherwise a window number
@@ -5595,6 +5613,7 @@ mod tests {
             "winrestcmd",
             "escape",
             "fnameescape",
+            "shellescape",
             "argc",
             "argidx",
             "rand",
@@ -10099,6 +10118,41 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_fnameescape(&[string(b"hello.txt")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"hello.txt".to_vec())));
+    }
+
+    // --- f_shellescape ---
+
+    #[test]
+    fn shellescape_wraps_a_plain_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev_ssl = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        // Force 'shellslash' on so the expected single-quote form is
+        // platform-independent (see vim_strsave_shellescape's own
+        // ShellVarsGuard precedent in strings.rs).
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 1;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_shellescape(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"'hello'".to_vec())));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev_ssl;
+    }
+
+    #[test]
+    fn shellescape_second_arg_controls_do_special() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev_ssl = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = 1;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_shellescape(&[string(b"abc!"), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"'abc\\!'".to_vec())));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_shellescape(&[string(b"abc!")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"'abc!'".to_vec())));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl = prev_ssl;
     }
 
     // --- f_argc / f_argidx ---

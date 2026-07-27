@@ -20,6 +20,10 @@
 //! terminator) is represented here as simply running past the end of
 //! the given slice, so `ends_excmd`/`find_nextcmd`/`check_nextcmd` all
 //! take a plain `&[u8]`/`u8` rather than a nullable pointer.
+//!
+//! Also translated: `find_cmdline_var` - a small, self-contained
+//! `spec_str[]` table lookup (`%`/`#`/`<cword>`/`<sfile>`/etc.), needed
+//! by `strings.c`'s `vim_strsave_shellescape()` (`shellescape()`).
 
 use crate::buffer_defs::b_flags;
 
@@ -77,6 +81,77 @@ pub fn check_nextcmd(p: &[u8]) -> Option<usize> {
         Some(&b'|') | Some(&b'\n') => Some(s + 1),
         _ => None,
     }
+}
+
+/// A special cmdline variable recognized by [`find_cmdline_var`]
+/// (`SPEC_*`, `ex_docmd.c`). `Client` (`SPEC_CLIENT`) is commented out
+/// in the original itself and not modeled here either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdlineSpecialVar {
+    /// `%` - current file name (`SPEC_PERC`).
+    Perc,
+    /// `#` - alternate file name (`SPEC_HASH`).
+    Hash,
+    /// `<cword>` - cursor word (`SPEC_CWORD`).
+    Cword,
+    /// `<cWORD>` - cursor WORD (`SPEC_CCWORD`).
+    Ccword,
+    /// `<cexpr>` - expr under cursor (`SPEC_CEXPR`).
+    Cexpr,
+    /// `<cfile>` - cursor path name (`SPEC_CFILE`).
+    Cfile,
+    /// `<sfile>` - `:so` file name (`SPEC_SFILE`).
+    Sfile,
+    /// `<slnum>` - `:so` file line number (`SPEC_SLNUM`).
+    Slnum,
+    /// `<stack>` - call stack (`SPEC_STACK`).
+    Stack,
+    /// `<script>` - script file name (`SPEC_SCRIPT`).
+    Script,
+    /// `<afile>` - autocommand file name (`SPEC_AFILE`).
+    Afile,
+    /// `<abuf>` - autocommand buffer number (`SPEC_ABUF`).
+    Abuf,
+    /// `<amatch>` - autocommand match name (`SPEC_AMATCH`).
+    Amatch,
+    /// `<sflnum>` - script file line number (`SPEC_SFLNUM`).
+    Sflnum,
+    /// `<SID>` - script ID, `<SNR>123_` (`SPEC_SID`).
+    Sid,
+}
+
+/// The exact string each [`CmdlineSpecialVar`] variant matches,
+/// mirroring `find_cmdline_var`'s own `spec_str[]` table 1:1 (same
+/// order, same literal text).
+const CMDLINE_SPEC_STRS: &[(CmdlineSpecialVar, &[u8])] = &[
+    (CmdlineSpecialVar::Perc, b"%"),
+    (CmdlineSpecialVar::Hash, b"#"),
+    (CmdlineSpecialVar::Cword, b"<cword>"),
+    (CmdlineSpecialVar::Ccword, b"<cWORD>"),
+    (CmdlineSpecialVar::Cexpr, b"<cexpr>"),
+    (CmdlineSpecialVar::Cfile, b"<cfile>"),
+    (CmdlineSpecialVar::Sfile, b"<sfile>"),
+    (CmdlineSpecialVar::Slnum, b"<slnum>"),
+    (CmdlineSpecialVar::Stack, b"<stack>"),
+    (CmdlineSpecialVar::Script, b"<script>"),
+    (CmdlineSpecialVar::Afile, b"<afile>"),
+    (CmdlineSpecialVar::Abuf, b"<abuf>"),
+    (CmdlineSpecialVar::Amatch, b"<amatch>"),
+    (CmdlineSpecialVar::Sflnum, b"<sflnum>"),
+    (CmdlineSpecialVar::Sid, b"<SID>"),
+];
+
+/// Check whether `src` starts with a special cmdline variable (`%`,
+/// `#`, `<cword>`, `<sfile>`, etc.) - if so, returns which one and how
+/// many bytes it occupies; `None` otherwise (`find_cmdline_var`).
+#[must_use]
+pub fn find_cmdline_var(src: &[u8]) -> Option<(CmdlineSpecialVar, usize)> {
+    for &(spec, s) in CMDLINE_SPEC_STRS {
+        if src.starts_with(s) {
+            return Some((spec, s.len()));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -199,5 +274,33 @@ mod tests {
     #[test]
     fn check_nextcmd_finds_newline_with_no_leading_whitespace() {
         assert_eq!(check_nextcmd(b"\necho 2"), Some(1));
+    }
+
+    #[test]
+    fn find_cmdline_var_recognizes_perc_and_hash() {
+        assert_eq!(find_cmdline_var(b"%rest"), Some((CmdlineSpecialVar::Perc, 1)));
+        assert_eq!(find_cmdline_var(b"#rest"), Some((CmdlineSpecialVar::Hash, 1)));
+    }
+
+    #[test]
+    fn find_cmdline_var_recognizes_angle_bracket_forms() {
+        assert_eq!(find_cmdline_var(b"<cword> rest"), Some((CmdlineSpecialVar::Cword, 7)));
+        assert_eq!(find_cmdline_var(b"<cWORD> rest"), Some((CmdlineSpecialVar::Ccword, 7)));
+        assert_eq!(find_cmdline_var(b"<sfile>"), Some((CmdlineSpecialVar::Sfile, 7)));
+        assert_eq!(find_cmdline_var(b"<SID>"), Some((CmdlineSpecialVar::Sid, 5)));
+    }
+
+    #[test]
+    fn find_cmdline_var_none_for_plain_text() {
+        assert_eq!(find_cmdline_var(b"plain text"), None);
+        assert_eq!(find_cmdline_var(b""), None);
+        assert_eq!(find_cmdline_var(b"<unknown>"), None);
+    }
+
+    #[test]
+    fn find_cmdline_var_prefix_match_only_checks_the_start() {
+        // "<cword>" is a real prefix of "<cwordXYZ>" - starts_with
+        // matches regardless of what follows.
+        assert_eq!(find_cmdline_var(b"<cword>XYZ"), Some((CmdlineSpecialVar::Cword, 7)));
     }
 }

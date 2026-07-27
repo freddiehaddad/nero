@@ -41,9 +41,8 @@
 //! `get_past_head`).
 //!
 //! Deferred:
-//! - `vim_strsave_escaped`/`_ext`, `vim_strnsave_unquoted`,
-//!   `vim_strsave_shellescape`, `del_trailing_spaces`:
-//!   need `charset.c`'s real `g_chartab`/`option.c`.
+//! - `vim_strnsave_unquoted`, `del_trailing_spaces`: need `charset.c`'s
+//!   real `g_chartab`/`option.c`.
 //! - `vim_snprintf`/`vim_vsnprintf`/`kv_do_printf` and the whole custom
 //!   positional-argument printf machinery: Rust's native `format!`/
 //!   `write!` macros are the direct replacement for this (matching
@@ -54,6 +53,22 @@
 //!   belongs with the eval engine, phase 5.
 //! - `reverse_text`, `strrep`, `cmp_keyvalue_value*`: not yet reached: no
 //!   caller translated yet that needs them.
+//!
+//! Also translated: `vim_strsave_escaped` (used by `escape()`) and
+//! `vim_strsave_shellescape` (used by `shellescape()`) - re-examined
+//! after this module doc's own earlier note grouped both under
+//! "needs `charset.c`'s real `g_chartab`/`option.c`" (stale even for
+//! `vim_strsave_escaped`, translated in an earlier session).
+//! `vim_strsave_shellescape` itself needs no chartab access at all -
+//! only `crate::option::csh_like_shell`/`fish_like_shell`,
+//! `crate::ex_docmd::find_cmdline_var`, and `crate::mbyte::utfc_ptr2len`,
+//! all either already existing or newly harvested alongside.
+//! Deliberately collapses the original's own separate length-counting
+//! pass and fixed-size-buffer-filling pass into a single pass building
+//! a growing `Vec<u8>` - Rust's own `Vec` has no need for the
+//! original's C-style pre-sizing dance (matching this crate's own
+//! established `winrestcmd()`/`grow_string_tv` precedent for this
+//! exact simplification).
 
 use crate::ascii_defs::NUL;
 use crate::macros_defs::tolower_loc;
@@ -346,6 +361,94 @@ pub unsafe fn vim_strsave_escaped(string: &[u8], esc_chars: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Escape `string` for use as a shell command-line argument, wrapping
+/// it in quotes (`'`...`'`, or `"`...`"` on Windows without
+/// `'shellslash'` set) and escaping embedded quotes/special characters
+/// as needed (`vim_strsave_shellescape`). `do_special` additionally
+/// escapes `'!'` and cmdline-special-variable sequences (`%`, `#`,
+/// `<cword>`, etc. - see [`crate::ex_docmd::find_cmdline_var`]);
+/// `do_newline` additionally escapes embedded newlines. csh-like
+/// shells escape both twice (once for Nvim, once for the shell
+/// itself, since csh's own single-quote handling still expands `!`);
+/// fish-like shells additionally escape a literal backslash (fish
+/// treats `\` as an escape character even within single quotes).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`crate::mbyte::utfc_ptr2len`], and, on Windows, directly for
+/// `'shellslash'`).
+#[must_use]
+pub unsafe fn vim_strsave_shellescape(string: &[u8], do_special: bool, do_newline: bool) -> Vec<u8> {
+    let csh_like = crate::option::csh_like_shell();
+    let fish_like = crate::option::fish_like_shell();
+
+    // On Windows, without 'shellslash', the whole string is wrapped in
+    // double quotes with "" escaping an embedded double quote
+    // (cmd.exe's own quoting convention); everywhere else - including
+    // Windows WITH 'shellslash' set - it's wrapped in single quotes
+    // with '\'' escaping an embedded single quote (POSIX shell
+    // quoting). `use_dquote` is unconditionally `false` on non-Windows
+    // targets, matching the original's own `#ifdef MSWIN` guard.
+    #[cfg(windows)]
+    // SAFETY: forwarded from this function's own safety doc.
+    let use_dquote = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssl == 0;
+    #[cfg(not(windows))]
+    let use_dquote = false;
+    let quote = if use_dquote { b'"' } else { b'\'' };
+
+    let mut out = Vec::with_capacity(string.len() + 2);
+    out.push(quote);
+
+    let mut p = 0usize;
+    while p < string.len() {
+        let c = string[p];
+        if use_dquote && c == b'"' {
+            out.push(b'"');
+            out.push(b'"');
+            p += 1;
+            continue;
+        }
+        if !use_dquote && c == b'\'' {
+            out.extend_from_slice(b"'\\''");
+            p += 1;
+            continue;
+        }
+        if (c == b'\n' && (csh_like || do_newline)) || (c == b'!' && (csh_like || do_special)) {
+            out.push(b'\\');
+            if csh_like && do_special {
+                out.push(b'\\');
+            }
+            out.push(c);
+            p += 1;
+            continue;
+        }
+        if do_special {
+            if let Some((_, used_len)) = crate::ex_docmd::find_cmdline_var(&string[p..]) {
+                out.push(b'\\'); // insert backslash
+                out.extend_from_slice(&string[p..p + used_len]);
+                p += used_len;
+                continue;
+            }
+        }
+        if c == b'\\' && fish_like {
+            out.push(b'\\');
+            out.push(c);
+            p += 1;
+            continue;
+        }
+        // mb_copy_char: copy one full (possibly multi-byte,
+        // composing-character-inclusive) character.
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&string[p..]) }).unwrap_or(1).max(1);
+        let l = l.min(string.len() - p);
+        out.extend_from_slice(&string[p..p + l]);
+        p += l;
+    }
+
+    out.push(quote);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +647,159 @@ mod tests {
         // continue; }` fast path skipping the esc_chars check
         // entirely for multibyte sequences).
         assert_eq!(unsafe { vim_strsave_escaped("a一b".as_bytes(), "一".as_bytes()) }, "a一b".as_bytes().to_vec());
+    }
+
+    // --- vim_strsave_shellescape ---
+
+    /// RAII guard forcing `'shell'`/`'shellslash'` to known values for
+    /// its whole lifetime, restoring the previous values on drop (even
+    /// on panic). Callers must hold `global_state_test_lock()`.
+    struct ShellVarsGuard {
+        prev_sh: Option<Vec<u8>>,
+        prev_ssl: i32,
+    }
+
+    impl ShellVarsGuard {
+        /// A plain (non-csh, non-fish) shell, single-quote escaping
+        /// (matching the original's own non-Windows default, and
+        /// Windows WITH `'shellslash'` set).
+        fn plain_single_quote() -> Self {
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = ShellVarsGuard { prev_sh: ov.p_sh.clone(), prev_ssl: ov.p_ssl };
+            ov.p_sh = Some(b"/bin/sh".to_vec());
+            ov.p_ssl = 1;
+            guard
+        }
+
+        fn set_shell(name: &[u8]) -> Self {
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = ShellVarsGuard { prev_sh: ov.p_sh.clone(), prev_ssl: ov.p_ssl };
+            ov.p_sh = Some(name.to_vec());
+            ov.p_ssl = 1;
+            guard
+        }
+
+        #[cfg(windows)]
+        fn windows_double_quote() -> Self {
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = ShellVarsGuard { prev_sh: ov.p_sh.clone(), prev_ssl: ov.p_ssl };
+            ov.p_sh = Some(b"cmd.exe".to_vec());
+            ov.p_ssl = 0;
+            guard
+        }
+    }
+
+    impl Drop for ShellVarsGuard {
+        fn drop(&mut self) {
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            ov.p_sh = self.prev_sh.take();
+            ov.p_ssl = self.prev_ssl;
+        }
+    }
+
+    #[test]
+    fn shellescape_wraps_plain_string_in_single_quotes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"hello", false, false) }, b"'hello'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_escapes_embedded_single_quote() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"it's", false, false) }, b"'it'\\''s'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_do_special_false_leaves_bang_unescaped_for_plain_shell() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"abc!", false, false) }, b"'abc!'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_do_special_true_escapes_bang() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"abc!", true, true) }, b"'abc\\!'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_do_newline_escapes_embedded_newline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"a\nb", false, true) }, b"'a\\\nb'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_no_do_newline_leaves_newline_unescaped_for_plain_shell() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"a\nb", false, false) }, b"'a\nb'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_do_special_escapes_cmdline_special_vars() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"%", true, true) }, b"'\\%'".to_vec());
+        assert_eq!(unsafe { vim_strsave_shellescape(b"<cword>", true, true) }, b"'\\<cword>'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_do_special_false_leaves_special_vars_unescaped() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"%", false, false) }, b"'%'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_csh_like_shell_escapes_bang_even_without_do_special() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::set_shell(b"/bin/tcsh");
+        // csh_like on its own (do_special=false) escapes '!' once.
+        assert_eq!(unsafe { vim_strsave_shellescape(b"abc!", false, false) }, b"'abc\\!'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_csh_like_shell_with_do_special_escapes_bang_twice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::set_shell(b"/bin/csh");
+        // csh_like AND do_special both true: double backslash.
+        assert_eq!(unsafe { vim_strsave_shellescape(b"abc!", true, true) }, b"'abc\\\\!'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_fish_like_shell_escapes_embedded_backslash() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::set_shell(b"/usr/bin/fish");
+        assert_eq!(unsafe { vim_strsave_shellescape(b"a\\b", false, false) }, b"'a\\\\b'".to_vec());
+    }
+
+    #[test]
+    fn shellescape_preserves_multibyte_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::plain_single_quote();
+        assert_eq!(
+            unsafe { vim_strsave_shellescape("一二".as_bytes(), false, false) },
+            "'一二'".as_bytes().to_vec()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shellescape_uses_double_quotes_on_windows_without_shellslash() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::windows_double_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"hello", false, false) }, b"\"hello\"".to_vec());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shellescape_escapes_embedded_double_quote_on_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = ShellVarsGuard::windows_double_quote();
+        assert_eq!(unsafe { vim_strsave_shellescape(b"say \"hi\"", false, false) }, b"\"say \"\"hi\"\"\"".to_vec());
     }
 }
