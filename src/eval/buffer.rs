@@ -30,7 +30,11 @@
 //! `buflist_new`, is NOT modeled and panics via `unimplemented!()` if
 //! actually reached - matching this module's own established
 //! "translate the common path, panic loudly on a genuinely
-//! untranslated-but-reached path" convention).
+//! untranslated-but-reached path" convention), and `bufwinid()`/
+//! `bufwinnr()` (via `buf_win_common`, additionally using the
+//! already-existing `crate::window::win_has_winnr` - both only
+//! search the CURRENT tab page, matching the original's own
+//! `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` walk exactly).
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -184,6 +188,68 @@ pub(crate) unsafe fn f_bufnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
         i64::from(unsafe { &*buf }.handle)
     };
     rettv.value = TypvalValue::Number(n);
+}
+
+/// Shared implementation for [`f_bufwinid`]/[`f_bufwinnr`]
+/// (`buf_win_common`, `eval/buffer.c`). `get_nr == true` returns the
+/// window NUMBER (within the current tab page only, matching the
+/// original's own `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` walk);
+/// `get_nr == false` returns the window ID (handle). `-1` if `{buf}`
+/// doesn't resolve to a real buffer, or no window in the current tab
+/// shows it.
+///
+/// # Safety
+/// Forwarded from [`tv_get_buf`]'s own safety doc, plus
+/// [`crate::window::win_has_winnr`]'s own safety doc.
+unsafe fn buf_win_common(argvars: &[TypvalT], rettv: &mut TypvalT, get_nr: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { tv_get_buf(&argvars[0]) };
+    if buf.is_null() {
+        rettv.value = TypvalValue::Number(-1);
+        return;
+    }
+
+    let mut winnr = 0;
+    let mut found: i64 = -1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let has_winnr = unsafe { crate::window::win_has_winnr(wp, curtab) };
+        winnr += i32::from(has_winnr);
+        if std::ptr::eq(w.w_buffer, buf) && (!get_nr || has_winnr) {
+            found = i64::from(if get_nr { winnr } else { w.handle });
+            break;
+        }
+        wp = w.w_next;
+    }
+    rettv.value = TypvalValue::Number(found);
+}
+
+/// `bufwinid({buf})` - the window-ID of the first window (in the
+/// current tab page) showing buffer `{buf}` (`f_bufwinid`,
+/// `eval/buffer.c`), via [`buf_win_common`].
+///
+/// # Safety
+/// Forwarded from [`buf_win_common`]'s own safety doc.
+pub(crate) unsafe fn f_bufwinid(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_win_common(argvars, rettv, false) };
+}
+
+/// `bufwinnr({buf})` - like [`f_bufwinid`] but returns a window
+/// NUMBER instead of a window ID (`f_bufwinnr`, `eval/buffer.c`), via
+/// [`buf_win_common`].
+///
+/// # Safety
+/// Forwarded from [`buf_win_common`]'s own safety doc.
+pub(crate) unsafe fn f_bufwinnr(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_win_common(argvars, rettv, true) };
 }
 
 #[cfg(test)]
@@ -426,5 +492,134 @@ mod tests {
             f_bufnr(&[num(999), num(1)], &mut rettv);
         }));
         assert!(result.is_err(), "expected a panic (buflist_new not yet translated)");
+    }
+
+    // ---- f_bufwinid / f_bufwinnr ----
+
+    /// Points `GLOBALS.firstwin`/`curtab`/`curbuf`/`curwin`/`lastbuf`
+    /// for the guard's lifetime, restoring all previous values on
+    /// drop. `lastbuf` is set to `curbuf` too (matching a common
+    /// single-buffer test fixture) so that `tv_get_buf`'s own
+    /// `Number`-typed dispatch (`buflist_findnr`, which walks
+    /// `GLOBALS.lastbuf`/`b_prev` - NOT `curbuf` directly) can
+    /// actually find the test buffer by its handle.
+    struct WinBufGlobalsGuard {
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_lastbuf: *mut crate::buffer_defs::BufT,
+    }
+
+    impl WinBufGlobalsGuard {
+        fn set(
+            firstwin: *mut crate::buffer_defs::WinT,
+            tp: *mut crate::buffer_defs::TabpageT,
+            curbuf: *mut crate::buffer_defs::BufT,
+        ) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = WinBufGlobalsGuard {
+                prev_firstwin: globals.firstwin,
+                prev_curtab: globals.curtab,
+                prev_curbuf: globals.curbuf,
+                prev_curwin: globals.curwin,
+                prev_lastbuf: globals.lastbuf,
+            };
+            globals.firstwin = firstwin;
+            globals.curtab = tp;
+            globals.curbuf = curbuf;
+            globals.curwin = firstwin;
+            globals.lastbuf = curbuf;
+            guard
+        }
+    }
+
+    impl Drop for WinBufGlobalsGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = self.prev_firstwin;
+            globals.curtab = self.prev_curtab;
+            globals.curbuf = self.prev_curbuf;
+            globals.curwin = self.prev_curwin;
+            globals.lastbuf = self.prev_lastbuf;
+        }
+    }
+
+    fn focusable_win(
+        handle: crate::types_defs::HandleT,
+        buf: *mut crate::buffer_defs::BufT,
+    ) -> crate::buffer_defs::WinT {
+        crate::buffer_defs::WinT {
+            handle,
+            w_buffer: buf,
+            w_config: crate::buffer_defs::WinConfig { focusable: true, hide: false, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bufwinid_finds_the_window_id_showing_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 5, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut second = focusable_win(20, buf_ptr);
+        let second_ptr = &mut second as *mut crate::buffer_defs::WinT;
+        let mut first = crate::buffer_defs::WinT { w_next: second_ptr, ..focusable_win(10, std::ptr::null_mut()) };
+        let first_ptr = &mut first as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinBufGlobalsGuard::set(first_ptr, tp_ptr, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_bufwinid(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(20));
+    }
+
+    #[test]
+    fn bufwinnr_finds_the_window_number_showing_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 5, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut second = focusable_win(20, buf_ptr);
+        let second_ptr = &mut second as *mut crate::buffer_defs::WinT;
+        let mut first = crate::buffer_defs::WinT { w_next: second_ptr, ..focusable_win(10, std::ptr::null_mut()) };
+        let first_ptr = &mut first as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinBufGlobalsGuard::set(first_ptr, tp_ptr, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_bufwinnr(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn bufwinid_returns_minus_1_when_buffer_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(10, std::ptr::null_mut());
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinBufGlobalsGuard::set(win_ptr, tp_ptr, std::ptr::null_mut());
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_bufwinid(&[num(999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn bufwinid_returns_minus_1_when_no_window_shows_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { handle: 5, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = focusable_win(10, std::ptr::null_mut());
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinBufGlobalsGuard::set(win_ptr, tp_ptr, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_bufwinid(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 }
