@@ -408,6 +408,69 @@ pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<Vec<u8>> {
     Some(retval)
 }
 
+/// Get the type of register `regname` (`get_reg_type`).
+///
+/// Returns `None` for `kMTUnknown` (matching this crate's own
+/// established `Option<MotionType>` idiom for the original's `-1`
+/// sentinel - see `normal_defs.rs`'s own doc comment for
+/// `K_MT_UNKNOWN`). The special registers below (file name, alternate
+/// file name, expression, last command line, last search pattern,
+/// last inserted text, black hole, and the 4
+/// `Ctrl_F`/`Ctrl_P`/`Ctrl_W`/`Ctrl_A` "under cursor" pseudo-registers)
+/// are always charwise, matching the original's own `switch`.
+///
+/// `reg_width` is populated only for a real `BlockWise` register,
+/// matching the original's own `reg_width != NULL` guard.
+///
+/// # Safety
+/// Forwarded from [`get_yank_register`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_reg_type(regname: i32, reg_width: Option<&mut crate::pos_defs::ColnrT>) -> Option<crate::normal_defs::MotionType> {
+    match u8::try_from(regname).ok() {
+        Some(b'%' | b'#' | b'=' | b':' | b'/' | b'.' | b'_') => {
+            return Some(crate::normal_defs::MotionType::CharWise);
+        }
+        // Ctrl_F / Ctrl_P / Ctrl_W / Ctrl_A ("under cursor" pseudo-registers).
+        Some(0x06 | 0x10 | 0x17 | 0x01) => return Some(crate::normal_defs::MotionType::CharWise),
+        _ => {}
+    }
+
+    if regname != 0 && !valid_yank_reg(regname, false) {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg = unsafe { &*get_yank_register(regname, YregModeT::Paste) };
+
+    if reg.y_array.is_some() {
+        if let Some(w) = reg_width {
+            if reg.y_type == crate::normal_defs::MotionType::BlockWise {
+                *w = reg.y_width;
+            }
+        }
+        Some(reg.y_type)
+    } else {
+        None
+    }
+}
+
+/// Format a register type as its display string (`format_reg_type`).
+///
+/// Returns the display form directly as a freshly-owned `Vec<u8>`
+/// rather than writing into a caller-provided fixed buffer - matches
+/// this crate's established "Rust's own growable buffer needs no
+/// pre-sizing dance" simplification (e.g. `winrestcmd`/
+/// `vim_strsave_shellescape`).
+#[must_use]
+pub fn format_reg_type(reg_type: Option<crate::normal_defs::MotionType>, reg_width: crate::pos_defs::ColnrT) -> Vec<u8> {
+    match reg_type {
+        Some(crate::normal_defs::MotionType::LineWise) => vec![b'V'],
+        Some(crate::normal_defs::MotionType::CharWise) => vec![b'v'],
+        Some(crate::normal_defs::MotionType::BlockWise) => format!("\x16{}", reg_width + 1).into_bytes(),
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,5 +764,116 @@ mod tests {
     fn get_reg_contents_klist_flag_is_unimplemented() {
         let result = std::panic::catch_unwind(|| unsafe { get_reg_contents(i32::from(b'a'), greg_flags::LIST) });
         assert!(result.is_err(), "expected a panic (kGRegList not yet translated)");
+    }
+
+    // --- get_reg_type / format_reg_type ---
+
+    #[test]
+    fn get_reg_type_special_registers_are_always_charwise() {
+        for regname in *b"%#=:/._" {
+            assert_eq!(
+                unsafe { get_reg_type(i32::from(regname), None) },
+                Some(crate::normal_defs::MotionType::CharWise),
+                "register {} should be charwise",
+                regname as char
+            );
+        }
+        // Ctrl_F / Ctrl_P / Ctrl_W / Ctrl_A.
+        for regname in [0x06, 0x10, 0x17, 0x01] {
+            assert_eq!(unsafe { get_reg_type(regname, None) }, Some(crate::normal_defs::MotionType::CharWise));
+        }
+    }
+
+    #[test]
+    fn get_reg_type_invalid_name_is_none() {
+        assert_eq!(unsafe { get_reg_type(i32::from(b'!'), None) }, None);
+    }
+
+    #[test]
+    fn get_reg_type_unset_named_register_is_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_reg_type(i32::from(b'a'), None) }, None);
+    }
+
+    #[test]
+    fn get_reg_type_reads_a_populated_charwise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'b')).unwrap();
+        unsafe {
+            let reg = &mut Y_REGS.get_mut()[idx];
+            reg.y_array = Some(vec![b"hi".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::CharWise;
+        }
+
+        assert_eq!(unsafe { get_reg_type(i32::from(b'b'), None) }, Some(crate::normal_defs::MotionType::CharWise));
+
+        unsafe { Y_REGS.get_mut()[idx] = YankregT::default() };
+    }
+
+    #[test]
+    fn get_reg_type_reads_a_populated_linewise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'c')).unwrap();
+        unsafe {
+            let reg = &mut Y_REGS.get_mut()[idx];
+            reg.y_array = Some(vec![b"hi".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::LineWise;
+        }
+
+        assert_eq!(unsafe { get_reg_type(i32::from(b'c'), None) }, Some(crate::normal_defs::MotionType::LineWise));
+
+        unsafe { Y_REGS.get_mut()[idx] = YankregT::default() };
+    }
+
+    #[test]
+    fn get_reg_type_blockwise_register_populates_reg_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'd')).unwrap();
+        unsafe {
+            let reg = &mut Y_REGS.get_mut()[idx];
+            reg.y_array = Some(vec![b"hi".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::BlockWise;
+            reg.y_width = 3;
+        }
+
+        let mut width: crate::pos_defs::ColnrT = -1;
+        let reg_type = unsafe { get_reg_type(i32::from(b'd'), Some(&mut width)) };
+        assert_eq!(reg_type, Some(crate::normal_defs::MotionType::BlockWise));
+        assert_eq!(width, 3);
+
+        unsafe { Y_REGS.get_mut()[idx] = YankregT::default() };
+    }
+
+    #[test]
+    fn get_reg_type_none_reg_width_is_accepted_for_a_blockwise_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'e')).unwrap();
+        unsafe {
+            let reg = &mut Y_REGS.get_mut()[idx];
+            reg.y_array = Some(vec![b"hi".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::BlockWise;
+            reg.y_width = 3;
+        }
+
+        assert_eq!(unsafe { get_reg_type(i32::from(b'e'), None) }, Some(crate::normal_defs::MotionType::BlockWise));
+
+        unsafe { Y_REGS.get_mut()[idx] = YankregT::default() };
+    }
+
+    #[test]
+    fn format_reg_type_charwise_and_linewise() {
+        assert_eq!(format_reg_type(Some(crate::normal_defs::MotionType::CharWise), 0), b"v");
+        assert_eq!(format_reg_type(Some(crate::normal_defs::MotionType::LineWise), 0), b"V");
+    }
+
+    #[test]
+    fn format_reg_type_blockwise_includes_ctrl_v_and_width_plus_one() {
+        let result = format_reg_type(Some(crate::normal_defs::MotionType::BlockWise), 3);
+        assert_eq!(result, b"\x164");
+    }
+
+    #[test]
+    fn format_reg_type_unknown_is_empty() {
+        assert_eq!(format_reg_type(None, 0), Vec::<u8>::new());
     }
 }

@@ -416,6 +416,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"wildmenumode"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_wildmenumode });
         m.insert(&b"windowsversion"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_windowsversion });
         m.insert(&b"getreg"[..], EvalFuncDefT { min_argc: 0, max_argc: 3, base_arg: 1, func: f_getreg });
+        m.insert(&b"getregtype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getregtype });
         m.insert(&b"changenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_changenr });
         m.insert(&b"interrupt"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_interrupt });
         m.insert(&b"invert"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_invert });
@@ -4979,6 +4980,32 @@ unsafe fn f_getreg(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `getregtype([{regname}])` - the type of register `{regname}`
+/// (default `v:register`) as a `String` (`"v"`/`"V"`/`"<CTRL-V>N"`, or
+/// `""` for an unknown/invalid register) (`f_getregtype`, `funcs.c`),
+/// via the already-existing [`crate::register::get_reg_type`]/
+/// [`crate::register::format_reg_type`].
+///
+/// # Safety
+/// Forwarded from [`getreg_get_regname`]/
+/// [`crate::register::get_reg_type`]'s own safety docs.
+unsafe fn f_getregtype(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // On error return an empty string, matching the original's own
+    // unconditional `rettv->vval.v_string = NULL` before anything else.
+    rettv.value = TypvalValue::String(None);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let regname = unsafe { getreg_get_regname(argvars) };
+    if regname == 0 {
+        return;
+    }
+
+    let mut reg_width: crate::pos_defs::ColnrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg_type = unsafe { crate::register::get_reg_type(regname, Some(&mut reg_width)) };
+    rettv.value = TypvalValue::String(Some(crate::register::format_reg_type(reg_type, reg_width)));
+}
+
 /// `eval({string})` - evaluate `{string}` and return the result
 /// (`f_eval`, `eval.c`), via the already-existing
 /// [`crate::eval::eval::eval1`].
@@ -6980,6 +7007,7 @@ mod tests {
             "wildmenumode",
             "windowsversion",
             "getreg",
+            "getregtype",
             "changenr",
             "interrupt",
             "invert",
@@ -12068,6 +12096,54 @@ mod tests {
         // via a real test failure, not assumed).
         let mut rettv = TypvalT::default();
         unsafe { f_getreg(&[string(b"a"), num(0), num(1)], &mut rettv) };
+    }
+
+    // --- f_getregtype ---
+
+    #[test]
+    fn getregtype_unset_named_register_is_empty_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_getregtype(&[string(b"a")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    #[test]
+    fn getregtype_black_hole_is_charwise() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_getregtype(&[string(b"_")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"v".to_vec())));
+    }
+
+    #[test]
+    fn getregtype_defaults_to_v_register() {
+        let _guard = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Reg, Some(b"_")) };
+        let mut rettv = TypvalT::default();
+        unsafe { f_getregtype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"v".to_vec())));
+        unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Reg, Some(b"\"")) };
+    }
+
+    #[test]
+    fn getregtype_invalid_name_is_empty_string() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_getregtype(&[string(b"!")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    #[test]
+    fn getregtype_type_error_leaves_rettv_as_a_null_string() {
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { f_getregtype(&[list_tv], &mut rettv) };
+        // The original unconditionally sets rettv to a NULL VAR_STRING
+        // (observably an empty string) before parsing the regname
+        // argument, and never overwrites it again on this early-return
+        // path - unlike f_getreg's own type-error path (which never
+        // touches rettv at all), a real, faithfully-preserved
+        // difference between the two functions' own real structure.
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 
     // --- f_eval ---
