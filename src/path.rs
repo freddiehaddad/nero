@@ -1276,6 +1276,29 @@ pub fn invocation_path_tail(invocation: &[u8]) -> (usize, usize) {
     (tail, tail_end.wrapping_sub(tail))
 }
 
+/// Concatenate `fname1` and `fname2` into a freshly-allocated
+/// `Vec<u8>` (`concat_fnames`). Only adds a [`crate::ascii_defs::PATHSEP`]
+/// (`'/'`) when `sep` is `true` AND it's actually necessary (`fname1`
+/// is non-empty and doesn't already end in a path separator).
+///
+/// Deliberately does NOT also translate `concat_fnames_realloc`'s own
+/// distinct "reallocate an existing, caller-owned buffer in place"
+/// contract - this crate's own `Vec<u8>` already grows dynamically
+/// with no realloc-in-place ceremony needed, making a separate
+/// realloc-shaped variant of the exact same `do_concat_fnames` logic
+/// pure duplication; this one function already serves every real
+/// caller's actual need.
+#[must_use]
+pub fn concat_fnames(fname1: &[u8], fname2: &[u8], sep: bool) -> Vec<u8> {
+    let mut result = Vec::with_capacity(fname1.len() + 1 + fname2.len());
+    result.extend_from_slice(fname1);
+    if sep && !fname1.is_empty() && !after_pathsep(fname1, fname1.len()) {
+        result.push(crate::ascii_defs::PATHSEP);
+    }
+    result.extend_from_slice(fname2);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2112,5 +2135,39 @@ mod tests {
         let (tail, len) = invocation_path_tail(b"abc/");
         assert_eq!(tail, 4);
         assert_eq!(len, 3usize.wrapping_sub(4));
+    }
+
+    #[test]
+    fn concat_fnames_adds_separator_when_requested_and_needed() {
+        assert_eq!(concat_fnames(b"foo", b"bar", true), b"foo/bar");
+    }
+
+    #[test]
+    fn concat_fnames_does_not_double_an_existing_separator() {
+        assert_eq!(concat_fnames(b"foo/", b"bar", true), b"foo/bar");
+    }
+
+    #[test]
+    fn concat_fnames_without_sep_never_adds_a_separator() {
+        assert_eq!(concat_fnames(b"foo", b"bar", false), b"foobar");
+    }
+
+    #[test]
+    fn concat_fnames_with_empty_fname1_never_adds_a_separator() {
+        // Matches the original's own `sep && *fname1 && ...` guard:
+        // an empty fname1 skips the separator even when sep is true.
+        assert_eq!(concat_fnames(b"", b"bar", true), b"bar");
+    }
+
+    #[test]
+    fn concat_fnames_with_empty_fname2() {
+        assert_eq!(concat_fnames(b"foo", b"", true), b"foo/");
+        assert_eq!(concat_fnames(b"foo", b"", false), b"foo");
+    }
+
+    #[test]
+    fn concat_fnames_both_empty() {
+        assert_eq!(concat_fnames(b"", b"", true), b"");
+        assert_eq!(concat_fnames(b"", b"", false), b"");
     }
 }
