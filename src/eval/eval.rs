@@ -2304,6 +2304,148 @@ pub unsafe fn typval_compare(typ1: &mut TypvalT, typ2: &TypvalT, typ: ExprType, 
     true
 }
 
+/// Get the byte index for character index `idx` in `str`. Composing
+/// characters are included. If going over the end, returns
+/// `str.len()`. If `idx` is negative, count from the end (`-1` is the
+/// last character). When going over the start, returns `-1`
+/// (`char_idx2byte`).
+///
+/// No real caller yet - only [`string_slice`] uses it so far, itself
+/// not yet wired into `handle_subscript`/`eval_index` (a separate,
+/// substantial follow-up) - matching this crate's established
+/// "translate a small, simple, mechanically-correct piece ahead of its
+/// real caller" precedent.
+///
+/// # Safety
+/// Forwards [`crate::mbyte::utf_head_off`]'s own safety doc.
+#[allow(dead_code)]
+unsafe fn char_idx2byte(str: &[u8], idx: VarnumberT) -> isize {
+    let mut nchar = idx;
+    let mut nbyte: usize;
+
+    if nchar >= 0 {
+        nbyte = 0;
+        while nchar > 0 && nbyte < str.len() {
+            // SAFETY: forwarded from this function's own safety doc.
+            nbyte += unsafe { crate::mbyte::utfc_ptr2len(&str[nbyte..]) } as usize;
+            nchar -= 1;
+        }
+    } else {
+        nbyte = str.len();
+        // utf_head_off requires its own `base` to include a trailing
+        // NUL byte - build one once, up front, matching f_trim's own
+        // already-established pattern for this exact requirement.
+        let mut nul_terminated = str.to_vec();
+        nul_terminated.push(0);
+        while nchar < 0 && nbyte > 0 {
+            nbyte -= 1;
+            // SAFETY: forwarded from this function's own safety doc.
+            nbyte -= unsafe { crate::mbyte::utf_head_off(&nul_terminated, nbyte) } as usize;
+            nchar += 1;
+        }
+        if nchar < 0 {
+            return -1;
+        }
+    }
+    nbyte as isize
+}
+
+/// Return the character `str[index]` where `index` is the character
+/// index, including composing characters. Returns `None` if `index`
+/// is out of range (`char_from_string`).
+///
+/// Drops the original's `str == NULL` early return - this crate's own
+/// [`tv_get_string`], the real caller's own established way to obtain
+/// `str` in the first place, never produces a null/absent result
+/// (always at least an empty `Vec`), making that check provably
+/// unreachable here.
+///
+/// No real caller yet - see [`char_idx2byte`]'s own doc comment for
+/// why this is translated ahead of `handle_subscript`/`eval_index`
+/// anyway.
+///
+/// # Safety
+/// Forwards [`char_idx2byte`]'s own safety doc (via
+/// [`crate::mbyte::utf_head_off`]).
+#[allow(dead_code)]
+unsafe fn char_from_string(str: &[u8], index: VarnumberT) -> Option<Vec<u8>> {
+    let mut nchar = index;
+    let slen = str.len();
+
+    if index < 0 {
+        // Do the same as for a list: a negative index counts from the
+        // end.
+        let mut clen: VarnumberT = 0;
+        let mut nbyte = 0usize;
+        while nbyte < slen {
+            // SAFETY: forwarded from this function's own safety doc.
+            nbyte += unsafe { crate::mbyte::utfc_ptr2len(&str[nbyte..]) } as usize;
+            clen += 1;
+        }
+        nchar = clen + index;
+        if nchar < 0 {
+            // Unlike list: index out of range results in an empty
+            // string.
+            return None;
+        }
+    }
+
+    let mut nbyte = 0usize;
+    while nchar > 0 && nbyte < slen {
+        // SAFETY: forwarded from this function's own safety doc.
+        nbyte += unsafe { crate::mbyte::utfc_ptr2len(&str[nbyte..]) } as usize;
+        nchar -= 1;
+    }
+    if nbyte >= slen {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let char_len = unsafe { crate::mbyte::utfc_ptr2len(&str[nbyte..]) } as usize;
+    Some(str[nbyte..nbyte + char_len].to_vec())
+}
+
+/// Return the slice `str[first : last]` using character indexes.
+/// Composing characters are included. Returns `None` when the result
+/// is empty (`string_slice`).
+///
+/// `exclusive` is `true` for `slice()`. Drops the original's
+/// `str == NULL` early return, for the same reason as
+/// [`char_from_string`]'s own doc comment.
+///
+/// No real caller yet - see [`char_idx2byte`]'s own doc comment for
+/// why this is translated ahead of `handle_subscript`/`eval_index`/
+/// `f_slice` anyway.
+///
+/// # Safety
+/// Forwards [`char_idx2byte`]'s own safety doc.
+#[allow(dead_code)]
+unsafe fn string_slice(str: &[u8], first: VarnumberT, last: VarnumberT, exclusive: bool) -> Option<Vec<u8>> {
+    let slen = str.len() as isize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut start_byte = unsafe { char_idx2byte(str, first) };
+    if start_byte < 0 {
+        start_byte = 0; // first index very negative: use zero.
+    }
+
+    let end_byte = if (last == -1 && !exclusive) || last == crate::eval::typval_defs::VARNUMBER_MAX {
+        slen
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut end_byte = unsafe { char_idx2byte(str, last) };
+        if !exclusive && end_byte >= 0 && end_byte < slen {
+            // end index is inclusive.
+            // SAFETY: forwarded from this function's own safety doc.
+            end_byte += unsafe { crate::mbyte::utfc_ptr2len(&str[end_byte as usize..]) } as isize;
+        }
+        end_byte
+    };
+
+    if start_byte >= slen || end_byte <= start_byte {
+        return None;
+    }
+    Some(str[start_byte as usize..end_byte as usize].to_vec())
+}
+
 /// Handle `expr[expr]`/`expr.name`/`expr(expr)`/`expr->name(expr)`
 /// subscript chaining after an already-parsed primary expression
 /// (`handle_subscript`).
@@ -6914,6 +7056,111 @@ mod tests {
             unsafe { typval_compare(&mut t1, &t2, ExprType::Match, false) }
         });
         assert!(result.is_err(), "expected a panic (pattern_match not yet translated)");
+    }
+
+    // --- char_idx2byte / char_from_string / string_slice ---
+
+    #[test]
+    fn char_idx2byte_ascii_forward() {
+        assert_eq!(unsafe { char_idx2byte(b"hello", 2) }, 2);
+    }
+
+    #[test]
+    fn char_idx2byte_negative_counts_from_the_end() {
+        // -1 is the last character - byte offset 4 ('o').
+        assert_eq!(unsafe { char_idx2byte(b"hello", -1) }, 4);
+    }
+
+    #[test]
+    fn char_idx2byte_zero_is_the_start() {
+        assert_eq!(unsafe { char_idx2byte(b"hello", 0) }, 0);
+    }
+
+    #[test]
+    fn char_idx2byte_forward_past_the_end_returns_the_length() {
+        assert_eq!(unsafe { char_idx2byte(b"hi", 99) }, 2);
+    }
+
+    #[test]
+    fn char_idx2byte_excessively_negative_returns_negative_one() {
+        assert_eq!(unsafe { char_idx2byte(b"hi", -99) }, -1);
+    }
+
+    #[test]
+    fn char_idx2byte_multibyte_steps_by_character_not_byte() {
+        // "a" + COMBINING ACUTE ACCENT (U+0301, 2 bytes) + "b" - 3
+        // characters total (the base 'a' plus its own composing mark
+        // count as ONE character index, matching utfc_ptr2len's own
+        // composing-aware stepping), 4 bytes total.
+        let s = "a\u{0301}b".as_bytes();
+        assert_eq!(s.len(), 4);
+        assert_eq!(unsafe { char_idx2byte(s, 0) }, 0); // "a\u{0301}"
+        assert_eq!(unsafe { char_idx2byte(s, 1) }, 3); // "b"
+    }
+
+    #[test]
+    fn char_from_string_reads_a_single_character() {
+        assert_eq!(unsafe { char_from_string(b"hello", 1) }, Some(b"e".to_vec()));
+    }
+
+    #[test]
+    fn char_from_string_negative_index_counts_from_the_end() {
+        assert_eq!(unsafe { char_from_string(b"hello", -1) }, Some(b"o".to_vec()));
+    }
+
+    #[test]
+    fn char_from_string_out_of_range_is_none() {
+        assert_eq!(unsafe { char_from_string(b"hi", 10) }, None);
+    }
+
+    #[test]
+    fn char_from_string_excessively_negative_is_none() {
+        assert_eq!(unsafe { char_from_string(b"hi", -10) }, None);
+    }
+
+    #[test]
+    fn char_from_string_reads_a_multibyte_character() {
+        // "日本" - 2 characters, 3 bytes each.
+        let s = "日本".as_bytes();
+        assert_eq!(unsafe { char_from_string(s, 1) }, Some("本".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn string_slice_inclusive_range() {
+        assert_eq!(unsafe { string_slice(b"hello", 1, 3, false) }, Some(b"ell".to_vec()));
+    }
+
+    #[test]
+    fn string_slice_exclusive_range_drops_the_last_index() {
+        assert_eq!(unsafe { string_slice(b"hello", 1, 3, true) }, Some(b"el".to_vec()));
+    }
+
+    #[test]
+    fn string_slice_negative_end_means_to_the_last_character() {
+        assert_eq!(unsafe { string_slice(b"hello", 1, -1, false) }, Some(b"ello".to_vec()));
+    }
+
+    #[test]
+    fn string_slice_end_beyond_the_length_clamps() {
+        assert_eq!(unsafe { string_slice(b"hi", 0, 100, false) }, Some(b"hi".to_vec()));
+    }
+
+    #[test]
+    fn string_slice_start_beyond_the_length_is_none() {
+        assert_eq!(unsafe { string_slice(b"hi", 10, 20, false) }, None);
+    }
+
+    #[test]
+    fn string_slice_empty_result_when_end_before_start_is_none() {
+        assert_eq!(unsafe { string_slice(b"hello", 3, 1, false) }, None);
+    }
+
+    #[test]
+    fn string_slice_varnumber_max_end_means_to_the_end() {
+        assert_eq!(
+            unsafe { string_slice(b"hello", 2, crate::eval::typval_defs::VARNUMBER_MAX, true) },
+            Some(b"llo".to_vec())
+        );
     }
 
     // --- handle_subscript ---
