@@ -270,6 +270,29 @@
 //! `QUEUE_FOREACH` dict-watcher notification inside
 //! `set_ref_in_item_dict` is omitted - `DictT` has no `watchers` field
 //! yet (the same accepted gap already documented on `DictT` itself).
+//!
+//! Also translated: `get_lval`/`clear_lval`/`get_lval_subscript`/
+//! `get_lval_dict_item`/`get_lval_blob`/`get_lval_list` (plus a new
+//! [`LvalT`] modeling `lval_T`) - the lvalue-resolution engine behind
+//! `islocked()`/`remove()`/`:let`/`:unlet` (only `islocked()`,
+//! `eval/funcs.rs`'s `f_islocked`, is wired up as a real caller so
+//! far). Two genuinely-unreached-today branches `unimplemented!()`:
+//! a magic brace (`{...}`) detected in the variable name (needs
+//! `make_expanded_name`, not yet translated - covers `get_lval`'s
+//! `skip: true` fast path too, since `find_name_end`'s own translation
+//! doesn't model `FNE_INCL_BR` yet either, and no caller passes
+//! `skip: true` yet regardless); and assigning through a scope
+//! dictionary (`rettv: Some(_)` inside `get_lval_dict_item`, needs
+//! `var_wrong_func_name`/`function_exists`/`trans_function_name`, the
+//! last of which is a substantial separate undertaking) - `islocked()`
+//! always calls with `rettv: None`, so this is provably unreached by
+//! today's one real caller. `get_lval_subscript`'s own `hashtab_T *ht`/
+//! `dictitem_T *v` parameters, and `get_lval_list`'s own `flags`
+//! parameter, are dropped entirely: confirmed via direct inspection of
+//! the current upstream source that none of the three is ever actually
+//! READ anywhere in its respective function body (only assigned at the
+//! call site) - a genuine, confirmed-unused-parameter situation in the
+//! original, not a narrowing.
 
 use crate::charset::skipwhite;
 use crate::eval::typval_defs::{TypvalT, TypvalValue, VarLockStatus, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
@@ -2348,14 +2371,15 @@ pub fn handle_subscript(
 const NAMESPACE_CHAR: &[u8] = b"abglstvw";
 
 /// `eval.h`'s `find_name_end`/[`find_name_end`] flag: include `[`/`.`
-/// in the name scan (used only by `get_lval`'s lvalue-resolution code,
-/// not yet translated - see [`find_name_end`]'s own doc comment for
-/// why it's not modeled here) (`FNE_INCL_BR`).
+/// in the name scan (used only by `get_lval`'s lvalue-resolution
+/// `skip: true` fast path, itself `unimplemented!()` - see
+/// [`find_name_end`]'s own doc comment for why it's not modeled here)
+/// (`FNE_INCL_BR`).
 #[allow(dead_code)]
 const FNE_INCL_BR: i32 = 1;
 /// `eval.h`'s `find_name_end` flag: check that the name starts with a
 /// valid character (`FNE_CHECK_START`).
-const FNE_CHECK_START: i32 = 2;
+pub const FNE_CHECK_START: i32 = 2;
 
 /// Get the length of the name of a variable or function, handling (at
 /// most) a single scope-prefix colon (e.g. `"s:"` in `"s:var"`, but
@@ -4344,6 +4368,647 @@ pub unsafe fn list2fpos(
         // SAFETY: forwarded from this function's own safety doc.
         *curswantp = unsafe { crate::eval::typval::tv_list_find_nr(l, i + 1, None) } as crate::pos_defs::ColnrT;
     }
+
+    OK
+}
+
+/// `eval.h`'s `get_lval` flag: do not give error messages
+/// (`GLV_QUIET`, aliases `userfunc.c`'s `TFN_QUIET`).
+pub const GLV_QUIET: i32 = 2;
+/// `eval.h`'s `get_lval` flag: do not use script autoloading
+/// (`GLV_NO_AUTOLOAD`, aliases `userfunc.c`'s `TFN_NO_AUTOLOAD`).
+pub const GLV_NO_AUTOLOAD: i32 = 4;
+/// `eval.h`'s `get_lval` flag: caller will not change the variable
+/// (`GLV_READ_ONLY`, aliases `userfunc.c`'s `TFN_READ_ONLY`).
+pub const GLV_READ_ONLY: i32 = 16;
+
+/// Lvalue definition, filled in by [`get_lval`] (`lval_T`).
+///
+/// `ll_name`/`ll_name_len` mirror the original, except `ll_name`
+/// always borrows directly from [`get_lval`]'s own `name` argument -
+/// the original's separate `ll_exp_name` (a separately-allocated
+/// expanded name, used only when `name` contains a magic brace, e.g.
+/// `foo{expr}bar`) isn't modeled at all: only `make_expanded_name`
+/// (not yet translated) would ever populate it, and [`get_lval`]
+/// `unimplemented!()`s before ever reaching that path (see this
+/// module's own doc comment).
+///
+/// The raw pointers here (`ll_tv`/`ll_li`/`ll_list`/`ll_dict`/`ll_di`/
+/// `ll_blob`) match this crate's established convention for the
+/// typval/list/dict/blob object graph - see `eval/typval_defs.rs`'s
+/// own module doc comment for why (shared, GLOBALS-adjacent,
+/// intrusively-linked heap objects, not owned Rust references).
+#[derive(Default)]
+pub struct LvalT<'a> {
+    /// Start of variable name, `None` if invalid (`ll_name`).
+    pub ll_name: Option<&'a [u8]>,
+    /// Length of `ll_name` actually used as the name (`ll_name_len`).
+    pub ll_name_len: usize,
+    /// Typval of the item being used, if any (`ll_tv`).
+    pub ll_tv: *mut TypvalT,
+    /// The list item, or null (`ll_li`).
+    pub ll_li: *mut crate::eval::typval_defs::ListitemT,
+    /// The list, or null (`ll_list`).
+    pub ll_list: *mut crate::eval::typval_defs::ListT,
+    /// `true` when a `[i:j]` range was used (`ll_range`).
+    pub ll_range: bool,
+    /// Second index is empty: `[i:]` (`ll_empty2`).
+    pub ll_empty2: bool,
+    /// First index for list (`ll_n1`).
+    pub ll_n1: i32,
+    /// Second index for list range (`ll_n2`).
+    pub ll_n2: i32,
+    /// The dict, or null (`ll_dict`).
+    pub ll_dict: *mut crate::eval::typval_defs::DictT,
+    /// The dictitem, or null (`ll_di`).
+    pub ll_di: *mut crate::eval::typval_defs::DictitemT,
+    /// New key for Dict, if adding one (`ll_newkey`).
+    pub ll_newkey: Option<Vec<u8>>,
+    /// The blob, or null (`ll_blob`).
+    pub ll_blob: *mut crate::eval::typval_defs::BlobT,
+}
+
+/// Clear lval `lp` that was filled by [`get_lval`] (`clear_lval`).
+///
+/// The original frees `ll_exp_name`/`ll_newkey`. `ll_exp_name` isn't
+/// modeled at all (see [`LvalT`]'s own doc comment); `ll_newkey` is an
+/// owned `Option<Vec<u8>>`, freed automatically when the `LvalT` is
+/// dropped. Kept as a real, explicit function anyway (rather than
+/// omitted outright) purely so future translated callers have the
+/// same direct, literal call site as the original - it does nothing
+/// today.
+pub fn clear_lval(_lp: &mut LvalT) {}
+
+/// Whether `partial` is the special `v:lua` value used for calling
+/// Lua functions (`is_luafunc`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::get_vim_var_partial`]'s own
+/// safety doc - in practice a no-op today (only reads GLOBALS's own
+/// vimvars table; `partial` itself is never dereferenced, only
+/// pointer-compared).
+#[must_use]
+pub unsafe fn is_luafunc(partial: *mut crate::eval::typval_defs::PartialT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    partial == unsafe { crate::eval::vars::get_vim_var_partial(crate::eval::vars::VimVarIndex::Lua) }
+}
+
+/// Whether `tv` holds the special `v:lua` partial value
+/// (`tv_is_luafunc`).
+///
+/// # Safety
+/// Same as [`is_luafunc`].
+#[must_use]
+pub unsafe fn tv_is_luafunc(tv: &TypvalT) -> bool {
+    matches!(tv.value, TypvalValue::Partial(p) if
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { is_luafunc(p) })
+}
+
+/// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
+/// `"dict['key']"`), list item (`"list[expr]"`), or list slice
+/// (`"list[expr:expr]"`) (`get_lval`).
+///
+/// Indexing only works when trying to use it with an EXISTING List or
+/// Dictionary - see `get_lval_subscript`'s own doc comment.
+///
+/// `rettv`, if `Some`, is the value about to be assigned - used only
+/// for a couple of type checks inside `get_lval_dict_item`, which
+/// `unimplemented!()`s the one sub-branch that actually needs it (see
+/// that function's own doc comment; this module's own doc comment
+/// explains why that's provably unreached by `islocked()`, the only
+/// real caller so far).
+///
+/// See this module's own doc comment for why the `skip: true` fast
+/// path and a magic-brace (`{...}`) name both `unimplemented!()`.
+///
+/// Returns the byte offset just past the name, including any index,
+/// or `None` for a parsing error - matching [`find_name_end`]'s own
+/// established `usize`-offset-instead-of-pointer convention.
+///
+/// # Safety
+/// Every raw pointer field this function sets on `lp` must be treated
+/// exactly like every other typval/list/dict/blob pointer in this
+/// crate - see `eval/typval_defs.rs`'s own module doc comment.
+/// Forwarded from [`crate::eval::vars::find_var`]'s own safety doc
+/// (this function's real gateway into GLOBALS-adjacent state).
+pub unsafe fn get_lval<'a>(
+    name: &'a [u8],
+    rettv: Option<&TypvalT>,
+    lp: &mut LvalT<'a>,
+    unlet: bool,
+    skip: bool,
+    flags: i32,
+    fne_flags: i32,
+) -> Option<usize> {
+    *lp = LvalT::default();
+
+    if skip {
+        // When skipping just find the end of the name.
+        lp.ll_name = Some(name);
+        unimplemented!(
+            "get_lval: skip=true needs find_name_end's FNE_INCL_BR support, not yet \
+             translated - see this module's own doc comment"
+        );
+    }
+
+    // Find the end of the name.
+    let (p, magic_braces) = find_name_end(name, fne_flags);
+    if magic_braces.is_some() {
+        // Don't expand the name when we already know there is an error,
+        // and reporting an invalid expression in braces both need
+        // make_expanded_name - see this module's own doc comment.
+        unimplemented!(
+            "get_lval: a magic brace ('{{...}}') in the variable name needs \
+             make_expanded_name, not yet translated"
+        );
+    }
+    lp.ll_name = Some(name);
+    lp.ll_name_len = p;
+
+    // Without [idx] or .key we are done.
+    if !matches!(name.get(p), Some(&b'[') | Some(&b'.')) {
+        return Some(p);
+    }
+
+    // Only pass want_ht=true when we would write to the variable, it
+    // prevents autoload as well.
+    let want_ht = (flags & GLV_READ_ONLY) == 0;
+    let no_autoload = (flags & GLV_NO_AUTOLOAD) != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (v, _ht) = unsafe { crate::eval::vars::find_var(&name[..p], want_ht, no_autoload) };
+    let Some(v) = v else {
+        // semsg(_("E121: Undefined variable: %.*s"), ...) omitted when
+        // !quiet - message display, not tractable; the identical None
+        // (matching the original's NULL) is kept regardless of quiet.
+        return None;
+    };
+
+    lp.ll_tv = match v {
+        crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe { std::ptr::addr_of_mut!((*p).di_tv) },
+        crate::eval::typval_defs::DictitemVariant::Scope(p) => unsafe { std::ptr::addr_of_mut!((*p).di_tv) },
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_is_luafunc(&*lp.ll_tv) } {
+        // For v:lua just return a pointer to the "." after the "v:lua".
+        // If the caller is trans_function_name() it will check for a
+        // Lua function name.
+        return Some(p);
+    }
+
+    // If the next character is a "." or a "[", then process the subitem.
+    // SAFETY: forwarded from this function's own safety doc.
+    let end = unsafe { get_lval_subscript(lp, p, name, rettv, unlet, flags) }?;
+    lp.ll_name_len = end;
+    Some(end)
+}
+
+/// `get_lval_subscript`'s own `glv_status_T` return: whether resolving
+/// one `[idx]`/`.key` subscript succeeded, failed outright, or
+/// succeeded while also signaling "stop, this was a new Dict key"
+/// (`GLV_OK`/`GLV_FAIL`/`GLV_STOP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlvStatus {
+    Ok,
+    Fail,
+    Stop,
+}
+
+/// Get the lval of a list/dict/blob subitem starting at `p`. Loops
+/// until no more `[idx]` or `.key` is following (`get_lval_subscript`).
+///
+/// Drops the original's `hashtab_T *ht`/`dictitem_T *v` parameters
+/// entirely - confirmed via direct inspection of the current upstream
+/// source that neither is ever actually read anywhere in this
+/// function's own body (only ever assigned at the call site in
+/// [`get_lval`]) - a genuine, confirmed-unused-parameter situation in
+/// the original, not a narrowing.
+///
+/// # Safety
+/// Same as [`get_lval`].
+unsafe fn get_lval_subscript(
+    lp: &mut LvalT,
+    mut p: usize,
+    name: &[u8],
+    rettv: Option<&TypvalT>,
+    unlet: bool,
+    flags: i32,
+) -> Option<usize> {
+    let quiet = (flags & GLV_QUIET) != 0;
+    let mut var1 = TypvalT::default();
+    let mut var2 = TypvalT::default();
+    let mut empty1 = false;
+
+    let at = |p: usize| name.get(p).copied();
+
+    // Loop until no more [idx] or .key is following.
+    while at(p) == Some(b'[') || (at(p) == Some(b'.') && at(p + 1) != Some(b'=') && at(p + 1) != Some(b'.')) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ll_tv_type = unsafe { &*lp.ll_tv }.var_type();
+        if at(p) == Some(b'.') && ll_tv_type != crate::eval::typval_defs::VarType::Dict {
+            // semsg(_(e_dot_can_only_be_used_on_dictionary_str), name)
+            // omitted when !quiet - message display, not tractable.
+            let _ = quiet;
+            return None;
+        }
+        if !matches!(
+            ll_tv_type,
+            crate::eval::typval_defs::VarType::List
+                | crate::eval::typval_defs::VarType::Dict
+                | crate::eval::typval_defs::VarType::Blob
+        ) {
+            // emsg(_("E689: Can only index a List, Dictionary or Blob"))
+            // omitted when !quiet - message display, not tractable.
+            return None;
+        }
+
+        // A NULL list/blob works like an empty list/blob, allocate one now.
+        // SAFETY: forwarded from this function's own safety doc.
+        match unsafe { &(*lp.ll_tv).value } {
+            TypvalValue::List(l) if l.is_null() => {
+                // SAFETY: forwarded from this function's own safety doc.
+                let _ = unsafe {
+                    crate::eval::typval::tv_list_alloc_ret(&mut *lp.ll_tv, crate::eval::typval_defs::ListLenSpecials::Unknown as isize)
+                };
+            }
+            TypvalValue::Blob(b) if b.is_null() => {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::eval::typval::tv_blob_alloc_ret(&mut *lp.ll_tv) };
+            }
+            _ => {}
+        }
+
+        if lp.ll_range {
+            // emsg(_("E708: [:] must come last")) omitted - message
+            // display, not tractable; the identical FAIL is kept.
+            break;
+        }
+
+        let mut key: Option<&[u8]> = None;
+        if at(p) == Some(b'.') {
+            let key_start = p + 1;
+            let mut len = 0;
+            while matches!(at(key_start + len), Some(c) if crate::macros_defs::ascii_isalnum(i32::from(c)) || c == b'_') {
+                len += 1;
+            }
+            if len == 0 {
+                // emsg(_("E713: Cannot use empty key after .")) omitted
+                // when !quiet - message display, not tractable.
+                return None;
+            }
+            key = Some(&name[key_start..key_start + len]);
+            p = key_start + len;
+        } else {
+            // Get the index [expr] or the first index [expr: ].
+            p += 1;
+            p += skipwhite(&name[p..]);
+            if at(p) == Some(b':') {
+                empty1 = true;
+            } else {
+                empty1 = false;
+                // SAFETY: forwarded from this function's own safety doc.
+                let (ok, consumed) = unsafe {
+                    eval1(&name[p..], &mut var1, Some(&mut EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() }))
+                };
+                p += consumed;
+                if ok == FAIL {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe {
+                        crate::eval::typval::tv_clear_simple(&var1);
+                        crate::eval::typval::tv_clear_simple(&var2);
+                    }
+                    return None;
+                }
+                if !crate::eval::typval::tv_check_str(&var1) {
+                    // Not a number or string.
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe {
+                        crate::eval::typval::tv_clear_simple(&var1);
+                        crate::eval::typval::tv_clear_simple(&var2);
+                    }
+                    return None;
+                }
+                p += skipwhite(&name[p..]);
+            }
+
+            // Optionally get the second index [ :expr].
+            if at(p) == Some(b':') {
+                if ll_tv_type == crate::eval::typval_defs::VarType::Dict {
+                    // emsg(_(e_cannot_slice_dictionary)) omitted when
+                    // !quiet - message display, not tractable.
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe {
+                        crate::eval::typval::tv_clear_simple(&var1);
+                        crate::eval::typval::tv_clear_simple(&var2);
+                    }
+                    return None;
+                }
+                if let Some(rettv) = rettv {
+                    let ok_list = matches!(&rettv.value, TypvalValue::List(l) if !l.is_null());
+                    let ok_blob = matches!(&rettv.value, TypvalValue::Blob(b) if !b.is_null());
+                    if !ok_list && !ok_blob {
+                        // emsg(_("E709: [:] requires a List or Blob value"))
+                        // omitted when !quiet - message display, not
+                        // tractable.
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe {
+                            crate::eval::typval::tv_clear_simple(&var1);
+                            crate::eval::typval::tv_clear_simple(&var2);
+                        }
+                        return None;
+                    }
+                }
+                p += 1;
+                p += skipwhite(&name[p..]);
+                if at(p) == Some(b']') {
+                    lp.ll_empty2 = true;
+                } else {
+                    lp.ll_empty2 = false;
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let (ok, consumed) = unsafe {
+                        eval1(&name[p..], &mut var2, Some(&mut EvalargT { eval_flags: EVAL_EVALUATE, ..Default::default() }))
+                    };
+                    p += consumed;
+                    if ok == FAIL || !crate::eval::typval::tv_check_str(&var2) {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe {
+                            crate::eval::typval::tv_clear_simple(&var1);
+                            crate::eval::typval::tv_clear_simple(&var2);
+                        }
+                        return None;
+                    }
+                }
+                lp.ll_range = true;
+            } else {
+                lp.ll_range = false;
+            }
+
+            if at(p) != Some(b']') {
+                // emsg(_(e_missbrac)) omitted when !quiet - message
+                // display, not tractable.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::eval::typval::tv_clear_simple(&var1);
+                    crate::eval::typval::tv_clear_simple(&var2);
+                }
+                return None;
+            }
+            // Skip to past ']'.
+            p += 1;
+        }
+
+        let status = if ll_tv_type == crate::eval::typval_defs::VarType::Dict {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { get_lval_dict_item(lp, name, key, p, &var1, flags, unlet, rettv) }
+        } else if ll_tv_type == crate::eval::typval_defs::VarType::Blob {
+            // SAFETY: forwarded from this function's own safety doc.
+            let blob_status = unsafe { get_lval_blob(lp, &var1, &var2, empty1, quiet) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::eval::typval::tv_clear_simple(&var1);
+                crate::eval::typval::tv_clear_simple(&var2);
+            }
+            return if blob_status == FAIL { None } else { Some(p) };
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { get_lval_list(lp, &var1, &var2, empty1, quiet) } == FAIL {
+                GlvStatus::Fail
+            } else {
+                GlvStatus::Ok
+            }
+        };
+
+        match status {
+            GlvStatus::Fail => {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::eval::typval::tv_clear_simple(&var1);
+                    crate::eval::typval::tv_clear_simple(&var2);
+                }
+                return None;
+            }
+            GlvStatus::Stop => break,
+            GlvStatus::Ok => {}
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::eval::typval::tv_clear_simple(&var1);
+            crate::eval::typval::tv_clear_simple(&var2);
+        }
+        var1 = TypvalT::default();
+        var2 = TypvalT::default();
+    }
+
+    Some(p)
+}
+
+/// Get a Dict lval variable that can be assigned a value to (`"name"`,
+/// `"name[expr]"`, `"name.key"`, etc.) (`get_lval_dict_item`).
+///
+/// `p` is the position just after the parsed `[key]`/`.key`
+/// (collapsing the original's in/out `char **key_end` - re-reading the
+/// current upstream source directly confirms `*key_end` is only ever
+/// read once at function entry and, on its one write-back path,
+/// written back UNCHANGED from that same value, making a true in/out
+/// parameter unnecessary here).
+///
+/// The `rettv: Some(_)` sub-branch (checking a function/variable name
+/// is valid before assigning through a scope dictionary)
+/// `unimplemented!()`s - needs `var_wrong_func_name`/`function_exists`/
+/// `trans_function_name` (a substantial separate undertaking); see
+/// this module's own doc comment for why this is provably unreached
+/// by `islocked()`, the only real caller so far (always passes
+/// `rettv: None`).
+///
+/// # Safety
+/// Same as [`get_lval`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_lval_dict_item(
+    lp: &mut LvalT,
+    name: &[u8],
+    key: Option<&[u8]>,
+    p: usize,
+    var1: &TypvalT,
+    flags: i32,
+    unlet: bool,
+    rettv: Option<&TypvalT>,
+) -> GlvStatus {
+    let quiet = (flags & GLV_QUIET) != 0;
+    // "[key]": get key from "var1" (is number or string) when no
+    // literal ".key" was parsed.
+    let key_owned;
+    let key: &[u8] = match key {
+        Some(k) => k,
+        None => {
+            key_owned = crate::eval::typval::tv_get_string(var1);
+            &key_owned
+        }
+    };
+    lp.ll_list = std::ptr::null_mut();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ll_tv = unsafe { &mut *lp.ll_tv };
+    // A NULL dict is equivalent with an empty dict.
+    if let TypvalValue::Dict(d) = &mut ll_tv.value {
+        if d.is_null() {
+            let new_dict = crate::eval::typval::tv_dict_alloc();
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*new_dict).dv_refcount += 1 };
+            *d = new_dict;
+        }
+        lp.ll_dict = *d;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    lp.ll_di = unsafe { crate::eval::typval::tv_dict_find(lp.ll_dict.as_mut(), key) }.unwrap_or(std::ptr::null_mut());
+
+    // When assigning to a scope dictionary check that a function and
+    // variable name is valid (only variable name unless it is l: or
+    // g: dictionary). Disallow overwriting a builtin function.
+    // SAFETY: forwarded from this function's own safety doc.
+    if rettv.is_some() && unsafe { (*lp.ll_dict).dv_scope } != crate::eval::typval_defs::ScopeType::NoScope {
+        unimplemented!(
+            "get_lval_dict_item: assigning through a scope dictionary needs \
+             var_wrong_func_name/function_exists/trans_function_name, not yet \
+             translated - see this function's own doc comment"
+        );
+    }
+
+    if !lp.ll_di.is_null()
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { tv_is_luafunc(&(*lp.ll_di).di_tv) }
+        && rettv.is_none()
+    {
+        // semsg(e_illvar, "v:['lua']") omitted - message display, not
+        // tractable; the identical GLV_FAIL is kept.
+        return GlvStatus::Fail;
+    }
+
+    if lp.ll_di.is_null() {
+        // Can't add "v:" or "a:" variable.
+        let is_vimvar_dict = std::ptr::eq(lp.ll_dict, crate::eval::vars::get_vimvar_dict());
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_funccal_args_ht = std::ptr::eq(
+            unsafe { std::ptr::addr_of!((*lp.ll_dict).dv_hashtab) },
+            crate::eval::userfunc::get_funccal_args_ht(),
+        );
+        if is_vimvar_dict || is_funccal_args_ht {
+            // semsg(_(e_illvar), name) omitted - message display, not
+            // tractable; the identical GLV_FAIL is kept.
+            let _ = name;
+            return GlvStatus::Fail;
+        }
+
+        // Key does not exist in dict: may need to add it.
+        let p_at = name.get(p).copied();
+        if p_at == Some(b'[') || p_at == Some(b'.') || unlet {
+            // semsg(_(e_dictkey), key) omitted when !quiet - message
+            // display, not tractable.
+            let _ = quiet;
+            return GlvStatus::Fail;
+        }
+        lp.ll_newkey = Some(key.to_vec());
+        return GlvStatus::Stop;
+        // Existing variable, need to check if it can be changed.
+    } else if (flags & GLV_READ_ONLY) == 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && (crate::eval::vars::var_check_ro(unsafe { (*lp.ll_di).di_flags })
+            // SAFETY: forwarded from this function's own safety doc.
+            || crate::eval::vars::var_check_lock(unsafe { (*lp.ll_di).di_flags }))
+    {
+        return GlvStatus::Fail;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    lp.ll_tv = unsafe { std::ptr::addr_of_mut!((*lp.ll_di).di_tv) };
+
+    GlvStatus::Ok
+}
+
+/// Get a blob lval variable that can be assigned a value to (`"name"`,
+/// `"name[expr]"`, `"name[expr:expr]"`, etc.) (`get_lval_blob`).
+///
+/// `var1`/`var2` specify the starting/ending blob index; `empty1`
+/// means no starting index was specified in a range. Returns `OK`/
+/// `FAIL` (`crate::vim_defs::{OK, FAIL}`), matching the original's own
+/// `int` return.
+///
+/// # Safety
+/// Same as [`get_lval`].
+unsafe fn get_lval_blob(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: bool, quiet: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ll_tv = unsafe { &mut *lp.ll_tv };
+    let TypvalValue::Blob(blob) = ll_tv.value else {
+        unreachable!("get_lval_blob's only caller already confirmed VAR_BLOB");
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let bloblen = unsafe { crate::eval::typval::tv_blob_len(blob) };
+
+    lp.ll_n1 = if empty1 { 0 } else { crate::eval::typval::tv_get_number(var1) as i32 };
+
+    if crate::eval::typval::tv_blob_check_index(bloblen, crate::eval::typval_defs::VarnumberT::from(lp.ll_n1), quiet) == FAIL {
+        return FAIL;
+    }
+    if lp.ll_range && !lp.ll_empty2 {
+        lp.ll_n2 = crate::eval::typval::tv_get_number(var2) as i32;
+        if crate::eval::typval::tv_blob_check_range(
+            bloblen,
+            crate::eval::typval_defs::VarnumberT::from(lp.ll_n1),
+            crate::eval::typval_defs::VarnumberT::from(lp.ll_n2),
+            quiet,
+        ) == FAIL
+        {
+            return FAIL;
+        }
+    }
+
+    lp.ll_blob = blob;
+    lp.ll_tv = std::ptr::null_mut();
+
+    OK
+}
+
+/// Get a List lval variable that can be assigned a value to (`"name"`,
+/// `"name[expr]"`, `"name[expr:expr]"`, etc.) (`get_lval_list`).
+///
+/// Drops the original's `flags` parameter entirely - confirmed via
+/// direct inspection of the current upstream source that it is never
+/// actually read anywhere in this function's own body (see this
+/// module's own doc comment for the same situation with
+/// [`get_lval_subscript`]'s `ht`/`v`).
+///
+/// # Safety
+/// Same as [`get_lval`].
+unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: bool, quiet: bool) -> i32 {
+    lp.ll_n1 = if empty1 { 0 } else { crate::eval::typval::tv_get_number(var1) as i32 };
+
+    lp.ll_dict = std::ptr::null_mut();
+    // SAFETY: forwarded from this function's own safety doc.
+    let ll_tv = unsafe { &*lp.ll_tv };
+    let TypvalValue::List(list) = ll_tv.value else {
+        unreachable!("get_lval_list's only caller already confirmed VAR_LIST");
+    };
+    lp.ll_list = list;
+    // SAFETY: forwarded from this function's own safety doc.
+    lp.ll_li = unsafe { crate::eval::typval::tv_list_check_range_index_one(lp.ll_list, &mut lp.ll_n1, quiet) };
+    if lp.ll_li.is_null() {
+        return FAIL;
+    }
+
+    if lp.ll_range && !lp.ll_empty2 {
+        lp.ll_n2 = crate::eval::typval::tv_get_number(var2) as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::eval::typval::tv_list_check_range_index_two(lp.ll_list, &mut lp.ll_n1, lp.ll_li, &mut lp.ll_n2, quiet) }
+            == FAIL
+        {
+            return FAIL;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    lp.ll_tv = unsafe { std::ptr::addr_of_mut!((*lp.ll_li).li_tv) };
 
     OK
 }
@@ -8292,6 +8957,314 @@ mod tests {
         assert_eq!(w.w_pcmark, pos);
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    // --- is_luafunc / tv_is_luafunc / get_lval / clear_lval ---
+
+    #[test]
+    fn is_luafunc_matches_only_the_real_v_lua_partial() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut p = crate::eval::typval_defs::PartialT::default();
+        let prev = unsafe { crate::eval::vars::get_vim_var_partial(crate::eval::vars::VimVarIndex::Lua) };
+
+        unsafe { crate::eval::vars::set_vim_var_partial(crate::eval::vars::VimVarIndex::Lua, &mut p as *mut _) };
+        assert!(unsafe { is_luafunc(&mut p as *mut _) });
+        assert!(!unsafe { is_luafunc(std::ptr::null_mut()) });
+
+        unsafe { crate::eval::vars::set_vim_var_partial(crate::eval::vars::VimVarIndex::Lua, prev) };
+    }
+
+    #[test]
+    fn tv_is_luafunc_true_only_for_the_v_lua_partial_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut p = crate::eval::typval_defs::PartialT::default();
+        let prev = unsafe { crate::eval::vars::get_vim_var_partial(crate::eval::vars::VimVarIndex::Lua) };
+        unsafe { crate::eval::vars::set_vim_var_partial(crate::eval::vars::VimVarIndex::Lua, &mut p as *mut _) };
+
+        let lua_tv = TypvalT { value: TypvalValue::Partial(&mut p as *mut _), ..Default::default() };
+        assert!(unsafe { tv_is_luafunc(&lua_tv) });
+
+        let mut other = crate::eval::typval_defs::PartialT::default();
+        let other_tv = TypvalT { value: TypvalValue::Partial(&mut other as *mut _), ..Default::default() };
+        assert!(!unsafe { tv_is_luafunc(&other_tv) });
+
+        let number_tv = TypvalT { value: TypvalValue::Number(1), ..Default::default() };
+        assert!(!unsafe { tv_is_luafunc(&number_tv) });
+
+        unsafe { crate::eval::vars::set_vim_var_partial(crate::eval::vars::VimVarIndex::Lua, prev) };
+    }
+
+    #[test]
+    fn clear_lval_does_nothing_observable() {
+        let mut lv = LvalT { ll_newkey: Some(b"x".to_vec()), ..Default::default() };
+        clear_lval(&mut lv);
+        // ll_newkey is untouched (freed for real once `lv` itself drops,
+        // per this function's own doc comment) - this only checks the
+        // call itself doesn't panic/mutate anything observable.
+        assert_eq!(lv.ll_newkey, Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn get_lval_plain_variable_name_has_no_subscript_fields_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"x");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(7) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end = unsafe { get_lval(b"g:x", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(3));
+        assert_eq!(lv.ll_name, Some(&b"g:x"[..]));
+        assert_eq!(lv.ll_name_len, 3);
+        assert!(lv.ll_tv.is_null());
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_undefined_variable_with_subscript_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let mut lv = LvalT::default();
+        let end = unsafe { get_lval(b"g:nope[0]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, None);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_list_item_subscript_resolves_the_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+            crate::eval::typval::tv_list_append_number(&mut *list, 30);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mylist");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end =
+            unsafe { get_lval(b"g:mylist[1]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(b"g:mylist[1]".len()));
+        assert_eq!(lv.ll_list, list);
+        assert!(!lv.ll_li.is_null());
+        assert!(!lv.ll_tv.is_null());
+        unsafe { assert_eq!((*lv.ll_tv).value, TypvalValue::Number(20)) };
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_list_range_subscript_resolves_n1_and_n2() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let list = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+            crate::eval::typval::tv_list_append_number(&mut *list, 30);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mylist");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end =
+            unsafe { get_lval(b"g:mylist[0:1]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(b"g:mylist[0:1]".len()));
+        assert!(lv.ll_range);
+        assert!(!lv.ll_empty2);
+        assert_eq!(lv.ll_n1, 0);
+        assert_eq!(lv.ll_n2, 1);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_dict_dot_key_and_bracket_key_both_resolve_the_same_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"foo");
+            (*a).di_tv.value = TypvalValue::Number(42);
+            crate::eval::typval::tv_dict_add(&mut *dict, a);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mydict");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end =
+            unsafe { get_lval(b"g:mydict.foo", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(b"g:mydict.foo".len()));
+        assert_eq!(lv.ll_dict, dict);
+        assert!(!lv.ll_di.is_null());
+        unsafe { assert_eq!((*lv.ll_tv).value, TypvalValue::Number(42)) };
+
+        let mut lv2 = LvalT::default();
+        let end2 = unsafe {
+            get_lval(b"g:mydict['foo']", None, &mut lv2, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START)
+        };
+        assert_eq!(end2, Some(b"g:mydict['foo']".len()));
+        assert_eq!(lv2.ll_di, lv.ll_di);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_dict_new_key_sets_ll_newkey_and_succeeds() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*dict).dv_refcount += 1 };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mydict");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end =
+            unsafe { get_lval(b"g:mydict.newkey", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(b"g:mydict.newkey".len()));
+        assert_eq!(lv.ll_newkey, Some(b"newkey".to_vec()));
+        assert!(lv.ll_di.is_null());
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_blob_byte_subscript_resolves_blob_and_clears_tv() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_refcount += 1;
+            (*blob).bv_ga.ga_concat_len(b"abc");
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"myblob");
+        unsafe { (*item).di_tv.value = TypvalValue::Blob(blob) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end =
+            unsafe { get_lval(b"g:myblob[1]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, Some(b"g:myblob[1]".len()));
+        assert_eq!(lv.ll_blob, blob);
+        assert_eq!(lv.ll_n1, 1);
+        assert!(lv.ll_tv.is_null());
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_indexing_a_number_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"n");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end = unsafe { get_lval(b"g:n[0]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, None);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_dot_on_non_dict_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"n");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end = unsafe { get_lval(b"g:n.foo", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START) };
+        assert_eq!(end, None);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_chained_subscript_dict_then_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let inner_list = crate::eval::typval::tv_list_alloc(1);
+        unsafe {
+            crate::eval::typval::tv_list_ref(inner_list);
+            crate::eval::typval::tv_list_append_number(&mut *inner_list, 99);
+        }
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::List(inner_list);
+            crate::eval::typval::tv_dict_add(&mut *dict, a);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mydict");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut lv = LvalT::default();
+        let end = unsafe {
+            get_lval(b"g:mydict.a[0]", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START)
+        };
+        assert_eq!(end, Some(b"g:mydict.a[0]".len()));
+        assert_eq!(lv.ll_list, inner_list);
+        unsafe { assert_eq!((*lv.ll_tv).value, TypvalValue::Number(99)) };
+
+        reset_globals_for_test();
+    }
+
+    #[test]
+    fn get_lval_read_only_flag_skips_the_lock_check() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"locked");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            (*a).di_flags |= crate::eval::typval_defs::dict_item_flags::LOCK;
+            crate::eval::typval::tv_dict_add(&mut *dict, a);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"mydict");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        // GLV_READ_ONLY set: resolves fine even though the item is locked.
+        let mut lv = LvalT::default();
+        let end = unsafe {
+            get_lval(b"g:mydict.locked", None, &mut lv, false, false, GLV_NO_AUTOLOAD | GLV_READ_ONLY, FNE_CHECK_START)
+        };
+        assert_eq!(end, Some(b"g:mydict.locked".len()));
+
+        // Without GLV_READ_ONLY, the same locked item fails to resolve.
+        let mut lv2 = LvalT::default();
+        let end2 = unsafe { get_lval(b"g:mydict.locked", None, &mut lv2, false, false, GLV_NO_AUTOLOAD, FNE_CHECK_START) };
+        assert_eq!(end2, None);
+
+        reset_globals_for_test();
     }
 }
 

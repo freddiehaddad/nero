@@ -424,6 +424,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getfontname"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_getfontname });
         m.insert(&b"isinf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isinf });
         m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
+        m.insert(&b"islocked"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_islocked });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
@@ -2768,6 +2769,86 @@ fn f_isinf(argvars: &[TypvalT], rettv: &mut TypvalT) {
 fn f_isnan(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let is_nan = matches!(argvars[0].value, TypvalValue::Float(f) if f.is_nan());
     rettv.value = TypvalValue::Number(i64::from(is_nan));
+}
+
+/// `islocked({expr})` - whether `{expr}` (the NAME of a variable, List
+/// item, or Dict entry - not the value itself) is locked (`f_islocked`,
+/// `funcs.c`), via [`crate::eval::eval::get_lval`].
+///
+/// Every error path here (trailing garbage after the name, a `[:]`
+/// range, a not-yet-existing Dict key, and - the one case not
+/// reachable from `get_lval` itself - an outright parse failure)
+/// omits its `semsg()`/`emsg()`: message display, not tractable;
+/// `rettv` is simply left at its already-set `-1` default, matching
+/// this crate's established "skip the display, keep an otherwise-
+/// harmless default" policy.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::get_lval`]/
+/// [`crate::eval::vars::find_var`]/[`crate::eval::typval::tv_islocked`]'s
+/// own safety docs.
+unsafe fn f_islocked(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut lv = crate::eval::eval::LvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let end = unsafe {
+        crate::eval::eval::get_lval(
+            &name,
+            None,
+            &mut lv,
+            false,
+            false,
+            crate::eval::eval::GLV_NO_AUTOLOAD | crate::eval::eval::GLV_READ_ONLY,
+            crate::eval::eval::FNE_CHECK_START,
+        )
+    };
+
+    if let (Some(end), true) = (end, lv.ll_name.is_some()) {
+        if end != name.len() {
+            // semsg(...) omitted - see this function's own doc comment.
+        } else if lv.ll_tv.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (di, _ht) = unsafe { crate::eval::vars::find_var(&name[..lv.ll_name_len], false, true) };
+            if let Some(di) = di {
+                let (di_flags, di_tv): (u8, *const TypvalT) = match di {
+                    crate::eval::typval_defs::DictitemVariant::Dict(p) => unsafe {
+                        ((*p).di_flags, std::ptr::addr_of!((*p).di_tv))
+                    },
+                    crate::eval::typval_defs::DictitemVariant::Scope(p) => unsafe {
+                        ((*p).di_flags, std::ptr::addr_of!((*p).di_tv))
+                    },
+                };
+                // Consider a variable locked when:
+                // 1. the variable itself is locked
+                // 2. the value of the variable is locked.
+                // 3. the List or Dict value is locked.
+                let locked = (di_flags & crate::eval::typval_defs::dict_item_flags::LOCK) != 0
+                    // SAFETY: forwarded from this function's own safety doc.
+                    || unsafe { crate::eval::typval::tv_islocked(&*di_tv) };
+                rettv.value = TypvalValue::Number(i64::from(locked));
+            }
+        } else if lv.ll_range {
+            // emsg(_("E786: Range not allowed")) omitted - see this
+            // function's own doc comment.
+        } else if lv.ll_newkey.is_some() {
+            // semsg(_(e_dictkey), ...) omitted - see this function's
+            // own doc comment.
+        } else if !lv.ll_list.is_null() {
+            // List item.
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { crate::eval::typval::tv_islocked(&(*lv.ll_li).li_tv) };
+            rettv.value = TypvalValue::Number(i64::from(locked));
+        } else {
+            // Dictionary item.
+            // SAFETY: forwarded from this function's own safety doc.
+            let locked = unsafe { crate::eval::typval::tv_islocked(&(*lv.ll_di).di_tv) };
+            rettv.value = TypvalValue::Number(i64::from(locked));
+        }
+    }
+
+    crate::eval::eval::clear_lval(&mut lv);
 }
 
 /// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a
@@ -9628,6 +9709,166 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_isnan(&[num(5)], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_islocked ---
+
+    #[test]
+    fn islocked_true_for_a_locked_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_var");
+        unsafe {
+            (*item).di_tv.value = TypvalValue::Number(1);
+            (*item).di_flags |= crate::eval::typval_defs::dict_item_flags::LOCK;
+        }
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_var")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_false_for_an_unlocked_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_var");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_var")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_undefined_plain_variable_leaves_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_nope")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_list_item_reflects_the_items_own_lock_status() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+            (*(*list).lv_first).li_tv.v_lock = crate::eval::typval_defs::VarLockStatus::Locked;
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_list");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_list[0]")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let mut rettv2 = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_list[1]")], &mut rettv2) };
+        assert_eq!(rettv2.value, TypvalValue::Number(0));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_dict_entry_reflects_the_entrys_own_lock_status() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*dict).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"foo");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            // f_islocked's own "Dictionary item" branch only ever
+            // checks tv_islocked(&di_tv) - unlike the "plain variable"
+            // branch, it never also checks di_flags (see tv_islocked's
+            // own doc comment: it inspects v_lock, not di_flags).
+            (*a).di_tv.v_lock = crate::eval::typval_defs::VarLockStatus::Locked;
+            crate::eval::typval::tv_dict_add(&mut *dict, a);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_dict");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_dict.foo")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_range_not_allowed_leaves_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let list = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_ref(list);
+            crate::eval::typval::tv_list_append_number(&mut *list, 10);
+            crate::eval::typval::tv_list_append_number(&mut *list, 20);
+        }
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_range");
+        unsafe { (*item).di_tv.value = TypvalValue::List(list) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_range[0:1]")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_new_dict_key_leaves_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*dict).dv_refcount += 1 };
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_newkey");
+        unsafe { (*item).di_tv.value = TypvalValue::Dict(dict) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_newkey.doesnotexist")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    #[test]
+    fn islocked_trailing_garbage_after_name_leaves_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+
+        let item = crate::eval::typval::tv_dict_item_alloc(b"nero_test_islocked_var");
+        unsafe { (*item).di_tv.value = TypvalValue::Number(1) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), item) };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_islocked(&[string(b"g:nero_test_islocked_var extra")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
     }
 
     // --- f_sha256 ---

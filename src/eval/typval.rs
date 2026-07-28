@@ -2143,6 +2143,38 @@ pub unsafe fn tv_blob_len(b: *const crate::eval::typval_defs::BlobT) -> i32 {
     unsafe { (*b).bv_ga.ga_len }
 }
 
+/// Check that `n1` is a valid index into a blob of length `bloblen`
+/// (`tv_blob_check_index`).
+///
+/// Drops the original's `quiet` effect on the return value (it only
+/// ever gates the omitted `semsg()` message text, matching this
+/// crate's established `_quiet`/`_verbose`-parameter precedent, e.g.
+/// [`crate::eval::vars::eval_variable`]'s own `_verbose` parameter) -
+/// named `_quiet` here for the same reason.
+#[must_use]
+pub fn tv_blob_check_index(bloblen: i32, n1: crate::eval::typval_defs::VarnumberT, _quiet: bool) -> i32 {
+    if n1 < 0 || n1 > crate::eval::typval_defs::VarnumberT::from(bloblen) {
+        return FAIL;
+    }
+    OK
+}
+
+/// Check that `n1..=n2` is a valid range for a blob of length
+/// `bloblen` (`tv_blob_check_range`). See [`tv_blob_check_index`]'s
+/// own doc comment for why `quiet` is renamed `_quiet`.
+#[must_use]
+pub fn tv_blob_check_range(
+    bloblen: i32,
+    n1: crate::eval::typval_defs::VarnumberT,
+    n2: crate::eval::typval_defs::VarnumberT,
+    _quiet: bool,
+) -> i32 {
+    if n2 < 0 || n2 >= crate::eval::typval_defs::VarnumberT::from(bloblen) || n2 < n1 {
+        return FAIL;
+    }
+    OK
+}
+
 /// Get one byte from a blob (`tv_blob_get`, `eval/typval.h`'s own
 /// `static inline`).
 ///
@@ -2543,7 +2575,6 @@ pub unsafe fn tv_list_find_str(l: *mut crate::eval::typval_defs::ListT, n: i32) 
 ///
 /// # Safety
 /// Same as [`tv_list_find`].
-#[allow(dead_code)] // no real translated caller yet (tv_list_check_range_index_one, its only caller, not yet translated) - tested directly, matching this crate's established convention for private helpers harvested ahead of their real caller
 fn tv_list_find_index(l: *mut crate::eval::typval_defs::ListT, idx: &mut i32) -> *mut crate::eval::typval_defs::ListitemT {
     // SAFETY: forwarded from this function's own safety doc.
     let li = unsafe { tv_list_find(l, *idx) };
@@ -2557,6 +2588,61 @@ fn tv_list_find_index(l: *mut crate::eval::typval_defs::ListT, idx: &mut i32) ->
         return unsafe { tv_list_find(l, *idx) };
     }
     li
+}
+
+/// Check that `n1` is a valid index for the (only or first) index of
+/// a range into list `l`, normalizing a negative index to positive;
+/// returns the found item, or null on an out-of-range index
+/// (`tv_list_check_range_index_one`). See [`tv_blob_check_index`]'s
+/// own doc comment for why `quiet` is renamed `_quiet`.
+///
+/// # Safety
+/// Same as `tv_list_find_index`/[`tv_list_find`].
+#[must_use]
+pub unsafe fn tv_list_check_range_index_one(
+    l: *mut crate::eval::typval_defs::ListT,
+    n1: &mut i32,
+    _quiet: bool,
+) -> *mut crate::eval::typval_defs::ListitemT {
+    tv_list_find_index(l, n1)
+}
+
+/// Check that `n2` can be used as the second index in a range of list
+/// `l`. If `n1`/`n2` is negative it is changed to the positive index.
+/// `li1` is the item for item `n1` (`tv_list_check_range_index_two`).
+/// See [`tv_blob_check_index`]'s own doc comment for why `quiet` is
+/// renamed `_quiet`.
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT` whose
+/// every item is reachable via `lv_first`'s own `li_next` chain;
+/// `li1`, if non-null, must be one of those items.
+pub unsafe fn tv_list_check_range_index_two(
+    l: *mut crate::eval::typval_defs::ListT,
+    n1: &mut i32,
+    li1: *const crate::eval::typval_defs::ListitemT,
+    n2: &mut i32,
+    _quiet: bool,
+) -> i32 {
+    if *n2 < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ni = unsafe { tv_list_find(l, *n2) };
+        if ni.is_null() {
+            return FAIL;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        *n2 = unsafe { tv_list_idx_of_item(l, ni) };
+    }
+
+    // Check that n2 isn't before n1.
+    if *n1 < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        *n1 = unsafe { tv_list_idx_of_item(l, li1) };
+    }
+    if *n2 < *n1 {
+        return FAIL;
+    }
+    OK
 }
 
 /// Locate `item` in a list and return its index, or `-1` if not found
@@ -4867,6 +4953,23 @@ mod tests {
     }
 
     #[test]
+    fn tv_blob_check_index_accepts_zero_through_bloblen_inclusive() {
+        // n1 == bloblen is valid (it's the "append/insert at end" index).
+        assert_eq!(tv_blob_check_index(3, 0, false), OK);
+        assert_eq!(tv_blob_check_index(3, 3, false), OK);
+        assert_eq!(tv_blob_check_index(3, -1, false), FAIL);
+        assert_eq!(tv_blob_check_index(3, 4, false), FAIL);
+    }
+
+    #[test]
+    fn tv_blob_check_range_rejects_negative_out_of_range_or_reversed() {
+        assert_eq!(tv_blob_check_range(3, 0, 2, false), OK);
+        assert_eq!(tv_blob_check_range(3, 0, -1, false), FAIL);
+        assert_eq!(tv_blob_check_range(3, 0, 3, false), FAIL); // n2 == bloblen is out of range.
+        assert_eq!(tv_blob_check_range(3, 2, 1, false), FAIL); // n2 < n1.
+    }
+
+    #[test]
     fn tv_blob_set_ret_wires_value_and_increments_refcount() {
         let b = tv_blob_alloc();
         let mut tv = TypvalT::default();
@@ -6694,6 +6797,56 @@ mod tests {
             assert_eq!(tv_list_idx_of_item(l, item1), 1);
             assert_eq!(tv_list_idx_of_item(l, std::ptr::null()), -1);
             assert_eq!(tv_list_idx_of_item(std::ptr::null(), item0), -1);
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_check_range_index_one_normalizes_negative_and_rejects_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(2);
+        unsafe {
+            tv_list_append_number(l, 10);
+            tv_list_append_number(l, 20);
+
+            let mut n1 = -1;
+            let li = tv_list_check_range_index_one(l, &mut n1, false);
+            assert!(!li.is_null());
+            assert_eq!((*li).li_tv.value, TypvalValue::Number(20));
+
+            let mut n1 = 5;
+            assert!(tv_list_check_range_index_one(l, &mut n1, false).is_null());
+
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_check_range_index_two_resolves_negative_n2_and_rejects_reversed_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_number(l, 10);
+            tv_list_append_number(l, 20);
+            tv_list_append_number(l, 30);
+            let li1 = (*l).lv_first;
+
+            // n2 == -1 resolves to the last item's index (2).
+            let mut n1 = 0;
+            let mut n2 = -1;
+            assert_eq!(tv_list_check_range_index_two(l, &mut n1, li1, &mut n2, false), OK);
+            assert_eq!(n2, 2);
+
+            // An out-of-range negative n2 fails.
+            let mut n1 = 0;
+            let mut n2 = -10;
+            assert_eq!(tv_list_check_range_index_two(l, &mut n1, li1, &mut n2, false), FAIL);
+
+            // n2 before n1 fails (reversed range).
+            let mut n1 = 2;
+            let mut n2 = 0;
+            assert_eq!(tv_list_check_range_index_two(l, &mut n1, li1, &mut n2, false), FAIL);
 
             tv_list_free(l);
         }
