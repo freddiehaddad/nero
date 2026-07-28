@@ -428,6 +428,12 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"blob2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_blob2list });
         m.insert(&b"list2blob"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_list2blob });
         m.insert(&b"string"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_string });
+        m.insert(&b"assert_equal"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_assert_equal });
+        m.insert(&b"assert_notequal"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_assert_notequal });
+        m.insert(&b"assert_true"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_assert_true });
+        m.insert(&b"assert_false"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_assert_false });
+        m.insert(&b"assert_report"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_assert_report });
+        m.insert(&b"assert_inrange"[..], EvalFuncDefT { min_argc: 3, max_argc: 4, base_arg: 3, func: f_assert_inrange });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
@@ -2933,6 +2939,84 @@ unsafe fn f_list2blob(argvars: &[TypvalT], rettv: &mut TypvalT) {
 unsafe fn f_string(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     rettv.value = TypvalValue::String(Some(unsafe { crate::eval::encode::encode_tv2string(&argvars[0]) }));
+}
+
+/// `assert_equal({expected}, {actual}[, {msg}])` - records a
+/// `v:errors` entry when `{expected}` and `{actual}` are not equal
+/// (`f_assert_equal`, `testing.c`), via
+/// [`crate::testing::assert_equal_common`].
+///
+/// # Safety
+/// Forwarded from [`crate::testing::assert_equal_common`]'s own safety
+/// doc.
+unsafe fn f_assert_equal(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_equal_common(argvars, crate::testing::AssertType::Equal) });
+}
+
+/// `assert_notequal({expected}, {actual}[, {msg}])` - records a
+/// `v:errors` entry when `{expected}` and `{actual}` ARE equal
+/// (`f_assert_notequal`, `testing.c`).
+///
+/// # Safety
+/// Same as [`f_assert_equal`].
+unsafe fn f_assert_notequal(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_equal_common(argvars, crate::testing::AssertType::NotEqual) });
+}
+
+/// `assert_true({actual}[, {msg}])` - records a `v:errors` entry when
+/// `{actual}` isn't `true`-like (`1`, or `v:true`) (`f_assert_true`,
+/// `testing.c`), via [`crate::testing::assert_bool`].
+///
+/// # Safety
+/// Forwarded from [`crate::testing::assert_bool`]'s own safety doc.
+unsafe fn f_assert_true(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_bool(argvars, true) });
+}
+
+/// `assert_false({actual}[, {msg}])` - records a `v:errors` entry when
+/// `{actual}` isn't `false`-like (`0`, or `v:false`)
+/// (`f_assert_false`, `testing.c`).
+///
+/// # Safety
+/// Same as [`f_assert_true`].
+unsafe fn f_assert_false(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_bool(argvars, false) });
+}
+
+/// `assert_report({msg})` - unconditionally records `{msg}` as a
+/// `v:errors` entry (`f_assert_report`, `testing.c`).
+///
+/// # Safety
+/// Forwarded from [`crate::testing::assert_error`]'s own safety doc.
+unsafe fn f_assert_report(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut ga = crate::testing::prepare_assert_error();
+    ga.extend_from_slice(&crate::eval::typval::tv_get_string(&argvars[0]));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::testing::assert_error(&ga) };
+    rettv.value = TypvalValue::Number(1);
+}
+
+/// `assert_inrange({lower}, {upper}, {actual}[, {msg}])` - records a
+/// `v:errors` entry when `{actual}` isn't within `{lower}..={upper}`
+/// (`f_assert_inrange`, `testing.c`), via
+/// [`crate::testing::assert_inrange`].
+///
+/// # Safety
+/// Forwarded from [`crate::testing::assert_inrange`]'s own safety doc.
+unsafe fn f_assert_inrange(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_float_or_nr_arg(argvars, 0) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_float_or_nr_arg(argvars, 1) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_float_or_nr_arg(argvars, 2) == crate::vim_defs::FAIL
+        || (argvars.len() > 3 && crate::eval::typval::tv_check_for_opt_string_arg(argvars, 3) == crate::vim_defs::FAIL)
+    {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(unsafe { crate::testing::assert_inrange(argvars) });
 }
 
 /// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a
@@ -10091,6 +10175,93 @@ mod tests {
         unsafe { f_string(&[TypvalT { value: TypvalValue::List(l), ..Default::default() }], &mut rettv2) };
         assert_eq!(rettv2.value, TypvalValue::String(Some(b"[1, 2]".to_vec())));
         unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    // --- f_assert_equal / f_assert_notequal / f_assert_true / f_assert_false / f_assert_report / f_assert_inrange ---
+
+    fn reset_v_errors_for_funcs_test() {
+        unsafe {
+            let tv = crate::eval::vars::get_vim_var_tv(crate::eval::vars::VimVarIndex::Errors);
+            if let TypvalValue::List(l) = (*tv).value {
+                if !l.is_null() {
+                    crate::eval::typval::tv_list_unref(l);
+                }
+            }
+            (*tv).value = TypvalValue::List(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn assert_equal_and_notequal_builtins_wire_through_correctly() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors_for_funcs_test();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_equal(&[num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_equal(&[num(1), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_notequal(&[num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        reset_v_errors_for_funcs_test();
+    }
+
+    #[test]
+    fn assert_true_and_false_builtins_wire_through_correctly() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors_for_funcs_test();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_true(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_false(&[num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        reset_v_errors_for_funcs_test();
+    }
+
+    #[test]
+    fn assert_report_builtin_always_records_and_returns_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors_for_funcs_test();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_report(&[string(b"oops")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        reset_v_errors_for_funcs_test();
+    }
+
+    #[test]
+    fn assert_inrange_builtin_wires_through_correctly() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_v_errors_for_funcs_test();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_inrange(&[num(1), num(10), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_inrange(&[num(1), num(10), num(20)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        // Optional msg arg omitted entirely (argvars.len() == 3) must
+        // not panic - the real bug this test specifically guards
+        // against (tv_check_for_opt_string_arg indexes argvars[3]
+        // directly, which is only safe because f_assert_inrange
+        // guards it with `argvars.len() > 3` first).
+        let mut rettv = TypvalT::default();
+        unsafe { f_assert_inrange(&[num(1), num(10), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        reset_v_errors_for_funcs_test();
     }
 
     // --- f_sha256 ---

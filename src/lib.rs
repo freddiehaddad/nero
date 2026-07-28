@@ -102,6 +102,7 @@ pub mod state_defs;
 pub mod statusline_defs;
 pub mod strings;
 pub mod tag;
+pub mod testing;
 pub mod types_defs;
 pub mod undo;
 pub mod undo_defs;
