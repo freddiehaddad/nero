@@ -8329,6 +8329,37 @@ mod tests {
     }
 
     #[test]
+    fn e2e_filter_map_on_a_blob_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // filter() on a real Blob LITERAL (0z-prefixed hex bytes)
+        // through the whole parser chain (eval_number's blob branch).
+        let (ret, tv) = eval_str(b"filter(0z01000200, 'v:val')");
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(filtered) = tv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(filtered), 2);
+            assert_eq!(crate::eval::typval::tv_blob_get(filtered, 0), 1);
+            assert_eq!(crate::eval::typval::tv_blob_get(filtered, 1), 2);
+            crate::eval::typval::tv_blob_unref(filtered);
+        }
+
+        // map() - each byte incremented by 1.
+        let (ret, tv) = eval_str(b"map(0z0a0b0c, 'v:val + 1')");
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(mapped) = tv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_get(mapped, 0), 0x0b);
+            assert_eq!(crate::eval::typval::tv_blob_get(mapped, 1), 0x0c);
+            assert_eq!(crate::eval::typval::tv_blob_get(mapped, 2), 0x0d);
+            crate::eval::typval::tv_blob_unref(mapped);
+        }
+
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_add_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

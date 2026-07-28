@@ -2807,7 +2807,21 @@ pub unsafe fn filter_map_one(
         remove = tv_get_number_chk(&newtv, Some(&mut error)) == 0;
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { tv_clear_simple(&newtv) };
-        newtv = TypvalT::default();
+        // Deliberately NOT reset to TypvalT::default() here: the
+        // original's own `tv_clear(newtv)` (via `encode_vim_to_nothing`)
+        // only releases whatever OWNED resource the value holds
+        // (List/Dict/Blob/Partial/Func refcounts) - it never touches
+        // `newtv->v_type` itself. For the overwhelmingly common case
+        // (an ordinary Number/Bool result), tv_clear is a complete
+        // no-op, and newtv keeps its real Number/Bool value/type
+        // afterward - filter_map_blob's own caller-side check
+        // (`newtv.v_type != VAR_NUMBER && newtv.v_type != VAR_BOOL`)
+        // depends on exactly this NOT being reset to Unknown here.
+        // Caught via 2 real, reproducible test failures before this
+        // fix (blob byte removal silently doing nothing) - resetting
+        // to Default was an extra, incorrect step this crate's own
+        // tv_clear_simple's &-not-&mut signature already hints isn't
+        // what the original does.
         // On type error, nothing has been removed; return FAIL to stop
         // the loop. The error message was given by tv_get_number_chk().
         if error {
@@ -2816,7 +2830,6 @@ pub unsafe fn filter_map_one(
     } else if filtermap == FilterMapT::Foreach {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { tv_clear_simple(&newtv) };
-        newtv = TypvalT::default();
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -2997,18 +3010,112 @@ pub unsafe fn filter_map_dict(d: *mut DictT, filtermap: FilterMapT, expr: &Typva
     unsafe { (*d).dv_lock = prev_lock };
 }
 
+/// Implementation of `map()`/`mapnew()`/`filter()`/`foreach()` for a
+/// `Blob`. Apply `expr` to every byte in `blob_arg` and return the
+/// result in `rettv` (`filter_map_blob`).
+///
+/// The original's own in-place byte removal
+/// (`memmove(p + i, p + i + 1, ...)`) becomes a plain
+/// `Vec::remove` - `GarrayT.ga_data` is already a real `Vec<u8>` in
+/// this crate (see `garray_defs.rs`'s own doc comment), so there is no
+/// manual pointer arithmetic to replicate.
+///
+/// # Safety
+/// `blob_arg`, if non-null, must be a valid pointer to a live
+/// `crate::eval::typval_defs::BlobT`; `expr` must be valid (forwards
+/// `filter_map_one`'s own safety requirements).
+pub unsafe fn filter_map_blob(
+    blob_arg: *mut crate::eval::typval_defs::BlobT,
+    filtermap: FilterMapT,
+    expr: &TypvalT,
+    rettv: &mut TypvalT,
+) {
+    use crate::eval::vars::{set_vim_var_nr, set_vim_var_type, VimVarIndex};
+
+    if filtermap == FilterMapT::MapNew {
+        rettv.value = TypvalValue::Blob(std::ptr::null_mut());
+    }
+    let b = blob_arg;
+    if b.is_null()
+        || (filtermap == FilterMapT::Filter && value_check_lock(unsafe { (*b).bv_lock }, None))
+    {
+        return;
+    }
+
+    let mut b_ret = b;
+    if filtermap == FilterMapT::MapNew {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_blob_copy(b, rettv) };
+        let TypvalValue::Blob(new_b) = rettv.value else {
+            unreachable!("tv_blob_copy always sets rettv.value to Blob(_)")
+        };
+        b_ret = new_b;
+    }
+
+    // set_vim_var_nr() doesn't set the type.
+    unsafe { set_vim_var_type(VimVarIndex::Key, VarType::Number) };
+
+    let prev_lock = unsafe { (*b).bv_lock };
+    if prev_lock == VarLockStatus::Unlocked {
+        unsafe { (*b).bv_lock = VarLockStatus::Locked };
+    }
+
+    let mut i: i32 = 0;
+    let mut idx: VarnumberT = 0;
+    while i < unsafe { (*b).bv_ga.ga_len } {
+        // SAFETY: forwarded from this function's own safety doc.
+        let val = unsafe { tv_blob_get(b, i) };
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::Number(VarnumberT::from(val)),
+        };
+        unsafe { set_vim_var_nr(VimVarIndex::Key, idx) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, newtv, rem) = unsafe { filter_map_one(&tv, expr, filtermap) };
+        if ret == FAIL {
+            unsafe { tv_clear_simple(&newtv) };
+            break;
+        }
+
+        if filtermap != FilterMapT::Foreach {
+            if !matches!(newtv.value, TypvalValue::Number(_) | TypvalValue::Bool(_)) {
+                unsafe { tv_clear_simple(&newtv) };
+                // emsg(_(e_invalblob)) omitted - message display, not
+                // tractable; the identical break is kept.
+                break;
+            }
+            if filtermap != FilterMapT::Filter {
+                let new_val = tv_get_number(&newtv);
+                if new_val != VarnumberT::from(val) {
+                    unsafe { tv_blob_set(b_ret, i, new_val as u8) };
+                }
+            } else if rem {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    (*blob_arg).bv_ga.ga_data.remove(i as usize);
+                    (*blob_arg).bv_ga.ga_len -= 1;
+                }
+                i -= 1;
+            }
+        }
+        idx += 1;
+        i += 1;
+    }
+
+    unsafe { (*b).bv_lock = prev_lock };
+}
+
 /// Implementation of `map()`, `mapnew()`, `filter()` and `foreach()`
 /// (`filter_map`).
 ///
-/// [`TypvalValue::List`]/[`TypvalValue::Dict`] are both modeled -
-/// [`TypvalValue::Blob`]/[`TypvalValue::String`] each need their own
-/// `filter_map_blob`/`filter_map_string` iteration, not yet
-/// translated - `unimplemented!()`s if either is ever passed as the
-/// first argument.
+/// [`TypvalValue::List`]/[`TypvalValue::Dict`]/[`TypvalValue::Blob`]
+/// are all modeled - [`TypvalValue::String`] needs its own
+/// `filter_map_string` iteration, not yet translated -
+/// `unimplemented!()`s if it is ever passed as the first argument.
 ///
 /// # Safety
-/// Forwards `filter_map_list`/`filter_map_dict`'s own safety
-/// requirements for `argvars[0]`.
+/// Forwards `filter_map_list`/`filter_map_dict`/`filter_map_blob`'s
+/// own safety requirements for `argvars[0]`.
 pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: FilterMapT) {
     use crate::eval::vars::{prepare_vimvar, VimVarIndex};
 
@@ -3020,10 +3127,7 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
     }
 
     match &argvars[0].value {
-        TypvalValue::Blob(_) => unimplemented!(
-            "filter_map: Blob argument needs filter_map_blob, not yet translated"
-        ),
-        TypvalValue::List(_) | TypvalValue::Dict(_) => {}
+        TypvalValue::Blob(_) | TypvalValue::List(_) | TypvalValue::Dict(_) => {}
         TypvalValue::String(_) => unimplemented!(
             "filter_map: String argument needs filter_map_string, not yet translated"
         ),
@@ -3066,6 +3170,10 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
         TypvalValue::Dict(d) => {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { filter_map_dict(d, filtermap, expr, rettv) };
+        }
+        TypvalValue::Blob(b) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { filter_map_blob(b, filtermap, expr, rettv) };
         }
         _ => unreachable!("filter_map: argvars[0] type was already validated above"),
     }
@@ -8153,26 +8261,110 @@ mod filter_map_tests {
         unsafe { tv_dict_unref(d) };
     }
 
-    #[test]
-    #[should_panic(expected = "filter_map_blob")]
-    fn filter_panics_on_a_blob_argument() {
-        let _lock = crate::globals::global_state_test_lock();
+    fn blob_of(bytes: &[u8]) -> *mut crate::eval::typval_defs::BlobT {
         let b = tv_blob_alloc();
+        unsafe {
+            (*b).bv_ga.ga_data.extend_from_slice(bytes);
+            (*b).bv_ga.ga_len = bytes.len() as i32;
+        }
+        b
+    }
+
+    fn blob_bytes(b: *mut crate::eval::typval_defs::BlobT) -> Vec<u8> {
+        unsafe { (&(*b).bv_ga.ga_data)[..(*b).bv_ga.ga_len as usize].to_vec() }
+    }
+
+    #[test]
+    fn filter_removes_blob_bytes_that_are_falsy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[1, 0, 2, 0, 3]);
+        let argvars =
+            [TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() }, string_expr(b"v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+
+        assert_eq!(blob_bytes(b), vec![1, 2, 3]);
+        assert!(matches!(rettv.value, TypvalValue::Blob(p) if p == b));
+
+        unsafe { tv_blob_unref(b) };
+    }
+
+    #[test]
+    fn map_replaces_each_blob_byte_in_place() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[1, 2, 3]);
+        let argvars = [
+            TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() },
+            string_expr(b"v:val + 10"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        assert_eq!(blob_bytes(b), vec![11, 12, 13]);
+
+        unsafe { tv_blob_unref(b) };
+    }
+
+    #[test]
+    fn mapnew_builds_a_new_blob_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[1, 2, 3]);
+        let argvars = [
+            TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() },
+            string_expr(b"v:val + 100"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::MapNew) };
+
+        // Original untouched.
+        assert_eq!(blob_bytes(b), vec![1, 2, 3]);
+        let TypvalValue::Blob(b_new) = rettv.value else { panic!("expected a new Blob") };
+        assert_ne!(b_new, b);
+        assert_eq!(blob_bytes(b_new), vec![101, 102, 103]);
+
+        unsafe {
+            tv_blob_unref(b);
+            tv_blob_unref(b_new);
+        }
+    }
+
+    #[test]
+    fn v_key_reflects_the_zero_based_index_during_blob_iteration() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[10, 20, 30]);
+        let argvars = [
+            TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() },
+            string_expr(b"v:val + v:key"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        assert_eq!(blob_bytes(b), vec![10, 21, 32]);
+        unsafe { tv_blob_unref(b) };
+    }
+
+    #[test]
+    fn filter_on_an_empty_blob_is_a_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[]);
         let argvars =
             [TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() }, string_expr(b"1")];
         let mut rettv = TypvalT::default();
-        // Same force-free-then-re-panic discipline as
-        // filter_panics_on_a_dict_argument above - a fresh, empty Blob
-        // has no separate GC-linked-list of its own (only List/Dict do),
-        // but freeing it explicitly is still the right thing to do
-        // rather than leaking the allocation.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            filter(&argvars, &mut rettv, FilterMapT::Filter);
-        }));
-        unsafe { tv_blob_free(b) };
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(blob_bytes(b), Vec::<u8>::new());
+        unsafe { tv_blob_unref(b) };
+    }
+
+    #[test]
+    fn filter_stays_faithful_when_removing_the_first_blob_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = blob_of(&[0, 1, 2]);
+        let argvars =
+            [TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() }, string_expr(b"v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(blob_bytes(b), vec![1, 2]);
+        unsafe { tv_blob_unref(b) };
     }
 
     #[test]
