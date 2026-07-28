@@ -37,9 +37,20 @@
 //! `hide`/`focusable` fields for `win_has_winnr`'s own floating-
 //! window-aware numbering check. `get_winnr`'s own digit+direction
 //! argument form (e.g. `winnr("3j")`) needs `win_vert_neighbor`/
-//! `win_horz_neighbor` (real window-layout geometry, not yet
-//! translated) and panics via `unimplemented!()` if actually reached -
-//! the common no-argument, `"$"`, and `"#"` cases are fully modeled.
+//! `win_horz_neighbor` (real window-layout geometry) - now translated
+//! (see below), so the full digit+direction form is real too.
+//!
+//! Also translated: `frame2win` (a trivial leaf-of-a-frame-tree walk)
+//! and `win_vert_neighbor`/`win_horz_neighbor` (`window.c`'s own
+//! frame-tree neighbor-navigation algorithms for `winnr("3j")`-style
+//! window movement) - both walk the already-translated `FrameT`'s
+//! `fr_parent`/`fr_prev`/`fr_next`/`fr_child`/`fr_layout`/`fr_win`
+//! fields plus `WinT.w_wincol`/`w_wcol` (vertical)/`w_winrow`/`w_wrow`
+//! (horizontal) for the "which child is under the cursor" sub-search -
+//! all fields already existed. Neither needs `win_goto` (which would
+//! also redraw/switch real editor focus, not translated) - they just
+//! COMPUTE a candidate window, matching `get_winnr`'s own read-only
+//! use exactly.
 //!
 //! Also translated: `check_can_set_curbuf_disabled`/
 //! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
@@ -377,13 +388,12 @@ pub unsafe fn win_findbuf(bufnr: i32) -> Vec<crate::types_defs::HandleT> {
 /// common case - the CURRENT window's own number, `0` for a hidden/
 /// non-focusable window unless it IS the current window).
 ///
-/// Only `arg == None`, `b"$"` (last window), and `b"#"` (previous
-/// window) are modeled - the digit+direction form (e.g. `b"3j"`)
-/// needs `win_vert_neighbor`/`win_horz_neighbor` (real window-layout
-/// geometry, not yet translated) and panics via `unimplemented!()` if
-/// actually reached; any other unrecognized `arg` returns `0`
-/// (matching the original's own `invalid_arg` path, whose real
-/// `semsg` display is omitted - message display, not tractable).
+/// `arg == None`, `b"$"` (last window), `b"#"` (previous window), and
+/// the digit+direction form (e.g. `b"3j"`, via [`win_vert_neighbor`]/
+/// [`win_horz_neighbor`]) are all modeled; any other unrecognized
+/// `arg` returns `0` (matching the original's own `invalid_arg` path,
+/// whose real `semsg` display is omitted - message display, not
+/// tractable).
 ///
 /// # Safety
 /// `tp` must be a valid, non-null pointer to a live `TabpageT`, and
@@ -425,15 +435,27 @@ pub unsafe fn get_winnr(tp: *const crate::buffer_defs::TabpageT, arg: Option<&[u
             }
         } else {
             let (count, consumed) = crate::charset::getdigits_int(arg, false, 0);
-            let _count = if count <= 0 { 1 } else { count };
+            let count = if count <= 0 { 1 } else { count };
             let dir = &arg[consumed..];
-            if dir == b"j" || dir == b"k" || dir == b"h" || dir == b"l" {
-                unimplemented!(
-                    "get_winnr: digit+direction form (e.g. \"3j\") needs \
-                     win_vert_neighbor/win_horz_neighbor, not yet translated"
-                );
+            let mut invalid_arg = false;
+            if dir == b"j" {
+                // SAFETY: forwarded from this function's own safety doc.
+                twin = unsafe { win_vert_neighbor(tp, twin, false, count) };
+            } else if dir == b"k" {
+                // SAFETY: forwarded from this function's own safety doc.
+                twin = unsafe { win_vert_neighbor(tp, twin, true, count) };
+            } else if dir == b"h" {
+                // SAFETY: forwarded from this function's own safety doc.
+                twin = unsafe { win_horz_neighbor(tp, twin, true, count) };
+            } else if dir == b"l" {
+                // SAFETY: forwarded from this function's own safety doc.
+                twin = unsafe { win_horz_neighbor(tp, twin, false, count) };
+            } else {
+                invalid_arg = true;
             }
-            nr = 0;
+            if invalid_arg {
+                nr = 0;
+            }
         }
     // SAFETY: forwarded from this function's own safety doc.
     } else if !unsafe { win_has_winnr(twin, tp) } {
@@ -752,6 +774,219 @@ pub unsafe fn find_tabwin(wvp: &TypvalT, tvp: &TypvalT) -> *mut WinT {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { find_win_by_nr(wvp, tp) }
+}
+
+/// Get the leaf window contained within frame `frp` (`frame2win`) - a
+/// non-leaf frame's own `fr_child` chain always bottoms out at a leaf
+/// (`fr_win.is_some()`) eventually, matching the original's own
+/// unconditional `while (frp->fr_win == NULL) { frp = frp->fr_child; }`
+/// loop (no bounds/null check - a well-formed frame tree, which is all
+/// this crate can ever construct, always terminates).
+///
+/// # Safety
+/// `frp` must be a valid, non-null pointer to a live `FrameT`, and its
+/// own `fr_child` chain must consist of valid, live `FrameT` pointers
+/// down to a leaf.
+#[must_use]
+pub unsafe fn frame2win(mut frp: *const crate::buffer_defs::FrameT) -> *mut WinT {
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let fr = unsafe { &*frp };
+        if !fr.fr_win.is_null() {
+            return fr.fr_win;
+        }
+        frp = fr.fr_child;
+    }
+}
+
+/// Get the window `count` positions above (`up == true`) or below
+/// `wp` in `tp`'s frame tree (`win_vert_neighbor`). Returns `wp`
+/// itself (via `foundfr` staying `wp.w_frame`) if no such neighbor
+/// exists.
+///
+/// # Safety
+/// `wp`/`tp` must be valid, non-null pointers; `wp.w_frame`'s own
+/// `fr_parent`/`fr_next`/`fr_prev`/`fr_child` chains, and `tp`'s own
+/// `tp_topframe`, must consist of valid, live pointers.
+#[must_use]
+pub unsafe fn win_vert_neighbor(
+    tp: *const crate::buffer_defs::TabpageT,
+    wp: *mut WinT,
+    up: bool,
+    count: i32,
+) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    let mut foundfr = w.w_frame;
+
+    if w.w_floating {
+        // SAFETY: forwarded from this function's own safety doc.
+        let prevwin = unsafe { crate::globals::GLOBALS.get_mut() }.prevwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        return if unsafe { win_valid(prevwin) } && !unsafe { &*prevwin }.w_floating {
+            prevwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        };
+    }
+
+    let mut remaining = count;
+    'outer: while remaining > 0 {
+        remaining -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut fr = foundfr;
+        let nfr;
+        loop {
+            if std::ptr::eq(fr, unsafe { &*tp }.tp_topframe) {
+                break 'outer;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let f = unsafe { &*fr };
+            let candidate = if up { f.fr_prev } else { f.fr_next };
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*f.fr_parent }.fr_layout == crate::buffer_defs::FR_COL && !candidate.is_null() {
+                nfr = candidate;
+                break;
+            }
+            fr = f.fr_parent;
+        }
+
+        // Now go downwards to find the bottom or top frame in it.
+        let mut nfr = nfr;
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = unsafe { &*nfr };
+            if n.fr_layout == crate::buffer_defs::FR_LEAF {
+                foundfr = nfr;
+                break;
+            }
+            let mut fr = n.fr_child;
+            if n.fr_layout == crate::buffer_defs::FR_ROW {
+                // Find the frame at the cursor column.
+                loop {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let f = unsafe { &*fr };
+                    if f.fr_next.is_null() {
+                        break;
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let fw = unsafe { &*frame2win(fr) };
+                    if fw.w_wincol + f.fr_width > w.w_wincol + w.w_wcol {
+                        break;
+                    }
+                    fr = f.fr_next;
+                }
+            }
+            if n.fr_layout == crate::buffer_defs::FR_COL && up {
+                loop {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let f = unsafe { &*fr };
+                    if f.fr_next.is_null() {
+                        break;
+                    }
+                    fr = f.fr_next;
+                }
+            }
+            nfr = fr;
+        }
+    }
+
+    if foundfr.is_null() { std::ptr::null_mut() } else { unsafe { &*foundfr }.fr_win }
+}
+
+/// Get the window `count` positions to the left (`left == true`) or
+/// right of `wp` in `tp`'s frame tree (`win_horz_neighbor`). Returns
+/// `wp` itself (via `foundfr` staying `wp.w_frame`) if no such
+/// neighbor exists.
+///
+/// # Safety
+/// Same requirements as [`win_vert_neighbor`].
+#[must_use]
+pub unsafe fn win_horz_neighbor(
+    tp: *const crate::buffer_defs::TabpageT,
+    wp: *mut WinT,
+    left: bool,
+    count: i32,
+) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    let mut foundfr = w.w_frame;
+
+    if w.w_floating {
+        // SAFETY: forwarded from this function's own safety doc.
+        let prevwin = unsafe { crate::globals::GLOBALS.get_mut() }.prevwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        return if unsafe { win_valid(prevwin) } && !unsafe { &*prevwin }.w_floating {
+            prevwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        };
+    }
+
+    let mut remaining = count;
+    'outer: while remaining > 0 {
+        remaining -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut fr = foundfr;
+        let nfr;
+        loop {
+            if std::ptr::eq(fr, unsafe { &*tp }.tp_topframe) {
+                break 'outer;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let f = unsafe { &*fr };
+            let candidate = if left { f.fr_prev } else { f.fr_next };
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*f.fr_parent }.fr_layout == crate::buffer_defs::FR_ROW && !candidate.is_null() {
+                nfr = candidate;
+                break;
+            }
+            fr = f.fr_parent;
+        }
+
+        // Now go downwards to find the leftmost or rightmost frame in it.
+        let mut nfr = nfr;
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = unsafe { &*nfr };
+            if n.fr_layout == crate::buffer_defs::FR_LEAF {
+                foundfr = nfr;
+                break;
+            }
+            let mut fr = n.fr_child;
+            if n.fr_layout == crate::buffer_defs::FR_COL {
+                // Find the frame at the cursor row.
+                loop {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let f = unsafe { &*fr };
+                    if f.fr_next.is_null() {
+                        break;
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let fw = unsafe { &*frame2win(fr) };
+                    if fw.w_winrow + f.fr_height > w.w_winrow + w.w_wrow {
+                        break;
+                    }
+                    fr = f.fr_next;
+                }
+            }
+            if n.fr_layout == crate::buffer_defs::FR_ROW && left {
+                loop {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let f = unsafe { &*fr };
+                    if f.fr_next.is_null() {
+                        break;
+                    }
+                    fr = f.fr_next;
+                }
+            }
+            nfr = fr;
+        }
+    }
+
+    if foundfr.is_null() { std::ptr::null_mut() } else { unsafe { &*foundfr }.fr_win }
 }
 
 /// Check if `wp` is at the bottom of its column of windows - i.e.
@@ -1739,16 +1974,106 @@ mod tests {
     }
 
     #[test]
-    fn get_winnr_digit_direction_form_is_unimplemented() {
+    fn get_winnr_digit_direction_form_navigates_to_a_real_neighbor() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = focusable_win(1);
+        let mut win2 = focusable_win(2);
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let mut leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let leaf1_ptr = &mut leaf1 as *mut crate::buffer_defs::FrameT;
+        // SAFETY: `leaf2_ptr`/`leaf1_ptr` are valid, live pointers into
+        // this test's own locals.
+        unsafe { (*leaf2_ptr).fr_prev = leaf1_ptr };
+        let mut col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: leaf1_ptr,
+            ..Default::default()
+        };
+        let col_ptr = &mut col as *mut crate::buffer_defs::FrameT;
+        // SAFETY: forwarded from the earlier comment.
+        unsafe {
+            (*leaf1_ptr).fr_parent = col_ptr;
+            (*leaf2_ptr).fr_parent = col_ptr;
+            (*win1_ptr).w_frame = leaf1_ptr;
+            (*win2_ptr).w_frame = leaf2_ptr;
+            // Separate, plain window-LIST linkage (distinct from the
+            // frame-tree linkage above) - needed by get_winnr's own
+            // trailing "count up to twin" walk from `firstwin`.
+            (*win1_ptr).w_next = win2_ptr;
+        }
+        let mut tp = crate::buffer_defs::TabpageT { tp_topframe: col_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinnrGlobalsGuard::set(win1_ptr, tp_ptr, win1_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+
+        // From win1 (top), "1j" (down) reaches win2.
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"1j")) }, 2);
+        // From win1 (top), "1k" (up) has no neighbor - stays on win1.
+        assert_eq!(unsafe { get_winnr(tp_ptr, Some(b"1k")) }, 1);
+    }
+
+    #[test]
+    fn win_vert_neighbor_returns_wp_itself_when_no_neighbor_exists() {
         let _lock = crate::globals::global_state_test_lock();
         let mut win = focusable_win(1);
-        let mut tp = crate::buffer_defs::TabpageT::default();
         let win_ptr = &mut win as *mut WinT;
-        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
-        let _guard = WinnrGlobalsGuard::set(win_ptr, tp_ptr, win_ptr, std::ptr::null_mut(), std::ptr::null_mut());
+        let mut leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &mut leaf as *mut crate::buffer_defs::FrameT;
+        // SAFETY: `win_ptr` is a valid, live pointer into this test's
+        // own local.
+        unsafe { (*win_ptr).w_frame = leaf_ptr };
+        let tp = crate::buffer_defs::TabpageT { tp_topframe: leaf_ptr, ..Default::default() };
 
-        let result = std::panic::catch_unwind(|| unsafe { get_winnr(tp_ptr, Some(b"3j")) });
-        assert!(result.is_err(), "expected a panic (win_vert_neighbor not yet translated)");
+        let found = unsafe { win_vert_neighbor(&tp, win_ptr, true, 1) };
+        assert_eq!(found, win_ptr);
+    }
+
+    #[test]
+    fn win_horz_neighbor_finds_the_right_neighbor_in_a_row_split() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = focusable_win(1);
+        let mut win2 = focusable_win(2);
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let mut leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let leaf1_ptr = &mut leaf1 as *mut crate::buffer_defs::FrameT;
+        // SAFETY: `leaf1_ptr`/`leaf2_ptr` are valid, live pointers into
+        // this test's own locals.
+        unsafe { (*leaf2_ptr).fr_prev = leaf1_ptr };
+        let mut row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: leaf1_ptr,
+            ..Default::default()
+        };
+        let row_ptr = &mut row as *mut crate::buffer_defs::FrameT;
+        // SAFETY: forwarded from the earlier comment.
+        unsafe {
+            (*leaf1_ptr).fr_parent = row_ptr;
+            (*leaf2_ptr).fr_parent = row_ptr;
+            (*win1_ptr).w_frame = leaf1_ptr;
+            (*win2_ptr).w_frame = leaf2_ptr;
+        }
+        let tp = crate::buffer_defs::TabpageT { tp_topframe: row_ptr, ..Default::default() };
+
+        let found = unsafe { win_horz_neighbor(&tp, win1_ptr, false, 1) };
+        assert_eq!(found, win2_ptr);
+    }
+
+    #[test]
+    fn frame2win_walks_down_to_the_leaf() {
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT as *mut crate::buffer_defs::FrameT;
+        let root =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_ROW, fr_child: leaf_ptr, ..Default::default() };
+        assert_eq!(unsafe { frame2win(&root) }, win_ptr);
     }
 
     // ---- find_tabwin ----
