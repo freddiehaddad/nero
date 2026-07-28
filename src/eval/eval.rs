@@ -9204,6 +9204,57 @@ mod tests {
     }
 
     #[test]
+    fn e2e_sort_and_uniq_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // Default comparison is by STRING form: "10" < "2" < "9".
+        let (ret, tv) = eval_str(b"sort([10, 9, 2])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        let mut nums = Vec::new();
+        unsafe {
+            let mut li = crate::eval::typval::tv_list_first(l);
+            while !li.is_null() {
+                if let TypvalValue::Number(n) = (*li).li_tv.value {
+                    nums.push(n);
+                }
+                li = (*li).li_next;
+            }
+            crate::eval::typval::tv_list_unref(l);
+        }
+        assert_eq!(nums, vec![10, 2, 9]);
+
+        // "n" flag: numeric comparison.
+        let (ret, tv) = eval_str(b"sort([10, 9, 2], \"n\")");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 3);
+        let first = unsafe { (*crate::eval::typval::tv_list_first(l)).li_tv.value.clone() };
+        assert_eq!(first, TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        // uniq() only collapses ADJACENT duplicates.
+        let (ret, tv) = eval_str(b"uniq([1, 1, 2, 2, 1])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        let mut nums = Vec::new();
+        unsafe {
+            let mut li = crate::eval::typval::tv_list_first(l);
+            while !li.is_null() {
+                if let TypvalValue::Number(n) = (*li).li_tv.value {
+                    nums.push(n);
+                }
+                li = (*li).li_next;
+            }
+            crate::eval::typval::tv_list_unref(l);
+        }
+        assert_eq!(nums, vec![1, 2, 1]);
+
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_count_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

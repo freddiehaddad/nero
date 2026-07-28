@@ -383,6 +383,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"extendnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_extendnew });
         m.insert(&b"range"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_range });
         m.insert(&b"repeat"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_repeat });
+        m.insert(&b"sort"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_sort });
+        m.insert(&b"uniq"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_uniq });
         m.insert(&b"join"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_join });
         m.insert(&b"flatten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flatten });
         m.insert(&b"flattennew"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flattennew });
@@ -2044,6 +2046,35 @@ unsafe fn f_reverse(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
         _ => {}
     }
+}
+
+/// `sort({list} [, {func} [, {dict}]])` builtin (`f_sort`).
+///
+/// Only the default comparator (no `{func}`) is real - a `{func}`
+/// naming/being a custom comparator `unimplemented!()`s the moment
+/// [`crate::eval::typval::do_sort_uniq`] would actually need to CALL
+/// it (needs the full `call_func`/`funcexe_T` machinery, not yet
+/// translated).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::do_sort_uniq`]'s own safety
+/// doc.
+unsafe fn f_sort(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::do_sort_uniq(argvars, rettv, true) };
+}
+
+/// `uniq({list} [, {func} [, {dict}]])` builtin (`f_uniq`).
+///
+/// See [`f_sort`]'s own doc comment for the same custom-comparator
+/// gap.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::do_sort_uniq`]'s own safety
+/// doc.
+unsafe fn f_uniq(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::do_sort_uniq(argvars, rettv, false) };
 }
 
 /// Count the number of times `needle` occurs in `haystack`
@@ -7880,6 +7911,8 @@ mod tests {
             "swapname",
             "clearmatches",
             "getmatches",
+            "sort",
+            "uniq",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }

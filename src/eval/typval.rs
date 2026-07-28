@@ -2874,6 +2874,320 @@ pub unsafe fn tv_list_reverse(l: *mut crate::eval::typval_defs::ListT) {
     list.lv_idx = list.lv_len - list.lv_idx - 1;
 }
 
+/// Parsed options for `sort()`/`uniq()`'s optional 2nd/3rd arguments
+/// (`sortinfo_T`, `eval/typval.c`'s own file-static-by-pointer struct -
+/// translated as a plain by-value struct instead, since Rust's
+/// `slice::sort_by` (used by [`do_sort`]) can receive extra context
+/// via a capturing closure, unlike C's raw `qsort` callback (which has
+/// no spare "userdata" parameter, hence the original's own need for a
+/// `sortinfo_T *sortinfo` file-static for `item_compare`/
+/// `item_compare2` to reach back into) - no such static is needed
+/// here at all).
+#[derive(Default)]
+struct SortInfo {
+    item_compare_ic: bool,
+    item_compare_lc: bool,
+    item_compare_numeric: bool,
+    item_compare_numbers: bool,
+    item_compare_float: bool,
+    /// `true` when a custom comparator (a `Funcref`/`Partial`, or an
+    /// unrecognized non-empty string naming a function) was
+    /// requested. [`do_sort`]/[`do_uniq`] `unimplemented!()` the
+    /// moment they would actually need to CALL it (needs the full
+    /// `call_func`/`funcexe_T` machinery, not yet translated) rather
+    /// than here at parse time - matching the original's own exact
+    /// timing (a custom comparator is only ever invoked lazily, once
+    /// per comparison, never during argument parsing itself).
+    has_custom_comparator: bool,
+}
+
+/// Parse the optional 2nd/3rd arguments to `sort()`/`uniq()`
+/// (`parse_sort_uniq_args`).
+///
+/// The original's own `emsg()`/`semsg()` calls for a genuine type
+/// error are omitted, matching this crate's established "skip the
+/// display, keep the identical `FAIL`" policy.
+fn parse_sort_uniq_args(argvars: &[TypvalT]) -> Result<SortInfo, ()> {
+    let mut info = SortInfo::default();
+
+    let Some(arg1) = argvars.get(1) else {
+        return Ok(info);
+    };
+    if matches!(arg1.value, TypvalValue::Unknown) {
+        return Ok(info);
+    }
+
+    match &arg1.value {
+        TypvalValue::Func(_) | TypvalValue::Partial(_) => {
+            info.has_custom_comparator = true;
+        }
+        TypvalValue::Number(nr) => {
+            if *nr == 1 {
+                info.item_compare_ic = true;
+            } else if *nr != 0 {
+                return Err(());
+            }
+        }
+        _ => {
+            let mut error = false;
+            let nr = tv_get_number_chk(arg1, Some(&mut error));
+            if error {
+                return Err(());
+            }
+            if nr == 1 {
+                info.item_compare_ic = true;
+            } else {
+                // Not a number at all (already excluded VAR_NUMBER
+                // above) - a non-numeric second argument names a
+                // custom comparator, unless it's one of the 5
+                // recognized single-letter shorthand flags.
+                let s = tv_get_string(arg1);
+                if s.is_empty() {
+                    // Empty string means default sort - nothing to do.
+                } else if s == b"n" {
+                    info.item_compare_numeric = true;
+                } else if s == b"N" {
+                    info.item_compare_numbers = true;
+                } else if s == b"f" {
+                    info.item_compare_float = true;
+                } else if s == b"i" {
+                    info.item_compare_ic = true;
+                } else if s == b"l" {
+                    info.item_compare_lc = true;
+                } else {
+                    info.has_custom_comparator = true;
+                }
+            }
+        }
+    }
+
+    if argvars.len() > 2 && !matches!(argvars[2].value, TypvalValue::Unknown) {
+        // Optional 3rd argument: {dict} (`item_compare_selfdict`) -
+        // only matters when actually calling a custom comparator
+        // (tracked via `has_custom_comparator` instead of a separate
+        // field, since nothing else ever reads it).
+        if tv_check_for_dict_arg(argvars, 2) == FAIL {
+            return Err(());
+        }
+    }
+
+    Ok(info)
+}
+
+/// The default (non-custom-function) comparator for `sort()`/`uniq()`
+/// (`item_compare`).
+///
+/// The original's own "break ties by original index" step
+/// (`item_compare`'s own `keep_zero` parameter, used only by
+/// [`do_sort`]) is omitted entirely: Rust's `slice::sort_by` is
+/// documented as STABLE, which already preserves the original
+/// relative order of any two comparison-equal items - exactly the
+/// same observable effect the original's own index-based tie-break
+/// achieves by hand. [`do_uniq`]'s own real need for a genuine `0`
+/// result (to detect adjacent duplicates) is unaffected either way,
+/// since it never asked for tie-breaking in the first place.
+///
+/// The original's own `strcoll` (locale-aware comparison,
+/// `item_compare_lc`) is treated identically to a plain byte
+/// comparison: this crate has no real locale-switching mechanism, so
+/// every session behaves as if under the default "C" locale, under
+/// which `strcoll` and `strcmp` already agree exactly.
+fn item_compare(tv1: &TypvalT, tv2: &TypvalT, info: &SortInfo) -> i32 {
+    if info.item_compare_numbers {
+        let v1 = tv_get_number(tv1);
+        let v2 = tv_get_number(tv2);
+        return if v1 == v2 {
+            0
+        } else if v1 > v2 {
+            1
+        } else {
+            -1
+        };
+    }
+
+    if info.item_compare_float {
+        let v1 = tv_get_float(tv1);
+        let v2 = tv_get_float(tv2);
+        return if v1 == v2 {
+            0
+        } else if v1 > v2 {
+            1
+        } else {
+            -1
+        };
+    }
+
+    // encode_tv2string() puts quotes around a string and allocates -
+    // don't do that for string VALUES themselves. Use a single quote
+    // when comparing with a non-string, to do what the docs promise.
+    let p1: Vec<u8> = if let TypvalValue::String(_) = tv1.value {
+        if !matches!(tv2.value, TypvalValue::String(_)) || info.item_compare_numeric {
+            vec![b'\'']
+        } else {
+            tv_get_string(tv1)
+        }
+    } else {
+        // SAFETY: only reads tv1, no ownership concerns.
+        unsafe { crate::eval::encode::encode_tv2string(tv1) }
+    };
+    let p2: Vec<u8> = if let TypvalValue::String(_) = tv2.value {
+        if !matches!(tv1.value, TypvalValue::String(_)) || info.item_compare_numeric {
+            vec![b'\'']
+        } else {
+            tv_get_string(tv2)
+        }
+    } else {
+        // SAFETY: only reads tv2, no ownership concerns.
+        unsafe { crate::eval::encode::encode_tv2string(tv2) }
+    };
+
+    if !info.item_compare_numeric {
+        crate::mbyte::mb_strcmp_ic(info.item_compare_ic, &p1, &p2)
+    } else {
+        let n1 = crate::eval::eval::string2float(&p1).0;
+        let n2 = crate::eval::eval::string2float(&p2).0;
+        if n1 == n2 {
+            0
+        } else if n1 > n2 {
+            1
+        } else {
+            -1
+        }
+    }
+}
+
+/// Sort a list in place using `info`'s comparison rules (`do_sort`).
+///
+/// The original's own array-of-pointers + `qsort` + rebuild-the-
+/// linked-list dance is simplified: collect each item's raw pointer
+/// into a `Vec`, `sort_by` (Rust's own guaranteed-stable sort - see
+/// [`item_compare`]'s own doc comment for why this makes the
+/// original's manual index-based tie-break unnecessary), then
+/// re-append each item (via the already-real [`tv_list_append`],
+/// which re-links an EXISTING item rather than allocating a new one)
+/// in the new order.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+unsafe fn do_sort(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
+    if info.has_custom_comparator {
+        unimplemented!(
+            "do_sort: calling a user-supplied comparator (Funcref/Partial/named function - \
+             item_compare2, needs the full call_func/funcexe_T machinery) is not yet translated"
+        );
+    }
+
+    let mut items: Vec<*mut crate::eval::typval_defs::ListitemT> = Vec::new();
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut cur = unsafe { tv_list_first(l) };
+    while !cur.is_null() {
+        items.push(cur);
+        // SAFETY: `cur` is a live item currently linked into `l`.
+        cur = unsafe { (*cur).li_next };
+    }
+
+    items.sort_by(|&a, &b| {
+        // SAFETY: both are live items currently linked into `l`.
+        let (tv1, tv2) = unsafe { (&(*a).li_tv, &(*b).li_tv) };
+        match item_compare(tv1, tv2, info) {
+            n if n < 0 => std::cmp::Ordering::Less,
+            0 => std::cmp::Ordering::Equal,
+            _ => std::cmp::Ordering::Greater,
+        }
+    });
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*l).lv_first = std::ptr::null_mut();
+        (*l).lv_last = std::ptr::null_mut();
+        (*l).lv_idx_item = std::ptr::null_mut();
+        (*l).lv_len = 0;
+    }
+    for item in items {
+        // SAFETY: every item was detached above (the list's own head/
+        // tail/count were just cleared) before this loop re-appends
+        // each one in sorted order; forwarded from this function's
+        // own safety doc for `l` itself.
+        unsafe { tv_list_append(l, item) };
+    }
+}
+
+/// Remove adjacent duplicate items from a list in place, using
+/// `info`'s comparison rules (`do_uniq`).
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+unsafe fn do_uniq(l: *mut crate::eval::typval_defs::ListT, info: &SortInfo) {
+    if info.has_custom_comparator {
+        unimplemented!(
+            "do_uniq: calling a user-supplied comparator (Funcref/Partial/named function - \
+             item_compare2, needs the full call_func/funcexe_T machinery) is not yet translated"
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let first = unsafe { tv_list_first(l) };
+    if first.is_null() {
+        return;
+    }
+    // SAFETY: `first` is a live item currently linked into `l`.
+    let mut li = unsafe { (*first).li_next };
+    while !li.is_null() {
+        // SAFETY: `li` is live and non-first, so it has a predecessor.
+        let prev_li = unsafe { (*li).li_prev };
+        // SAFETY: both are live items currently linked into `l`.
+        let equal = unsafe { item_compare(&(*prev_li).li_tv, &(*li).li_tv, info) } == 0;
+        if equal {
+            // SAFETY: forwarded from this function's own safety doc.
+            li = unsafe { tv_list_item_remove(l, li) };
+        } else {
+            // SAFETY: `li` is still live.
+            li = unsafe { (*li).li_next };
+        }
+    }
+}
+
+/// The shared `sort()`/`uniq()` implementation (`do_sort_uniq`).
+///
+/// The original's own `semsg`/`emsg` calls (wrong-arg-type, locked-
+/// list) are omitted, matching this crate's established "skip the
+/// display, keep the identical state/return" policy.
+///
+/// # Safety
+/// Forwards `do_sort`/`do_uniq`'s own safety docs for
+/// `argvars[0]`'s `List`, once confirmed non-null.
+pub unsafe fn do_sort_uniq(argvars: &[TypvalT], rettv: &mut TypvalT, sort: bool) {
+    let TypvalValue::List(l) = &argvars[0].value else {
+        return;
+    };
+    let l = *l;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if value_check_lock(unsafe { tv_list_locked(l) }, None) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_list_set_ret(rettv, l) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { tv_list_len(l) } <= 1 {
+        return; // short list sorts pretty quickly
+    }
+
+    let Ok(info) = parse_sort_uniq_args(argvars) else {
+        return;
+    };
+
+    if sort {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { do_sort(l, &info) };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { do_uniq(l, &info) };
+    }
+}
+
 /// Which of `map()`/`mapnew()`/`filter()`/`foreach()` a `filter_map`-
 /// family function is being used for (`filtermap_T`, `eval/list.c`'s
 /// own header - no dedicated `_defs.rs` module exists for `list.c`, so
@@ -7976,6 +8290,128 @@ mod tests {
             tv_list_free(empty);
             tv_list_free(one);
         }
+    }
+
+    // ---- do_sort_uniq (sort()/uniq()) ------------------------------------
+
+    #[test]
+    fn do_sort_uniq_default_comparison_is_by_string_form() {
+        // Default (no flag) comparison is BY STRING FORM, not numeric:
+        // "10" < "2" < "9" lexically, even though 2 < 9 < 10 numerically.
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 9, 2]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let argvars = [TypvalT { value: TypvalValue::List(l), ..Default::default() }];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(collect_numbers(l), vec![10, 2, 9]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_numeric_flag_n_sorts_numerically() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 9, 2]);
+        let mut rettv = TypvalT::default();
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT { value: TypvalValue::String(Some(b"n".to_vec())), ..Default::default() },
+        ];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(collect_numbers(l), vec![2, 9, 10]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_ic_flag_sorts_case_insensitively() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(3);
+        unsafe {
+            tv_list_append_string(l, Some(b"banana"));
+            tv_list_append_string(l, Some(b"Apple"));
+            tv_list_append_string(l, Some(b"cherry"));
+        }
+        let mut rettv = TypvalT::default();
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+        ];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        let mut strs = Vec::new();
+        let mut li = unsafe { tv_list_first(l) };
+        while !li.is_null() {
+            match unsafe { &(*li).li_tv.value } {
+                TypvalValue::String(s) => strs.push(s.clone().unwrap()),
+                other => panic!("expected String, found {other:?}"),
+            }
+            li = unsafe { (*li).li_next };
+        }
+        assert_eq!(strs, vec![b"Apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_short_list_is_a_noop_but_still_sets_rettv() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[42]);
+        let mut rettv = TypvalT::default();
+        let argvars = [TypvalT { value: TypvalValue::List(l), ..Default::default() }];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(rettv.value, TypvalValue::List(l));
+        assert_eq!(collect_numbers(l), vec![42]);
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_locked_list_is_left_completely_untouched() {
+        // A locked list's own check happens BEFORE tv_list_set_ret -
+        // rettv is left at its OWN prior value, not even pointed at
+        // the (untouched) list.
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[3, 1, 2]);
+        unsafe { (*l).lv_lock = VarLockStatus::Locked };
+        let mut rettv = TypvalT { value: TypvalValue::Number(99), ..Default::default() };
+        let argvars = [TypvalT { value: TypvalValue::List(l), ..Default::default() }];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(rettv.value, TypvalValue::Number(99));
+        assert_eq!(collect_numbers(l), vec![3, 1, 2]); // unchanged
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_non_list_arg_is_a_noop() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(7), ..Default::default() };
+        let argvars = [TypvalT { value: TypvalValue::Number(5), ..Default::default() }];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, true) };
+        assert_eq!(rettv.value, TypvalValue::Number(7));
+    }
+
+    #[test]
+    fn do_sort_uniq_custom_comparator_funcref_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[3, 1, 2]);
+        let mut rettv = TypvalT::default();
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT { value: TypvalValue::Func(Some(b"SomeComparator".to_vec())), ..Default::default() },
+        ];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            do_sort_uniq(&argvars, &mut rettv, true)
+        }));
+        assert!(result.is_err(), "expected a panic (item_compare2/call_func not yet translated)");
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn do_sort_uniq_uniq_removes_only_adjacent_duplicates() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[1, 1, 2, 2, 2, 3, 1]);
+        let mut rettv = TypvalT::default();
+        let argvars = [TypvalT { value: TypvalValue::List(l), ..Default::default() }];
+        unsafe { do_sort_uniq(&argvars, &mut rettv, false) };
+        // Only ADJACENT duplicates collapse - the trailing lone `1`
+        // stays separate from the leading pair.
+        assert_eq!(collect_numbers(l), vec![1, 2, 3, 1]);
+        unsafe { tv_list_free(l) };
     }
 
     // ---- tv_item_lock ---------------------------------------------------
