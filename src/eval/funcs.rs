@@ -425,6 +425,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"isinf"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isinf });
         m.insert(&b"isnan"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_isnan });
         m.insert(&b"islocked"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_islocked });
+        m.insert(&b"blob2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_blob2list });
+        m.insert(&b"list2blob"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_list2blob });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
@@ -2849,6 +2851,75 @@ unsafe fn f_islocked(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 
     crate::eval::eval::clear_lval(&mut lv);
+}
+
+/// `blob2list({blob})` - convert `{blob}` into a List of numbers, one
+/// per byte (`f_blob2list`, `eval/typval.c`).
+///
+/// # Safety
+/// If `argvars[0].value` is `Blob`-typed with a non-null pointer, that
+/// pointer must be valid.
+unsafe fn f_blob2list(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe {
+        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize)
+    };
+
+    if crate::eval::typval::tv_check_for_blob_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+
+    let TypvalValue::Blob(blob) = argvars[0].value else { unreachable!() };
+    // SAFETY: forwarded from this function's own safety doc.
+    for i in 0..unsafe { crate::eval::typval::tv_blob_len(blob) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        let byte = unsafe { crate::eval::typval::tv_blob_get(blob, i) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_number(l, crate::eval::typval_defs::VarnumberT::from(byte)) };
+    }
+}
+
+/// `list2blob({list})` - convert a List of numbers (each `0`-`255`)
+/// into a Blob, one byte per item (`f_list2blob`, `eval/typval.c`).
+///
+/// The original's own `E1239: Invalid value for blob: %d` error (a
+/// list item outside `0..=255`) is omitted - message display, not
+/// tractable; the identical "clear the blob and stop" behavior is
+/// kept for both that case AND a non-numeric item (`tv_get_number_chk`
+/// itself sets `error`).
+///
+/// # Safety
+/// If `argvars[0].value` is `List`-typed with a non-null pointer, that
+/// pointer must be valid, with every item's own value a genuine
+/// `TypvalT`.
+unsafe fn f_list2blob(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let blob = crate::eval::typval::tv_blob_alloc_ret(rettv);
+
+    if crate::eval::typval::tv_check_for_list_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+
+    let TypvalValue::List(l) = argvars[0].value else { unreachable!() };
+    if l.is_null() {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { crate::eval::typval::tv_list_first(l) };
+    while !item.is_null() {
+        let mut error = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = crate::eval::typval::tv_get_number_chk(unsafe { &(*item).li_tv }, Some(&mut error));
+        if error || !(0..=255).contains(&n) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*blob).bv_ga.ga_clear() };
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*blob).bv_ga.ga_append(n as u8) };
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+    }
 }
 
 /// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a
@@ -9869,6 +9940,117 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(-1));
 
         unsafe { crate::eval::vars::vars_clear(&mut *crate::eval::vars::get_globvar_dict()) };
+    }
+
+    // --- f_blob2list / f_list2blob ---
+
+    #[test]
+    fn blob2list_converts_each_byte_to_a_list_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = crate::eval::typval::tv_blob_alloc();
+        unsafe { (*b).bv_ga.ga_concat_len(b"AB\xff") };
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_blob2list(&[TypvalT { value: TypvalValue::Blob(b), ..Default::default() }], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 3);
+            let mut item = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(i64::from(b'A')));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(i64::from(b'B')));
+            item = (*item).li_next;
+            assert_eq!((*item).li_tv.value, TypvalValue::Number(0xff));
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn blob2list_empty_blob_is_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = crate::eval::typval::tv_blob_alloc();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_blob2list(&[TypvalT { value: TypvalValue::Blob(b), ..Default::default() }], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_blob_free(b);
+        }
+    }
+
+    #[test]
+    fn blob2list_non_blob_arg_still_returns_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_blob2list(&[num(5)], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(l), 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn list2blob_converts_each_number_to_a_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(l, i64::from(b'A'));
+            crate::eval::typval::tv_list_append_number(l, i64::from(b'B'));
+            crate::eval::typval::tv_list_append_number(l, 0xff);
+        }
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_list2blob(&[TypvalT { value: TypvalValue::List(l), ..Default::default() }], &mut rettv) };
+
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 3);
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 0), b'A');
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 1), b'B');
+            assert_eq!(crate::eval::typval::tv_blob_get(b, 2), 0xff);
+            crate::eval::typval::tv_blob_free(b);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn list2blob_out_of_range_value_clears_the_blob_and_stops() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(l, i64::from(b'A'));
+            crate::eval::typval::tv_list_append_number(l, 256);
+        }
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_list2blob(&[TypvalT { value: TypvalValue::List(l), ..Default::default() }], &mut rettv) };
+
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
+            crate::eval::typval::tv_blob_free(b);
+            crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn list2blob_non_list_arg_still_returns_an_empty_blob() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_list2blob(&[num(5)], &mut rettv) };
+
+        let TypvalValue::Blob(b) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
+            crate::eval::typval::tv_blob_free(b);
+        }
     }
 
     // --- f_sha256 ---
