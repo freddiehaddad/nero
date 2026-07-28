@@ -538,6 +538,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"reltimestr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimestr });
         m.insert(&b"reltimefloat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reltimefloat });
         m.insert(&b"arglistid"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: BASE_NONE, func: f_arglistid });
+        m.insert(&b"argv"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: BASE_NONE, func: f_argv });
         m.insert(&b"clearmatches"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::r#match::f_clearmatches });
         m.insert(&b"getmatches"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::r#match::f_getmatches });
         crate::globals::GlobalCell::new(m)
@@ -6992,6 +6993,113 @@ unsafe fn f_arglistid(argvars: &[TypvalT], rettv: &mut TypvalT) {
     });
 }
 
+/// Get the display name for one argument-list entry (`alist_name`,
+/// `arglist.c`) - the associated buffer's own name if it has one, else
+/// the name as originally given.
+///
+/// Currently has no real caller: [`get_arglist_as_rettv`]'s own
+/// `unimplemented!()` guard (see its own doc comment) means this is
+/// never actually invoked yet - translated ahead of that real usage
+/// anyway, matching this crate's established "small, simple, no
+/// design freedom to get wrong" precedent for such pieces.
+///
+/// # Safety
+/// Forwarded from [`crate::buffer::buflist_findnr`]'s own safety doc.
+#[allow(dead_code)]
+unsafe fn alist_name(aep: &crate::arglist_defs::AentryT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let bp = unsafe { crate::buffer::buflist_findnr(aep.ae_fnum) };
+    if bp.is_null() {
+        return aep.ae_fname.clone();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    match &unsafe { &*bp }.b_fname {
+        Some(name) => name.clone(),
+        None => aep.ae_fname.clone(),
+    }
+}
+
+/// Build the `List` of argument-list file names `argv()` (with no
+/// `{nr}` given) returns (`get_arglist_as_rettv`, `arglist.c`).
+///
+/// `argcount` is always `0` for every `AlistT` this crate can
+/// currently construct in a real running session (nothing populates
+/// an arglist's own items yet - `al_ga`'s real `AentryT`-typed item
+/// storage doesn't exist, a distinct, narrower gap from "no real
+/// caller": `f_argc`'s own tests already demonstrate `al_ga.ga_len`
+/// CAN be set directly for testing purposes, so this isn't provably
+/// unreachable the same way e.g. `AUTOCMDS` is - `unimplemented!()`s
+/// if a nonzero `argcount` is ever actually passed, rather than
+/// silently reading garbage).
+///
+/// # Safety
+/// Forwarded from [`alist_name`]'s own safety doc; `arglist`, if
+/// `argcount > 0`, must be a valid pointer to at least `argcount`
+/// live `AentryT` values (not currently satisfiable by anything this
+/// crate can construct).
+unsafe fn get_arglist_as_rettv(argcount: i32, rettv: &mut TypvalT) {
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, argcount as isize) };
+    if argcount > 0 {
+        unimplemented!("get_arglist_as_rettv: reading a real AentryT out of al_ga needs a typed accessor not yet built - al_ga is always empty for any AlistT this crate can currently construct");
+    }
+    let _ = l;
+}
+
+/// `argv([{nr} [, {winid}]])` - the `{nr}`'th file in the argument
+/// list (0-based), or the WHOLE list if `{nr}` is omitted or `-1`
+/// (`f_argv`, `arglist.c`), via [`alist_name`]/[`get_arglist_as_rettv`].
+///
+/// # Safety
+/// Forwarded from [`get_arglist_as_rettv`]/[`alist_name`]/
+/// [`crate::window::find_win_by_nr_or_id`]'s own safety docs.
+unsafe fn f_argv(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: `wp` must be a valid, non-null `WinT` pointer whose own
+    // `w_alist` is a valid, non-null `AlistT` pointer.
+    unsafe fn win_argcount(wp: *mut crate::buffer_defs::WinT) -> i32 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let alist = unsafe { &*wp }.w_alist;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*alist }.al_ga.ga_len
+    }
+
+    if argvars.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        let argcount = unsafe { win_argcount(curwin) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { get_arglist_as_rettv(argcount, rettv) };
+        return;
+    }
+
+    // Resolve which arglist (and its item count) `{winid}` (the 2nd
+    // argument) selects - `found` mirrors the original's own
+    // `arglist != NULL` check.
+    let (found, argcount) = if argvars.len() < 2 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        (true, unsafe { win_argcount(curwin) })
+    } else if matches!(argvars[1].value, TypvalValue::Number(-1)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        (true, unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len)
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[1]) };
+        if wp.is_null() { (false, 0) } else { (true, unsafe { win_argcount(wp) }) }
+    };
+
+    rettv.value = TypvalValue::String(None);
+    let idx = crate::eval::typval::tv_get_number_chk(&argvars[0], None) as i32;
+    if found && idx >= 0 && idx < argcount {
+        unimplemented!("f_argv: reading a real AentryT out of al_ga needs a typed accessor not yet built - al_ga is always empty for any AlistT this crate can currently construct");
+    } else if idx == -1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { get_arglist_as_rettv(argcount, rettv) };
+    }
+}
+
 /// `stdpath({what})` - a |standard-path| location (`f_stdpath`,
 /// `funcs.c`), via the already-existing
 /// `crate::os::stdpaths::get_xdg_home`.
@@ -7912,6 +8020,7 @@ mod tests {
             "reltimestr",
             "reltimefloat",
             "arglistid",
+            "argv",
             "swapname",
             "prompt_setcallback",
             "prompt_setinterrupt",
@@ -15915,6 +16024,97 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_arglistid(&[num(1), num(-1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_argv ---
+
+    #[test]
+    fn argv_no_args_returns_the_whole_empty_arglist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist = crate::arglist_defs::AlistT::default();
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argv(&[], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn argv_minus_one_returns_the_whole_empty_arglist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist = crate::arglist_defs::AlistT::default();
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argv(&[num(-1)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn argv_out_of_range_index_returns_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist = crate::arglist_defs::AlistT::default();
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argv(&[num(0)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn argv_unresolvable_window_returns_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argv(&[num(0), num(999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn argv_global_arglist_via_negative_winid_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_argv(&[num(-1), num(-1)], &mut rettv) };
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn argv_in_range_index_is_unimplemented() {
+        // A real AentryT read isn't supported yet (al_ga has no typed
+        // item accessor) - forcing a nonzero, in-range al_ga.ga_len
+        // (the same test-only fabrication f_argc's own tests already
+        // use) must panic rather than silently reading garbage.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alist =
+            crate::arglist_defs::AlistT { al_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() }, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f_argv(&[num(0)], &mut rettv);
+        }));
+        assert!(result.is_err(), "expected a panic (al_ga has no typed AentryT accessor yet)");
     }
 
     // --- f_stdpath ---
