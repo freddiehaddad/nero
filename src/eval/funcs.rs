@@ -368,6 +368,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"items"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_items });
         m.insert(&b"get"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_get });
         m.insert(&b"index"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_index });
+        m.insert(&b"indexof"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_indexof });
         m.insert(&b"reverse"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_reverse });
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
@@ -1648,6 +1649,223 @@ unsafe fn f_index(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         item = unsafe { (*item).li_next };
         idx += 1;
+    }
+}
+
+/// Evaluate `expr` (a `String`-typed expression only - see this
+/// crate's own `eval_expr_typval`) with `v:key`/`v:val` already set by
+/// the caller, returning whether the result is truthy
+/// (`indexof_eval_expr`).
+///
+/// # Safety
+/// `expr` must be valid (forwards `eval_expr_typval`'s own safety
+/// requirements).
+unsafe fn indexof_eval_expr(expr: &TypvalT) -> bool {
+    let mut newtv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let ret = unsafe { crate::eval::eval::eval_expr_typval(expr, false, &mut [], &mut newtv) };
+    if ret == crate::vim_defs::FAIL {
+        return false;
+    }
+    let mut error = false;
+    let found = crate::eval::typval::tv_get_bool_chk(&newtv, Some(&mut error));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_clear_simple(&newtv) };
+    !error && found != 0
+}
+
+/// Evaluate `expr` for each byte in the `Blob` `b`, starting at
+/// `startidx`, returning the index of the byte where `expr` is TRUE,
+/// or `-1` if it never is (`indexof_blob`).
+///
+/// # Safety
+/// `b`, if non-null, must be a valid pointer to a live `BlobT`; `expr`
+/// must be valid (forwards `indexof_eval_expr`'s own safety
+/// requirements).
+unsafe fn indexof_blob(
+    b: *mut crate::eval::typval_defs::BlobT,
+    startidx: crate::eval::typval_defs::VarnumberT,
+    expr: &TypvalT,
+) -> crate::eval::typval_defs::VarnumberT {
+    use crate::eval::vars::{set_vim_var_nr, set_vim_var_type, VimVarIndex};
+
+    if b.is_null() {
+        return -1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = i64::from(unsafe { crate::eval::typval::tv_blob_len(b) });
+    let mut startidx = startidx;
+    if startidx < 0 {
+        // negative index: index from the last byte.
+        startidx = (len + startidx).max(0);
+    }
+
+    unsafe {
+        set_vim_var_type(VimVarIndex::Key, crate::eval::typval_defs::VarType::Number);
+        set_vim_var_type(VimVarIndex::Val, crate::eval::typval_defs::VarType::Number);
+    }
+
+    let mut idx = startidx;
+    while idx < len {
+        unsafe {
+            set_vim_var_nr(VimVarIndex::Key, idx);
+            // SAFETY: forwarded from this function's own safety doc.
+            set_vim_var_nr(VimVarIndex::Val, i64::from(crate::eval::typval::tv_blob_get(b, idx as i32)));
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { indexof_eval_expr(expr) } {
+            return idx;
+        }
+        idx += 1;
+    }
+
+    -1
+}
+
+/// Evaluate `expr` for each item in the `List` `l`, starting at the
+/// item resolved from `startidx`, returning the index of the item
+/// where `expr` is TRUE, or `-1` if it never is (`indexof_list`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`; `expr`
+/// must be valid (forwards `indexof_eval_expr`'s own safety
+/// requirements).
+unsafe fn indexof_list(
+    l: *mut crate::eval::typval_defs::ListT,
+    startidx: crate::eval::typval_defs::VarnumberT,
+    expr: &TypvalT,
+) -> crate::eval::typval_defs::VarnumberT {
+    use crate::eval::vars::{get_vim_var_tv, set_vim_var_nr, set_vim_var_type, VimVarIndex};
+
+    if l.is_null() {
+        return -1;
+    }
+
+    let mut idx: i32 = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = if startidx == 0 {
+        unsafe { crate::eval::typval::tv_list_first(l) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let uidx = unsafe { crate::eval::typval::tv_list_uidx(l, startidx as i32) };
+        if uidx == -1 {
+            std::ptr::null_mut()
+        } else {
+            idx = uidx;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::eval::typval::tv_list_find(l, idx) }
+        }
+    };
+
+    unsafe { set_vim_var_type(VimVarIndex::Key, crate::eval::typval_defs::VarType::Number) };
+
+    while !item.is_null() {
+        unsafe {
+            set_vim_var_nr(VimVarIndex::Key, i64::from(idx));
+            // SAFETY: forwarded from this function's own safety doc.
+            crate::eval::typval::tv_copy(&(*item).li_tv, &mut *get_vim_var_tv(VimVarIndex::Val));
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let found = unsafe { indexof_eval_expr(expr) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&*get_vim_var_tv(VimVarIndex::Val)) };
+
+        if found {
+            return i64::from(idx);
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        item = unsafe { (*item).li_next };
+        idx += 1;
+    }
+
+    -1
+}
+
+/// `indexof({object}, {expr} [, {opts}])` - the index of the first
+/// item/byte in `{object}` (a `List`/`Blob`) for which `{expr}`
+/// evaluates truthy (`f_indexof`).
+///
+/// Only a `String`-typed `{expr}` is supported - a `Funcref`/`Partial`
+/// needs `eval_expr_partial`/`eval_expr_func` (the whole function-CALL
+/// machinery, not yet translated) - `unimplemented!()`s if either is
+/// ever passed (via `eval_expr_typval`'s own already-established
+/// gap). `{opts}`'s own `"startidx"` key is supported; no other key is
+/// meaningful for `indexof()` in the original either.
+///
+/// The original's own `did_emsg`/`called_emsg` save-restore-and-abort-
+/// on-error dance (detecting a genuine runtime error inside `{expr}`
+/// to stop iterating early) is omitted: nothing in this crate currently
+/// increments `GLOBALS.did_emsg`/`called_emsg` on any reachable path
+/// (no real `emsg`/`semsg` call site touches them yet), so that whole
+/// mechanism is a provable no-op today, not just a skipped side effect.
+///
+/// # Safety
+/// Forwards `indexof_blob`/`indexof_list`'s own safety requirements
+/// for `argvars[0]`.
+unsafe fn f_indexof(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    use crate::eval::vars::{prepare_vimvar, restore_vimvar, VimVarIndex};
+
+    rettv.value = TypvalValue::Number(-1);
+
+    // argvars.len() > 2 replaces the original's own argvars[2].v_type
+    // != VAR_UNKNOWN sentinel check (this crate's argvars is already
+    // exactly as long as what was actually passed, unlike the
+    // original's own fixed-size, sentinel-padded array) -
+    // tv_check_for_opt_dict_arg itself indexes argvars[2] directly, so
+    // it must only ever be called when that index genuinely exists;
+    // skipping it entirely when the optional {opts} arg is absent
+    // produces the identical net effect, since tv_check_for_opt_dict_arg's
+    // own first check is precisely "argvars[2] unknown -> OK" anyway
+    // (matching f_deepcopy's own already-established precedent for
+    // this exact situation).
+    if crate::eval::typval::tv_check_for_list_or_blob_arg(argvars, 0) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_string_or_func_arg(argvars, 1) == crate::vim_defs::FAIL
+        || (argvars.len() > 2
+            && crate::eval::typval::tv_check_for_opt_dict_arg(argvars, 2) == crate::vim_defs::FAIL)
+    {
+        return;
+    }
+
+    let empty_string = matches!(&argvars[1].value, TypvalValue::String(s) if s.as_deref().unwrap_or(&[]).is_empty());
+    let null_func_name = matches!(&argvars[1].value, TypvalValue::Func(name) if name.is_none());
+    if empty_string || null_func_name {
+        return;
+    }
+
+    let mut startidx: crate::eval::typval_defs::VarnumberT = 0;
+    if argvars.len() > 2 {
+        if let TypvalValue::Dict(d) = &argvars[2].value {
+            let d = *d;
+            // SAFETY: forwarded from this function's own safety doc.
+            startidx = unsafe {
+                crate::eval::typval::tv_dict_get_number_def(d.as_mut(), b"startidx", 0)
+            };
+        }
+    }
+
+    let mut save_val = TypvalT::default();
+    let mut save_key = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        prepare_vimvar(VimVarIndex::Val, &mut save_val);
+        prepare_vimvar(VimVarIndex::Key, &mut save_key);
+    }
+
+    if let TypvalValue::Blob(b) = argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        rettv.value = TypvalValue::Number(unsafe { indexof_blob(b, startidx, &argvars[1]) });
+    } else if let TypvalValue::List(l) = argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        rettv.value = TypvalValue::Number(unsafe { indexof_list(l, startidx, &argvars[1]) });
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        restore_vimvar(VimVarIndex::Key, save_key);
+        restore_vimvar(VimVarIndex::Val, save_val);
     }
 }
 
@@ -7404,6 +7622,7 @@ mod tests {
             "items",
             "get",
             "index",
+            "indexof",
             "reverse",
             "count",
             "copy",
@@ -8246,6 +8465,421 @@ mod tests {
         let args = [TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() }, num(1)];
         unsafe { f_index(&args, &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- indexof_eval_expr / indexof_blob / indexof_list / f_indexof ---
+
+    /// RAII guard preparing BOTH `v:key`/`v:val` (matching `f_indexof`'s
+    /// own real dispatch, which always prepares both regardless of
+    /// which one a given `{expr}` actually references) and restoring
+    /// them on drop - even through a panicking `assert_eq!` (Rust always
+    /// runs destructors during unwinding), so a failing assertion can
+    /// never leave `v:key`/`v:val` permanently registered for a LATER
+    /// test to inherit. Needed because `indexof_blob`/`indexof_list`
+    /// have no save/restore logic of their own (that is `f_indexof`'s
+    /// job, per their own doc comments) - any DIRECT test of either
+    /// (bypassing `f_indexof`) must supply this wrapping itself, exactly
+    /// matching `filter_map_one`'s own already-established direct-test
+    /// precedent in `eval/typval.rs`.
+    struct PreparedVimvars {
+        save_key: TypvalT,
+        save_val: TypvalT,
+    }
+
+    impl PreparedVimvars {
+        fn new() -> Self {
+            let mut save_key = TypvalT::default();
+            let mut save_val = TypvalT::default();
+            unsafe {
+                crate::eval::vars::prepare_vimvar(crate::eval::vars::VimVarIndex::Key, &mut save_key);
+                crate::eval::vars::prepare_vimvar(crate::eval::vars::VimVarIndex::Val, &mut save_val);
+            }
+            Self { save_key, save_val }
+        }
+    }
+
+    impl Drop for PreparedVimvars {
+        fn drop(&mut self) {
+            unsafe {
+                crate::eval::vars::restore_vimvar(
+                    crate::eval::vars::VimVarIndex::Key,
+                    std::mem::take(&mut self.save_key),
+                );
+                crate::eval::vars::restore_vimvar(
+                    crate::eval::vars::VimVarIndex::Val,
+                    std::mem::take(&mut self.save_val),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn indexof_eval_expr_true_for_a_truthy_self_contained_expression() {
+        let expr = string(b"1 == 1");
+        assert!(unsafe { indexof_eval_expr(&expr) });
+    }
+
+    #[test]
+    fn indexof_eval_expr_false_for_a_falsy_self_contained_expression() {
+        let expr = string(b"1 == 2");
+        assert!(!unsafe { indexof_eval_expr(&expr) });
+    }
+
+    #[test]
+    fn indexof_eval_expr_false_when_evaluation_fails() {
+        let expr = string(b"1 +"); // deliberately invalid syntax
+        assert!(!unsafe { indexof_eval_expr(&expr) });
+    }
+
+    #[test]
+    fn indexof_eval_expr_reads_v_val() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        unsafe { crate::eval::vars::set_vim_var_nr(crate::eval::vars::VimVarIndex::Val, 5) };
+        let expr = string(b"v:val == 5");
+        assert!(unsafe { indexof_eval_expr(&expr) });
+    }
+
+    #[test]
+    fn indexof_blob_finds_a_matching_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let expr = string(b"v:val == 20");
+        assert_eq!(unsafe { indexof_blob(blob, 0, &expr) }, 1);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_returns_negative_one_when_nothing_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let expr = string(b"v:val == 99");
+        assert_eq!(unsafe { indexof_blob(blob, 0, &expr) }, -1);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_with_a_positive_startidx_skips_an_earlier_occurrence() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![5, 9, 5, 9];
+            (*blob).bv_ga.ga_len = 4;
+        }
+        let expr = string(b"v:val == 5");
+        assert_eq!(unsafe { indexof_blob(blob, 0, &expr) }, 0);
+        assert_eq!(unsafe { indexof_blob(blob, 1, &expr) }, 2);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_with_a_negative_startidx_indexes_from_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3, 4, 5];
+            (*blob).bv_ga.ga_len = 5;
+        }
+        // -2 -> len(5) + -2 = 3, so the scan starts at the 4th byte.
+        let expr = string(b"v:val == 4");
+        assert_eq!(unsafe { indexof_blob(blob, -2, &expr) }, 3);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_clamps_an_excessively_negative_startidx_to_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![1, 2, 3];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let expr = string(b"v:val == 1");
+        assert_eq!(unsafe { indexof_blob(blob, -99, &expr) }, 0);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_v_key_reflects_the_byte_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![100, 100, 100];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let expr = string(b"v:key == 2");
+        assert_eq!(unsafe { indexof_blob(blob, 0, &expr) }, 2);
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn indexof_blob_on_a_null_blob_returns_negative_one() {
+        let expr = string(b"1");
+        assert_eq!(unsafe { indexof_blob(std::ptr::null_mut(), 0, &expr) }, -1);
+    }
+
+    #[test]
+    fn indexof_list_finds_a_matching_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 10);
+            crate::eval::typval::tv_list_append_number(&mut *l, 20);
+            crate::eval::typval::tv_list_append_number(&mut *l, 30);
+        }
+        let expr = string(b"v:val == 20");
+        assert_eq!(unsafe { indexof_list(l, 0, &expr) }, 1);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_returns_negative_one_when_nothing_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 1);
+            crate::eval::typval::tv_list_append_number(&mut *l, 2);
+        }
+        let expr = string(b"v:val == 99");
+        assert_eq!(unsafe { indexof_list(l, 0, &expr) }, -1);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_with_a_positive_startidx_skips_an_earlier_occurrence() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(4);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 5);
+            crate::eval::typval::tv_list_append_number(&mut *l, 9);
+            crate::eval::typval::tv_list_append_number(&mut *l, 5);
+            crate::eval::typval::tv_list_append_number(&mut *l, 9);
+        }
+        let expr = string(b"v:val == 5");
+        assert_eq!(unsafe { indexof_list(l, 0, &expr) }, 0);
+        assert_eq!(unsafe { indexof_list(l, 1, &expr) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_with_a_negative_startidx_indexes_from_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(5);
+        unsafe {
+            for n in [1, 2, 3, 4, 5] {
+                crate::eval::typval::tv_list_append_number(&mut *l, n);
+            }
+        }
+        // -2 normalizes to index 3 (the 4th item).
+        let expr = string(b"v:val == 4");
+        assert_eq!(unsafe { indexof_list(l, -2, &expr) }, 3);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_with_an_out_of_range_startidx_returns_negative_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            for n in [1, 2, 3] {
+                crate::eval::typval::tv_list_append_number(&mut *l, n);
+            }
+        }
+        // tv_list_uidx(l, 100) normalizes to -1 (out of range), so the
+        // starting item is null and the loop never runs, regardless of
+        // what expr would otherwise match.
+        let expr = string(b"1");
+        assert_eq!(unsafe { indexof_list(l, 100, &expr) }, -1);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_v_key_reflects_the_zero_based_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _vv = PreparedVimvars::new();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            for n in [100, 100, 100] {
+                crate::eval::typval::tv_list_append_number(&mut *l, n);
+            }
+        }
+        let expr = string(b"v:key == 2");
+        assert_eq!(unsafe { indexof_list(l, 0, &expr) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn indexof_list_on_a_null_list_returns_negative_one() {
+        let expr = string(b"1");
+        assert_eq!(unsafe { indexof_list(std::ptr::null_mut(), 0, &expr) }, -1);
+    }
+
+    #[test]
+    fn f_indexof_finds_the_first_matching_item_in_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 10);
+            crate::eval::typval::tv_list_append_number(&mut *l, 20);
+            crate::eval::typval::tv_list_append_number(&mut *l, 30);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }, string(b"v:val == 20")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn f_indexof_finds_a_matching_byte_in_a_blob() {
+        let _lock = crate::globals::global_state_test_lock();
+        let blob = crate::eval::typval::tv_blob_alloc();
+        unsafe {
+            (*blob).bv_ga.ga_data = vec![10, 20, 30];
+            (*blob).bv_ga.ga_len = 3;
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::Blob(blob), ..Default::default() }, string(b"v:val == 30")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_blob_free(blob) };
+    }
+
+    #[test]
+    fn f_indexof_returns_negative_one_when_nothing_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *l, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }, string(b"v:val == 99")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn f_indexof_honors_the_startidx_option_from_the_opts_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(4);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 5);
+            crate::eval::typval::tv_list_append_number(&mut *l, 9);
+            crate::eval::typval::tv_list_append_number(&mut *l, 5);
+            crate::eval::typval::tv_list_append_number(&mut *l, 9);
+        }
+        let dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *dict, b"startidx", 1) };
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            string(b"v:val == 5"),
+            TypvalT { value: TypvalValue::Dict(dict), ..Default::default() },
+        ];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        unsafe {
+            crate::eval::typval::tv_list_unref(l);
+            crate::eval::typval::tv_dict_unref(dict);
+        }
+    }
+
+    #[test]
+    fn f_indexof_returns_negative_one_for_an_empty_string_expr() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *l, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }, string(b"")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn f_indexof_returns_negative_one_for_a_null_funcref_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *l, 1) };
+        let mut rettv = TypvalT::default();
+        let args = [
+            TypvalT { value: TypvalValue::List(l), ..Default::default() },
+            TypvalT { value: TypvalValue::Func(None), ..Default::default() },
+        ];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn f_indexof_returns_negative_one_for_a_non_list_non_blob_object() {
+        let mut rettv = TypvalT::default();
+        let args = [string(b"not a list"), string(b"1")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn f_indexof_works_with_only_the_required_two_arguments() {
+        // Confirms the argvars.len() > 2 guard around
+        // tv_check_for_opt_dict_arg doesn't panic when {opts} is
+        // genuinely absent (this crate's own argvars convention).
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(&mut *l, 42) };
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }, string(b"v:val == 42")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn f_indexof_leaves_v_key_and_v_val_unregistered_afterward() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe {
+            crate::hashtab::hashitem_empty((*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"val"))
+        });
+        assert!(unsafe {
+            crate::hashtab::hashitem_empty((*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"key"))
+        });
+
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(&mut *l, 1);
+            crate::eval::typval::tv_list_append_number(&mut *l, 2);
+        }
+        let mut rettv = TypvalT::default();
+        let args = [TypvalT { value: TypvalValue::List(l), ..Default::default() }, string(b"v:val == 2")];
+        unsafe { f_indexof(&args, &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        assert!(unsafe {
+            crate::hashtab::hashitem_empty((*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"val"))
+        });
+        assert!(unsafe {
+            crate::hashtab::hashitem_empty((*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"key"))
+        });
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 
     // --- f_reverse / reverse_text ---
