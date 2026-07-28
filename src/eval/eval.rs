@@ -2774,6 +2774,36 @@ unsafe fn eval_index(
     (OK, pos)
 }
 
+/// Turn `rettv`'s `"dict.Func"` value into a partial bound to
+/// `selfdict`, unless it is ALREADY a partial that was bound
+/// EXPLICITLY (`pt_auto == false`) rather than by this exact
+/// mechanism (`set_selfdict`).
+///
+/// A defensive `!p.is_null()` check guards the original's own direct
+/// `rettv->vval.v_partial->pt_auto`/`pt_dict` dereference (which has
+/// no null check at all) - not a behavior change for any real input
+/// this crate can currently construct (a null-pointer `Partial` isn't
+/// producible by any translated code path today), just avoiding a
+/// literal null dereference (real UB in Rust, unlike C) for a
+/// pathological one.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::userfunc::make_partial`]'s own safety
+/// doc.
+pub unsafe fn set_selfdict(rettv: &mut TypvalT, selfdict: *mut crate::eval::typval_defs::DictT) {
+    if let TypvalValue::Partial(p) = rettv.value {
+        if !p.is_null() {
+            // SAFETY: `p` was just checked non-null above.
+            let (pt_auto, pt_dict) = unsafe { ((*p).pt_auto, (*p).pt_dict) };
+            if !pt_auto && !pt_dict.is_null() {
+                return;
+            }
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::userfunc::make_partial(selfdict, rettv) };
+}
+
 /// Handle `expr[expr]`/`expr.name`/`expr(expr)`/`expr->name(expr)`
 /// subscript chaining after an already-parsed primary expression
 /// (`handle_subscript`).
@@ -2789,10 +2819,8 @@ unsafe fn eval_index(
 /// The original's own final "turn `dict.Func` into a partial bound to
 /// `dict`" step (`set_selfdict`/`make_partial`, reached only when the
 /// loop's LAST successful step read a `Dict` value that turned out to
-/// hold a `Funcref`) also panics via `unimplemented!()` - a narrow,
-/// specifically-scoped gap (neither `make_partial` nor `set_selfdict`
-/// are translated yet), rather than silently skipping the dict-to-
-/// method binding this real Vimscript feature depends on.
+/// hold a `Funcref`) is now real too - see [`set_selfdict`]'s own doc
+/// comment.
 ///
 /// `tv_is_luafunc(rettv)` (gating the original's own `v:lua`-specific
 /// lambda-name-parsing branch, checked ONCE before the loop even
@@ -2890,10 +2918,8 @@ pub fn handle_subscript(
 
     // Turn "dict.Func" into a partial for "Func" bound to "dict".
     if !selfdict.is_null() && tv_is_func(rettv) {
-        unimplemented!(
-            "handle_subscript: binding a Funcref value to its enclosing dict (set_selfdict/ \
-             make_partial) is not yet translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_selfdict(rettv, selfdict) };
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -7558,6 +7584,97 @@ mod tests {
         );
     }
 
+    // --- set_selfdict ---
+
+    #[test]
+    fn set_selfdict_skips_an_explicitly_bound_partial() {
+        // A partial with pt_auto == false (bound EXPLICITLY, e.g. via
+        // function(Func, dict) rather than the "dict.Func" syntax
+        // sugar this whole mechanism handles) must be left completely
+        // untouched - matches the original's own early-return guard.
+        let _lock = crate::globals::global_state_test_lock();
+        let explicit_dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*explicit_dict).dv_refcount = 1 };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_dict: explicit_dict,
+            pt_auto: false,
+            ..Default::default()
+        }));
+        let mut rettv = TypvalT { value: TypvalValue::Partial(pt), ..Default::default() };
+
+        let new_selfdict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*new_selfdict).dv_refcount = 1 };
+        unsafe { set_selfdict(&mut rettv, new_selfdict) };
+
+        // Untouched: still the SAME partial, still pointing at the
+        // ORIGINAL explicit dict, never re-bound to new_selfdict.
+        assert_eq!(rettv.value, TypvalValue::Partial(pt));
+        assert_eq!(unsafe { (*pt).pt_dict }, explicit_dict);
+        unsafe {
+            crate::eval::typval::partial_unref(pt);
+            crate::eval::typval::tv_dict_unref(new_selfdict);
+        }
+    }
+
+    #[test]
+    fn set_selfdict_rebinds_an_auto_partial() {
+        // A partial with pt_auto == true (itself the product of an
+        // earlier "dict.Func" auto-binding) is NOT exempt from this
+        // guard - it still gets processed normally (make_partial's own
+        // "resolve pt_name -> find_func" path takes over from there).
+        //
+        // Uses pt_name (not pt_func) for the OLD partial, matching
+        // make_partial's own test precedent
+        // (make_partial_rebinds_an_already_partial_value_by_name) -
+        // this deliberately avoids exercising the pt_func-direct
+        // branch here (its own real UfuncT-refcount-lifecycle
+        // interactions are already covered by make_partial's own,
+        // more targeted tests), keeping this test focused purely on
+        // set_selfdict's OWN pt_auto-gating decision.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = Box::new(crate::eval::typval_defs::UfuncT {
+            uf_name: b"SetSelfdictFn\0".to_vec(),
+            uf_flags: crate::eval::userfunc::fc_flags::DICT,
+            ..Default::default()
+        });
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp.as_mut() as *mut _) };
+
+        let old_dict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*old_dict).dv_refcount = 1 };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_name: Some(b"SetSelfdictFn".to_vec()),
+            pt_dict: old_dict,
+            pt_auto: true,
+            ..Default::default()
+        }));
+        let mut rettv = TypvalT { value: TypvalValue::Partial(pt), ..Default::default() };
+
+        let new_selfdict = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*new_selfdict).dv_refcount = 1 };
+        unsafe { set_selfdict(&mut rettv, new_selfdict) };
+
+        let TypvalValue::Partial(new_pt) = rettv.value else { panic!("expected a Partial") };
+        assert_ne!(new_pt, pt, "must be rebound to a genuinely new partial");
+        assert_eq!(unsafe { (*new_pt).pt_dict }, new_selfdict);
+        assert_eq!(unsafe { (*new_selfdict).dv_refcount }, 2);
+        // Releasing the OLD partial (via make_partial's own internal
+        // partial_unref, already run above) also released its own
+        // pt_dict (old_dict), fully freeing it. `new_selfdict` itself
+        // still needs TWO releases: one for the new partial's own
+        // hold (bumped by make_partial), one for this test's own
+        // initial hold (matching every other test in this file's
+        // established "dv_refcount = 1 represents the test's own
+        // hold, on top of whatever a real function call additionally
+        // bumps" convention).
+        unsafe {
+            crate::eval::typval::partial_unref(new_pt);
+            crate::eval::typval::tv_dict_unref(new_selfdict);
+        }
+    }
+
     // --- handle_subscript ---
 
     /// Test helper: allocate a fresh `Dict`, giving it `dv_refcount = 1`,
@@ -7821,35 +7938,67 @@ mod tests {
     }
 
     #[test]
-    fn handle_subscript_dict_func_binding_is_unimplemented() {
-        // `{f: SomeFunc}.f` reaches the loop's own end with `selfdict`
-        // still non-null and a Func-valued `rettv` - the "turn
-        // dict.Func into a bound partial" step (set_selfdict/
-        // make_partial) is not yet translated, so this must panic
-        // rather than silently returning an unbound Funcref.
+    fn handle_subscript_dict_func_binding_creates_a_bound_partial() {
+        // `{f: DictFunc}.f` where `DictFunc` is a real, registered
+        // "dict function" (`function() dict`, `FC_DICT`) - the loop's
+        // own end reaches `set_selfdict`/`make_partial` for real,
+        // turning the plain Funcref into a Partial bound to the
+        // originating Dict.
         let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = Box::new(crate::eval::typval_defs::UfuncT {
+            uf_name: b"HsDictFunc\0".to_vec(),
+            uf_flags: crate::eval::userfunc::fc_flags::DICT,
+            ..Default::default()
+        });
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp.as_mut() as *mut _) };
+
         let d = test_dict_for_rettv();
         let item = crate::eval::typval::tv_dict_item_alloc(b"f");
-        unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"somefunc".to_vec())) };
+        unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"HsDictFunc".to_vec())) };
         unsafe { crate::eval::typval::tv_dict_add(&mut *d, item) };
         let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
         let mut evalarg = evaluate_evalarg();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_subscript(b".f", &mut rettv, Some(&mut evalarg), false)
-        }));
-        assert!(result.is_err(), "expected a panic (set_selfdict/make_partial not yet translated)");
-        // A real finding, not just test cleanup: this specific panic
-        // is reached AFTER the loop's own `selfdict` tracking has
-        // already bumped `d`'s refcount (protecting it across the
-        // `.f` lookup), but BEFORE handle_subscript's own final
-        // `tv_dict_unref(selfdict)` call - `unimplemented!()` unwinds
-        // straight past that cleanup. In a real crash this would not
-        // matter (the whole process is dying anyway); it only matters
-        // here because `catch_unwind` lets the test process continue,
-        // so `d` must be explicitly released to avoid permanently
-        // leaking it into the shared GC_FIRST_DICT registry for
-        // whichever OTHER test happens to run next.
-        unsafe { crate::eval::typval::tv_dict_unref(d) };
+        let (ret, consumed) = handle_subscript(b".f", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 2);
+
+        let TypvalValue::Partial(pt) = rettv.value else { panic!("expected a bound Partial") };
+        assert!(!pt.is_null());
+        unsafe {
+            assert!((*pt).pt_auto);
+            assert_eq!((*pt).pt_dict, d);
+            assert_eq!((*pt).pt_name.as_deref(), Some(&b"HsDictFunc"[..]));
+            // Releasing the partial also releases its own held
+            // reference to `d` - a single call fully cleans up both,
+            // with no separate `tv_dict_unref(d)` needed.
+            crate::eval::typval::partial_unref(pt);
+        }
+    }
+
+    #[test]
+    fn handle_subscript_dict_func_binding_leaves_a_non_dict_function_unbound() {
+        // `{f: PlainFunc}.f` where `PlainFunc` is NOT a dict function
+        // (no `FC_DICT`) - `set_selfdict`/`make_partial` run for real
+        // but correctly decline to bind, leaving `rettv` as a plain,
+        // unbound Funcref.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp =
+            Box::new(crate::eval::typval_defs::UfuncT { uf_name: b"HsPlainFunc\0".to_vec(), ..Default::default() });
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp.as_mut() as *mut _) };
+
+        let d = test_dict_for_rettv();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"f");
+        unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"HsPlainFunc".to_vec())) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *d, item) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b".f", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 2);
+        assert_eq!(rettv.value, TypvalValue::Func(Some(b"HsPlainFunc".to_vec())));
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
     }
 
     #[test]
@@ -7966,6 +8115,7 @@ mod tests {
     fn eval_expr_string_fails_on_a_non_stringish_expr() {
         // TypvalValue::List has no string representation - tv_get_string_chk
         // returns None for it.
+        let _lock = crate::globals::global_state_test_lock();
         let list = crate::eval::typval::tv_list_alloc(0);
         let expr = TypvalT { value: TypvalValue::List(list), ..TypvalT::default() };
         let mut rettv = TypvalT::default();
