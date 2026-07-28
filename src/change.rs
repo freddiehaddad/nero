@@ -24,12 +24,14 @@
 //! `msg_clr_eos`/`msg_end`/`msg_delay`/`showmode`) is skipped -
 //! `message.c`'s display pipeline is not yet tractable - but every
 //! OTHER observable state change is kept faithfully, including
-//! `set_vim_var_string(VV_WARNINGMSG, ...)`: unlike `evalvars_init`
-//! (the full `v:` scope-dict-wiring bootstrap, still not translated),
-//! `set_vim_var_string` itself only writes directly to the `VIMVARS`
-//! storage slot (`crate::eval::vars::VIMVARS[idx].tv`), which is real
-//! and requires no dict/hashtable wiring at all - confirmed by reading
-//! its own body before wiring this call in for real.
+//! `set_vim_var_string(VV_WARNINGMSG, ...)`: `set_vim_var_string`
+//! itself only writes directly to the `VIMVARS` storage slot
+//! (`crate::eval::vars::VIMVARS[idx].di.di_tv`), which is real and
+//! requires no dict/hashtable wiring at all - confirmed by reading
+//! its own body before wiring this call in for real. (`evalvars_init`,
+//! the full `v:` scope-dict bootstrap, is now ALSO translated, but
+//! `change_warning` never needed to wait for it - this call worked
+//! correctly even before `evalvars_init` existed.)
 //!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display

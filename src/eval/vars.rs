@@ -66,17 +66,14 @@
 //! `evalvars_init` itself (which overrides several entries' VALUES with
 //! real startup values - `v:count1`/`v:hlsearch`/`v:searchforward` all
 //! become `1`, `v:true` becomes `Bool(True)`, `v:errors` gets a real
-//! empty list, etc.) is NOT yet translated: it needs
-//! `tv_dict_alloc_lock`/`tv_list_set_lock` (not yet translated),
-//! msgpack-type introspection (`msgpack_type_names`/
-//! `eval_msgpack_type_lists`), and a Lua partial callback for `v:lua` -
-//! each a genuinely separate undertaking from this table + its
-//! accessors, left for a dedicated future pass. Until it lands, every
-//! `VIMVARS` entry's VALUE reads as its bare static-initializer
-//! default, NOT its real runtime value - documented per-function below
-//! where this matters. Wiring every entry into a real `v:` scope
-//! `DictT` via `hash_add` (`evalvars_init`'s OTHER job) is, however,
-//! now done - see `VIMVARDICT`.
+//! empty list, `v:completed_item`/`v:event` become real, empty,
+//! `Fixed`-locked dicts, `v:lua` becomes a real bound `Partial`, etc.)
+//! IS now translated - see its own doc comment for exactly which 2
+//! pieces remain deliberately deferred (`v:version`/`v:versionlong`,
+//! `v:msgpack_types`, and `v:startreason`'s env-var-based override).
+//! Wiring every entry into a real `v:` scope `DictT` via `hash_add`
+//! (`evalvars_init`'s OTHER job) was already done before this function
+//! itself landed - see `VIMVARDICT`.
 //!
 
 //! `set_vim_var_type`/`set_vim_var_nr`/`set_vim_var_partial` preserve
@@ -541,8 +538,7 @@ struct Vimvar {
 
 /// The `v:` variable table (`vimvars[]`). See this module's own doc
 /// comment for the full explanation of this table's construction,
-/// indexing, and relationship to the NOT-yet-translated
-/// `evalvars_init`.
+/// indexing, and relationship to [`evalvars_init`].
 static VIMVARS: std::sync::LazyLock<crate::globals::GlobalCell<Vec<Vimvar>>> =
     std::sync::LazyLock::new(|| {
         let mut vimvars = vec![
@@ -796,11 +792,11 @@ static VIMVARS: std::sync::LazyLock<crate::globals::GlobalCell<Vec<Vimvar>>> =
 /// &globvars_var, VAR_DEF_SCOPE)` call's real effect on the DICT
 /// itself (`DefScope`/`DO_NOT_FREE_CNT`) - added alongside
 /// `GLOBVARS_VAR` below, since both represent the same slice of
-/// `init_var_dict`'s work. `evalvars_init`'s OWN remaining body (real
-/// startup values for individual `g:`-adjacent globals, msgpack-type
-/// introspection, etc.) is unrelated to `g:` specifically and remains
-/// separately deferred - see `VIMVARS`'s own doc comment for the
-/// analogous `v:`-side deferral.
+/// `init_var_dict`'s work. `evalvars_init` ITSELF is now fully
+/// translated (see its own doc comment), but its real body only ever
+/// touches `v:`-side globals, never anything `g:`-specific - so it has
+/// no further bearing on `GLOBVARDICT` beyond the `init_var_dict`
+/// effect already accounted for here.
 static GLOBVARDICT: std::sync::LazyLock<crate::globals::GlobalCell<DictT>> =
     std::sync::LazyLock::new(|| {
         crate::globals::GlobalCell::new(DictT {
@@ -894,6 +890,225 @@ pub fn del_menutrans_vars() {
         // SAFETY: item was just looked up from d's own dv_index,
         // satisfying tv_dict_item_remove's own safety contract.
         unsafe { crate::eval::typval::tv_dict_item_remove(d, item) };
+    }
+}
+
+/// Set every `v:` special variable to its real startup default
+/// (`evalvars_init`, `eval/vars.c`).
+///
+/// The `init_var_dict`/`vimvars[]`-population half of the original's
+/// own job is ALREADY done: `GLOBVARDICT`/`VIMVARDICT`'s own lazy
+/// construction already sets `dv_scope`/`dv_lock`/`dv_refcount` to
+/// exactly what `init_var_dict` would (see their own doc comments),
+/// and `VIMVARS`'s own construction already fills every entry's
+/// `di_flags`/`di_key` from its `name`/`flags` (mirroring the
+/// original's own per-entry loop). This function's OWN remaining real
+/// job is overriding several `VIMVARS` entries' bare static-initializer
+/// VALUES with real runtime startup values.
+///
+/// Two pieces are deliberately deferred, each documented precisely:
+/// - `v:version`/`v:versionlong` need `min_vim_version`/
+///   `highest_patch` (`version.c`'s own generated `vim_versions[]`/
+///   `included_patchsets[][]` tables - a separate mechanical-
+///   transcription undertaking, not attempted here).
+/// - `v:msgpack_types` needs a new `MessagePackType` enum/
+///   `eval_msgpack_type_lists` array (`eval/decode.c`/`eval/encode.c`,
+///   the JSON/msgpack encoding subsystem, not translated - nothing
+///   would ever READ this array back today anyway).
+/// - The `v:startreason` env-var-based OVERRIDE (checking
+///   `ENV_STARTREASON` for a `nvim --remote`-triggered restart) needs
+///   `os_unsetenv` (not yet translated) - only the unconditional
+///   `"normal"` default (the original's own FIRST, unconditional
+///   `set_vim_var_string` call) is set here.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` and the shared `VIMVARDICT`/
+/// `VIMVARS`/`FUNC_HASHTAB` state - any TEST calling this must hold
+/// `crate::globals::global_state_test_lock()` for its whole body.
+pub unsafe fn evalvars_init() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        set_vim_var_dict(VimVarIndex::CompletedItem, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
+        set_vim_var_dict(VimVarIndex::Event, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
+
+        let errors = crate::eval::typval::tv_list_alloc(crate::eval::typval_defs::ListLenSpecials::Unknown as isize);
+        set_vim_var_list(VimVarIndex::Errors, errors);
+
+        set_vim_var_nr(VimVarIndex::Stderr, 2); // CHAN_STDERR
+        set_vim_var_nr(VimVarIndex::Searchforward, 1);
+        set_vim_var_nr(VimVarIndex::Hlsearch, 1);
+        set_vim_var_nr(VimVarIndex::Count1, 1);
+        set_vim_var_string(VimVarIndex::Startreason, Some(b"normal"));
+        set_vim_var_special(VimVarIndex::Exiting, crate::eval::typval_defs::SpecialVarValue::Null);
+
+        set_vim_var_nr(VimVarIndex::TypeNumber, i64::from(crate::eval::typval_defs::var_type_result::NUMBER));
+        set_vim_var_nr(VimVarIndex::TypeString, i64::from(crate::eval::typval_defs::var_type_result::STRING));
+        set_vim_var_nr(VimVarIndex::TypeFunc, i64::from(crate::eval::typval_defs::var_type_result::FUNC));
+        set_vim_var_nr(VimVarIndex::TypeList, i64::from(crate::eval::typval_defs::var_type_result::LIST));
+        set_vim_var_nr(VimVarIndex::TypeDict, i64::from(crate::eval::typval_defs::var_type_result::DICT));
+        set_vim_var_nr(VimVarIndex::TypeFloat, i64::from(crate::eval::typval_defs::var_type_result::FLOAT));
+        set_vim_var_nr(VimVarIndex::TypeBool, i64::from(crate::eval::typval_defs::var_type_result::BOOL));
+        set_vim_var_nr(VimVarIndex::TypeBlob, i64::from(crate::eval::typval_defs::var_type_result::BLOB));
+
+        set_vim_var_bool(VimVarIndex::False, crate::eval::typval_defs::BoolVarValue::False);
+        set_vim_var_bool(VimVarIndex::True, crate::eval::typval_defs::BoolVarValue::True);
+        set_vim_var_special(VimVarIndex::Null, crate::eval::typval_defs::SpecialVarValue::Null);
+        set_vim_var_nr(VimVarIndex::Numbermax, crate::eval::typval_defs::VARNUMBER_MAX);
+        set_vim_var_nr(VimVarIndex::Numbermin, crate::eval::typval_defs::VARNUMBER_MIN);
+        set_vim_var_nr(
+            VimVarIndex::Numbersize,
+            i64::from(std::mem::size_of::<crate::eval::typval_defs::VarnumberT>() as u32 * 8),
+        );
+        set_vim_var_nr(VimVarIndex::Maxcol, i64::from(crate::pos_defs::MAXCOL));
+
+        let sc_col = crate::globals::GLOBALS.get_mut().sc_col;
+        set_vim_var_nr(VimVarIndex::Echospace, i64::from(sc_col - 1));
+
+        // v:lua: a bound, always-present Partial referencing no real
+        // function (matching the original's own "shouldn't be printed,
+        // but if it is, do not crash" placeholder name).
+        let vvlua_partial = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_name: Some(Vec::new()),
+            pt_refcount: 1,
+            ..Default::default()
+        }));
+        set_vim_var_partial(VimVarIndex::Lua, vvlua_partial);
+
+        set_reg_var(0); // default for v:register is not 0 but '"'
+    }
+}
+
+#[cfg(test)]
+mod evalvars_init_tests {
+    use super::*;
+
+    /// Verifies every real value `evalvars_init` sets, then explicitly
+    /// releases the 4 heap-allocated resources it creates (2 `Dict`s,
+    /// 1 `List`, 1 `Partial`), resetting each `VIMVARS` slot's stored
+    /// pointer back to null afterward - this crate's own established
+    /// convention for testing an intentionally-one-shot session
+    /// bootstrap function (matching `new_script_vars`/`func_hashtab`'s
+    /// own precedent) without leaving a dangling pointer OR a
+    /// permanently-populated `GC_FIRST_DICT`/`GC_FIRST_LIST` entry for
+    /// later, unrelated tests to trip over.
+    ///
+    /// Deliberately does NOT reset the simple scalar slots
+    /// (`v:stderr`, `v:searchforward`, `v:hlsearch`, `v:count1`,
+    /// `v:startreason`, `v:exiting`, the 8 `v:t_*` constants,
+    /// `v:false`/`v:true`/`v:null`, `v:numbermax`/`v:numbermin`/
+    /// `v:numbersize`/`v:maxcol`/`v:echospace`, `v:register`) back to
+    /// their pre-call values: none of them hold a heap-linked resource
+    /// that could dangle, and no OTHER test in this file asserts a
+    /// SPECIFIC value for any of these slots without first setting it
+    /// itself (verified by inspection) - only var_type()-only checks
+    /// exist, which stay correct regardless (evalvars_init never
+    /// changes a slot's TYPE tag, only its VALUE).
+    #[test]
+    fn evalvars_init_sets_real_startup_values() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        // Precondition, matching this crate's own established
+        // GC_FIRST_DICT/GC_FIRST_LIST convention: nothing else should
+        // be live before this test runs its own allocations.
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+
+        // Captured BEFORE the call so this assertion is correct
+        // regardless of what any other test has left GLOBALS.sc_col
+        // at - asserting the RELATIONSHIP evalvars_init computes, not
+        // a hardcoded absolute value.
+        let sc_col_before = unsafe { crate::globals::GLOBALS.get_mut() }.sc_col;
+
+        // SAFETY: this test holds global_state_test_lock() for its
+        // whole body, matching every other GLOBALS/VIMVARS-touching
+        // test in this file.
+        unsafe {
+            evalvars_init();
+
+            // v:completed_item / v:event: real, empty, Fixed-locked
+            // dicts, and genuinely distinct from one another.
+            let completed_item = get_vim_var_dict(VimVarIndex::CompletedItem);
+            assert!(!completed_item.is_null());
+            assert_eq!((*completed_item).dv_lock, VarLockStatus::Fixed);
+            assert_eq!((*completed_item).dv_index.len(), 0);
+
+            let event = get_vim_var_dict(VimVarIndex::Event);
+            assert!(!event.is_null());
+            assert_eq!((*event).dv_lock, VarLockStatus::Fixed);
+            assert_eq!((*event).dv_index.len(), 0);
+            assert_ne!(completed_item, event);
+
+            // v:errors: a real, empty list.
+            let errors = get_vim_var_list(VimVarIndex::Errors);
+            assert!(!errors.is_null());
+            assert_eq!((*errors).lv_len, 0);
+
+            // Simple numeric/string/special values.
+            assert_eq!(get_vim_var_nr(VimVarIndex::Stderr), 2);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Searchforward), 1);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Hlsearch), 1);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Count1), 1);
+            assert_eq!(get_vim_var_str(VimVarIndex::Startreason), b"normal".to_vec());
+            assert_eq!(
+                (*get_vim_var_tv(VimVarIndex::Exiting)).value,
+                TypvalValue::Special(SpecialVarValue::Null)
+            );
+
+            // v:t_* type constants (var_type_result's own numbering,
+            // NOT VarType's discriminants - a deliberately separate
+            // scheme, see var_type_result's own doc comment).
+            use crate::eval::typval_defs::var_type_result;
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeNumber), i64::from(var_type_result::NUMBER));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeString), i64::from(var_type_result::STRING));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeFunc), i64::from(var_type_result::FUNC));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeList), i64::from(var_type_result::LIST));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeDict), i64::from(var_type_result::DICT));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeFloat), i64::from(var_type_result::FLOAT));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeBool), i64::from(var_type_result::BOOL));
+            assert_eq!(get_vim_var_nr(VimVarIndex::TypeBlob), i64::from(var_type_result::BLOB));
+
+            // v:false / v:true / v:null.
+            assert_eq!((*get_vim_var_tv(VimVarIndex::False)).value, TypvalValue::Bool(BoolVarValue::False));
+            assert_eq!((*get_vim_var_tv(VimVarIndex::True)).value, TypvalValue::Bool(BoolVarValue::True));
+            assert_eq!((*get_vim_var_tv(VimVarIndex::Null)).value, TypvalValue::Special(SpecialVarValue::Null));
+
+            // v:numbermax / v:numbermin / v:numbersize / v:maxcol /
+            // v:echospace.
+            assert_eq!(get_vim_var_nr(VimVarIndex::Numbermax), crate::eval::typval_defs::VARNUMBER_MAX);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Numbermin), crate::eval::typval_defs::VARNUMBER_MIN);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Numbersize), 64);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Maxcol), i64::from(crate::pos_defs::MAXCOL));
+            assert_eq!(get_vim_var_nr(VimVarIndex::Echospace), i64::from(sc_col_before - 1));
+
+            // v:lua: a real, bound Partial (empty name, not None -
+            // matching the original's own "shouldn't be printed, but
+            // if it is, do not crash" placeholder).
+            let lua_partial = get_vim_var_partial(VimVarIndex::Lua);
+            assert!(!lua_partial.is_null());
+            assert_eq!((*lua_partial).pt_refcount, 1);
+            assert_eq!((*lua_partial).pt_name, Some(Vec::new()));
+
+            // v:register: reflects set_reg_var(0)'s effect (the
+            // default register name is '"', not the literal digit 0).
+            assert_eq!(get_vim_var_str(VimVarIndex::Reg), vec![b'"']);
+
+            // --- Cleanup: release every heap-allocated resource this
+            // call created, then reset each VIMVARS slot's own stored
+            // pointer back to null - avoiding both a permanent
+            // GC_FIRST_DICT/GC_FIRST_LIST entry and a dangling pointer
+            // left in VIMVARS for a later test to dereference.
+            crate::eval::typval::tv_dict_unref(completed_item);
+            set_vim_var_dict(VimVarIndex::CompletedItem, std::ptr::null_mut());
+            crate::eval::typval::tv_dict_unref(event);
+            set_vim_var_dict(VimVarIndex::Event, std::ptr::null_mut());
+            crate::eval::typval::tv_list_unref(errors);
+            set_vim_var_list(VimVarIndex::Errors, std::ptr::null_mut());
+            crate::eval::typval::partial_unref(lua_partial);
+            set_vim_var_partial(VimVarIndex::Lua, std::ptr::null_mut());
+        }
+
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        assert!(crate::eval::typval::gc_first_list_is_empty());
     }
 }
 
@@ -1008,14 +1223,17 @@ static COMPAT_HASHTAB: std::sync::LazyLock<crate::globals::GlobalCell<crate::has
 /// stable address for the rest of the program, exactly like a real
 /// static array element's address in the original.
 ///
-/// `evalvars_init`'s OWN remaining body (setting real default values
-/// for `v:version`/`v:argv`/`v:progpath`/etc. via
-/// `min_vim_version`/`os_getenv`/other not-yet-translated subsystems,
-/// `vars.c` lines 288-358) is a separate, substantial undertaking,
-/// deliberately not folded in here - this static only builds the DICT
-/// STRUCTURE, matching this crate's usual "structure before the
-/// engine/values" precedent (e.g. `OptIndex`/`CmdIdxT` before their
-/// real populated tables).
+/// `evalvars_init` ITSELF is now fully translated (see its own doc
+/// comment) and sets most `VIMVARS` entries' real runtime VALUES -
+/// only `v:version`/`v:versionlong` (needs `version.c`'s generated
+/// version-history tables) and `v:msgpack_types` (needs the JSON/
+/// msgpack encoding subsystem) remain genuinely deferred. This static
+/// only ever builds the DICT STRUCTURE regardless (matching this
+/// crate's usual "structure before the engine/values" precedent, e.g.
+/// `OptIndex`/`CmdIdxT` before their real populated tables) - it does
+/// not itself call `evalvars_init`, since a `LazyLock`'s own init
+/// closure has no way to also run an unrelated, separately-invoked
+/// bootstrap function.
 static VIMVARDICT: std::sync::LazyLock<crate::globals::GlobalCell<DictT>> =
     std::sync::LazyLock::new(|| {
         let mut dict = DictT {

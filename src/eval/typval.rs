@@ -1635,6 +1635,21 @@ pub fn tv_dict_alloc() -> *mut DictT {
     d
 }
 
+/// Allocate an empty dictionary with a given lock status
+/// (`tv_dict_alloc_lock`).
+///
+/// Note: like [`tv_dict_alloc`], this touches the shared
+/// `GC_FIRST_DICT` linked list - any TEST calling it must hold
+/// `crate::globals::global_state_test_lock()` for its whole body.
+#[must_use]
+pub fn tv_dict_alloc_lock(lock: VarLockStatus) -> *mut DictT {
+    let d = tv_dict_alloc();
+    // SAFETY: `d` was just allocated above, not yet reachable from
+    // anywhere else.
+    unsafe { (*d).dv_lock = lock };
+    d
+}
+
 /// Set the return value of `tv` to a dict, incrementing its reference
 /// count if non-null (`tv_dict_set_ret`, `eval/typval.h`'s own
 /// `static inline`).
