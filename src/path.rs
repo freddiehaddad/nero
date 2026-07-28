@@ -31,6 +31,15 @@
 //! `dir_of_file_exists` slices the already-bounded `&[u8]` directly
 //! instead of the original's own temporary-NUL-terminate-then-restore
 //! trick on a mutable copy - no in-place mutation needed at all.
+//! `invocation_path_tail` returns `(tail_offset, tail_len)` instead of
+//! a pointer plus an out-parameter length. Its own quoted-segment/
+//! backslash-escape handling has a genuine, verified platform
+//! difference: on Windows, `vim_ispathsep_nocolon('\\')` is checked
+//! FIRST in the very same `if`/`else if` chain that would otherwise
+//! treat a quoted `\"` as an escaped quote, so backslash is ALWAYS
+//! treated as a directory separator there (even inside a quoted
+//! segment) - the escape mechanism can only ever be exercised on
+//! non-Windows, where a bare backslash is never a path separator.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -1224,6 +1233,49 @@ pub fn dir_of_file_exists(fname: &[u8]) -> bool {
     crate::os::fs::os_isdir(std::path::Path::new(dir_str))
 }
 
+/// Get the last component of `invocation` (e.g. `argv[0]`), handling
+/// double-quoted segments (`invocation_path_tail`) - e.g. Windows' own
+/// `"C:\Program Files\nvim.exe" --headless`: the scan stops at the
+/// FIRST unquoted space, treating everything from there on as
+/// command-line arguments, not part of the invocation path itself. A
+/// backslash immediately before a quote, while inside a quoted
+/// segment, is skipped without ending the quote (an escaped `"`).
+///
+/// Returns `(tail_offset, tail_len)`: the byte offset of the tail
+/// component's own start (immediately after its last path separator),
+/// and its length - NOT necessarily `invocation.len() - tail_offset`,
+/// since a quote character consumed partway through the scan doesn't
+/// extend the counted length (matching the original's own `tail_end`
+/// bookkeeping, including its real edge-case behavior for a trailing
+/// separator with nothing meaningful after it: `tail_end` can end up
+/// BEFORE `tail`, at which point the original's own pointer-difference
+/// arithmetic - cast to `size_t` - wraps around; `wrapping_sub` matches
+/// this faithfully rather than panicking on a checked subtraction).
+#[must_use]
+pub fn invocation_path_tail(invocation: &[u8]) -> (usize, usize) {
+    let head = get_past_head(invocation);
+    let mut tail = head;
+    let mut tail_end = head;
+    let mut p = head;
+    let mut inquote = false;
+    while p < invocation.len() && (inquote || invocation[p] != b' ') {
+        // SAFETY: p is a valid index into invocation (the loop
+        // condition guards p < invocation.len()).
+        let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&invocation[p..]) }).unwrap_or(1).max(1);
+        if vim_ispathsep_nocolon(i32::from(invocation[p])) {
+            tail = p + 1; // now tail points one past the separator.
+        } else if invocation[p] == b'\\' && inquote {
+            p += 1;
+        } else if invocation[p] == b'"' {
+            inquote = !inquote;
+        } else {
+            tail_end = p + l;
+        }
+        p += l;
+    }
+    (tail, tail_end.wrapping_sub(tail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1992,5 +2044,73 @@ mod tests {
     #[test]
     fn dir_of_file_exists_false_for_invalid_utf8_directory_portion() {
         assert!(!dir_of_file_exists(b"\xffbaddir/file.txt"));
+    }
+
+    #[test]
+    fn invocation_path_tail_plain_path_no_quotes() {
+        assert_eq!(invocation_path_tail(b"/usr/bin/nvim"), (9, 4));
+        assert_eq!(&b"/usr/bin/nvim"[9..9 + 4], b"nvim");
+    }
+
+    #[test]
+    fn invocation_path_tail_stops_at_the_first_unquoted_space() {
+        assert_eq!(invocation_path_tail(b"/usr/bin/nvim --headless"), (9, 4));
+    }
+
+    #[test]
+    fn invocation_path_tail_quoted_segment_includes_an_embedded_space() {
+        // The quoted "a b/c" segment's own embedded space does NOT
+        // stop the scan (inquote is true throughout it) - only the
+        // real, unquoted space after the closing quote does.
+        assert_eq!(invocation_path_tail(b"\"a b/c\" --headless"), (5, 1));
+        assert_eq!(&b"\"a b/c\" --headless"[5..5 + 1], b"c");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn invocation_path_tail_backslash_escaped_quote_does_not_close_it() {
+        // Inside a quoted segment, `\"` is an escaped quote (does not
+        // end the quoted segment) - the scan continues past both the
+        // backslash and the quote, landing on the character after.
+        // Hand-traced byte-by-byte: tail commits at the '/' (index 3),
+        // tail_end only ever advances on a "normal" character (never
+        // on the backslash+quote pair itself), but its FINAL value (7,
+        // set after 'c') still spans the whole "b\"c" run since
+        // nothing else moved tail_end backward in between.
+        //
+        // Windows-only note: `vim_ispathsep_nocolon` treats '\\' as a
+        // path separator UNCONDITIONALLY there (checked BEFORE the
+        // backslash-escape branch in the same if/else-if chain), so
+        // this exact escaped-quote mechanism can only ever be
+        // EXERCISED on non-Windows, where a bare backslash is never a
+        // path separator - verified directly by tracing both
+        // platforms' real branch order before writing this test.
+        let invocation: &[u8] = b"\"a/b\\\"c\" --headless";
+        assert_eq!(invocation_path_tail(invocation), (3, 4));
+        assert_eq!(&invocation[3..3 + 4], b"b\\\"c");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn invocation_path_tail_windows_backslash_is_always_a_separator_even_inside_quotes() {
+        // On Windows, vim_ispathsep_nocolon('\\') is checked FIRST in
+        // the same if/else-if chain that would otherwise treat a
+        // quoted backslash as an escape - so it always commits `tail`
+        // forward, even while inquote is true, unlike non-Windows
+        // (see this file's own sibling test for that platform).
+        let invocation: &[u8] = b"\"a/b\\\"c\" --headless";
+        assert_eq!(invocation_path_tail(invocation), (5, 14));
+    }
+
+    #[test]
+    fn invocation_path_tail_trailing_separator_wraps_the_length() {
+        // A trailing separator with nothing meaningful after it means
+        // tail_end never gets updated past the separator's own
+        // position - tail ends up strictly greater than tail_end,
+        // matching the original's own real (if unusual) pointer-
+        // difference-cast-to-size_t wraparound behavior exactly.
+        let (tail, len) = invocation_path_tail(b"abc/");
+        assert_eq!(tail, 4);
+        assert_eq!(len, 3usize.wrapping_sub(4));
     }
 }
