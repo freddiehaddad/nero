@@ -3856,6 +3856,117 @@ pub unsafe fn eval0(
     ret
 }
 
+/// Evaluate the expression at `arg` (must already be skipped of
+/// leading whitespace), reporting a suitable error if it fails
+/// (`eval1_emsg`).
+///
+/// The original's own `fill_evalarg_from_eap(&evalarg, eap, eap != NULL
+/// && eap->skip)` is inlined directly here rather than translated as
+/// its own standalone function: every real call in this crate passes
+/// `eap = None` (matching `eval_to_string_eap`'s own established
+/// precedent for the identical situation), for which
+/// `fill_evalarg_from_eap` always resolves to exactly
+/// `{ eval_flags: if skip { 0 } else { EVAL_EVALUATE } }` regardless of
+/// `eap` - the `eap`-populated branch (threading through
+/// `eval_getline`/`eval_cookie` for multi-line `:source` context) has no
+/// real caller to exercise yet.
+///
+/// The original's own `semsg(_(e_invexpr2), start)` (reported only when
+/// the failure isn't already explained by an aborting error, an
+/// interrupt, an exception, or a more specific prior message - see
+/// `aborting`) is omitted (message display, not tractable) - the
+/// identical `FAIL` return and [`clear_evalarg`] cleanup are kept
+/// exactly.
+///
+/// # Safety
+/// Forwarded from [`eval1`]'s own safety doc.
+pub unsafe fn eval1_emsg(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    eap: Option<&mut crate::ex_cmds_defs::ExargT>,
+) -> (i32, usize) {
+    let skip = eap.as_deref().is_some_and(|e| e.skip);
+    let mut evalarg = EvalargT { eval_flags: if skip { 0 } else { EVAL_EVALUATE }, ..Default::default() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, consumed) = unsafe { eval1(arg, rettv, Some(&mut evalarg)) };
+    clear_evalarg(Some(&mut evalarg), None);
+    (ret, consumed)
+}
+
+/// Evaluate a [`TypvalValue::String`]-typed `{expr}` typval as a
+/// Vimscript expression (`eval_expr_string`).
+///
+/// The original's `tv_get_string_buf_chk` (using a caller-supplied
+/// fixed buffer to avoid `tv_get_string_chk`'s own shared static
+/// scratch buffer) has no need for a Rust translation of its own - a
+/// Rust `tv_get_string_chk` call already returns a freshly-owned
+/// `Vec<u8>` per call, with no shared-buffer hazard to work around
+/// (matching this crate's own already-established precedent for this
+/// exact simplification, see `tv_get_string_chk`'s own doc comment).
+///
+/// # Safety
+/// Forwarded from [`eval1_emsg`]'s own safety doc.
+unsafe fn eval_expr_string(expr: &TypvalT, rettv: &mut TypvalT) -> i32 {
+    let Some(s) = crate::eval::typval::tv_get_string_chk(expr) else {
+        return FAIL;
+    };
+
+    let start = skipwhite(&s);
+    // SAFETY: forwarded from this function's own safety doc.
+    let (ret, consumed) = unsafe { eval1_emsg(&s[start..], rettv, None) };
+    if ret == FAIL {
+        return FAIL;
+    }
+    let pos = start + consumed;
+
+    // check for trailing chars after expr
+    let trailing = skipwhite(&s[pos..]);
+    if pos + trailing != s.len() {
+        // semsg(_(e_invexpr2), s) omitted - message display, not
+        // tractable; the identical tv_clear/FAIL is kept.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(rettv) };
+        return FAIL;
+    }
+
+    OK
+}
+
+/// Evaluate an expression which can be a function, partial, or string.
+/// Pass arguments `argv[..argc]` (`eval_expr_typval`).
+///
+/// Only the [`TypvalValue::String`] (with `want_func == false`) case is
+/// modeled: a [`TypvalValue::Partial`]/[`TypvalValue::Func`] value, or
+/// `want_func == true`, needs `eval_expr_partial`/`eval_expr_func` (the
+/// whole function-CALL machinery - `call_partial`/`call_func`), a
+/// substantial, separate undertaking not yet translated - `panic!()`s
+/// with a clear, specific message if either is ever reached, rather
+/// than silently mishandling it.
+///
+/// # Safety
+/// Forwarded from `eval_expr_string`'s own safety doc.
+pub unsafe fn eval_expr_typval(
+    expr: &TypvalT,
+    want_func: bool,
+    _argv: &mut [TypvalT],
+    rettv: &mut TypvalT,
+) -> i32 {
+    if matches!(expr.value, TypvalValue::Partial(_)) {
+        unimplemented!(
+            "eval_expr_typval: a Partial callback needs eval_expr_partial (call_partial), not yet \
+             translated"
+        );
+    }
+    if matches!(expr.value, TypvalValue::Func(_)) || want_func {
+        unimplemented!(
+            "eval_expr_typval: a Funcref callback needs eval_expr_func (call_func), not yet \
+             translated"
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval_expr_string(expr, rettv) }
+}
+
 /// Skip over an expression at `arg`, without evaluating it
 /// (`skip_expr`).
 ///
@@ -6894,6 +7005,88 @@ mod tests {
         assert!(evalarg.eval_tofree.is_none());
         assert_eq!(eap.cmdline_tofree, Some(b"old_line".to_vec()));
         assert_eq!(eap.arg, Some(b"new_line".to_vec()));
+    }
+
+    // --- eval1_emsg / eval_expr_string / eval_expr_typval ---
+
+    #[test]
+    fn eval1_emsg_evaluates_a_simple_expression() {
+        let mut rettv = TypvalT::default();
+        let (ret, consumed) = unsafe { eval1_emsg(b"1 + 2", &mut rettv, None) };
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 5);
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn eval1_emsg_fails_and_reports_only_what_was_consumed_on_invalid_input() {
+        let mut rettv = TypvalT::default();
+        let (ret, _consumed) = unsafe { eval1_emsg(b")", &mut rettv, None) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_expr_string_evaluates_a_plain_string_typval() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"3 * 4".to_vec())), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_expr_string(&expr, &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(12));
+    }
+
+    #[test]
+    fn eval_expr_string_fails_on_a_non_stringish_expr() {
+        // TypvalValue::List has no string representation - tv_get_string_chk
+        // returns None for it.
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let expr = TypvalT { value: TypvalValue::List(list), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_expr_string(&expr, &mut rettv) };
+        assert_eq!(ret, FAIL);
+        unsafe { crate::eval::typval::tv_list_free_list(list) };
+    }
+
+    #[test]
+    fn eval_expr_string_fails_and_clears_rettv_on_trailing_garbage() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"1 + 2 garbage".to_vec())), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_expr_string(&expr, &mut rettv) };
+        assert_eq!(ret, FAIL);
+    }
+
+    #[test]
+    fn eval_expr_string_tolerates_trailing_whitespace() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"  5 + 5  ".to_vec())), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_expr_string(&expr, &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(10));
+    }
+
+    #[test]
+    fn eval_expr_typval_dispatches_a_string_to_eval_expr_string() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"2 + 2".to_vec())), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        let ret = unsafe { eval_expr_typval(&expr, false, &mut [], &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_expr_partial")]
+    fn eval_expr_typval_panics_on_a_partial() {
+        let pt = crate::eval::typval_defs::PartialT::default();
+        let expr = TypvalT { value: TypvalValue::Partial(&pt as *const _ as *mut _), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { eval_expr_typval(&expr, false, &mut [], &mut rettv) };
+    }
+
+    #[test]
+    #[should_panic(expected = "eval_expr_func")]
+    fn eval_expr_typval_panics_on_want_func_even_for_a_string() {
+        let expr = TypvalT { value: TypvalValue::String(Some(b"foo".to_vec())), ..TypvalT::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { eval_expr_typval(&expr, true, &mut [], &mut rettv) };
     }
 
     // --- eval0-eval7 end-to-end ---

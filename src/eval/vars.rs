@@ -1953,6 +1953,107 @@ pub unsafe fn set_reg_var(c: i32) {
     }
 }
 
+/// Save `v:` variable `idx`'s current value into `save_tv`, in
+/// preparation for a temporary override - e.g. `v:val`/`v:key` while
+/// `filter()`/`map()`/`sort()`'s comparator expression is running
+/// (`prepare_vimvar`).
+///
+/// If `idx`'s value is normally [`VarType::Unknown`] (not registered in
+/// the real `v:` scope dict's hashtable at all by default - true of
+/// `v:val`/`v:key` specifically, see `VIMVARS`'s own doc comment),
+/// this ALSO adds it to `VIMVARDICT`'s `dv_hashtab`/`dv_index` for the
+/// duration of the override, exactly mirroring the original's own
+/// `hash_add(&vimvarht, vimvars[idx].vv_di.di_key)` - without this,
+/// `v:val`/`v:key` would stay invisible to a real Vimscript expression
+/// evaluated while the caller believes they're "set" (`find_var_in_ht`'s
+/// real, hash-based lookup would never find them).
+///
+/// The original's own `vimvars[idx].vv_str = NULL;  // don't free it
+/// now` has no Rust equivalent to translate: that line exists only to
+/// stop the *next* line's plain struct-copy-without-clearing from
+/// double-freeing a cached string pointer the original keeps alongside
+/// `vv_tv` - this crate's `Vimvar`/`TypvalT` has no such separate cache,
+/// and `TypvalT` itself implements no `Drop` at all (this crate's
+/// established manual-memory-management style), so a plain
+/// [`std::mem::take`] (leaving [`TypvalT::default`]/[`TypvalValue::Unknown`]
+/// behind) is both safe and a faithful "just a bitwise struct copy, no
+/// double-free risk" translation - the caller (`filter_map_one`,
+/// `sort()`'s comparator, etc.) always immediately overwrites the slot
+/// with a real new value anyway, so this difference is never observable.
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn prepare_vimvar(idx: VimVarIndex, save_tv: &mut TypvalT) {
+    let v = vimvar_ptr(idx);
+    // SAFETY: forwarded from this function's own safety doc.
+    *save_tv = unsafe { std::mem::take(&mut (*v).di.di_tv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*v).di.di_tv.value.var_type() } != VarType::Unknown {
+        return;
+    }
+    // SAFETY: `di_key` is never mutated/freed while VIMVARS lives (see
+    // VIMVARDICT's own construction, which relies on the exact same
+    // stability), and outlives this whole hash-table entry's lifetime.
+    let key_ptr = unsafe { (*v).di.di_key.as_mut_ptr() as *mut std::os::raw::c_char };
+    let dict = get_vimvar_dict();
+    // SAFETY: forwarded from this function's own safety doc; `dict` is
+    // VIMVARDICT's own stable storage (see get_vimvar_dict's doc).
+    unsafe {
+        (*dict).dv_hashtab.hash_add(key_ptr);
+        (*dict).dv_index.insert(key_ptr as usize, std::ptr::addr_of_mut!((*v).di));
+    }
+}
+
+/// Restore `v:` variable `idx` to typval `save_tv` (`restore_vimvar`).
+///
+/// Note that the `v:` variable must have been cleared already (matching
+/// the original's own doc comment) - the caller is responsible for
+/// releasing whatever value the slot held immediately before this call,
+/// exactly as with [`prepare_vimvar`]'s own caller-immediately-
+/// overwrites contract.
+///
+/// When no longer defined (the slot's restored value is
+/// [`VarType::Unknown`] - true of `v:val`/`v:key`), removes the entry
+/// from `VIMVARDICT`'s `dv_hashtab`/`dv_index`, mirroring
+/// [`prepare_vimvar`]'s own temporary registration exactly. The
+/// original's `internal_error("restore_vimvar()")` (reached only if the
+/// entry mysteriously isn't found - a genuine "should never happen"
+/// caller-contract violation, since [`prepare_vimvar`] always adds it
+/// first) becomes a `debug_assert!`, matching this crate's established
+/// policy for this exact class of internal-invariant check.
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn restore_vimvar(idx: VimVarIndex, save_tv: TypvalT) {
+    let v = vimvar_ptr(idx);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*v).di.di_tv = save_tv };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*v).di.di_tv.value.var_type() } != VarType::Unknown {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let key: &[u8] = unsafe { &(*v).di.di_key };
+    // Strip the trailing NUL di_key always carries - hash_find/
+    // hash_remove take the bare key bytes (matching
+    // tv_dict_item_remove's own established treatment of this exact
+    // convention).
+    let key = &key[..key.len().saturating_sub(1)];
+    let key_ptr = key.as_ptr();
+    let dict = get_vimvar_dict();
+    // SAFETY: forwarded from this function's own safety doc; `dict` is
+    // VIMVARDICT's own stable storage.
+    unsafe {
+        let found = !hashitem_empty((*dict).dv_hashtab.hash_find(key));
+        debug_assert!(found, "restore_vimvar: v:{} not found in vimvarht", (*v).name);
+        if found {
+            (*dict).dv_hashtab.hash_remove(key);
+            (*dict).dv_index.remove(&(key_ptr as usize));
+        }
+    }
+}
+
 /// Set `v:count`/`v:count1`, and (if `set_prevcount`) `v:prevcount`
 /// from the current `v:count` (`set_vcount`).
 ///
@@ -5111,5 +5212,93 @@ mod set_var_tests {
         unsafe {
             f_setbufvar(&argvars, &mut rettv);
         }
+    }
+}
+
+#[cfg(test)]
+mod prepare_restore_vimvar_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_then_restore_a_normally_registered_variable_roundtrips() {
+        let _lock = crate::globals::global_state_test_lock();
+        // v:count is normally registered (VarType != Unknown) - its
+        // hashtab/dv_index membership must be unaffected by
+        // prepare/restore.
+        let before_hash_used = unsafe { (*get_vimvar_dict()).dv_hashtab.ht_used };
+
+        let mut save = TypvalT::default();
+        unsafe { set_vim_var_nr(VimVarIndex::Count, 42) };
+        unsafe { prepare_vimvar(VimVarIndex::Count, &mut save) };
+        assert_eq!(save.value, TypvalValue::Number(42));
+
+        unsafe { set_vim_var_nr(VimVarIndex::Count, 7) };
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count) }, 7);
+
+        unsafe { restore_vimvar(VimVarIndex::Count, save) };
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Count) }, 42);
+        assert_eq!(unsafe { (*get_vimvar_dict()).dv_hashtab.ht_used }, before_hash_used);
+    }
+
+    #[test]
+    fn prepare_vimvar_registers_val_in_the_hashtable_while_active() {
+        let _lock = crate::globals::global_state_test_lock();
+        // v:val is normally VAR_UNKNOWN and NOT in the hashtable.
+        assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
+
+        let mut save = TypvalT::default();
+        unsafe { prepare_vimvar(VimVarIndex::Val, &mut save) };
+
+        // Now genuinely findable via a real hash lookup, matching a
+        // real Vimscript `v:val` reference during filter()/map().
+        assert!(!unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
+
+        unsafe { restore_vimvar(VimVarIndex::Val, save) };
+
+        // Removed again afterward.
+        assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
+    }
+
+    #[test]
+    fn prepare_vimvar_registers_key_in_the_hashtable_while_active() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"key")) });
+
+        let mut save = TypvalT::default();
+        unsafe { prepare_vimvar(VimVarIndex::Key, &mut save) };
+        assert!(!unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"key")) });
+
+        unsafe { restore_vimvar(VimVarIndex::Key, save) };
+        assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"key")) });
+    }
+
+    #[test]
+    fn prepare_vimvar_is_reentrant_safe_for_nested_val_overrides() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Simulates a nested filter()/map() call (an expression whose
+        // own v:val use triggers ANOTHER filter() internally) - the
+        // outer save/restore pair must not corrupt the inner one's own
+        // hashtab registration.
+        let mut save_outer = TypvalT::default();
+        unsafe { prepare_vimvar(VimVarIndex::Val, &mut save_outer) };
+        unsafe { set_vim_var_nr(VimVarIndex::Val, 1) };
+
+        let mut save_inner = TypvalT::default();
+        unsafe { prepare_vimvar(VimVarIndex::Val, &mut save_inner) };
+        unsafe { set_vim_var_nr(VimVarIndex::Val, 2) };
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Val) }, 2);
+
+        unsafe { restore_vimvar(VimVarIndex::Val, save_inner) };
+        assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Val) }, 1);
+        // Still registered: save_inner's own value (captured by the
+        // inner prepare_vimvar, when v:val already held Number(1)) is
+        // Number, not Unknown, so this restore's own
+        // "remove-if-Unknown" gate does not fire - matching the
+        // original's exact per-restore-call decision, made purely from
+        // the value being restored, not any notion of "nesting depth".
+        assert!(!unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
+
+        unsafe { restore_vimvar(VimVarIndex::Val, save_outer) };
+        assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
     }
 }
