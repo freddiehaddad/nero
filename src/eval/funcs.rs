@@ -11481,6 +11481,7 @@ mod tests {
 
     #[test]
     fn getwinpos_always_returns_minus_1_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_getwinpos(&[], &mut rettv) };
         let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
@@ -15921,6 +15922,7 @@ mod tests {
 
     #[test]
     fn reltime_no_args_returns_a_2_element_list() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_reltime(&[], &mut rettv) };
         let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
@@ -15932,6 +15934,7 @@ mod tests {
 
     #[test]
     fn reltime_one_arg_computes_elapsed_time_since_start() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut start_rettv = TypvalT::default();
         unsafe { f_reltime(&[], &mut start_rettv) };
         let TypvalValue::List(start_l) = &start_rettv.value else { panic!("expected a List") };
@@ -15948,6 +15951,7 @@ mod tests {
 
     #[test]
     fn reltime_two_args_computes_difference() {
+        let _lock = crate::globals::global_state_test_lock();
         let start = proftime_list(0, 0);
         let end = proftime_list(0, 1_000_000_000);
         let mut rettv = TypvalT::default();
