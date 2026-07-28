@@ -20,10 +20,13 @@
 //! nullable `char *f1, char *f2` parameters are modeled as
 //! `Option<&[u8]>` since, unlike most other functions here, the
 //! original has no `FUNC_ATTR_NONNULL_*` attribute and explicitly
-//! null-checks both), and `path_has_wildcard`/`path_has_exp_wildcard`
+//! null-checks both), `path_has_wildcard`/`path_has_exp_wildcard`
 //! (byte-scanned the same way as everything else in this file, no
 //! `mbyte.c` dependency needed - every character tested is a fixed
-//! ASCII byte).
+//! ASCII byte), `vim_isAbsName` (as [`vim_is_abs_name`], trivially
+//! composed from already-existing `path_with_url`/`path_is_absolute`),
+//! and `path_with_extension` (via `mbyte.c`'s `mb_strcmp_ic`, already
+//! translated).
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -1136,6 +1139,31 @@ pub fn path_has_exp_wildcard(p: &[u8]) -> bool {
     false
 }
 
+/// Return `true` if `name` is a full (absolute) path name or URL
+/// (`vim_isAbsName`).
+#[must_use]
+pub fn vim_is_abs_name(name: &[u8]) -> bool {
+    path_with_url(name) != 0 || path_is_absolute(name)
+}
+
+/// Check if a file name has a particular extension (`path_with_extension`),
+/// honoring `'fileignorecase'` (case-insensitive comparison) via
+/// [`crate::mbyte::mb_strcmp_ic`]. `false` when `path` has no `.`
+/// extension at all, matching the original's own `strrchr` returning
+/// `NULL`.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'fileignorecase'`).
+#[must_use]
+pub unsafe fn path_with_extension(path: &[u8], extension: &[u8]) -> bool {
+    let Some(dot) = path.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let ic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic != 0;
+    crate::mbyte::mb_strcmp_ic(ic, &path[dot + 1..], extension) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1796,5 +1824,59 @@ mod tests {
     #[test]
     fn path_has_exp_wildcard_false_for_a_plain_name() {
         assert!(!path_has_exp_wildcard(b"foo.txt"));
+    }
+
+    #[test]
+    fn vim_is_abs_name_true_for_an_absolute_path() {
+        if cfg!(windows) {
+            assert!(vim_is_abs_name(b"C:\\foo\\bar"));
+        } else {
+            assert!(vim_is_abs_name(b"/foo/bar"));
+        }
+    }
+
+    #[test]
+    fn vim_is_abs_name_true_for_a_url() {
+        assert!(vim_is_abs_name(b"http://example.com"));
+    }
+
+    #[test]
+    fn vim_is_abs_name_false_for_a_relative_path() {
+        assert!(!vim_is_abs_name(b"relative/path"));
+    }
+
+    #[test]
+    fn path_with_extension_true_for_a_matching_extension() {
+        let _guard = crate::globals::global_state_test_lock();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = 0;
+        assert!(unsafe { path_with_extension(b"file.txt", b"txt") });
+    }
+
+    #[test]
+    fn path_with_extension_uses_the_last_dot() {
+        let _guard = crate::globals::global_state_test_lock();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = 0;
+        assert!(unsafe { path_with_extension(b"file.tar.gz", b"gz") });
+        assert!(!unsafe { path_with_extension(b"file.tar.gz", b"tar") });
+    }
+
+    #[test]
+    fn path_with_extension_false_without_any_dot() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert!(!unsafe { path_with_extension(b"file", b"txt") });
+    }
+
+    #[test]
+    fn path_with_extension_case_sensitivity_follows_fileignorecase() {
+        let _guard = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic;
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = 0;
+        assert!(!unsafe { path_with_extension(b"file.TXT", b"txt") });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = 1;
+        assert!(unsafe { path_with_extension(b"file.TXT", b"txt") });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = prev;
     }
 }
