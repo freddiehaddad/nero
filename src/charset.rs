@@ -97,6 +97,11 @@
 //! raw pointer, since Rust slices are addressed by index, not pointer
 //! arithmetic - this is the direct structural translation of "pointer
 //! advanced past X", not a behavior change.
+//!
+//! Also translated: `vim_is_fname_char` - a trivial `vim_isfilec(c) ||
+//! c==',' || c==' ' || c=='@' || c==':'` (characters left out of
+//! `'isfname'`'s own default to make "gf" work), needing no new
+//! infrastructure at all.
 
 use crate::ascii_defs::{ascii_isbdigit, ascii_isdigit, ascii_isodigit, ascii_iswhite, ascii_isxdigit};
 use crate::eval::typval_defs::{UvarnumberT, VarnumberT, UVARNUMBER_MAX, VARNUMBER_MAX, VARNUMBER_MIN};
@@ -761,6 +766,14 @@ pub fn backslash_halve_save(p: &[u8]) -> Vec<u8> {
         }
     }
     result
+}
+
+/// Check if `c` is a valid file-name character, including characters
+/// left out of `'isfname'` to make "gf" work, such as `,`, ` `, `@`,
+/// `:`, etc. (`vim_is_fname_char`).
+#[must_use]
+pub fn vim_is_fname_char(c: i32) -> bool {
+    vim_isfilec(c) || c == i32::from(b',') || c == i32::from(b' ') || c == i32::from(b'@') || c == i32::from(b':')
 }
 
 /// Check that `c` is a valid file-name character or a wildcard
@@ -1780,6 +1793,28 @@ mod tests {
     fn vim_isfilec_or_wc_accepts_everything_at_or_above_0x100() {
         assert!(vim_isfilec_or_wc(0x100));
         assert!(vim_isfilec_or_wc(i32::MAX));
+    }
+
+    #[test]
+    fn vim_is_fname_char_delegates_to_vim_isfilec_for_ordinary_chars() {
+        assert!(vim_is_fname_char(i32::from(b'a')));
+        assert!(vim_is_fname_char(i32::from(b'.')));
+        assert!(!vim_is_fname_char(i32::from(b'&')));
+    }
+
+    #[test]
+    fn vim_is_fname_char_accepts_characters_left_out_of_the_default_isfname() {
+        // Space and ':' are never part of 'isfname''s own default set
+        // on either platform (verified against default_is_file_char
+        // directly) - these are the genuinely NEW characters
+        // vim_is_fname_char adds on top of vim_isfilec, exactly to
+        // let "gf" work on paths containing them.
+        assert!(!vim_isfilec(i32::from(b' ')));
+        assert!(!vim_isfilec(i32::from(b':')));
+        assert!(vim_is_fname_char(i32::from(b' ')));
+        assert!(vim_is_fname_char(i32::from(b':')));
+        assert!(vim_is_fname_char(i32::from(b',')));
+        assert!(vim_is_fname_char(i32::from(b'@')));
     }
 
     #[test]

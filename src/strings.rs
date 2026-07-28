@@ -63,6 +63,14 @@
 //! only `crate::option::csh_like_shell`/`fish_like_shell`,
 //! `crate::ex_docmd::find_cmdline_var`, and `crate::mbyte::utfc_ptr2len`,
 //! all either already existing or newly harvested alongside.
+//!
+//! `vim_strsave_escaped` is now the `cc = '\\'`/`bsl = false` special
+//! case of the fuller `vim_strsave_escaped_ext` (also translated) -
+//! the general form's real callers (`register.c`'s `@:`-register
+//! command-line escaping, `os/shell.c`'s shell-quote escaping) aren't
+//! translated yet, but the function itself is small, self-contained,
+//! and has no design freedom to get wrong, matching this crate's own
+//! established "translate ahead of a real caller" precedent.
 //! Deliberately collapses the original's own separate length-counting
 //! pass and fixed-size-buffer-filling pass into a single pass building
 //! a growing `Vec<u8>` - Rust's own `Vec` has no need for the
@@ -333,15 +341,19 @@ pub fn vim_strchr(string: &[u8], c: i32) -> Option<usize> {
 }
 
 /// Escape every character in `string` that also appears in
-/// `esc_chars` with a backslash (`vim_strsave_escaped`, matching the
-/// original's own `cc = '\\'`/`bsl = false` default parameterization
-/// of `vim_strsave_escaped_ext` - the `bsl`-true variant, needing
-/// `rem_backslash`, is not modeled since nothing calls it that way).
+/// `esc_chars`, escaping with `cc`; when `bsl` is `true`, ALSO escape
+/// characters where [`crate::charset::rem_backslash`] would remove
+/// the backslash (`vim_strsave_escaped_ext`). [`vim_strsave_escaped`]
+/// is the `cc = '\\'`/`bsl = false` special case this crate's own
+/// earlier translation of it already hardcoded - this general form
+/// exists to serve `register.c`'s `@:`-register command-line
+/// escaping and `os/shell.c`'s shell-quote escaping, once either of
+/// those files' own real call sites are translated.
 ///
 /// # Safety
 /// Touches `OPTION_VARS` (via [`crate::mbyte::utfc_ptr2len`]).
 #[must_use]
-pub unsafe fn vim_strsave_escaped(string: &[u8], esc_chars: &[u8]) -> Vec<u8> {
+pub unsafe fn vim_strsave_escaped_ext(string: &[u8], esc_chars: &[u8], cc: u8, bsl: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(string.len());
     let mut p = 0usize;
     while p < string.len() {
@@ -352,13 +364,28 @@ pub unsafe fn vim_strsave_escaped(string: &[u8], esc_chars: &[u8]) -> Vec<u8> {
             p += l;
             continue;
         }
-        if vim_strchr(esc_chars, i32::from(string[p])).is_some() {
-            out.push(b'\\');
+        if vim_strchr(esc_chars, i32::from(string[p])).is_some()
+            || (bsl && crate::charset::rem_backslash(&string[p..]))
+        {
+            out.push(cc);
         }
         out.push(string[p]);
         p += 1;
     }
     out
+}
+
+/// Escape every character in `string` that also appears in
+/// `esc_chars` with a backslash (`vim_strsave_escaped`, the
+/// `cc = '\\'`/`bsl = false` special case of
+/// [`vim_strsave_escaped_ext`]).
+///
+/// # Safety
+/// Forwards [`vim_strsave_escaped_ext`]'s own safety requirement.
+#[must_use]
+pub unsafe fn vim_strsave_escaped(string: &[u8], esc_chars: &[u8]) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { vim_strsave_escaped_ext(string, esc_chars, b'\\', false) }
 }
 
 /// Escape `string` for use as a shell command-line argument, wrapping
@@ -647,6 +674,48 @@ mod tests {
         // continue; }` fast path skipping the esc_chars check
         // entirely for multibyte sequences).
         assert_eq!(unsafe { vim_strsave_escaped("a一b".as_bytes(), "一".as_bytes()) }, "a一b".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escaped_ext_uses_a_custom_escape_character() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { vim_strsave_escaped_ext(b"a b", b" ", b'^', false) },
+            b"a^ b".to_vec()
+        );
+    }
+
+    #[test]
+    fn vim_strsave_escaped_ext_bsl_also_escapes_rem_backslash_candidates() {
+        // On non-Windows, rem_backslash accepts every backslash not
+        // at the very end of the string - with bsl=true, THAT
+        // backslash gets an extra escape character prepended too,
+        // even though '\\' itself isn't in esc_chars.
+        let _guard = crate::globals::global_state_test_lock();
+        if cfg!(unix) {
+            assert_eq!(
+                unsafe { vim_strsave_escaped_ext(b"a\\b", b"", b'^', true) },
+                b"a^\\b".to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn vim_strsave_escaped_ext_bsl_false_never_touches_a_lone_backslash() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { vim_strsave_escaped_ext(b"a\\b", b"", b'^', false) },
+            b"a\\b".to_vec()
+        );
+    }
+
+    #[test]
+    fn vim_strsave_escaped_ext_matches_vim_strsave_escaped_with_default_args() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { vim_strsave_escaped_ext(b"a b.c", b" .", b'\\', false) },
+            unsafe { vim_strsave_escaped(b"a b.c", b" .") }
+        );
     }
 
     // --- vim_strsave_shellescape ---
