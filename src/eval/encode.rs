@@ -10,13 +10,28 @@
 //! binary strings, etc), controlled by the template's own
 //! `TYPVAL_ENCODE_ALLOW_SPECIALS` flag.
 //!
-//! Only the "string" backend (`encode_vim_to_string`/
-//! `encode_tv2string`, the machinery behind the `string()` builtin) is
-//! translated here - it has `TYPVAL_ENCODE_ALLOW_SPECIALS` set to
+//! The "string" (`encode_vim_to_string`/`encode_tv2string`, backing
+//! the `string()` builtin) and "echo" (`encode_vim_to_echo`/
+//! `encode_tv2echo`, backing `:echo`'s own display and dozens of other
+//! internal "stringify for display" call sites) backends are both
+//! translated here - both have `TYPVAL_ENCODE_ALLOW_SPECIALS` set to
 //! `false` in the original, so the entire "special dictionary" input
-//! path (~150 lines of the shared template) never applies and isn't
-//! modeled at all. `echo`/`json`/`msgpack` are separate, not-yet-
-//! translated undertakings.
+//! path (~150 lines of the shared template) never applies to either
+//! and isn't modeled at all. `json`/`msgpack` remain separate,
+//! not-yet-translated undertakings (`ALLOW_SPECIALS: true` for both).
+//!
+//! "string" and "echo" share the exact same scalar/container
+//! formatting rules for EVERYTHING except self-reference text (see
+//! below) - confirmed directly against a real `nvim` binary
+//! (`v0.13.0-dev`), not assumed from reading the shared macro template
+//! alone: `:echo [1, 'a']` and `string([1, 'a'])` both print
+//! `[1, 'a']`. The ONE real difference lives at the THIN WRAPPER level
+//! (`encode_tv2echo`, not the container-walking `encode_vim_to_echo`
+//! itself): a top-level `String`/`Func` value bypasses the whole
+//! encoder and uses its raw text directly, unquoted - `:echo 'hello'`
+//! prints `hello`, not `'hello'`, but that SAME string nested inside a
+//! container (`:echo [1, 'a']` above) still gets quoted, because it
+//! isn't the top-level value that time.
 //!
 //! Self-referencing containers (`let l = [] | call add(l, l)`) are
 //! handled via `copyID`-marking exactly like `eval.rs`'s own
@@ -26,24 +41,29 @@
 //! structures" reason - verified directly via a dedicated test
 //! walking 20,000 levels of list-in-list nesting, matching
 //! `set_ref_in_list_items`'s own established verification precedent.
-//! Self-reference itself renders as `{E724@N}` (uniformly for BOTH
-//! List and Dict - NOT `[...@N]`/`{...@N}`, which is
-//! `encode_vim_to_echo`'s own DIFFERENT `TYPVAL_ENCODE_CONV_RECURSE`
-//! override) - confirmed directly against a real `nvim` binary
-//! (`v0.13.0-dev`), not assumed from reading the macro alone: `string()`
-//! of a list/dict containing itself prints `[1, [{E724@0}]]`/
-//! `{'a': 1, 'b': {E724@0}}`. The original's own one-time
-//! `emsg("E724: ...")` (gated by a `did_echo_string_emsg` static so a
-//! deeply-nested self-reference doesn't flood multiple errors) is
-//! omitted - message display, not tractable - but the identical
-//! `{E724@N}` text is still produced.
+//! Self-reference itself is the ONE real formatting difference between
+//! "string" and "echo" (`EncodeMode` selects between them): `string()`
+//! renders it as `{E724@N}` uniformly for BOTH List and Dict, plus a
+//! real one-time `emsg("E724: ...")` (omitted here - message display,
+//! not tractable; the identical `{E724@N}` text is still produced);
+//! `:echo` renders it as `[...@N]`/`{...@N}` (List-vs-Dict specific)
+//! with NO `emsg` at all - a genuine behavioral difference in the
+//! original itself, not an omission, confirmed directly against the
+//! same real `nvim` binary for both: `string(l)`/`:echo l` for a list
+//! containing itself print `[1, [{E724@0}]]`/`[1, [...@0]]`
+//! respectively. Easy to misread as the same format on a first pass
+//! through the macro definitions (the FIRST `TYPVAL_ENCODE_CONV_RECURSE`
+//! override in the source backs "string"; a SECOND, differently-shaped
+//! one a few lines later backs "echo") - this was double-checked
+//! against the real binary specifically because of that risk.
 //!
-//! `Func`/`Partial` values `unimplemented!()` - `string()` of a
-//! Funcref/Partial is a narrow case, and `Partial`'s own "bound args"/
-//! "self dict" sub-iteration would add a third, rarely-needed
-//! `EncodeFrame` variant for comparatively little value; add if a
-//! real caller ever needs it. A bare `VAR_FUNC` (no partial wrapper)
-//! IS implemented in full, since it needed no extra stack-frame
+//! `Func`/`Partial` values `unimplemented!()` inside the shared
+//! container walker - `string()`/`:echo` of a Funcref/Partial is a
+//! narrow case, and `Partial`'s own "bound args"/"self dict"
+//! sub-iteration would add a third, rarely-needed `EncodeFrame`
+//! variant for comparatively little value; add if a real caller ever
+//! needs it. A bare `VAR_FUNC` (no partial wrapper) IS implemented in
+//! full for both backends, since it needed no extra stack-frame
 //! machinery beyond what `encode_string_quoted` already provides -
 //! its own exact output (`function('name')`) was also confirmed
 //! against the same real `nvim` binary.
@@ -159,15 +179,17 @@ fn encode_func(out: &mut Vec<u8>, name: Option<&[u8]>) {
 
 /// Convert a single, already-known-scalar (or List/Dict-start) value,
 /// pushing a new [`EncodeFrame`] onto `stack` for List/Dict instead of
-/// recursing (`TYPVAL_ENCODE_CONVERT_ONE_VALUE`, specialized for the
-/// "string" backend - see this module's own doc comment).
+/// recursing (`TYPVAL_ENCODE_CONVERT_ONE_VALUE`, shared by both the
+/// "string" and "echo" backends - see this module's own doc comment -
+/// `mode` selects only the one place they actually differ: the
+/// self-reference text).
 ///
 /// The original's own early-exit (`goto
 /// typval_encode_stop_converting_one_item`, used by
 /// `TYPVAL_ENCODE_CONV_DICT_START`/`_LIST_START` to let a backend skip
 /// the rest of `TYPVAL_ENCODE_CONVERT_ONE_VALUE` after already fully
-/// handling a value) is not modeled - the "string" backend's own
-/// `_DICT_START`/`_LIST_START` macros are both plain, unconditional
+/// handling a value) is not modeled - both backends' own
+/// `_DICT_START`/`_LIST_START` macros are plain, unconditional
 /// `ga_append`s with no such early-exit, so this situation never
 /// actually arises here.
 ///
@@ -175,7 +197,7 @@ fn encode_func(out: &mut Vec<u8>, name: Option<&[u8]>) {
 /// If `tv`'s value is `List`/`Dict`/`Blob`-typed with a non-null
 /// pointer, that pointer must be valid, with every item/entry
 /// reachable through it also holding valid values recursively.
-unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv: &TypvalT, copy_id: i32) {
+unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv: &TypvalT, copy_id: i32, mode: EncodeMode) {
     match &tv.value {
         TypvalValue::String(s) => encode_string_quoted(out, s.as_deref()),
         TypvalValue::Number(n) => out.extend_from_slice(n.to_string().as_bytes()),
@@ -187,8 +209,8 @@ unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv:
         TypvalValue::Func(name) => encode_func(out, name.as_deref()),
         TypvalValue::Partial(_) => {
             unimplemented!(
-                "encode_vim_to_string: Partial values not yet translated - see this \
-                 module's own doc comment"
+                "encode_vim_to_string/encode_vim_to_echo: Partial values not yet \
+                 translated - see this module's own doc comment"
             );
         }
         TypvalValue::List(l) => {
@@ -201,22 +223,8 @@ unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv:
             let list = unsafe { &mut **l };
             let saved_copy_id = list.lv_copy_id;
             if saved_copy_id == copy_id {
-                // Self-referencing: "{E724@N}" - the "string" backend's
-                // own TYPVAL_ENCODE_CONV_RECURSE uses this SAME format
-                // for both List and Dict (verified directly against a
-                // real `nvim` binary: `string(l)` for a list containing
-                // itself prints "[1, [{E724@0}]]", not "[...@0]" - that
-                // literal format is `encode_vim_to_ECHO`'s own DIFFERENT
-                // TYPVAL_ENCODE_CONV_RECURSE override, a separate,
-                // not-yet-translated backend; the leading E724 is the
-                // real error code, not a placeholder). The original's
-                // own one-time `emsg("E724: ...")` (gated by a
-                // `did_echo_string_emsg` static so a deeply-nested
-                // self-reference doesn't flood multiple errors) is
-                // omitted - message display, not tractable; the
-                // identical `{E724@N}` text is still produced.
                 let backref = encode_backref(stack, EncodeRef::List(*l));
-                out.extend_from_slice(format!("{{E724@{backref}}}").as_bytes());
+                mode.write_self_reference(out, backref, true);
                 return;
             }
             list.lv_copy_id = copy_id;
@@ -233,12 +241,8 @@ unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv:
             let dict = unsafe { &mut **d };
             let saved_copy_id = dict.dv_copy_id;
             if saved_copy_id == copy_id {
-                // Self-referencing: "{E724@N}" - see the List arm's own
-                // doc comment above for why (verified the same way
-                // against a real `nvim` binary: `string(d)` for a dict
-                // containing itself prints "{'a': 1, 'b': {E724@0}}").
                 let backref = encode_backref(stack, EncodeRef::Dict(*d));
-                out.extend_from_slice(format!("{{E724@{backref}}}").as_bytes());
+                mode.write_self_reference(out, backref, false);
                 return;
             }
             dict.dv_copy_id = copy_id;
@@ -251,10 +255,40 @@ unsafe fn convert_one_value(out: &mut Vec<u8>, stack: &mut Vec<EncodeFrame>, tv:
         }
         TypvalValue::Special(_) => out.extend_from_slice(b"v:null"),
         TypvalValue::Unknown => {
-            unreachable!("encode_vim_to_string: VAR_UNKNOWN should never reach a real caller")
+            unreachable!("encode_vim_to_string/encode_vim_to_echo: VAR_UNKNOWN should never reach a real caller")
         }
     }
 }
+
+/// Which backend [`convert_one_value`]/the main driving loop is
+/// producing output for - the ONLY place the "string" and "echo"
+/// backends actually differ (every scalar/container formatting rule
+/// is otherwise identical, confirmed directly against a real `nvim`
+/// binary - see this module's own doc comment).
+#[derive(Clone, Copy)]
+enum EncodeMode {
+    /// `encode_vim_to_string` - self-reference renders as `{E724@N}`
+    /// uniformly for List and Dict, plus a real one-time `emsg`
+    /// (omitted here - message display, not tractable).
+    Str,
+    /// `encode_vim_to_echo` - self-reference renders as `[...@N]`/
+    /// `{...@N}` (List-vs-Dict specific), no `emsg` at all.
+    Echo,
+}
+
+impl EncodeMode {
+    /// Write this mode's own self-reference text for a List (`is_list:
+    /// true`) or Dict (`is_list: false`) - see [`EncodeMode`]'s own doc
+    /// comment.
+    fn write_self_reference(self, out: &mut Vec<u8>, backref: usize, is_list: bool) {
+        match self {
+            EncodeMode::Str => out.extend_from_slice(format!("{{E724@{backref}}}").as_bytes()),
+            EncodeMode::Echo if is_list => out.extend_from_slice(format!("[...@{backref}]").as_bytes()),
+            EncodeMode::Echo => out.extend_from_slice(format!("{{...@{backref}}}").as_bytes()),
+        }
+    }
+}
+
 
 /// Either a List or a Dict pointer, compared for identity by
 /// [`encode_backref`] (a small helper enum - the original relies on a
@@ -287,10 +321,10 @@ fn encode_backref(stack: &[EncodeFrame], val: EncodeRef) -> usize {
     stack.len()
 }
 
-/// Convert `top_tv` into the same textual representation `string(tv)`
-/// would produce (`encode_vim_to_string`, specialized directly for
-/// the "string" backend - see this module's own doc comment for why
-/// the other 3 backends aren't modeled).
+/// Convert `top_tv` into the same textual representation `string(tv)`/
+/// `:echo tv` would produce, depending on `mode`
+/// (`TYPVAL_ENCODE_ENCODE`, shared driving loop for both the "string"
+/// and "echo" backends).
 ///
 /// Drives `convert_one_value` in a loop exactly like the original's
 /// own `while (kv_size(mpstack))` - each iteration either finishes a
@@ -303,13 +337,13 @@ fn encode_backref(stack: &[EncodeFrame], val: EncodeRef) -> usize {
 /// reachable through it also holding valid values recursively (same
 /// contract as `tv_clear_simple`/every other typval-tree-walking
 /// function in this crate).
-pub unsafe fn encode_vim_to_string(top_tv: &TypvalT) -> Vec<u8> {
+unsafe fn encode_generic(top_tv: &TypvalT, mode: EncodeMode) -> Vec<u8> {
     let mut out = Vec::new();
     let copy_id = crate::eval::eval::get_copy_id();
     let mut stack: Vec<EncodeFrame> = Vec::new();
 
     // SAFETY: forwarded from this function's own safety doc.
-    unsafe { convert_one_value(&mut out, &mut stack, top_tv, copy_id) };
+    unsafe { convert_one_value(&mut out, &mut stack, top_tv, copy_id, mode) };
 
     while let Some(frame) = stack.last_mut() {
         let next_tv: *const TypvalT = match frame {
@@ -377,10 +411,22 @@ pub unsafe fn encode_vim_to_string(top_tv: &TypvalT) -> Vec<u8> {
             }
         };
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { convert_one_value(&mut out, &mut stack, &*next_tv, copy_id) };
+        unsafe { convert_one_value(&mut out, &mut stack, &*next_tv, copy_id, mode) };
     }
 
     out
+}
+
+/// Convert `top_tv` into the same textual representation `string(tv)`
+/// would produce (`encode_vim_to_string`, specialized directly for
+/// the "string" backend - see this module's own doc comment for why
+/// the other 2 backends (`json`/`msgpack`) aren't modeled).
+///
+/// # Safety
+/// Same as `encode_generic`.
+pub unsafe fn encode_vim_to_string(top_tv: &TypvalT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { encode_generic(top_tv, EncodeMode::Str) }
 }
 
 /// Public entry point matching the original's own thin wrapper
@@ -395,6 +441,52 @@ pub unsafe fn encode_tv2string(tv: &TypvalT) -> Vec<u8> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { encode_vim_to_string(tv) }
 }
+
+/// Convert `top_tv` into the same textual representation `:echo tv`
+/// would produce (`encode_vim_to_echo`, the "echo" backend) - every
+/// scalar/container formatting rule is identical to
+/// [`encode_vim_to_string`] EXCEPT self-reference (`[...@N]`/`{...@N}`
+/// here, list-vs-dict specific, vs `encode_vim_to_string`'s uniform
+/// `{E724@N}` - see this module's own doc comment for how this was
+/// confirmed against a real `nvim` binary) - no `emsg` is produced for
+/// self-reference here either way (`encode_vim_to_string`'s own,
+/// omitted per this crate's established message-display policy;
+/// `encode_vim_to_echo`'s own `TYPVAL_ENCODE_CONV_RECURSE` override
+/// genuinely never calls `emsg` at all in the original, confirmed the
+/// same way - a real behavioral difference from `string()`, not an
+/// omission).
+///
+/// # Safety
+/// Same as `encode_generic`.
+pub unsafe fn encode_vim_to_echo(top_tv: &TypvalT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { encode_generic(top_tv, EncodeMode::Echo) }
+}
+
+/// Public entry point matching the original's own thin wrapper
+/// (`encode_tv2echo`) - unlike every other entry point in this module,
+/// this one has its OWN special case: a top-level `String`/`Func`
+/// value bypasses the whole encoder and uses its raw text directly
+/// (no quotes) - confirmed directly against a real `nvim` binary:
+/// `:echo 'hello'` prints `hello` (unquoted), but `:echo [1, 'a']`
+/// prints `[1, 'a']` (quoted) - the SAME nested string, quoted only
+/// because it isn't the TOP-level value. `Func`'s own bare name (no
+/// `function(...)` wrapper) is used the same way, matching the
+/// original's own `tv->vval.v_string` reuse for both `VAR_STRING`/
+/// `VAR_FUNC` at this wrapper layer specifically (`encode.h`'s own
+/// documented layout coincidence, not a mistake).
+///
+/// # Safety
+/// Same as [`encode_vim_to_echo`].
+#[must_use]
+pub unsafe fn encode_tv2echo(tv: &TypvalT) -> Vec<u8> {
+    match &tv.value {
+        TypvalValue::String(s) | TypvalValue::Func(s) => s.clone().unwrap_or_default(),
+        // SAFETY: forwarded from this function's own safety doc.
+        _ => unsafe { encode_vim_to_echo(tv) },
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -725,6 +817,122 @@ mod tests {
     fn encode_tv2string_matches_encode_vim_to_string() {
         // SAFETY: test-only values, always genuinely valid.
         assert_eq!(unsafe { encode_tv2string(&num(42)) }, unsafe { encode_vim_to_string(&num(42)) });
+    }
+
+    // --- encode_vim_to_echo / encode_tv2echo ---
+    //
+    // All expected outputs cross-checked directly against a real
+    // `nvim` binary (v0.13.0-dev) via `:echo`, the same way as the
+    // "string" backend's own tests above.
+
+    fn echo(tv: &TypvalT) -> String {
+        // SAFETY: test-only values, always genuinely valid.
+        String::from_utf8(unsafe { encode_tv2echo(tv) }).unwrap()
+    }
+
+    #[test]
+    fn echo_top_level_string_is_unquoted() {
+        assert_eq!(echo(&string(b"hello")), "hello");
+        assert_eq!(echo(&string(b"")), "");
+    }
+
+    #[test]
+    fn echo_top_level_func_is_bare_name() {
+        let tv = TypvalT { value: TypvalValue::Func(Some(b"tr".to_vec())), ..Default::default() };
+        assert_eq!(echo(&tv), "tr");
+    }
+
+    #[test]
+    fn echo_nested_string_and_func_are_still_quoted_wrapped() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_tv(l, &TypvalT { value: TypvalValue::Func(Some(b"tr".to_vec())), ..Default::default() }) };
+        assert_eq!(echo(&TypvalT { value: TypvalValue::List(l), ..Default::default() }), "[function('tr')]");
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn echo_scalars_match_string_backend() {
+        // Every scalar/container formatting rule (besides top-level
+        // String/Func and self-reference) is shared between the two
+        // backends - see this module's own doc comment.
+        assert_eq!(echo(&num(42)), "42");
+        assert_eq!(echo(&float(2.25)), "2.25");
+        assert_eq!(echo(&float(f64::NAN)), "str2float('nan')");
+        let t = TypvalT { value: TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::True), ..Default::default() };
+        assert_eq!(echo(&t), "v:true");
+        let n = TypvalT { value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null), ..Default::default() };
+        assert_eq!(echo(&n), "v:null");
+    }
+
+    #[test]
+    fn echo_list_and_dict_containers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(l, 1);
+            crate::eval::typval::tv_list_append_string(l, Some(b"a"));
+        }
+        assert_eq!(echo(&TypvalT { value: TypvalValue::List(l), ..Default::default() }), "[1, 'a']");
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn echo_self_referencing_list_uses_bracket_backref_not_e724() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_ref(l);
+            crate::eval::typval::tv_list_append_number(l, 1);
+            crate::eval::typval::tv_list_append_number(l, 2);
+            crate::eval::typval::tv_list_append_tv(l, &TypvalT { value: TypvalValue::List(l), ..Default::default() });
+        }
+        assert_eq!(echo(&TypvalT { value: TypvalValue::List(l), ..Default::default() }), "[1, 2, [...@0]]");
+        // Same manual force-free reasoning as self_referencing_list_renders_e724_backref.
+        unsafe {
+            let mut item = (*l).lv_first;
+            while !item.is_null() {
+                let next = (*item).li_next;
+                drop(Box::from_raw(item));
+                item = next;
+            }
+            crate::eval::typval::tv_list_free_list(l);
+        }
+    }
+
+    #[test]
+    fn echo_self_referencing_dict_uses_brace_backref_not_e724() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe {
+            (*d).dv_refcount += 1;
+            let a = crate::eval::typval::tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            crate::eval::typval::tv_dict_add(&mut *d, a);
+            let b = crate::eval::typval::tv_dict_item_alloc(b"b");
+            (*b).di_tv.value = TypvalValue::Dict(d);
+            (*d).dv_refcount += 1;
+            crate::eval::typval::tv_dict_add(&mut *d, b);
+        }
+        assert_eq!(echo(&TypvalT { value: TypvalValue::Dict(d), ..Default::default() }), "{'a': 1, 'b': {...@0}}");
+        // Same manual force-free reasoning as self_referencing_dict_renders_e724_backref.
+        unsafe {
+            for item in (*d).dv_index.values().copied() {
+                drop(Box::from_raw(item));
+            }
+            crate::eval::typval::tv_dict_free_dict(d);
+        }
+    }
+
+    #[test]
+    fn encode_tv2echo_matches_encode_vim_to_echo_for_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(l, 7) };
+        let tv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // SAFETY: test-only values, always genuinely valid.
+        assert_eq!(unsafe { encode_tv2echo(&tv) }, unsafe { encode_vim_to_echo(&tv) });
+        unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 }
 
