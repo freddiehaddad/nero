@@ -133,15 +133,15 @@
 //!
 //! Also translated: `filter()`/`map()`/`mapnew()` (from `eval/list.c`,
 //! via a new `crate::eval::typval::filter_map`/`filter_map_one`/
-//! `filter_map_list` family, plus `crate::eval::vars::prepare_vimvar`/
-//! `restore_vimvar` and `crate::eval::eval::eval_expr_string`/
-//! `eval_expr_typval` - see those modules' own doc comments for the
-//! full design). Only a `List` first argument, with a `String`
+//! `filter_map_list`/`filter_map_dict` family, plus
+//! `crate::eval::vars::prepare_vimvar`/`restore_vimvar` and
+//! `crate::eval::eval::eval_expr_string`/`eval_expr_typval` - see
+//! those modules' own doc comments for the full design). `List` and
+//! `Dict` first arguments are both supported, with a `String`
 //! `{expr2}` (the overwhelmingly common real-world shape, e.g.
-//! `filter(list, 'v:val > 0')`), is currently supported:
-//! `Dict`/`Blob`/`String` containers each need their own
-//! `filter_map_dict`/`filter_map_blob`/`filter_map_string` iteration,
-//! not yet translated; a `Funcref`/`Partial` `{expr2}` needs
+//! `filter(list, 'v:val > 0')`): `Blob`/`String` containers each need
+//! their own `filter_map_blob`/`filter_map_string` iteration, not yet
+//! translated; a `Funcref`/`Partial` `{expr2}` needs
 //! `eval_expr_partial`/`eval_expr_func` (the whole function-CALL
 //! machinery), a substantial, separate undertaking. `foreach()` is
 //! deliberately NOT registered at all: every real invocation is
@@ -1993,13 +1993,13 @@ unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::eval::var_item_copy(std::ptr::null(), &argvars[0], rettv, true, copy_id) };
 }
 
-/// `filter({expr1}, {expr2})` - remove items from `{expr1}` (a `List`)
-/// for which `{expr2}` evaluates to zero/falsy (`f_filter`,
+/// `filter({expr1}, {expr2})` - remove items from `{expr1}` (a `List`
+/// or `Dict`) for which `{expr2}` evaluates to zero/falsy (`f_filter`,
 /// `eval/list.c`).
 ///
-/// Only a `List` first argument is currently supported -
-/// `Dict`/`Blob`/`String` each `unimplemented!()` (see
-/// `crate::eval::typval::filter_map`'s own doc comment).
+/// `List`/`Dict` first arguments are supported - `Blob`/`String` each
+/// `unimplemented!()` (see `crate::eval::typval::filter_map`'s own
+/// doc comment).
 ///
 /// # Safety
 /// Forwards `crate::eval::typval::filter_map`'s own safety
@@ -2009,11 +2009,12 @@ unsafe fn f_filter(argvars: &[TypvalT], rettv: &mut TypvalT) {
     unsafe { crate::eval::typval::filter_map(argvars, rettv, crate::eval::typval::FilterMapT::Filter) };
 }
 
-/// `map({expr1}, {expr2})` - replace each item in `{expr1}` (a `List`)
-/// with the result of evaluating `{expr2}` (`f_map`, `eval/list.c`).
+/// `map({expr1}, {expr2})` - replace each item in `{expr1}` (a `List`
+/// or `Dict`) with the result of evaluating `{expr2}` (`f_map`,
+/// `eval/list.c`).
 ///
-/// Only a `List` first argument is currently supported - see
-/// [`f_filter`]'s own doc comment.
+/// `List`/`Dict` first arguments are supported - see [`f_filter`]'s
+/// own doc comment.
 ///
 /// # Safety
 /// Forwards `crate::eval::typval::filter_map`'s own safety
@@ -2024,10 +2025,11 @@ unsafe fn f_map(argvars: &[TypvalT], rettv: &mut TypvalT) {
 }
 
 /// `mapnew({expr1}, {expr2})` - like [`f_map`], but returns a NEW
-/// `List`, leaving `{expr1}` untouched (`f_mapnew`, `eval/list.c`).
+/// `List`/`Dict`, leaving `{expr1}` untouched (`f_mapnew`,
+/// `eval/list.c`).
 ///
-/// Only a `List` first argument is currently supported - see
-/// [`f_filter`]'s own doc comment.
+/// `List`/`Dict` first arguments are supported - see [`f_filter`]'s
+/// own doc comment.
 ///
 /// # Safety
 /// Forwards `crate::eval::typval::filter_map`'s own safety

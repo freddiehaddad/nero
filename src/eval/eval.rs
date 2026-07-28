@@ -8298,6 +8298,37 @@ mod tests {
     }
 
     #[test]
+    fn e2e_filter_map_mapnew_on_a_dict_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // filter() on a real Dict LITERAL through the whole parser
+        // chain (eval_dict, not just eval_list) - removes entries whose
+        // value is falsy.
+        let (ret, tv) = eval_str(b"filter(#{a: 1, b: 0, c: 2}, 'v:val')");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(filtered) = tv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_len(Some(&*filtered)), 2);
+            assert!(crate::eval::typval::tv_dict_find(Some(&mut *filtered), b"a").is_some());
+            assert!(crate::eval::typval::tv_dict_find(Some(&mut *filtered), b"b").is_none());
+            crate::eval::typval::tv_dict_unref(filtered);
+        }
+
+        // map() using v:key - real string concatenation per entry.
+        let (ret, tv) = eval_str(b"map(#{x: 1}, 'v:key . v:val')");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(mapped) = tv.value else { panic!("expected a Dict") };
+        unsafe {
+            let item = crate::eval::typval::tv_dict_find(Some(&mut *mapped), b"x").unwrap();
+            assert_eq!((*item).di_tv.value, TypvalValue::String(Some(b"x1".to_vec())));
+            crate::eval::typval::tv_dict_unref(mapped);
+        }
+
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_add_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

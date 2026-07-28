@@ -2900,18 +2900,115 @@ pub unsafe fn filter_map_list(
     unsafe { tv_list_set_lock(l, prev_lock) };
 }
 
+/// Implementation of `map()`/`mapnew()`/`filter()`/`foreach()` for a
+/// `Dict`. Apply `expr` to every item in dict `d` and return the
+/// result in `rettv` (`filter_map_dict`).
+///
+/// Iterates a SNAPSHOT of `d`'s own items (via `dv_index.values()`,
+/// collected into a plain `Vec` first) rather than the original's own
+/// `TV_DICT_ITER`/`hash_lock`/`hash_unlock`-guarded live-hashtable
+/// walk: `dv_index` is a `HashMap`, which Rust's own borrow checker
+/// will not let this function mutate (via `tv_dict_item_remove`)
+/// WHILE also iterating it directly - snapshotting first sidesteps
+/// this cleanly, and is a faithful translation regardless, since the
+/// original's own hashtable iteration order was never a Vimscript-
+/// visible guarantee to begin with (matching this crate's own
+/// `max_min`/`tv_dict_equal` precedent for the identical situation).
+/// `hash_lock`/`hash_unlock` are correspondingly not needed either -
+/// they exist in the original purely to keep a LIVE-hashtable walk
+/// safe while removing entries mid-iteration, a concern the snapshot
+/// approach doesn't have.
+///
+/// # Safety
+/// `d`, if non-null, must be a valid pointer to a live `DictT`; `expr`
+/// must be valid (forwards `filter_map_one`'s own safety
+/// requirements).
+pub unsafe fn filter_map_dict(d: *mut DictT, filtermap: FilterMapT, expr: &TypvalT, rettv: &mut TypvalT) {
+    use crate::eval::vars::{get_vim_var_tv, set_vim_var_string, var_check_fixed, var_check_ro, VimVarIndex};
+
+    if filtermap == FilterMapT::MapNew {
+        rettv.value = TypvalValue::Dict(std::ptr::null_mut());
+    }
+    if d.is_null()
+        || (filtermap == FilterMapT::Filter && value_check_lock(unsafe { (*d).dv_lock }, None))
+    {
+        return;
+    }
+
+    let mut d_ret: *mut DictT = std::ptr::null_mut();
+    if filtermap == FilterMapT::MapNew {
+        d_ret = unsafe { tv_dict_alloc_ret(rettv) };
+    }
+
+    let prev_lock = unsafe { (*d).dv_lock };
+    if prev_lock == VarLockStatus::Unlocked {
+        unsafe { (*d).dv_lock = VarLockStatus::Locked };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let items: Vec<*mut DictitemT> = unsafe { (*d).dv_index.values().copied().collect() };
+    for di in items {
+        if filtermap == FilterMapT::Map
+            && (value_check_lock(unsafe { (*di).di_tv.v_lock }, None)
+                || var_check_ro(unsafe { (*di).di_flags }))
+        {
+            break;
+        }
+
+        // di_key always carries a trailing NUL (this crate's own
+        // established DictitemT.di_key convention) - strip it before
+        // handing the "clean" key bytes to set_vim_var_string.
+        let key: &[u8] = unsafe { &(*di).di_key };
+        let key = &key[..key.len().saturating_sub(1)];
+        unsafe { set_vim_var_string(VimVarIndex::Key, Some(key)) };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, mut newtv, rem) = unsafe { filter_map_one(&(*di).di_tv, expr, filtermap) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&*get_vim_var_tv(VimVarIndex::Key)) };
+        if ret == FAIL {
+            unsafe { tv_clear_simple(&newtv) };
+            break;
+        }
+
+        if filtermap == FilterMapT::Map {
+            // map(): replace the dict item value.
+            unsafe { tv_clear_simple(&(*di).di_tv) };
+            newtv.v_lock = VarLockStatus::Unlocked;
+            unsafe { (*di).di_tv = newtv };
+        } else if filtermap == FilterMapT::MapNew {
+            // mapnew(): add the item value to the new dict.
+            let key: &[u8] = unsafe { &(*di).di_key };
+            let key = &key[..key.len().saturating_sub(1)];
+            let r = unsafe { tv_dict_add_tv(&mut *d_ret, key, &newtv) };
+            unsafe { tv_clear_simple(&newtv) };
+            if r == FAIL {
+                break;
+            }
+        } else if filtermap == FilterMapT::Filter && rem {
+            // filter(false): remove the item from the dict.
+            if var_check_fixed(unsafe { (*di).di_flags }) || var_check_ro(unsafe { (*di).di_flags }) {
+                break;
+            }
+            unsafe { tv_dict_item_remove(&mut *d, di) };
+        }
+    }
+
+    unsafe { (*d).dv_lock = prev_lock };
+}
+
 /// Implementation of `map()`, `mapnew()`, `filter()` and `foreach()`
 /// (`filter_map`).
 ///
-/// Only the [`TypvalValue::List`] container is modeled -
-/// [`TypvalValue::Dict`]/[`TypvalValue::Blob`]/[`TypvalValue::String`]
-/// each need their own `filter_map_dict`/`filter_map_blob`/
-/// `filter_map_string` iteration, not yet translated -
-/// `unimplemented!()`s if any of those is ever passed as the first
-/// argument.
+/// [`TypvalValue::List`]/[`TypvalValue::Dict`] are both modeled -
+/// [`TypvalValue::Blob`]/[`TypvalValue::String`] each need their own
+/// `filter_map_blob`/`filter_map_string` iteration, not yet
+/// translated - `unimplemented!()`s if either is ever passed as the
+/// first argument.
 ///
 /// # Safety
-/// Forwards `filter_map_list`'s own safety requirements for `argvars[0]`.
+/// Forwards `filter_map_list`/`filter_map_dict`'s own safety
+/// requirements for `argvars[0]`.
 pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: FilterMapT) {
     use crate::eval::vars::{prepare_vimvar, VimVarIndex};
 
@@ -2926,10 +3023,7 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
         TypvalValue::Blob(_) => unimplemented!(
             "filter_map: Blob argument needs filter_map_blob, not yet translated"
         ),
-        TypvalValue::List(_) => {}
-        TypvalValue::Dict(_) => unimplemented!(
-            "filter_map: Dict argument needs filter_map_dict, not yet translated"
-        ),
+        TypvalValue::List(_) | TypvalValue::Dict(_) => {}
         TypvalValue::String(_) => unimplemented!(
             "filter_map: String argument needs filter_map_string, not yet translated"
         ),
@@ -2964,11 +3058,16 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
     // (message-display bookkeeping, not tractable, and filter_map_one
     // already reports evaluation failure via its own FAIL return).
 
-    if let TypvalValue::List(l) = argvars[0].value {
-        // SAFETY: forwarded from this function's own safety doc.
-        unsafe { filter_map_list(l, filtermap, expr, rettv) };
-    } else {
-        unreachable!("filter_map: argvars[0] type was already validated above");
+    match argvars[0].value {
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { filter_map_list(l, filtermap, expr, rettv) };
+        }
+        TypvalValue::Dict(d) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { filter_map_dict(d, filtermap, expr, rettv) };
+        }
+        _ => unreachable!("filter_map: argvars[0] type was already validated above"),
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -7936,28 +8035,122 @@ mod filter_map_tests {
     }
 
     #[test]
-    #[should_panic(expected = "filter_map_dict")]
-    fn filter_panics_on_a_dict_argument() {
+    fn filter_removes_dict_entries_that_are_falsy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            // No manual dv_refcount bump here (unlike e.g.
+            // e2e_copy_builtin_function_calls's own g: variable
+            // pattern, which genuinely needs one to represent that
+            // separate owner) - filter_map's own tv_copy(argvars[0],
+            // rettv) call is the ONLY reference this test needs to
+            // balance against its own single tv_dict_unref(d) at the
+            // end. A duplicate manual bump here would leave the dict
+            // stuck at refcount 1 forever, permanently leaking it into
+            // GC_FIRST_DICT.
+            let a = tv_dict_item_alloc(b"keep");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *d, a);
+            let b = tv_dict_item_alloc(b"drop");
+            (*b).di_tv.value = TypvalValue::Number(0);
+            tv_dict_add(&mut *d, b);
+        }
+        let argvars =
+            [TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() }, string_expr(b"v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+
+        assert_eq!(unsafe { tv_dict_len(Some(&*d)) }, 1);
+        assert!(unsafe { tv_dict_find(Some(&mut *d), b"keep") }.is_some());
+        assert!(unsafe { tv_dict_find(Some(&mut *d), b"drop") }.is_none());
+        assert!(matches!(rettv.value, TypvalValue::Dict(p) if p == d));
+
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn map_replaces_each_dict_value_using_v_key() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let a = tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *d, a);
+        }
+        let argvars = [
+            TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() },
+            string_expr(b"v:key . \":\" . v:val"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        let item = unsafe { tv_dict_find(Some(&mut *d), b"a") }.unwrap();
+        assert_eq!(unsafe { (*item).di_tv.value.clone() }, TypvalValue::String(Some(b"a:1".to_vec())));
+
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn mapnew_builds_a_new_dict_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let a = tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::Number(1);
+            tv_dict_add(&mut *d, a);
+        }
+        let argvars = [
+            TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() },
+            string_expr(b"v:val + 100"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::MapNew) };
+
+        // Original untouched.
+        let orig_item = unsafe { tv_dict_find(Some(&mut *d), b"a") }.unwrap();
+        assert_eq!(unsafe { (*orig_item).di_tv.value.clone() }, TypvalValue::Number(1));
+
+        let TypvalValue::Dict(d_new) = rettv.value else { panic!("expected a new Dict") };
+        assert_ne!(d_new, d);
+        let new_item = unsafe { tv_dict_find(Some(&mut *d_new), b"a") }.unwrap();
+        assert_eq!(unsafe { (*new_item).di_tv.value.clone() }, TypvalValue::Number(101));
+
+        unsafe {
+            tv_dict_unref(d);
+            tv_dict_unref(d_new);
+        }
+    }
+
+    #[test]
+    fn filter_on_a_dict_declines_to_remove_a_fixed_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        unsafe {
+            let a = tv_dict_item_alloc(b"a");
+            (*a).di_tv.value = TypvalValue::Number(0); // falsy - would be removed
+            (*a).di_flags = crate::eval::typval_defs::dict_item_flags::FIX;
+            tv_dict_add(&mut *d, a);
+        }
+        let argvars =
+            [TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() }, string_expr(b"v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+
+        // The loop breaks (not removed) since the entry is FIX-flagged.
+        assert_eq!(unsafe { tv_dict_len(Some(&*d)) }, 1);
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn filter_on_an_empty_dict_is_a_no_op() {
         let _lock = crate::globals::global_state_test_lock();
         let d = tv_dict_alloc();
         let argvars =
             [TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() }, string_expr(b"1")];
         let mut rettv = TypvalT::default();
-        // Catch the expected panic just long enough to force-free the
-        // freshly-allocated (empty, never linked to anything else) Dict
-        // shell before re-raising it - otherwise it leaks permanently
-        // into the shared GC_FIRST_DICT linked list, deterministically
-        // corrupting OTHER, unrelated GC-linked-list tests that assert
-        // "no dict is live before this test" (this crate's own
-        // established "a deliberately-panicking test that allocated a
-        // real container must still release it" discipline).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            filter(&argvars, &mut rettv, FilterMapT::Filter);
-        }));
-        unsafe { tv_dict_free_dict(d) };
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(unsafe { tv_dict_len(Some(&*d)) }, 0);
+        unsafe { tv_dict_unref(d) };
     }
 
     #[test]
