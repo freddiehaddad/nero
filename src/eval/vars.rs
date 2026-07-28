@@ -1468,8 +1468,9 @@ pub unsafe fn var_exists(var: &[u8]) -> bool {
         // SAFETY: forwarded from this function's own safety doc.
         n = unsafe { eval_variable(name, Some(&mut tv), false, true) } == crate::vim_defs::OK;
         if n {
-            let evalarg = crate::eval::eval::EvalargT { eval_flags: crate::eval::eval::EVAL_EVALUATE, ..Default::default() };
-            let (status, sub_consumed) = crate::eval::eval::handle_subscript(rest, &tv, Some(&evalarg), false);
+            let mut evalarg = crate::eval::eval::EvalargT { eval_flags: crate::eval::eval::EVAL_EVALUATE, ..Default::default() };
+            let (status, sub_consumed) =
+                crate::eval::eval::handle_subscript(rest, &mut tv, Some(&mut evalarg), false);
             n = status == crate::vim_defs::OK;
             if n {
                 // SAFETY: tv was just filled in by eval_variable above,

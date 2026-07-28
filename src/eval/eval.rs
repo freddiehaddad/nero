@@ -2446,64 +2446,459 @@ unsafe fn string_slice(str: &[u8], first: VarnumberT, last: VarnumberT, exclusiv
     Some(str[start_byte as usize..end_byte as usize].to_vec())
 }
 
+/// Return `true` if character `c` can be used as the first character
+/// of a dictionary key in `.name` syntax (`eval_isdictc`).
+#[must_use]
+pub fn eval_isdictc(c: i32) -> bool {
+    crate::macros_defs::ascii_isalnum(c) || c == i32::from(b'_')
+}
+
+/// Check if `rettv` can have an `[index]` or `[sli:ce]`
+/// (`check_can_index`).
+///
+/// The original's own `emsg()` call for each rejected type is omitted,
+/// matching this crate's established "skip the display, keep the
+/// identical FAIL" policy.
+fn check_can_index(rettv: &TypvalT, evaluate: bool, _verbose: bool) -> i32 {
+    match rettv.value {
+        TypvalValue::Func(_) | TypvalValue::Partial(_) => FAIL,
+        TypvalValue::Float(_) => FAIL,
+        TypvalValue::Bool(_) | TypvalValue::Special(_) => FAIL,
+        TypvalValue::Unknown if evaluate => FAIL,
+        TypvalValue::Unknown
+        | TypvalValue::String(_)
+        | TypvalValue::Number(_)
+        | TypvalValue::List(_)
+        | TypvalValue::Dict(_)
+        | TypvalValue::Blob(_) => OK,
+    }
+}
+
+/// Apply index or range to `rettv` (`eval_index_inner`).
+///
+/// `var1` is the first index (`None` for `[:expr]`), `var2` the
+/// second (`None` for `[expr]`/`[expr:]`). `exclusive` is `true` for
+/// `slice()` (character-index-aware even for a `String`) - an
+/// ordinary (`exclusive == false`) subscript indexes a `String` by
+/// BYTE, not by character. This is a real, faithfully-preserved
+/// distinction in the original (confirmed directly against the real
+/// source, not assumed), not a bug: Vimscript's own documented
+/// `str[n]`/`str[n1:n2]` semantics are byte-based, while `slice()`
+/// is explicitly character-based. `key`, if set, is the already-
+/// scanned `.name` text (a `[key]`-style `Dict` access instead
+/// resolves the key from `var1`).
+///
+/// The original's own `emsg()` calls (dict-key-not-found, cannot-
+/// slice-a-dictionary) are omitted, matching this crate's established
+/// "skip the display, keep the identical FAIL" policy.
+///
+/// A genuine, faithfully-preserved original quirk, confirmed directly
+/// against the real source: the `VAR_BLOB` branch's own `FAIL` result
+/// (e.g. a genuine out-of-range plain index) is silently discarded
+/// here - only `VAR_LIST`'s own `FAIL` genuinely propagates.
+///
+/// # Safety
+/// Forwards [`crate::eval::typval::tv_blob_slice_or_index`]/
+/// [`crate::eval::typval::tv_list_slice_or_index`]/
+/// [`char_from_string`]/[`string_slice`]'s own safety docs for
+/// `rettv`'s current value.
+unsafe fn eval_index_inner(
+    rettv: &mut TypvalT,
+    is_range: bool,
+    var1: Option<&TypvalT>,
+    var2: Option<&TypvalT>,
+    exclusive: bool,
+    key: Option<&[u8]>,
+    verbose: bool,
+) -> i32 {
+    use crate::eval::typval::{
+        tv_blob_slice_or_index, tv_clear_simple, tv_copy, tv_dict_find, tv_get_number, tv_get_string, tv_get_string_chk,
+        tv_list_slice_or_index,
+    };
+
+    let mut n1: VarnumberT = 0;
+    let mut n2: VarnumberT = 0;
+    if let Some(v1) = var1 {
+        if !matches!(rettv.value, TypvalValue::Dict(_)) {
+            n1 = tv_get_number(v1);
+        }
+    }
+
+    if is_range {
+        if matches!(rettv.value, TypvalValue::Dict(_)) {
+            return FAIL;
+        }
+        n2 = if let Some(v2) = var2 { tv_get_number(v2) } else { crate::eval::typval_defs::VARNUMBER_MAX };
+    }
+
+    match rettv.value {
+        TypvalValue::Bool(_)
+        | TypvalValue::Special(_)
+        | TypvalValue::Func(_)
+        | TypvalValue::Float(_)
+        | TypvalValue::Partial(_)
+        | TypvalValue::Unknown => {
+            // Not evaluating, skipping over subscript.
+        }
+
+        TypvalValue::Number(_) | TypvalValue::String(_) => {
+            let s = tv_get_string(rettv);
+            let len = s.len() as VarnumberT;
+            let v: Option<Vec<u8>> = if exclusive {
+                if is_range {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { string_slice(&s, n1, n2, exclusive) }
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { char_from_string(&s, n1) }
+                }
+            } else if is_range {
+                // The resulting variable is a substring. If the
+                // indexes are out of range the result is empty. This
+                // is BYTE-based (not character-index-aware), matching
+                // the original's own non-exclusive range branch
+                // exactly.
+                let mut n1 = n1;
+                let mut n2 = n2;
+                if n1 < 0 {
+                    n1 += len;
+                    if n1 < 0 {
+                        n1 = 0;
+                    }
+                }
+                if n2 < 0 {
+                    n2 += len;
+                } else if n2 >= len {
+                    n2 = len;
+                }
+                if n1 >= len || n2 < 0 || n1 > n2 {
+                    None
+                } else {
+                    Some(s[n1 as usize..=n2 as usize].to_vec())
+                }
+            } else {
+                // The resulting variable is a string of a single
+                // BYTE (not a whole character - see this function's
+                // own doc comment). If the index is too big or
+                // negative the result is empty.
+                if n1 >= len || n1 < 0 {
+                    None
+                } else {
+                    Some(vec![s[n1 as usize]])
+                }
+            };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            rettv.value = TypvalValue::String(v);
+        }
+
+        TypvalValue::Blob(b) => {
+            // The original's own FAIL result here is silently
+            // discarded - see this function's own doc comment.
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { tv_blob_slice_or_index(b, is_range, n1, n2, exclusive, rettv) };
+        }
+
+        TypvalValue::List(l) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { tv_list_slice_or_index(l, is_range, n1, n2, exclusive, rettv, verbose) } == FAIL {
+                return FAIL;
+            }
+        }
+
+        TypvalValue::Dict(d) => {
+            let key: Vec<u8> = match key {
+                Some(k) => k.to_vec(),
+                None => match var1.and_then(tv_get_string_chk) {
+                    Some(k) => k,
+                    None => return FAIL,
+                },
+            };
+
+            let item = tv_dict_find(if d.is_null() { None } else { Some(unsafe { &mut *d }) }, &key);
+            let Some(item) = item else {
+                return FAIL;
+            };
+            // SAFETY: `item` was just found live in `d`'s own hashtable
+            // above.
+            if unsafe { tv_is_luafunc(&(*item).di_tv) } {
+                return FAIL;
+            }
+
+            let mut tmp = TypvalT::default();
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_copy(&(*item).di_tv, &mut tmp) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(rettv) };
+            *rettv = tmp;
+        }
+    }
+    OK
+}
+
+/// Evaluate an `[expr]`/`[expr:expr]` index, or `.name` (`eval_index`).
+///
+/// `arg` must point AT the `[` or `.`. Returns `(status, consumed)` -
+/// `consumed` is how far past the whole index/slice/key expression
+/// `arg` was advanced (including the trailing `]`/key text and any
+/// following whitespace).
+///
+/// # Safety
+/// Forwards [`eval1`]/[`eval_index_inner`]'s own safety docs.
+unsafe fn eval_index(
+    arg: &[u8],
+    rettv: &mut TypvalT,
+    mut evalarg: Option<&mut EvalargT>,
+    verbose: bool,
+) -> (i32, usize) {
+    use crate::eval::typval::{tv_check_str, tv_clear_simple};
+
+    let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+    let mut empty1 = false;
+    let mut empty2 = false;
+    let mut range = false;
+    let mut key: Option<Vec<u8>> = None;
+
+    if check_can_index(rettv, evaluate, verbose) == FAIL {
+        return (FAIL, 0);
+    }
+
+    let mut var1 = TypvalT::default();
+    let mut var2 = TypvalT::default();
+    let mut pos;
+
+    if arg[0] == b'.' {
+        // dict.name
+        let mut keylen = 0;
+        while arg.get(1 + keylen).is_some_and(|&c| eval_isdictc(i32::from(c))) {
+            keylen += 1;
+        }
+        if keylen == 0 {
+            return (FAIL, 0);
+        }
+        key = Some(arg[1..1 + keylen].to_vec());
+        pos = 1 + keylen;
+        pos += skipwhite(&arg[pos..]);
+    } else {
+        // something[idx]
+        //
+        // Get the (first) variable from inside the [].
+        pos = 1;
+        pos += skipwhite(&arg[pos..]);
+        if arg.get(pos) == Some(&b':') {
+            empty1 = true;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (ret, consumed) = unsafe { eval1(&arg[pos..], &mut var1, evalarg.as_deref_mut()) };
+            pos += consumed;
+            if ret == FAIL {
+                return (FAIL, pos);
+            }
+            if evaluate && !tv_check_str(&var1) {
+                // Not a number or string.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(&var1) };
+                return (FAIL, pos);
+            }
+        }
+
+        // Get the second variable from inside the [:].
+        if arg.get(pos) == Some(&b':') {
+            range = true;
+            pos += 1;
+            pos += skipwhite(&arg[pos..]);
+            if arg.get(pos) == Some(&b']') {
+                empty2 = true;
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                let (ret, consumed) = unsafe { eval1(&arg[pos..], &mut var2, evalarg) };
+                pos += consumed;
+                if ret == FAIL {
+                    if !empty1 {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { tv_clear_simple(&var1) };
+                    }
+                    return (FAIL, pos);
+                }
+                if evaluate && !tv_check_str(&var2) {
+                    // Not a number or string.
+                    if !empty1 {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { tv_clear_simple(&var1) };
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { tv_clear_simple(&var2) };
+                    return (FAIL, pos);
+                }
+            }
+        }
+
+        // Check for the ']'.
+        if arg.get(pos) != Some(&b']') {
+            // e_missbrac display omitted.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&var1) };
+            if range {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(&var2) };
+            }
+            return (FAIL, pos);
+        }
+        pos += 1; // skip the ']'
+        pos += skipwhite(&arg[pos..]);
+    }
+
+    if evaluate {
+        // SAFETY: forwarded from this function's own safety doc.
+        let res = unsafe {
+            eval_index_inner(
+                rettv,
+                range,
+                if empty1 { None } else { Some(&var1) },
+                if empty2 { None } else { Some(&var2) },
+                false,
+                key.as_deref(),
+                verbose,
+            )
+        };
+        if !empty1 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&var1) };
+        }
+        if range {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_clear_simple(&var2) };
+        }
+        return (res, pos);
+    }
+    (OK, pos)
+}
+
 /// Handle `expr[expr]`/`expr.name`/`expr(expr)`/`expr->name(expr)`
 /// subscript chaining after an already-parsed primary expression
 /// (`handle_subscript`).
 ///
-/// Only the common "nothing follows" fast path is modeled: if the
-/// original's own `while` loop condition would be true for even its
-/// very first iteration (there really is a `[`/`.`/`(`/`->`
-/// continuation to handle), this panics via `unimplemented!()` - the
-/// real subscript/index/method-call/function-call logic
-/// (`eval_index`/`call_func_rettv`/`eval_method`/`eval_lambda`) is a
-/// substantial, separate undertaking, not attempted here.
+/// The `[`/`.` forms are now real, including the original's own
+/// LOOP (so `a[0][1].foo` chains correctly) and `selfdict` tracking
+/// (the dict a `.name`/`[key]` lookup was just read FROM, kept alive
+/// across the loop in case the NEXT step needs it). `(` (function
+/// call, `call_func_rettv`) and `->` (method call, `eval_method`/
+/// `eval_lambda`) still panic via `unimplemented!()` - substantial,
+/// separate undertakings, not attempted here.
+///
+/// The original's own final "turn `dict.Func` into a partial bound to
+/// `dict`" step (`set_selfdict`/`make_partial`, reached only when the
+/// loop's LAST successful step read a `Dict` value that turned out to
+/// hold a `Funcref`) also panics via `unimplemented!()` - a narrow,
+/// specifically-scoped gap (neither `make_partial` nor `set_selfdict`
+/// are translated yet), rather than silently skipping the dict-to-
+/// method binding this real Vimscript feature depends on.
 ///
 /// `tv_is_luafunc(rettv)` (gating the original's own `v:lua`-specific
-/// lambda-name-parsing branch) is always `false` here: nothing this
-/// crate can currently construct produces a `VAR_PARTIAL` bound to a
-/// Lua function (lambdas/`v:lua` support are both still
-/// unimplemented), so that branch is dead code in this crate today -
-/// correctly omitted rather than translated ahead of any real need.
+/// lambda-name-parsing branch, checked ONCE before the loop even
+/// starts) is always `false` here: nothing this crate can currently
+/// construct produces a `VAR_PARTIAL` bound to a Lua function
+/// (lambdas/`v:lua` support are both still unimplemented), so that
+/// whole branch is dead code in this crate today - correctly omitted
+/// rather than translated ahead of any real need.
 ///
-/// `preceded_by_whitespace` replaces the original's own
-/// `!ascii_iswhite(*(*arg - 1))` check (looking at the byte
-/// immediately BEFORE `arg`): this module's own "remaining slice,
-/// indexed from 0" parsing idiom has no way to look backward past its
-/// own start, so callers instead report whether their own most recent
-/// `skipwhite` call (immediately before invoking this function)
-/// actually consumed at least one byte - exactly equivalent, since a
-/// `skipwhite` call consuming zero bytes means the byte immediately
-/// before the (unchanged) position was not whitespace to begin with,
-/// and consuming one or more means it definitely was.
+/// `preceded_by_whitespace` (the parameter) replaces the original's
+/// own `!ascii_iswhite(*(*arg - 1))` check (looking at the byte
+/// immediately BEFORE `arg`) for the loop's FIRST iteration only: this
+/// module's own "remaining slice, indexed from 0" parsing idiom has no
+/// way to look backward past `arg`'s own start, so the caller instead
+/// reports whether their own most recent `skipwhite` call (immediately
+/// before invoking this function) actually consumed at least one byte,
+/// which is exactly equivalent, since a `skipwhite` call consuming
+/// zero bytes means the byte immediately before the (unchanged)
+/// position was not whitespace to begin with, and consuming one or
+/// more means it definitely was. For every SUBSEQUENT loop iteration,
+/// this function recomputes the same check directly (via
+/// `arg[pos - 1]`), since by then `pos > 0` and looking backward
+/// within `arg` itself is safe.
 ///
-/// Returns `(OK, 0)` for the fast path (nothing to consume - the
-/// original's own loop, having never executed, leaves `*arg`
-/// unmodified).
+/// Returns `(OK, 0)` when nothing follows at all (the loop's own
+/// condition is false on its very first check - `arg` is left
+/// unmodified, matching the original's own untouched `*arg` for this
+/// exact case).
 #[must_use]
 pub fn handle_subscript(
     arg: &[u8],
-    rettv: &TypvalT,
-    evalarg: Option<&EvalargT>,
+    rettv: &mut TypvalT,
+    mut evalarg: Option<&mut EvalargT>,
     preceded_by_whitespace: bool,
 ) -> (i32, usize) {
-    use crate::eval::typval::tv_is_func;
+    use crate::eval::typval::{tv_clear_simple, tv_dict_unref, tv_is_func};
 
-    let evaluate = evalarg.is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
+    let evaluate = evalarg.as_deref().is_some_and(|e| e.eval_flags & EVAL_EVALUATE != 0);
 
-    let starts_index_dot_or_call = arg.first() == Some(&b'[')
-        || (arg.first() == Some(&b'.') && matches!(rettv.value, TypvalValue::Dict(_)))
-        || (arg.first() == Some(&b'(') && (!evaluate || tv_is_func(rettv)));
-    let starts_method_call = arg.first() == Some(&b'-') && arg.get(1) == Some(&b'>');
+    let mut ret = OK;
+    let mut selfdict: *mut crate::eval::typval_defs::DictT = std::ptr::null_mut();
+    let mut pos = 0;
+    let mut preceded_by_whitespace = preceded_by_whitespace;
 
-    if (!preceded_by_whitespace && starts_index_dot_or_call) || starts_method_call {
+    while ret == OK {
+        let rest = &arg[pos..];
+        let starts_index_dot_or_call = rest.first() == Some(&b'[')
+            || (rest.first() == Some(&b'.') && matches!(rettv.value, TypvalValue::Dict(_)))
+            || (rest.first() == Some(&b'(') && (!evaluate || tv_is_func(rettv)));
+        let starts_method_call = rest.first() == Some(&b'-') && rest.get(1) == Some(&b'>');
+
+        if !((!preceded_by_whitespace && starts_index_dot_or_call) || starts_method_call) {
+            break;
+        }
+
+        if rest.first() == Some(&b'(') {
+            unimplemented!(
+                "handle_subscript: function-call handling (call_func_rettv) is not yet \
+                 translated"
+            );
+        } else if starts_method_call {
+            unimplemented!(
+                "handle_subscript: method-call handling (eval_method/eval_lambda) is not yet \
+                 translated"
+            );
+        } else {
+            // '[' or '.'
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { tv_dict_unref(selfdict) };
+            selfdict = if let TypvalValue::Dict(d) = rettv.value {
+                if !d.is_null() {
+                    // SAFETY: `d` is a live Dict currently held by
+                    // `rettv` itself.
+                    unsafe { (*d).dv_refcount += 1 };
+                }
+                d
+            } else {
+                std::ptr::null_mut()
+            };
+
+            // SAFETY: forwarded from this function's own safety doc.
+            let (r, consumed) = unsafe { eval_index(rest, rettv, evalarg.as_deref_mut(), true) };
+            if r == FAIL {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { tv_clear_simple(rettv) };
+                rettv.value = TypvalValue::Unknown;
+                ret = FAIL;
+            }
+            pos += consumed;
+        }
+
+        preceded_by_whitespace =
+            pos > 0 && crate::ascii_defs::ascii_iswhite(i32::from(arg[pos - 1]));
+    }
+
+    // Turn "dict.Func" into a partial for "Func" bound to "dict".
+    if !selfdict.is_null() && tv_is_func(rettv) {
         unimplemented!(
-            "handle_subscript: subscript/index (eval_index), function-call \
-             (call_func_rettv), and method-call (eval_method/eval_lambda) handling \
-             not yet translated"
+            "handle_subscript: binding a Funcref value to its enclosing dict (set_selfdict/ \
+             make_partial) is not yet translated"
         );
     }
 
-    (crate::vim_defs::OK, 0)
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_dict_unref(selfdict) };
+    (ret, pos)
 }
 
 /// `eval.c`'s own file-static `namespace_char` - the single-character
@@ -3421,7 +3816,7 @@ pub unsafe fn eval7(
     // Handle following '[', '(' and '.' for expr[expr], expr.name,
     // expr(expr), expr->name(expr).
     if ret == OK {
-        let (r, consumed) = handle_subscript(&arg[pos..], rettv, evalarg.as_deref(), ws_skip > 0);
+        let (r, consumed) = handle_subscript(&arg[pos..], rettv, evalarg, ws_skip > 0);
         ret = r;
         pos += consumed;
     }
@@ -7165,61 +7560,347 @@ mod tests {
 
     // --- handle_subscript ---
 
-    #[test]
-    fn handle_subscript_nothing_follows_is_ok() {
-        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
-        let mut evalarg = evaluate_evalarg();
-        let (ret, consumed) = handle_subscript(b"", &rettv, Some(&evalarg), false);
-        assert_eq!(ret, OK);
-        assert_eq!(consumed, 0);
-        let (ret, consumed) = handle_subscript(b" + 1", &rettv, Some(&mut evalarg).map(|e| &*e), false);
-        assert_eq!(ret, OK);
-        assert_eq!(consumed, 0);
+    /// Test helper: allocate a fresh `Dict`, giving it `dv_refcount = 1`,
+    /// matching [`crate::eval::typval::tv_dict_set_ret`]'s own
+    /// convention for the state a real `rettv` holding a `Dict` value
+    /// is always in (the state `eval7`'s own real callers produce).
+    fn test_dict_for_rettv() -> *mut crate::eval::typval_defs::DictT {
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: freshly allocated above, exclusively held here.
+        unsafe { (*d).dv_refcount = 1 };
+        d
+    }
+
+    /// Test helper: allocate a fresh `List` of numbers, giving it
+    /// `lv_refcount = 1` for the same reason as [`test_dict_for_rettv`].
+    fn test_list_for_rettv(nums: &[VarnumberT]) -> *mut crate::eval::typval_defs::ListT {
+        let l = crate::eval::typval::tv_list_alloc(nums.len() as isize);
+        for &n in nums {
+            // SAFETY: freshly allocated above, exclusively held here.
+            unsafe { crate::eval::typval::tv_list_append_number(l, n) };
+        }
+        // SAFETY: forwarded from tv_list_ref's own safety doc.
+        unsafe { crate::eval::typval::tv_list_ref(l) };
+        l
+    }
+
+    /// Test helper: allocate a fresh `Blob`, giving it `bv_refcount = 1`
+    /// for the same reason as [`test_dict_for_rettv`].
+    fn test_blob_for_rettv(bytes: &[u8]) -> *mut crate::eval::typval_defs::BlobT {
+        let b = crate::eval::typval::tv_blob_alloc();
+        // SAFETY: freshly allocated above, exclusively held here.
+        unsafe {
+            (*b).bv_ga.ga_concat_len(bytes);
+            (*b).bv_refcount = 1;
+        }
+        b
     }
 
     #[test]
-    fn handle_subscript_index_bracket_panics() {
-        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
-        let evalarg = evaluate_evalarg();
-        let result = std::panic::catch_unwind(|| handle_subscript(b"[0]", &rettv, Some(&evalarg), false));
-        assert!(result.is_err());
+    fn handle_subscript_nothing_follows_is_ok() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+        let (ret, consumed) = handle_subscript(b" + 1", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 0);
+        assert_eq!(rettv.value, TypvalValue::Number(5));
     }
 
     #[test]
     fn handle_subscript_whitespace_before_bracket_suppresses_it() {
         // "5 [0]" - a space before "[" means it's NOT treated as a
         // subscript continuation (matches the original's own
-        // whitespace-sensitivity), so this must NOT panic.
-        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
-        let evalarg = evaluate_evalarg();
-        let (ret, consumed) = handle_subscript(b"[0]", &rettv, Some(&evalarg), true);
+        // whitespace-sensitivity), so `rettv` is left untouched.
+        let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[0]", &mut rettv, Some(&mut evalarg), true);
         assert_eq!(ret, OK);
         assert_eq!(consumed, 0);
+        assert_eq!(rettv.value, TypvalValue::Number(5));
     }
 
     #[test]
-    fn handle_subscript_dot_only_continues_for_a_dict() {
-        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
-        let evalarg = evaluate_evalarg();
-        // "." after a Number (not a Dict) does not continue.
-        let (ret, consumed) = handle_subscript(b".foo", &rettv, Some(&evalarg), false);
+    fn handle_subscript_number_bracket_index_byte_indexes_the_string_form() {
+        // A genuine, faithfully-preserved real Vimscript behavior,
+        // confirmed directly against eval_index_inner's own real
+        // structure: an ordinary (non-slice()) Number/String subscript
+        // is BYTE-indexed against the value's own string form -
+        // `5[0]` is `"5"[0]`, i.e. `"5"` - not an error, not a panic.
+        let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[0]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"5".to_vec())));
+    }
+
+    #[test]
+    fn handle_subscript_dot_after_number_does_not_continue() {
+        let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        // "." after a Number (not a Dict) does not continue - only a
+        // Dict's own field satisfies `starts_index_dot_or_call`'s "."
+        // branch.
+        let (ret, consumed) = handle_subscript(b".foo", &mut rettv, Some(&mut evalarg), false);
         assert_eq!(ret, OK);
         assert_eq!(consumed, 0);
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
 
-        let dict_rettv = TypvalT { value: TypvalValue::Dict(std::ptr::null_mut()), ..Default::default() };
-        let result = std::panic::catch_unwind(|| handle_subscript(b".foo", &dict_rettv, Some(&evalarg), false));
-        assert!(result.is_err());
+    #[test]
+    fn handle_subscript_dict_dot_key_reads_the_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        let d = test_dict_for_rettv();
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *d, b"foo", Some(b"bar")) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b".foo", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 4);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"bar".to_vec())));
+        // handle_subscript's own internal selfdict bookkeeping must
+        // have fully released `d` on its own - nothing manually freed
+        // here.
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_dict_bracket_key_reads_the_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = test_dict_for_rettv();
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *d, b"foo", Some(b"bar")) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[\"foo\"]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 7);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"bar".to_vec())));
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_dict_missing_key_fails_gracefully() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = test_dict_for_rettv();
+        unsafe { crate::eval::typval::tv_dict_add_str(&mut *d, b"bar", Some(b"baz")) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b".foo", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, FAIL);
+        assert_eq!(consumed, 4);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+        // Even on the FAIL path, `d` must be fully released - not
+        // leaked just because the lookup itself failed.
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_list_bracket_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = test_list_for_rettv(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[1]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(rettv.value, TypvalValue::Number(20));
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_list_bracket_slice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = test_list_for_rettv(&[10, 20, 30, 40]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        // list[1:2] is an INCLUSIVE range (ordinary subscript syntax,
+        // not slice()) - items at indices 1 and 2.
+        let (ret, consumed) = handle_subscript(b"[1:2]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 5);
+        let TypvalValue::List(sliced) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(sliced) }, 2);
+        assert_eq!(list_item(sliced, 0), TypvalValue::Number(20));
+        assert_eq!(list_item(sliced, 1), TypvalValue::Number(30));
+        unsafe { crate::eval::typval::tv_list_unref(sliced) };
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_blob_bracket_index() {
+        // A single-index Blob subscript yields the raw byte VALUE as
+        // a Number (matching real Vimscript's `blob[1]` semantics) -
+        // NOT a 1-byte sub-blob (that's only what a RANGE, `blob[1:1]`,
+        // would produce).
+        let b = test_blob_for_rettv(&[0x10, 0x20, 0x30]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[1]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 3);
+        assert_eq!(rettv.value, TypvalValue::Number(0x20));
+    }
+
+    #[test]
+    fn handle_subscript_chained_list_of_lists() {
+        // `[[1, 2], [3, 4]][0][1]` == 2 - the loop must chain BOTH
+        // subscripts in one call, and every intermediate List
+        // (the outer list, and the [1, 2] inner list it yields) must
+        // be released along the way with no leak.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let inner1 = test_list_for_rettv(&[1, 2]);
+        unsafe { (*inner1).lv_refcount = 0 }; // will be owned solely by `outer`'s own item
+        let inner2 = test_list_for_rettv(&[3, 4]);
+        unsafe { (*inner2).lv_refcount = 0 };
+        let outer = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_list(outer, inner1);
+            crate::eval::typval::tv_list_append_list(outer, inner2);
+            crate::eval::typval::tv_list_ref(outer);
+        }
+        let mut rettv = TypvalT { value: TypvalValue::List(outer), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[0][1]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 6);
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+        // Both `outer` and `inner1` must be fully released - `inner2`
+        // (never touched by this subscript chain) must ALSO be
+        // released, via `outer`'s own free-contents cascade.
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_chained_dict_dot_chain() {
+        // `{a: {b: {c: 42}}}.a.b.c` == 42 - a 3-level dict chain, each
+        // step re-tracking `selfdict` and releasing the PREVIOUS
+        // level's own extra hold, with no leak at the end.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        let d2 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_nr(&mut *d2, b"c", 42) };
+        let d1 = crate::eval::typval::tv_dict_alloc();
+        unsafe { crate::eval::typval::tv_dict_add_dict(&mut *d1, b"b", d2) };
+        let d0 = test_dict_for_rettv();
+        unsafe { crate::eval::typval::tv_dict_add_dict(&mut *d0, b"a", d1) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d0), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b".a.b.c", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 6);
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_selfdict_no_leak_across_dict_then_list() {
+        // `{list: [42]}.list[0]` == 42 - a Dict step followed by a
+        // List step: `selfdict` must track the Dict across the FIRST
+        // iteration, then be released once the chain moves past it
+        // into the List (no longer a Dict), with no leak.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+        let l = crate::eval::typval::tv_list_alloc(1);
+        unsafe { crate::eval::typval::tv_list_append_number(l, 42) };
+        let d = test_dict_for_rettv();
+        unsafe { crate::eval::typval::tv_dict_add_list(&mut *d, b"list", l) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b".list[0]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 8);
+        assert_eq!(rettv.value, TypvalValue::Number(42));
+        assert!(crate::eval::typval::gc_first_dict_is_empty());
+        assert!(crate::eval::typval::gc_first_list_is_empty());
+    }
+
+    #[test]
+    fn handle_subscript_dict_func_binding_is_unimplemented() {
+        // `{f: SomeFunc}.f` reaches the loop's own end with `selfdict`
+        // still non-null and a Func-valued `rettv` - the "turn
+        // dict.Func into a bound partial" step (set_selfdict/
+        // make_partial) is not yet translated, so this must panic
+        // rather than silently returning an unbound Funcref.
+        let _lock = crate::globals::global_state_test_lock();
+        let d = test_dict_for_rettv();
+        let item = crate::eval::typval::tv_dict_item_alloc(b"f");
+        unsafe { (*item).di_tv.value = TypvalValue::Func(Some(b"somefunc".to_vec())) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *d, item) };
+        let mut rettv = TypvalT { value: TypvalValue::Dict(d), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_subscript(b".f", &mut rettv, Some(&mut evalarg), false)
+        }));
+        assert!(result.is_err(), "expected a panic (set_selfdict/make_partial not yet translated)");
+        // A real finding, not just test cleanup: this specific panic
+        // is reached AFTER the loop's own `selfdict` tracking has
+        // already bumped `d`'s refcount (protecting it across the
+        // `.f` lookup), but BEFORE handle_subscript's own final
+        // `tv_dict_unref(selfdict)` call - `unimplemented!()` unwinds
+        // straight past that cleanup. In a real crash this would not
+        // matter (the whole process is dying anyway); it only matters
+        // here because `catch_unwind` lets the test process continue,
+        // so `d` must be explicitly released to avoid permanently
+        // leaking it into the shared GC_FIRST_DICT registry for
+        // whichever OTHER test happens to run next.
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn handle_subscript_space_between_subscripts_stops_the_chain() {
+        // "[0] [1]" (a literal space between the two subscripts) must
+        // only chain the FIRST subscript - handle_subscript's own loop
+        // has no whitespace-skipping of its own BETWEEN iterations, so
+        // the second "[1]" is never treated as a continuation (matches
+        // a real editor's own behavior: `a[0] [1]` is `a[0]` followed
+        // by unrelated trailing text, not a chained index).
+        //
+        // `consumed` is still 4, not 3: `eval_index`'s own trailing
+        // `pos += skipwhite(&arg[pos..])` (after the closing `]`, in
+        // anticipation of a POSSIBLE continuation) already eats the
+        // single space - it's the NEXT iteration's own
+        // `preceded_by_whitespace` recomputation (seeing that eaten
+        // space) that correctly declines to treat "[1]" as a
+        // continuation, not an earlier stop.
+        let _lock = crate::globals::global_state_test_lock();
+        let inner1 = test_list_for_rettv(&[1, 2]);
+        unsafe { (*inner1).lv_refcount = 0 };
+        let inner2 = test_list_for_rettv(&[3, 4]);
+        unsafe { (*inner2).lv_refcount = 0 };
+        let outer = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_list(outer, inner1);
+            crate::eval::typval::tv_list_append_list(outer, inner2);
+            crate::eval::typval::tv_list_ref(outer);
+        }
+        let mut rettv = TypvalT { value: TypvalValue::List(outer), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
+        let (ret, consumed) = handle_subscript(b"[0] [1]", &mut rettv, Some(&mut evalarg), false);
+        assert_eq!(ret, OK);
+        assert_eq!(consumed, 4);
+        let TypvalValue::List(result) = rettv.value else { panic!("expected a List") };
+        assert_eq!(list_item(result, 0), TypvalValue::Number(1));
+        assert_eq!(list_item(result, 1), TypvalValue::Number(2));
+        unsafe { crate::eval::typval::tv_list_unref(result) };
     }
 
     #[test]
     fn handle_subscript_arrow_method_call_panics_even_with_preceding_whitespace() {
-        let rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
-        let evalarg = evaluate_evalarg();
+        let mut rettv = TypvalT { value: TypvalValue::Number(5), ..Default::default() };
+        let mut evalarg = evaluate_evalarg();
         // "->" continues regardless of preceding whitespace (matches
         // the original's own `|| (**arg == '-' && (*arg)[1] == '>')`
         // being a separate OR-branch, not gated by the whitespace
         // check at all).
-        let result = std::panic::catch_unwind(|| handle_subscript(b"->len()", &rettv, Some(&evalarg), true));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_subscript(b"->len()", &mut rettv, Some(&mut evalarg), true)
+        }));
         assert!(result.is_err());
     }
 
@@ -9187,6 +9868,68 @@ mod tests {
         let item = crate::eval::typval::tv_dict_find(unsafe { d.as_mut() }, b"a").unwrap();
         assert_eq!(unsafe { (*item).di_tv.value.clone() }, TypvalValue::Number(1));
         unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    // --- end-to-end: real subscript expressions (handle_subscript/
+    // eval_index, via the whole eval0-eval7 chain) ---
+
+    #[test]
+    fn e2e_list_index_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[1, 2, 3][1]");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn e2e_nested_list_chained_index_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[[1, 2], [3, 4]][0][1]");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn e2e_literal_dict_dot_key_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"#{a: 1}.a");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn e2e_literal_dict_bracket_key_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"#{a: 1}[\"a\"]");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn e2e_string_index_subscript_is_byte_indexed() {
+        // Real, faithfully-preserved Vimscript behavior: ordinary
+        // string subscripting is BYTE-indexed, not character-indexed
+        // (unlike slice()) - "hello"[1] == "e".
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"\"hello\"[1]");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"e".to_vec())));
+    }
+
+    #[test]
+    fn e2e_dict_of_lists_chained_dot_then_bracket_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"#{items: [10, 20, 30]}.items[2]");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(30));
+    }
+
+    #[test]
+    fn e2e_list_of_dicts_chained_bracket_then_dot_subscript() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (ret, tv) = eval_str(b"[#{a: 1}, #{a: 2}][1].a");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::Number(2));
     }
 
     #[test]

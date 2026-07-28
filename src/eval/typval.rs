@@ -213,6 +213,20 @@ const LUA_NOREF: crate::types_defs::LuaRef = -1;
 /// comment.
 static GC_FIRST_DICT: GlobalCell<*mut DictT> = GlobalCell::new(std::ptr::null_mut());
 
+/// Test-only accessor: `true` if no `Dict` is currently linked into
+/// the shared `GC_FIRST_DICT` registry - lets tests in OTHER modules
+/// (e.g. `eval::eval`'s own `handle_subscript` tests) directly verify
+/// they leave no dangling/leaked `Dict` behind, matching this
+/// session's own established "check `GC_FIRST_LIST`/`GC_FIRST_DICT`
+/// before/after" regression-proving convention.
+#[cfg(test)]
+pub(crate) fn gc_first_dict_is_empty() -> bool {
+    // SAFETY: GC_FIRST_DICT is only ever read/written through this
+    // accessor and the crate's own established `global_state_test_lock()`
+    // discipline, matching every other read site in this module.
+    unsafe { *GC_FIRST_DICT.get_mut() }.is_null()
+}
+
 /// Allocate a dictionary item. The type and value of the item
 /// (`.di_tv`) still need to be initialized by the caller
 /// (`tv_dict_item_alloc`/`tv_dict_item_alloc_len` - collapsed into one
@@ -2501,6 +2515,17 @@ pub unsafe fn tv_blob_remove(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// [`GC_FIRST_DICT`].
 static GC_FIRST_LIST: GlobalCell<*mut crate::eval::typval_defs::ListT> =
     GlobalCell::new(std::ptr::null_mut());
+
+/// Test-only accessor: `true` if no `List` is currently linked into
+/// the shared `GC_FIRST_LIST` registry - see
+/// [`gc_first_dict_is_empty`]'s own doc comment for why this exists.
+#[cfg(test)]
+pub(crate) fn gc_first_list_is_empty() -> bool {
+    // SAFETY: GC_FIRST_LIST is only ever read/written through this
+    // accessor and the crate's own established `global_state_test_lock()`
+    // discipline, matching every other read site in this module.
+    unsafe { *GC_FIRST_LIST.get_mut() }.is_null()
+}
 
 /// Allocate an empty list. Caller should take care of the reference
 /// count (`tv_list_alloc`).
