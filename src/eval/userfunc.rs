@@ -977,6 +977,38 @@ pub unsafe fn get_func_tv(
     (ret, pos)
 }
 
+/// Expand a `s:`/`<SID>`-prefixed function name into its real,
+/// resolved `<SNR>{sid}_{name}` form (`get_scriptlocal_funcname`).
+///
+/// `None` for a name with no script-local prefix (not an error - the
+/// original's own first `return NULL` case), OR when the current
+/// script context has no valid script ID (the original's own
+/// `emsg(_(e_usingsid))`-then-`return NULL` case - message display
+/// omitted, matching this crate's established policy, but the exact
+/// same `None` result is kept).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`.
+pub unsafe fn get_scriptlocal_funcname(funcname: &[u8]) -> Option<Vec<u8>> {
+    let off = if funcname.starts_with(b"s:") {
+        2
+    } else if funcname.starts_with(b"<SID>") {
+        5
+    } else {
+        return None;
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if !(sid > 0 && sid <= crate::runtime::script_item_count()) {
+        return None;
+    }
+
+    let mut newname = format!("<SNR>{sid}_").into_bytes();
+    newname.extend_from_slice(&funcname[off..]);
+    Some(newname)
+}
+
 /// Whether a function name is genuinely refcounted BY NAME
 /// (`func_name_refcount`): numbered functions (`"123"`) and lambdas
 /// (`"<lambda>42"`) are; an ordinary named function's `ufunc_T` lives
@@ -4365,6 +4397,43 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         func_init();
         func_unref(Some(b"999"));
+    }
+
+    // ---- get_scriptlocal_funcname -----------------------------------------
+
+    #[test]
+    fn get_scriptlocal_funcname_no_prefix_returns_none() {
+        assert_eq!(unsafe { get_scriptlocal_funcname(b"MyFunc") }, None);
+    }
+
+    #[test]
+    fn get_scriptlocal_funcname_expands_s_colon_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let expanded = unsafe { get_scriptlocal_funcname(b"s:MyFunc") };
+        assert_eq!(expanded, Some(format!("<SNR>{sid}_MyFunc").into_bytes()));
+    }
+
+    #[test]
+    fn get_scriptlocal_funcname_expands_sid_tag_prefix() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let expanded = unsafe { get_scriptlocal_funcname(b"<SID>MyFunc") };
+        assert_eq!(expanded, Some(format!("<SNR>{sid}_MyFunc").into_bytes()));
+    }
+
+    #[test]
+    fn get_scriptlocal_funcname_returns_none_when_sid_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 0;
+
+        assert_eq!(unsafe { get_scriptlocal_funcname(b"s:MyFunc") }, None);
     }
 
     // ---- make_partial ----------------------------------------------------

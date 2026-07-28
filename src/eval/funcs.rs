@@ -429,6 +429,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"bufwinid"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufwinid });
         m.insert(&b"bufwinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufwinnr });
         m.insert(&b"swapname"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_swapname });
+        m.insert(&b"prompt_setcallback"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_prompt_setcallback });
+        m.insert(&b"prompt_setinterrupt"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_prompt_setinterrupt });
         m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
         m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
         m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
@@ -7911,6 +7913,8 @@ mod tests {
             "reltimefloat",
             "arglistid",
             "swapname",
+            "prompt_setcallback",
+            "prompt_setinterrupt",
             "clearmatches",
             "getmatches",
             "sort",

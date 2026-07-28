@@ -123,6 +123,16 @@
 //! every `lua_table_ref` is always `LUA_NOREF` (the Lua host, phase
 //! 13, isn't started).
 //!
+//! Also translated: `callback_from_typval`/`callback_free` (`eval.c`/
+//! `eval/typval.c`) - the `Callback` conversion/lifecycle functions
+//! used directly by `prompt_setcallback()`/`prompt_setinterrupt()`
+//! (`eval/buffer.rs`), and a real step toward (but not the whole of)
+//! the dict-watcher subsystem, which still additionally needs the
+//! `QUEUE`-as-`Vec` `DictWatcher` design and `tv_dict_watcher_add`/
+//! `_remove`/`_notify` themselves. `callback_put`/`callback_copy`/
+//! `callback_to_string`/`tv_callback_equal` remain untranslated -
+//! none has a real caller among currently-translated code yet.
+//!
 //! # Deferred
 //! - `tv_clear`/`tv_free` themselves: `tv_clear`'s *real* behavior is
 //!   implemented via a shared encode-traversal abstraction
@@ -196,7 +206,7 @@
 //! doubly-linked-list reversal).
 
 use crate::eval::typval_defs::{
-    dict_item_flags, DictT, DictitemT, ListLenSpecials, PartialT, ScopeType, TypvalT, TypvalValue,
+    dict_item_flags, Callback, DictT, DictitemT, ListLenSpecials, PartialT, ScopeType, TypvalT, TypvalValue,
     VarLockStatus, VarType, VarnumberT,
 };
 use crate::globals::GlobalCell;
@@ -1277,6 +1287,87 @@ pub unsafe fn partial_unref(pt: *mut PartialT) {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { partial_free(pt) };
     }
+}
+
+/// Convert a `typval_T` into a [`Callback`] (`callback_from_typval`,
+/// `eval.c`) - used by `prompt_setcallback()`/`prompt_setinterrupt()`
+/// and the (not yet translated) dict-watcher subsystem.
+///
+/// The original's own `nlua_is_table_from_lua` branch (a Lua-table
+/// value used as a callable) is NOT modeled: this crate's own
+/// `TypvalValue` enum has no Lua-table variant at all (no Lua host is
+/// embedded yet), so that branch is provably, always unreachable here
+/// - not merely "the common case."
+///
+/// The original's own `emsg("E921: ...")` display (on failure) is
+/// omitted, matching this module's established "skip the message,
+/// keep the exact same success/failure result" policy. Returns
+/// `Option<Callback>` rather than the original's own bare `bool` (or a
+/// `Result<Callback, ()>` with no real error payload to carry) - `None`
+/// is this crate's own idiomatic "failed, no further detail" shape.
+///
+/// # Safety
+/// If `arg.value` is `Partial`-typed with a non-null pointer, that
+/// pointer must be valid.
+pub unsafe fn callback_from_typval(arg: &TypvalT) -> Option<Callback> {
+    match &arg.value {
+        TypvalValue::Partial(pt) if !pt.is_null() => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (**pt).pt_refcount += 1 };
+            Some(Callback::Partial(*pt))
+        }
+        TypvalValue::String(Some(s))
+            if s.first().is_some_and(|b| crate::ascii_defs::ascii_isdigit(i32::from(*b))) =>
+        {
+            None
+        }
+        TypvalValue::Func(Some(name)) => {
+            if name.is_empty() {
+                Some(Callback::None)
+            } else {
+                // Unlike the `String` case below, a `Func` value's own
+                // name is never re-resolved via `get_scriptlocal_funcname`
+                // - matching the original's own `if (arg->v_type ==
+                // VAR_STRING) { ... get_scriptlocal_funcname(name) ...
+                // }` guard, which only fires for `VAR_STRING`.
+                crate::eval::userfunc::func_ref(Some(name));
+                Some(Callback::Funcref(name.clone()))
+            }
+        }
+        TypvalValue::String(Some(name)) => {
+            if name.is_empty() {
+                Some(Callback::None)
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                let funcref = unsafe { crate::eval::userfunc::get_scriptlocal_funcname(name) }.unwrap_or_else(|| name.clone());
+                crate::eval::userfunc::func_ref(Some(&funcref));
+                Some(Callback::Funcref(funcref))
+            }
+        }
+        TypvalValue::Func(None) | TypvalValue::String(None) => None,
+        TypvalValue::Special(_) => Some(Callback::None),
+        TypvalValue::Number(0) => Some(Callback::None),
+        _ => None,
+    }
+}
+
+/// Free/unreference a [`Callback`]'s own held resource (`callback_free`,
+/// `eval/typval.c`) - `Lua` is a documented, narrow, unreachable gap
+/// (needs the Lua host's own `NLUA_CLEAR_REF`, not translated; nothing
+/// in this crate can construct a real `Callback::Lua` value yet).
+pub fn callback_free(callback: &mut Callback) {
+    match callback {
+        Callback::Funcref(name) => crate::eval::userfunc::func_unref(Some(name)),
+        // SAFETY: `pt`, if non-null, must be a valid pointer previously
+        // returned by a real allocation - guaranteed by every real
+        // constructor of a `Callback::Partial` in this crate
+        // (`callback_from_typval` above bumps `pt_refcount` on an
+        // ALREADY-live `PartialT`, never allocates a fresh dangling one).
+        Callback::Partial(pt) => unsafe { partial_unref(*pt) },
+        Callback::Lua(_) => unimplemented!("callback_free: Lua callbacks need the Lua host, not yet translated"),
+        Callback::None => {}
+    }
+    *callback = Callback::None;
 }
 
 /// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
@@ -4987,6 +5078,7 @@ pub unsafe fn tv_equal(tv1: &TypvalT, tv2: &TypvalT, ic: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval::typval_defs::CallbackType;
     use crate::vim_defs::FAIL;
 
     /// A minimal, otherwise-zeroed `ListT` for `tv_copy`/`tv_list_ref`
@@ -6247,6 +6339,146 @@ mod tests {
         // and decrements ITS refcount for real (2 -> 1).
         unsafe { partial_unref(pt) };
         assert_eq!(fp.uf_refcount, 1);
+    }
+
+    // ---- callback_from_typval / callback_free -----------------------------
+
+    #[test]
+    fn callback_from_typval_partial_bumps_refcount() {
+        let mut pt = PartialT { pt_refcount: 1, ..Default::default() };
+        let pt_ptr = &mut pt as *mut PartialT;
+        let tv = TypvalT { value: TypvalValue::Partial(pt_ptr), ..Default::default() };
+        let cb = unsafe { callback_from_typval(&tv) }.unwrap();
+        assert_eq!(pt.pt_refcount, 2);
+        assert!(matches!(cb, Callback::Partial(p) if p == pt_ptr));
+    }
+
+    #[test]
+    fn callback_from_typval_null_partial_is_an_error() {
+        let tv = TypvalT { value: TypvalValue::Partial(std::ptr::null_mut()), ..Default::default() };
+        assert!(unsafe { callback_from_typval(&tv) }.is_none());
+    }
+
+    #[test]
+    fn callback_from_typval_a_string_starting_with_a_digit_is_an_error() {
+        // Real function NAMES never start with a digit - a numeric-
+        // looking string is rejected outright, matching the original's
+        // own `ascii_isdigit(*arg->vval.v_string)` guard.
+        let tv = TypvalT { value: TypvalValue::String(Some(b"123notafunc".to_vec())), ..Default::default() };
+        assert!(unsafe { callback_from_typval(&tv) }.is_none());
+    }
+
+    #[test]
+    fn callback_from_typval_ordinary_string_name_becomes_a_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT { value: TypvalValue::String(Some(b"MyFunc".to_vec())), ..Default::default() };
+        let cb = unsafe { callback_from_typval(&tv) }.unwrap();
+        assert!(matches!(cb, Callback::Funcref(name) if name == b"MyFunc"));
+    }
+
+    #[test]
+    fn callback_from_typval_ordinary_func_name_becomes_a_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT { value: TypvalValue::Func(Some(b"MyFunc".to_vec())), ..Default::default() };
+        let cb = unsafe { callback_from_typval(&tv) }.unwrap();
+        assert!(matches!(cb, Callback::Funcref(name) if name == b"MyFunc"));
+    }
+
+    #[test]
+    fn callback_from_typval_script_local_string_name_is_expanded() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let tv = TypvalT { value: TypvalValue::String(Some(b"s:MyFunc".to_vec())), ..Default::default() };
+        let cb = unsafe { callback_from_typval(&tv) }.unwrap();
+        let expected = format!("<SNR>{sid}_MyFunc").into_bytes();
+        assert!(matches!(cb, Callback::Funcref(name) if name == expected));
+    }
+
+    #[test]
+    fn callback_from_typval_script_local_func_name_is_not_re_expanded() {
+        // Unlike the String case, a Func value's own name is used
+        // VERBATIM - matching the original's own `if (arg->v_type ==
+        // VAR_STRING) { get_scriptlocal_funcname(...) }` guard, which
+        // never fires for VAR_FUNC.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let tv = TypvalT { value: TypvalValue::Func(Some(b"s:MyFunc".to_vec())), ..Default::default() };
+        let cb = unsafe { callback_from_typval(&tv) }.unwrap();
+        assert!(matches!(cb, Callback::Funcref(name) if name == b"s:MyFunc"));
+    }
+
+    #[test]
+    fn callback_from_typval_empty_string_is_none() {
+        let tv = TypvalT { value: TypvalValue::String(Some(Vec::new())), ..Default::default() };
+        assert_eq!(unsafe { callback_from_typval(&tv) }.unwrap().kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_from_typval_null_string_is_an_error() {
+        let tv = TypvalT { value: TypvalValue::String(None), ..Default::default() };
+        assert!(unsafe { callback_from_typval(&tv) }.is_none());
+    }
+
+    #[test]
+    fn callback_from_typval_special_is_none() {
+        let tv = TypvalT {
+            value: TypvalValue::Special(crate::eval::typval_defs::SpecialVarValue::Null),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { callback_from_typval(&tv) }.unwrap().kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_from_typval_number_zero_is_none() {
+        let tv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        assert_eq!(unsafe { callback_from_typval(&tv) }.unwrap().kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_from_typval_nonzero_number_is_an_error() {
+        let tv = TypvalT { value: TypvalValue::Number(1), ..Default::default() };
+        assert!(unsafe { callback_from_typval(&tv) }.is_none());
+    }
+
+    #[test]
+    fn callback_free_partial_releases_it() {
+        let pt = Box::into_raw(Box::new(PartialT { pt_refcount: 1, ..Default::default() }));
+        let mut cb = Callback::Partial(pt);
+        callback_free(&mut cb);
+        assert_eq!(cb.kind(), CallbackType::None);
+        // A clean, crash-free run (no double-free/UB) IS the check -
+        // matching this crate's own established `partial_unref`-style
+        // convention for proving a real free happened.
+    }
+
+    #[test]
+    fn callback_free_funcref_releases_a_numbered_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 2,
+            uf_name: b"77\0".to_vec(),
+            ..Default::default()
+        };
+        let fp_ptr = &mut fp as *mut crate::eval::typval_defs::UfuncT;
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp_ptr) };
+        let mut cb = Callback::Funcref(b"77".to_vec());
+        callback_free(&mut cb);
+        assert_eq!(fp.uf_refcount, 1);
+        assert_eq!(cb.kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn callback_free_none_is_a_noop() {
+        let mut cb = Callback::None;
+        callback_free(&mut cb);
+        assert_eq!(cb.kind(), CallbackType::None);
     }
 
     #[test]

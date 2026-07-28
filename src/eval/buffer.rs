@@ -40,6 +40,16 @@
 //! `None` (Vimscript `v:null`) whenever `{buf}` doesn't resolve to a
 //! real buffer, has no memfile yet, or its memfile has no on-disk
 //! swap file name.
+//!
+//! Also translated: `prompt_setcallback()`/`prompt_setinterrupt()`
+//! (via a shared `set_prompt_callback` helper, using the now-real
+//! `crate::eval::typval::callback_from_typval`/`callback_free`) -
+//! installs a `Funcref`/`Partial` callback into `BufT.b_prompt_callback`/
+//! `b_prompt_interrupt`, freeing whichever callback was previously
+//! there. `prompt_setprompt()` (the third member of this family) is
+//! NOT translated - its own "live update while the user is mid-edit"
+//! branch (the common, real-world case) needs `extmark_splice_cols`,
+//! not yet translated.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -295,6 +305,63 @@ pub(crate) unsafe fn f_swapname(argvars: &[TypvalT], rettv: &mut TypvalT) {
         }
     };
     rettv.value = TypvalValue::String(name);
+}
+
+/// Shared engine for `prompt_setcallback()`/`prompt_setinterrupt()`:
+/// resolve `{buffer}`, convert `{callback}` into a real
+/// [`crate::eval::typval_defs::Callback`], and install it into
+/// whichever of `BufT`'s two prompt-callback fields `get_field`
+/// selects, freeing the previous one first.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`]); forwards [`tv_get_buf`]'s own
+/// safety doc; if `argvars[1].value` is `Partial`-typed with a
+/// non-null pointer, that pointer must be valid.
+unsafe fn set_prompt_callback(
+    argvars: &[TypvalT],
+    get_field: impl FnOnce(&mut crate::buffer_defs::BufT) -> &mut crate::eval::typval_defs::Callback,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { tv_get_buf(&argvars[0]) };
+    if buf.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(callback) = (unsafe { crate::eval::typval::callback_from_typval(&argvars[1]) }) else {
+        return;
+    };
+
+    // SAFETY: `buf` is a valid, non-null pointer per the check above.
+    let field = get_field(unsafe { &mut *buf });
+    crate::eval::typval::callback_free(field);
+    *field = callback;
+}
+
+/// `prompt_setcallback({buf}, {expr})` - set the callback invoked when
+/// Enter is pressed in a prompt buffer (`f_prompt_setcallback`,
+/// `eval/buffer.c`), via [`set_prompt_callback`].
+///
+/// # Safety
+/// Forwarded from [`set_prompt_callback`]'s own safety doc.
+pub(crate) unsafe fn f_prompt_setcallback(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_prompt_callback(argvars, |b| &mut b.b_prompt_callback) };
+}
+
+/// `prompt_setinterrupt({buf}, {expr})` - set the callback invoked
+/// when `CTRL-C` is pressed in a prompt buffer (`f_prompt_setinterrupt`,
+/// `eval/buffer.c`), via [`set_prompt_callback`].
+///
+/// # Safety
+/// Forwarded from [`set_prompt_callback`]'s own safety doc.
+pub(crate) unsafe fn f_prompt_setinterrupt(argvars: &[TypvalT], _rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_prompt_callback(argvars, |b| &mut b.b_prompt_interrupt) };
 }
 
 #[cfg(test)]
@@ -762,5 +829,102 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_swapname(&[string(b"")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b".cur.swp".to_vec())));
+    }
+
+    // ---- f_prompt_setcallback / f_prompt_setinterrupt ----
+
+    #[test]
+    fn prompt_setcallback_installs_a_funcref_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_prompt_setcallback(&[num(1), string(b"MyCallback")], &mut rettv) };
+        assert!(
+            matches!(&buf.b_prompt_callback, crate::eval::typval_defs::Callback::Funcref(n) if n == b"MyCallback")
+        );
+    }
+
+    #[test]
+    fn prompt_setcallback_replaces_and_frees_a_previous_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        crate::eval::userfunc::func_init();
+        let mut fp = crate::eval::typval_defs::UfuncT {
+            uf_refcount: 2,
+            uf_name: b"55\0".to_vec(),
+            ..Default::default()
+        };
+        let fp_ptr = &mut fp as *mut crate::eval::typval_defs::UfuncT;
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp_ptr) };
+        let mut buf = crate::buffer_defs::BufT {
+            handle: 1,
+            b_prompt_callback: crate::eval::typval_defs::Callback::Funcref(b"55".to_vec()),
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_prompt_setcallback(&[num(1), string(b"NewCallback")], &mut rettv) };
+        // The old numbered-function callback was genuinely released.
+        assert_eq!(fp.uf_refcount, 1);
+        assert!(
+            matches!(&buf.b_prompt_callback, crate::eval::typval_defs::Callback::Funcref(n) if n == b"NewCallback")
+        );
+    }
+
+    #[test]
+    fn prompt_setcallback_does_nothing_when_secure_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_prompt_setcallback(&[num(1), string(b"MyCallback")], &mut rettv) };
+        assert_eq!(buf.b_prompt_callback.kind(), crate::eval::typval_defs::CallbackType::None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    #[test]
+    fn prompt_setcallback_does_nothing_for_an_unknown_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, std::ptr::null_mut());
+
+        let mut rettv = TypvalT::default();
+        // Should not panic even though there's no buffer 42 anywhere.
+        unsafe { f_prompt_setcallback(&[num(42), string(b"MyCallback")], &mut rettv) };
+    }
+
+    #[test]
+    fn prompt_setinterrupt_installs_into_the_interrupt_field_not_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT::default();
+        let _guard = BufGlobalsGuard::set(std::ptr::null_mut(), &mut win, buf_ptr);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_prompt_setinterrupt(&[num(1), string(b"MyInterrupt")], &mut rettv) };
+        assert!(
+            matches!(&buf.b_prompt_interrupt, crate::eval::typval_defs::Callback::Funcref(n) if n == b"MyInterrupt")
+        );
+        assert_eq!(buf.b_prompt_callback.kind(), crate::eval::typval_defs::CallbackType::None);
     }
 }
