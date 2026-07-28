@@ -108,6 +108,25 @@
 //! trailing NUL only invites bugs like direct content comparisons
 //! - e.g. `get_showbreak_value`'s `"NONE"` check - silently failing).
 //!
+//! Also translated: `skip_to_option_part`/`copy_option_part`
+//! (`option.c`'s own comma-separated-option-string parsing helpers,
+//! e.g. for `'suffixes'`/`'path'`) - `p`/`option` cursors replace the
+//! original's own `char *`/`char **` in-out pointers with a plain
+//! byte offset into the whole option string; `copy_option_part`'s own
+//! `maxlen`-truncation is kept faithfully (real, observable behavior
+//! for a part longer than `maxlen`, not just an implementation
+//! detail this crate's growable `Vec<u8>` could otherwise drop).
+//! `path.rs`'s `match_suffix` is their first real caller.
+//!
+//! **STALE-NOTE FIX**: `find_option`/`find_option_len` (below) were
+//! previously (incorrectly) described here as still needing the
+//! perfect-hash generated table - they are, in fact, ALREADY
+//! translated, via `OPTION_HASH_ELEMS` (a plain `HashMap`, not a
+//! literal port of the original's hand-rolled dispatch tree - see
+//! that static's own doc comment for why a `HashMap` is a faithful,
+//! simpler substitute). This note is corrected here rather than left
+//! to compound further.
+//!
 //! Deferred: the full `set_option_value`/`set_option`/
 //! `did_set_option`/`validate_option_value` write pipeline - each
 //! layer found to need a currently-blocked subsystem while scoping
@@ -130,15 +149,6 @@
 //!   logic is translated yet). The OTHER, simpler numeric bound
 //!   checks (most of the switch) have no such blocker and would be a
 //!   reasonable follow-up once isolated from the 3 blocked cases.
-//! - `find_option`/`find_option_len` (option name -> `OptIndex`
-//!   lookup, needed by `do_set`'s own parsing) rely on a real,
-//!   machine-generated PERFECT HASH function and table
-//!   (`option.c.generated.h`/`options_map.generated.h`, produced by
-//!   `src/gen/gen_options.lua` from the same `options.lua` master
-//!   table `options.generated.h` itself comes from) - a substantial,
-//!   self-contained mechanical-transcription undertaking of its own,
-//!   directly analogous to `option_defs.rs`'s own `OPTIONS` table
-//!   effort, good future-session material but not chased here.
 //! - `was_set_insecurely`/`insecure_flag` still need `OPTIONS[idx]
 //!   .flags`'s own `WAS_SET`/`INSECURE` bits threaded through a real
 //!   `:set` call site to have any meaningful test value.
@@ -2229,6 +2239,75 @@ pub fn find_option_end(arg: &[u8]) -> (Option<usize>, OptIndex) {
     (Some(p), find_option_len(arg, p))
 }
 
+/// Skip to next part of an option argument: skip a leading comma and
+/// any following spaces (`skip_to_option_part`).
+///
+/// `option` is the whole option string being parsed; `p` is the
+/// current byte offset into it (replacing the original's own `char *`
+/// cursor). Returns the new offset.
+#[must_use]
+pub fn skip_to_option_part(option: &[u8], mut p: usize) -> usize {
+    if option.get(p) == Some(&b',') {
+        p += 1;
+    }
+    while option.get(p) == Some(&b' ') {
+        p += 1;
+    }
+    p
+}
+
+/// Isolate one part of a string option separated by `sep_chars`
+/// (`copy_option_part`).
+///
+/// `option` is the whole option string; `p` is the current byte
+/// offset into it (replacing the original's own `char **option`
+/// in-out cursor). Returns `(isolated_part, next_p)`: the isolated
+/// part, truncated to at most `maxlen - 1` bytes (matching the
+/// original's own fixed-size `buf[maxlen]` truncation - this crate's
+/// growable `Vec<u8>` doesn't NEED this limit, but it's kept
+/// faithfully since it's real, observable behavior for an option part
+/// longer than `maxlen`, not merely an implementation detail to
+/// simplify away), and the offset where parsing should continue for
+/// the next part.
+#[must_use]
+pub fn copy_option_part(option: &[u8], p: usize, maxlen: usize, sep_chars: &[u8]) -> (Vec<u8>, usize) {
+    let mut buf = Vec::new();
+    let mut p = p;
+
+    // Skip '.' at start of option part, for 'suffixes'.
+    if option.get(p) == Some(&b'.') {
+        buf.push(b'.');
+        p += 1;
+    }
+    while option.get(p).is_some_and(|&c| {
+        c != crate::ascii_defs::NUL && crate::strings::vim_strchr(sep_chars, i32::from(c)).is_none()
+    }) {
+        // Skip a backslash before a separator character (and space) -
+        // the escaped separator itself is then copied as a literal
+        // character instead of ending the part.
+        if option.get(p) == Some(&b'\\')
+            && option
+                .get(p + 1)
+                .is_some_and(|&c2| crate::strings::vim_strchr(sep_chars, i32::from(c2)).is_some())
+        {
+            p += 1;
+        }
+        if let Some(&c) = option.get(p) {
+            if buf.len() < maxlen.saturating_sub(1) {
+                buf.push(c);
+            }
+        }
+        p += 1;
+    }
+
+    if option.get(p).is_some_and(|&c| c != crate::ascii_defs::NUL && c != b',') {
+        p += 1;
+    }
+    p = skip_to_option_part(option, p);
+
+    (buf, p)
+}
+
 /// Error message for `'chistory'`/`'lhistory'` given a non-positive
 /// value (`e_cannot_have_negative_or_zero_number_of_quickfix`, a
 /// file-local `static const char[]` in the original - kept file-local
@@ -4163,6 +4242,101 @@ mod find_option_tests {
         let (end, idx) = find_option_end(b"t_kb=x");
         assert_eq!(end, Some(4));
         assert_eq!(idx, OptIndex::Invalid);
+    }
+
+    #[test]
+    fn skip_to_option_part_skips_comma_and_spaces() {
+        assert_eq!(skip_to_option_part(b",  next", 0), 3);
+    }
+
+    #[test]
+    fn skip_to_option_part_no_comma_still_skips_spaces() {
+        assert_eq!(skip_to_option_part(b"   next", 0), 3);
+    }
+
+    #[test]
+    fn skip_to_option_part_neither_comma_nor_space_is_a_no_op() {
+        assert_eq!(skip_to_option_part(b"next", 0), 0);
+    }
+
+    #[test]
+    fn skip_to_option_part_at_end_of_string_is_a_no_op() {
+        assert_eq!(skip_to_option_part(b"abc", 3), 3);
+    }
+
+    #[test]
+    fn copy_option_part_isolates_up_to_a_separator() {
+        let (part, next) = copy_option_part(b"foo,bar", 0, 30, b".,");
+        assert_eq!(part, b"foo");
+        assert_eq!(next, 4); // past the comma
+        let (part2, next2) = copy_option_part(b"foo,bar", next, 30, b".,");
+        assert_eq!(part2, b"bar");
+        assert_eq!(next2, 7);
+    }
+
+    #[test]
+    fn copy_option_part_keeps_a_leading_dot() {
+        // The leading '.' skip is specifically for 'suffixes' entries
+        // like ".bak" - it's copied, not treated as a separator itself
+        // even when '.' is one of sep_chars.
+        let (part, next) = copy_option_part(b".bak,~", 0, 30, b".,");
+        assert_eq!(part, b".bak");
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn copy_option_part_empty_entry_between_commas() {
+        let (part, next) = copy_option_part(b",,foo", 0, 30, b".,");
+        assert_eq!(part, b"");
+        assert_eq!(next, 1);
+        let (part2, next2) = copy_option_part(b",,foo", next, 30, b".,");
+        assert_eq!(part2, b"");
+        assert_eq!(next2, 2);
+        let (part3, _) = copy_option_part(b",,foo", next2, 30, b".,");
+        assert_eq!(part3, b"foo");
+    }
+
+    #[test]
+    fn copy_option_part_backslash_escapes_a_separator_character() {
+        // "a\,b,c" - the backslash-comma is an escaped literal comma
+        // within the FIRST part, not a part boundary. `next` lands on
+        // the 'c' (index 5), NOT past it - "c" is still a whole
+        // unconsumed part waiting for the next call, matching the
+        // original's own pointer-arithmetic trace (only the FIRST
+        // comma after "a\,b" is consumed as the part separator).
+        let (part, next) = copy_option_part(b"a\\,b,c", 0, 30, b",");
+        assert_eq!(part, b"a,b");
+        assert_eq!(next, 5);
+        assert_eq!(&b"a\\,b,c"[next..], b"c");
+    }
+
+    #[test]
+    fn copy_option_part_truncates_to_maxlen_but_still_advances_past_the_whole_part() {
+        // maxlen=4 means at most 3 bytes are copied (maxlen - 1), but
+        // the cursor still advances past the ENTIRE "abcdef" part -
+        // parsing correctly continues at "ghi" afterward.
+        let (part, next) = copy_option_part(b"abcdef,ghi", 0, 4, b",");
+        assert_eq!(part, b"abc");
+        assert_eq!(next, 7);
+        let (part2, _) = copy_option_part(b"abcdef,ghi", next, 4, b",");
+        assert_eq!(part2, b"ghi");
+    }
+
+    #[test]
+    fn copy_option_part_no_trailing_separator_reaches_the_end() {
+        let (part, next) = copy_option_part(b"solo", 0, 30, b".,");
+        assert_eq!(part, b"solo");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn copy_option_part_space_separator_is_skipped_like_a_comma() {
+        // sep_chars containing a space (matches expand_path_option's
+        // own " ," call) - stopping on a space (not a comma) takes the
+        // explicit "skip non-standard separator" branch.
+        let (part, next) = copy_option_part(b"foo bar", 0, 30, b" ,");
+        assert_eq!(part, b"foo");
+        assert_eq!(next, 4);
     }
 }
 

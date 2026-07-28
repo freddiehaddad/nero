@@ -77,9 +77,24 @@
 //! restore, not pointer arithmetic that could otherwise land off a
 //! character boundary for a pathological input).
 //!
-//! Deferred: everything else requiring options, multibyte case
-//! folding, or subsystems not yet ported (wildcard expansion,
-//! `'suffixes'`/`'wildignore'`, etc.).
+//! Also translated: `concat_fnames` (via `path.c`'s shared
+//! `do_concat_fnames` core logic) - `concat_fnames_realloc`'s own
+//! distinct "reallocate an existing, caller-owned buffer in place"
+//! contract is deliberately NOT modeled separately, since this
+//! crate's `Vec<u8>` already grows dynamically with no realloc-in-
+//! place ceremony needed, so `concat_fnames` alone serves every real
+//! caller's actual need. `path_to_backslash` (the trivial sibling of
+//! `path_to_slash`, via the already-existing `memchrsub`).
+//! `match_suffix` (via `option.c`'s newly-translated
+//! `copy_option_part`/`skip_to_option_part`) - `'suffixes'` is no
+//! longer deferred as a whole subsystem: this one real consumer of
+//! it is translated.
+//!
+//! Deferred: everything else requiring the general wildcard/glob
+//! expansion machinery (`path_expand`/`gen_expand_wildcards`/
+//! `expand_path_option`/etc., needing `'wildignore'`/`'path'` parsing
+//! and directory scanning), multibyte case folding beyond what's
+//! already used above, or subsystems not yet ported.
 
 use crate::os::os_defs::MAXPATHL;
 
@@ -363,6 +378,11 @@ pub fn path_with_url(fname: &[u8]) -> i32 {
 
     // ":/" or ":\\" must follow
     path_is_url(&fname[i..])
+}
+
+/// Convert all slashes to backslashes in place (`path_to_backslash`).
+pub fn path_to_backslash(p: &mut [u8]) {
+    crate::memory::memchrsub(p, crate::ascii_defs::PATHSEP, b'\\');
 }
 
 /// Convert `p` to use forward slashes in place, unless it looks like a
@@ -1175,6 +1195,50 @@ pub unsafe fn path_with_extension(path: &[u8], extension: &[u8]) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     let ic = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic != 0;
     crate::mbyte::mb_strcmp_ic(ic, &path[dot + 1..], extension) == 0
+}
+
+/// Returns `true` if `fname` matches with an entry in `'suffixes'`
+/// (`match_suffix`) - e.g. used by `gen_expand_wildcards` to decide
+/// whether a completion candidate should be considered "less
+/// interesting" (a backup/object file).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (for `'suffixes'`) and
+/// forwards [`path_fnamencmp`]'s own safety requirement (reads
+/// `'fileignorecase'` transitively).
+#[must_use]
+pub unsafe fn match_suffix(fname: &[u8]) -> bool {
+    const MAXSUFLEN: usize = 30;
+    let fnamelen = fname.len();
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_su = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_su
+        .clone()
+        .unwrap_or_default();
+
+    let mut setsuflen = 0usize;
+    let mut pos = 0;
+    while pos < p_su.len() {
+        let (suf_buf, next_pos) = crate::option::copy_option_part(&p_su, pos, MAXSUFLEN, b".,");
+        pos = next_pos;
+        setsuflen = suf_buf.len();
+        if setsuflen == 0 {
+            // Empty entry: match a name with no '.' in its tail at all.
+            let tail = &fname[path_tail(fname)..];
+            if crate::strings::vim_strchr(tail, i32::from(b'.')).is_none() {
+                setsuflen = 1;
+                break;
+            }
+        } else if fnamelen >= setsuflen
+            // SAFETY: forwarded from this function's own safety doc.
+            && unsafe { path_fnamencmp(&suf_buf, &fname[fnamelen - setsuflen..], setsuflen) } == 0
+        {
+            break;
+        } else {
+            setsuflen = 0;
+        }
+    }
+    setsuflen != 0
 }
 
 /// Return the byte offset of the path separator right before `fname`'s
@@ -2013,6 +2077,93 @@ mod tests {
         assert!(unsafe { path_with_extension(b"file.TXT", b"txt") });
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = prev;
+    }
+
+    /// RAII helper temporarily setting `OPTION_VARS.p_su` for
+    /// `match_suffix` tests, restoring the previous value on drop
+    /// (even through a panic) - the caller must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime,
+    /// matching this file's own established `ShellslashGuard`-style
+    /// convention.
+    struct PSuGuard {
+        prev: Option<Vec<u8>>,
+    }
+    impl PSuGuard {
+        fn set(value: &[u8]) -> Self {
+            let vars = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let prev = vars.p_su.clone();
+            vars.p_su = Some(value.to_vec());
+            Self { prev }
+        }
+    }
+    impl Drop for PSuGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_su = self.prev.take();
+        }
+    }
+
+    #[test]
+    fn match_suffix_real_default_matches_bak() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b".bak,~,.o,.h,.info,.swp,.obj");
+        assert!(unsafe { match_suffix(b"foo.bak") });
+    }
+
+    #[test]
+    fn match_suffix_real_default_no_match() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b".bak,~,.o,.h,.info,.swp,.obj");
+        assert!(!unsafe { match_suffix(b"foo.txt") });
+    }
+
+    #[test]
+    fn match_suffix_real_default_no_dot_at_all_does_not_match() {
+        // None of the real default's entries are empty, so a dotless
+        // name doesn't hit the "empty entry" fallback either.
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b".bak,~,.o,.h,.info,.swp,.obj");
+        assert!(!unsafe { match_suffix(b"foo") });
+    }
+
+    #[test]
+    fn match_suffix_empty_entry_matches_a_dotless_name() {
+        // A leading empty entry (",.bak") means "match any name with
+        // no '.' in its own tail at all".
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b",.bak");
+        assert!(unsafe { match_suffix(b"foo") });
+        assert!(!unsafe { match_suffix(b"foo.txt") }); // has a dot, no match
+        assert!(unsafe { match_suffix(b"foo.bak") }); // matches the real entry instead
+    }
+
+    #[test]
+    fn match_suffix_empty_suffixes_option_never_matches() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b"");
+        assert!(!unsafe { match_suffix(b"foo.bak") });
+        assert!(!unsafe { match_suffix(b"foo") });
+    }
+
+    #[test]
+    fn match_suffix_backslash_escaped_dot_is_a_literal_character_not_a_new_entry() {
+        // "a\.b" is ONE entry ("a.b"), not "a" then a leading-dot "b".
+        let _guard = crate::globals::global_state_test_lock();
+        let _p_su = PSuGuard::set(b"a\\.b");
+        assert!(unsafe { match_suffix(b"fooa.b") });
+    }
+
+    #[test]
+    fn path_to_backslash_converts_forward_slashes() {
+        let mut p = b"a/b/c".to_vec();
+        path_to_backslash(&mut p);
+        assert_eq!(p, b"a\\b\\c");
+    }
+
+    #[test]
+    fn path_to_backslash_no_slashes_is_a_no_op() {
+        let mut p = b"abc".to_vec();
+        path_to_backslash(&mut p);
+        assert_eq!(p, b"abc");
     }
 
     #[test]
