@@ -2249,6 +2249,133 @@ pub fn tv_blob_alloc_ret(ret_tv: &mut TypvalT) -> *mut crate::eval::typval_defs:
     b
 }
 
+/// Return a slice of `blob` from index `n1` to `n2` in `rettv`. The
+/// length of the blob is `len`. Returns an empty blob if the indexes
+/// are out of range (`tv_blob_slice`).
+///
+/// # Safety
+/// `blob` must be a valid pointer to the live [`crate::eval::typval_defs::BlobT`]
+/// currently held by `rettv.value` (the original reads `rettv->vval.v_blob`
+/// directly inside the loop, so this crate's translation takes the
+/// same pointer explicitly rather than re-reading it from `rettv` each
+/// time - the caller must ensure both refer to the same blob).
+fn tv_blob_slice(
+    blob: *const crate::eval::typval_defs::BlobT,
+    len: i32,
+    n1: crate::eval::typval_defs::VarnumberT,
+    n2: crate::eval::typval_defs::VarnumberT,
+    exclusive: bool,
+    rettv: &mut TypvalT,
+) -> i32 {
+    let len = crate::eval::typval_defs::VarnumberT::from(len);
+    let mut n1 = n1;
+    let mut n2 = n2;
+    if n1 < 0 {
+        n1 += len;
+        if n1 < 0 {
+            n1 = 0;
+        }
+    }
+    if n2 < 0 {
+        n2 += len;
+    } else if n2 >= len {
+        n2 = len - crate::eval::typval_defs::VarnumberT::from(!exclusive);
+    }
+    if exclusive {
+        n2 -= 1;
+    }
+    if n1 >= len || n2 < 0 || n1 > n2 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(rettv) };
+        rettv.value = TypvalValue::Blob(std::ptr::null_mut());
+    } else {
+        let new_blob = tv_blob_alloc();
+        let new_len = (n2 - n1 + 1) as i32;
+        // SAFETY: `new_blob` was just allocated above, a fresh pointer
+        // not shared with anything yet.
+        unsafe {
+            (*new_blob).bv_ga.ga_data = vec![0u8; new_len as usize];
+            (*new_blob).bv_ga.ga_len = new_len;
+            (*new_blob).bv_ga.ga_maxlen = new_len;
+        }
+        for i in n1..=n2 {
+            // SAFETY: forwarded from this function's own safety doc -
+            // `blob` and `rettv.value`'s own blob pointer are the same
+            // live object.
+            let byte = unsafe { tv_blob_get(blob, i as i32) };
+            // SAFETY: `new_blob` was just sized above to hold exactly
+            // `new_len` bytes, and `i - n1` ranges over `0..new_len`.
+            unsafe { tv_blob_set(new_blob, (i - n1) as i32, byte) };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(rettv) };
+        // SAFETY: `new_blob` was just allocated above, a fresh pointer
+        // not shared with anything yet.
+        unsafe { tv_blob_set_ret(rettv, new_blob) };
+    }
+
+    OK
+}
+
+/// Return the byte value in `blob` at index `idx` in `rettv`. If the
+/// index is too big or negative that is an error. The length of the
+/// blob is `len` (`tv_blob_index`).
+///
+/// The original's own `semsg(_(e_blobidx), idx)` is omitted, matching
+/// this crate's established "skip the display, keep the identical
+/// FAIL" policy.
+///
+/// # Safety
+/// Same as `tv_blob_slice`.
+fn tv_blob_index(
+    blob: *const crate::eval::typval_defs::BlobT,
+    len: i32,
+    idx: crate::eval::typval_defs::VarnumberT,
+    rettv: &mut TypvalT,
+) -> i32 {
+    let len = crate::eval::typval_defs::VarnumberT::from(len);
+    let mut idx = idx;
+    if idx < 0 {
+        idx += len;
+    }
+    if idx < len && idx >= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let v = i64::from(unsafe { tv_blob_get(blob, idx as i32) });
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(rettv) };
+        rettv.value = TypvalValue::Number(v);
+    } else {
+        return FAIL;
+    }
+
+    OK
+}
+
+/// Apply `[idx]`/`[n1:n2]` indexing or slicing to a `Blob`, dispatching
+/// to `tv_blob_slice`/`tv_blob_index` (`tv_blob_slice_or_index`).
+///
+/// # Safety
+/// `blob` must be a valid pointer to the same live blob currently held
+/// by `rettv.value` (matching the original's own
+/// `tv_blob_len(rettv->vval.v_blob)` self-read).
+pub unsafe fn tv_blob_slice_or_index(
+    blob: *const crate::eval::typval_defs::BlobT,
+    is_range: bool,
+    n1: crate::eval::typval_defs::VarnumberT,
+    n2: crate::eval::typval_defs::VarnumberT,
+    exclusive: bool,
+    rettv: &mut TypvalT,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { tv_blob_len(blob) };
+
+    if is_range {
+        tv_blob_slice(blob, len, n1, n2, exclusive, rettv)
+    } else {
+        tv_blob_index(blob, len, n1, rettv)
+    }
+}
+
 /// Copy a blob typval to a different typval (`tv_blob_copy`).
 ///
 /// # Safety
@@ -4173,6 +4300,107 @@ pub unsafe fn tv_list_concat(
 
     tv.value = TypvalValue::List(l);
     true
+}
+
+/// Return a slice of `ol` (from character/item index `n1` to `n2`,
+/// inclusive) as a NEW list (`tv_list_slice`).
+///
+/// # Safety
+/// `ol` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::ListT`] with at least `n2 + 1` items
+/// (the caller - [`tv_list_slice_or_index`] - is responsible for the
+/// same bounds-checking the original performs before calling this).
+unsafe fn tv_list_slice(
+    ol: *mut crate::eval::typval_defs::ListT,
+    n1: crate::eval::typval_defs::VarnumberT,
+    n2: crate::eval::typval_defs::VarnumberT,
+) -> *mut crate::eval::typval_defs::ListT {
+    let l = tv_list_alloc(isize::try_from(n2 - n1 + 1).unwrap_or(0));
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut item = unsafe { tv_list_find(ol, n1 as i32) };
+    let mut n1 = n1;
+    while n1 <= n2 {
+        // SAFETY: `item` is non-null for every iteration this loop
+        // actually reaches, per this function's own safety doc.
+        unsafe {
+            tv_list_append_tv(l, &(*item).li_tv);
+            item = (*item).li_next;
+        }
+        n1 += 1;
+    }
+    l
+}
+
+/// Apply `[idx]`/`[n1:n2]` indexing or slicing to a `List`
+/// (`tv_list_slice_or_index`).
+///
+/// The original's own `semsg(_(e_list_index_out_of_range_nr), n1_arg)`
+/// (a genuine, non-range out-of-bounds index) is omitted, matching
+/// this crate's established "skip the display, keep the identical
+/// FAIL" policy.
+///
+/// # Safety
+/// `list` must be a valid pointer to the same live list currently held
+/// by `rettv.value` (matching the original's own
+/// `tv_list_len(rettv->vval.v_list)` self-read).
+pub unsafe fn tv_list_slice_or_index(
+    list: *mut crate::eval::typval_defs::ListT,
+    range: bool,
+    n1_arg: crate::eval::typval_defs::VarnumberT,
+    n2_arg: crate::eval::typval_defs::VarnumberT,
+    exclusive: bool,
+    rettv: &mut TypvalT,
+    _verbose: bool,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = crate::eval::typval_defs::VarnumberT::from(unsafe { tv_list_len(list) });
+    let mut n1 = n1_arg;
+    let mut n2 = n2_arg;
+
+    if n1 < 0 {
+        n1 += len;
+    }
+    if n1 < 0 || n1 >= len {
+        // For a range we allow invalid values and return an empty
+        // list. A list index out of range is an error.
+        if !range {
+            return FAIL;
+        }
+        n1 = len;
+    }
+    if range {
+        if n2 < 0 {
+            n2 += len;
+        } else if n2 >= len {
+            n2 = len - crate::eval::typval_defs::VarnumberT::from(!exclusive);
+        }
+        if exclusive {
+            n2 -= 1;
+        }
+        if n2 < 0 || n2 + 1 < n1 {
+            n2 = -1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { tv_list_slice(list, n1, n2) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(rettv) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_list_set_ret(rettv, l) };
+    } else {
+        // Copy the item to a temporary first, to avoid that clearing
+        // the list (which may drop the original list's own reference)
+        // makes it invalid before the copy completes.
+        let mut var1 = TypvalT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            let found = tv_list_find(list, n1 as i32);
+            tv_copy(&(*found).li_tv, &mut var1);
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(rettv) };
+        *rettv = var1;
+    }
+    OK
 }
 
 // Comparison:
@@ -6311,6 +6539,139 @@ mod tests {
         }
     }
 
+    fn blob_of(bytes: &[u8]) -> *mut crate::eval::typval_defs::BlobT {
+        let b = tv_blob_alloc();
+        unsafe {
+            (*b).bv_ga.ga_data = bytes.to_vec();
+            (*b).bv_ga.ga_len = bytes.len() as i32;
+        }
+        b
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_plain_index_reads_a_byte() {
+        let b = blob_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // The success path calls tv_clear_simple(rettv) internally
+        // (releasing b's own reference, exactly as the original's
+        // real tv_clear(rettv) does before overwriting it with the
+        // Number result) - b must NOT be freed again afterward.
+        let ret = unsafe { tv_blob_slice_or_index(b, false, 2, 0, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(30));
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_plain_index_negative_counts_from_the_end() {
+        let b = blob_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // See the previous test's own comment: b is released internally
+        // on this success path too.
+        let ret = unsafe { tv_blob_slice_or_index(b, false, -1, 0, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(50));
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_plain_index_out_of_range_fails() {
+        let b = blob_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        let ret = unsafe { tv_blob_slice_or_index(b, false, 10, 0, false, &mut rettv) };
+        assert_eq!(ret, FAIL);
+        // rettv is left untouched (b's own reference NOT released) on
+        // the plain-index FAIL path - this is the ONE case among
+        // these tests where b genuinely still needs freeing.
+        assert_eq!(rettv.value, TypvalValue::Blob(b));
+        unsafe { tv_blob_free(b) };
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_inclusive_range_produces_a_sub_blob() {
+        let b = blob_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // blob[1:3] (inclusive) -> bytes at indices 1, 2, 3.
+        let ret = unsafe { tv_blob_slice_or_index(b, true, 1, 3, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(result) = rettv.value else { panic!("expected a Blob") };
+        assert_ne!(result, b);
+        // b's own reference was released internally (see the plain-
+        // index tests' own comment above) - only the NEW result blob
+        // needs freeing here.
+        unsafe {
+            assert_eq!((*result).bv_ga.ga_data, vec![20, 30, 40]);
+            tv_blob_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_exclusive_range_drops_the_last_index() {
+        let b = blob_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // slice()-style exclusive [1:3) -> only indices 1, 2.
+        let ret = unsafe { tv_blob_slice_or_index(b, true, 1, 3, true, &mut rettv) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(result) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!((*result).bv_ga.ga_data, vec![20, 30]);
+            tv_blob_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_range_with_negative_start_clamps_to_zero() {
+        let b = blob_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // blob[-99:1] clamps the start to 0.
+        let ret = unsafe { tv_blob_slice_or_index(b, true, -99, 1, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(result) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!((*result).bv_ga.ga_data, vec![10, 20]);
+            tv_blob_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_range_negative_end_counts_from_the_end() {
+        let b = blob_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // blob[1:-1] -> from index 1 to the last byte, inclusive.
+        let ret = unsafe { tv_blob_slice_or_index(b, true, 1, -1, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(result) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!((*result).bv_ga.ga_data, vec![20, 30, 40, 50]);
+            tv_blob_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_range_end_beyond_len_clamps_to_the_last_byte() {
+        let b = blob_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        let ret = unsafe { tv_blob_slice_or_index(b, true, 0, 100, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        let TypvalValue::Blob(result) = rettv.value else { panic!("expected a Blob") };
+        unsafe {
+            assert_eq!((*result).bv_ga.ga_data, vec![10, 20, 30]);
+            tv_blob_free(result);
+        }
+    }
+
+    #[test]
+    fn tv_blob_slice_or_index_range_out_of_bounds_gives_a_null_blob() {
+        let b = blob_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::Blob(b), ..Default::default() };
+        // Start index at/past the length, in RANGE mode, is not an
+        // error (unlike plain indexing) - result is a null blob. This
+        // branch ALSO releases b's own reference internally (the same
+        // tv_clear_simple(rettv) call runs on every success path,
+        // including this "empty result" one) - nothing left to free.
+        let ret = unsafe { tv_blob_slice_or_index(b, true, 10, 20, false, &mut rettv) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Blob(std::ptr::null_mut()));
+    }
+
     #[test]
     fn tv_list_extend_appends_l2_items_to_l1() {
         let _lock = crate::globals::global_state_test_lock();
@@ -6422,6 +6783,129 @@ mod tests {
             tv_list_free(l2);
             tv_list_free(result);
         }
+    }
+
+    fn int_list_of(nums: &[crate::eval::typval_defs::VarnumberT]) -> *mut crate::eval::typval_defs::ListT {
+        let l = tv_list_alloc(nums.len() as isize);
+        unsafe {
+            for n in nums {
+                tv_list_append_tv(l, &number_tv(*n));
+            }
+        }
+        l
+    }
+
+    fn collect_numbers(l: *mut crate::eval::typval_defs::ListT) -> Vec<crate::eval::typval_defs::VarnumberT> {
+        let mut out = Vec::new();
+        let mut li = unsafe { tv_list_first(l) };
+        while !li.is_null() {
+            match unsafe { &(*li).li_tv.value } {
+                TypvalValue::Number(n) => out.push(*n),
+                other => panic!("expected Number, found {other:?}"),
+            }
+            li = unsafe { (*li).li_next };
+        }
+        out
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_plain_index_reads_an_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // The success path calls tv_clear_simple(rettv) internally
+        // (releasing l's own reference, matching the original's real
+        // tv_clear(rettv) before overwriting it with the Number
+        // result) - l must NOT be freed again afterward.
+        let ret = unsafe { tv_list_slice_or_index(l, false, 2, 0, false, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(30));
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_plain_index_negative_counts_from_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // See the previous test's own comment: l is released
+        // internally on this success path too.
+        let ret = unsafe { tv_list_slice_or_index(l, false, -1, 0, false, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        assert_eq!(rettv.value, TypvalValue::Number(50));
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_plain_index_out_of_range_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        let ret = unsafe { tv_list_slice_or_index(l, false, 10, 0, false, &mut rettv, false) };
+        assert_eq!(ret, FAIL);
+        // rettv is left untouched (l's own reference NOT released) on
+        // the plain-index FAIL path - this is the ONE case among
+        // these tests where l genuinely still needs freeing.
+        assert_eq!(rettv.value, TypvalValue::List(l));
+        unsafe { tv_list_free(l) };
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_inclusive_range_produces_a_new_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // list[1:3] (inclusive) -> items at indices 1, 2, 3.
+        let ret = unsafe { tv_list_slice_or_index(l, true, 1, 3, false, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        let TypvalValue::List(result) = rettv.value else { panic!("expected a List") };
+        assert_ne!(result, l);
+        assert_eq!(collect_numbers(result), vec![20, 30, 40]);
+        // l's own reference was released internally (see the plain-
+        // index tests' own comment above) - only the NEW result list
+        // needs freeing here.
+        unsafe { tv_list_free(result) };
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_exclusive_range_drops_the_last_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // slice()-style exclusive [1:3) -> only indices 1, 2.
+        let ret = unsafe { tv_list_slice_or_index(l, true, 1, 3, true, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        let TypvalValue::List(result) = rettv.value else { panic!("expected a List") };
+        assert_eq!(collect_numbers(result), vec![20, 30]);
+        unsafe { tv_list_free(result) };
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_range_negative_end_counts_from_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30, 40, 50]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // list[1:-1] -> from index 1 to the last item, inclusive.
+        let ret = unsafe { tv_list_slice_or_index(l, true, 1, -1, false, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        let TypvalValue::List(result) = rettv.value else { panic!("expected a List") };
+        assert_eq!(collect_numbers(result), vec![20, 30, 40, 50]);
+        unsafe { tv_list_free(result) };
+    }
+
+    #[test]
+    fn tv_list_slice_or_index_range_start_out_of_range_gives_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = int_list_of(&[10, 20, 30]);
+        let mut rettv = TypvalT { value: TypvalValue::List(l), ..Default::default() };
+        // Start index at/past the length, in RANGE mode, is not an
+        // error (unlike plain indexing) - result is an empty list.
+        // This branch ALSO releases l's own reference internally (the
+        // same tv_clear_simple(rettv) call runs on every success
+        // path) - only the new (empty) result list needs freeing.
+        let ret = unsafe { tv_list_slice_or_index(l, true, 10, 20, false, &mut rettv, false) };
+        assert_eq!(ret, OK);
+        let TypvalValue::List(result) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { tv_list_len(result) }, 0);
+        unsafe { tv_list_free(result) };
     }
 
     #[test]
