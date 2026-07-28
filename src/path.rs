@@ -28,6 +28,9 @@
 //! and `path_with_extension` (via `mbyte.c`'s `mb_strcmp_ic`, already
 //! translated). `gettail_dir` also returns a byte offset (not a raw
 //! pointer) into the last directory component's own leading separator.
+//! `dir_of_file_exists` slices the already-bounded `&[u8]` directly
+//! instead of the original's own temporary-NUL-terminate-then-restore
+//! trick on a mutable copy - no in-place mutation needed at all.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -1197,6 +1200,30 @@ pub fn gettail_dir(fname: &[u8]) -> usize {
     dir_end
 }
 
+/// Return whether the directory containing `fname` exists
+/// (`dir_of_file_exists`) - `true` when `fname` has no directory
+/// component at all (matching the original's own `p == fname` fast
+/// path), `false` when `fname`'s directory portion isn't valid UTF-8
+/// (this crate's established "invalid UTF-8 is treated the same as a
+/// nonexistent path" convention - see this module's own doc comment).
+///
+/// The original temporarily NUL-terminates a mutable copy of `fname`
+/// at the tail separator to check just the directory portion, then
+/// restores it; this translation instead slices the ALREADY-bounded
+/// `&[u8]` directly - no in-place mutation needed at all, since a Rust
+/// slice already carries its own length.
+#[must_use]
+pub fn dir_of_file_exists(fname: &[u8]) -> bool {
+    let tail = path_tail_with_sep(fname);
+    if tail == 0 {
+        return true;
+    }
+    let Ok(dir_str) = std::str::from_utf8(&fname[..tail]) else {
+        return false;
+    };
+    crate::os::fs::os_isdir(std::path::Path::new(dir_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,5 +1964,33 @@ mod tests {
         // commit dir_end, matching a hand-trace of the original's
         // exact three-variable state machine.
         assert_eq!(gettail_dir(b"a/b/"), 1);
+    }
+
+    #[test]
+    fn dir_of_file_exists_true_with_no_directory_component() {
+        // Matches the original's own `p == fname` fast path exactly -
+        // never even reaches os_isdir.
+        assert!(dir_of_file_exists(b"justafile.txt"));
+    }
+
+    #[test]
+    fn dir_of_file_exists_true_for_a_real_existing_directory() {
+        let dir = std::env::temp_dir();
+        let mut path = dir.to_str().unwrap().as_bytes().to_vec();
+        if !crate::path::vim_ispathsep(i32::from(*path.last().unwrap())) {
+            path.push(b'/');
+        }
+        path.extend_from_slice(b"nero_test_dir_of_file_exists_probe.txt");
+        assert!(dir_of_file_exists(&path));
+    }
+
+    #[test]
+    fn dir_of_file_exists_false_for_a_nonexistent_directory() {
+        assert!(!dir_of_file_exists(b"/definitely/does/not/exist/nero_probe/file.txt"));
+    }
+
+    #[test]
+    fn dir_of_file_exists_false_for_invalid_utf8_directory_portion() {
+        assert!(!dir_of_file_exists(b"\xffbaddir/file.txt"));
     }
 }
