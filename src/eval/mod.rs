@@ -11,6 +11,7 @@
 pub mod eval;
 pub mod executor;
 pub mod buffer;
+pub mod encode;
 pub mod fs;
 pub mod funcs;
 pub mod typval;

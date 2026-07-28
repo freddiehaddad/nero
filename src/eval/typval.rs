@@ -1075,7 +1075,7 @@ pub fn tv_check_for_list_or_blob_arg(args: &[TypvalT], idx: usize) -> i32 {
 /// literal `1.999995` prints as `"1.99999"`, not `"2"`, because its
 /// nearest `f64` is very slightly less than the exact decimal
 /// `1.999995`), and exponent-carry-on-rounding (`9999999.0` above).
-fn fmt_g(value: f64) -> Vec<u8> {
+pub(crate) fn fmt_g(value: f64) -> Vec<u8> {
     if value == 0.0 {
         // Preserve the sign of zero, matching glibc (`-0.0` -> `"-0"`).
         return if value.is_sign_negative() { b"-0".to_vec() } else { b"0".to_vec() };

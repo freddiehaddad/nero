@@ -427,6 +427,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"islocked"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_islocked });
         m.insert(&b"blob2list"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_blob2list });
         m.insert(&b"list2blob"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_list2blob });
+        m.insert(&b"string"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_string });
         m.insert(&b"sha256"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_sha256 });
         m.insert(&b"exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_exists });
         m.insert(&b"getwinpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getwinpos });
@@ -2920,6 +2921,18 @@ unsafe fn f_list2blob(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         item = unsafe { (*item).li_next };
     }
+}
+
+/// `string({expr})` - convert `{expr}` to a String, in a format that
+/// can be parsed back with `eval()` (`f_string`, `strings.c`), via
+/// [`crate::eval::encode::encode_tv2string`].
+///
+/// # Safety
+/// Forwarded from [`crate::eval::encode::encode_tv2string`]'s own
+/// safety doc.
+unsafe fn f_string(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::String(Some(unsafe { crate::eval::encode::encode_tv2string(&argvars[0]) }));
 }
 
 /// `sha256({expr})` - the SHA256 checksum of `{expr}` (a String or a
@@ -10051,6 +10064,33 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_blob_len(b), 0);
             crate::eval::typval::tv_blob_free(b);
         }
+    }
+
+    // --- f_string ---
+
+    #[test]
+    fn string_quotes_a_plain_string_value() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_string(&[string(b"hi")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"'hi'".to_vec())));
+    }
+
+    #[test]
+    fn string_of_a_number_and_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_string(&[num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"42".to_vec())));
+
+        let l = crate::eval::typval::tv_list_alloc(2);
+        unsafe {
+            crate::eval::typval::tv_list_append_number(l, 1);
+            crate::eval::typval::tv_list_append_number(l, 2);
+        }
+        let mut rettv2 = TypvalT::default();
+        unsafe { f_string(&[TypvalT { value: TypvalValue::List(l), ..Default::default() }], &mut rettv2) };
+        assert_eq!(rettv2.value, TypvalValue::String(Some(b"[1, 2]".to_vec())));
+        unsafe { crate::eval::typval::tv_list_unref(l) };
     }
 
     // --- f_sha256 ---
