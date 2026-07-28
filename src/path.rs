@@ -26,7 +26,8 @@
 //! ASCII byte), `vim_isAbsName` (as [`vim_is_abs_name`], trivially
 //! composed from already-existing `path_with_url`/`path_is_absolute`),
 //! and `path_with_extension` (via `mbyte.c`'s `mb_strcmp_ic`, already
-//! translated).
+//! translated). `gettail_dir` also returns a byte offset (not a raw
+//! pointer) into the last directory component's own leading separator.
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -1164,6 +1165,38 @@ pub unsafe fn path_with_extension(path: &[u8], extension: &[u8]) -> bool {
     crate::mbyte::mb_strcmp_ic(ic, &path[dot + 1..], extension) == 0
 }
 
+/// Return the byte offset of the path separator right before `fname`'s
+/// own final directory component (`gettail_dir`) - e.g. for
+/// `"a/b/c.txt"`, the offset of the SECOND `/` (`"/c.txt"` is the
+/// returned suffix); for a bare filename with no directory component
+/// at all (e.g. `"abc"`), returns `0` (the whole string).
+///
+/// Scans byte-by-byte rather than replicating the original's own
+/// `MB_PTR_ADV` multi-byte-character advance - only path-separator
+/// bytes are ever tested, matching this module's own established
+/// "byte scan agrees with a UTF-8-character-aware scan when every
+/// tested byte is ASCII" precedent.
+#[must_use]
+pub fn gettail_dir(fname: &[u8]) -> usize {
+    let mut dir_end = 0;
+    let mut next_dir_end = 0;
+    let mut look_for_sep = true;
+    for (i, &b) in fname.iter().enumerate() {
+        if vim_ispathsep(i32::from(b)) {
+            if look_for_sep {
+                next_dir_end = i;
+                look_for_sep = false;
+            }
+        } else {
+            if !look_for_sep {
+                dir_end = next_dir_end;
+            }
+            look_for_sep = true;
+        }
+    }
+    dir_end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1878,5 +1911,31 @@ mod tests {
         assert!(unsafe { path_with_extension(b"file.TXT", b"txt") });
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fic = prev;
+    }
+
+    #[test]
+    fn gettail_dir_two_components_points_at_the_last_separator() {
+        assert_eq!(gettail_dir(b"a/b"), 1);
+        assert_eq!(&b"a/b"[gettail_dir(b"a/b")..], b"/b");
+    }
+
+    #[test]
+    fn gettail_dir_three_components_points_at_the_second_separator() {
+        assert_eq!(gettail_dir(b"a/b/c.txt"), 3);
+        assert_eq!(&b"a/b/c.txt"[gettail_dir(b"a/b/c.txt")..], b"/c.txt");
+    }
+
+    #[test]
+    fn gettail_dir_no_separator_at_all_returns_zero() {
+        assert_eq!(gettail_dir(b"abc"), 0);
+    }
+
+    #[test]
+    fn gettail_dir_trailing_separator_with_nothing_after_is_not_counted() {
+        // A trailing separator with no further component after it
+        // never satisfies the "!look_for_sep" transition needed to
+        // commit dir_end, matching a hand-trace of the original's
+        // exact three-variable state machine.
+        assert_eq!(gettail_dir(b"a/b/"), 1);
     }
 }
