@@ -195,7 +195,10 @@
 //! `static`)/`tv_list_idx_of_item`/`tv_list_reverse` (in-place
 //! doubly-linked-list reversal).
 
-use crate::eval::typval_defs::{dict_item_flags, DictT, DictitemT, PartialT, ScopeType, TypvalT, TypvalValue, VarLockStatus};
+use crate::eval::typval_defs::{
+    dict_item_flags, DictT, DictitemT, ListLenSpecials, PartialT, ScopeType, TypvalT, TypvalValue,
+    VarLockStatus, VarType, VarnumberT,
+};
 use crate::globals::GlobalCell;
 use crate::vim_defs::{FAIL, OK};
 
@@ -605,6 +608,28 @@ pub unsafe fn tv_list_locked(l: *const crate::eval::typval_defs::ListT) -> VarLo
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { (*l).lv_lock }
+}
+
+/// Set a list's lock status (`tv_list_set_lock`, `eval/typval.h`'s own
+/// `static inline`).
+///
+/// # Panics
+/// If `l` is null and `lock` isn't [`VarLockStatus::Fixed`] - matching
+/// the original's own `assert(lock == VAR_FIXED)` for this case (a
+/// null list is always, unconditionally "fixed"/immutable, so setting
+/// any OTHER lock status on one is a genuine caller-contract
+/// violation).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live
+/// `crate::eval::typval_defs::ListT`.
+pub unsafe fn tv_list_set_lock(l: *mut crate::eval::typval_defs::ListT, lock: VarLockStatus) {
+    if l.is_null() {
+        assert_eq!(lock, VarLockStatus::Fixed);
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*l).lv_lock = lock };
 }
 
 /// Return true if typval is locked (`tv_islocked`).
@@ -2695,6 +2720,262 @@ pub unsafe fn tv_list_reverse(l: *mut crate::eval::typval_defs::ListT) {
     }
 
     list.lv_idx = list.lv_len - list.lv_idx - 1;
+}
+
+/// Which of `map()`/`mapnew()`/`filter()`/`foreach()` a `filter_map`-
+/// family function is being used for (`filtermap_T`, `eval/list.c`'s
+/// own header - no dedicated `_defs.rs` module exists for `list.c`, so
+/// this small enum is embedded directly here, same treatment as
+/// `charset.h`'s `vim_isbreak` in `charset.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterMapT {
+    /// `map()` - replace each item in place.
+    Map,
+    /// `mapnew()` - build and return a new container, leaving the
+    /// original untouched.
+    MapNew,
+    /// `filter()` - remove items in place for which `{expr2}` is
+    /// falsy.
+    Filter,
+    /// `foreach()` - call `{expr2}` for its side effect only, the
+    /// original container/its own first argument is always returned
+    /// unchanged.
+    Foreach,
+}
+
+/// Handle one item for `map()`/`filter()`/`foreach()`. Sets `v:val` to
+/// `tv`. Caller must set `v:key` (`filter_map_one`).
+///
+/// Only the shared, non-`Foreach`-with-a-`String`-expr path is
+/// modeled: `foreach()` given a raw command STRING (as opposed to a
+/// `Funcref`/expression to call/evaluate) needs `do_cmdline_cmd` (the
+/// whole Ex-command execution engine) - `unimplemented!()`s if
+/// actually reached (i.e. only when `filtermap == Foreach` AND
+/// `expr.value` is `TypvalValue::String`; every other combination,
+/// including `foreach()` given a `Funcref`, falls through to the
+/// shared `eval_expr_typval` call below, which has its own separate,
+/// already-documented gap for non-`String` expressions).
+///
+/// Returns `(status, remove)` - `remove` is only meaningful for
+/// [`FilterMapT::Filter`] (whether `{expr2}` evaluated to zero/falsy).
+///
+/// # Safety
+/// `tv`/`expr` must be valid; forwards `tv_copy`/`eval_expr_typval`/
+/// `tv_get_number_chk`/`tv_clear_simple`'s own safety requirements.
+pub unsafe fn filter_map_one(
+    tv: &TypvalT,
+    expr: &TypvalT,
+    filtermap: FilterMapT,
+) -> (i32, TypvalT, bool) {
+    use crate::eval::eval::eval_expr_typval;
+    use crate::eval::vars::{get_vim_var_tv, VimVarIndex};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(tv, &mut *get_vim_var_tv(VimVarIndex::Val)) };
+
+    let mut newtv = TypvalT::default();
+    let mut remove = false;
+
+    if filtermap == FilterMapT::Foreach && matches!(expr.value, TypvalValue::String(_)) {
+        unimplemented!(
+            "filter_map_one: foreach() given a raw command string needs do_cmdline_cmd, not yet \
+             translated"
+        );
+    }
+
+    // The original does `argv[0] = *get_vim_var_tv(VV_KEY); argv[1] =
+    // *get_vim_var_tv(VV_VAL);` here (a plain struct COPY, purely to
+    // build the argument array a Partial/Funcref callback would
+    // receive) - this crate's own eval_expr_typval only has a real
+    // (String-expr) branch today, which never reads argv at all, so
+    // an empty slice is passed instead of duplicating v:key/v:val's
+    // OWN storage (which would otherwise create two independent
+    // "owners" of the same heap-allocated value with no refcount bump,
+    // a real double-free hazard were argv itself ever cleared).
+    // SAFETY: forwarded from this function's own safety doc.
+    let ret = unsafe { eval_expr_typval(expr, false, &mut [], &mut newtv) };
+    if ret == FAIL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&*get_vim_var_tv(VimVarIndex::Val)) };
+        return (FAIL, newtv, remove);
+    }
+
+    let mut result = OK;
+    if filtermap == FilterMapT::Filter {
+        let mut error = false;
+        // filter(): when expr is zero remove the item.
+        remove = tv_get_number_chk(&newtv, Some(&mut error)) == 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&newtv) };
+        newtv = TypvalT::default();
+        // On type error, nothing has been removed; return FAIL to stop
+        // the loop. The error message was given by tv_get_number_chk().
+        if error {
+            result = FAIL;
+        }
+    } else if filtermap == FilterMapT::Foreach {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_clear_simple(&newtv) };
+        newtv = TypvalT::default();
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_clear_simple(&*get_vim_var_tv(VimVarIndex::Val)) };
+    (result, newtv, remove)
+}
+
+/// Implementation of `map()`/`mapnew()`/`filter()`/`foreach()` for a
+/// `List`. Apply `expr` to every item in list `l` and return the
+/// result in `rettv` (`filter_map_list`).
+///
+/// # Safety
+/// `l`, if non-null, must be a valid pointer to a live `ListT`; `expr`
+/// must be valid (forwards `filter_map_one`'s own safety
+/// requirements).
+pub unsafe fn filter_map_list(
+    l: *mut crate::eval::typval_defs::ListT,
+    filtermap: FilterMapT,
+    expr: &TypvalT,
+    rettv: &mut TypvalT,
+) {
+    use crate::eval::vars::{set_vim_var_nr, set_vim_var_type, VimVarIndex};
+
+    if filtermap == FilterMapT::MapNew {
+        rettv.value = TypvalValue::List(std::ptr::null_mut());
+    }
+    if l.is_null()
+        || (filtermap == FilterMapT::Filter && value_check_lock(unsafe { tv_list_locked(l) }, None))
+    {
+        return;
+    }
+
+    let mut l_ret: *mut crate::eval::typval_defs::ListT = std::ptr::null_mut();
+    if filtermap == FilterMapT::MapNew {
+        l_ret = unsafe { tv_list_alloc_ret(rettv, ListLenSpecials::Unknown as isize) };
+    }
+
+    // set_vim_var_nr() doesn't set the type.
+    unsafe { set_vim_var_type(VimVarIndex::Key, VarType::Number) };
+
+    let prev_lock = unsafe { tv_list_locked(l) };
+    if prev_lock == VarLockStatus::Unlocked {
+        unsafe { tv_list_set_lock(l, VarLockStatus::Locked) };
+    }
+
+    let mut idx: VarnumberT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut li = unsafe { tv_list_first(l) };
+    while !li.is_null() {
+        if filtermap == FilterMapT::Map
+            && value_check_lock(unsafe { (*li).li_tv.v_lock }, None)
+        {
+            break;
+        }
+        unsafe { set_vim_var_nr(VimVarIndex::Key, idx) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, mut newtv, rem) = unsafe { filter_map_one(&(*li).li_tv, expr, filtermap) };
+        if ret == FAIL {
+            unsafe { tv_clear_simple(&newtv) };
+            break;
+        }
+
+        if filtermap == FilterMapT::Map {
+            // map(): replace the list item value.
+            unsafe { tv_clear_simple(&(*li).li_tv) };
+            newtv.v_lock = VarLockStatus::Unlocked;
+            unsafe { (*li).li_tv = newtv };
+        } else if filtermap == FilterMapT::MapNew {
+            // mapnew(): append the list item value.
+            unsafe { tv_list_append_owned_tv(l_ret, newtv) };
+        }
+
+        if filtermap == FilterMapT::Filter && rem {
+            li = unsafe { tv_list_item_remove(l, li) };
+        } else {
+            li = unsafe { (*li).li_next };
+        }
+        idx += 1;
+    }
+
+    unsafe { tv_list_set_lock(l, prev_lock) };
+}
+
+/// Implementation of `map()`, `mapnew()`, `filter()` and `foreach()`
+/// (`filter_map`).
+///
+/// Only the [`TypvalValue::List`] container is modeled -
+/// [`TypvalValue::Dict`]/[`TypvalValue::Blob`]/[`TypvalValue::String`]
+/// each need their own `filter_map_dict`/`filter_map_blob`/
+/// `filter_map_string` iteration, not yet translated -
+/// `unimplemented!()`s if any of those is ever passed as the first
+/// argument.
+///
+/// # Safety
+/// Forwards `filter_map_list`'s own safety requirements for `argvars[0]`.
+pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: FilterMapT) {
+    use crate::eval::vars::{prepare_vimvar, VimVarIndex};
+
+    // map(), filter(), foreach() return the first argument, also on
+    // failure.
+    if filtermap != FilterMapT::MapNew && !matches!(argvars[0].value, TypvalValue::String(_)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tv_copy(&argvars[0], rettv) };
+    }
+
+    match &argvars[0].value {
+        TypvalValue::Blob(_) => unimplemented!(
+            "filter_map: Blob argument needs filter_map_blob, not yet translated"
+        ),
+        TypvalValue::List(_) => {}
+        TypvalValue::Dict(_) => unimplemented!(
+            "filter_map: Dict argument needs filter_map_dict, not yet translated"
+        ),
+        TypvalValue::String(_) => unimplemented!(
+            "filter_map: String argument needs filter_map_string, not yet translated"
+        ),
+        _ => {
+            // semsg(_(e_argument_of_str_must_be_list_string_dictionary_or_blob),
+            // func_name) omitted - message display, not tractable; the
+            // identical early-return (no state change beyond the
+            // rettv=argvars[0] copy above) is kept.
+            return;
+        }
+    }
+
+    let expr = &argvars[1];
+    // On type errors, the preceding call has already displayed an
+    // error message. Avoid a misleading error message for an empty
+    // string that was not passed as argument.
+    if matches!(expr.value, TypvalValue::Unknown) {
+        return;
+    }
+
+    let mut save_val = TypvalT::default();
+    let mut save_key = TypvalT::default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        prepare_vimvar(VimVarIndex::Val, &mut save_val);
+        prepare_vimvar(VimVarIndex::Key, &mut save_key);
+    }
+
+    // The original also resets did_emsg here to detect whether an
+    // error occurred during evaluation of the expression - omitted
+    // (message-display bookkeeping, not tractable, and filter_map_one
+    // already reports evaluation failure via its own FAIL return).
+
+    if let TypvalValue::List(l) = argvars[0].value {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { filter_map_list(l, filtermap, expr, rettv) };
+    } else {
+        unreachable!("filter_map: argvars[0] type was already validated above");
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::vars::restore_vimvar(VimVarIndex::Key, save_key);
+        crate::eval::vars::restore_vimvar(VimVarIndex::Val, save_val);
+    }
 }
 
 /// Advance watchers to the next item. Used just before removing an
@@ -7430,5 +7711,340 @@ mod tests {
             assert_eq!((*(*item).li_next).li_tv.value, TypvalValue::Number(2));
             tv_list_free(l);
         }
+    }
+}
+
+#[cfg(test)]
+mod filter_map_tests {
+    use super::*;
+    use crate::hashtab::hashitem_empty;
+
+    fn string_expr(s: &[u8]) -> TypvalT {
+        TypvalT { value: TypvalValue::String(Some(s.to_vec())), ..TypvalT::default() }
+    }
+
+    fn list_of(nums: &[VarnumberT]) -> *mut crate::eval::typval_defs::ListT {
+        let l = tv_list_alloc(nums.len() as isize);
+        for n in nums {
+            unsafe { tv_list_append_number(&mut *l, *n) };
+        }
+        l
+    }
+
+    fn collect(l: *mut crate::eval::typval_defs::ListT) -> Vec<VarnumberT> {
+        let mut out = Vec::new();
+        let mut li = unsafe { tv_list_first(l) };
+        while !li.is_null() {
+            match unsafe { &(*li).li_tv.value } {
+                TypvalValue::Number(n) => out.push(*n),
+                other => panic!("expected Number, found {other:?}"),
+            }
+            li = unsafe { (*li).li_next };
+        }
+        out
+    }
+
+    #[test]
+    fn filter_removes_items_that_are_falsy() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[1, 2, 3, 4, 5]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val % 2 == 0"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+
+        assert_eq!(collect(l), vec![2, 4]);
+        // filter() returns the (mutated) first argument itself.
+        assert!(matches!(rettv.value, TypvalValue::List(p) if p == l));
+
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn map_replaces_each_item_in_place() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[1, 2, 3]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val * 10"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        assert_eq!(collect(l), vec![10, 20, 30]);
+        assert!(matches!(rettv.value, TypvalValue::List(p) if p == l));
+
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn mapnew_builds_a_new_list_leaving_the_original_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[1, 2, 3]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val + 100"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::MapNew) };
+
+        // Original untouched.
+        assert_eq!(collect(l), vec![1, 2, 3]);
+        let TypvalValue::List(l_new) = rettv.value else {
+            panic!("expected a new List");
+        };
+        assert_ne!(l_new, l);
+        assert_eq!(collect(l_new), vec![101, 102, 103]);
+
+        unsafe {
+            tv_list_unref(l);
+            tv_list_unref(l_new);
+        }
+    }
+
+    #[test]
+    fn v_key_reflects_the_zero_based_index_during_iteration() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[10, 20, 30]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val + v:key"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        assert_eq!(collect(l), vec![10, 21, 32]);
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn filter_on_an_empty_list_is_a_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val > 0"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert!(collect(l).is_empty());
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn filter_stays_faithful_when_removing_the_first_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[0, 1, 2]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(collect(l), vec![1, 2]);
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn map_on_a_locked_item_stops_the_whole_loop_early() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = list_of(&[1, 2, 3]);
+        // Lock the SECOND item specifically.
+        let second = unsafe { (*tv_list_first(l)).li_next };
+        unsafe { (*second).li_tv.v_lock = VarLockStatus::Locked };
+
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val * 100"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+
+        // First item mapped, second (locked) and third left untouched -
+        // matches the original's own "value_check_lock breaks the
+        // whole loop, not just skips this one item" structure.
+        assert_eq!(collect(l), vec![100, 2, 3]);
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    fn filter_map_one_returns_fail_when_expression_evaluation_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        // filter_map_one has no save/restore logic of its own (that is
+        // filter_map's job, per its own doc comment - "Caller must set
+        // v:key") - calling it directly, as this test deliberately
+        // does to isolate filter_map_one from the full filter_map
+        // dispatch, still needs prepare_vimvar/restore_vimvar wrapped
+        // around it, exactly like a real caller always does, or v:val's
+        // slot is left permanently holding whatever tv_copy just wrote
+        // into it (tv_clear_simple does nothing to reset a Number back
+        // to Unknown - it only releases owned List/Dict/Blob/String
+        // resources, of which a Number has none).
+        let mut save_val = TypvalT::default();
+        unsafe { crate::eval::vars::prepare_vimvar(crate::eval::vars::VimVarIndex::Val, &mut save_val) };
+
+        let tv = TypvalT { value: TypvalValue::Number(1), ..TypvalT::default() };
+        let expr = string_expr(b"1 +"); // deliberately invalid
+        let (ret, _newtv, _rem) = unsafe { filter_map_one(&tv, &expr, FilterMapT::Filter) };
+        assert_eq!(ret, FAIL);
+
+        unsafe { crate::eval::vars::restore_vimvar(crate::eval::vars::VimVarIndex::Val, save_val) };
+    }
+
+    #[test]
+    fn filter_map_one_releases_v_vals_own_temporary_reference_after_use() {
+        let _lock = crate::globals::global_state_test_lock();
+        // v:val must be registered (prepare_vimvar) for the expression
+        // evaluator to actually find it via a real Vimscript reference -
+        // matches what filter_map (the real caller) always does first.
+        // prepare_vimvar also leaves v:val's slot cleared (Unknown),
+        // matching the precondition filter_map_one itself relies on:
+        // its own tv_copy(tv, v:val_slot) call is a plain, C-style
+        // struct overwrite with NO cleanup of any PRE-EXISTING value in
+        // the destination (verified directly against the real tv_copy
+        // source: `memmove(&to->vval, &from->vval, ...)`, no free of
+        // `to`'s old value at all) - exactly mirrored by this crate's
+        // own `to.value = from.value.clone()` - so v:val's slot must
+        // already be empty before filter_map_one is called, which it
+        // always is in real use (either fresh from prepare_vimvar, or
+        // already tv_clear_simple'd by the PREVIOUS iteration's own
+        // filter_map_one call).
+        let mut save_val = TypvalT::default();
+        unsafe { crate::eval::vars::prepare_vimvar(crate::eval::vars::VimVarIndex::Val, &mut save_val) };
+
+        // The per-item value itself (`tv`) is a List - tv_copy's own
+        // List branch bumps its refcount when copying it into v:val.
+        let l = tv_list_alloc(0);
+        unsafe { tv_list_ref(l) }; // this test's own +1 ref, keeping `l` alive
+        assert_eq!(unsafe { (*l).lv_refcount }, 1);
+
+        let tv = TypvalT { value: TypvalValue::List(l), ..TypvalT::default() };
+        let expr = string_expr(b"1"); // doesn't need to inspect v:val itself
+        let (ret, newtv, _rem) = unsafe { filter_map_one(&tv, &expr, FilterMapT::Filter) };
+        assert_eq!(ret, OK);
+        unsafe { tv_clear_simple(&newtv) };
+
+        // v:val's own temporary reference (bumped by tv_copy, released
+        // by filter_map_one's own final tv_clear_simple) is gone -
+        // refcount back to just this test's own +1 ref.
+        assert_eq!(unsafe { (*l).lv_refcount }, 1);
+
+        unsafe { crate::eval::vars::restore_vimvar(crate::eval::vars::VimVarIndex::Val, save_val) };
+        unsafe { tv_list_unref(l) };
+    }
+
+    #[test]
+    #[should_panic(expected = "filter_map_dict")]
+    fn filter_panics_on_a_dict_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let argvars =
+            [TypvalT { value: TypvalValue::Dict(d), ..TypvalT::default() }, string_expr(b"1")];
+        let mut rettv = TypvalT::default();
+        // Catch the expected panic just long enough to force-free the
+        // freshly-allocated (empty, never linked to anything else) Dict
+        // shell before re-raising it - otherwise it leaks permanently
+        // into the shared GC_FIRST_DICT linked list, deterministically
+        // corrupting OTHER, unrelated GC-linked-list tests that assert
+        // "no dict is live before this test" (this crate's own
+        // established "a deliberately-panicking test that allocated a
+        // real container must still release it" discipline).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            filter(&argvars, &mut rettv, FilterMapT::Filter);
+        }));
+        unsafe { tv_dict_free_dict(d) };
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "filter_map_blob")]
+    fn filter_panics_on_a_blob_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let b = tv_blob_alloc();
+        let argvars =
+            [TypvalT { value: TypvalValue::Blob(b), ..TypvalT::default() }, string_expr(b"1")];
+        let mut rettv = TypvalT::default();
+        // Same force-free-then-re-panic discipline as
+        // filter_panics_on_a_dict_argument above - a fresh, empty Blob
+        // has no separate GC-linked-list of its own (only List/Dict do),
+        // but freeing it explicitly is still the right thing to do
+        // rather than leaking the allocation.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            filter(&argvars, &mut rettv, FilterMapT::Filter);
+        }));
+        unsafe { tv_blob_free(b) };
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "filter_map_string")]
+    fn filter_panics_on_a_string_argument() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b"hello"), string_expr(b"1")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+    }
+
+    #[test]
+    fn filter_on_a_non_container_type_is_a_graceful_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(5), ..TypvalT::default() },
+            string_expr(b"1"),
+        ];
+        let mut rettv = TypvalT::default();
+        // Must not panic - a Number is neither List/Dict/Blob/String.
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn filter_leaves_v_val_and_v_key_unregistered_afterward() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe {
+            hashitem_empty(
+                (*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"val"),
+            )
+        });
+        assert!(unsafe {
+            hashitem_empty(
+                (*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"key"),
+            )
+        });
+
+        let l = list_of(&[1, 2]);
+        let argvars = [
+            TypvalT { value: TypvalValue::List(l), ..TypvalT::default() },
+            string_expr(b"v:val"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+
+        assert!(unsafe {
+            hashitem_empty(
+                (*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"val"),
+            )
+        });
+        assert!(unsafe {
+            hashitem_empty(
+                (*crate::eval::vars::get_vimvar_dict()).dv_hashtab.hash_find(b"key"),
+            )
+        });
+
+        unsafe { tv_list_unref(l) };
+    }
+
+    /// Thin wrapper matching `f_filter`/`f_map`/`f_mapnew`'s own
+    /// eventual shape, so every test above reads naturally as "call
+    /// the builtin", without yet requiring `eval/funcs.rs`'s own
+    /// registration machinery.
+    unsafe fn filter(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: FilterMapT) {
+        unsafe { filter_map(argvars, rettv, filtermap) };
     }
 }

@@ -131,6 +131,25 @@
 //! copied once by default, or once per occurrence with
 //! `deepcopy({expr}, 1)`).
 //!
+//! Also translated: `filter()`/`map()`/`mapnew()` (from `eval/list.c`,
+//! via a new `crate::eval::typval::filter_map`/`filter_map_one`/
+//! `filter_map_list` family, plus `crate::eval::vars::prepare_vimvar`/
+//! `restore_vimvar` and `crate::eval::eval::eval_expr_string`/
+//! `eval_expr_typval` - see those modules' own doc comments for the
+//! full design). Only a `List` first argument, with a `String`
+//! `{expr2}` (the overwhelmingly common real-world shape, e.g.
+//! `filter(list, 'v:val > 0')`), is currently supported:
+//! `Dict`/`Blob`/`String` containers each need their own
+//! `filter_map_dict`/`filter_map_blob`/`filter_map_string` iteration,
+//! not yet translated; a `Funcref`/`Partial` `{expr2}` needs
+//! `eval_expr_partial`/`eval_expr_func` (the whole function-CALL
+//! machinery), a substantial, separate undertaking. `foreach()` is
+//! deliberately NOT registered at all: every real invocation is
+//! blocked today, either via `do_cmdline_cmd` (a raw command-string
+//! `{expr2}`) or the same funcref-call machinery gap above (anything
+//! else) - matching this crate's established "don't register a
+//! builtin whose entire reachable path is blocked" precedent.
+//!
 //! Also translated (from `eval/list.c`, not `funcs.c` itself):
 //! `add()` (append one item to a `List`/`Blob`, returning the SAME
 //! container) and `insert()` (insert one item before a given index,
@@ -353,6 +372,9 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"count"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_count });
         m.insert(&b"copy"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_copy });
         m.insert(&b"deepcopy"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_deepcopy });
+        m.insert(&b"filter"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_filter });
+        m.insert(&b"map"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_map });
+        m.insert(&b"mapnew"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_mapnew });
         m.insert(&b"add"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_add });
         m.insert(&b"insert"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_insert });
         m.insert(&b"remove"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_remove });
@@ -1969,6 +1991,50 @@ unsafe fn f_deepcopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let copy_id = if noref == 0 { crate::eval::eval::get_copy_id() } else { 0 };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::var_item_copy(std::ptr::null(), &argvars[0], rettv, true, copy_id) };
+}
+
+/// `filter({expr1}, {expr2})` - remove items from `{expr1}` (a `List`)
+/// for which `{expr2}` evaluates to zero/falsy (`f_filter`,
+/// `eval/list.c`).
+///
+/// Only a `List` first argument is currently supported -
+/// `Dict`/`Blob`/`String` each `unimplemented!()` (see
+/// `crate::eval::typval::filter_map`'s own doc comment).
+///
+/// # Safety
+/// Forwards `crate::eval::typval::filter_map`'s own safety
+/// requirements.
+unsafe fn f_filter(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::filter_map(argvars, rettv, crate::eval::typval::FilterMapT::Filter) };
+}
+
+/// `map({expr1}, {expr2})` - replace each item in `{expr1}` (a `List`)
+/// with the result of evaluating `{expr2}` (`f_map`, `eval/list.c`).
+///
+/// Only a `List` first argument is currently supported - see
+/// [`f_filter`]'s own doc comment.
+///
+/// # Safety
+/// Forwards `crate::eval::typval::filter_map`'s own safety
+/// requirements.
+unsafe fn f_map(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::filter_map(argvars, rettv, crate::eval::typval::FilterMapT::Map) };
+}
+
+/// `mapnew({expr1}, {expr2})` - like [`f_map`], but returns a NEW
+/// `List`, leaving `{expr1}` untouched (`f_mapnew`, `eval/list.c`).
+///
+/// Only a `List` first argument is currently supported - see
+/// [`f_filter`]'s own doc comment.
+///
+/// # Safety
+/// Forwards `crate::eval::typval::filter_map`'s own safety
+/// requirements.
+unsafe fn f_mapnew(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::filter_map(argvars, rettv, crate::eval::typval::FilterMapT::MapNew) };
 }
 
 /// `add({object}, {expr})` - append `{expr}` to `{object}` (a `List`
@@ -7342,6 +7408,9 @@ mod tests {
             "count",
             "copy",
             "deepcopy",
+            "filter",
+            "map",
+            "mapnew",
             "add",
             "insert",
             "remove",

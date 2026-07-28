@@ -8235,6 +8235,69 @@ mod tests {
     }
 
     #[test]
+    fn e2e_filter_map_mapnew_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // filter() on a List literal - removes falsy items in place,
+        // and returns the (mutated) same List.
+        let (ret, tv) = eval_str(b"filter([1, 2, 3, 4, 5, 6], 'v:val % 2 == 0')");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(filtered) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(filtered), 3);
+            let first = crate::eval::typval::tv_list_first(filtered);
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(2));
+            crate::eval::typval::tv_list_unref(filtered);
+        }
+
+        // map() - replaces each item in place, using both v:val and
+        // v:key.
+        let (ret, tv) = eval_str(b"map([10, 20, 30], 'v:val + v:key')");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(mapped) = tv.value else { panic!("expected a List") };
+        unsafe {
+            let first = crate::eval::typval::tv_list_first(mapped);
+            let second = (*first).li_next;
+            let third = (*second).li_next;
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(10));
+            assert_eq!((*second).li_tv.value, TypvalValue::Number(21));
+            assert_eq!((*third).li_tv.value, TypvalValue::Number(32));
+            crate::eval::typval::tv_list_unref(mapped);
+        }
+
+        // mapnew() - via a real g: variable, proving the ORIGINAL list
+        // is untouched (unlike map()'s own in-place mutation) and that
+        // get_func_tv's own argument-cleanup loop (this whole arc's
+        // earlier bug fix) doesn't disturb the freshly-built result.
+        let orig = crate::eval::typval::tv_list_alloc(3);
+        unsafe {
+            crate::eval::typval::tv_list_ref(orig);
+            crate::eval::typval::tv_list_append_number(&mut *orig, 1);
+            crate::eval::typval::tv_list_append_number(&mut *orig, 2);
+            crate::eval::typval::tv_list_append_number(&mut *orig, 3);
+        }
+        let orig_item = crate::eval::typval::tv_dict_item_alloc(b"orig");
+        unsafe { (*orig_item).di_tv.value = TypvalValue::List(orig) };
+        unsafe { crate::eval::typval::tv_dict_add(&mut *crate::eval::vars::get_globvar_dict(), orig_item) };
+
+        let (ret, tv) = eval_str(b"mapnew(g:orig, 'v:val * 100')");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(new_list) = tv.value else { panic!("expected a List") };
+        assert_ne!(new_list, orig);
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_list_len(orig), 3);
+            let orig_first = crate::eval::typval::tv_list_first(orig);
+            assert_eq!((*orig_first).li_tv.value, TypvalValue::Number(1)); // untouched
+            let new_first = crate::eval::typval::tv_list_first(new_list);
+            assert_eq!((*new_first).li_tv.value, TypvalValue::Number(100));
+            crate::eval::typval::tv_list_unref(new_list);
+        }
+
+        reset_globals_for_test(); // releases g:orig's own List reference.
+    }
+
+    #[test]
     fn e2e_add_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

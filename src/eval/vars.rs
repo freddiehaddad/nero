@@ -5301,4 +5301,29 @@ mod prepare_restore_vimvar_tests {
         unsafe { restore_vimvar(VimVarIndex::Val, save_outer) };
         assert!(unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) });
     }
+
+    #[test]
+    fn prepare_vimvar_survives_many_repeated_cycles() {
+        let _lock = crate::globals::global_state_test_lock();
+        for i in 0..200 {
+            let mut save = TypvalT::default();
+            unsafe { prepare_vimvar(VimVarIndex::Val, &mut save) };
+            assert!(
+                !unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) },
+                "iteration {i}: val should be registered while active"
+            );
+            unsafe { set_vim_var_nr(VimVarIndex::Val, i) };
+            assert_eq!(unsafe { get_vim_var_nr(VimVarIndex::Val) }, i, "iteration {i}: value mismatch");
+            unsafe { restore_vimvar(VimVarIndex::Val, save) };
+            assert!(
+                unsafe { hashitem_empty((*get_vimvar_dict()).dv_hashtab.hash_find(b"val")) },
+                "iteration {i}: val should be unregistered after restore"
+            );
+            assert_eq!(
+                unsafe { (*get_vim_var_tv(VimVarIndex::Val)).value.var_type() },
+                VarType::Unknown,
+                "iteration {i}: value should be back to Unknown"
+            );
+        }
+    }
 }
