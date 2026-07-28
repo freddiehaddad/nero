@@ -62,6 +62,20 @@
 //! to `vim_copyfile` (needs symlink-aware copying, not yet
 //! translated) - both narrow, honestly-documented gaps rather than a
 //! silently-wrong result.
+//!
+//! Also translated: `glob2regpat()` (via a new `file_pat_to_reg_pat`,
+//! from `fileio.c`, hosted here alongside its only currently-
+//! translated caller) - converts a glob-shaped file pattern (e.g.
+//! `"*.c"`, `"file{one,two}.txt"`) into an equivalent Vim regex search
+//! pattern. Needed [`crate::charset::vim_isfilec`], itself now
+//! translated using the same fixed-default-rule shortcut as
+//! `vim_isprintc`/`vim_isbreak`/`vim_isidc` (`'isfname'`'s own default
+//! is a fixed, `BACKSLASH_IN_FILENAME`-conditional split, verified
+//! directly against `options.lua` rather than assumed still needing
+//! the real `g_chartab`). Every output was independently cross-checked
+//! against a real `nvim` binary's own `glob2regpat()` before trusting
+//! it, including the platform-specific Windows-only bracket-escape
+//! behavior for a backslash before a valid `'isfname'` character.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -346,6 +360,187 @@ fn vim_rename(from: &std::path::Path, to: &std::path::Path) -> i32 {
     }
 
     unimplemented!("vim_rename(): os_rename failed, vim_copyfile fallback not yet translated");
+}
+
+/// `glob2regpat({string})` - convert a file pattern into a search
+/// pattern (`f_glob2regpat`, `eval/fs.c`, via [`file_pat_to_reg_pat`]).
+pub(crate) unsafe fn f_glob2regpat(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let pat = crate::eval::typval::tv_get_string_chk(&argvars[0]);
+    rettv.value = TypvalValue::String(pat.and_then(|p| file_pat_to_reg_pat(&p, None, false)));
+}
+
+/// Convert a file pattern (e.g. `"*.c"`, `"file{one,two}.txt"`) into an
+/// equivalent Vim regex search pattern (`file_pat_to_reg_pat`,
+/// `fileio.c`, hosted here alongside its only currently-translated
+/// caller, `f_glob2regpat`).
+///
+/// `allow_dirs`, if `Some`, is set to `true` when the pattern includes
+/// a path separator (meaning matching should be allowed to span
+/// directories) - `false` otherwise, matching the original's own
+/// unconditional `*allow_dirs = false;` up front. `no_bslash` disables
+/// the Windows-only `\`-escaping special cases (matches the original's
+/// own `no_bslash` parameter exactly).
+///
+/// Returns `None` on an unbalanced `{`/`}` (the original's own
+/// `E219`/`E220` error paths - message display is omitted, matching
+/// this module's established policy, but the `None`/null-return
+/// failure signal itself is kept faithfully).
+///
+/// Collapses the original's own separate size-computation-then-fill
+/// two-pass structure into a single pass building a growing `Vec<u8>`,
+/// since Rust's own `Vec` needs no pre-sizing dance, matching this
+/// crate's established simplification for this exact C idiom (e.g.
+/// `winrestcmd`/`vim_strsave_shellescape`).
+#[must_use]
+pub fn file_pat_to_reg_pat(pat: &[u8], mut allow_dirs: Option<&mut bool>, no_bslash: bool) -> Option<Vec<u8>> {
+    if let Some(ad) = allow_dirs.as_deref_mut() {
+        *ad = false;
+    }
+
+    if pat.is_empty() {
+        return Some(b"^$".to_vec());
+    }
+
+    let mut reg_pat = Vec::with_capacity(pat.len() + 2);
+
+    // Skip leading '*'s (keeping at least one byte if the ENTIRE
+    // pattern is nothing but stars) - a leading '*' needs no explicit
+    // ".*"/anchor: an un-anchored regex (no leading '^') already
+    // matches anywhere in the string, achieving the same effect.
+    let mut start = 0;
+    if pat[0] == b'*' {
+        while start < pat.len() - 1 && pat[start] == b'*' {
+            start += 1;
+        }
+    } else {
+        reg_pat.push(b'^');
+    }
+
+    // Trim trailing '*'s the same way, from the other end, and skip
+    // the closing "$" anchor when the pattern ends with one - a
+    // trailing '*' already means "match anything after", achieved by
+    // simply not anchoring the end either.
+    let mut end = pat.len() - 1; // inclusive index of the last byte considered
+    let mut add_dollar = true;
+    if pat[end] == b'*' {
+        while end > start && pat[end] == b'*' {
+            end -= 1;
+        }
+        add_dollar = false;
+    }
+
+    let mut nested: i32 = 0;
+    let mut p = start;
+    while p < pat.len() && nested >= 0 && p <= end {
+        match pat[p] {
+            b'*' => {
+                reg_pat.push(b'.');
+                reg_pat.push(b'*');
+                // "**" matches like "*".
+                while p + 1 < pat.len() && pat[p + 1] == b'*' {
+                    p += 1;
+                }
+            }
+            b @ (b'.' | b'~') => {
+                reg_pat.push(b'\\');
+                reg_pat.push(b);
+            }
+            b'?' => {
+                reg_pat.push(b'.');
+            }
+            b'\\' => match pat.get(p + 1).copied() {
+                None => {
+                    // Trailing lone backslash: contributes nothing,
+                    // matching the original's own early, empty `break`.
+                }
+                Some(next) => {
+                    if cfg!(windows)
+                        && !no_bslash
+                        && (crate::charset::vim_isfilec(i32::from(next)) || next == b'*' || next == b'?')
+                        && next != b'+'
+                    {
+                        // "\x" -> "[\/]" e.g. "dir\file"; "\*"/"\?"
+                        // likewise. No extra `p` advancement here - the
+                        // character right after the backslash (`next`)
+                        // is reprocessed as its own, separate character
+                        // on the NEXT loop iteration, matching the
+                        // original's own single `p++` (from the
+                        // backslash's own position) for this branch.
+                        reg_pat.extend_from_slice(b"[\\/]");
+                        if let Some(ad) = allow_dirs.as_deref_mut() {
+                            *ad = true;
+                        }
+                    } else {
+                        // `*++p`: advance past the backslash to examine
+                        // the character immediately following it -
+                        // undoing escaping from `ExpandEscape()`.
+                        p += 1;
+                        let c = pat[p];
+                        if c == b'?' && (!cfg!(windows) || no_bslash) {
+                            reg_pat.push(b'?');
+                        } else if matches!(c, b',' | b'%' | b'#') || crate::ascii_defs::ascii_isspace(i32::from(c)) || matches!(c, b'{' | b'}') {
+                            reg_pat.push(c);
+                        } else if c == b'\\' && pat.get(p + 1) == Some(&b'\\') && pat.get(p + 2) == Some(&b'{') {
+                            // "\\\{n,m\}" -> "\{n,m}".
+                            reg_pat.push(b'\\');
+                            reg_pat.push(b'{');
+                            p += 2;
+                        } else {
+                            if let Some(ad) = allow_dirs.as_deref_mut() {
+                                if crate::path::vim_ispathsep(i32::from(c)) && (!cfg!(windows) || !no_bslash || c != b'\\') {
+                                    *ad = true;
+                                }
+                            }
+                            reg_pat.push(b'\\');
+                            reg_pat.push(c);
+                        }
+                    }
+                }
+            },
+            b'/' if cfg!(windows) => {
+                reg_pat.extend_from_slice(b"[\\/]");
+                if let Some(ad) = allow_dirs.as_deref_mut() {
+                    *ad = true;
+                }
+            }
+            b'{' => {
+                reg_pat.push(b'\\');
+                reg_pat.push(b'(');
+                nested += 1;
+            }
+            b'}' => {
+                reg_pat.push(b'\\');
+                reg_pat.push(b')');
+                nested -= 1;
+            }
+            b',' => {
+                if nested != 0 {
+                    reg_pat.push(b'\\');
+                    reg_pat.push(b'|');
+                } else {
+                    reg_pat.push(b',');
+                }
+            }
+            c => {
+                if let Some(ad) = allow_dirs.as_deref_mut() {
+                    if crate::path::vim_ispathsep(i32::from(c)) {
+                        *ad = true;
+                    }
+                }
+                reg_pat.push(c);
+            }
+        }
+        p += 1;
+    }
+
+    if add_dollar {
+        reg_pat.push(b'$');
+    }
+
+    if nested != 0 {
+        return None;
+    }
+    Some(reg_pat)
 }
 
 /// Shared "resolve `{winnr}[, {tabnr}]` into `(scope, tabpage,
@@ -1343,5 +1538,151 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(-1));
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+    }
+
+    // --- file_pat_to_reg_pat / f_glob2regpat ---
+
+    #[test]
+    fn file_pat_to_reg_pat_empty_pattern_is_anchor_only() {
+        assert_eq!(file_pat_to_reg_pat(b"", None, false), Some(b"^$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_plain_literal_escapes_dots() {
+        assert_eq!(file_pat_to_reg_pat(b"file.txt", None, false), Some(b"^file\\.txt$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_leading_star_needs_no_anchor() {
+        // A leading '*' is stripped without emitting ".*"/"^" at all -
+        // an un-anchored regex already matches anywhere in the string,
+        // achieving the same "match anything before" effect.
+        assert_eq!(file_pat_to_reg_pat(b"*.c", None, false), Some(b"\\.c$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_trailing_star_needs_no_dollar() {
+        // A trailing '*' is trimmed OUT of the scan range entirely (the
+        // same way a leading '*' is skipped) - nothing at all is
+        // emitted for it, not even ".*": an un-anchored regex (no
+        // trailing '$') already matches any longer string starting
+        // with "foo", achieving "match anything after" implicitly.
+        assert_eq!(file_pat_to_reg_pat(b"foo*", None, false), Some(b"^foo".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_bare_star_has_no_anchors_at_all() {
+        assert_eq!(file_pat_to_reg_pat(b"*", None, false), Some(b".*".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_double_star_collapses_like_a_single_star() {
+        assert_eq!(file_pat_to_reg_pat(b"a**b", None, false), Some(b"^a.*b$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_question_mark_becomes_any_char() {
+        assert_eq!(file_pat_to_reg_pat(b"a?b", None, false), Some(b"^a.b$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_tilde_is_escaped() {
+        assert_eq!(file_pat_to_reg_pat(b"a~b", None, false), Some(b"^a\\~b$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_braces_become_alternation() {
+        assert_eq!(file_pat_to_reg_pat(b"{foo,bar}", None, false), Some(b"^\\(foo\\|bar\\)$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_unbalanced_opening_brace_fails() {
+        assert_eq!(file_pat_to_reg_pat(b"{foo", None, false), None);
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_unbalanced_closing_brace_fails() {
+        assert_eq!(file_pat_to_reg_pat(b"foo}", None, false), None);
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_sets_allow_dirs_for_a_path_separator() {
+        // `case '/':`'s own "[\/]" bracket-escape only exists inside
+        // the original's `#ifdef BACKSLASH_IN_FILENAME` (Windows-only)
+        // - on non-Windows, '/' falls through to the plain `default:`
+        // case instead, emitted as a literal character (still setting
+        // allow_dirs via vim_ispathsep either way). Verified directly
+        // against a real nvim binary on Windows before trusting this.
+        let mut allow_dirs = false;
+        let result = file_pat_to_reg_pat(b"a/b", Some(&mut allow_dirs), false);
+        assert!(allow_dirs);
+        if cfg!(windows) {
+            assert_eq!(result, Some(b"^a[\\/]b$".to_vec()));
+        } else {
+            assert_eq!(result, Some(b"^a/b$".to_vec()));
+        }
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_leaves_allow_dirs_false_without_a_separator() {
+        let mut allow_dirs = true; // starts true - must be reset to false up front.
+        let result = file_pat_to_reg_pat(b"abc", Some(&mut allow_dirs), false);
+        assert!(!allow_dirs);
+        assert_eq!(result, Some(b"^abc$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_trailing_lone_backslash_contributes_nothing() {
+        assert_eq!(file_pat_to_reg_pat(b"a\\", None, false), Some(b"^a$".to_vec()));
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_escaped_comma_is_platform_specific() {
+        // Hand-traced against the real C control flow: on Windows, the
+        // backslash-before-an-isfname-char branch fires for ANY valid
+        // 'isfname' character (comma included, per its own default),
+        // producing "[\/]" for the backslash itself, then reprocessing
+        // the comma on its own as a literal ','. On non-Windows, the
+        // backslash instead falls into the "undo ExpandEscape()"
+        // un-escaping branch, producing a bare literal ',' with no
+        // leading "[\/]" at all.
+        if cfg!(windows) {
+            assert_eq!(file_pat_to_reg_pat(b"a\\,b", None, false), Some(b"^a[\\/],b$".to_vec()));
+        } else {
+            assert_eq!(file_pat_to_reg_pat(b"a\\,b", None, false), Some(b"^a,b$".to_vec()));
+        }
+    }
+
+    #[test]
+    fn file_pat_to_reg_pat_escaped_question_mark_is_platform_specific() {
+        // Both '*' and '?' are EXPLICITLY listed in the Windows
+        // bracket-escape condition regardless of vim_isfilec, so "\?"
+        // triggers it there too (reprocessing '?' as its own wildcard
+        // afterward); non-Windows un-escapes it straight to a literal
+        // '?' character instead.
+        if cfg!(windows) {
+            assert_eq!(file_pat_to_reg_pat(b"a\\?b", None, false), Some(b"^a[\\/].b$".to_vec()));
+        } else {
+            assert_eq!(file_pat_to_reg_pat(b"a\\?b", None, false), Some(b"^a?b$".to_vec()));
+        }
+    }
+
+    #[test]
+    fn f_glob2regpat_wraps_file_pat_to_reg_pat() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_glob2regpat(&[string(b"*.c")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"\\.c$".to_vec())));
+    }
+
+    #[test]
+    fn f_glob2regpat_type_error_yields_a_null_string() {
+        let mut rettv = TypvalT::default();
+        // A List value is not "stringish" - tv_get_string_chk returns
+        // None for it (matching the original's own str_errors-driven
+        // failure for this exact type), which glob2regpat() propagates
+        // straight through to a null result string.
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        unsafe { f_glob2regpat(&[list_tv], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 }

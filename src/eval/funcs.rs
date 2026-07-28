@@ -421,6 +421,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcwd"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_getcwd });
         m.insert(&b"haslocaldir"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_haslocaldir });
         m.insert(&b"rename"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_rename });
+        m.insert(&b"glob2regpat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_glob2regpat });
         m.insert(&b"bufexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufexists });
         m.insert(&b"buflisted"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_buflisted });
         m.insert(&b"bufloaded"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufloaded });
@@ -7916,6 +7917,7 @@ mod tests {
             "getcwd",
             "haslocaldir",
             "rename",
+            "glob2regpat",
             "bufexists",
             "buflisted",
             "bufloaded",

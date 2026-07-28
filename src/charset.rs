@@ -41,14 +41,19 @@
 //!   `MSWIN`-conditional two-way split, same shape as `'isfname'`'s own
 //!   default); a past note here conflating it with `'iskeyword'`'s own
 //!   separate (and NOT similarly shortcut-able) default was corrected.
-//! - `vim_iswordc`/`vim_iswordp`/`vim_isfilec` families: still need the
-//!   real `g_chartab` (built by `buf_init_chartab` above) - unlike
-//!   `vim_isIDc` just above, these depend on `'iskeyword'`/`'isfname'`,
-//!   whose own defaults (or per-buffer/filetype customization, for
-//!   `'iskeyword'`) this crate has not separately re-verified as
+//! - `vim_isfilec` (as [`vim_isfilec`]) is now ALSO translated, using
+//!   the same fixed-default-rule shortcut - `'isfname'`'s own default
+//!   is a fixed, `BACKSLASH_IN_FILENAME`-conditional split too (verified
+//!   directly against `options.lua`), not a `g_chartab`-needing
+//!   general mechanism after all.
+//! - `vim_iswordc`/`vim_iswordp` families: still need the real
+//!   `g_chartab` (built by `buf_init_chartab` above) - these depend on
+//!   `'iskeyword'`, whose own default (or per-buffer/filetype
+//!   customization) this crate has not separately re-verified as
 //!   similarly shortcut-able yet.
-//! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: need
-//!   `vim_isfilec` (hence the real `g_chartab`).
+//! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: now that
+//!   `vim_isfilec` exists, worth re-checking directly rather than
+//!   assumed still blocked.
 //! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
 //!   `transchar_nonprint` are now translated too (this pass), returning
 //!   an owned `Vec<u8>` (including trailing NUL) instead of a pointer
@@ -645,6 +650,116 @@ fn default_is_id_char(c: u8) -> bool {
 #[must_use]
 pub fn vim_isidc(c: i32) -> bool {
     c > 0 && c < 0x100 && default_is_id_char(c as u8)
+}
+
+/// Whether byte `c` is a file-name character under `'isfname'`'s own
+/// DEFAULT (non-customized) value - `g_chartab`'s `CT_FNAME_CHAR` bit,
+/// approximated the same "fixed default rule" way as
+/// [`default_is_id_char`] above (see its own doc comment).
+///
+/// `'isfname'` defaults to `"@,48-57,/,.,-,_,+,,,#,$,%,~,="` on
+/// non-Windows or `"@,48-57,/,\,.,-,_,+,,,#,$,%,{,},[,],@-@,!,~,="` on
+/// Windows (`options.lua`'s own `BACKSLASH_IN_FILENAME`-conditional
+/// default - a fixed split, matching this crate's own `default_is_id_char`
+/// precedent for a similarly platform-conditional default). The `"@"`
+/// part (any character `isalpha()` accepts) is approximated as
+/// ASCII-only, matching this crate's implicit "C" locale assumption.
+#[must_use]
+fn default_is_file_char(c: u8) -> bool {
+    if c.is_ascii_alphabetic()
+        || c.is_ascii_digit()
+        || matches!(c, b'/' | b'.' | b'-' | b'_' | b'+' | b',' | b'#' | b'$' | b'%' | b'~' | b'=')
+    {
+        return true;
+    }
+    if cfg!(windows) {
+        matches!(c, b'\\' | b'{' | b'}' | b'[' | b']' | b'@' | b'!')
+    } else {
+        false
+    }
+}
+
+/// Check that `c` is a valid file-name character as specified by
+/// `'isfname'`'s own default value (`vim_isfilec`) - see
+/// `default_is_file_char`'s own doc comment for the "default-rule
+/// shortcut, not the real `g_chartab`" caveat that applies here
+/// identically. Characters above `0xFF` (multi-byte) are always
+/// assumed valid, matching the original's own documented assumption.
+#[must_use]
+pub fn vim_isfilec(c: i32) -> bool {
+    c >= 0x100 || (c > 0 && default_is_file_char(c as u8))
+}
+
+/// Return `true` if the backslash at the start of `str` should be
+/// removed (`rem_backslash`) - decides whether a leading backslash was
+/// only there to protect a shell-special character, not a genuine part
+/// of the file name. `str` is the REMAINING slice starting at the
+/// candidate backslash (matching this crate's own "remaining slice,
+/// not a raw pointer" idiom for a C string walk).
+///
+/// On non-Windows (no `BACKSLASH_IN_FILENAME`), every backslash not at
+/// the very end of the string should be halved - matching the
+/// original's own much simpler `#else` branch exactly.
+#[must_use]
+pub fn rem_backslash(str: &[u8]) -> bool {
+    if str.first() != Some(&b'\\') {
+        return false;
+    }
+    if cfg!(windows) {
+        let Some(&next) = str.get(1) else { return false };
+        next < 0x80 && (next == b' ' || (next != b'*' && next != b'?' && !vim_isfilec(i32::from(next))))
+    } else {
+        str.len() > 1
+    }
+}
+
+/// Halve the number of backslashes in a file name argument, in place
+/// (`backslash_halve`). Shrinks `p` when any backslash needed halving,
+/// leaves it untouched otherwise (matching the original's own
+/// `if (*p != NUL)` guard - a no-op when `rem_backslash` never matches
+/// anywhere in the string).
+pub fn backslash_halve(p: &mut Vec<u8>) {
+    let mut read = 0;
+    while read < p.len() && !rem_backslash(&p[read..]) {
+        read += 1;
+    }
+    if read >= p.len() {
+        return;
+    }
+    let mut write = read;
+    while read < p.len() {
+        if rem_backslash(&p[read..]) {
+            p[write] = p[read + 1];
+            write += 1;
+            read += 2;
+        } else {
+            p[write] = p[read];
+            write += 1;
+            read += 1;
+        }
+    }
+    p.truncate(write);
+}
+
+/// [`backslash_halve`] plus save the result in a freshly-allocated
+/// `Vec` (`backslash_halve_save`) - unlike the in-place variant, always
+/// builds a fresh copy regardless of whether any backslash actually
+/// needed halving, matching the original's own unconditional-copy
+/// structure exactly.
+#[must_use]
+pub fn backslash_halve_save(p: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(p.len());
+    let mut read = 0;
+    while read < p.len() {
+        if rem_backslash(&p[read..]) {
+            result.push(p[read + 1]);
+            read += 2;
+        } else {
+            result.push(p[read]);
+            read += 1;
+        }
+    }
+    result
 }
 
 /// Return number of display cells occupied by character `c`
@@ -1464,6 +1579,154 @@ mod tests {
             assert!(vim_isidc(255)); // end of the Unix range
             assert!(!vim_isidc(191)); // just below the Unix range
         }
+    }
+
+    #[test]
+    fn vim_isfilec_accepts_letters_digits_and_common_path_punctuation() {
+        assert!(vim_isfilec(i32::from(b'a')));
+        assert!(vim_isfilec(i32::from(b'Z')));
+        assert!(vim_isfilec(i32::from(b'0')));
+        assert!(vim_isfilec(i32::from(b'/')));
+        assert!(vim_isfilec(i32::from(b'.')));
+        assert!(vim_isfilec(i32::from(b'-')));
+        assert!(vim_isfilec(i32::from(b'_')));
+        assert!(vim_isfilec(i32::from(b'+')));
+        assert!(vim_isfilec(i32::from(b',')));
+        assert!(vim_isfilec(i32::from(b'#')));
+        assert!(vim_isfilec(i32::from(b'$')));
+        assert!(vim_isfilec(i32::from(b'%')));
+        assert!(vim_isfilec(i32::from(b'~')));
+        assert!(vim_isfilec(i32::from(b'=')));
+    }
+
+    #[test]
+    fn vim_isfilec_rejects_ordinary_ascii_punctuation() {
+        assert!(!vim_isfilec(i32::from(b' ')));
+        assert!(!vim_isfilec(i32::from(b'&')));
+        assert!(!vim_isfilec(i32::from(b'^')));
+        assert!(!vim_isfilec(i32::from(b':')));
+    }
+
+    #[test]
+    fn vim_isfilec_rejects_out_of_range_and_non_positive_values() {
+        assert!(!vim_isfilec(0));
+        assert!(!vim_isfilec(-1));
+    }
+
+    #[test]
+    fn vim_isfilec_accepts_everything_at_or_above_0x100() {
+        assert!(vim_isfilec(0x100));
+        assert!(vim_isfilec(i32::MAX));
+    }
+
+    #[test]
+    fn vim_isfilec_backslash_and_brace_bracket_chars_are_windows_only() {
+        // 'isfname' only includes '\', '{', '}', '[', ']', '@', '!' on
+        // Windows (BACKSLASH_IN_FILENAME) - excluded everywhere else.
+        if cfg!(windows) {
+            assert!(vim_isfilec(i32::from(b'\\')));
+            assert!(vim_isfilec(i32::from(b'{')));
+            assert!(vim_isfilec(i32::from(b'}')));
+            assert!(vim_isfilec(i32::from(b'[')));
+            assert!(vim_isfilec(i32::from(b']')));
+            assert!(vim_isfilec(i32::from(b'@')));
+            assert!(vim_isfilec(i32::from(b'!')));
+        } else {
+            assert!(!vim_isfilec(i32::from(b'\\')));
+            assert!(!vim_isfilec(i32::from(b'{')));
+            assert!(!vim_isfilec(i32::from(b'}')));
+            assert!(!vim_isfilec(i32::from(b'[')));
+            assert!(!vim_isfilec(i32::from(b']')));
+            assert!(!vim_isfilec(i32::from(b'@')));
+            assert!(!vim_isfilec(i32::from(b'!')));
+        }
+    }
+
+    #[test]
+    fn rem_backslash_false_without_a_leading_backslash() {
+        assert!(!rem_backslash(b"abc"));
+        assert!(!rem_backslash(b""));
+    }
+
+    #[test]
+    fn rem_backslash_trailing_backslash_never_removed() {
+        assert!(!rem_backslash(b"\\"));
+    }
+
+    #[test]
+    fn rem_backslash_platform_specific_behavior() {
+        if cfg!(windows) {
+            // Kept: normal file-name char, '$', '*', '?' - all valid
+            // isfname chars (or explicitly excluded wildcards) on
+            // Windows, so the backslash protecting them stays.
+            assert!(!rem_backslash(b"\\a"));
+            assert!(!rem_backslash(b"\\$"));
+            assert!(!rem_backslash(b"\\*"));
+            assert!(!rem_backslash(b"\\?"));
+            // Removed: a space, or a character NOT in 'isfname'
+            // (e.g. '&', special to cmd.exe) - the backslash was only
+            // there to protect it, not a real file-name backslash.
+            assert!(rem_backslash(b"\\ x"));
+            assert!(rem_backslash(b"\\&"));
+        } else {
+            // Non-Windows: every backslash not at the very end is
+            // halved, matching the original's own much simpler
+            // #else branch.
+            assert!(rem_backslash(b"\\a"));
+            assert!(rem_backslash(b"\\&"));
+        }
+    }
+
+    #[test]
+    fn backslash_halve_is_a_no_op_without_any_matching_backslash() {
+        let mut p = b"abc".to_vec();
+        backslash_halve(&mut p);
+        assert_eq!(p, b"abc");
+    }
+
+    #[test]
+    fn backslash_halve_shrinks_in_place() {
+        let mut p = if cfg!(windows) { b"a\\ b".to_vec() } else { b"a\\b".to_vec() };
+        backslash_halve(&mut p);
+        if cfg!(windows) {
+            assert_eq!(p, b"a b");
+        } else {
+            assert_eq!(p, b"ab");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn backslash_halve_windows_kept_wildcard_stays_unchanged() {
+        let mut p = b"a\\*b".to_vec();
+        backslash_halve(&mut p);
+        assert_eq!(p, b"a\\*b");
+    }
+
+    #[test]
+    fn backslash_halve_save_is_a_fresh_copy_even_when_unchanged() {
+        let p = b"abc".to_vec();
+        let result = backslash_halve_save(&p);
+        assert_eq!(result, b"abc");
+    }
+
+    #[test]
+    fn backslash_halve_save_halves_matching_backslashes() {
+        let p = if cfg!(windows) { b"a\\ b".to_vec() } else { b"a\\b".to_vec() };
+        let result = backslash_halve_save(&p);
+        if cfg!(windows) {
+            assert_eq!(result, b"a b");
+        } else {
+            assert_eq!(result, b"ab");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn backslash_halve_save_windows_kept_wildcard_stays_unchanged() {
+        let p = b"a\\*b".to_vec();
+        let result = backslash_halve_save(&p);
+        assert_eq!(result, b"a\\*b");
     }
 
     #[test]
