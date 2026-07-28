@@ -8360,6 +8360,25 @@ mod tests {
     }
 
     #[test]
+    fn e2e_filter_map_on_a_string_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // filter() on a real double-quoted String LITERAL through the
+        // whole parser chain (eval_string, not just a raw TypvalT).
+        let (ret, tv) = eval_str(b"filter(\"hello\", \"v:val != 'l'\")");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"heo".to_vec())));
+
+        // map() - built via toupper(), a real registered builtin.
+        let (ret, tv) = eval_str(b"map(\"abc\", 'toupper(v:val)')");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"ABC".to_vec())));
+
+        reset_globals_for_test();
+    }
+
+    #[test]
     fn e2e_add_builtin_function_calls() {
         let _lock = crate::globals::global_state_test_lock();
         reset_globals_for_test();

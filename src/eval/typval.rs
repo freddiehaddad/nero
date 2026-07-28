@@ -3105,17 +3105,99 @@ pub unsafe fn filter_map_blob(
     unsafe { (*b).bv_lock = prev_lock };
 }
 
+/// Implementation of `map()`/`mapnew()`/`filter()`/`foreach()` for a
+/// `String`. Apply `expr` to every character in `str` and return the
+/// result in `rettv` (`filter_map_string`).
+///
+/// Unlike the List/Dict/Blob variants (which mutate their argument in
+/// place for `map()`/`filter()`), a String always produces a genuinely
+/// NEW string - Vimscript strings are plain values, not refcounted,
+/// mutable containers - matching the original's own `rettv->vval.
+/// v_string = ga.ga_data` (a freshly built buffer, never the input
+/// `str` itself).
+///
+/// `str` is iterated at the byte level (no embedded-NUL scanning, no
+/// trailing NUL expected) - matching this crate's own established
+/// "Vimscript `String` typval values are a plain `Vec<u8>` with no
+/// implicit NUL terminator" convention (see `tv_get_string_chk`'s own
+/// doc comment) - `str.len()` is the sole, authoritative stop
+/// condition, exactly like the original's own NUL-terminated C string
+/// stops at its own implicit terminator.
+///
+/// # Safety
+/// `expr` must be valid (forwards `filter_map_one`'s own safety
+/// requirements).
+pub unsafe fn filter_map_string(str: &[u8], filtermap: FilterMapT, expr: &TypvalT, rettv: &mut TypvalT) {
+    use crate::eval::vars::{set_vim_var_nr, set_vim_var_type, VimVarIndex};
+    use crate::mbyte::utfc_ptr2len;
+
+    rettv.value = TypvalValue::String(None);
+
+    // set_vim_var_nr() doesn't set the type.
+    unsafe { set_vim_var_type(VimVarIndex::Key, VarType::Number) };
+
+    let mut ga: Vec<u8> = Vec::new();
+    let mut pos: usize = 0;
+    let mut idx: VarnumberT = 0;
+    while pos < str.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { utfc_ptr2len(&str[pos..]) }.max(1) as usize;
+        let tv = TypvalT {
+            v_lock: VarLockStatus::Unlocked,
+            value: TypvalValue::String(Some(str[pos..pos + len].to_vec())),
+        };
+
+        unsafe { set_vim_var_nr(VimVarIndex::Key, idx) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let (ret, newtv, rem) = unsafe { filter_map_one(&tv, expr, filtermap) };
+        if ret == FAIL {
+            unsafe {
+                tv_clear_simple(&newtv);
+                tv_clear_simple(&tv);
+            }
+            break;
+        }
+
+        if matches!(filtermap, FilterMapT::Map | FilterMapT::MapNew) {
+            if let TypvalValue::String(Some(s)) = &newtv.value {
+                ga.extend_from_slice(s);
+            } else {
+                unsafe {
+                    tv_clear_simple(&newtv);
+                    tv_clear_simple(&tv);
+                }
+                // emsg(_(e_string_required)) omitted - message
+                // display, not tractable; the identical break is kept.
+                break;
+            }
+        } else if filtermap == FilterMapT::Foreach || !rem {
+            if let TypvalValue::String(Some(s)) = &tv.value {
+                ga.extend_from_slice(s);
+            }
+        }
+
+        unsafe {
+            tv_clear_simple(&newtv);
+            tv_clear_simple(&tv);
+        }
+
+        idx += 1;
+        pos += len;
+    }
+
+    rettv.value = TypvalValue::String(Some(ga));
+}
+
 /// Implementation of `map()`, `mapnew()`, `filter()` and `foreach()`
 /// (`filter_map`).
 ///
-/// [`TypvalValue::List`]/[`TypvalValue::Dict`]/[`TypvalValue::Blob`]
-/// are all modeled - [`TypvalValue::String`] needs its own
-/// `filter_map_string` iteration, not yet translated -
-/// `unimplemented!()`s if it is ever passed as the first argument.
+/// [`TypvalValue::List`]/[`TypvalValue::Dict`]/[`TypvalValue::Blob`]/
+/// [`TypvalValue::String`] are ALL modeled - every real container type
+/// `filter()`/`map()`/`mapnew()` accept in the original.
 ///
 /// # Safety
-/// Forwards `filter_map_list`/`filter_map_dict`/`filter_map_blob`'s
-/// own safety requirements for `argvars[0]`.
+/// Forwards `filter_map_list`/`filter_map_dict`/`filter_map_blob`/
+/// `filter_map_string`'s own safety requirements for `argvars[0]`.
 pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: FilterMapT) {
     use crate::eval::vars::{prepare_vimvar, VimVarIndex};
 
@@ -3127,10 +3209,7 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
     }
 
     match &argvars[0].value {
-        TypvalValue::Blob(_) | TypvalValue::List(_) | TypvalValue::Dict(_) => {}
-        TypvalValue::String(_) => unimplemented!(
-            "filter_map: String argument needs filter_map_string, not yet translated"
-        ),
+        TypvalValue::Blob(_) | TypvalValue::List(_) | TypvalValue::Dict(_) | TypvalValue::String(_) => {}
         _ => {
             // semsg(_(e_argument_of_str_must_be_list_string_dictionary_or_blob),
             // func_name) omitted - message display, not tractable; the
@@ -3162,18 +3241,26 @@ pub unsafe fn filter_map(argvars: &[TypvalT], rettv: &mut TypvalT, filtermap: Fi
     // (message-display bookkeeping, not tractable, and filter_map_one
     // already reports evaluation failure via its own FAIL return).
 
-    match argvars[0].value {
+    match &argvars[0].value {
         TypvalValue::List(l) => {
+            let l = *l;
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { filter_map_list(l, filtermap, expr, rettv) };
         }
         TypvalValue::Dict(d) => {
+            let d = *d;
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { filter_map_dict(d, filtermap, expr, rettv) };
         }
         TypvalValue::Blob(b) => {
+            let b = *b;
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { filter_map_blob(b, filtermap, expr, rettv) };
+        }
+        TypvalValue::String(s) => {
+            let s: &[u8] = s.as_deref().unwrap_or(&[]);
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { filter_map_string(s, filtermap, expr, rettv) };
         }
         _ => unreachable!("filter_map: argvars[0] type was already validated above"),
     }
@@ -8368,12 +8455,75 @@ mod filter_map_tests {
     }
 
     #[test]
-    #[should_panic(expected = "filter_map_string")]
-    fn filter_panics_on_a_string_argument() {
+    fn filter_removes_string_characters_that_are_falsy() {
         let _lock = crate::globals::global_state_test_lock();
-        let argvars = [string_expr(b"hello"), string_expr(b"1")];
+        let argvars =
+            [string_expr(b"abc"), string_expr(b"v:val != 'b'")];
         let mut rettv = TypvalT::default();
         unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"ac".to_vec())));
+    }
+
+    #[test]
+    fn map_replaces_each_string_character_with_a_string_result() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b"abc"), string_expr(b"toupper(v:val)")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"ABC".to_vec())));
+    }
+
+    #[test]
+    fn mapnew_on_a_string_produces_a_new_string_too() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b"ab"), string_expr(b"v:val . v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::MapNew) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"aabb".to_vec())));
+    }
+
+    #[test]
+    fn filter_on_an_empty_string_is_a_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b""), string_expr(b"1")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Filter) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
+    }
+
+    #[test]
+    fn v_key_reflects_the_zero_based_index_during_string_iteration() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b"xyz"), string_expr(b"v:key == 1 ? \"_\" : v:val")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"x_z".to_vec())));
+    }
+
+    #[test]
+    fn map_on_a_string_treats_each_multi_byte_character_as_one_unit() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A 2-character, 6-byte UTF-8 string ("日本" - two 3-byte CJK
+        // characters) - v:key must advance by CHARACTER, not by byte,
+        // matching utfc_ptr2len's own per-character length.
+        let argvars = [
+            string_expr("日本".as_bytes()),
+            string_expr(b"v:key == 0 ? 'A' : 'B'"),
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"AB".to_vec())));
+    }
+
+    #[test]
+    fn map_on_a_string_breaks_when_expr_does_not_return_a_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let argvars = [string_expr(b"ab"), string_expr(b"42")];
+        let mut rettv = TypvalT::default();
+        unsafe { filter(&argvars, &mut rettv, FilterMapT::Map) };
+        // Breaks on the FIRST character - result is empty, not "ab"
+        // unchanged (map() on a String always builds a fresh result).
+        assert_eq!(rettv.value, TypvalValue::String(Some(Vec::new())));
     }
 
     #[test]
