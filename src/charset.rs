@@ -45,15 +45,16 @@
 //!   the same fixed-default-rule shortcut - `'isfname'`'s own default
 //!   is a fixed, `BACKSLASH_IN_FILENAME`-conditional split too (verified
 //!   directly against `options.lua`), not a `g_chartab`-needing
-//!   general mechanism after all.
+//!   general mechanism after all. `rem_backslash`/`backslash_halve`/
+//!   `backslash_halve_save` (needing exactly this) and `vim_isfilec_or_wc`
+//!   (`"gf"`'s own file-or-wildcard-character predicate, needing
+//!   `crate::path::path_has_wildcard` too) are now translated alongside
+//!   it.
 //! - `vim_iswordc`/`vim_iswordp` families: still need the real
 //!   `g_chartab` (built by `buf_init_chartab` above) - these depend on
 //!   `'iskeyword'`, whose own default (or per-buffer/filetype
 //!   customization) this crate has not separately re-verified as
 //!   similarly shortcut-able yet.
-//! - `rem_backslash`/`backslash_halve`/`backslash_halve_save`: now that
-//!   `vim_isfilec` exists, worth re-checking directly rather than
-//!   assumed still blocked.
 //! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
 //!   `transchar_nonprint` are now translated too (this pass), returning
 //!   an owned `Vec<u8>` (including trailing NUL) instead of a pointer
@@ -760,6 +761,27 @@ pub fn backslash_halve_save(p: &[u8]) -> Vec<u8> {
         }
     }
     result
+}
+
+/// Check that `c` is a valid file-name character or a wildcard
+/// character (`vim_isfilec_or_wc`). Explicitly interprets `]` as a
+/// wildcard character, since `path_has_wildcard` itself returns
+/// `false` for it. Characters above `0xFF` (multi-byte) are always
+/// assumed valid via [`vim_isfilec`]'s own already-documented
+/// assumption, checked first (matching the original's exact
+/// short-circuit order).
+///
+/// Builds a real, single-byte slice to hand to `path_has_wildcard`
+/// rather than the original's own 2-byte (`char` + NUL) stack buffer -
+/// a Rust slice already carries its own length, no NUL terminator
+/// needed (matching this crate's established convention throughout).
+/// The truncating `c as u8` cast matches the original's own `(char)c`
+/// cast exactly - only ever reached once `vim_isfilec(c)` has already
+/// confirmed `c < 0x100` (having returned `false`, not short-circuited
+/// the `||` on the `c >= 0x100` case).
+#[must_use]
+pub fn vim_isfilec_or_wc(c: i32) -> bool {
+    vim_isfilec(c) || c == i32::from(b']') || crate::path::path_has_wildcard(&[c as u8])
 }
 
 /// Return number of display cells occupied by character `c`
@@ -1727,6 +1749,37 @@ mod tests {
         let p = b"a\\*b".to_vec();
         let result = backslash_halve_save(&p);
         assert_eq!(result, b"a\\*b");
+    }
+
+    #[test]
+    fn vim_isfilec_or_wc_accepts_ordinary_file_chars() {
+        assert!(vim_isfilec_or_wc(i32::from(b'a')));
+        assert!(vim_isfilec_or_wc(i32::from(b'.')));
+    }
+
+    #[test]
+    fn vim_isfilec_or_wc_explicitly_accepts_close_bracket() {
+        // ']' is explicitly special-cased since path_has_wildcard
+        // itself returns false for a single ']' (no wildcard meaning
+        // in isolation), but "gf"-style commands still want it treated
+        // as expandable.
+        assert!(vim_isfilec_or_wc(i32::from(b']')));
+    }
+
+    #[test]
+    fn vim_isfilec_or_wc_accepts_a_wildcard_character() {
+        assert!(vim_isfilec_or_wc(i32::from(b'*')));
+    }
+
+    #[test]
+    fn vim_isfilec_or_wc_rejects_a_plain_non_file_non_wildcard_char() {
+        assert!(!vim_isfilec_or_wc(i32::from(b'&')));
+    }
+
+    #[test]
+    fn vim_isfilec_or_wc_accepts_everything_at_or_above_0x100() {
+        assert!(vim_isfilec_or_wc(0x100));
+        assert!(vim_isfilec_or_wc(i32::MAX));
     }
 
     #[test]

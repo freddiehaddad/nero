@@ -20,7 +20,10 @@
 //! nullable `char *f1, char *f2` parameters are modeled as
 //! `Option<&[u8]>` since, unlike most other functions here, the
 //! original has no `FUNC_ATTR_NONNULL_*` attribute and explicitly
-//! null-checks both).
+//! null-checks both), and `path_has_wildcard`/`path_has_exp_wildcard`
+//! (byte-scanned the same way as everything else in this file, no
+//! `mbyte.c` dependency needed - every character tested is a fixed
+//! ASCII byte).
 //!
 //! Several originals use `MB_PTR_ADV`/check `utf_head_off` to advance
 //! multi-byte-safely. This translation intentionally scans byte-by-byte
@@ -1071,6 +1074,68 @@ pub unsafe fn shorten_dir(str_: &[u8]) -> Vec<u8> {
     unsafe { shorten_dir_len(str_, 1) }
 }
 
+/// Checks whether `p` contains a character `path_expand`/wildcard
+/// expansion can expand (`path_has_wildcard`) - Unix: one of
+/// `` *?[{`'$ `` (plus a standalone `~`, when followed by more
+/// characters); Windows: one of `` ?*$[` `` (no `~` special case).
+///
+/// Scans byte-by-byte rather than replicating the original's own
+/// `MB_PTR_ADV` multi-byte-character advance: every character tested
+/// here is a fixed ASCII byte (`< 0x80`), which can never appear as a
+/// continuation/lead byte of a genuine multi-byte UTF-8 sequence, so a
+/// byte scan and a UTF-8-character-aware scan agree on whether ANY
+/// match exists - matching this module's own already-established
+/// precedent for this exact simplification (see the module's own doc
+/// comment). The Unix-only "escaped backslash" skip
+/// (`if (p[0]=='\\' && p[1] != NUL) { p++; continue; }`, which in the
+/// original's `for` loop still runs the loop's own `MB_PTR_ADV`
+/// advance afterward via `continue`) is modeled as skipping exactly 2
+/// bytes - a possible under-advance for a multi-byte character
+/// immediately following the backslash, but one that can never change
+/// the final boolean answer, since every subsequent byte examined in
+/// that scenario would be a UTF-8 continuation byte (`>= 0x80`),
+/// which can never match any of the ASCII wildcard characters anyway.
+#[must_use]
+pub fn path_has_wildcard(p: &[u8]) -> bool {
+    let wildcards: &[u8] = if cfg!(unix) { b"*?[{`'$" } else { b"?*$[`" };
+    let mut i = 0;
+    while i < p.len() {
+        if cfg!(unix) && p[i] == b'\\' && i + 1 < p.len() {
+            i += 2;
+            continue;
+        }
+        if wildcards.contains(&p[i]) || (p[i] == b'~' && i + 1 < p.len()) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Checks whether `p` has a character `path_expand` can expand
+/// (`path_has_exp_wildcard`) - Unix: one of `*?[{`; Windows: one of
+/// `*?[` (no `` ` ``/`'`/`$`/`~` special cases, unlike
+/// [`path_has_wildcard`]'s broader set).
+///
+/// Same byte-scan-agrees-with-multi-byte-scan reasoning as
+/// [`path_has_wildcard`] applies identically here.
+#[must_use]
+pub fn path_has_exp_wildcard(p: &[u8]) -> bool {
+    let wildcards: &[u8] = if cfg!(unix) { b"*?[{" } else { b"*?[" };
+    let mut i = 0;
+    while i < p.len() {
+        if cfg!(unix) && p[i] == b'\\' && i + 1 < p.len() {
+            i += 2;
+            continue;
+        }
+        if wildcards.contains(&p[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,5 +1735,66 @@ mod tests {
     fn shorten_dir_is_shorten_dir_len_with_trim_len_one() {
         let _guard = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { shorten_dir(b"foo/bar/baz.txt") }, unsafe { shorten_dir_len(b"foo/bar/baz.txt", 1) });
+    }
+
+    #[test]
+    fn path_has_wildcard_false_for_a_plain_name() {
+        assert!(!path_has_wildcard(b"foo.txt"));
+    }
+
+    #[test]
+    fn path_has_wildcard_true_for_a_star() {
+        assert!(path_has_wildcard(b"foo*.txt"));
+    }
+
+    #[test]
+    fn path_has_wildcard_trailing_lone_tilde_is_not_a_wildcard() {
+        // Only a '~' with more characters AFTER it counts (home-dir
+        // expansion needs somewhere to expand into) - a bare trailing
+        // tilde does not.
+        assert!(!path_has_wildcard(b"foo~"));
+    }
+
+    #[test]
+    fn path_has_wildcard_leading_tilde_is_a_wildcard_on_any_platform() {
+        // The "(p[0]=='~' && p[1]!=NUL)" check sits OUTSIDE the
+        // original's own #ifdef UNIX/#else block - it applies
+        // unconditionally on every platform, unlike the wildcards
+        // character set itself (which DOES differ by platform).
+        assert!(path_has_wildcard(b"~foo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_has_wildcard_escaped_star_is_not_a_wildcard_on_unix() {
+        // "a\*b" - the backslash-escaped '*' is skipped over entirely,
+        // treated as a literal asterisk, not a wildcard indicator.
+        assert!(!path_has_wildcard(b"a\\*b"));
+    }
+
+    #[test]
+    fn path_has_exp_wildcard_true_for_braces_on_unix_only() {
+        // '{' is in the Unix exp-wildcard set ("*?[{") but NOT the
+        // Windows one ("*?[") - a real platform difference, unlike
+        // path_has_wildcard's own tilde special-case above.
+        if cfg!(unix) {
+            assert!(path_has_exp_wildcard(b"foo{a,b}.txt"));
+        } else {
+            assert!(!path_has_exp_wildcard(b"foo{a,b}.txt"));
+        }
+    }
+
+    #[test]
+    fn path_has_exp_wildcard_false_for_dollar_even_though_path_has_wildcard_counts_it() {
+        // '$' is in path_has_wildcard's broader set but NOT in
+        // path_has_exp_wildcard's narrower one - a real, deliberate
+        // difference between the two functions' own wildcard sets.
+        assert!(path_has_wildcard(b"foo$HOME"));
+        assert!(!path_has_exp_wildcard(b"foo$HOME"));
+    }
+
+    #[test]
+    fn path_has_exp_wildcard_false_for_a_plain_name() {
+        assert!(!path_has_exp_wildcard(b"foo.txt"));
     }
 }
