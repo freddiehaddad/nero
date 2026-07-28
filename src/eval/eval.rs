@@ -8042,6 +8042,43 @@ mod tests {
             crate::eval::typval::tv_list_unref(l);
         }
 
+        // items() through the real parser: a Dict literal (its own
+        // long-established, dedicated dict-only unit tests already
+        // cover this shape directly, but this test's own name has
+        // always implied end-to-end items() coverage - add it for
+        // real here), plus the newly-completed List/String cases.
+        let (ret, tv) = eval_str(b"items(#{a: 1})");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+        unsafe {
+            let pair = crate::eval::typval::tv_list_first(l);
+            let TypvalValue::List(p) = (*pair).li_tv.value else { panic!("expected a List") };
+            let k = crate::eval::typval::tv_list_first(p);
+            assert_eq!((*k).li_tv.value, TypvalValue::String(Some(b"a".to_vec())));
+            assert_eq!((*(*k).li_next).li_tv.value, TypvalValue::Number(1));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        let (ret, tv) = eval_str(b"items([10, 20])");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        unsafe {
+            let pair1 = (*crate::eval::typval::tv_list_first(l)).li_next;
+            let TypvalValue::List(p1) = (*pair1).li_tv.value else { panic!("expected a List") };
+            let k1 = crate::eval::typval::tv_list_first(p1);
+            assert_eq!((*k1).li_tv.value, TypvalValue::Number(1));
+            assert_eq!((*(*k1).li_next).li_tv.value, TypvalValue::Number(20));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        let (ret, tv) = eval_str(b"items(\"hi\")");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
         reset_globals_for_test();
     }
 
