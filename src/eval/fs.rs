@@ -4,10 +4,9 @@
 //! builtins: `delete()`, `getcwd()`, `isdirectory()`, `mkdir()`,
 //! `rename()`, `glob()`/`globpath()`, `readfile()`/`writefile()`, and
 //! more. Most need substantial not-yet-translated machinery
-//! (`vim_rename`'s cross-device-safe rename, `delete_recursive`'s
-//! directory-tree walk, `find_file_in_path_option`'s `'path'`-option
-//! search) - this file starts with the smallest, most self-contained
-//! subset.
+//! (`delete_recursive`'s directory-tree walk,
+//! `find_file_in_path_option`'s `'path'`-option search) - this file
+//! starts with the smallest, most self-contained subset.
 //!
 //! Translated: `isdirectory()` (via the already-existing
 //! [`crate::os::fs::os_isdir`]), `isabsolutepath()` (via the already-
@@ -49,6 +48,20 @@
 //! simply never been re-verified since. `getcwd()`'s own Windows-only
 //! `slash_adjust()` post-processing step is translated alongside, in
 //! `path.rs`.
+//!
+//! Also translated: `rename()` (via a new `vim_rename`, from
+//! `fileio.c`, hosted here alongside its only caller) - the common
+//! case (renaming within the same filesystem) via the already-
+//! existing [`crate::os::fs::os_fileinfo`]/[`crate::os::fs::os_remove`]/
+//! [`crate::os::fs::os_rename`]. Two deliberate, narrower-than-the-
+//! original simplifications, documented on `vim_rename` itself: the
+//! "same name" fast path uses plain byte equality instead of the
+//! original's own case/separator-style-normalizing `path_fnamecmp`
+//! (not yet translated), and a failed `os_rename` (typically a
+//! cross-filesystem move) `unimplemented!()`s instead of falling back
+//! to `vim_copyfile` (needs symlink-aware copying, not yet
+//! translated) - both narrow, honestly-documented gaps rather than a
+//! silently-wrong result.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 
@@ -269,6 +282,70 @@ pub(crate) unsafe fn f_pathshorten(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         Some(p) => rettv.value = TypvalValue::String(Some(unsafe { crate::path::shorten_dir_len(&p, trim_len) })),
     }
+}
+
+/// `rename({from}, {to})` - rename (or move) a file (`f_rename`,
+/// `eval/fs.c`, via [`vim_rename`]). Returns `0` on success, `-1` on
+/// failure (the original's own `check_secure()` guard is kept
+/// faithfully; a missing/non-UTF8 `{from}`/`{to}` is treated the same
+/// as a failed rename, matching this module's established
+/// `bytes_to_path` convention).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`]).
+pub(crate) unsafe fn f_rename(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let from = crate::eval::typval::tv_get_string(&argvars[0]);
+    let to = crate::eval::typval::tv_get_string(&argvars[1]);
+    let (Some(from_path), Some(to_path)) = (bytes_to_path(&from), bytes_to_path(&to)) else {
+        return;
+    };
+
+    rettv.value = TypvalValue::Number(i64::from(vim_rename(from_path, to_path)));
+}
+
+/// Rename (or move) a file, matching the original's own `vim_rename`
+/// (`fileio.c`) common-case behavior: renaming within the same
+/// filesystem.
+///
+/// Deliberately narrower than the original in two documented ways:
+/// - The "same name" fast path (`path_fnamecmp(from, to) == 0`) is
+///   approximated via plain byte equality rather than
+///   `path_fnamecmp`'s own case/separator-style-normalizing
+///   comparison (not yet translated) - identical on any case-sensitive
+///   filesystem, the common case on this crate's supported platforms.
+///   The original's own further `p_fic`-gated "different case, same
+///   name, needs a temp-file round-trip" sub-case
+///   (`rename_with_tmp`) is not modeled at all.
+/// - When `os_rename` itself fails (typically a cross-filesystem
+///   move), the original falls back to `vim_copyfile` (copy, then
+///   delete the source) - not yet translated (needs symlink-aware
+///   copying) - `unimplemented!()`s if actually reached, rather than
+///   silently reporting failure for what could be a legitimate move.
+///
+/// @return `0` on success, `-1` on failure (`from` doesn't exist).
+fn vim_rename(from: &std::path::Path, to: &std::path::Path) -> i32 {
+    if from.as_os_str() == to.as_os_str() {
+        return 0;
+    }
+
+    if crate::os::fs::os_fileinfo(from).is_none() {
+        return -1;
+    }
+
+    crate::os::fs::os_remove(to);
+
+    if crate::os::fs::os_rename(from, to) == crate::vim_defs::OK {
+        return 0;
+    }
+
+    unimplemented!("vim_rename(): os_rename failed, vim_copyfile fallback not yet translated");
 }
 
 /// Shared "resolve `{winnr}[, {tabnr}]` into `(scope, tabpage,
@@ -1176,5 +1253,95 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_haslocaldir(&[string(b"x")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    // --- f_rename / vim_rename ---
+
+    #[test]
+    fn rename_moves_a_real_file() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let from = std::env::temp_dir().join("nero_test_rename_from.txt");
+        let to = std::env::temp_dir().join("nero_test_rename_to.txt");
+        let _ = std::fs::remove_file(&to);
+        std::fs::write(&from, b"contents").unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_rename(&[string(from.to_str().unwrap().as_bytes()), string(to.to_str().unwrap().as_bytes())], &mut rettv);
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"contents");
+
+        std::fs::remove_file(&to).unwrap();
+    }
+
+    #[test]
+    fn rename_overwrites_an_existing_destination() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let from = std::env::temp_dir().join("nero_test_rename_overwrite_from.txt");
+        let to = std::env::temp_dir().join("nero_test_rename_overwrite_to.txt");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_rename(&[string(from.to_str().unwrap().as_bytes()), string(to.to_str().unwrap().as_bytes())], &mut rettv);
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+
+        std::fs::remove_file(&to).unwrap();
+    }
+
+    #[test]
+    fn rename_fails_when_from_does_not_exist() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_rename(
+                &[string(b"/definitely/does/not/exist/nero-test-rename-from"), string(b"/tmp/nero-test-rename-to")],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn rename_same_path_is_a_no_op_success() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        // Deliberately does NOT exist - `vim_rename`'s "same name" fast
+        // path returns success without ever checking `from`/`to` exist,
+        // matching the original's own early `path_fnamecmp` check
+        // (which runs before the "from exists" check).
+        let name: &[u8] = b"/definitely/does/not/exist/nero-test-rename-same";
+        let mut rettv = TypvalT::default();
+        unsafe { f_rename(&[string(name), string(name)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn rename_fails_and_secure_is_bumped_when_secure_is_set() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_rename(&[string(b"irrelevant-from"), string(b"irrelevant-to")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 2);
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
     }
 }
