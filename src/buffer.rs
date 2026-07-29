@@ -26,7 +26,10 @@
 //! header function, not from `buffer.c` itself - harvested for
 //! `drawscreen.c`'s `number_width`), `curbuf_reusable` (via already-
 //! existing `buf_is_empty`/`bt_quickfix`/`crate::undo::
-//! curbuf_is_changed`); and now that `eval/typval_defs.rs`'s
+//! curbuf_is_changed`), `buflist_name_nr` (via already-existing
+//! `buflist_findnr`/`buflist_findlnum` - returns `Option<(Vec<u8>,
+//! LinenrT)>` in place of the original's own out-parameters); and now
+//! that `eval/typval_defs.rs`'s
 //! `TypvalT`/`ChangedtickDictItem` are real (not opaque placeholders),
 //! `buf_get_changedtick`/`buf_set_changedtick`/`buf_inc_changedtick`/
 //! `buf_init_changedtick` - each skips only the real dict-watcher
@@ -509,6 +512,31 @@ pub unsafe fn buflist_findfmark(buf: &BufT) -> crate::mark_defs::FmarkT {
 pub unsafe fn buflist_findlnum(buf: &BufT) -> crate::pos_defs::LinenrT {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { buflist_findfmark(buf) }.mark.lnum
+}
+
+/// Look up buffer `fnum`'s own short file name and remembered line
+/// number (`buflist_name_nr`). Returns `Some((fname, lnum))` in place
+/// of the original's own `char **fname`/`linenr_T *lnum` out-
+/// parameters plus a separate `OK`/`FAIL` result - `None` exactly
+/// where the original returns `FAIL` (no such buffer, or the buffer
+/// has no short file name).
+///
+/// # Safety
+/// Forwarded from [`buflist_findnr`]/[`buflist_findlnum`]'s own
+/// safety docs.
+#[must_use]
+pub unsafe fn buflist_name_nr(fnum: i32) -> Option<(Vec<u8>, crate::pos_defs::LinenrT)> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { buflist_findnr(fnum) };
+    if buf.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*buf };
+    let fname = buf.b_fname.clone()?;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { buflist_findlnum(buf) };
+    Some((fname, lnum))
 }
 
 /// Get `b:changedtick` value. Faster than querying `b:`
@@ -1118,6 +1146,75 @@ mod tests {
     impl Drop for CurwinGuard {
         fn drop(&mut self) {
             unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+        }
+    }
+
+    /// Points `GLOBALS.lastbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching this file's own `CurbufGuard`/`CurwinGuard`).
+    struct LastbufGuard {
+        previous: *mut BufT,
+    }
+
+    impl LastbufGuard {
+        fn set(new_lastbuf: *mut BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = new_lastbuf;
+            LastbufGuard { previous }
+        }
+    }
+
+    impl Drop for LastbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn buflist_name_nr_returns_none_for_an_unknown_buffer_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = LastbufGuard::set(std::ptr::null_mut());
+        assert!(unsafe { buflist_name_nr(42) }.is_none());
+    }
+
+    #[test]
+    fn buflist_name_nr_returns_none_when_buffer_has_no_short_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 7, b_fname: None, ..Default::default() };
+        let _guard = LastbufGuard::set(&mut buf as *mut BufT);
+        assert!(unsafe { buflist_name_nr(7) }.is_none());
+    }
+
+    #[test]
+    fn buflist_name_nr_returns_the_short_name_and_lnum() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _curwin_guard = CurwinGuard::set(win_ptr);
+
+        let wi = Box::into_raw(Box::new(crate::buffer_defs::WinInfo {
+            wi_win: win_ptr,
+            wi_mark: crate::mark_defs::FmarkT {
+                mark: crate::pos_defs::PosT { lnum: 17, col: 0, coladd: 0 },
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let mut buf = BufT {
+            handle: 3,
+            b_fname: Some(b"foo.txt".to_vec()),
+            b_wininfo: vec![wi],
+            ..Default::default()
+        };
+        let _lastbuf_guard = LastbufGuard::set(&mut buf as *mut BufT);
+
+        let (fname, lnum) = unsafe { buflist_name_nr(3) }.expect("buffer 3 should be found");
+        assert_eq!(fname, b"foo.txt");
+        assert_eq!(lnum, 17);
+
+        unsafe {
+            drop(Box::from_raw(wi));
         }
     }
 }
