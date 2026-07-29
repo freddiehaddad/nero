@@ -20,15 +20,27 @@
 //! own module doc comment).
 //!
 //! Translated so far: `line_len`/`matching_chars`/`matching_chars_iwhite`
-//! - the core "how well do these two lines match" primitives (a
-//! longest-common-subsequence-style character count). The rest of the
-//! file (the N-dimensional tensor search itself) is translated
-//! incrementally in later commits.
+//! (the core "how well do these two lines match" primitives, a
+//! longest-common-subsequence-style character count) plus
+//! `count_n_matched_chars` (combines that pairwise across N
+//! participating lines) and `unwrap_indexes` (flattens an N-dimensional
+//! tensor coordinate into a row-major index). The rest of the file (the
+//! tensor search itself) is translated incrementally in later commits.
 //!
 //! Also note: `LN_MAX_BUFS`/`LN_DECISION_MAX` are declared here even
 //! though only used by later additions to this file, since they are
 //! genuine top-of-file constants in the original (`#define`s just above
 //! `diffcmppath_S`) rather than something specific to any one function.
+
+// This file's only real entry point, `linematch_nbuffers`, is not
+// translated yet (it lands in a later commit) - until then, nothing
+// calls these `static`-in-the-original private helpers outside their own
+// tests. #[allow(dead_code)] instead of prematurely making them `pub`
+// (misrepresenting the original's intended visibility) or deleting them
+// (losing verified, tested translation work ahead of its eventual use) -
+// the same convention already established in marktree.rs/move.rs/
+// undo.rs/userfunc.rs for helpers harvested ahead of their real caller.
+#![allow(dead_code)]
 
 /// Maximum number of buffers `linematch_nbuffers` can compare at once
 /// (`LN_MAX_BUFS`).
@@ -126,6 +138,60 @@ fn matching_chars_iwhite(m1: &[u8], m2: &[u8]) -> i32 {
     matching_chars(&strip(m1), &strip(m2))
 }
 
+/// Counts the matching characters between every pair of participating
+/// (non-`None`) lines in `sp`, normalizing the sum so that 3-or-more-way
+/// matches are scored comparably to a plain 2-way match
+/// (`count_n_matched_chars`).
+///
+/// `sp`'s `None` entries are the original's `sp[i]->ptr == NULL` check -
+/// a buffer not participating in this particular comparison.
+fn count_n_matched_chars(sp: &[Option<&[u8]>], iwhite: bool) -> i32 {
+    let mut matched_chars = 0i32;
+    let mut matched = 0i32;
+    for i in 0..sp.len() {
+        for j in (i + 1)..sp.len() {
+            if let (Some(a), Some(b)) = (sp[i], sp[j]) {
+                matched += 1;
+                matched_chars += if iwhite {
+                    matching_chars_iwhite(a, b)
+                } else {
+                    matching_chars(a, b)
+                };
+            }
+        }
+    }
+
+    // prioritize a match of 3 (or more lines) equally to a match of 2 lines
+    if matched >= 2 {
+        matched_chars *= 2;
+        matched_chars /= matched;
+    }
+
+    matched_chars
+}
+
+/// Flattens an N-dimensional tensor index `values` (one coordinate per
+/// dimension, dimension `k` ranging `0..=diff_len[k]`) into a single flat
+/// row-major index (`unwrap_indexes`).
+///
+/// `values` and `diff_len` must have the same length (the original's
+/// shared `ndiffs` parameter).
+fn unwrap_indexes(values: &[i32], diff_len: &[i32]) -> usize {
+    debug_assert_eq!(values.len(), diff_len.len());
+
+    let mut num_unwrap_scalar: usize = 1;
+    for &len in diff_len {
+        num_unwrap_scalar *= (len as usize) + 1;
+    }
+
+    let mut path_idx = 0;
+    for k in 0..diff_len.len() {
+        num_unwrap_scalar /= (diff_len[k] as usize) + 1;
+        path_idx += num_unwrap_scalar * (values[k] as usize);
+    }
+    path_idx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +246,74 @@ mod tests {
         // the original would read one byte past the end here. Must not
         // panic, and must still compare the real content correctly.
         assert_eq!(matching_chars_iwhite(b"abc", b"abc"), 3);
+    }
+
+    #[test]
+    fn count_n_matched_chars_two_buffers() {
+        assert_eq!(
+            count_n_matched_chars(&[Some(b"abc".as_slice()), Some(b"abc".as_slice())], false),
+            3
+        );
+    }
+
+    #[test]
+    fn count_n_matched_chars_skips_absent_buffers() {
+        // Only the Some/Some pair (index 0 and 2) should be compared.
+        let sp = [Some(b"abc".as_slice()), None, Some(b"abc".as_slice())];
+        assert_eq!(count_n_matched_chars(&sp, false), 3);
+    }
+
+    #[test]
+    fn count_n_matched_chars_normalizes_three_way_match() {
+        // 3 participating buffers -> 3 pairs, each scoring 3 -> summed
+        // to 9, then normalized by `*2/3` (matched == 3) -> 6.
+        let sp = [
+            Some(b"abc".as_slice()),
+            Some(b"abc".as_slice()),
+            Some(b"abc".as_slice()),
+        ];
+        assert_eq!(count_n_matched_chars(&sp, false), 6);
+    }
+
+    #[test]
+    fn count_n_matched_chars_none_participating_is_zero() {
+        assert_eq!(count_n_matched_chars(&[None, None], false), 0);
+    }
+
+    #[test]
+    fn count_n_matched_chars_respects_iwhite() {
+        // Both lines share a space character at a "corresponding" slot:
+        // raw comparison counts it as 1 matching character, but with
+        // iwhite stripping the space from both first, "ab" vs "xy" have
+        // nothing in common.
+        let sp = [Some(b"a b".as_slice()), Some(b"x y".as_slice())];
+        assert_eq!(count_n_matched_chars(&sp, false), 1);
+        assert_eq!(count_n_matched_chars(&sp, true), 0);
+    }
+
+    #[test]
+    fn unwrap_indexes_origin_is_zero() {
+        assert_eq!(unwrap_indexes(&[0, 0, 0], &[3, 2, 1]), 0);
+    }
+
+    #[test]
+    fn unwrap_indexes_end_is_last_cell() {
+        // The final coordinate (diff_len itself) must unwrap to the very
+        // last flat index: product(diff_len[k] + 1) - 1.
+        let diff_len = [3, 2, 1];
+        let memsize: usize = diff_len.iter().map(|&n| (n as usize) + 1).product();
+        assert_eq!(unwrap_indexes(&diff_len, &diff_len), memsize - 1);
+    }
+
+    #[test]
+    fn unwrap_indexes_matches_manual_row_major_2d() {
+        // A 2D (3+1) x (2+1) tensor: index (i, j) should unwrap to
+        // i * (2 + 1) + j, the standard row-major formula.
+        let diff_len = [3, 2];
+        for i in 0..=3 {
+            for j in 0..=2 {
+                assert_eq!(unwrap_indexes(&[i, j], &diff_len), (i as usize) * 3 + (j as usize));
+            }
+        }
     }
 }
