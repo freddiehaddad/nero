@@ -139,6 +139,13 @@
 //! `crate::context::is_ctx_win`. Its own debug-only `assert()` is
 //! likewise preserved as a `debug_assert!`.
 //!
+//! Also translated: `leaving_window`/`entering_window` (prompt-buffer
+//! Insert-mode bookkeeping run when switching away from/to a window -
+//! only ever does anything for a prompt-type buffer, via already-real
+//! `crate::buffer::bt_prompt`/`crate::context::is_ctx_win`,
+//! `GLOBALS.restart_edit`/`mode_displayed`/`clear_cmdline`/`Ins`/
+//! `State`, `BufT.b_prompt_insert`).
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1835,6 +1842,80 @@ pub unsafe fn can_close_floating_windows(tp: *const crate::buffer_defs::TabpageT
         wp = w.w_prev;
     }
     true
+}
+
+/// Called when leaving `win` (switching away from it, entering
+/// another tabpage, or `ctx_switch()`) - pairs with
+/// [`entering_window`]. Only matters for a prompt buffer
+/// (`leaving_window`).
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is a valid, non-null pointer to a live `BufT`. Touches
+/// `crate::globals::GLOBALS`.
+pub unsafe fn leaving_window(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *win };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *w.w_buffer };
+    // Not for a ctx window: it shows its buffer only temporarily.
+    if !crate::buffer::bt_prompt(Some(buf)) || crate::context::is_ctx_win(win) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+
+    // When leaving a prompt window stop Insert mode and perhaps
+    // restart it when entering that window again.
+    buf.b_prompt_insert = g.restart_edit;
+    if g.restart_edit != 0 && g.mode_displayed {
+        g.clear_cmdline = true; // unshow mode later
+    }
+    g.restart_edit = 0;
+
+    // When leaving the window (or closing the window) was done from a
+    // callback we need to break out of the Insert mode loop and
+    // restart Insert mode when entering the window again.
+    if (g.State & crate::state_defs::mode::INSERT as i32) != 0 && !g.Ins.stop_insert_mode {
+        g.Ins.stop_insert_mode = true;
+        if buf.b_prompt_insert == 0 {
+            buf.b_prompt_insert = i32::from(b'A');
+        }
+    }
+}
+
+/// Called when `win` becomes `curwin`: switching to it, entering its
+/// tabpage, or `ctx_restore()`. Pairs with [`leaving_window`]. Only
+/// matters for a prompt buffer (`entering_window`).
+///
+/// # Safety
+/// Same as [`leaving_window`].
+pub unsafe fn entering_window(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *win };
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *w.w_buffer };
+    // Not for a ctx window: it shows its buffer only temporarily.
+    if !crate::buffer::bt_prompt(Some(buf)) || crate::context::is_ctx_win(win) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+
+    // When switching to a prompt buffer that was in Insert mode,
+    // don't stop Insert mode, it may have been set in
+    // leaving_window().
+    if buf.b_prompt_insert != 0 {
+        g.Ins.stop_insert_mode = false;
+    }
+
+    // When entering the prompt window restart Insert mode if we were
+    // in Insert mode when we left it and not already in Insert mode.
+    if (g.State & crate::state_defs::mode::INSERT as i32) == 0 {
+        g.restart_edit = buf.b_prompt_insert;
+    }
 }
 
 #[cfg(test)]
@@ -4068,6 +4149,203 @@ mod tests {
 
         unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = prev_lastwin;
         unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    // ---- leaving_window / entering_window ----
+
+    /// Saves/restores `GLOBALS.restart_edit`/`mode_displayed`/
+    /// `clear_cmdline`/`Ins.stop_insert_mode`/`State` for the guard's
+    /// lifetime - the fields `leaving_window`/`entering_window` touch.
+    struct PromptWindowGlobalsGuard {
+        prev_restart_edit: i32,
+        prev_mode_displayed: bool,
+        prev_clear_cmdline: bool,
+        prev_stop_insert_mode: bool,
+        prev_state: i32,
+    }
+    impl PromptWindowGlobalsGuard {
+        fn set(restart_edit: i32, mode_displayed: bool, state: i32, stop_insert_mode: bool) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = PromptWindowGlobalsGuard {
+                prev_restart_edit: g.restart_edit,
+                prev_mode_displayed: g.mode_displayed,
+                prev_clear_cmdline: g.clear_cmdline,
+                prev_stop_insert_mode: g.Ins.stop_insert_mode,
+                prev_state: g.State,
+            };
+            g.restart_edit = restart_edit;
+            g.mode_displayed = mode_displayed;
+            g.clear_cmdline = false;
+            g.Ins.stop_insert_mode = stop_insert_mode;
+            g.State = state;
+            guard
+        }
+    }
+    impl Drop for PromptWindowGlobalsGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.restart_edit = self.prev_restart_edit;
+            g.mode_displayed = self.prev_mode_displayed;
+            g.clear_cmdline = self.prev_clear_cmdline;
+            g.Ins.stop_insert_mode = self.prev_stop_insert_mode;
+            g.State = self.prev_state;
+        }
+    }
+
+    #[test]
+    fn leaving_window_no_op_for_a_non_prompt_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PromptWindowGlobalsGuard::set(1, true, 0, false);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { leaving_window(win_ptr) };
+
+        // Nothing touched: restart_edit stays 1, b_prompt_insert stays 0.
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 1);
+        assert_eq!(unsafe { &*buf_ptr }.b_prompt_insert, 0);
+    }
+
+    #[test]
+    fn leaving_window_saves_restart_edit_and_clears_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PromptWindowGlobalsGuard::set(i32::from(b'i'), true, 0, false);
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { leaving_window(win_ptr) };
+
+        assert_eq!(unsafe { &*buf_ptr }.b_prompt_insert, i32::from(b'i'));
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 0);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.clear_cmdline);
+    }
+
+    #[test]
+    fn leaving_window_leaves_clear_cmdline_untouched_when_restart_edit_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PromptWindowGlobalsGuard::set(0, true, 0, false);
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { leaving_window(win_ptr) };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.clear_cmdline);
+    }
+
+    #[test]
+    fn leaving_window_stops_insert_mode_and_defaults_prompt_insert_to_a() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            PromptWindowGlobalsGuard::set(0, false, crate::state_defs::mode::INSERT as i32, false);
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { leaving_window(win_ptr) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Ins.stop_insert_mode);
+        // b_prompt_insert was 0 (from restart_edit == 0), so the
+        // insert-mode-interrupted branch defaults it to 'A'.
+        assert_eq!(unsafe { &*buf_ptr }.b_prompt_insert, i32::from(b'A'));
+    }
+
+    #[test]
+    fn leaving_window_does_not_stop_insert_mode_when_already_stopped() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            PromptWindowGlobalsGuard::set(0, false, crate::state_defs::mode::INSERT as i32, true);
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_bt: Some(b"prompt".to_vec()), ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { leaving_window(win_ptr) };
+
+        // Already true beforehand; b_prompt_insert stays 0 (the
+        // "defaults to 'A'" branch is only reached when
+        // stop_insert_mode is newly set here).
+        assert_eq!(unsafe { &*buf_ptr }.b_prompt_insert, 0);
+    }
+
+    #[test]
+    fn entering_window_no_op_for_a_non_prompt_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PromptWindowGlobalsGuard::set(0, false, 0, true);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { entering_window(win_ptr) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Ins.stop_insert_mode);
+    }
+
+    #[test]
+    fn entering_window_unsets_stop_insert_mode_when_b_prompt_insert_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            PromptWindowGlobalsGuard::set(0, false, crate::state_defs::mode::INSERT as i32, true);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_prompt_insert: i32::from(b'A'),
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { entering_window(win_ptr) };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Ins.stop_insert_mode);
+    }
+
+    #[test]
+    fn entering_window_restarts_insert_mode_when_not_already_in_insert_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PromptWindowGlobalsGuard::set(0, false, 0, false);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_prompt_insert: i32::from(b'A'),
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { entering_window(win_ptr) };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, i32::from(b'A'));
+    }
+
+    #[test]
+    fn entering_window_leaves_restart_edit_untouched_when_already_in_insert_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            PromptWindowGlobalsGuard::set(7, false, crate::state_defs::mode::INSERT as i32, false);
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_prompt_insert: i32::from(b'A'),
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe { entering_window(win_ptr) };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 7);
     }
 
     #[test]
