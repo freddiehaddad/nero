@@ -131,6 +131,14 @@
 //! `debug_assert!`, matching this crate's established policy for real
 //! internal-invariant checks.
 //!
+//! Also translated: `can_close_floating_windows` (whether every
+//! floating window stacked at the top of a tabpage's window list can
+//! be closed without losing unsaved changes), via already-real
+//! `WinT.w_prev`/`w_floating`/`w_buffer`, `BufT.b_nwindows`,
+//! `crate::undo::buf_is_changed`, `crate::buffer::buf_hide`,
+//! `crate::context::is_ctx_win`. Its own debug-only `assert()` is
+//! likewise preserved as a `debug_assert!`.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1781,6 +1789,52 @@ pub unsafe fn last_window(win: *const WinT) -> bool {
     let first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { &*first_tabpage }.tp_next.is_null()
+}
+
+/// Check if floating windows in tabpage `tp` can be closed
+/// (`can_close_floating_windows`). `tp` must be null for the current
+/// tabpage. Must not be called when the ctx window is in use.
+///
+/// The original's own `assert()` (a debug-only invariant check, not
+/// functional logic) is preserved as a `debug_assert!`.
+///
+/// # Safety
+/// `tp`, if non-null, must be a valid pointer to a live `TabpageT`
+/// whose own `tp_lastwin` is a valid, non-null pointer to a live
+/// `WinT`. `crate::globals::GLOBALS.lastwin` must likewise be valid
+/// and non-null when `tp` is null. Whichever chain is walked (via
+/// `w_prev`, for as long as `w_floating` is true) must consist
+/// entirely of valid, live `WinT` pointers, each with a valid,
+/// non-null `w_buffer`.
+#[must_use]
+pub unsafe fn can_close_floating_windows(tp: *const crate::buffer_defs::TabpageT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    debug_assert!(
+        !std::ptr::eq(tp, g.curtab.cast_const())
+            && (!tp.is_null() || !crate::context::is_ctx_win(g.lastwin))
+    );
+    let mut wp = if !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_lastwin
+    } else {
+        g.lastwin
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    while unsafe { &*wp }.w_floating {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &mut *w.w_buffer };
+        // SAFETY: forwarded from this function's own safety doc.
+        let need_hide = unsafe { crate::undo::buf_is_changed(buf) } && buf.b_nwindows <= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        if need_hide && !unsafe { crate::buffer::buf_hide(buf) } {
+            return false;
+        }
+        wp = w.w_prev;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -3848,6 +3902,172 @@ mod tests {
         assert!(unsafe { one_window(win_ptr, std::ptr::null()) });
 
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    // ---- can_close_floating_windows ----
+
+    #[test]
+    fn can_close_floating_windows_true_when_no_floating_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_floating: false, ..win_with_buffer(1, buf_ptr) };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { can_close_floating_windows(tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn can_close_floating_windows_true_when_floating_window_buffer_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut normal_buf = crate::buffer_defs::BufT::default();
+        let normal_buf_ptr = &mut normal_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_win = WinT { w_floating: false, ..win_with_buffer(1, normal_buf_ptr) };
+        let normal_win_ptr = &mut normal_win as *mut WinT;
+
+        let mut float_buf = crate::buffer_defs::BufT { b_changed: 0, ..Default::default() };
+        let float_buf_ptr = &mut float_buf as *mut crate::buffer_defs::BufT;
+        let mut float_win = WinT {
+            w_floating: true,
+            w_prev: normal_win_ptr,
+            ..win_with_buffer(2, float_buf_ptr)
+        };
+        let float_win_ptr = &mut float_win as *mut WinT;
+
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: float_win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { can_close_floating_windows(tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn can_close_floating_windows_true_when_changed_buffer_has_other_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut normal_buf = crate::buffer_defs::BufT::default();
+        let normal_buf_ptr = &mut normal_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_win = WinT { w_floating: false, ..win_with_buffer(1, normal_buf_ptr) };
+        let normal_win_ptr = &mut normal_win as *mut WinT;
+
+        // b_changed set, but b_nwindows > 1 means need_hide is false
+        // regardless (the buffer is still visible in ANOTHER window).
+        let mut float_buf =
+            crate::buffer_defs::BufT { b_changed: 1, b_nwindows: 2, ..Default::default() };
+        let float_buf_ptr = &mut float_buf as *mut crate::buffer_defs::BufT;
+        let mut float_win = WinT {
+            w_floating: true,
+            w_prev: normal_win_ptr,
+            ..win_with_buffer(2, float_buf_ptr)
+        };
+        let float_win_ptr = &mut float_win as *mut WinT;
+
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: float_win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { can_close_floating_windows(tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn can_close_floating_windows_true_when_changed_buffer_can_be_hidden() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut normal_buf = crate::buffer_defs::BufT::default();
+        let normal_buf_ptr = &mut normal_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_win = WinT { w_floating: false, ..win_with_buffer(1, normal_buf_ptr) };
+        let normal_win_ptr = &mut normal_win as *mut WinT;
+
+        let mut float_buf = crate::buffer_defs::BufT {
+            b_changed: 1,
+            b_nwindows: 1,
+            b_p_bh: Some(b"hide".to_vec()),
+            ..Default::default()
+        };
+        let float_buf_ptr = &mut float_buf as *mut crate::buffer_defs::BufT;
+        let mut float_win = WinT {
+            w_floating: true,
+            w_prev: normal_win_ptr,
+            ..win_with_buffer(2, float_buf_ptr)
+        };
+        let float_win_ptr = &mut float_win as *mut WinT;
+
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: float_win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { can_close_floating_windows(tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn can_close_floating_windows_false_when_changed_buffer_cannot_be_hidden() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut normal_buf = crate::buffer_defs::BufT::default();
+        let normal_buf_ptr = &mut normal_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_win = WinT { w_floating: false, ..win_with_buffer(1, normal_buf_ptr) };
+        let normal_win_ptr = &mut normal_win as *mut WinT;
+
+        // b_p_bh = "unload" -> buf_hide always returns false, regardless
+        // of the global 'hidden' option.
+        let mut float_buf = crate::buffer_defs::BufT {
+            b_changed: 1,
+            b_nwindows: 1,
+            b_p_bh: Some(b"unload".to_vec()),
+            ..Default::default()
+        };
+        let float_buf_ptr = &mut float_buf as *mut crate::buffer_defs::BufT;
+        let mut float_win = WinT {
+            w_floating: true,
+            w_prev: normal_win_ptr,
+            ..win_with_buffer(2, float_buf_ptr)
+        };
+        let float_win_ptr = &mut float_win as *mut WinT;
+
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: float_win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(!unsafe { can_close_floating_windows(tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn can_close_floating_windows_null_tp_uses_globals_lastwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_floating: false, ..win_with_buffer(1, buf_ptr) };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_lastwin = unsafe { crate::globals::GLOBALS.get_mut() }.lastwin;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = win_ptr;
+        // curtab must be some real, non-null tabpage DIFFERENT from the
+        // null `tp` passed below, matching a real running session
+        // (curtab is never null) and satisfying the original's own
+        // `tp != curtab` debug assertion.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = tp_ptr;
+
+        assert!(unsafe { can_close_floating_windows(std::ptr::null()) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = prev_lastwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
     }
 
     #[test]
