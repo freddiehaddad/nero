@@ -81,6 +81,7 @@ pub mod memline_defs;
 pub mod memory;
 pub mod memory_defs;
 pub mod menu_defs;
+pub mod message;
 #[path = "move.rs"]
 pub mod r#move;
 pub mod normal_defs;
