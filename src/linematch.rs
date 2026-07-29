@@ -21,10 +21,11 @@
 //!
 //! Translated so far: `line_len`/`matching_chars`/`matching_chars_iwhite`
 //! (the core "how well do these two lines match" primitives, a
-//! longest-common-subsequence-style character count) plus
-//! `count_n_matched_chars` (combines that pairwise across N
-//! participating lines) and `unwrap_indexes` (flattens an N-dimensional
-//! tensor coordinate into a row-major index). The rest of the file (the
+//! longest-common-subsequence-style character count), `count_n_matched_chars`
+//! (combines that pairwise across N participating lines), `unwrap_indexes`
+//! (flattens an N-dimensional tensor coordinate into a row-major index),
+//! and [`fastforward_buf_to_lnum`] (advances a multi-line buffer forward
+//! to the start of a given line number). The rest of the file (the
 //! tensor search itself) is translated incrementally in later commits.
 //!
 //! Also note: `LN_MAX_BUFS`/`LN_DECISION_MAX` are declared here even
@@ -192,6 +193,31 @@ fn unwrap_indexes(values: &[i32], diff_len: &[i32]) -> usize {
     path_idx
 }
 
+/// Advances `s` forward past `lnum - 1` newlines, returning the
+/// remaining buffer starting at the beginning of line `lnum`
+/// (`fastforward_buf_to_lnum`).
+///
+/// If `s` runs out of newlines before reaching `lnum` (fewer than
+/// `lnum - 1` lines remain), returns the empty slice - matching the
+/// original's own `{ .ptr = NULL, .size = 0 }` result in that case.
+///
+/// Unlike this file's other helpers (all `static` in the original),
+/// this one has real external linkage in the original C (also called
+/// directly by `lua/xdiff.c`'s `vim.diff()` binding, not just internally
+/// by `linematch_nbuffers`), so it is `pub` here too.
+pub fn fastforward_buf_to_lnum(mut s: &[u8], lnum: crate::pos_defs::LinenrT) -> &[u8] {
+    for _ in 0..(lnum - 1) {
+        match s.iter().position(|&b| b == b'\n') {
+            Some(pos) => s = &s[pos + 1..],
+            None => {
+                s = &[];
+                break;
+            }
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +341,30 @@ mod tests {
                 assert_eq!(unwrap_indexes(&[i, j], &diff_len), (i as usize) * 3 + (j as usize));
             }
         }
+    }
+
+    #[test]
+    fn fastforward_buf_to_lnum_lnum_1_is_a_no_op() {
+        assert_eq!(fastforward_buf_to_lnum(b"one\ntwo\nthree", 1), b"one\ntwo\nthree");
+    }
+
+    #[test]
+    fn fastforward_buf_to_lnum_skips_to_the_right_line() {
+        assert_eq!(fastforward_buf_to_lnum(b"one\ntwo\nthree", 2), b"two\nthree");
+        assert_eq!(fastforward_buf_to_lnum(b"one\ntwo\nthree", 3), b"three");
+    }
+
+    #[test]
+    fn fastforward_buf_to_lnum_past_the_end_is_empty() {
+        // Only 3 lines exist; asking for line 4 (or beyond) runs out of
+        // newlines before getting there.
+        assert_eq!(fastforward_buf_to_lnum(b"one\ntwo\nthree", 4), b"");
+        assert_eq!(fastforward_buf_to_lnum(b"one\ntwo\nthree", 100), b"");
+    }
+
+    #[test]
+    fn fastforward_buf_to_lnum_empty_buffer() {
+        assert_eq!(fastforward_buf_to_lnum(b"", 1), b"");
+        assert_eq!(fastforward_buf_to_lnum(b"", 2), b"");
     }
 }
