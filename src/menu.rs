@@ -8,7 +8,13 @@
 //! *names*, needing only [`crate::menu_defs`]'s already-translated
 //! struct shapes - [`menu_is_menubar`], [`menu_is_popup`],
 //! [`menu_is_toolbar`], [`menu_is_winbar`], [`menu_is_separator`],
-//! [`menu_name_equal`] (and its own helper, `menu_namecmp`).
+//! [`menu_name_equal`] (and its own helper, `menu_namecmp`),
+//! [`menu_is_hidden`]; and the current-mode resolvers `get_menu_mode`
+//! (private, matching the original's own `static`) and
+//! [`get_menu_mode_flag`], needing only already-real `GLOBALS.State`/
+//! `Visual.active`/`Visual.select`/`finish_op` plus
+//! `crate::menu_defs::menu_index`/`menu_mode` (both already
+//! translated ahead of this file, from `menu_defs.h`).
 //!
 //! Deferred: everything else - the whole menu tree (`root_menu`/
 //! `get_root_menu`), `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
@@ -95,6 +101,80 @@ pub fn menu_name_equal(name: &[u8], menu: &VimMenu) -> bool {
         return true;
     }
     menu_namecmp(name, menu.name.as_deref()) || menu_namecmp(name, menu.dname.as_deref())
+}
+
+/// Whether `name` is a hidden menu name: starts with [`MNU_HIDDEN_CHAR`]
+/// (`']'`), or is a `PopUp` menu whose 6th byte is present (i.e. has
+/// something following the plain `"PopUp"` prefix beyond a bare mode
+/// suffix - matching the original's own `name[5] != NUL` check exactly)
+/// (`menu_is_hidden`).
+#[must_use]
+pub fn menu_is_hidden(name: &[u8]) -> bool {
+    name.first() == Some(&MNU_HIDDEN_CHAR) || (menu_is_popup(name) && name.get(5).is_some())
+}
+
+/// Resolve the current mode into a [`crate::menu_defs::menu_index`]
+/// value, or `INVALID` if none of the recognized modes apply
+/// (`get_menu_mode`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS` must be a valid, initialized singleton
+/// (same requirement as every other function reading it).
+#[must_use]
+unsafe fn get_menu_mode() -> i32 {
+    use crate::menu_defs::menu_index;
+    use crate::state_defs::mode;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+
+    if g.State & mode::TERMINAL as i32 != 0 {
+        return menu_index::TERMINAL;
+    }
+    if g.Visual.active {
+        if g.Visual.select {
+            return menu_index::SELECT;
+        }
+        return menu_index::VISUAL;
+    }
+    if g.State & mode::INSERT as i32 != 0 {
+        return menu_index::INSERT;
+    }
+    if g.State & mode::CMDLINE as i32 != 0
+        || g.State == mode::ASKMORE as i32
+        || g.State == mode::HITRETURN as i32
+    {
+        return menu_index::CMDLINE;
+    }
+    if g.finish_op {
+        return menu_index::OP_PENDING;
+    }
+    if g.State & mode::NORMAL as i32 != 0 {
+        return menu_index::NORMAL;
+    }
+    if g.State & mode::LANGMAP as i32 != 0 {
+        // must be a "r" command, like Insert mode
+        return menu_index::INSERT;
+    }
+    menu_index::INVALID
+}
+
+/// The bit-flag ([`crate::menu_defs::menu_mode`]) form of
+/// `get_menu_mode()` - `0` when no recognized mode applies
+/// (`get_menu_mode_flag`).
+///
+/// # Safety
+/// Same as `get_menu_mode()`.
+#[must_use]
+pub unsafe fn get_menu_mode_flag() -> i32 {
+    use crate::menu_defs::menu_index;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mode = unsafe { get_menu_mode() };
+    if mode == menu_index::INVALID {
+        return 0;
+    }
+    1 << mode
 }
 
 #[cfg(test)]
@@ -187,5 +267,140 @@ mod tests {
         assert!(menu_name_equal(b"File", &menu));
         assert!(menu_name_equal("Fichier".as_bytes(), &menu));
         assert!(!menu_name_equal(b"Edit", &menu));
+    }
+
+    #[test]
+    fn menu_is_hidden_true_for_leading_hidden_char() {
+        assert!(menu_is_hidden(b"]File"));
+    }
+
+    #[test]
+    fn menu_is_hidden_true_for_a_popup_with_a_mode_suffix() {
+        // "PopUp" is exactly 5 bytes; a 6th byte present (e.g. the "i"
+        // in "PopUpi") means name[5] != NUL in the original.
+        assert!(menu_is_hidden(b"PopUpi"));
+    }
+
+    #[test]
+    fn menu_is_hidden_false_for_a_bare_popup_name() {
+        // "PopUp" alone has no 6th byte - name[5] == NUL originally.
+        assert!(!menu_is_hidden(b"PopUp"));
+    }
+
+    #[test]
+    fn menu_is_hidden_false_for_an_ordinary_name() {
+        assert!(!menu_is_hidden(b"File"));
+        assert!(!menu_is_hidden(b""));
+    }
+
+    /// RAII guard restoring the `GLOBALS` fields `get_menu_mode`/
+    /// `get_menu_mode_flag` read, on drop (even on test panic).
+    struct MenuModeGuard {
+        prev_state: i32,
+        prev_visual_active: bool,
+        prev_visual_select: bool,
+        prev_finish_op: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl MenuModeGuard {
+        fn set(state: i32, visual_active: bool, visual_select: bool, finish_op: bool) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = Self {
+                prev_state: g.State,
+                prev_visual_active: g.Visual.active,
+                prev_visual_select: g.Visual.select,
+                prev_finish_op: g.finish_op,
+                _lock,
+            };
+            g.State = state;
+            g.Visual.active = visual_active;
+            g.Visual.select = visual_select;
+            g.finish_op = finish_op;
+            guard
+        }
+    }
+
+    impl Drop for MenuModeGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.State = self.prev_state;
+            g.Visual.active = self.prev_visual_active;
+            g.Visual.select = self.prev_visual_select;
+            g.finish_op = self.prev_finish_op;
+        }
+    }
+
+    #[test]
+    fn get_menu_mode_flag_terminal() {
+        let _guard = MenuModeGuard::set(crate::state_defs::mode::TERMINAL as i32, false, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::TERMINAL);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_visual_and_select() {
+        {
+            let _guard = MenuModeGuard::set(crate::state_defs::mode::NORMAL as i32, true, false, false);
+            assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::VISUAL);
+        }
+        {
+            let _guard = MenuModeGuard::set(crate::state_defs::mode::NORMAL as i32, true, true, false);
+            assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::SELECT);
+        }
+    }
+
+    #[test]
+    fn get_menu_mode_flag_insert() {
+        let _guard = MenuModeGuard::set(crate::state_defs::mode::INSERT as i32, false, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::INSERT);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_cmdline_via_bit_and_via_exact_states() {
+        {
+            let _guard = MenuModeGuard::set(crate::state_defs::mode::CMDLINE as i32, false, false, false);
+            assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::CMDLINE);
+        }
+        {
+            let _guard = MenuModeGuard::set(crate::state_defs::mode::ASKMORE as i32, false, false, false);
+            assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::CMDLINE);
+        }
+        {
+            let _guard = MenuModeGuard::set(crate::state_defs::mode::HITRETURN as i32, false, false, false);
+            assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::CMDLINE);
+        }
+    }
+
+    #[test]
+    fn get_menu_mode_flag_op_pending() {
+        let _guard = MenuModeGuard::set(0, false, false, true);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::OP_PENDING);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_normal() {
+        let _guard = MenuModeGuard::set(crate::state_defs::mode::NORMAL as i32, false, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::NORMAL);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_langmap_reports_insert() {
+        let _guard = MenuModeGuard::set(crate::state_defs::mode::LANGMAP as i32, false, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::INSERT);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_invalid_is_zero() {
+        let _guard = MenuModeGuard::set(0, false, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, 0);
+    }
+
+    #[test]
+    fn get_menu_mode_flag_terminal_takes_priority_over_visual() {
+        // TERMINAL is checked FIRST in the original, even if Visual
+        // happens to also be active.
+        let _guard = MenuModeGuard::set(crate::state_defs::mode::TERMINAL as i32, true, false, false);
+        assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::TERMINAL);
     }
 }
