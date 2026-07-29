@@ -24,7 +24,9 @@
 //! `buf_is_empty` (now tractable now that `memline.c`'s `ml_get_buf`
 //! exists), `buffer.h`'s `buf_meta_total` (a tiny `static inline`
 //! header function, not from `buffer.c` itself - harvested for
-//! `drawscreen.c`'s `number_width`); and now that `eval/typval_defs.rs`'s
+//! `drawscreen.c`'s `number_width`), `curbuf_reusable` (via already-
+//! existing `buf_is_empty`/`bt_quickfix`/`crate::undo::
+//! curbuf_is_changed`); and now that `eval/typval_defs.rs`'s
 //! `TypvalT`/`ChangedtickDictItem` are real (not opaque placeholders),
 //! `buf_get_changedtick`/`buf_set_changedtick`/`buf_inc_changedtick`/
 //! `buf_init_changedtick` - each skips only the real dict-watcher
@@ -320,6 +322,33 @@ pub unsafe fn buf_hide(buf: &BufT) -> bool {
 #[must_use]
 pub unsafe fn buf_is_empty(buf: &mut BufT) -> bool {
     buf.b_ml.ml_line_count == 1 && unsafe { crate::memline::ml_get_buf(buf, 1) }[0] == 0
+}
+
+/// Return `true` if the current buffer's memory can be re-used, e.g.
+/// for `":enew"` (`curbuf_reusable`). Reads `crate::globals::GLOBALS
+/// .curbuf` directly (matching the original's own unconditional
+/// `curbuf` reliance).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`, if non-null, must be a valid
+/// pointer to a live `BufT`, and its `b_ml.ml_mfp` (if non-null) must
+/// be a valid pointer to a live `MemfileT` (forwarded to
+/// [`buf_is_empty`]'s own requirement).
+#[must_use]
+pub unsafe fn curbuf_reusable() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    if curbuf.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *curbuf };
+    buf.b_ffname.is_none()
+        && buf.b_nwindows <= 1
+        && buf.terminal.is_null()
+        && (buf.b_ml.ml_mfp.is_null() || unsafe { buf_is_empty(buf) })
+        && !bt_quickfix(Some(buf))
+        && !unsafe { crate::undo::curbuf_is_changed() }
 }
 
 /// Return the total count of a given kind of extmark metadata in
@@ -840,6 +869,60 @@ mod tests {
     impl Drop for CurbufGuard {
         fn drop(&mut self) {
             unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn curbuf_reusable_false_when_curbuf_is_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CurbufGuard::set(std::ptr::null_mut());
+        assert!(!unsafe { curbuf_reusable() });
+    }
+
+    #[test]
+    fn curbuf_reusable_true_for_a_fresh_unnamed_empty_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(unsafe { curbuf_reusable() });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn curbuf_reusable_false_when_buffer_has_a_filename() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        buf.b_ffname = Some(b"/tmp/example.txt".to_vec());
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(!unsafe { curbuf_reusable() });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn curbuf_reusable_false_when_more_than_one_window_shows_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        buf.b_nwindows = 2;
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(!unsafe { curbuf_reusable() });
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
         }
     }
 
