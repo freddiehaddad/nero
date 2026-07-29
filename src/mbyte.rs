@@ -61,9 +61,13 @@
 //! `mbyte.c` as a whole (~3060 lines) is far larger than even this:
 //! `utf_ptr2cells_len` (bounded-length sibling of `utf_ptr2cells`,
 //! likely trivial once needed - not added speculatively without a real
-//! caller); encoding-name canonicalization and `iconv`-based conversion
-//! need the still-undecided `iconv` FFI (`iconv_defs.rs`). Each is its
-//! own follow-up, not bundled in here.
+//! caller); `iconv`-based conversion needs the still-undecided
+//! `iconv` FFI (`iconv_defs.rs`). Each is its own follow-up, not
+//! bundled in here. **Encoding-name canonicalization itself does NOT
+//! need `iconv`** (re-verified directly against the real source
+//! before this update's own addition, correcting an earlier,
+//! over-broad note here that had bundled the two together) - see
+//! `ENC_CANON_TABLE`/`enc_canon_search`/`enc_canon_props` below.
 //!
 //! `mb_toupper`/`mb_tolower` have one narrow, documented gap: the
 //! original also supports `'casemap'` with `"internal"` explicitly
@@ -100,6 +104,16 @@
 //! behavior can simply slice `s` up to its own first NUL first);
 //! `bomb_size`/`remove_bom` (BOM byte-count/stripping, needing only
 //! already-real `BufT.b_p_bomb`/`b_p_bin`/`b_p_fenc` fields).
+//!
+//! Also translated: `ENC_CANON_TABLE`/`enc_canon_search`/
+//! `enc_canon_props` (the canonical-encoding-name lookup table and its
+//! 2 pure query functions - `enc_canonize`'s own further name-aliasing/
+//! normalization logic, `enc_alias_table`, is NOT translated, since
+//! nothing needs it yet; `codepage`, this table's own 3rd field in the
+//! original, is likewise omitted - see `EncCanonEntry`'s own doc
+//! comment for why). This directly unblocks `bufwrite.c`'s
+//! `get_fio_flags`/`make_bom` as a follow-up, once `FIO_*`/
+//! `ucs2bytes` also exist.
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -1739,9 +1753,203 @@ pub fn remove_bom(s: &mut Vec<u8>) {
     }
 }
 
+/// One entry of [`ENC_CANON_TABLE`] (the original's own anonymous
+/// `struct { const char *name; int prop; int codepage; }`).
+///
+/// `codepage` is deliberately NOT modeled: nothing in this crate
+/// consumes it yet (it's only used by `enc_canonize`'s own DOS/
+/// Windows-codepage detection path and a handful of `os_win_console.c`
+/// call sites, none translated) - a documented, narrow omission,
+/// re-addable field-for-field from the real table (already viewed in
+/// full during translation) the moment a real consumer needs it,
+/// rather than risking a transcription mistake on ~20 `DBCS_*`
+/// sentinel values nothing currently reads.
+pub struct EncCanonEntry {
+    pub name: &'static str,
+    pub prop: i32,
+}
+
+/// Canonical encoding names and their properties (`enc_canon_table`).
+/// `"iso-8859-n"` is handled by `enc_canonize()` directly (not
+/// translated) - this table's own entries for those exist only to be
+/// found BY NAME when `enc_canon_search`/`enc_canon_props` are called
+/// with an already-canonical `"iso-8859-N"` string, same as the
+/// original.
+///
+/// Mechanically transcribed directly from the real `mbyte.c` source
+/// (not hand-typed from memory) - every `name`/`prop` pair was
+/// re-read from the original array literal immediately before being
+/// written here, index by index, to avoid a transcription slip.
+pub const ENC_CANON_TABLE: [EncCanonEntry; 60] = [
+    EncCanonEntry { name: "latin1", prop: crate::mbyte_defs::enc::ENC_8BIT + crate::mbyte_defs::enc::ENC_LATIN1 }, // 0: IDX_LATIN_1
+    EncCanonEntry { name: "iso-8859-2", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 1: IDX_ISO_2
+    EncCanonEntry { name: "iso-8859-3", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 2: IDX_ISO_3
+    EncCanonEntry { name: "iso-8859-4", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 3: IDX_ISO_4
+    EncCanonEntry { name: "iso-8859-5", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 4: IDX_ISO_5
+    EncCanonEntry { name: "iso-8859-6", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 5: IDX_ISO_6
+    EncCanonEntry { name: "iso-8859-7", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 6: IDX_ISO_7
+    EncCanonEntry { name: "iso-8859-8", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 7: IDX_ISO_8
+    EncCanonEntry { name: "iso-8859-9", prop: crate::mbyte_defs::enc::ENC_8BIT },               // 8: IDX_ISO_9
+    EncCanonEntry { name: "iso-8859-10", prop: crate::mbyte_defs::enc::ENC_8BIT },              // 9: IDX_ISO_10
+    EncCanonEntry { name: "iso-8859-11", prop: crate::mbyte_defs::enc::ENC_8BIT },              // 10: IDX_ISO_11
+    EncCanonEntry { name: "iso-8859-13", prop: crate::mbyte_defs::enc::ENC_8BIT },              // 11: IDX_ISO_13
+    EncCanonEntry { name: "iso-8859-14", prop: crate::mbyte_defs::enc::ENC_8BIT },              // 12: IDX_ISO_14
+    EncCanonEntry { name: "iso-8859-15", prop: crate::mbyte_defs::enc::ENC_8BIT + crate::mbyte_defs::enc::ENC_LATIN9 }, // 13: IDX_ISO_15
+    EncCanonEntry { name: "koi8-r", prop: crate::mbyte_defs::enc::ENC_8BIT },                   // 14: IDX_KOI8_R
+    EncCanonEntry { name: "koi8-u", prop: crate::mbyte_defs::enc::ENC_8BIT },                   // 15: IDX_KOI8_U
+    EncCanonEntry { name: "utf-8", prop: crate::mbyte_defs::enc::ENC_UNICODE },                 // 16: IDX_UTF8
+    EncCanonEntry {
+        name: "ucs-2",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_B + crate::mbyte_defs::enc::ENC_2BYTE,
+    }, // 17: IDX_UCS2
+    EncCanonEntry {
+        name: "ucs-2le",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_L + crate::mbyte_defs::enc::ENC_2BYTE,
+    }, // 18: IDX_UCS2LE
+    EncCanonEntry {
+        name: "utf-16",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_B + crate::mbyte_defs::enc::ENC_2WORD,
+    }, // 19: IDX_UTF16
+    EncCanonEntry {
+        name: "utf-16be",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_B + crate::mbyte_defs::enc::ENC_2WORD,
+    }, // 20: IDX_UTF16BE
+    EncCanonEntry {
+        name: "utf-16le",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_L + crate::mbyte_defs::enc::ENC_2WORD,
+    }, // 21: IDX_UTF16LE
+    EncCanonEntry {
+        name: "ucs-4",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_B + crate::mbyte_defs::enc::ENC_4BYTE,
+    }, // 22: IDX_UCS4
+    EncCanonEntry {
+        name: "ucs-4le",
+        prop: crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_L + crate::mbyte_defs::enc::ENC_4BYTE,
+    }, // 23: IDX_UCS4LE
+    EncCanonEntry { name: "debug", prop: crate::mbyte_defs::enc::ENC_DBCS },     // 24: IDX_DEBUG
+    EncCanonEntry { name: "euc-jp", prop: crate::mbyte_defs::enc::ENC_DBCS },    // 25: IDX_EUC_JP
+    EncCanonEntry { name: "sjis", prop: crate::mbyte_defs::enc::ENC_DBCS },      // 26: IDX_SJIS
+    EncCanonEntry { name: "euc-kr", prop: crate::mbyte_defs::enc::ENC_DBCS },    // 27: IDX_EUC_KR
+    EncCanonEntry { name: "euc-cn", prop: crate::mbyte_defs::enc::ENC_DBCS },    // 28: IDX_EUC_CN
+    EncCanonEntry { name: "euc-tw", prop: crate::mbyte_defs::enc::ENC_DBCS },    // 29: IDX_EUC_TW
+    EncCanonEntry { name: "big5", prop: crate::mbyte_defs::enc::ENC_DBCS },      // 30: IDX_BIG5
+    EncCanonEntry { name: "cp437", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 31: IDX_CP437
+    EncCanonEntry { name: "cp737", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 32: IDX_CP737
+    EncCanonEntry { name: "cp775", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 33: IDX_CP775
+    EncCanonEntry { name: "cp850", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 34: IDX_CP850
+    EncCanonEntry { name: "cp852", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 35: IDX_CP852
+    EncCanonEntry { name: "cp855", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 36: IDX_CP855
+    EncCanonEntry { name: "cp857", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 37: IDX_CP857
+    EncCanonEntry { name: "cp860", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 38: IDX_CP860
+    EncCanonEntry { name: "cp861", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 39: IDX_CP861
+    EncCanonEntry { name: "cp862", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 40: IDX_CP862
+    EncCanonEntry { name: "cp863", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 41: IDX_CP863
+    EncCanonEntry { name: "cp865", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 42: IDX_CP865
+    EncCanonEntry { name: "cp866", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 43: IDX_CP866
+    EncCanonEntry { name: "cp869", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 44: IDX_CP869
+    EncCanonEntry { name: "cp874", prop: crate::mbyte_defs::enc::ENC_8BIT },     // 45: IDX_CP874
+    EncCanonEntry { name: "cp932", prop: crate::mbyte_defs::enc::ENC_DBCS },     // 46: IDX_CP932
+    EncCanonEntry { name: "cp936", prop: crate::mbyte_defs::enc::ENC_DBCS },     // 47: IDX_CP936
+    EncCanonEntry { name: "cp949", prop: crate::mbyte_defs::enc::ENC_DBCS },     // 48: IDX_CP949
+    EncCanonEntry { name: "cp950", prop: crate::mbyte_defs::enc::ENC_DBCS },     // 49: IDX_CP950
+    EncCanonEntry { name: "cp1250", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 50: IDX_CP1250
+    EncCanonEntry { name: "cp1251", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 51: IDX_CP1251
+    EncCanonEntry { name: "cp1253", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 52: IDX_CP1253
+    EncCanonEntry { name: "cp1254", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 53: IDX_CP1254
+    EncCanonEntry { name: "cp1255", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 54: IDX_CP1255
+    EncCanonEntry { name: "cp1256", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 55: IDX_CP1256
+    EncCanonEntry { name: "cp1257", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 56: IDX_CP1257
+    EncCanonEntry { name: "cp1258", prop: crate::mbyte_defs::enc::ENC_8BIT },    // 57: IDX_CP1258
+    EncCanonEntry { name: "macroman", prop: crate::mbyte_defs::enc::ENC_8BIT + crate::mbyte_defs::enc::ENC_MACROMAN }, // 58: IDX_MACROMAN
+    EncCanonEntry { name: "hp-roman8", prop: crate::mbyte_defs::enc::ENC_8BIT }, // 59: IDX_HPROMAN8
+];
+
+/// Find encoding `name` in the list of canonical encoding names.
+/// Returns `None` if not found (`enc_canon_search`).
+#[must_use]
+pub fn enc_canon_search(name: &[u8]) -> Option<usize> {
+    ENC_CANON_TABLE.iter().position(|entry| entry.name.as_bytes() == name)
+}
+
+/// Find canonical encoding `name` in the list and return its
+/// properties. Returns `0` if not found (`enc_canon_props`).
+#[must_use]
+pub fn enc_canon_props(name: &[u8]) -> i32 {
+    if let Some(i) = enc_canon_search(name) {
+        return ENC_CANON_TABLE[i].prop;
+    }
+    if name.starts_with(b"2byte-") {
+        return crate::mbyte_defs::enc::ENC_DBCS;
+    }
+    if name.starts_with(b"8bit-") || name.starts_with(b"iso-8859-") {
+        return crate::mbyte_defs::enc::ENC_8BIT;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enc_canon_table_has_exactly_60_entries() {
+        assert_eq!(ENC_CANON_TABLE.len(), 60);
+    }
+
+    #[test]
+    fn enc_canon_table_first_and_last_entries_match_the_real_source() {
+        assert_eq!(ENC_CANON_TABLE[0].name, "latin1");
+        assert_eq!(ENC_CANON_TABLE[0].prop, crate::mbyte_defs::enc::ENC_8BIT + crate::mbyte_defs::enc::ENC_LATIN1);
+        assert_eq!(ENC_CANON_TABLE[59].name, "hp-roman8");
+        assert_eq!(ENC_CANON_TABLE[59].prop, crate::mbyte_defs::enc::ENC_8BIT);
+    }
+
+    #[test]
+    fn enc_canon_search_finds_a_real_entry() {
+        assert_eq!(enc_canon_search(b"utf-8"), Some(16));
+        assert_eq!(enc_canon_search(b"macroman"), Some(58));
+    }
+
+    #[test]
+    fn enc_canon_search_returns_none_for_an_unknown_name() {
+        assert_eq!(enc_canon_search(b"not-a-real-encoding"), None);
+    }
+
+    #[test]
+    fn enc_canon_props_returns_the_table_entrys_prop() {
+        assert_eq!(enc_canon_props(b"utf-8"), crate::mbyte_defs::enc::ENC_UNICODE);
+        assert_eq!(
+            enc_canon_props(b"ucs-2"),
+            crate::mbyte_defs::enc::ENC_UNICODE + crate::mbyte_defs::enc::ENC_ENDIAN_B + crate::mbyte_defs::enc::ENC_2BYTE
+        );
+        assert_eq!(enc_canon_props(b"latin1"), crate::mbyte_defs::enc::ENC_8BIT + crate::mbyte_defs::enc::ENC_LATIN1);
+    }
+
+    #[test]
+    fn enc_canon_props_falls_back_to_2byte_prefix() {
+        assert_eq!(enc_canon_props(b"2byte-anything"), crate::mbyte_defs::enc::ENC_DBCS);
+    }
+
+    #[test]
+    fn enc_canon_props_falls_back_to_8bit_prefix() {
+        assert_eq!(enc_canon_props(b"8bit-anything"), crate::mbyte_defs::enc::ENC_8BIT);
+    }
+
+    #[test]
+    fn enc_canon_props_falls_back_to_iso_8859_prefix() {
+        // "iso-8859-1" isn't literally in ENC_CANON_TABLE (that's
+        // "latin1" instead, aliased via the NOT-translated
+        // enc_alias_table/enc_canonize) - enc_canon_props itself,
+        // called directly with an "iso-8859-N" string, falls through
+        // to this generic prefix match, matching the real source.
+        assert_eq!(enc_canon_props(b"iso-8859-1"), crate::mbyte_defs::enc::ENC_8BIT);
+        assert_eq!(enc_canon_props(b"iso-8859-16"), crate::mbyte_defs::enc::ENC_8BIT);
+    }
+
+    #[test]
+    fn enc_canon_props_returns_zero_for_a_completely_unknown_name() {
+        assert_eq!(enc_canon_props(b"not-a-real-encoding"), 0);
+    }
 
     #[test]
     fn utf8len_tab_matches_hand_derived_formula_for_all_256_bytes() {
