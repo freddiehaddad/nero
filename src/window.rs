@@ -65,6 +65,24 @@
 //! to get wrong - matching this crate's established "translate ahead
 //! of a real caller" precedent.
 //!
+//! Also translated: `frame_minheight`/`frame_minwidth` (the minimal
+//! height/width a frame needs, using `'winminheight'`/`'winminwidth'`,
+//! or `'winheight'`/`'winwidth'` for a specific "next current window",
+//! via already-real `OPTION_VARS.p_wh`/`p_wmh`/`p_wiw`/`p_wmw` and
+//! `WinT.w_winbar_height`/`w_hsep_height`/`w_status_height`/
+//! `w_vsep_width`). Introduces [`NOWIN`], a real, non-null sentinel
+//! pointer value (`(win_T *)-1` in the original, distinct from both
+//! null and any genuine `*mut WinT`) meaning "don't reserve at least
+//! one line/column for the current window", the original's own real
+//! 3-way distinction (null/`NOWIN`/a real window) for the
+//! `next_curwin` parameter, kept as a raw-pointer comparison rather
+//! than an `Option`-based redesign, matching the original's own
+//! genuine pointer-identity semantics exactly. `FR_ROW` sums
+//! (side-by-side widths add up) for `frame_minheight` but takes the
+//! max for `frame_minwidth` (a column-of-rows only needs its LARGEST
+//! single child's width), the same ROW/COL role-swap already
+//! established for `frame_fixed_height`/`frame_fixed_width`.
+//!
 //! Also translated: `check_can_set_curbuf_disabled`/
 //! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
 //! the original's real `emsg` call, matching the established "skip the
@@ -905,6 +923,136 @@ pub unsafe fn frame_fixed_width(frp: *const crate::buffer_defs::FrameT) -> bool 
         child = unsafe { &*child }.fr_next;
     }
     true
+}
+
+/// Sentinel value for [`frame_minheight`]/[`frame_minwidth`]'s own
+/// `next_curwin` parameter, meaning "don't reserve at least one line/
+/// column for the current window" (`NOWIN`, `((win_T *)-1)` in the
+/// original - a real, non-null, but deliberately invalid pointer
+/// value, distinguished from both a null pointer, the ordinary case,
+/// and any genuine `*mut WinT`).
+pub const NOWIN: *mut WinT = -1isize as *mut WinT;
+
+/// Compute the minimal height for frame `topfrp` (`frame_minheight`),
+/// using `'winminheight'`. When `next_curwin` is a real window
+/// pointer, uses `'winheight'` for THAT window instead. When
+/// `next_curwin` is [`NOWIN`], don't reserve at least one line for
+/// the current window (`GLOBALS.curwin`).
+///
+/// # Safety
+/// `topfrp` must be a valid, non-null pointer to a live `FrameT`,
+/// whose own `fr_child`/`fr_next` chain (if any) consists entirely of
+/// valid, live `FrameT` pointers, and whose `fr_win` (if non-null) is
+/// a valid, live `WinT` pointer. `next_curwin` must be either
+/// [`NOWIN`], null, or a valid, live `WinT` pointer. Touches
+/// `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn frame_minheight(topfrp: *const crate::buffer_defs::FrameT, next_curwin: *mut WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*topfrp };
+    if !fr.fr_win.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let win = unsafe { &*fr.fr_win };
+        // Combined height of window bar and separator column or status line.
+        let extra_height = win.w_winbar_height + win.w_hsep_height + win.w_status_height;
+        // SAFETY: forwarded from this function's own safety doc.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        if std::ptr::eq(fr.fr_win, next_curwin) {
+            opts.p_wh as i32 + extra_height
+        } else {
+            let mut m = opts.p_wmh as i32 + extra_height;
+            // SAFETY: forwarded from this function's own safety doc.
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            if std::ptr::eq(fr.fr_win, curwin as *const WinT) && next_curwin.is_null() {
+                // Current window is minimal one line high.
+                if opts.p_wmh == 0 {
+                    m += 1;
+                }
+            }
+            m
+        }
+    } else if fr.fr_layout == crate::buffer_defs::FR_ROW {
+        // get the minimal height from each frame in this row
+        let mut m = 0;
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = unsafe { frame_minheight(child, next_curwin) };
+            if n > m {
+                m = n;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        m
+    } else {
+        // Add up the minimal heights for all frames in this column.
+        let mut m = 0;
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            m += unsafe { frame_minheight(child, next_curwin) };
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        m
+    }
+}
+
+/// Compute the minimal width for frame `topfrp` (`frame_minwidth`),
+/// using `'winminwidth'`. When `next_curwin` is a real window
+/// pointer, uses `'winwidth'` for THAT window instead. When
+/// `next_curwin` is [`NOWIN`], don't reserve at least one column for
+/// the current window (`GLOBALS.curwin`).
+///
+/// # Safety
+/// Same as [`frame_minheight`].
+#[must_use]
+pub unsafe fn frame_minwidth(topfrp: *const crate::buffer_defs::FrameT, next_curwin: *mut WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*topfrp };
+    if !fr.fr_win.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let win = unsafe { &*fr.fr_win };
+        // SAFETY: forwarded from this function's own safety doc.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        if std::ptr::eq(fr.fr_win, next_curwin) {
+            opts.p_wiw as i32 + win.w_vsep_width
+        } else {
+            // window: minimal width of the window plus separator column
+            let mut m = opts.p_wmw as i32 + win.w_vsep_width;
+            // SAFETY: forwarded from this function's own safety doc.
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            // Current window is minimal one column wide.
+            if opts.p_wmw == 0 && std::ptr::eq(fr.fr_win, curwin as *const WinT) && next_curwin.is_null() {
+                m += 1;
+            }
+            m
+        }
+    } else if fr.fr_layout == crate::buffer_defs::FR_COL {
+        // get the minimal width from each frame in this column
+        let mut m = 0;
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let n = unsafe { frame_minwidth(child, next_curwin) };
+            m = m.max(n);
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        m
+    } else {
+        // Add up the minimal widths for all frames in this row.
+        let mut m = 0;
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            m += unsafe { frame_minwidth(child, next_curwin) };
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        m
+    }
 }
 
 /// Get the window `count` positions above (`up == true`) or below
@@ -2331,6 +2479,223 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { frame_fixed_width(&row) });
+    }
+
+    // ---- frame_minheight / frame_minwidth ----
+
+    /// RAII guard temporarily setting `OPTION_VARS.p_wh`/`p_wmh`/
+    /// `p_wiw`/`p_wmw`, restoring the previous values on drop. Caller
+    /// must hold `global_state_test_lock()` for the whole lifetime.
+    struct MinSizeOptsGuard {
+        prev_wh: crate::types_defs::OptInt,
+        prev_wmh: crate::types_defs::OptInt,
+        prev_wiw: crate::types_defs::OptInt,
+        prev_wmw: crate::types_defs::OptInt,
+    }
+    impl MinSizeOptsGuard {
+        fn set(wh: i64, wmh: i64, wiw: i64, wmw: i64) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = MinSizeOptsGuard {
+                prev_wh: opts.p_wh,
+                prev_wmh: opts.p_wmh,
+                prev_wiw: opts.p_wiw,
+                prev_wmw: opts.p_wmw,
+            };
+            opts.p_wh = wh;
+            opts.p_wmh = wmh;
+            opts.p_wiw = wiw;
+            opts.p_wmw = wmw;
+            guard
+        }
+    }
+    impl Drop for MinSizeOptsGuard {
+        fn drop(&mut self) {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            opts.p_wh = self.prev_wh;
+            opts.p_wmh = self.prev_wmh;
+            opts.p_wiw = self.prev_wiw;
+            opts.p_wmw = self.prev_wmw;
+        }
+    }
+
+    fn win_with_extras(handle: crate::types_defs::HandleT) -> WinT {
+        WinT {
+            handle,
+            w_winbar_height: 1,
+            w_hsep_height: 2,
+            w_status_height: 3,
+            w_vsep_width: 4,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frame_minheight_leaf_uses_winheight_for_next_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // extra_height = 1 + 2 + 3 = 6; p_wh(10) + 6 = 16.
+        assert_eq!(unsafe { frame_minheight(&leaf, win_ptr) }, 16);
+    }
+
+    #[test]
+    fn frame_minheight_leaf_uses_winminheight_for_a_non_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win = win_with_extras(1);
+        let mut other = win_with_extras(2);
+        let win_ptr = &mut win as *mut WinT;
+        let other_ptr = &mut other as *mut WinT;
+        let _guard = CurwinListGuard::set(other_ptr, std::ptr::null_mut());
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // Not next_curwin, not curwin: p_wmh(2) + extra_height(6) = 8.
+        assert_eq!(unsafe { frame_minheight(&leaf, other_ptr) }, 8);
+    }
+
+    #[test]
+    fn frame_minheight_current_window_gets_a_plus_one_bump_when_winminheight_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 0, 20, 5);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinListGuard::set(win_ptr, std::ptr::null_mut());
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // curwin, next_curwin == NULL, p_wmh == 0: 0 + 6 + 1 = 7.
+        assert_eq!(unsafe { frame_minheight(&leaf, std::ptr::null_mut()) }, 7);
+    }
+
+    #[test]
+    fn frame_minheight_current_window_no_bump_when_winminheight_is_nonzero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 3, 20, 5);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinListGuard::set(win_ptr, std::ptr::null_mut());
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // p_wmh == 3 (nonzero): no +1 bump. 3 + 6 = 9.
+        assert_eq!(unsafe { frame_minheight(&leaf, std::ptr::null_mut()) }, 9);
+    }
+
+    #[test]
+    fn frame_minheight_nowin_suppresses_the_current_window_bump() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 0, 20, 5);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinListGuard::set(win_ptr, std::ptr::null_mut());
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // NOWIN is non-null, so the "next_curwin.is_null()" bump-gate
+        // is false even though this IS curwin and p_wmh == 0.
+        assert_eq!(unsafe { frame_minheight(&leaf, NOWIN) }, 6);
+    }
+
+    #[test]
+    fn frame_minheight_row_takes_the_maximum_of_its_children() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win1 = win_with_extras(1); // minheight (not curwin/next): 2+6=8
+        let mut win2 = WinT { handle: 2, w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, ..Default::default() }; // 2+0=2
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &leaf2 as *const _ as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { frame_minheight(&row, std::ptr::null_mut()) }, 8);
+    }
+
+    #[test]
+    fn frame_minheight_col_sums_its_children() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win1 = win_with_extras(1); // 2+6=8
+        let mut win2 = WinT { handle: 2, w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, ..Default::default() }; // 2+0=2
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &leaf2 as *const _ as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { frame_minheight(&col, std::ptr::null_mut()) }, 10); // 8 + 2
+    }
+
+    #[test]
+    fn frame_minwidth_leaf_uses_winwidth_for_next_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // p_wiw(20) + w_vsep_width(4) = 24.
+        assert_eq!(unsafe { frame_minwidth(&leaf, win_ptr) }, 24);
+    }
+
+    #[test]
+    fn frame_minwidth_current_window_gets_a_plus_one_bump_when_winminwidth_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 0);
+        let mut win = win_with_extras(1);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinListGuard::set(win_ptr, std::ptr::null_mut());
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        // 0 + 4 + 1 = 5.
+        assert_eq!(unsafe { frame_minwidth(&leaf, std::ptr::null_mut()) }, 5);
+    }
+
+    #[test]
+    fn frame_minwidth_col_is_the_any_case_taking_the_maximum() {
+        // FR_COL's role for width is the "max" case, the OPPOSITE of
+        // frame_minheight's own FR_ROW-is-"max" - verifying the roles
+        // are genuinely swapped, matching frame_fixed_width's own
+        // swapped ROW/COL convention.
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win1 = win_with_extras(1); // p_wmw(5) + w_vsep_width(4) = 9
+        let mut win2 = WinT { handle: 2, w_vsep_width: 0, ..Default::default() }; // 5 + 0 = 5
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &leaf2 as *const _ as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { frame_minwidth(&col, std::ptr::null_mut()) }, 9);
+    }
+
+    #[test]
+    fn frame_minwidth_row_sums_its_children() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win1 = win_with_extras(1); // 9
+        let mut win2 = WinT { handle: 2, w_vsep_width: 0, ..Default::default() }; // 5
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &leaf2 as *const _ as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { frame_minwidth(&row, std::ptr::null_mut()) }, 14); // 9 + 5
     }
 
     // ---- find_tabwin ----
