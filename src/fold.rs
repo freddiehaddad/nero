@@ -61,12 +61,15 @@
 //! [`has_folding`] can only ever return `false` or panic today, never
 //! `true` (see [`fold_adjust_cursor`]'s own doc comment).
 //!
+//! `cursor.c`'s own `get_cursor_rel_lnum` (a real consumer of
+//! [`has_any_folding`]/[`has_folding`]) is translated over in
+//! `cursor.rs` itself, now completely (previously only had its "no
+//! folding" fast path; the fold-skipping loop is now real too, via
+//! the same already-existing `has_folding`).
+//!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
-//! ex-commands), `get_cursor_rel_lnum` (`cursor.c` - its own "no
-//! folds" fast path is a one-liner given `hasAnyFolding` now exists,
-//! left for `cursor.rs` itself to pick up alongside
-//! `check_cursor_lnum`/`check_cursor`), `foldManualAllowed` (needs
+//! ex-commands), `foldManualAllowed` (needs
 //! `emsg` - message display, not yet translated - for its own two
 //! real, reachable error-message branches; otherwise a one-liner given
 //! `foldmethod_is_manual`/`foldmethod_is_marker` now both exist),

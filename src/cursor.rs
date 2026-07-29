@@ -783,12 +783,17 @@ pub unsafe fn check_cursor(wp: *mut WinT) {
 /// Return `lnum`'s line-count distance from `wp.w_cursor.lnum`, fold-aware
 /// (`get_cursor_rel_lnum`).
 ///
-/// Only the "no folding" fast path (`lnum == cursor ||
-/// !has_any_folding(wp)`) is translated - the fold-skipping loop,
-/// reached only when [`crate::fold::has_any_folding`] returns true, is
-/// `unimplemented!()` directly in this function (a separate case from
-/// `fold::has_folding`'s own internal panic, not reached here at all
-/// since this function never calls `has_folding`).
+/// The fold-skipping loop (reached only when
+/// [`crate::fold::has_any_folding`] returns true) calls the already-
+/// real `crate::fold::has_folding` exactly like the original - this
+/// crate's own `has_folding`/`has_folding_win` can currently only ever
+/// return `false` (no-op) or panic via `has_folding_win`'s own
+/// `unimplemented!()` (when folding might genuinely be active, i.e.
+/// the exact condition that got us into this loop in the first
+/// place), so reaching this loop today always panics through that
+/// EXISTING dependency - not a fresh `unimplemented!()` of this
+/// function's own. Once the real fold-tree search exists, this loop
+/// will start working correctly with no changes needed here.
 ///
 /// # Safety
 /// `wp` must be a valid, non-null pointer to a live `WinT` whose own
@@ -796,16 +801,39 @@ pub unsafe fn check_cursor(wp: *mut WinT) {
 #[must_use]
 pub unsafe fn get_cursor_rel_lnum(wp: *mut WinT, lnum: crate::pos_defs::LinenrT) -> LinenrT {
     // SAFETY: forwarded from this function's own safety doc.
-    let wref = unsafe { &*wp };
+    let wref = unsafe { &mut *wp };
     let cursor = wref.w_cursor.lnum;
     // SAFETY: forwarded from this function's own safety doc.
     if lnum == cursor || !unsafe { crate::fold::has_any_folding(wref) } {
         return lnum - cursor;
     }
-    unimplemented!(
-        "get_cursor_rel_lnum: the fold-skipping loop is not yet translated (only the \
-         \"hasAnyFolding() == false\" fast path is)"
-    );
+
+    let mut from_line = if lnum < cursor { lnum } else { cursor };
+    let to_line = if lnum > cursor { lnum } else { cursor };
+    let mut retval: LinenrT = 0;
+
+    // Loop until we reach to_line, skipping folds.
+    while from_line < to_line {
+        // If from_line is in a fold, set it to the last line of that
+        // fold (discarding the return value, matching the original's
+        // own reliance on the out-parameter alone).
+        let cur_line = from_line;
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { crate::fold::has_folding(wref, cur_line, None, Some(&mut from_line)) };
+        from_line += 1;
+        retval += 1;
+    }
+
+    // If to_line is in a closed fold, the line count is off by +1. Correct it.
+    if from_line > to_line {
+        retval -= 1;
+    }
+
+    if lnum < cursor {
+        -retval
+    } else {
+        retval
+    }
 }
 
 /// Set `curwin.w_leftcol` to `leftcol`, adjusting the cursor position
@@ -1504,6 +1532,57 @@ mod tests {
 
         drop(guard);
         close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_cursor_rel_lnum_negative_distance_when_lnum_before_cursor() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 3, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"one\0");
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 2, b"three\0", 6, false) },
+            crate::vim_defs::OK
+        );
+
+        assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 1) }, -2);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "the real fold-tree search is not yet translated")]
+    fn get_cursor_rel_lnum_panics_when_folding_could_be_active() {
+        // No real ml_open-backed memline is needed here: the panic
+        // path (has_any_folding -> has_folding_win's own
+        // unimplemented!()) never touches buf.b_ml, only
+        // buf.terminal/win.w_onebuf_opt - avoids leaking a boxed
+        // MemfileT across the panic (this test never reaches a
+        // cleanup step).
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"expr".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // lnum != cursor and has_any_folding is true -> enters the
+        // fold-skipping loop, which panics via has_folding_win's own
+        // unimplemented!() on its first has_folding call.
+        let _ = unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 2) };
     }
 
     #[test]
