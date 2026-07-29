@@ -86,6 +86,7 @@ pub mod ops_defs;
 pub mod os;
 pub mod path;
 pub mod plines;
+pub mod popupmenu;
 pub mod pos_defs;
 pub mod profile;
 pub mod regexp_defs;

@@ -435,6 +435,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"hostname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_hostname });
         m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
         m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
+        m.insert(&b"pumvisible"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pumvisible });
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
@@ -5323,6 +5324,18 @@ unsafe fn f_eventhandler(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(vgetc_busy));
 }
 
+/// `pumvisible()` - whether the popup menu is currently displayed
+/// (`f_pumvisible`, `funcs.c`), via the already-real
+/// `crate::popupmenu::pum_visible`. Matches the original's own
+/// structure exactly: `rettv` is only assigned when the popup menu
+/// IS visible, otherwise left at its caller's own default-initialized
+/// `Number(0)`.
+fn f_pumvisible(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::popupmenu::pum_visible() {
+        rettv.value = TypvalValue::Number(1);
+    }
+}
+
 /// `did_filetype()` - whether the `FileType` autocommand event has
 /// been triggered at least once for the current buffer
 /// (`f_did_filetype`, `funcs.c`), via the already-real
@@ -7928,6 +7941,7 @@ mod tests {
             "hostname",
             "foreground",
             "eventhandler",
+            "pumvisible",
             "did_filetype",
             "garbagecollect",
             "getcharsearch",
@@ -12970,6 +12984,25 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(1));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.vgetc_busy = saved;
+    }
+
+    // --- f_pumvisible ---
+
+    #[test]
+    fn pumvisible_reflects_pum_visible() {
+        let _guard = crate::globals::global_state_test_lock();
+
+        crate::popupmenu::tests::set_pum_is_visible(false);
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        f_pumvisible(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        crate::popupmenu::tests::set_pum_is_visible(true);
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        f_pumvisible(&[], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        crate::popupmenu::tests::set_pum_is_visible(false);
     }
 
     // --- f_did_filetype ---
