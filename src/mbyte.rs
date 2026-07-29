@@ -80,6 +80,26 @@
 //! Deferred (need another not-yet-decided subsystem):
 //! `utf_ptr2cells_len`, and everything else in the file (encoding-name
 //! tables, `iconv` conversion, `show_utf8`, etc.).
+//!
+//! Also translated: `mb_isalpha` (trivial `mb_islower(a) ||
+//! mb_isupper(a)`); the line-break punctuation predicates
+//! `utf_eat_space`/`utf_allow_break_before`/`utf_allow_break_after`/
+//! `utf_allow_break` (pure, fixed-table lookups needing no `g_chartab`/
+//! options at all - their own real callers, `ops.c`'s "J" join command
+//! and `textformat.c`'s `gq` auto-formatting, aren't translated yet,
+//! but these are small, self-contained, and have no design freedom to
+//! get wrong, matching this crate's established "translate ahead of a
+//! real caller" precedent; the original's own hand-rolled binary
+//! search over 2 fixed, verified-sorted arrays is replaced with
+//! `[T]::binary_search`, provably equivalent given the data's own real
+//! sortedness); `utf_valid_string` (always checks the WHOLE given
+//! slice - the original's own `end == NULL` "stop at the first NUL"
+//! mode isn't modeled separately, since a NUL byte is itself a valid,
+//! length-1 ASCII "character" per `UTF8LEN_TAB_ZERO`, so it never
+//! terminates either scan early; a caller wanting NUL-terminated
+//! behavior can simply slice `s` up to its own first NUL first);
+//! `bomb_size`/`remove_bom` (BOM byte-count/stripping, needing only
+//! already-real `BufT.b_p_bomb`/`b_p_bin`/`b_p_fenc` fields).
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -697,6 +717,16 @@ pub unsafe fn mb_tolower(a: i32) -> i32 {
 pub unsafe fn mb_isupper(a: i32) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { mb_tolower(a) != a }
+}
+
+/// `mb_isalpha`.
+///
+/// # Safety
+/// Same as [`mb_tolower`] (forwarded via [`mb_islower`]/[`mb_isupper`]).
+#[must_use]
+pub unsafe fn mb_isalpha(a: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { mb_islower(a) || mb_isupper(a) }
 }
 
 /// Read a single (possibly multi-byte) character from `s`, never
@@ -1525,6 +1555,190 @@ pub unsafe fn mb_adjust_cursor() {
     unsafe { crate::mark::mark_mb_adjustpos(buf, &mut curwin.w_cursor) };
 }
 
+/// Whether space is NOT allowed before/after `cc` (`utf_eat_space`) -
+/// a fixed set of Unicode punctuation ranges (general/supplemental
+/// punctuation, CJK symbols, full-width ASCII punctuation).
+#[must_use]
+pub const fn utf_eat_space(cc: i32) -> bool {
+    (cc >= 0x2000 && cc <= 0x206F) // General punctuations
+        || (cc >= 0x2e00 && cc <= 0x2e7f) // Supplemental punctuations
+        || (cc >= 0x3000 && cc <= 0x303f) // CJK symbols and punctuations
+        || (cc >= 0xff01 && cc <= 0xff0f) // Full width ASCII punctuations
+        || (cc >= 0xff1a && cc <= 0xff20) // ..
+        || (cc >= 0xff3b && cc <= 0xff40) // ..
+        || (cc >= 0xff5b && cc <= 0xff65) // ..
+}
+
+/// Punctuation characters where a line break is never allowed
+/// immediately BEFORE (`utf_allow_break_before`'s own fixed,
+/// sorted `BOL_prohibition_punct` table - closing brackets/
+/// punctuation that shouldn't start a new line).
+const BOL_PROHIBITION_PUNCT: [i32; 43] = [
+    b'!' as i32,
+    b'%' as i32,
+    b')' as i32,
+    b',' as i32,
+    b':' as i32,
+    b';' as i32,
+    b'>' as i32,
+    b'?' as i32,
+    b']' as i32,
+    b'}' as i32,
+    0x2019, // ' right single quotation mark
+    0x201d, // " right double quotation mark
+    0x2020, // dagger
+    0x2021, // double dagger
+    0x2026, // horizontal ellipsis
+    0x2030, // per mille sign
+    0x2031, // per ten thousand sign
+    0x203c, // double exclamation mark
+    0x2047, // double question mark
+    0x2048, // question exclamation mark
+    0x2049, // exclamation question mark
+    0x2103, // degree celsius
+    0x2109, // degree fahrenheit
+    0x3001, // ideographic comma
+    0x3002, // ideographic full stop
+    0x3009, // right angle bracket
+    0x300b, // right double angle bracket
+    0x300d, // right corner bracket
+    0x300f, // right white corner bracket
+    0x3011, // right black lenticular bracket
+    0x3015, // right tortoise shell bracket
+    0x3017, // right white lenticular bracket
+    0x3019, // right white tortoise shell bracket
+    0x301b, // right white square bracket
+    0xff01, // fullwidth exclamation mark
+    0xff09, // fullwidth right parenthesis
+    0xff0c, // fullwidth comma
+    0xff0e, // fullwidth full stop
+    0xff1a, // fullwidth colon
+    0xff1b, // fullwidth semicolon
+    0xff1f, // fullwidth question mark
+    0xff3d, // fullwidth right square bracket
+    0xff5d, // fullwidth right curly bracket
+];
+
+/// Punctuation characters where a line break is never allowed
+/// immediately AFTER (`utf_allow_break_after`'s own fixed, sorted
+/// `EOL_prohibition_punct` table - opening brackets/punctuation that
+/// shouldn't end a line).
+const EOL_PROHIBITION_PUNCT: [i32; 19] = [
+    b'(' as i32,
+    b'<' as i32,
+    b'[' as i32,
+    b'`' as i32,
+    b'{' as i32,
+    0x2018, // left single quotation mark
+    0x201c, // left double quotation mark
+    0x3008, // left angle bracket
+    0x300a, // left double angle bracket
+    0x300c, // left corner bracket
+    0x300e, // left white corner bracket
+    0x3010, // left black lenticular bracket
+    0x3014, // left tortoise shell bracket
+    0x3016, // left white lenticular bracket
+    0x3018, // left white tortoise shell bracket
+    0x301a, // left white square bracket
+    0xff08, // fullwidth left parenthesis
+    0xff3b, // fullwidth left square bracket
+    0xff5b, // fullwidth left curly bracket
+];
+
+/// Whether a line break is allowed before `cc` (`utf_allow_break_before`).
+///
+/// The original's own hand-rolled binary search over
+/// `BOL_PROHIBITION_PUNCT` (a real, verified-sorted array) is
+/// replaced with `[T]::binary_search`, provably equivalent given the
+/// array's own real sortedness - Rust's standard binary search over
+/// the identical data.
+#[must_use]
+pub fn utf_allow_break_before(cc: i32) -> bool {
+    BOL_PROHIBITION_PUNCT.binary_search(&cc).is_err()
+}
+
+/// Whether a line break is allowed after `cc` (`utf_allow_break_after`).
+/// See [`utf_allow_break_before`]'s own doc for the binary-search
+/// substitution reasoning.
+#[must_use]
+pub fn utf_allow_break_after(cc: i32) -> bool {
+    EOL_PROHIBITION_PUNCT.binary_search(&cc).is_err()
+}
+
+/// Whether a line break is allowed between `cc` and `ncc`
+/// (`utf_allow_break`) - never between two identical em-dashes or
+/// horizontal-ellipsis characters, otherwise delegates to
+/// [`utf_allow_break_after`]/[`utf_allow_break_before`].
+#[must_use]
+pub fn utf_allow_break(cc: i32, ncc: i32) -> bool {
+    if cc == ncc && (cc == 0x2014 || cc == 0x2026) {
+        return false;
+    }
+    utf_allow_break_after(cc) && utf_allow_break_before(ncc)
+}
+
+/// Returns `true` if `s` is a valid UTF-8 byte sequence
+/// (`utf_valid_string`).
+///
+/// Always checks the WHOLE given slice (the original's own `end ==
+/// NULL` "stop at the first NUL" mode is not modeled separately - a
+/// NUL byte is itself a valid, length-1 ASCII "character" per
+/// [`UTF8LEN_TAB_ZERO`], so it never terminates the scan early on
+/// either path; a caller wanting the NUL-terminated behavior can
+/// simply slice `s` up to its own first NUL byte before calling this,
+/// an equally faithful and arguably safer approach than relying on an
+/// implicit terminator a Rust `&[u8]` doesn't have).
+#[must_use]
+pub fn utf_valid_string(s: &[u8]) -> bool {
+    let mut p = 0usize;
+    while p < s.len() {
+        let l = usize::from(UTF8LEN_TAB_ZERO[s[p] as usize]);
+        if l == 0 {
+            return false; // invalid lead byte
+        }
+        if p + l > s.len() {
+            return false; // incomplete byte sequence
+        }
+        p += 1;
+        for _ in 1..l {
+            if (s[p] & 0xc0) != 0x80 {
+                return false; // invalid trail byte
+            }
+            p += 1;
+        }
+    }
+    true
+}
+
+/// Number of bytes a byte-order mark for the buffer's own `'fenc'`
+/// would occupy, or `0` if `'bomb'`/binary mode mean no BOM should be
+/// written (`bomb_size`).
+#[must_use]
+pub fn bomb_size(buf: &crate::buffer_defs::BufT) -> i32 {
+    if buf.b_p_bomb == 0 || buf.b_p_bin != 0 {
+        return 0;
+    }
+    match buf.b_p_fenc.as_deref() {
+        None | Some(b"utf-8") => 3,
+        Some(fenc) if fenc.starts_with(b"ucs-2") || fenc.starts_with(b"utf-16") => 2,
+        Some(fenc) if fenc.starts_with(b"ucs-4") => 4,
+        _ => 0,
+    }
+}
+
+/// Remove every UTF-8 byte-order-mark (`EF BB BF`) occurrence from
+/// `s`, shifting the remaining bytes down in place (`remove_bom`).
+pub fn remove_bom(s: &mut Vec<u8>) {
+    let mut p = 0;
+    while p < s.len() {
+        if s[p] == 0xef && s.get(p + 1) == Some(&0xbb) && s.get(p + 2) == Some(&0xbf) {
+            s.drain(p..p + 3);
+            continue;
+        }
+        p += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2206,5 +2420,204 @@ mod tests {
     fn mb_charlen_counts_multibyte_characters() {
         let _guard = option_vars_test_lock();
         assert_eq!(unsafe { mb_charlen("一二三".as_bytes()) }, 3);
+    }
+
+    #[test]
+    fn mb_isalpha_true_for_ascii_letters() {
+        let _guard = option_vars_test_lock();
+        assert!(unsafe { mb_isalpha(i32::from(b'a')) });
+        assert!(unsafe { mb_isalpha(i32::from(b'A')) });
+    }
+
+    #[test]
+    fn mb_isalpha_false_for_digits_and_space() {
+        let _guard = option_vars_test_lock();
+        assert!(!unsafe { mb_isalpha(i32::from(b'5')) });
+        assert!(!unsafe { mb_isalpha(i32::from(b' ')) });
+    }
+
+    #[test]
+    fn utf_eat_space_true_at_range_boundaries() {
+        assert!(utf_eat_space(0x2000));
+        assert!(utf_eat_space(0x206f));
+        assert!(utf_eat_space(0x3000)); // CJK symbols/punctuation start
+    }
+
+    #[test]
+    fn utf_eat_space_false_outside_any_range() {
+        assert!(!utf_eat_space(0x1fff));
+        assert!(!utf_eat_space(0x2070));
+        assert!(!utf_eat_space(i32::from(b'a')));
+    }
+
+    #[test]
+    fn bol_prohibition_punct_table_is_sorted() {
+        // binary_search requires this - verified programmatically,
+        // not just by eye, matching the array's own real, mechanically
+        // transcribed C source order.
+        assert!(BOL_PROHIBITION_PUNCT.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(BOL_PROHIBITION_PUNCT.len(), 43);
+    }
+
+    #[test]
+    fn eol_prohibition_punct_table_is_sorted() {
+        assert!(EOL_PROHIBITION_PUNCT.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(EOL_PROHIBITION_PUNCT.len(), 19);
+    }
+
+    #[test]
+    fn utf_allow_break_before_false_for_listed_punctuation() {
+        assert!(!utf_allow_break_before(i32::from(b'!')));
+        assert!(!utf_allow_break_before(0x2019));
+        assert!(!utf_allow_break_before(0xff5d)); // last table entry
+    }
+
+    #[test]
+    fn utf_allow_break_before_true_for_ordinary_characters() {
+        assert!(utf_allow_break_before(i32::from(b'a')));
+    }
+
+    #[test]
+    fn utf_allow_break_after_false_for_listed_punctuation() {
+        assert!(!utf_allow_break_after(i32::from(b'(')));
+        assert!(!utf_allow_break_after(0xff5b)); // last table entry
+    }
+
+    #[test]
+    fn utf_allow_break_after_true_for_ordinary_characters() {
+        assert!(utf_allow_break_after(i32::from(b'a')));
+    }
+
+    #[test]
+    fn utf_allow_break_never_between_identical_em_dashes_or_ellipses() {
+        assert!(!utf_allow_break(0x2014, 0x2014));
+        assert!(!utf_allow_break(0x2026, 0x2026));
+    }
+
+    #[test]
+    fn utf_allow_break_delegates_to_before_and_after_otherwise() {
+        assert!(utf_allow_break(i32::from(b'a'), i32::from(b'b')));
+        assert!(!utf_allow_break(i32::from(b'('), i32::from(b'a'))); // '(' forbids break after
+        assert!(!utf_allow_break(i32::from(b'a'), i32::from(b'!'))); // '!' forbids break before
+    }
+
+    #[test]
+    fn utf_valid_string_accepts_ascii_and_multibyte() {
+        assert!(utf_valid_string(b"hello"));
+        assert!(utf_valid_string("一二三".as_bytes()));
+        assert!(utf_valid_string(b""));
+    }
+
+    #[test]
+    fn utf_valid_string_rejects_an_invalid_lead_byte() {
+        assert!(!utf_valid_string(&[0xff]));
+    }
+
+    #[test]
+    fn utf_valid_string_rejects_an_incomplete_sequence() {
+        // 0xE4 is a 3-byte lead byte, but nothing follows.
+        assert!(!utf_valid_string(&[0xe4]));
+    }
+
+    #[test]
+    fn utf_valid_string_rejects_an_invalid_trail_byte() {
+        // 0xE4 (3-byte lead) followed by 2 bytes that don't look like
+        // continuation bytes (0x00 & 0xc0 != 0x80).
+        assert!(!utf_valid_string(&[0xe4, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn bomb_size_default_fenc_is_3_bytes() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bomb: 1,
+            b_p_bin: 0,
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 3);
+        buf.b_p_fenc = Some(b"utf-8".to_vec());
+        assert_eq!(bomb_size(&buf), 3);
+    }
+
+    #[test]
+    fn bomb_size_ucs2_and_utf16_are_2_bytes() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bomb: 1,
+            b_p_bin: 0,
+            b_p_fenc: Some(b"ucs-2".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 2);
+        buf.b_p_fenc = Some(b"utf-16".to_vec());
+        assert_eq!(bomb_size(&buf), 2);
+    }
+
+    #[test]
+    fn bomb_size_ucs4_is_4_bytes() {
+        let buf = crate::buffer_defs::BufT {
+            b_p_bomb: 1,
+            b_p_bin: 0,
+            b_p_fenc: Some(b"ucs-4".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 4);
+    }
+
+    #[test]
+    fn bomb_size_zero_when_bomb_option_off() {
+        let buf = crate::buffer_defs::BufT {
+            b_p_bomb: 0,
+            b_p_bin: 0,
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 0);
+    }
+
+    #[test]
+    fn bomb_size_zero_when_binary_mode() {
+        let buf = crate::buffer_defs::BufT {
+            b_p_bomb: 1,
+            b_p_bin: 1,
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 0);
+    }
+
+    #[test]
+    fn bomb_size_zero_for_an_unrecognized_encoding() {
+        let buf = crate::buffer_defs::BufT {
+            b_p_bomb: 1,
+            b_p_bin: 0,
+            b_p_fenc: Some(b"latin1".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(bomb_size(&buf), 0);
+    }
+
+    #[test]
+    fn remove_bom_strips_a_leading_bom() {
+        let mut s = vec![0xef, 0xbb, 0xbf, b'h', b'i'];
+        remove_bom(&mut s);
+        assert_eq!(s, b"hi");
+    }
+
+    #[test]
+    fn remove_bom_no_bom_is_unchanged() {
+        let mut s = b"hi".to_vec();
+        remove_bom(&mut s);
+        assert_eq!(s, b"hi");
+    }
+
+    #[test]
+    fn remove_bom_leaves_a_lone_0xef_not_forming_a_real_bom() {
+        let mut s = vec![0xef, b'x', b'y'];
+        remove_bom(&mut s);
+        assert_eq!(s, vec![0xef, b'x', b'y']);
+    }
+
+    #[test]
+    fn remove_bom_removes_every_occurrence() {
+        let mut s = vec![0xef, 0xbb, 0xbf, b'a', 0xef, 0xbb, 0xbf, b'b'];
+        remove_bom(&mut s);
+        assert_eq!(s, b"ab");
     }
 }
