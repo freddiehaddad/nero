@@ -44,6 +44,7 @@ pub mod ex_getln;
 pub mod ex_eval;
 pub mod ex_eval_defs;
 pub mod extmark_defs;
+pub mod file_search;
 pub mod fold;
 pub mod fold_defs;
 pub mod fuzzy;
