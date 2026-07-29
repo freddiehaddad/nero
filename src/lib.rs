@@ -33,6 +33,7 @@ pub mod cursor_shape;
 pub mod decoration;
 pub mod decoration_defs;
 pub mod diff;
+pub mod digraph;
 pub mod drawscreen;
 pub mod errors;
 pub mod eval;
