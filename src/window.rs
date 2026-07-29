@@ -192,6 +192,14 @@
 //! either (both of its original branches reduce to the identical
 //! Rust assignment) - kept, unused, purely for signature fidelity.
 //!
+//! Also translated: `valid_tabpage_win` (whether a tabpage is valid
+//! AND has at least one valid window), via already-real
+//! `crate::globals::GLOBALS.first_tabpage`/`firstwin`/`curtab`,
+//! `TabpageT.tp_next`/`tp_firstwin`, `WinT.w_next`,
+//! `win_valid_any_tab` - matching `tabpage_win_valid`'s own
+//! established "current tabpage uses `GLOBALS.firstwin`, any other
+//! uses its own `tp_firstwin`" walk precedent.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -2194,6 +2202,47 @@ pub fn clear_float_config(fconfig: &mut crate::buffer_defs::WinConfig, free_fiel
     *fconfig = crate::buffer_defs::WinConfig::default();
     fconfig.style = saved_style;
     fconfig._cmdline_offset = saved_cmdline_offset;
+}
+
+/// Whether tabpage `tpc` is a valid, reachable tabpage with at least
+/// one valid window (`valid_tabpage_win`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers. For each such tabpage,
+/// its own window list (`tp_firstwin`/`w_next`, or
+/// `GLOBALS.firstwin`/`w_next` when it's the current tabpage) must
+/// consist of valid, live `WinT` pointers.
+#[must_use]
+pub unsafe fn valid_tabpage_win(tpc: *const crate::buffer_defs::TabpageT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        if std::ptr::eq(tp, tpc) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+            let mut wp = if is_curtab {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &*tp }.tp_firstwin
+            };
+            while !wp.is_null() {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { win_valid_any_tab(wp) } {
+                    return true;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                wp = unsafe { &*wp }.w_next;
+            }
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    // shouldn't happen
+    false
 }
 
 #[cfg(test)]
@@ -5027,6 +5076,104 @@ mod tests {
         assert_eq!(fconfig.height, 0);
         assert_eq!(fconfig.style, crate::buffer_defs::WinStyle::Minimal);
         assert_eq!(fconfig._cmdline_offset, 7);
+    }
+
+    // ---- valid_tabpage_win ----
+
+    /// Saves/restores `GLOBALS.first_tabpage`/`curtab`/`firstwin` for
+    /// the guard's lifetime - the exact field set `valid_tabpage_win`
+    /// needs (distinct from `OnlyOneWindowGuard`, which manages
+    /// `curbuf`/`curwin` instead of `curtab`).
+    struct ValidTabpageWinGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut WinT,
+    }
+    impl ValidTabpageWinGuard {
+        fn set(
+            first_tabpage: *mut crate::buffer_defs::TabpageT,
+            curtab: *mut crate::buffer_defs::TabpageT,
+            firstwin: *mut WinT,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = ValidTabpageWinGuard {
+                prev_first_tabpage: g.first_tabpage,
+                prev_curtab: g.curtab,
+                prev_firstwin: g.firstwin,
+            };
+            g.first_tabpage = first_tabpage;
+            g.curtab = curtab;
+            g.firstwin = firstwin;
+            guard
+        }
+    }
+    impl Drop for ValidTabpageWinGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.first_tabpage = self.prev_first_tabpage;
+            g.curtab = self.prev_curtab;
+            g.firstwin = self.prev_firstwin;
+        }
+    }
+
+    #[test]
+    fn valid_tabpage_win_true_for_curtab_with_a_valid_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = ValidTabpageWinGuard::set(tp_ptr, tp_ptr, win_ptr);
+
+        assert!(unsafe { valid_tabpage_win(tp_ptr) });
+    }
+
+    #[test]
+    fn valid_tabpage_win_false_for_curtab_with_no_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = ValidTabpageWinGuard::set(tp_ptr, tp_ptr, std::ptr::null_mut());
+
+        assert!(!unsafe { valid_tabpage_win(tp_ptr) });
+    }
+
+    #[test]
+    fn valid_tabpage_win_true_for_a_non_curtab_with_its_own_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_win = focusable_win(2);
+        let other_win_ptr = &mut other_win as *mut WinT;
+        let mut other_tp =
+            crate::buffer_defs::TabpageT { tp_firstwin: other_win_ptr, ..Default::default() };
+        let other_tp_ptr = &mut other_tp as *mut crate::buffer_defs::TabpageT;
+
+        let mut cur_win = focusable_win(1);
+        let cur_win_ptr = &mut cur_win as *mut WinT;
+        let mut cur_tp =
+            crate::buffer_defs::TabpageT { tp_next: other_tp_ptr, ..Default::default() };
+        let cur_tp_ptr = &mut cur_tp as *mut crate::buffer_defs::TabpageT;
+        // curtab is cur_tp_ptr, NOT other_tp_ptr - proving other_tp's
+        // own tp_firstwin is used, not GLOBALS.firstwin.
+        let _guard = ValidTabpageWinGuard::set(cur_tp_ptr, cur_tp_ptr, cur_win_ptr);
+
+        assert!(unsafe { valid_tabpage_win(other_tp_ptr) });
+    }
+
+    #[test]
+    fn valid_tabpage_win_false_when_tpc_is_not_in_the_tabpage_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut cur_win = focusable_win(1);
+        let cur_win_ptr = &mut cur_win as *mut WinT;
+        let mut cur_tp =
+            crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let cur_tp_ptr = &mut cur_tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = ValidTabpageWinGuard::set(cur_tp_ptr, cur_tp_ptr, cur_win_ptr);
+
+        let mut unrelated_tp = crate::buffer_defs::TabpageT::default();
+        let unrelated_tp_ptr = &mut unrelated_tp as *mut crate::buffer_defs::TabpageT;
+
+        // shouldn't happen in practice, but must not panic.
+        assert!(!unsafe { valid_tabpage_win(unrelated_tp_ptr) });
     }
 
     #[test]
