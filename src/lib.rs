@@ -35,6 +35,7 @@ pub mod context;
 pub mod context_defs;
 pub mod cursor;
 pub mod cursor_shape;
+pub mod debugger;
 pub mod decoration;
 pub mod decoration_defs;
 pub mod decoration_provider;
