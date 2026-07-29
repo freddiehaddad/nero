@@ -55,6 +55,7 @@ pub mod highlight_defs;
 pub mod iconv_defs;
 pub mod indent;
 pub mod input_defs;
+pub mod linematch;
 pub mod insert_defs;
 pub mod log;
 pub mod macros_defs;
