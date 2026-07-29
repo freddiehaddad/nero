@@ -104,6 +104,7 @@ pub mod strings;
 pub mod tag;
 pub mod testing;
 pub mod types_defs;
+pub mod ui;
 pub mod undo;
 pub mod undo_defs;
 pub mod vim_defs;

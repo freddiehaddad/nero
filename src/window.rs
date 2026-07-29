@@ -1055,6 +1055,132 @@ pub unsafe fn frame_minwidth(topfrp: *const crate::buffer_defs::FrameT, next_cur
     }
 }
 
+/// Return the default value for `'scroll'` for window `wp`
+/// (`win_default_scroll`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn win_default_scroll(wp: *const WinT) -> crate::types_defs::OptInt {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_view_height = unsafe { &*wp }.w_view_height;
+    crate::types_defs::OptInt::from((w_view_height / 2).max(1))
+}
+
+/// Return the number of lines used by the tab page line
+/// (`tabline_height`), via `'showtabline'`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn tabline_height() -> i32 {
+    if crate::ui::ui_has(crate::ui::UiExtension::Tabline) {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    debug_assert!(!first_tabpage.is_null());
+    // SAFETY: forwarded from this function's own safety doc.
+    let only_one_tab = unsafe { &*first_tabpage }.tp_next.is_null();
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_stal {
+        0 => 0,
+        1 if only_one_tab => 0,
+        1 => 1,
+        _ => 1,
+    }
+}
+
+/// Return the number of lines used by the global statusline
+/// (`global_stl_height`), via `'laststatus'`.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn global_stl_height() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls == 3 {
+        STATUS_HEIGHT
+    } else {
+        0
+    }
+}
+
+/// Return the minimal number of rows needed on the screen to display
+/// the current number of windows for tab page `tp` (`min_rows`).
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live `TabpageT`, whose
+/// own `tp_topframe` frame tree consists of valid, live pointers.
+/// Touches `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn min_rows(tp: *const crate::buffer_defs::TabpageT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if globals.firstwin.is_null() {
+        // not initialized yet
+        return MIN_LINES;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let t = unsafe { &*tp };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut total = unsafe { frame_minheight(t.tp_topframe, std::ptr::null_mut()) };
+    // SAFETY: forwarded from this function's own safety doc.
+    total += unsafe { tabline_height() } + unsafe { global_stl_height() };
+    let ch_used = if std::ptr::eq(tp, globals.curtab) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch
+    } else {
+        t.tp_ch_used
+    };
+    if ch_used > 0 {
+        total += 1; // count the room for the command line
+    }
+    total
+}
+
+/// Return the minimal number of rows needed on the screen to display
+/// the current number of windows for ALL tab pages
+/// (`min_rows_for_all_tabpages`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers, each with a valid,
+/// live `tp_topframe` frame tree. Touches
+/// `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn min_rows_for_all_tabpages() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if globals.firstwin.is_null() {
+        // not initialized yet
+        return MIN_LINES;
+    }
+
+    let mut total = 0;
+    let mut tp = globals.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let t = unsafe { &*tp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut n = unsafe { frame_minheight(t.tp_topframe, std::ptr::null_mut()) };
+        let ch_used = if std::ptr::eq(tp, globals.curtab) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch
+        } else {
+            t.tp_ch_used
+        };
+        if ch_used > 0 {
+            n += 1; // count the room for the command line
+        }
+        total = total.max(n);
+        tp = t.tp_next;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    total += unsafe { tabline_height() } + unsafe { global_stl_height() };
+    total
+}
+
 /// Get the window `count` positions above (`up == true`) or below
 /// `wp` in `tp`'s frame tree (`win_vert_neighbor`). Returns `wp`
 /// itself (via `foundfr` staying `wp.w_frame`) if no such neighbor
@@ -2696,6 +2822,206 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unsafe { frame_minwidth(&row, std::ptr::null_mut()) }, 14); // 9 + 5
+    }
+
+    // ---- win_default_scroll / tabline_height / global_stl_height / min_rows(_for_all_tabpages) ----
+
+    #[test]
+    fn win_default_scroll_halves_the_view_height() {
+        let win = WinT { w_view_height: 20, ..Default::default() };
+        assert_eq!(unsafe { win_default_scroll(&win) }, 10);
+    }
+
+    #[test]
+    fn win_default_scroll_never_returns_less_than_one() {
+        let win = WinT { w_view_height: 0, ..Default::default() };
+        assert_eq!(unsafe { win_default_scroll(&win) }, 1);
+        let win2 = WinT { w_view_height: 1, ..Default::default() };
+        assert_eq!(unsafe { win_default_scroll(&win2) }, 1);
+    }
+
+    /// RAII guard temporarily setting `OPTION_VARS.p_stal`/`p_ls` and
+    /// `GLOBALS.first_tabpage`, restoring the previous values on drop.
+    /// Caller must hold `global_state_test_lock()`.
+    struct TablineGlobalsGuard {
+        prev_stal: crate::types_defs::OptInt,
+        prev_ls: crate::types_defs::OptInt,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+    }
+    impl TablineGlobalsGuard {
+        fn set(stal: i64, ls: i64, first_tabpage: *mut crate::buffer_defs::TabpageT) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = TablineGlobalsGuard {
+                prev_stal: opts.p_stal,
+                prev_ls: opts.p_ls,
+                prev_first_tabpage: globals.first_tabpage,
+            };
+            opts.p_stal = stal;
+            opts.p_ls = ls;
+            globals.first_tabpage = first_tabpage;
+            guard
+        }
+    }
+    impl Drop for TablineGlobalsGuard {
+        fn drop(&mut self) {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            opts.p_stal = self.prev_stal;
+            opts.p_ls = self.prev_ls;
+            globals.first_tabpage = self.prev_first_tabpage;
+        }
+    }
+
+    #[test]
+    fn tabline_height_zero_when_showtabline_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
+        assert_eq!(unsafe { tabline_height() }, 0);
+    }
+
+    #[test]
+    fn tabline_height_one_only_shown_with_multiple_tabs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut only_tab = crate::buffer_defs::TabpageT::default();
+        let only_tab_ptr = &mut only_tab as *mut crate::buffer_defs::TabpageT;
+        {
+            let _guard = TablineGlobalsGuard::set(1, 0, only_tab_ptr);
+            assert_eq!(unsafe { tabline_height() }, 0);
+        }
+
+        let mut second_tab = crate::buffer_defs::TabpageT::default();
+        let second_tab_ptr = &mut second_tab as *mut crate::buffer_defs::TabpageT;
+        let mut first_tab =
+            crate::buffer_defs::TabpageT { tp_next: second_tab_ptr, ..Default::default() };
+        let first_tab_ptr = &mut first_tab as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(1, 0, first_tab_ptr);
+        assert_eq!(unsafe { tabline_height() }, 1);
+    }
+
+    #[test]
+    fn tabline_height_always_one_when_showtabline_is_two() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(2, 0, tp_ptr);
+        assert_eq!(unsafe { tabline_height() }, 1);
+    }
+
+    #[test]
+    fn global_stl_height_one_only_when_laststatus_is_three() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(0, 3, tp_ptr);
+        assert_eq!(unsafe { global_stl_height() }, STATUS_HEIGHT);
+
+        let _guard2 = TablineGlobalsGuard::set(0, 2, tp_ptr);
+        assert_eq!(unsafe { global_stl_height() }, 0);
+    }
+
+    #[test]
+    fn min_rows_not_initialized_yet_returns_min_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        globals.firstwin = std::ptr::null_mut();
+        let tp = crate::buffer_defs::TabpageT::default();
+        assert_eq!(unsafe { min_rows(&tp) }, MIN_LINES);
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn min_rows_for_all_tabpages_not_initialized_yet_returns_min_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        globals.firstwin = std::ptr::null_mut();
+        assert_eq!(unsafe { min_rows_for_all_tabpages() }, MIN_LINES);
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn min_rows_combines_frame_minheight_tabline_and_statusline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win = win_with_extras(1); // minheight (not curwin/next): p_wmh(2)+extra(6)=8
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_topframe: &leaf as *const _ as *mut crate::buffer_defs::FrameT,
+            tp_ch_used: 0, // not curtab's own p_ch, and 0 here means no +1 bump
+            ..Default::default()
+        };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        let prev_curtab = globals.curtab;
+        let prev_first_tabpage = globals.first_tabpage;
+        globals.firstwin = win_ptr; // just needs to be non-null
+        globals.curtab = std::ptr::null_mut(); // tp itself is NOT curtab
+        // tabline_height (called internally by min_rows) asserts
+        // first_tabpage is non-null - it need not be tp itself.
+        globals.first_tabpage = tp_ptr;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_stal = 0; // tabline_height == 0
+        opts.p_ls = 0; // global_stl_height == 0
+
+        // 8 (frame_minheight) + 0 (tabline) + 0 (statusline) + 0 (no
+        // command-line room, since tp_ch_used == 0) = 8.
+        assert_eq!(unsafe { min_rows(tp_ptr) }, 8);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_firstwin;
+        globals.curtab = prev_curtab;
+        globals.first_tabpage = prev_first_tabpage;
+    }
+
+    #[test]
+    fn min_rows_for_all_tabpages_takes_the_maximum_across_tabs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 5);
+        let mut win1 = win_with_extras(1); // 2+6=8
+        let mut win2 = WinT { handle: 2, w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, ..Default::default() }; // 2+0=2
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let leaf1 = crate::buffer_defs::FrameT { fr_win: win1_ptr, ..Default::default() };
+        let leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let mut tab2 = crate::buffer_defs::TabpageT {
+            tp_topframe: &leaf2 as *const _ as *mut crate::buffer_defs::FrameT,
+            tp_ch_used: 0,
+            ..Default::default()
+        };
+        let tab2_ptr = &mut tab2 as *mut crate::buffer_defs::TabpageT;
+        let mut tab1 = crate::buffer_defs::TabpageT {
+            tp_topframe: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            tp_next: tab2_ptr,
+            tp_ch_used: 0,
+            ..Default::default()
+        };
+        let tab1_ptr = &mut tab1 as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        let prev_curtab = globals.curtab;
+        let prev_first_tabpage = globals.first_tabpage;
+        globals.firstwin = win1_ptr;
+        globals.curtab = std::ptr::null_mut();
+        globals.first_tabpage = tab1_ptr;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_stal = 0;
+        opts.p_ls = 0;
+
+        // max(8, 2) + 0 + 0 = 8.
+        assert_eq!(unsafe { min_rows_for_all_tabpages() }, 8);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_firstwin;
+        globals.curtab = prev_curtab;
+        globals.first_tabpage = prev_first_tabpage;
     }
 
     // ---- find_tabwin ----

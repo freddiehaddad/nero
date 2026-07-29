@@ -140,15 +140,16 @@
 //!   project's own plan) AND the `OptionSet` autocommand trigger
 //!   machinery.
 //! - `validate_option_value`/`validate_num_option`/
-//!   `check_num_option_bounds` are NEWLY FOUND to need the frame-
-//!   layout/window-splitting subsystem for several of their numeric
-//!   bound checks (`kOptLines`/`kOptScrolljump`/`kOptScroll` need
-//!   `min_rows_for_all_tabpages`/`win_default_scroll`, which
-//!   themselves need `frame_minheight`/`tabline_height`/
-//!   `global_stl_height` - none of `window.c`'s frame-tree layout
-//!   logic is translated yet). The OTHER, simpler numeric bound
-//!   checks (most of the switch) have no such blocker and would be a
-//!   reasonable follow-up once isolated from the 3 blocked cases.
+//!   `check_num_option_bounds` are now FULLY translated (no remaining
+//!   panics): `OptIndex::Lines`/`OptIndex::Scroll` (previously the
+//!   only 2 blocked cases, needing `window.c`'s
+//!   `min_rows_for_all_tabpages`/`win_default_scroll`) are real now
+//!   that `frame_minheight`/`tabline_height`/`global_stl_height` exist
+//!   (`window.rs`) - `OptIndex::Lines`'s own real error message embeds
+//!   a dynamic value the original formats with `vim_snprintf`; this
+//!   crate returns a fixed placeholder string instead, since nothing
+//!   here displays it to a real user yet (see `check_num_option_
+//!   bounds`'s own doc comment for the full reasoning).
 //! - `was_set_insecurely`/`insecure_flag` still need `OPTIONS[idx]
 //!   .flags`'s own `WAS_SET`/`INSECURE` bits threaded through a real
 //!   `:set` call site to have any meaningful test value.
@@ -2331,30 +2332,39 @@ const e_cannot_have_more_than_hundred_quickfix: &str =
 /// there's no error at all, e.g. `Pumblend`'s silent clamp), matching
 /// the original's own in-out `newval` parameter.
 ///
-/// # Panics
-/// `unimplemented!()`s for `OptIndex::Lines`/`OptIndex::Scroll` - each
-/// needs `window.c`'s NOT-YET-TRANSLATED frame-layout/window-splitting
-/// subsystem (`min_rows_for_all_tabpages`/`win_default_scroll`, which
-/// themselves need `frame_minheight`/`tabline_height`/
-/// `global_stl_height`) to compute their real bound - see this file's
-/// own module doc comment. Every OTHER branch (including
-/// `OptIndex::Scrolljump`, which only needs the already-real
-/// `GLOBALS.Rows`, not the frame-layout subsystem) is fully real.
+/// `OptIndex::Lines`'s own real error message embeds the dynamic
+/// `min_rows_for_all_tabpages()` value ("E593: Need at least %d
+/// lines") - this crate has no real message-DISPLAY consumer yet that
+/// would need the exact number embedded in the text (there is no
+/// `:set` command parser calling this function today), so a fixed
+/// placeholder string is returned instead, matching this whole
+/// project's established "skip the message display, keep the state/
+/// return value correct" policy (`mf_write`/`u_get_headentry`/etc.) -
+/// the `Some`-vs-`None` result and the corrected `*newval` are both
+/// exactly faithful.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
-/// to a live `WinT` - not actually dereferenced by any branch below
-/// TODAY (the one branch that would need it, `OptIndex::Scroll`,
-/// currently always panics first), but documented as a real,
-/// forward-looking requirement so this function's contract doesn't
-/// silently change once that branch is unblocked.
+/// to a live `WinT` (dereferenced by the `OptIndex::Scroll` branch).
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain, each
+/// with a valid, live `tp_topframe` frame tree, must consist of valid,
+/// live pointers (`OptIndex::Lines`, via `min_rows_for_all_tabpages`).
 #[must_use]
 pub unsafe fn check_num_option_bounds(opt_idx: OptIndex, newval: &mut OptInt) -> Option<&'static str> {
     match opt_idx {
-        OptIndex::Lines => unimplemented!(
-            "check_num_option_bounds: OptIndex::Lines needs min_rows_for_all_tabpages, \
-             not yet translated (window.c's frame-layout subsystem)"
-        ),
+        OptIndex::Lines => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let min_rows = OptInt::from(unsafe { crate::window::min_rows_for_all_tabpages() });
+            let full_screen = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
+            let mut errmsg = None;
+            if *newval < min_rows && full_screen {
+                errmsg = Some("E593: Need at least N lines");
+                *newval = min_rows;
+            }
+            // True max size is defined by check_screensize().
+            *newval = (*newval).min(OptInt::from(i32::MAX));
+            errmsg
+        }
         OptIndex::Columns => {
             let full_screen = unsafe { crate::globals::GLOBALS.get_mut() }.full_screen;
             let mut errmsg = None;
@@ -2378,10 +2388,21 @@ pub unsafe fn check_num_option_bounds(opt_idx: OptIndex, newval: &mut OptInt) ->
             }
             None
         }
-        OptIndex::Scroll => unimplemented!(
-            "check_num_option_bounds: OptIndex::Scroll needs win_default_scroll, \
-             not yet translated (window.c's frame-layout subsystem)"
-        ),
+        OptIndex::Scroll => {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let full_screen = globals.full_screen;
+            // SAFETY: forwarded from this function's own safety doc.
+            let w_view_height = OptInt::from(unsafe { &*globals.curwin }.w_view_height);
+            let mut errmsg = None;
+            if (*newval <= 0 || (*newval > w_view_height && w_view_height > 0)) && full_screen {
+                if *newval != 0 {
+                    errmsg = Some(crate::errors::e_scroll);
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                *newval = unsafe { crate::window::win_default_scroll(globals.curwin) };
+            }
+            errmsg
+        }
         _ => None,
     }
 }
@@ -2391,11 +2412,6 @@ pub unsafe fn check_num_option_bounds(opt_idx: OptIndex, newval: &mut OptInt) ->
 /// Returns `Some(error_message)` on failure; `*newval` may ALSO have
 /// been corrected even on success (e.g. `Maxcombine` always forces
 /// `MAX_MCO`, `Pyxversion` forces `3`).
-///
-/// # Panics
-/// `unimplemented!()`s for `OptIndex::Lines`/`OptIndex::Scroll`, via
-/// the final [`check_num_option_bounds`] call - see that function's
-/// own doc comment. No OTHER branch panics.
 ///
 /// # Safety
 /// Forwards [`check_num_option_bounds`]'s own safety requirement.
@@ -2569,17 +2585,68 @@ mod num_option_bounds_tests {
     use super::*;
 
     #[test]
-    #[should_panic]
-    fn check_num_option_bounds_lines_panics() {
-        let mut v: OptInt = 10;
-        let _ = unsafe { check_num_option_bounds(OptIndex::Lines, &mut v) };
+    fn check_num_option_bounds_lines_uses_min_rows_for_all_tabpages() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        let prev_full_screen = globals.full_screen;
+        // firstwin == null takes min_rows_for_all_tabpages's own
+        // "not initialized yet" fast path, returning MIN_LINES (2) -
+        // avoids needing a full frame tree for this test.
+        globals.firstwin = std::ptr::null_mut();
+        globals.full_screen = true;
+
+        let mut v: OptInt = 1;
+        assert_eq!(
+            unsafe { check_num_option_bounds(OptIndex::Lines, &mut v) },
+            Some("E593: Need at least N lines")
+        );
+        assert_eq!(v, 2);
+
+        let mut v2: OptInt = 5;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Lines, &mut v2) }, None);
+        assert_eq!(v2, 5);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_firstwin;
+        globals.full_screen = prev_full_screen;
     }
 
     #[test]
-    #[should_panic]
-    fn check_num_option_bounds_scroll_panics() {
-        let mut v: OptInt = 10;
-        let _ = unsafe { check_num_option_bounds(OptIndex::Scroll, &mut v) };
+    fn check_num_option_bounds_scroll_uses_win_default_scroll() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { w_view_height: 20, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = globals.curwin;
+        let prev_full_screen = globals.full_screen;
+        globals.curwin = win_ptr;
+        globals.full_screen = true;
+
+        // 0 always takes the "correct it" branch, but 0 itself never
+        // produces an error message (matching the original's own
+        // `if (*newval != 0) { errmsg = e_scroll; }` guard).
+        let mut v0: OptInt = 0;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scroll, &mut v0) }, None);
+        assert_eq!(v0, 10); // win_default_scroll: max(20/2, 1) = 10
+
+        // Larger than w_view_height (20) and w_view_height > 0: errors
+        // AND gets corrected to win_default_scroll's value.
+        let mut v_big: OptInt = 100;
+        assert_eq!(
+            unsafe { check_num_option_bounds(OptIndex::Scroll, &mut v_big) },
+            Some(crate::errors::e_scroll)
+        );
+        assert_eq!(v_big, 10);
+
+        // Within [1, w_view_height]: left untouched.
+        let mut v_ok: OptInt = 5;
+        assert_eq!(unsafe { check_num_option_bounds(OptIndex::Scroll, &mut v_ok) }, None);
+        assert_eq!(v_ok, 5);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curwin = prev_curwin;
+        globals.full_screen = prev_full_screen;
     }
 
     #[test]
@@ -2918,10 +2985,24 @@ mod num_option_bounds_tests {
     }
 
     #[test]
-    #[should_panic]
-    fn validate_num_option_lines_panics_via_check_num_option_bounds() {
-        let mut v: OptInt = 10;
-        let _ = unsafe { validate_num_option(OptIndex::Lines, &mut v) };
+    fn validate_num_option_lines_delegates_to_check_num_option_bounds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = globals.firstwin;
+        let prev_full_screen = globals.full_screen;
+        globals.firstwin = std::ptr::null_mut();
+        globals.full_screen = true;
+
+        let mut v: OptInt = 1;
+        assert_eq!(
+            unsafe { validate_num_option(OptIndex::Lines, &mut v) },
+            Some("E593: Need at least N lines")
+        );
+        assert_eq!(v, 2);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_firstwin;
+        globals.full_screen = prev_full_screen;
     }
 }
 
