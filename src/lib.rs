@@ -119,6 +119,7 @@ pub mod runtime_defs;
 pub mod search;
 pub mod search_defs;
 pub mod sha256;
+pub mod sign;
 pub mod sign_defs;
 pub mod spell;
 pub mod spellsuggest;
