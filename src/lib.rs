@@ -27,6 +27,7 @@ pub mod change;
 pub mod charset;
 pub mod cmdexpand;
 pub mod cmdexpand_defs;
+pub mod cmdhist;
 pub mod context;
 pub mod context_defs;
 pub mod cursor;
