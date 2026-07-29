@@ -111,6 +111,7 @@ pub mod types_defs;
 pub mod ui;
 pub mod undo;
 pub mod undo_defs;
+pub mod usercmd;
 pub mod vim_defs;
 pub mod window;
 pub mod winfloat;
