@@ -58,6 +58,7 @@ pub mod help;
 pub mod highlight_defs;
 pub mod iconv_defs;
 pub mod indent;
+pub mod indent_c;
 pub mod input_defs;
 pub mod keycodes;
 pub mod keycodes_defs;
