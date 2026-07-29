@@ -6,8 +6,10 @@
 //! state machine, nested fold levels, etc.), not remotely close to
 //! being fully translated here.
 //!
-//! Translated: `foldmethodIsManual`/`foldmethodIsIndent` (pure
-//! `'foldmethod'` string-prefix checks), `hasAnyFolding` (`terminal`/
+//! Translated: `foldmethodIsManual`/`foldmethodIsIndent`/
+//! `foldmethodIsExpr`/`foldmethodIsMarker`/`foldmethodIsSyntax`/
+//! `foldmethodIsDiff` (pure `'foldmethod'` string-prefix checks),
+//! `hasAnyFolding` (`terminal`/
 //! `'foldenable'`/`foldmethodIsManual`/`w_folds`-emptiness check), and
 //! the "there are no folds to find" fast path of `checkupdate`/
 //! `hasFoldingWin`/`hasFolding`/`fold_info`/`lineFolded` (as
@@ -65,6 +67,30 @@ pub fn foldmethod_is_manual(wp: &WinT) -> bool {
 #[must_use]
 pub fn foldmethod_is_indent(wp: &WinT) -> bool {
     wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| s.first() == Some(&b'i'))
+}
+
+/// @return true if `'foldmethod'` is "expr" (`foldmethodIsExpr`).
+#[must_use]
+pub fn foldmethod_is_expr(wp: &WinT) -> bool {
+    wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| !s.is_empty() && s.get(1) == Some(&b'x'))
+}
+
+/// @return true if `'foldmethod'` is "marker" (`foldmethodIsMarker`).
+#[must_use]
+pub fn foldmethod_is_marker(wp: &WinT) -> bool {
+    wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| !s.is_empty() && s.get(2) == Some(&b'r'))
+}
+
+/// @return true if `'foldmethod'` is "syntax" (`foldmethodIsSyntax`).
+#[must_use]
+pub fn foldmethod_is_syntax(wp: &WinT) -> bool {
+    wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| s.first() == Some(&b's'))
+}
+
+/// @return true if `'foldmethod'` is "diff" (`foldmethodIsDiff`).
+#[must_use]
+pub fn foldmethod_is_diff(wp: &WinT) -> bool {
+    wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| s.first() == Some(&b'd'))
 }
 
 /// @return true if there may be folded lines in window `win`
@@ -260,6 +286,66 @@ mod tests {
         };
         assert!(!foldmethod_is_manual(&win));
         assert!(foldmethod_is_indent(&win));
+    }
+
+    /// Builds a `WinT` with `'foldmethod'` set to `fdm` for exercising
+    /// the `foldmethod_is_*` predicate family.
+    fn win_with_fdm(fdm: &[u8]) -> WinT {
+        WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fdm: Some(fdm.to_vec()), ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn foldmethod_is_expr_true_only_for_expr() {
+        assert!(foldmethod_is_expr(&win_with_fdm(b"expr")));
+        assert!(!foldmethod_is_expr(&win_with_fdm(b"manual")));
+        assert!(!foldmethod_is_expr(&win_with_fdm(b"indent")));
+        assert!(!foldmethod_is_expr(&win_with_fdm(b"marker")));
+        assert!(!foldmethod_is_expr(&win_with_fdm(b"syntax")));
+        assert!(!foldmethod_is_expr(&win_with_fdm(b"diff")));
+    }
+
+    #[test]
+    fn foldmethod_is_marker_true_only_for_marker() {
+        assert!(foldmethod_is_marker(&win_with_fdm(b"marker")));
+        assert!(!foldmethod_is_marker(&win_with_fdm(b"manual")));
+        assert!(!foldmethod_is_marker(&win_with_fdm(b"indent")));
+        assert!(!foldmethod_is_marker(&win_with_fdm(b"expr")));
+        assert!(!foldmethod_is_marker(&win_with_fdm(b"syntax")));
+        assert!(!foldmethod_is_marker(&win_with_fdm(b"diff")));
+    }
+
+    #[test]
+    fn foldmethod_is_syntax_true_only_for_syntax() {
+        assert!(foldmethod_is_syntax(&win_with_fdm(b"syntax")));
+        assert!(!foldmethod_is_syntax(&win_with_fdm(b"manual")));
+        assert!(!foldmethod_is_syntax(&win_with_fdm(b"indent")));
+        assert!(!foldmethod_is_syntax(&win_with_fdm(b"expr")));
+        assert!(!foldmethod_is_syntax(&win_with_fdm(b"marker")));
+        assert!(!foldmethod_is_syntax(&win_with_fdm(b"diff")));
+    }
+
+    #[test]
+    fn foldmethod_is_diff_true_only_for_diff() {
+        assert!(foldmethod_is_diff(&win_with_fdm(b"diff")));
+        assert!(!foldmethod_is_diff(&win_with_fdm(b"manual")));
+        assert!(!foldmethod_is_diff(&win_with_fdm(b"indent")));
+        assert!(!foldmethod_is_diff(&win_with_fdm(b"expr")));
+        assert!(!foldmethod_is_diff(&win_with_fdm(b"marker")));
+        assert!(!foldmethod_is_diff(&win_with_fdm(b"syntax")));
+    }
+
+    #[test]
+    fn foldmethod_is_all_false_when_wo_fdm_is_unset() {
+        let win = WinT::default();
+        assert!(!foldmethod_is_manual(&win));
+        assert!(!foldmethod_is_indent(&win));
+        assert!(!foldmethod_is_expr(&win));
+        assert!(!foldmethod_is_marker(&win));
+        assert!(!foldmethod_is_syntax(&win));
+        assert!(!foldmethod_is_diff(&win));
     }
 
     #[test]
