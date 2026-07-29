@@ -97,6 +97,21 @@
 //! their real callers (`frame_new_height`/`frame_new_width`, part of
 //! the larger window-resizing subsystem, not translated yet).
 //!
+//! Also translated: `window_layout_lock`/`window_layout_unlock`/
+//! `frames_locked`/`check_split_disallowed_err`/
+//! `check_split_disallowed`/`window_layout_locked_err`/
+//! `window_layout_locked` - 3 new file-static depth counters
+//! (`SPLIT_DISALLOWED`/`CLOSE_DISALLOWED`/`FRAME_LOCKED`, the last
+//! only ever incremented/decremented by `winframe_remove` in the
+//! original, not yet translated, so it stays `0` today) plus the
+//! predicates reading them. Every real `emsg` display is omitted,
+//! matching the established "skip the deferred message-display side
+//! effect, keep the exact same return value" policy -
+//! `check_split_disallowed_err`'s own return-value SENSE (`true` =
+//! allowed) is the OPPOSITE of `window_layout_locked_err`'s (`true` =
+//! locked), a real, deliberate distinction in the original's own two
+//! "_err" variants, preserved exactly rather than unified.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -105,6 +120,7 @@
 
 use crate::buffer_defs::WinT;
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
+use crate::globals::GlobalCell;
 
 /// minimal columns for screen (`MIN_COLUMNS`).
 pub const MIN_COLUMNS: i32 = 12;
@@ -1541,6 +1557,122 @@ pub unsafe fn win_new_height(wp: *mut WinT, height: i32) {
     unsafe { win_set_inner_size(wp, true) };
 }
 
+/// `split_disallowed` - depth counter; `> 0` means splitting a window
+/// is currently disallowed (`window.c`'s own file-static `int
+/// split_disallowed`). Mutated only by [`window_layout_lock`]/
+/// [`window_layout_unlock`].
+static SPLIT_DISALLOWED: GlobalCell<i32> = GlobalCell::new(0);
+
+/// `close_disallowed` - depth counter; `> 0` means closing a window is
+/// currently disallowed. Mutated only by [`window_layout_lock`]/
+/// [`window_layout_unlock`].
+static CLOSE_DISALLOWED: GlobalCell<i32> = GlobalCell::new(0);
+
+/// `frame_locked` - depth counter; `> 0` means the frame layout must
+/// not be changed. In the original, only ever incremented/decremented
+/// by `winframe_remove`, not yet translated - so this stays `0`
+/// forever in this crate today, matching the real state of any
+/// session that can't yet remove a window's frame from the layout
+/// tree.
+static FRAME_LOCKED: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Disallow changing the window layout (splitting or closing a
+/// window) until a matching [`window_layout_unlock`] call
+/// (`window_layout_lock`).
+pub fn window_layout_lock() {
+    // SAFETY: a plain increment through one exclusive borrow at a
+    // time, no aliasing hazard.
+    unsafe {
+        *SPLIT_DISALLOWED.get_mut() += 1;
+        *CLOSE_DISALLOWED.get_mut() += 1;
+    }
+}
+
+/// Undo one [`window_layout_lock`] call (`window_layout_unlock`).
+pub fn window_layout_unlock() {
+    // SAFETY: same as `window_layout_lock`.
+    unsafe {
+        *SPLIT_DISALLOWED.get_mut() -= 1;
+        *CLOSE_DISALLOWED.get_mut() -= 1;
+    }
+}
+
+/// `true` when the frame layout is currently locked and must not be
+/// changed (`frames_locked`).
+#[must_use]
+pub fn frames_locked() -> bool {
+    // SAFETY: a plain read through one exclusive borrow.
+    unsafe { *FRAME_LOCKED.get_mut() != 0 }
+}
+
+/// `true` when splitting a window containing `wp` is currently
+/// ALLOWED (`check_split_disallowed_err`'s own real sense: despite its
+/// name, this returns `true` for "no problem, go ahead" and `false`
+/// for "disallowed" - matching the original exactly). Omits the
+/// original's own `Error *err` out-parameter entirely: it exists only
+/// to carry message TEXT for a caller that displays it, and this
+/// crate's established "skip the deferred message-display side
+/// effect, keep the exact same return value" policy already applies
+/// (matching `check_can_set_curbuf_disabled`'s own precedent).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is a valid, non-null pointer to a live `BufT`.
+#[must_use]
+pub unsafe fn check_split_disallowed_err(wp: *const WinT) -> bool {
+    // SAFETY: a plain read through one exclusive borrow.
+    if unsafe { *SPLIT_DISALLOWED.get_mut() } > 0 {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*(&*wp).w_buffer };
+    if buf.b_locked_split != 0 {
+        return false;
+    }
+    true
+}
+
+/// If splitting a window containing `wp` is currently disallowed,
+/// return [`crate::vim_defs::FAIL`]; otherwise return
+/// [`crate::vim_defs::OK`] (`check_split_disallowed`). Omits the
+/// original's real `emsg` display, matching
+/// [`check_split_disallowed_err`].
+///
+/// # Safety
+/// Same as [`check_split_disallowed_err`].
+#[must_use]
+pub unsafe fn check_split_disallowed(wp: *const WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { check_split_disallowed_err(wp) } {
+        crate::vim_defs::OK
+    } else {
+        crate::vim_defs::FAIL
+    }
+}
+
+/// `true` when the window layout is currently LOCKED (cannot be
+/// changed) - the opposite return-value sense from
+/// [`check_split_disallowed_err`], matching the original's own real,
+/// deliberate distinction between the two "_err" variants
+/// (`window_layout_locked_err`). `cmd` only ever affects which of 2
+/// possible messages would be shown (never the return value itself) -
+/// kept, unused, purely for signature fidelity with the original.
+#[must_use]
+#[allow(unused_variables)]
+pub fn window_layout_locked_err(cmd: crate::ex_cmds_defs::CmdIdxT) -> bool {
+    // SAFETY: a plain read through one exclusive borrow.
+    unsafe { *SPLIT_DISALLOWED.get_mut() > 0 || *CLOSE_DISALLOWED.get_mut() > 0 }
+}
+
+/// Like [`window_layout_locked_err`], but matches the original's own
+/// outer wrapper name and behavior exactly (`window_layout_locked`) -
+/// identical return value, since the original's own `emsg` display
+/// (the only thing the wrapper adds) is already skipped.
+#[must_use]
+pub fn window_layout_locked(cmd: crate::ex_cmds_defs::CmdIdxT) -> bool {
+    window_layout_locked_err(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2014,6 +2146,148 @@ mod tests {
         assert!(!unsafe { check_can_set_curbuf_forceit(false) });
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    // ---- window_layout_lock / window_layout_unlock / frames_locked /
+    // check_split_disallowed / window_layout_locked ----
+
+    /// Resets `SPLIT_DISALLOWED`/`CLOSE_DISALLOWED`/`FRAME_LOCKED` to
+    /// `0` on both construction and drop, so a test using any of the 3
+    /// counters can never leak state into a later test regardless of
+    /// its own outcome (including a panic).
+    struct LayoutLockCountersGuard;
+    impl LayoutLockCountersGuard {
+        fn reset() -> Self {
+            unsafe {
+                *SPLIT_DISALLOWED.get_mut() = 0;
+                *CLOSE_DISALLOWED.get_mut() = 0;
+                *FRAME_LOCKED.get_mut() = 0;
+            }
+            LayoutLockCountersGuard
+        }
+    }
+    impl Drop for LayoutLockCountersGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *SPLIT_DISALLOWED.get_mut() = 0;
+                *CLOSE_DISALLOWED.get_mut() = 0;
+                *FRAME_LOCKED.get_mut() = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn window_layout_lock_increments_both_counters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        window_layout_lock();
+        assert_eq!(unsafe { *SPLIT_DISALLOWED.get_mut() }, 1);
+        assert_eq!(unsafe { *CLOSE_DISALLOWED.get_mut() }, 1);
+        window_layout_lock();
+        assert_eq!(unsafe { *SPLIT_DISALLOWED.get_mut() }, 2);
+        assert_eq!(unsafe { *CLOSE_DISALLOWED.get_mut() }, 2);
+    }
+
+    #[test]
+    fn window_layout_unlock_undoes_one_lock_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        window_layout_lock();
+        window_layout_lock();
+        window_layout_unlock();
+        assert_eq!(unsafe { *SPLIT_DISALLOWED.get_mut() }, 1);
+        assert_eq!(unsafe { *CLOSE_DISALLOWED.get_mut() }, 1);
+    }
+
+    #[test]
+    fn frames_locked_false_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        assert!(!frames_locked());
+    }
+
+    #[test]
+    fn frames_locked_true_when_frame_locked_counter_is_nonzero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        unsafe { *FRAME_LOCKED.get_mut() = 1 };
+        assert!(frames_locked());
+    }
+
+    #[test]
+    fn check_split_disallowed_err_true_when_nothing_disallows_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        let mut buf = crate::buffer_defs::BufT { b_locked_split: 0, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win = win_with_buffer(1, buf_ptr);
+        assert!(unsafe { check_split_disallowed_err(&win) });
+    }
+
+    #[test]
+    fn check_split_disallowed_err_false_when_split_disallowed_counter_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        window_layout_lock();
+        let mut buf = crate::buffer_defs::BufT { b_locked_split: 0, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win = win_with_buffer(1, buf_ptr);
+        assert!(!unsafe { check_split_disallowed_err(&win) });
+    }
+
+    #[test]
+    fn check_split_disallowed_err_false_when_buffer_has_locked_split() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        let mut buf = crate::buffer_defs::BufT { b_locked_split: 1, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win = win_with_buffer(1, buf_ptr);
+        assert!(!unsafe { check_split_disallowed_err(&win) });
+    }
+
+    #[test]
+    fn check_split_disallowed_maps_to_ok_and_fail() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        let mut buf = crate::buffer_defs::BufT { b_locked_split: 0, ..Default::default() };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win = win_with_buffer(1, buf_ptr);
+        assert_eq!(unsafe { check_split_disallowed(&win) }, crate::vim_defs::OK);
+
+        window_layout_lock();
+        assert_eq!(unsafe { check_split_disallowed(&win) }, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn window_layout_locked_err_false_when_neither_counter_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        assert!(!window_layout_locked_err(crate::ex_cmds_defs::CmdIdxT::split));
+    }
+
+    #[test]
+    fn window_layout_locked_err_true_when_split_disallowed_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        unsafe { *SPLIT_DISALLOWED.get_mut() = 1 };
+        assert!(window_layout_locked_err(crate::ex_cmds_defs::CmdIdxT::split));
+    }
+
+    #[test]
+    fn window_layout_locked_err_true_when_close_disallowed_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        unsafe { *CLOSE_DISALLOWED.get_mut() = 1 };
+        assert!(window_layout_locked_err(crate::ex_cmds_defs::CmdIdxT::tabnew));
+    }
+
+    #[test]
+    fn window_layout_locked_matches_window_layout_locked_err() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _counters = LayoutLockCountersGuard::reset();
+        assert!(!window_layout_locked(crate::ex_cmds_defs::CmdIdxT::split));
+        window_layout_lock();
+        assert!(window_layout_locked(crate::ex_cmds_defs::CmdIdxT::split));
     }
 
     /// Points `GLOBALS.firstwin`/`GLOBALS.curtab`/`GLOBALS.curwin` at
