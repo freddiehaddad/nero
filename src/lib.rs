@@ -123,6 +123,7 @@ pub mod ui;
 pub mod undo;
 pub mod undo_defs;
 pub mod usercmd;
+pub mod version;
 pub mod vim_defs;
 pub mod window;
 pub mod winfloat;
