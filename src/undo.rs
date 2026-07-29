@@ -62,7 +62,13 @@
 //! their own) now that `u_savecommon` is real; `u_eval_tree`/
 //! `f_undotree` (`"undotree()"`), a recursive undo-tree-to-List-of-
 //! Dicts introspection walk, needing only already-existing `UHeader`/
-//! `BufT` fields and `UhLink::ptr()`.
+//! `BufT` fields and `UhLink::ptr()`; `u_checkpoint` (the "snapshot
+//! and detach the undo tree" half of the `'inccommand'`-preview
+//! machinery, via the already-existing `undo_defs.rs`'s own
+//! `UndoCheckpoint` struct, `u_clearall`, and `buffer.rs`'s
+//! `buf_get_changedtick` - returns the checkpoint BY VALUE rather than
+//! through the original's own out-parameter, matching this crate's
+//! established convention).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -90,11 +96,19 @@
 //! - `u_undoline` (the "U" command's actual undo/redo-toggle logic,
 //!   distinct from the now-translated `u_saveline` save-side helper):
 //!   needs `extmark_splice_cols` (the extmark subsystem, not yet
-//!   translated), `changed_bytes` (`change.c`, not yet translated
-//!   beyond `file_ff_differs`), `check_cursor_col` (`cursor.c`, not
-//!   yet translated), and `beep_flush` (the message/display
-//!   subsystem). `u_savecommon` itself is no longer this function's
-//!   blocker now that it's real.
+//!   translated) and `changed_bytes` (`change.c`, not yet translated
+//!   beyond `file_ff_differs`) - both genuine, reachable blockers on
+//!   its own real success path, not a rare edge case. `check_cursor_col`
+//!   (`cursor.c`) is now real, contradicting a stale claim once made
+//!   here, and `beep_flush` (message display) would be skipped per
+//!   this crate's established policy, but the two blockers above alone
+//!   are enough to keep this genuinely blocked. `u_savecommon` itself
+//!   is no longer this function's blocker now that it's real.
+//! - `u_rollback`: needs the real `ctx_switch` (`context.c`'s `Win`/
+//!   `Buf` branches are `unimplemented!()`) and `u_undo_and_forget`
+//!   (the real undo-apply machinery, not translated) -
+//!   `u_checkpoint`, its sibling "snapshot and detach" half, IS now
+//!   translated (below), since it needs neither.
 //! - `ex_undolist`: needs the real message-display pipeline
 //!   (`msg_start`/`msg_puts_hl`/`msg_putchar`/`msg_end`/`msg`,
 //!   `message.c`, not tractable) - `exarg_T` existing isn't enough to
@@ -105,7 +119,7 @@ use crate::buffer_defs::BufT;
 use crate::globals::GlobalCell;
 use crate::mark_defs::{FmarkT, NMARKS};
 use crate::pos_defs::LinenrT;
-use crate::undo_defs::{uh_flags, UEntry, UHeader, UhLink};
+use crate::undo_defs::{uh_flags, UEntry, UHeader, UhLink, UndoCheckpoint};
 
 /// Repeat the previous undo/redo when `undo_undoes` is set, used by
 /// `u_savecommon`/`u_doit`. File-static in the original (`undo_undoes`).
@@ -1227,6 +1241,57 @@ pub unsafe fn f_undotree(argvars: &[crate::eval::typval_defs::TypvalT], rettv: &
     unsafe { crate::eval::typval::tv_dict_add_list(dict, b"entries", entries) };
 }
 
+/// Checkpoints the undo state of `buf` and detaches its undotree:
+/// subsequent edits build a disposable tree. Then `u_rollback()` could
+/// revert them without a trace ("undo-invisible" speculative edits,
+/// e.g. `'inccommand'` preview) - `u_rollback()` itself remains
+/// deferred (needs the real `ctx_switch`/`u_undo_and_forget`, neither
+/// translated), but `u_checkpoint()` alone is a complete, faithful
+/// snapshot-and-detach operation on its own (`u_checkpoint`).
+///
+/// Returns the checkpoint BY VALUE rather than writing through the
+/// original's own caller-supplied `UndoCheckpoint *uc` out-parameter -
+/// this crate's established "out-parameter becomes a return value"
+/// convention (e.g. `ml_open`/`fname_trans_sid`).
+///
+/// The returned `uc_line_ptr` is a genuine CLONE of `buf.b_u_line_ptr`,
+/// not an aliased pointer like the original's own `char *uc_line_ptr =
+/// buf->b_u_line_ptr` - this crate's `Option<Vec<u8>>` convention for
+/// `char*` fields has no sound "borrow this pointer for later" Rust
+/// equivalent, and a clone is observably identical here anyway (this
+/// crate has no in-place string mutation that could make the two
+/// diverge before a hypothetical future `u_rollback()` reads it back).
+///
+/// `buf.b_p_ul`'s final value uses `i32::MAX` (NOT `i64::MAX`),
+/// matching the original's own literal `INT_MAX` (a 32-bit `int`
+/// constant) assigned into the wider `OptInt`/`int64_t` field - a
+/// real, deliberate "effectively unlimited undo levels" sentinel
+/// value, not a mistranslated width.
+pub fn u_checkpoint(buf: &mut BufT) -> UndoCheckpoint {
+    let uc = UndoCheckpoint {
+        uc_oldhead: buf.b_u_oldhead,
+        uc_newhead: buf.b_u_newhead,
+        uc_curhead: buf.b_u_curhead,
+        uc_numhead: buf.b_u_numhead,
+        uc_synced: buf.b_u_synced,
+        uc_seq_last: buf.b_u_seq_last,
+        uc_save_nr_last: buf.b_u_save_nr_last,
+        uc_seq_cur: buf.b_u_seq_cur,
+        uc_time_cur: buf.b_u_time_cur,
+        uc_save_nr_cur: buf.b_u_save_nr_cur,
+        uc_line_ptr: buf.b_u_line_ptr.clone(),
+        uc_line_lnum: buf.b_u_line_lnum,
+        uc_line_colnr: buf.b_u_line_colnr,
+        uc_undolevels: buf.b_p_ul,
+        uc_changedtick: crate::buffer::buf_get_changedtick(buf),
+    };
+
+    u_clearall(buf);
+    buf.b_p_ul = i64::from(i32::MAX); // Make sure we can undo all changes.
+
+    uc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,6 +1429,64 @@ mod tests {
         }
         assert!(!buf.b_did_warn);
         u_blockfree(&mut buf);
+    }
+
+    #[test]
+    fn u_checkpoint_snapshots_every_field_then_detaches_the_tree() {
+        let mut buf = BufT::default();
+        let headers = push_linear_history(&mut buf, 2);
+        buf.b_u_curhead = headers[1];
+        buf.b_u_synced = false;
+        buf.b_u_seq_last = 7;
+        buf.b_u_save_nr_last = 3;
+        buf.b_u_seq_cur = 5;
+        buf.b_u_time_cur = 12345;
+        buf.b_u_save_nr_cur = 2;
+        buf.b_u_line_ptr = Some(b"saved line\0".to_vec());
+        buf.b_u_line_lnum = 4;
+        buf.b_u_line_colnr = 9;
+        buf.b_p_ul = 200;
+
+        let uc = u_checkpoint(&mut buf);
+
+        // The checkpoint captured the PRE-clear state exactly.
+        assert_eq!(uc.uc_oldhead, headers[0]);
+        assert_eq!(uc.uc_newhead, headers[1]);
+        assert_eq!(uc.uc_curhead, headers[1]);
+        assert_eq!(uc.uc_numhead, 2);
+        assert!(!uc.uc_synced);
+        assert_eq!(uc.uc_seq_last, 7);
+        assert_eq!(uc.uc_save_nr_last, 3);
+        assert_eq!(uc.uc_seq_cur, 5);
+        assert_eq!(uc.uc_time_cur, 12345);
+        assert_eq!(uc.uc_save_nr_cur, 2);
+        assert_eq!(uc.uc_line_ptr, Some(b"saved line\0".to_vec()));
+        assert_eq!(uc.uc_line_lnum, 4);
+        assert_eq!(uc.uc_line_colnr, 9);
+        assert_eq!(uc.uc_undolevels, 200);
+        // never initialized, matches buf_get_changedtick's own
+        // documented fallback.
+        assert_eq!(uc.uc_changedtick, 0);
+
+        // uc_line_ptr is a genuine clone, not an alias: mutating the
+        // buffer's own copy afterward must not affect the checkpoint's.
+        buf.b_u_line_ptr = Some(b"different\0".to_vec());
+        assert_eq!(uc.uc_line_ptr, Some(b"saved line\0".to_vec()));
+
+        // The buffer's own undo tree was detached (u_clearall's own
+        // effect) and 'undolevels' was raised to INT_MAX.
+        assert!(buf.b_u_oldhead.is_null());
+        assert!(buf.b_u_newhead.is_null());
+        assert!(buf.b_u_curhead.is_null());
+        assert_eq!(buf.b_u_numhead, 0);
+        assert_eq!(buf.b_p_ul, i64::from(i32::MAX));
+
+        // The checkpoint's own uc_oldhead/uc_newhead still point at the
+        // (now-detached-from-buf, but not yet freed) real headers -
+        // free them manually so this test doesn't leak.
+        for h in headers {
+            unsafe { drop(Box::from_raw(h)) };
+        }
     }
 
     #[test]
