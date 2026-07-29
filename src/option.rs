@@ -622,6 +622,78 @@ pub fn option_is_window_local(opt_idx: OptIndex) -> bool {
     (get_option(opt_idx).scope_flags & exclude) == 0 && option_has_scope(opt_idx, OptScope::Win)
 }
 
+/// Get the option value that represents an "unset" local value for
+/// `opt_idx` (`get_option_unset_value`).
+///
+/// For global-local options: string-typed ones always use an empty
+/// string (`STATIC_CSTR_AS_OPTVAL("")` in the original); the handful
+/// of non-string global-local options each get their own real,
+/// individually-verified sentinel (`Autocomplete`/`Autoread`/`Fsync`
+/// use [`TriState::None`]; `Scrolloff`/`Scrolloffpad`/`Sidescrolloff`
+/// use `-1`; `Undolevels` uses [`crate::option_vars`]'s already-real
+/// `NO_LOCAL_UNDOLEVEL`) - this exhaustive list mirrors the original's
+/// own `switch`, whose `default: abort();` asserts no OTHER non-string
+/// global-local option exists in `options[]` (verified true for this
+/// crate's own 377-entry `OPTIONS` table, mechanically transcribed
+/// from the same real generated source).
+///
+/// For options that are NOT global-local, the global value itself
+/// represents "unset".
+///
+/// # Safety
+/// `opt_idx` must not be [`OptIndex::Invalid`].
+#[must_use]
+pub unsafe fn get_option_unset_value(opt_idx: OptIndex) -> OptVal {
+    if option_is_global_local(opt_idx) {
+        if option_has_type(opt_idx, OptValType::String) {
+            return OptVal::String(Vec::new());
+        }
+        return match opt_idx {
+            OptIndex::Autocomplete | OptIndex::Autoread | OptIndex::Fsync => {
+                OptVal::Boolean(TriState::None)
+            }
+            OptIndex::Scrolloff | OptIndex::Scrolloffpad | OptIndex::Sidescrolloff => {
+                OptVal::Number(-1)
+            }
+            OptIndex::Undolevels => OptVal::Number(crate::option_vars::NO_LOCAL_UNDOLEVEL),
+            _ => unreachable!(
+                "get_option_unset_value: {opt_idx:?} is global-local and non-string, but \
+                 isn't one of the 7 options with a known unset sentinel - matches the \
+                 original's own `default: abort();`"
+            ),
+        };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { optval_from_varp(opt_idx, get_varp_scope(opt_idx, crate::option_defs::opt_set_flags::OPT_GLOBAL)) }
+}
+
+/// Check if the local value of a global-local option is unset for the
+/// current buffer/window. Always `false` for options that aren't
+/// global-local (`is_option_local_value_unset`).
+///
+/// # Safety
+/// `opt_idx` must not be [`OptIndex::Invalid`]; `crate::globals::
+/// GLOBALS.curbuf`/`curwin` must be valid, non-null pointers to live
+/// `BufT`/`WinT` values (forwarded to `get_varp_scope`'s own
+/// `OPT_LOCAL` resolution, which reads through `curbuf`/`curwin` when
+/// no explicit buffer/window is supplied - matching the original's own
+/// unconditional reliance on those globals here).
+#[must_use]
+pub unsafe fn is_option_local_value_unset(opt_idx: OptIndex) -> bool {
+    if !option_is_global_local(opt_idx) {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let local_value =
+        unsafe { optval_from_varp(opt_idx, get_varp_scope(opt_idx, crate::option_defs::opt_set_flags::OPT_LOCAL)) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let unset_local_value = unsafe { get_option_unset_value(opt_idx) };
+
+    local_value == unset_local_value
+}
+
 /// Get a raw pointer to `OPTIONS`'s element at `opt_idx`. Built on
 /// `GlobalCell::as_ptr()` (never `.get_mut()`), matching
 /// `eval/vars.rs`'s `vimvar_ptr`/`vimvar_ptr_at` precedent exactly:
@@ -3412,6 +3484,77 @@ mod tests {
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
         assert_eq!(result, 8);
+    }
+
+    #[test]
+    fn get_option_unset_value_string_global_local_is_always_empty() {
+        assert_eq!(
+            unsafe { get_option_unset_value(OptIndex::Equalprg) },
+            OptVal::String(Vec::new())
+        );
+    }
+
+    #[test]
+    fn get_option_unset_value_number_global_local_is_minus_one() {
+        assert_eq!(
+            unsafe { get_option_unset_value(OptIndex::Sidescrolloff) },
+            OptVal::Number(-1)
+        );
+    }
+
+    #[test]
+    fn get_option_unset_value_undolevels_uses_the_no_local_sentinel() {
+        assert_eq!(
+            unsafe { get_option_unset_value(OptIndex::Undolevels) },
+            OptVal::Number(crate::option_vars::NO_LOCAL_UNDOLEVEL)
+        );
+    }
+
+    #[test]
+    fn get_option_unset_value_non_global_local_uses_the_real_global_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ts;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ts = 4;
+
+        // 'tabstop' is a plain buffer-local option (not global-local),
+        // so its "unset" value is just the real global value.
+        assert_eq!(
+            unsafe { get_option_unset_value(OptIndex::Tabstop) },
+            OptVal::Number(4)
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ts = prev;
+    }
+
+    #[test]
+    fn is_option_local_value_unset_false_for_a_non_global_local_option() {
+        assert!(!unsafe { is_option_local_value_unset(OptIndex::Tabstop) });
+    }
+
+    #[test]
+    fn is_option_local_value_unset_true_when_local_matches_the_sentinel() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_siso = -1; // unset sentinel
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(unsafe { is_option_local_value_unset(OptIndex::Sidescrolloff) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn is_option_local_value_unset_false_when_local_is_explicitly_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        let mut win = WinT::default();
+        win.w_onebuf_opt.wo_siso = 3; // explicitly set, not the sentinel
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+
+        assert!(!unsafe { is_option_local_value_unset(OptIndex::Sidescrolloff) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 
     #[test]
