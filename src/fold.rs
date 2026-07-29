@@ -48,12 +48,20 @@
 //! }` branch unconditionally taken - see [`fold_level`]'s own doc
 //! comment for the full reasoning.
 //!
+//! Also translated: `find_wl_entry` (a pure `win.w_lines[]` valid-
+//! entry scan, needing only the already-real `WlineT`/`w_lines_valid`
+//! fields - returns `Option<usize>` in place of the original's own
+//! `-1` sentinel).
+//!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
 //! ex-commands), `get_cursor_rel_lnum` (`cursor.c` - its own "no
 //! folds" fast path is a one-liner given `hasAnyFolding` now exists,
 //! left for `cursor.rs` itself to pick up alongside
-//! `check_cursor_lnum`/`check_cursor`).
+//! `check_cursor_lnum`/`check_cursor`), `foldManualAllowed` (needs
+//! `emsg` - message display, not yet translated - for its own two
+//! real, reachable error-message branches; otherwise a one-liner given
+//! `foldmethod_is_manual`/`foldmethod_is_marker` now both exist).
 
 use crate::buffer_defs::WinT;
 
@@ -256,6 +264,27 @@ pub unsafe fn fold_level(wp: &mut WinT, _lnum: crate::pos_defs::LinenrT) -> i32 
         return 0;
     }
     unimplemented!("fold::fold_level: the real fold-tree level search is not yet translated");
+}
+
+/// Find an entry in `win.w_lines` for buffer line `lnum`. Only valid
+/// entries (`wl_valid`) are considered - entries where it is `false`
+/// may have a stale `wl_lnum`/`wl_foldend` (`find_wl_entry`).
+///
+/// Returns the index of the entry, or `None` if not found (in place
+/// of the original's own `-1` sentinel).
+#[must_use]
+pub fn find_wl_entry(win: &WinT, lnum: crate::pos_defs::LinenrT) -> Option<usize> {
+    for (i, wl) in win.w_lines.iter().enumerate().take(win.w_lines_valid as usize) {
+        if wl.wl_valid {
+            if lnum < wl.wl_lnum {
+                return None;
+            }
+            if lnum <= wl.wl_foldend {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -486,5 +515,77 @@ mod tests {
         // _lnum is genuinely unused on this fast path (see fold_level's
         // own doc comment) - any value yields the same 0 result.
         assert_eq!(unsafe { fold_level(&mut win, 9999) }, 0);
+    }
+
+    /// Builds a `WlineT` for `find_wl_entry` tests.
+    fn wline(lnum: crate::pos_defs::LinenrT, foldend: crate::pos_defs::LinenrT, valid: bool) -> crate::buffer_defs::WlineT {
+        crate::buffer_defs::WlineT { wl_lnum: lnum, wl_foldend: foldend, wl_valid: valid, ..Default::default() }
+    }
+
+    #[test]
+    fn find_wl_entry_returns_none_for_an_empty_w_lines() {
+        let win = WinT::default();
+        assert_eq!(find_wl_entry(&win, 5), None);
+    }
+
+    #[test]
+    fn find_wl_entry_finds_the_matching_range() {
+        let win = WinT {
+            w_lines: vec![wline(1, 3, true), wline(4, 4, true), wline(5, 8, true)],
+            w_lines_valid: 3,
+            ..Default::default()
+        };
+        assert_eq!(find_wl_entry(&win, 1), Some(0));
+        assert_eq!(find_wl_entry(&win, 3), Some(0));
+        assert_eq!(find_wl_entry(&win, 4), Some(1));
+        assert_eq!(find_wl_entry(&win, 6), Some(2));
+        assert_eq!(find_wl_entry(&win, 8), Some(2));
+    }
+
+    #[test]
+    fn find_wl_entry_returns_none_when_lnum_is_before_the_first_entry() {
+        let win = WinT {
+            w_lines: vec![wline(5, 8, true)],
+            w_lines_valid: 1,
+            ..Default::default()
+        };
+        assert_eq!(find_wl_entry(&win, 2), None);
+    }
+
+    #[test]
+    fn find_wl_entry_returns_none_when_lnum_is_past_the_last_entry() {
+        let win = WinT {
+            w_lines: vec![wline(1, 3, true), wline(4, 8, true)],
+            w_lines_valid: 2,
+            ..Default::default()
+        };
+        assert_eq!(find_wl_entry(&win, 9), None);
+    }
+
+    #[test]
+    fn find_wl_entry_skips_invalid_entries() {
+        // An invalid entry's wl_lnum/wl_foldend may be stale garbage
+        // (e.g. left over from before the buffer changed) - find_wl_entry
+        // must not let it terminate the scan early via its "lnum <
+        // wl_lnum" check, matching the original's own unconditional
+        // "if (win->w_lines[i].wl_valid)" per-entry guard.
+        let win = WinT {
+            w_lines: vec![wline(100, 200, false), wline(1, 5, true)],
+            w_lines_valid: 2,
+            ..Default::default()
+        };
+        assert_eq!(find_wl_entry(&win, 3), Some(1));
+    }
+
+    #[test]
+    fn find_wl_entry_only_scans_up_to_w_lines_valid() {
+        // A trailing entry beyond w_lines_valid must be ignored, even
+        // if it would otherwise match.
+        let win = WinT {
+            w_lines: vec![wline(1, 3, true), wline(4, 8, true)],
+            w_lines_valid: 1,
+            ..Default::default()
+        };
+        assert_eq!(find_wl_entry(&win, 6), None);
     }
 }
