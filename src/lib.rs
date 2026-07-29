@@ -37,6 +37,7 @@ pub mod cursor;
 pub mod cursor_shape;
 pub mod decoration;
 pub mod decoration_defs;
+pub mod decoration_provider;
 pub mod dialog;
 pub mod diff;
 pub mod digraph;
