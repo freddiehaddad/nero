@@ -52,6 +52,19 @@
 //! COMPUTE a candidate window, matching `get_winnr`'s own read-only
 //! use exactly.
 //!
+//! Also translated: `frame_fixed_height`/`frame_fixed_width` (whether
+//! a frame's height/width should not be changed because of
+//! `'winfixheight'`/`'winfixwidth'` - a leaf reflects its own window's
+//! option value directly; a `FR_ROW`/`FR_COL` frame is fixed if
+//! ANY/ALL of its children are, per the original's own exact
+//! structure, needing only already-real `WinT.w_onebuf_opt.wo_wfh`/
+//! `wo_wfw` fields). Translated ahead of their real callers
+//! (`win_equal_rec`/`frame_new_height`/`frame_new_width`, part of the
+//! larger window-resizing/equalization subsystem, not translated yet)
+//! since both are small, self-contained, and have no design freedom
+//! to get wrong - matching this crate's established "translate ahead
+//! of a real caller" precedent.
+//!
 //! Also translated: `check_can_set_curbuf_disabled`/
 //! `check_can_set_curbuf_forceit` (`'winfixbuf'` checks) - each omits
 //! the original's real `emsg` call, matching the established "skip the
@@ -797,6 +810,101 @@ pub unsafe fn frame2win(mut frp: *const crate::buffer_defs::FrameT) -> *mut WinT
         }
         frp = fr.fr_child;
     }
+}
+
+/// Return `true` if the height of frame `frp` should not be changed
+/// because of `'winfixheight'` (`frame_fixed_height`). A leaf frame is
+/// fixed height exactly when its own window's `'winfixheight'` is
+/// set; a `FR_ROW` (side-by-side) frame is fixed height if ANY child
+/// is; a `FR_COL` (stacked) frame is fixed height only if ALL children
+/// are - matching the original's own `FOR_ALL_FRAMES` walk over
+/// `fr_child`/`fr_next` exactly (translated as 2 separate, explicit
+/// loops rather than one parameterized "any vs all" loop, matching
+/// the original's own 2-branch structure directly rather than a
+/// cleverer-but-less-obviously-correct consolidation).
+///
+/// # Safety
+/// `frp` must be a valid, non-null pointer to a live `FrameT`, whose
+/// own `fr_child`/`fr_next` chain (if any) consists entirely of valid,
+/// live `FrameT` pointers, and whose `fr_win` (if non-null) is a
+/// valid, live `WinT` pointer.
+#[must_use]
+pub unsafe fn frame_fixed_height(frp: *const crate::buffer_defs::FrameT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*frp };
+    if !fr.fr_win.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { &*fr.fr_win }.w_onebuf_opt.wo_wfh != 0;
+    }
+    if fr.fr_layout == crate::buffer_defs::FR_ROW {
+        // Fixed height if ONE of the frames in the row is fixed height.
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { frame_fixed_height(child) } {
+                return true;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        return false;
+    }
+    // fr.fr_layout == FR_COL: fixed height if ALL of the frames in the
+    // column are fixed height.
+    let mut child = fr.fr_child;
+    while !child.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { frame_fixed_height(child) } {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        child = unsafe { &*child }.fr_next;
+    }
+    true
+}
+
+/// Return `true` if the width of frame `frp` should not be changed
+/// because of `'winfixwidth'` (`frame_fixed_width`) - the `FR_COL`/
+/// `FR_ROW` "any"/"all" roles are swapped relative to
+/// [`frame_fixed_height`] (a `FR_COL` frame is fixed width if ANY
+/// child is; a `FR_ROW` frame only if ALL are), matching the
+/// original's own exact structure.
+///
+/// # Safety
+/// Same as [`frame_fixed_height`].
+#[must_use]
+pub unsafe fn frame_fixed_width(frp: *const crate::buffer_defs::FrameT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*frp };
+    if !fr.fr_win.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { &*fr.fr_win }.w_onebuf_opt.wo_wfw != 0;
+    }
+    if fr.fr_layout == crate::buffer_defs::FR_COL {
+        // Fixed width if ONE of the frames in the column is fixed width.
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { frame_fixed_width(child) } {
+                return true;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        return false;
+    }
+    // fr.fr_layout == FR_ROW: fixed width if ALL of the frames in the
+    // row are fixed width.
+    let mut child = fr.fr_child;
+    while !child.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { frame_fixed_width(child) } {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        child = unsafe { &*child }.fr_next;
+    }
+    true
 }
 
 /// Get the window `count` positions above (`up == true`) or below
@@ -2074,6 +2182,155 @@ mod tests {
         let root =
             crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_ROW, fr_child: leaf_ptr, ..Default::default() };
         assert_eq!(unsafe { frame2win(&root) }, win_ptr);
+    }
+
+    // ---- frame_fixed_height / frame_fixed_width ----
+
+    /// Builds a `WinT` with a specific `'winfixheight'`/`'winfixwidth'`
+    /// value pre-set.
+    fn win_with_fixed(wfh: i32, wfw: i32) -> WinT {
+        let mut w = focusable_win(1);
+        w.w_onebuf_opt.wo_wfh = wfh;
+        w.w_onebuf_opt.wo_wfw = wfw;
+        w
+    }
+
+    #[test]
+    fn frame_fixed_height_leaf_reflects_the_window_option() {
+        let mut fixed_win = win_with_fixed(1, 0);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let fixed_leaf = crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, ..Default::default() };
+        assert!(unsafe { frame_fixed_height(&fixed_leaf) });
+
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+        let free_leaf = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        assert!(!unsafe { frame_fixed_height(&free_leaf) });
+    }
+
+    #[test]
+    fn frame_fixed_height_row_is_true_if_any_child_is_fixed() {
+        let mut fixed_win = win_with_fixed(1, 0);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(unsafe { frame_fixed_height(&row) });
+    }
+
+    #[test]
+    fn frame_fixed_height_row_is_false_if_no_child_is_fixed() {
+        let mut free_win1 = win_with_fixed(0, 0);
+        let free_win1_ptr = &mut free_win1 as *mut WinT;
+        let mut free_win2 = win_with_fixed(0, 0);
+        let free_win2_ptr = &mut free_win2 as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: free_win2_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: free_win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(!unsafe { frame_fixed_height(&row) });
+    }
+
+    #[test]
+    fn frame_fixed_height_col_needs_every_child_fixed() {
+        let mut fixed_win = win_with_fixed(1, 0);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+
+        // One fixed, one not: FR_COL as a whole is NOT fixed.
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let mixed_leaf1 =
+            crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let mixed_col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &mixed_leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(!unsafe { frame_fixed_height(&mixed_col) });
+
+        // Both fixed: FR_COL as a whole IS fixed.
+        let mut fixed_win2 = win_with_fixed(1, 0);
+        let fixed_win2_ptr = &mut fixed_win2 as *mut WinT;
+        let mut both_leaf2 = crate::buffer_defs::FrameT { fr_win: fixed_win2_ptr, ..Default::default() };
+        let both_leaf2_ptr = &mut both_leaf2 as *mut crate::buffer_defs::FrameT;
+        let both_leaf1 = crate::buffer_defs::FrameT {
+            fr_win: fixed_win_ptr,
+            fr_next: both_leaf2_ptr,
+            ..Default::default()
+        };
+        let both_col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &both_leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(unsafe { frame_fixed_height(&both_col) });
+    }
+
+    #[test]
+    fn frame_fixed_width_leaf_reflects_the_window_option() {
+        let mut fixed_win = win_with_fixed(0, 1);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let fixed_leaf = crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, ..Default::default() };
+        assert!(unsafe { frame_fixed_width(&fixed_leaf) });
+
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+        let free_leaf = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        assert!(!unsafe { frame_fixed_width(&free_leaf) });
+    }
+
+    #[test]
+    fn frame_fixed_width_col_is_true_if_any_child_is_fixed() {
+        // FR_COL's "any" role is the OPPOSITE of frame_fixed_height's
+        // own FR_ROW-is-"any" - verifying the roles are genuinely
+        // swapped, not accidentally identical to frame_fixed_height.
+        let mut fixed_win = win_with_fixed(0, 1);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(unsafe { frame_fixed_width(&col) });
+    }
+
+    #[test]
+    fn frame_fixed_width_row_needs_every_child_fixed() {
+        let mut fixed_win = win_with_fixed(0, 1);
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let mut free_win = win_with_fixed(0, 0);
+        let free_win_ptr = &mut free_win as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: free_win_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let leaf1 =
+            crate::buffer_defs::FrameT { fr_win: fixed_win_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        assert!(!unsafe { frame_fixed_width(&row) });
     }
 
     // ---- find_tabwin ----
