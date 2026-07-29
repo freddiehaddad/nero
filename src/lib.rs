@@ -23,6 +23,7 @@ pub mod autocmd_defs;
 pub mod base64;
 pub mod buffer;
 pub mod buffer_defs;
+pub mod buffer_updates;
 pub mod change;
 pub mod charset;
 pub mod clipboard;
