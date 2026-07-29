@@ -51,7 +51,12 @@
 //! Also translated: `find_wl_entry` (a pure `win.w_lines[]` valid-
 //! entry scan, needing only the already-real `WlineT`/`w_lines_valid`
 //! fields - returns `Option<usize>` in place of the original's own
-//! `-1` sentinel).
+//! `-1` sentinel); `getDeepestNesting` (+ its own
+//! `getDeepestNestingRecurse` helper) - the real recursive-descent-
+//! into-nested-folds body is `unimplemented!()` (no `fold_T`/
+//! `fd_nested` equivalent type exists yet), but the "no folds at all"
+//! fast path (`w_folds` empty) is real and exact, covering every
+//! currently-reachable case.
 //!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
@@ -285,6 +290,39 @@ pub fn find_wl_entry(win: &WinT, lnum: crate::pos_defs::LinenrT) -> Option<usize
         }
     }
     None
+}
+
+/// Get the lowest `'foldlevel'` value that makes the deepest nested
+/// fold in window `wp` (`getDeepestNesting`).
+///
+/// # Safety
+/// Same as [`has_any_folding`].
+#[must_use]
+pub unsafe fn get_deepest_nesting(wp: &mut WinT) -> i32 {
+    checkupdate(wp);
+    get_deepest_nesting_recurse(&wp.w_folds)
+}
+
+/// Recursive per-`garray_T` step of [`get_deepest_nesting`]
+/// (`getDeepestNestingRecurse`).
+///
+/// The real recursive-descent-into-nested-folds body is
+/// `unimplemented!()` - this crate has no `fold_T`/`fd_nested`
+/// equivalent type yet (nothing can create folds, so `w_folds` is
+/// always empty in practice, matching [`has_any_folding`]'s own
+/// established reasoning) - but the "no folds at all" fast path (an
+/// empty `gap`) is real and exact: the original's own `for` loop over
+/// `gap->ga_len` entries simply never executes for an empty array,
+/// returning `maxlevel`'s untouched initial value of `0`.
+#[must_use]
+fn get_deepest_nesting_recurse(gap: &crate::garray_defs::GarrayT) -> i32 {
+    if gap.is_empty() {
+        return 0;
+    }
+    unimplemented!(
+        "fold::get_deepest_nesting_recurse: no fold_T/fd_nested equivalent type exists yet to \
+         recurse into"
+    );
 }
 
 #[cfg(test)]
@@ -587,5 +625,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(find_wl_entry(&win, 6), None);
+    }
+
+    #[test]
+    fn get_deepest_nesting_is_zero_when_no_folds_exist() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { get_deepest_nesting(&mut win) }, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "no fold_T/fd_nested equivalent type exists yet")]
+    fn get_deepest_nesting_panics_once_a_fold_actually_exists() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_foldinvalid: false,
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let _ = unsafe { get_deepest_nesting(&mut win) };
     }
 }
