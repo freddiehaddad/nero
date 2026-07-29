@@ -25,6 +25,7 @@ pub mod buffer;
 pub mod buffer_defs;
 pub mod change;
 pub mod charset;
+pub mod cmdexpand;
 pub mod cmdexpand_defs;
 pub mod context;
 pub mod context_defs;
