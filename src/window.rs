@@ -89,6 +89,14 @@
 //! deferred-subsystem side effect, keep the state/return value
 //! correct" policy.
 //!
+//! Also translated: `frame_fix_width`/`frame_fix_height` (set a
+//! frame's own `fr_width`/`fr_height` directly from the window it
+//! contains, via already-real `WinT.w_width`/`w_vsep_width`/
+//! `w_height`/`w_hsep_height`/`w_status_height`) - trivial, mechanical
+//! one-liners with no design freedom of their own, translated ahead of
+//! their real callers (`frame_new_height`/`frame_new_width`, part of
+//! the larger window-resizing subsystem, not translated yet).
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -923,6 +931,32 @@ pub unsafe fn frame_fixed_width(frp: *const crate::buffer_defs::FrameT) -> bool 
         child = unsafe { &*child }.fr_next;
     }
     true
+}
+
+/// Set frame width from the window it contains (`frame_fix_width`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_frame` is a valid, non-null pointer to a live `FrameT`.
+pub unsafe fn frame_fix_width(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*wp };
+    let width = win.w_width + win.w_vsep_width;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *win.w_frame }.fr_width = width;
+}
+
+/// Set frame height from the window it contains (`frame_fix_height`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_frame` is a valid, non-null pointer to a live `FrameT`.
+pub unsafe fn frame_fix_height(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*wp };
+    let height = win.w_height + win.w_hsep_height + win.w_status_height;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *win.w_frame }.fr_height = height;
 }
 
 /// Sentinel value for [`frame_minheight`]/[`frame_minwidth`]'s own
@@ -2643,6 +2677,60 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { frame_fixed_width(&row) });
+    }
+
+    // ---- frame_fix_width / frame_fix_height ----
+
+    #[test]
+    fn frame_fix_width_sets_frame_width_from_window() {
+        let mut frame = crate::buffer_defs::FrameT { fr_width: 0, ..Default::default() };
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut win = WinT { w_width: 30, w_vsep_width: 1, w_frame: frame_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { frame_fix_width(win_ptr) };
+        assert_eq!(unsafe { &*frame_ptr }.fr_width, 31);
+    }
+
+    #[test]
+    fn frame_fix_width_with_zero_vsep_matches_window_width_exactly() {
+        let mut frame = crate::buffer_defs::FrameT { fr_width: 999, ..Default::default() };
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut win = WinT { w_width: 80, w_vsep_width: 0, w_frame: frame_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { frame_fix_width(win_ptr) };
+        assert_eq!(unsafe { &*frame_ptr }.fr_width, 80);
+    }
+
+    #[test]
+    fn frame_fix_height_sets_frame_height_from_window() {
+        let mut frame = crate::buffer_defs::FrameT { fr_height: 0, ..Default::default() };
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut win = WinT {
+            w_height: 20,
+            w_hsep_height: 1,
+            w_status_height: 1,
+            w_frame: frame_ptr,
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { frame_fix_height(win_ptr) };
+        assert_eq!(unsafe { &*frame_ptr }.fr_height, 22);
+    }
+
+    #[test]
+    fn frame_fix_height_with_zero_hsep_and_status_matches_window_height_exactly() {
+        let mut frame = crate::buffer_defs::FrameT { fr_height: 999, ..Default::default() };
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut win = WinT {
+            w_height: 24,
+            w_hsep_height: 0,
+            w_status_height: 0,
+            w_frame: frame_ptr,
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { frame_fix_height(win_ptr) };
+        assert_eq!(unsafe { &*frame_ptr }.fr_height, 24);
     }
 
     // ---- frame_minheight / frame_minwidth ----
