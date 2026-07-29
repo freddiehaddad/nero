@@ -32,6 +32,10 @@
 //! `plines_correct_topline` (`comp_botline`'s own inner per-line call)
 //! exists.
 //!
+//! Also translated: `validate_cheight` (via `plines.c`'s already-real
+//! `plines_win_full`) - unlike `validate_botline_win` above, its own
+//! real work needs no not-yet-translated subsystem.
+//!
 //! Also translated: `set_topline` (now that `fold.c`'s `has_folding`
 //! exists) - unblocked `mark.c`'s `mark_view_restore`. Omits the
 //! original's `redraw_later(wp, UPD_VALID)` call, matching the same
@@ -424,6 +428,33 @@ pub unsafe fn validate_virtcol(wp: *mut WinT) {
     let w = unsafe { &mut *wp };
     w.w_virtcol = virtcol;
     w.w_valid |= i32::from(w_valid::VALID_VIRTCOL);
+}
+
+/// Validate `wp.w_cline_height`/`wp.w_cline_folded` (`validate_cheight`).
+///
+/// # Safety
+/// Forwarded from [`check_cursor_moved`]/`crate::plines::plines_win_full`'s
+/// own safety docs.
+pub unsafe fn validate_cheight(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_cursor_moved(wp) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*wp }.w_valid & i32::from(w_valid::VALID_CHEIGHT) != 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*wp }.w_cursor.lnum;
+    let mut folded = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    let height = unsafe { crate::plines::plines_win_full(wp, lnum, None, Some(&mut folded), true, true) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    w.w_cline_height = height;
+    w.w_cline_folded = folded;
+    w.w_valid |= i32::from(w_valid::VALID_CHEIGHT);
 }
 
 /// Force-update `wp.w_curswant` from `wp.w_virtcol`
@@ -1240,6 +1271,51 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn validate_cheight_computes_and_marks_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+        win.w_topline = 5; // != cursor lnum (1), so win_get_fill (always 0) applies
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        win.w_cline_folded = true; // pre-set, must be overwritten to false
+
+        unsafe { validate_cheight(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cline_height, 1); // single unwrapped, unfolded line
+        assert!(!win.w_cline_folded);
+        assert_ne!(win.w_valid & i32::from(w_valid::VALID_CHEIGHT), 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn validate_cheight_is_a_noop_when_already_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_CHEIGHT);
+        win.w_cline_height = 42; // sentinel: must survive untouched
+        win.w_cline_folded = true;
+
+        unsafe { validate_cheight(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cline_height, 42);
+        assert!(win.w_cline_folded);
     }
 
     #[test]
