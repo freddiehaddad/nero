@@ -173,6 +173,12 @@
 //! `crate::context::is_ctx_win`, `WinT.w_floating`/
 //! `w_onebuf_opt.wo_pvw`/`w_next`.
 //!
+//! Also translated: `get_last_winid` (reads a new file-static
+//! `LAST_WIN_ID`, matching `window.c`'s own `last_win_id`, only ever
+//! incremented by `win_alloc`, not yet translated - so this stays at
+//! its initial value forever today) and `win_locked` (reads
+//! `WinT.w_locked` directly).
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -2110,6 +2116,31 @@ pub unsafe fn only_one_window() -> bool {
         wp = w.w_next;
     }
     count <= 1
+}
+
+/// `last_win_id` - the handle assigned to the most recently allocated
+/// window (`window.c`'s own file-static `int last_win_id`, starting
+/// one below [`LOWEST_WIN_ID`], matching the original exactly). Only
+/// ever incremented by `win_alloc`, not yet translated - so this
+/// stays at its initial value forever in this crate today.
+static LAST_WIN_ID: GlobalCell<i32> = GlobalCell::new(LOWEST_WIN_ID - 1);
+
+/// The handle most recently assigned to a new window
+/// (`get_last_winid`).
+#[must_use]
+pub fn get_last_winid() -> i32 {
+    // SAFETY: a plain read through one exclusive borrow.
+    unsafe { *LAST_WIN_ID.get_mut() }
+}
+
+/// Don't let autocommands close the given window (`win_locked`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn win_locked(wp: *const WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*wp }.w_locked
 }
 
 #[cfg(test)]
@@ -4853,6 +4884,35 @@ mod tests {
         assert!(unsafe { only_one_window() });
 
         unsafe { crate::context::CTX_WIN_VEC.get_mut() }.clear();
+    }
+
+    // ---- get_last_winid / win_locked ----
+
+    #[test]
+    fn get_last_winid_defaults_to_one_below_lowest_win_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *LAST_WIN_ID.get_mut() };
+        unsafe { *LAST_WIN_ID.get_mut() = LOWEST_WIN_ID - 1 };
+        assert_eq!(get_last_winid(), LOWEST_WIN_ID - 1);
+        unsafe { *LAST_WIN_ID.get_mut() = prev };
+    }
+
+    #[test]
+    fn get_last_winid_reflects_the_underlying_counter() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *LAST_WIN_ID.get_mut() };
+        unsafe { *LAST_WIN_ID.get_mut() = 1042 };
+        assert_eq!(get_last_winid(), 1042);
+        unsafe { *LAST_WIN_ID.get_mut() = prev };
+    }
+
+    #[test]
+    fn win_locked_reads_w_locked_directly() {
+        let win_unlocked = WinT { w_locked: 0, ..focusable_win(1) };
+        assert_eq!(unsafe { win_locked(&win_unlocked) }, 0);
+
+        let win_locked_win = WinT { w_locked: 1, ..focusable_win(1) };
+        assert_eq!(unsafe { win_locked(&win_locked_win) }, 1);
     }
 
     #[test]
