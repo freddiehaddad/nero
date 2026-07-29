@@ -4,9 +4,10 @@
 //! subsystem - almost all of it needs the tags-file search engine
 //! (`find_tags`), `:tag`/`:pop`/`:tselect` Ex-command handling, and
 //! real buffer switching/window management, none of which are
-//! translated yet. Only the read-only tag-stack introspection needed
-//! by the `gettagstack()` builtin is translated here:
-//! `get_tag_details`/[`get_tagstack`].
+//! translated yet. Translated: the read-only tag-stack introspection
+//! needed by the `gettagstack()` builtin (`get_tag_details`/
+//! [`get_tagstack`]), plus [`tag_strnicmp`] (a small, pure,
+//! case-insensitive comparator used for tag sorting).
 //!
 //! `tag.c`'s own `tagstack_clear_entry` was already translated in an
 //! earlier session, hosted in `mark.rs` alongside its only real
@@ -72,6 +73,30 @@ pub unsafe fn get_tagstack(wp: &WinT, retdict: *mut crate::eval::typval_defs::Di
         // yet shared beyond `l`.
         get_tag_details(&wp.w_tagstack[i], unsafe { &mut *d });
     }
+}
+
+/// Compares `s1`/`s2` for `len` bytes, ignoring ASCII case (folding to
+/// uppercase, matching `'sort -f'`) - `0` for a match, negative if
+/// `s1` sorts first, positive if `s2` sorts first (`tag_strnicmp`).
+///
+/// A byte beyond either slice's own length (when the other is longer)
+/// is treated as `0`/NUL, matching how a shorter, real NUL-terminated
+/// C string would naturally compare here.
+#[must_use]
+pub fn tag_strnicmp(s1: &[u8], s2: &[u8], len: usize) -> i32 {
+    for k in 0..len {
+        let c1 = s1.get(k).copied().unwrap_or(0);
+        let c2 = s2.get(k).copied().unwrap_or(0);
+        let diff =
+            crate::macros_defs::toupper_asc(i32::from(c1)) - crate::macros_defs::toupper_asc(i32::from(c2));
+        if diff != 0 {
+            return diff;
+        }
+        if c1 == 0 {
+            break;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -263,5 +288,37 @@ mod tests {
         // SAFETY: `rettv` owns its own dict exclusively; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    #[test]
+    fn tag_strnicmp_equal_strings() {
+        assert_eq!(tag_strnicmp(b"Foo", b"foo", 3), 0);
+    }
+
+    #[test]
+    fn tag_strnicmp_respects_len_bound() {
+        // Only the first 3 bytes ("foo") are compared.
+        assert_eq!(tag_strnicmp(b"foobar", b"foobaz", 3), 0);
+    }
+
+    #[test]
+    fn tag_strnicmp_case_insensitive_difference() {
+        assert!(tag_strnicmp(b"abc", b"abd", 3) < 0);
+        assert!(tag_strnicmp(b"abd", b"abc", 3) > 0);
+    }
+
+    #[test]
+    fn tag_strnicmp_shorter_string_compares_as_smaller() {
+        // "ab" (hits its own end early) vs "abc": comparing 3 bytes,
+        // the 3rd position is 0 (implicit NUL) vs 'c'.
+        assert!(tag_strnicmp(b"ab", b"abc", 3) < 0);
+        assert!(tag_strnicmp(b"abc", b"ab", 3) > 0);
+    }
+
+    #[test]
+    fn tag_strnicmp_stops_at_embedded_nul_equivalent() {
+        // Both empty: comparing for a len longer than either produces
+        // 0 immediately (both bytes default to 0 at every position).
+        assert_eq!(tag_strnicmp(b"", b"", 5), 0);
     }
 }
