@@ -121,6 +121,7 @@ pub mod search_defs;
 pub mod sha256;
 pub mod sign_defs;
 pub mod spell;
+pub mod spellsuggest;
 pub mod state;
 pub mod state_defs;
 pub mod statusline;
