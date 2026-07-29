@@ -10,7 +10,13 @@
 //! [`stl_clear_click_defs`], [`stl_alloc_click_defs`],
 //! [`stl_fill_click_defs`] - all pure struct/array manipulation over
 //! the already-translated [`StlClickDefinition`]/[`StlClickRecord`]
-//! shapes (`statusline_defs.rs`).
+//! shapes (`statusline_defs.rs`); and [`stl_connected`] (a frame-tree
+//! walk, needing only already-real `WinT.w_frame`/`FrameT.fr_parent`/
+//! `fr_layout`/`fr_next`) - no real caller yet (`win_redr_status`,
+//! its only reader, isn't translated), translated ahead of it anyway,
+//! matching this crate's established "translate a small, simple,
+//! mechanically-correct piece ahead of the surrounding engine"
+//! precedent.
 //!
 //! `StlClickDefinition.func` is stored here as an owned
 //! `Option<Vec<u8>>` (see `statusline_defs.rs`) rather than the
@@ -23,9 +29,12 @@
 //!
 //! Deferred: everything else - `win_redr_stl_expr`/`win_redr_status`/
 //! `win_redr_winbar`/`redraw_ruler`/`draw_tabline`/`build_statuscol_str`/
-//! `build_stl_str_hl`/`stl_truncate`/`stl_expand`, all needing the
-//! redraw/render pipeline and the statusline-format parser.
+//! `build_stl_str_hl`/`stl_truncate`/`stl_expand`/`get_trans_bufname`
+//! (needs `charset.c`'s still-deferred `trans_characters`), all
+//! needing the redraw/render pipeline and the statusline-format
+//! parser.
 
+use crate::buffer_defs::{FrameT, WinT, FR_COL};
 use crate::statusline_defs::{StlClickDefinition, StlClickRecord, StlClickType};
 
 /// Clears a click-definitions table, resetting every entry back to its
@@ -119,6 +128,34 @@ pub fn stl_fill_click_defs(
         click_defs[col] = cur_click_def.clone();
         col += 1;
     }
+}
+
+/// Whether the status line of window `wp` is connected to the status
+/// line of the window to its right - if not, it's a vertical
+/// separator instead. Only call when `wp.w_vsep_width != 0`
+/// (`stl_connected`).
+///
+/// # Safety
+/// `wp.w_frame` must be a valid, non-null pointer to a live `FrameT`,
+/// and so must every `fr_parent` reachable by following it upward.
+#[must_use]
+pub unsafe fn stl_connected(wp: &WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        let mut fr: *mut FrameT = wp.w_frame;
+        while !(*fr).fr_parent.is_null() {
+            let parent = (*fr).fr_parent;
+            if (*parent).fr_layout == FR_COL {
+                if !(*fr).fr_next.is_null() {
+                    break;
+                }
+            } else if !(*fr).fr_next.is_null() {
+                return true;
+            }
+            fr = parent;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -225,5 +262,78 @@ mod tests {
         }];
         stl_fill_click_defs(&mut defs, &recs, b"abc", 3, true);
         assert!(defs.iter().all(|d| d.r#type == StlClickType::TabSwitch));
+    }
+
+    #[test]
+    fn stl_connected_false_for_a_lone_topmost_frame() {
+        // wp.w_frame's own fr_parent is null - the loop never runs.
+        let mut leaf = FrameT { fr_layout: crate::buffer_defs::FR_LEAF, ..FrameT::default() };
+        let wp = WinT { w_frame: &mut leaf as *mut FrameT, ..WinT::default() };
+        assert!(!unsafe { stl_connected(&wp) });
+    }
+
+    #[test]
+    fn stl_connected_true_when_a_row_sibling_follows() {
+        // parent.fr_layout is FR_ROW (selects the "else" branch), and
+        // the LEAF's OWN fr_next (not the parent's!) is set - the
+        // original always checks `fr->fr_next` (the current frame),
+        // using `fr->fr_parent->fr_layout` only to pick which branch
+        // applies.
+        let mut sibling = FrameT::default();
+        let mut parent = FrameT { fr_layout: crate::buffer_defs::FR_ROW, ..FrameT::default() };
+        let mut leaf = FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_parent: &mut parent as *mut FrameT,
+            fr_next: &mut sibling as *mut FrameT,
+            ..FrameT::default()
+        };
+        let wp = WinT { w_frame: &mut leaf as *mut FrameT, ..WinT::default() };
+        assert!(unsafe { stl_connected(&wp) });
+    }
+
+    #[test]
+    fn stl_connected_false_when_parent_is_col_with_a_next_sibling() {
+        // parent.fr_layout is FR_COL (selects the "if" branch, which
+        // only `break`s, never returns true), and the LEAF's OWN
+        // fr_next is set - this is a horizontal separator case, not a
+        // connected status line, so the loop `break`s and falls
+        // through to false (given no further ancestor exists here).
+        let mut sibling = FrameT::default();
+        let mut parent = FrameT { fr_layout: crate::buffer_defs::FR_COL, ..FrameT::default() };
+        let mut leaf = FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_parent: &mut parent as *mut FrameT,
+            fr_next: &mut sibling as *mut FrameT,
+            ..FrameT::default()
+        };
+        let wp = WinT { w_frame: &mut leaf as *mut FrameT, ..WinT::default() };
+        assert!(!unsafe { stl_connected(&wp) });
+    }
+
+    #[test]
+    fn stl_connected_walks_up_multiple_levels() {
+        // Level 1: parent.fr_layout is FR_COL, but the LEAF's own
+        // fr_next is null, so the "if" branch's inner check is false -
+        // no break, falls through to `fr = fr->fr_parent` and
+        // continues the walk one level up.
+        // Level 2: fr is now `parent`; grandparent.fr_layout is FR_ROW
+        // (the "else" branch), and PARENT's own fr_next (the current
+        // fr at this point) is set - true.
+        let mut grandparent = FrameT { fr_layout: crate::buffer_defs::FR_ROW, ..FrameT::default() };
+        let mut parent_sibling = FrameT::default();
+        let mut parent = FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_parent: &mut grandparent as *mut FrameT,
+            fr_next: &mut parent_sibling as *mut FrameT,
+            ..FrameT::default()
+        };
+        let mut leaf = FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_parent: &mut parent as *mut FrameT,
+            fr_next: std::ptr::null_mut(),
+            ..FrameT::default()
+        };
+        let wp = WinT { w_frame: &mut leaf as *mut FrameT, ..WinT::default() };
+        assert!(unsafe { stl_connected(&wp) });
     }
 }
