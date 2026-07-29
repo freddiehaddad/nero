@@ -56,7 +56,10 @@
 //! into-nested-folds body is `unimplemented!()` (no `fold_T`/
 //! `fd_nested` equivalent type exists yet), but the "no folds at all"
 //! fast path (`w_folds` empty) is real and exact, covering every
-//! currently-reachable case.
+//! currently-reachable case; `foldAdjustCursor` (as
+//! [`fold_adjust_cursor`]) - currently always a no-op, since
+//! [`has_folding`] can only ever return `false` or panic today, never
+//! `true` (see [`fold_adjust_cursor`]'s own doc comment).
 //!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
@@ -66,7 +69,14 @@
 //! `check_cursor_lnum`/`check_cursor`), `foldManualAllowed` (needs
 //! `emsg` - message display, not yet translated - for its own two
 //! real, reachable error-message branches; otherwise a one-liner given
-//! `foldmethod_is_manual`/`foldmethod_is_marker` now both exist).
+//! `foldmethod_is_manual`/`foldmethod_is_marker` now both exist),
+//! `foldAdjustVisual` (its own "found a fold" branches are provably
+//! unreachable for the same reason as `fold_adjust_cursor`'s own doc
+//! comment explains, but its logic is substantially more involved -
+//! `Visual.start`/`w_cursor` pointer aliasing, `'selection'`-aware
+//! column adjustment - not worth hand-writing untestable speculative
+//! code for; a good candidate to revisit once the real fold-tree
+//! search exists).
 
 use crate::buffer_defs::WinT;
 
@@ -323,6 +333,32 @@ fn get_deepest_nesting_recurse(gap: &crate::garray_defs::GarrayT) -> i32 {
         "fold::get_deepest_nesting_recurse: no fold_T/fd_nested equivalent type exists yet to \
          recurse into"
     );
+}
+
+/// Move the cursor to the first line of a closed fold (`foldAdjustCursor`).
+///
+/// Currently always a no-op: [`has_folding`] can only ever return
+/// `false` (leaving `wp.w_cursor.lnum` untouched) or panic via
+/// [`has_folding_win`]'s own `unimplemented!()` (when
+/// [`has_any_folding`] is true) - it can never return `true` today,
+/// since that would require the not-yet-translated real fold-tree
+/// search to have run and found something. This makes
+/// `foldAdjustCursor`'s own sibling, `foldAdjustVisual`, provably
+/// unreachable in its "found a fold" branches for the same reason -
+/// deliberately not translated here to avoid writing speculative,
+/// untestable logic (see this module's own doc comment).
+///
+/// # Safety
+/// Same as [`has_any_folding`].
+pub unsafe fn fold_adjust_cursor(wp: &mut WinT) {
+    let lnum = wp.w_cursor.lnum;
+    let mut new_lnum = lnum;
+    // The original itself discards `hasFolding`'s own return value
+    // here too, relying only on its `firstp` out-parameter side
+    // effect.
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { has_folding(wp, lnum, Some(&mut new_lnum), None) };
+    wp.w_cursor.lnum = new_lnum;
 }
 
 #[cfg(test)]
@@ -649,5 +685,39 @@ mod tests {
             ..Default::default()
         };
         let _ = unsafe { get_deepest_nesting(&mut win) };
+    }
+
+    #[test]
+    fn fold_adjust_cursor_leaves_cursor_lnum_unchanged_when_no_folds() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_fen: 0, ..Default::default() },
+            w_cursor: crate::pos_defs::PosT { lnum: 7, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { fold_adjust_cursor(&mut win) };
+        assert_eq!(win.w_cursor.lnum, 7);
+        // fold_adjust_cursor only ever touches lnum (matching the
+        // original's own &wp->w_cursor.lnum out-parameter) - col/coladd
+        // must be left completely untouched.
+        assert_eq!(win.w_cursor.col, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "the real fold-tree search is not yet translated")]
+    fn fold_adjust_cursor_panics_when_folding_could_be_active() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"expr".to_vec()),
+                ..Default::default()
+            },
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { fold_adjust_cursor(&mut win) };
     }
 }
