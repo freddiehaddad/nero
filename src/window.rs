@@ -122,6 +122,15 @@
 //! established "translate ahead of a real caller" precedent for small,
 //! self-contained pieces with no design freedom of their own.
 //!
+//! Also translated: `one_window`/`last_window` (whether a window is
+//! the only non-floating window in a tabpage, or in the whole
+//! session), via already-real `WinT.w_next`/`w_floating`,
+//! `TabpageT.tp_firstwin`/`tp_next`,
+//! `crate::globals::GLOBALS.firstwin`/`first_tabpage`. The original's
+//! own debug-only `assert()` in `one_window` is preserved as a
+//! `debug_assert!`, matching this crate's established policy for real
+//! internal-invariant checks.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1719,6 +1728,59 @@ pub unsafe fn use_tabpage(tp: *mut crate::buffer_defs::TabpageT) {
     g.curwin = t.tp_curwin;
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = t.tp_ch_used;
+}
+
+/// Check if `win` is the only non-floating window in tabpage `tp`, or
+/// `None` for the current tabpage (`one_window`). Should be used in
+/// place of `ONE_WINDOW` when necessary, with `firstwin` or the
+/// affected window as argument depending on the situation.
+///
+/// The original's own `assert()` (a debug-only invariant check, not
+/// functional logic) is preserved as a `debug_assert!`.
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT`. `tp`, if
+/// non-null, must be a valid pointer to a live `TabpageT` whose own
+/// `tp_firstwin` is a valid, non-null pointer to a live `WinT`.
+/// `crate::globals::GLOBALS.firstwin` must likewise be valid and
+/// non-null when `tp` is null.
+#[must_use]
+pub unsafe fn one_window(win: *const WinT, tp: *const crate::buffer_defs::TabpageT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let first = if !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_firstwin
+    } else {
+        g.firstwin
+    };
+    debug_assert!(
+        (tp.is_null() || !std::ptr::eq(tp, g.curtab))
+            // SAFETY: forwarded from this function's own safety doc.
+            && !unsafe { &*first }.w_floating
+    );
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*win };
+    std::ptr::eq(first, win) && (w.w_next.is_null() || unsafe { &*w.w_next }.w_floating)
+}
+
+/// Check if `win` is the only window that exists, across every
+/// tabpage (`last_window`).
+///
+/// # Safety
+/// Forwarded from [`one_window`]'s own safety doc (called here with a
+/// null `tp`), plus `crate::globals::GLOBALS.first_tabpage`'s own
+/// `tp_next` chain must consist of valid, live `TabpageT` pointers.
+#[must_use]
+pub unsafe fn last_window(win: *const WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { one_window(win, std::ptr::null()) } {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*first_tabpage }.tp_next.is_null()
 }
 
 #[cfg(test)]
@@ -3704,5 +3766,147 @@ mod tests {
         assert_eq!(g.lastwin, win_ptr);
         assert_eq!(g.curwin, win_ptr);
         assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch, 7);
+    }
+
+    // ---- one_window / last_window ----
+
+    #[test]
+    fn one_window_true_when_win_is_the_only_window_via_explicit_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { one_window(win_ptr, tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn one_window_true_when_next_window_is_floating() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut floating = focusable_win(2);
+        floating.w_floating = true;
+        let floating_ptr = &mut floating as *mut WinT;
+        let mut win = WinT { w_next: floating_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(unsafe { one_window(win_ptr, tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn one_window_false_when_next_window_is_non_floating() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(!unsafe { one_window(win_ptr, tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn one_window_false_when_win_is_not_the_first_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        let mut first = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let first_ptr = &mut first as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: first_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert!(!unsafe { one_window(second_ptr, tp_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn one_window_null_tp_uses_globals_firstwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+
+        assert!(unsafe { one_window(win_ptr, std::ptr::null()) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn last_window_true_when_one_window_and_no_other_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp =
+            crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        let prev_first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = tp_ptr;
+
+        assert!(unsafe { last_window(win_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+    }
+
+    #[test]
+    fn last_window_false_when_another_tabpage_exists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut second_tp = crate::buffer_defs::TabpageT::default();
+        let second_tp_ptr = &mut second_tp as *mut crate::buffer_defs::TabpageT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: second_tp_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        let prev_first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = tp_ptr;
+
+        assert!(!unsafe { last_window(win_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+    }
+
+    #[test]
+    fn last_window_false_when_one_window_itself_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { w_next: second_ptr, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp =
+            crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        let prev_first_tabpage = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = tp_ptr;
+
+        assert!(!unsafe { last_window(win_ptr) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
     }
 }
