@@ -159,6 +159,13 @@
 //! (real, function-local C `static`s, translated as file-static
 //! `GlobalCell<bool>`s) are fully real and tested.
 //!
+//! Also translated: `global_winbar_height` (whether `'winbar'` is set
+//! globally, via already-real `OPTION_VARS.p_wbr`) and
+//! `get_maximum_wincount` (the maximum number of windows that fit
+//! within a given height in a frame, via already-real `frame2win`,
+//! `OPTION_VARS.p_wmh`, `WinT.w_winbar_height`,
+//! `FrameT.fr_child`/`fr_next`/`fr_layout`).
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1985,6 +1992,70 @@ pub fn trigger_tabclosedpre(_tp: *const crate::buffer_defs::TabpageT) {
         "trigger_tabclosedpre: real TabClosedPre autocmd execution needs goto_tabpage_tp, \
          unreachable today since has_event(TabClosedPre) is always false"
     );
+}
+
+/// Return the number of lines used by the global statusline/winbar,
+/// i.e. whether `'winbar'` is set globally (`global_winbar_height`).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn global_winbar_height() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_wbr = &unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wbr;
+    i32::from(p_wbr.as_deref().is_some_and(|s| !s.is_empty()))
+}
+
+/// Compute the maximum number of windows that fit within `height` in
+/// frame `fr` (`get_maximum_wincount`).
+///
+/// # Safety
+/// `fr` must be a valid, non-null pointer to a live `FrameT` whose own
+/// `fr_child`/`fr_next` chain (if any) consists of valid, live
+/// `FrameT` pointers, each with a `fr_win` (directly, or via nested
+/// leaves reachable through `frame2win`) that is a valid, non-null
+/// `WinT` pointer. Touches `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn get_maximum_wincount(fr: *const crate::buffer_defs::FrameT, height: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let frame = unsafe { &*fr };
+    let p_wmh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh as i32;
+
+    if frame.fr_layout != crate::buffer_defs::FR_COL {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*frame2win(fr) };
+        return height / (p_wmh + STATUS_HEIGHT + wp.w_winbar_height);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { global_winbar_height() } != 0 {
+        // If winbar is globally enabled, no need to check each window
+        // for it.
+        return height / (p_wmh + STATUS_HEIGHT + 1);
+    }
+
+    let mut height = height;
+    let mut total_wincount = 0;
+
+    // First, try to fit all child frames of `fr` into `height`.
+    let mut frp = frame.fr_child;
+    while !frp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*frame2win(frp) };
+        if height < p_wmh + STATUS_HEIGHT + wp.w_winbar_height {
+            break;
+        }
+        height -= p_wmh + STATUS_HEIGHT + wp.w_winbar_height;
+        total_wincount += 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        frp = unsafe { &*frp }.fr_next;
+    }
+
+    // If we still have enough room for more windows, just use the
+    // default winbar height (which is 0) in order to get the amount
+    // of windows that'd fit in the remaining space.
+    total_wincount += height / (p_wmh + STATUS_HEIGHT);
+
+    total_wincount
 }
 
 #[cfg(test)]
@@ -4465,6 +4536,118 @@ mod tests {
         // TabClosedPre's own registry is always empty today -
         // has_event is always false, so this must not panic.
         trigger_tabclosedpre(std::ptr::null());
+    }
+
+    // ---- global_winbar_height / get_maximum_wincount ----
+
+    #[test]
+    fn global_winbar_height_zero_when_winbar_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_wbr.take();
+        assert_eq!(unsafe { global_winbar_height() }, 0);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wbr = prev;
+    }
+
+    #[test]
+    fn global_winbar_height_zero_when_winbar_is_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_wbr.replace(Vec::new());
+        assert_eq!(unsafe { global_winbar_height() }, 0);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wbr = prev;
+    }
+
+    #[test]
+    fn global_winbar_height_one_when_winbar_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_wbr.replace(b"%f".to_vec());
+        assert_eq!(unsafe { global_winbar_height() }, 1);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wbr = prev;
+    }
+
+    /// Saves/restores `OPTION_VARS.p_wmh`/`p_wbr` for the guard's
+    /// lifetime.
+    struct WinbarWmhGuard {
+        prev_wmh: crate::types_defs::OptInt,
+        prev_wbr: Option<Vec<u8>>,
+    }
+    impl WinbarWmhGuard {
+        fn set(wmh: i64, wbr: Option<&[u8]>) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard =
+                WinbarWmhGuard { prev_wmh: opts.p_wmh, prev_wbr: opts.p_wbr.take() };
+            opts.p_wmh = wmh;
+            opts.p_wbr = wbr.map(<[u8]>::to_vec);
+            guard
+        }
+    }
+    impl Drop for WinbarWmhGuard {
+        fn drop(&mut self) {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            opts.p_wmh = self.prev_wmh;
+            opts.p_wbr = self.prev_wbr.take();
+        }
+    }
+
+    #[test]
+    fn get_maximum_wincount_non_col_frame_uses_frame2win_directly() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WinbarWmhGuard::set(1, None);
+        let mut win = WinT { w_winbar_height: 0, ..focusable_win(1) };
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win_ptr,
+            ..Default::default()
+        };
+        // height=10, p_wmh=1, STATUS_HEIGHT=1, winbar_height=0 -> 10/2 = 5.
+        assert_eq!(unsafe { get_maximum_wincount(&leaf, 10) }, 5);
+    }
+
+    #[test]
+    fn get_maximum_wincount_col_frame_with_global_winbar() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WinbarWmhGuard::set(1, Some(b"%f"));
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            ..Default::default()
+        };
+        // height=12, p_wmh=1, STATUS_HEIGHT=1, +1 for global winbar -> 12/3 = 4.
+        assert_eq!(unsafe { get_maximum_wincount(&col, 12) }, 4);
+    }
+
+    #[test]
+    fn get_maximum_wincount_col_frame_without_global_winbar_sums_children() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WinbarWmhGuard::set(1, None);
+        let mut win1 = WinT { w_winbar_height: 0, ..focusable_win(1) };
+        let win1_ptr = &mut win1 as *mut WinT;
+        let mut win2 = WinT { w_winbar_height: 0, ..focusable_win(2) };
+        let win2_ptr = &mut win2 as *mut WinT;
+
+        let mut leaf2 = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win2_ptr,
+            ..Default::default()
+        };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let leaf1 = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win1_ptr,
+            fr_next: leaf2_ptr,
+            ..Default::default()
+        };
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &leaf1 as *const _ as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        // Each child needs 2 rows (p_wmh=1 + STATUS_HEIGHT=1); with
+        // height=10, both children fit (uses 4), leaving 6 more ->
+        // 6/2=3 additional -> 2 (real children) + 3 = 5.
+        assert_eq!(unsafe { get_maximum_wincount(&col, 10) }, 5);
     }
 
     #[test]
