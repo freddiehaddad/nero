@@ -179,6 +179,19 @@
 //! its initial value forever today) and `win_locked` (reads
 //! `WinT.w_locked` directly).
 //!
+//! Also translated: `merge_win_config`/`clear_float_config` -
+//! `merge_win_config` collapses to a plain struct assignment: the
+//! original's own `clear_virttext` calls (freeing `dst`'s OLD
+//! `title_chunks`/`footer_chunks` virtual-text data before the
+//! overwrite, to avoid a C-style memory leak) have NO Rust
+//! equivalent, since `WinConfig`'s own fields are real, owned
+//! `Vec`s already dropped automatically by the assignment - matching
+//! the established "Rust's own ownership model already does what the
+//! C free dance does manually" pattern. `clear_float_config`'s own
+//! `free_fields` parameter therefore has no observable effect here
+//! either (both of its original branches reduce to the identical
+//! Rust assignment) - kept, unused, purely for signature fidelity.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -2141,6 +2154,46 @@ pub fn get_last_winid() -> i32 {
 pub unsafe fn win_locked(wp: *const WinT) -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { &*wp }.w_locked
+}
+
+/// Merge `src` into `dst`, replacing it entirely (`merge_win_config`).
+///
+/// The original's own explicit `clear_virttext(&dst->title_chunks)`/
+/// `clear_virttext(&dst->footer_chunks)` calls (freeing `dst`'s OLD
+/// virtual-text chunk data before the assignment overwrites the
+/// pointer, to avoid a C-style memory leak) have NO Rust equivalent
+/// here: this crate's own `WinConfig.title_chunks`/`footer_chunks`
+/// are real, owned `Vec<VirtTextChunk>`s (via `VirtTextChunk.text:
+/// NvimString = Vec<u8>`, not a raw pointer), so the plain assignment
+/// below already drops `dst`'s previous field values automatically,
+/// including any of their own owned heap data - matching this
+/// crate's established "Rust's own ownership model already does what
+/// the C `xfree`/`clear_virttext` dance does manually" pattern (e.g.
+/// `optval_free`/`tv_dict_free_contents`).
+pub fn merge_win_config(dst: &mut crate::buffer_defs::WinConfig, src: crate::buffer_defs::WinConfig) {
+    *dst = src;
+}
+
+/// Clear fields in `fconfig` that are only used for floating windows.
+/// Also clears fields unused after configure time, like width/height
+/// (`clear_float_config`).
+///
+/// The original's own `free_fields` parameter distinguishes whether
+/// [`merge_win_config`]'s manual virtual-text-clearing dance runs
+/// before the reset - a distinction with NO observable effect in this
+/// crate, since (per [`merge_win_config`]'s own doc comment) Rust's
+/// plain struct assignment always correctly frees the old owned data
+/// regardless. Both branches of the original's own `if
+/// (free_fields) {...} else {...}` therefore produce the exact same
+/// result here - `free_fields` is kept, unused, purely for signature
+/// fidelity with the original.
+#[allow(unused_variables)]
+pub fn clear_float_config(fconfig: &mut crate::buffer_defs::WinConfig, free_fields: bool) {
+    let saved_style = fconfig.style;
+    let saved_cmdline_offset = fconfig._cmdline_offset;
+    *fconfig = crate::buffer_defs::WinConfig::default();
+    fconfig.style = saved_style;
+    fconfig._cmdline_offset = saved_cmdline_offset;
 }
 
 #[cfg(test)]
@@ -4913,6 +4966,67 @@ mod tests {
 
         let win_locked_win = WinT { w_locked: 1, ..focusable_win(1) };
         assert_eq!(unsafe { win_locked(&win_locked_win) }, 1);
+    }
+
+    // ---- merge_win_config / clear_float_config ----
+
+    #[test]
+    fn merge_win_config_replaces_dst_entirely() {
+        let mut dst = crate::buffer_defs::WinConfig {
+            height: 5,
+            width: 5,
+            style: crate::buffer_defs::WinStyle::Minimal,
+            ..Default::default()
+        };
+        let src = crate::buffer_defs::WinConfig {
+            height: 20,
+            width: 30,
+            style: crate::buffer_defs::WinStyle::Unused,
+            ..Default::default()
+        };
+        merge_win_config(&mut dst, src.clone());
+        assert_eq!(dst.height, 20);
+        assert_eq!(dst.width, 30);
+        assert_eq!(dst.style, crate::buffer_defs::WinStyle::Unused);
+    }
+
+    #[test]
+    fn clear_float_config_resets_to_default_but_preserves_style_and_cmdline_offset() {
+        let mut fconfig = crate::buffer_defs::WinConfig {
+            height: 10,
+            width: 15,
+            style: crate::buffer_defs::WinStyle::Minimal,
+            _cmdline_offset: 42,
+            external: true,
+            ..Default::default()
+        };
+        clear_float_config(&mut fconfig, true);
+
+        let expected = crate::buffer_defs::WinConfig {
+            style: crate::buffer_defs::WinStyle::Minimal,
+            _cmdline_offset: 42,
+            ..Default::default()
+        };
+        assert_eq!(fconfig.height, expected.height);
+        assert_eq!(fconfig.width, expected.width);
+        assert_eq!(fconfig.external, expected.external);
+        assert_eq!(fconfig.style, crate::buffer_defs::WinStyle::Minimal);
+        assert_eq!(fconfig._cmdline_offset, 42);
+    }
+
+    #[test]
+    fn clear_float_config_free_fields_false_has_the_same_observable_effect() {
+        let mut fconfig = crate::buffer_defs::WinConfig {
+            height: 10,
+            style: crate::buffer_defs::WinStyle::Minimal,
+            _cmdline_offset: 7,
+            ..Default::default()
+        };
+        clear_float_config(&mut fconfig, false);
+
+        assert_eq!(fconfig.height, 0);
+        assert_eq!(fconfig.style, crate::buffer_defs::WinStyle::Minimal);
+        assert_eq!(fconfig._cmdline_offset, 7);
     }
 
     #[test]
