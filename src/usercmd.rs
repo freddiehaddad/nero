@@ -7,14 +7,16 @@
 //!
 //! Translated: [`uc_split_args_iter`] and [`uc_nargs_upper_bound`] - pure
 //! byte-string parsing helpers used for Lua `<f-args>` callback argument
-//! splitting, with no dependency on the command registry itself.
+//! splitting, with no dependency on the command registry itself - plus
+//! [`parse_addr_type_arg`], a small lookup table (`ADDR_TYPE_COMPLETE`,
+//! 8 entries) needing only the already-translated
+//! [`crate::ex_cmds_defs::CmdAddrT`] enum.
 //!
 //! Deferred: everything else - `uc_add_command`/`ex_command`/
-//! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`, and the
-//! `cmdcomplete_str_to_type`/`parse_addr_type_arg`/`parse_compl_arg`
-//! trio (each needs one of `command_complete[]`'s ~70-entry
-//! `EXPAND_*`-indexed table, or `addr_type_complete[]`, neither
-//! translated yet - a separate, dedicated undertaking).
+//! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`, and
+//! `cmdcomplete_str_to_type`/`parse_compl_arg` (both need
+//! `command_complete[]`'s much larger ~70-entry `EXPAND_*`-indexed
+//! table - a separate, dedicated undertaking).
 
 use crate::ascii_defs::ascii_iswhite;
 
@@ -101,6 +103,47 @@ pub fn uc_nargs_upper_bound(arg: &[u8]) -> usize {
     nargs
 }
 
+/// List of names of address types (`addr_type_complete`). Must be
+/// alphabetical by long name for completion (matching the original's
+/// own comment) - kept in the exact original order here too.
+///
+/// `shortname` isn't read by [`parse_addr_type_arg`] itself (only
+/// `name`, the long form, is checked there), but is kept for fidelity
+/// with the original's full struct shape, ready for a future
+/// completion-listing function that needs it too.
+const ADDR_TYPE_COMPLETE: &[(crate::ex_cmds_defs::CmdAddrT, &str, &str)] = &[
+    (crate::ex_cmds_defs::CmdAddrT::Arguments, "arguments", "arg"),
+    (crate::ex_cmds_defs::CmdAddrT::Lines, "lines", "line"),
+    (crate::ex_cmds_defs::CmdAddrT::LoadedBuffers, "loaded_buffers", "load"),
+    (crate::ex_cmds_defs::CmdAddrT::Tabs, "tabs", "tab"),
+    (crate::ex_cmds_defs::CmdAddrT::Buffers, "buffers", "buf"),
+    (crate::ex_cmds_defs::CmdAddrT::Windows, "windows", "win"),
+    (crate::ex_cmds_defs::CmdAddrT::Quickfix, "quickfix", "qf"),
+    (crate::ex_cmds_defs::CmdAddrT::Other, "other", "?"),
+];
+
+/// Looks up an address-type name (e.g. `b"lines"`, `b"windows"`)
+/// against `ADDR_TYPE_COMPLETE`'s own long names, returning the
+/// matching [`crate::ex_cmds_defs::CmdAddrT`], or `None` if `value`
+/// isn't a recognized address type (`parse_addr_type_arg`).
+///
+/// Returns `Option` in place of the original's `OK`/`FAIL` int plus
+/// `cmd_addr_T *addr_type_arg` out-parameter, matching this crate's
+/// established C-out-parameter-to-owned-return convention. Omits the
+/// original's own `semsg` error-message display - which also
+/// truncates its own `value` argument in place purely to shape that
+/// message's text, not replicated here since nothing needs it without
+/// displaying the message - matching this crate's established "skip
+/// the deferred message-display side effect" policy (e.g.
+/// `window::check_split_disallowed`).
+#[must_use]
+pub fn parse_addr_type_arg(value: &[u8]) -> Option<crate::ex_cmds_defs::CmdAddrT> {
+    ADDR_TYPE_COMPLETE
+        .iter()
+        .find(|&&(_, name, _)| name.as_bytes() == value)
+        .map(|&(addr, _, _)| addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +225,31 @@ mod tests {
         assert_eq!(uc_nargs_upper_bound(b""), 0);
         assert_eq!(uc_nargs_upper_bound(b"   "), 0);
         assert_eq!(uc_nargs_upper_bound(b"oneword"), 1);
+    }
+
+    #[test]
+    fn parse_addr_type_arg_recognizes_every_long_name() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        assert_eq!(parse_addr_type_arg(b"arguments"), Some(CmdAddrT::Arguments));
+        assert_eq!(parse_addr_type_arg(b"lines"), Some(CmdAddrT::Lines));
+        assert_eq!(parse_addr_type_arg(b"loaded_buffers"), Some(CmdAddrT::LoadedBuffers));
+        assert_eq!(parse_addr_type_arg(b"tabs"), Some(CmdAddrT::Tabs));
+        assert_eq!(parse_addr_type_arg(b"buffers"), Some(CmdAddrT::Buffers));
+        assert_eq!(parse_addr_type_arg(b"windows"), Some(CmdAddrT::Windows));
+        assert_eq!(parse_addr_type_arg(b"quickfix"), Some(CmdAddrT::Quickfix));
+        assert_eq!(parse_addr_type_arg(b"other"), Some(CmdAddrT::Other));
+    }
+
+    #[test]
+    fn parse_addr_type_arg_does_not_match_short_names() {
+        // Only the long name is checked, matching the original exactly.
+        assert_eq!(parse_addr_type_arg(b"arg"), None);
+        assert_eq!(parse_addr_type_arg(b"win"), None);
+    }
+
+    #[test]
+    fn parse_addr_type_arg_unknown_name_is_none() {
+        assert_eq!(parse_addr_type_arg(b"nonexistent"), None);
+        assert_eq!(parse_addr_type_arg(b""), None);
     }
 }
