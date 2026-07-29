@@ -166,6 +166,13 @@
 //! `OPTION_VARS.p_wmh`, `WinT.w_winbar_height`,
 //! `FrameT.fr_child`/`fr_next`/`fr_layout`).
 //!
+//! Also translated: `only_one_window` (whether the current tabpage
+//! has only one "real" window, used for `:only`/`:qa`-style checks),
+//! via already-real `crate::globals::GLOBALS.first_tabpage`/
+//! `firstwin`/`curbuf`/`curwin`, `crate::buffer::bt_help`,
+//! `crate::context::is_ctx_win`, `WinT.w_floating`/
+//! `w_onebuf_opt.wo_pvw`/`w_next`.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -2056,6 +2063,53 @@ pub unsafe fn get_maximum_wincount(fr: *const crate::buffer_defs::FrameT, height
     total_wincount += height / (p_wmh + STATUS_HEIGHT);
 
     total_wincount
+}
+
+/// `true` if the current tabpage has only one "real" window
+/// (`only_one_window`) - used for `:only`/`:qa`-style checks. A
+/// window counts unless it's a help/floating/preview window (and
+/// isn't the current window), or the ctx window. If there is another
+/// tabpage, there's always another window.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers.
+/// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain must
+/// consist of valid, live `WinT` pointers, each with a `w_buffer`
+/// (when non-null) that is a valid, live `BufT` pointer.
+/// `crate::globals::GLOBALS.curbuf`, if non-null, must likewise be
+/// valid.
+#[must_use]
+pub unsafe fn only_one_window() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // If there is another tab page there always is another window.
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { &*g.first_tabpage }.tp_next.is_null() {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = if g.curbuf.is_null() { None } else { Some(unsafe { &*g.curbuf }) };
+    let mut count = 0;
+    let mut wp = g.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = if w.w_buffer.is_null() { None } else { Some(unsafe { &*w.w_buffer }) };
+        if buf.is_some()
+            && (!((crate::buffer::bt_help(buf) && !crate::buffer::bt_help(curbuf))
+                || w.w_floating
+                || w.w_onebuf_opt.wo_pvw != 0)
+                || std::ptr::eq(wp, g.curwin))
+            && !crate::context::is_ctx_win(wp)
+        {
+            count += 1;
+        }
+        wp = w.w_next;
+    }
+    count <= 1
 }
 
 #[cfg(test)]
@@ -4648,6 +4702,157 @@ mod tests {
         // height=10, both children fit (uses 4), leaving 6 more ->
         // 6/2=3 additional -> 2 (real children) + 3 = 5.
         assert_eq!(unsafe { get_maximum_wincount(&col, 10) }, 5);
+    }
+
+    // ---- only_one_window ----
+
+    /// Saves/restores `GLOBALS.first_tabpage`/`firstwin`/`curbuf`/
+    /// `curwin` for the guard's lifetime.
+    struct OnlyOneWindowGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut WinT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut WinT,
+    }
+    impl OnlyOneWindowGuard {
+        fn set(
+            first_tabpage: *mut crate::buffer_defs::TabpageT,
+            firstwin: *mut WinT,
+            curbuf: *mut crate::buffer_defs::BufT,
+            curwin: *mut WinT,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = OnlyOneWindowGuard {
+                prev_first_tabpage: g.first_tabpage,
+                prev_firstwin: g.firstwin,
+                prev_curbuf: g.curbuf,
+                prev_curwin: g.curwin,
+            };
+            g.first_tabpage = first_tabpage;
+            g.firstwin = firstwin;
+            g.curbuf = curbuf;
+            g.curwin = curwin;
+            guard
+        }
+    }
+    impl Drop for OnlyOneWindowGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.first_tabpage = self.prev_first_tabpage;
+            g.firstwin = self.prev_firstwin;
+            g.curbuf = self.prev_curbuf;
+            g.curwin = self.prev_curwin;
+        }
+    }
+
+    #[test]
+    fn only_one_window_false_when_another_tabpage_exists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second_tp = crate::buffer_defs::TabpageT::default();
+        let second_tp_ptr = &mut second_tp as *mut crate::buffer_defs::TabpageT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: second_tp_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert!(!unsafe { only_one_window() });
+    }
+
+    #[test]
+    fn only_one_window_true_for_a_single_normal_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_with_buffer(1, buf_ptr);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, win_ptr, buf_ptr, win_ptr);
+
+        assert!(unsafe { only_one_window() });
+    }
+
+    #[test]
+    fn only_one_window_false_for_two_normal_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = crate::buffer_defs::BufT::default();
+        let buf1_ptr = &mut buf1 as *mut crate::buffer_defs::BufT;
+        let mut buf2 = crate::buffer_defs::BufT::default();
+        let buf2_ptr = &mut buf2 as *mut crate::buffer_defs::BufT;
+        let mut win2 = win_with_buffer(2, buf2_ptr);
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_next: win2_ptr, ..win_with_buffer(1, buf1_ptr) };
+        let win1_ptr = &mut win1 as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, win1_ptr, buf1_ptr, win1_ptr);
+
+        assert!(!unsafe { only_one_window() });
+    }
+
+    #[test]
+    fn only_one_window_help_window_not_curwin_does_not_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let curbuf_ptr = &mut curbuf as *mut crate::buffer_defs::BufT;
+        let mut help_buf = crate::buffer_defs::BufT { b_help: true, ..Default::default() };
+        let help_buf_ptr = &mut help_buf as *mut crate::buffer_defs::BufT;
+        let mut help_win = win_with_buffer(2, help_buf_ptr);
+        let help_win_ptr = &mut help_win as *mut WinT;
+        let mut cur_win = WinT { w_next: help_win_ptr, ..win_with_buffer(1, curbuf_ptr) };
+        let cur_win_ptr = &mut cur_win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, cur_win_ptr, curbuf_ptr, cur_win_ptr);
+
+        // help_win doesn't count (help buffer, curbuf isn't help, not
+        // curwin) - only cur_win counts -> count == 1 -> true.
+        assert!(unsafe { only_one_window() });
+    }
+
+    #[test]
+    fn only_one_window_help_window_that_is_curwin_counts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut help_buf = crate::buffer_defs::BufT { b_help: true, ..Default::default() };
+        let help_buf_ptr = &mut help_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_buf = crate::buffer_defs::BufT::default();
+        let normal_buf_ptr = &mut normal_buf as *mut crate::buffer_defs::BufT;
+        let mut normal_win = win_with_buffer(2, normal_buf_ptr);
+        let normal_win_ptr = &mut normal_win as *mut WinT;
+        let mut help_win = WinT { w_next: normal_win_ptr, ..win_with_buffer(1, help_buf_ptr) };
+        let help_win_ptr = &mut help_win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        // help_win IS curwin (counts, since `wp == curwin`), normal_win
+        // is a real, non-special buffer (also counts) -> count == 2 ->
+        // false.
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, help_win_ptr, help_buf_ptr, help_win_ptr);
+
+        assert!(!unsafe { only_one_window() });
+    }
+
+    #[test]
+    fn only_one_window_ctx_window_never_counts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = crate::buffer_defs::BufT::default();
+        let buf1_ptr = &mut buf1 as *mut crate::buffer_defs::BufT;
+        let mut buf2 = crate::buffer_defs::BufT::default();
+        let buf2_ptr = &mut buf2 as *mut crate::buffer_defs::BufT;
+        let mut ctx_win = win_with_buffer(2, buf2_ptr);
+        let ctx_win_ptr = &mut ctx_win as *mut WinT;
+        let mut real_win = WinT { w_next: ctx_win_ptr, ..win_with_buffer(1, buf1_ptr) };
+        let real_win_ptr = &mut real_win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = OnlyOneWindowGuard::set(tp_ptr, real_win_ptr, buf1_ptr, real_win_ptr);
+
+        unsafe { crate::context::CTX_WIN_VEC.get_mut() }
+            .push(crate::context_defs::CtxWin { cw_win: ctx_win_ptr, cw_used: true });
+
+        // ctx_win never counts regardless of its own buffer/curwin
+        // status - only real_win counts -> count == 1 -> true.
+        assert!(unsafe { only_one_window() });
+
+        unsafe { crate::context::CTX_WIN_VEC.get_mut() }.clear();
     }
 
     #[test]
