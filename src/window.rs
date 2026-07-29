@@ -112,6 +112,16 @@
 //! locked), a real, deliberate distinction in the original's own two
 //! "_err" variants, preserved exactly rather than unified.
 //!
+//! Also translated: `unuse_tabpage`/`use_tabpage` (save/restore the
+//! current window-list state - `GLOBALS.topframe`/`firstwin`/
+//! `lastwin`/`curwin`/`OPTION_VARS.p_ch` - into/from a `TabpageT`'s own
+//! `tp_topframe`/`tp_firstwin`/`tp_lastwin`/`tp_curwin`/`tp_ch_used`
+//! fields, in preparation for/after switching the current tabpage) -
+//! every field already existed. Translated ahead of their real callers
+//! (`enter_tabpage`/`leave_tabpage`, not translated yet), matching the
+//! established "translate ahead of a real caller" precedent for small,
+//! self-contained pieces with no design freedom of their own.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1671,6 +1681,44 @@ pub fn window_layout_locked_err(cmd: crate::ex_cmds_defs::CmdIdxT) -> bool {
 #[must_use]
 pub fn window_layout_locked(cmd: crate::ex_cmds_defs::CmdIdxT) -> bool {
     window_layout_locked_err(cmd)
+}
+
+/// Save the current window-list state into tabpage `tp`, in
+/// preparation for switching away from it (`unuse_tabpage`).
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live `TabpageT`.
+/// Touches `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+pub unsafe fn unuse_tabpage(tp: *mut crate::buffer_defs::TabpageT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let t = unsafe { &mut *tp };
+    t.tp_topframe = g.topframe;
+    t.tp_firstwin = g.firstwin;
+    t.tp_lastwin = g.lastwin;
+    t.tp_curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    t.tp_ch_used = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch;
+}
+
+/// Restore the window-list state previously saved into tabpage `tp`
+/// (`use_tabpage`), making it the current tabpage.
+///
+/// # Safety
+/// Same as [`unuse_tabpage`].
+pub unsafe fn use_tabpage(tp: *mut crate::buffer_defs::TabpageT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.curtab = tp;
+    // SAFETY: forwarded from this function's own safety doc.
+    let t = unsafe { &*g.curtab };
+    g.topframe = t.tp_topframe;
+    g.firstwin = t.tp_firstwin;
+    g.lastwin = t.tp_lastwin;
+    g.curwin = t.tp_curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = t.tp_ch_used;
 }
 
 #[cfg(test)]
@@ -3541,5 +3589,120 @@ mod tests {
         // Tab 0 -> find_tabpage(0) -> curtab, matching find_tabpage's
         // own already-established "0 means curtab" convention.
         assert_eq!(unsafe { find_tabwin(&num_tv(1), &num_tv(0)) }, win_ptr);
+    }
+
+    // ---- unuse_tabpage / use_tabpage ----
+
+    /// Points `GLOBALS.topframe`/`firstwin`/`lastwin`/`curwin`/`curtab`
+    /// and `OPTION_VARS.p_ch` at the given values for the guard's
+    /// lifetime, restoring all 6 previous values on drop - a dedicated
+    /// guard for `unuse_tabpage`/`use_tabpage`'s own specific field
+    /// set (distinct from `CurwinListGuard`'s narrower
+    /// `firstwin`/`curtab`/`curwin` coverage; `curtab` must be
+    /// restored here too since `use_tabpage` itself mutates it).
+    struct WindowListStateGuard {
+        prev_topframe: *mut crate::buffer_defs::FrameT,
+        prev_firstwin: *mut WinT,
+        prev_lastwin: *mut WinT,
+        prev_curwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_ch: crate::types_defs::OptInt,
+    }
+    impl WindowListStateGuard {
+        fn set(
+            topframe: *mut crate::buffer_defs::FrameT,
+            firstwin: *mut WinT,
+            lastwin: *mut WinT,
+            curwin: *mut WinT,
+            ch: crate::types_defs::OptInt,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = WindowListStateGuard {
+                prev_topframe: g.topframe,
+                prev_firstwin: g.firstwin,
+                prev_lastwin: g.lastwin,
+                prev_curwin: g.curwin,
+                prev_curtab: g.curtab,
+                prev_ch: opts.p_ch,
+            };
+            g.topframe = topframe;
+            g.firstwin = firstwin;
+            g.lastwin = lastwin;
+            g.curwin = curwin;
+            opts.p_ch = ch;
+            guard
+        }
+    }
+    impl Drop for WindowListStateGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.topframe = self.prev_topframe;
+            g.firstwin = self.prev_firstwin;
+            g.lastwin = self.prev_lastwin;
+            g.curwin = self.prev_curwin;
+            g.curtab = self.prev_curtab;
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = self.prev_ch;
+        }
+    }
+
+    #[test]
+    fn unuse_tabpage_saves_the_current_window_list_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut frame = crate::buffer_defs::FrameT::default();
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WindowListStateGuard::set(frame_ptr, win_ptr, win_ptr, win_ptr, 5);
+
+        unsafe { unuse_tabpage(tp_ptr) };
+
+        assert_eq!(unsafe { &*tp_ptr }.tp_topframe, frame_ptr);
+        assert_eq!(unsafe { &*tp_ptr }.tp_firstwin, win_ptr);
+        assert_eq!(unsafe { &*tp_ptr }.tp_lastwin, win_ptr);
+        assert_eq!(unsafe { &*tp_ptr }.tp_curwin, win_ptr);
+        assert_eq!(unsafe { &*tp_ptr }.tp_ch_used, 5);
+    }
+
+    #[test]
+    fn use_tabpage_restores_the_saved_window_list_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_win = focusable_win(2);
+        let other_win_ptr = &mut other_win as *mut WinT;
+        let mut other_frame = crate::buffer_defs::FrameT::default();
+        let other_frame_ptr = &mut other_frame as *mut crate::buffer_defs::FrameT;
+        let _guard = WindowListStateGuard::set(
+            other_frame_ptr,
+            other_win_ptr,
+            other_win_ptr,
+            other_win_ptr,
+            3,
+        );
+
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut frame = crate::buffer_defs::FrameT::default();
+        let frame_ptr = &mut frame as *mut crate::buffer_defs::FrameT;
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_topframe: frame_ptr,
+            tp_firstwin: win_ptr,
+            tp_lastwin: win_ptr,
+            tp_curwin: win_ptr,
+            tp_ch_used: 7,
+            ..Default::default()
+        };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        unsafe { use_tabpage(tp_ptr) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.curtab, tp_ptr);
+        assert_eq!(g.topframe, frame_ptr);
+        assert_eq!(g.firstwin, win_ptr);
+        assert_eq!(g.lastwin, win_ptr);
+        assert_eq!(g.curwin, win_ptr);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch, 7);
     }
 }
