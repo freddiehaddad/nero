@@ -487,6 +487,18 @@ pub fn get_sidescrolloff_value(wp: &WinT) -> OptInt {
     }
 }
 
+/// Set the global value for `'iminsert'` to `buf`'s own local value
+/// (`set_iminsert_global`).
+pub fn set_iminsert_global(buf: &BufT) {
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_iminsert = buf.b_p_iminsert;
+}
+
+/// Set the global value for `'imsearch'` to `buf`'s own local value
+/// (`set_imsearch_global`).
+pub fn set_imsearch_global(buf: &BufT) {
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_imsearch = buf.b_p_imsearch;
+}
+
 /// Parse `val` (or `wp.w_onebuf_opt.wo_culopt` when `val` is `None`) -
 /// `'cursorlineopt'`'s comma-separated flag list (`"line"`/`"both"`/
 /// `"number"`/`"screenline"`) - into `wp.w_p_culopt_flags`
@@ -3417,6 +3429,36 @@ mod tests {
         assert_eq!(get_sidescrolloff_value(&win_local), 6);
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_siso = prev;
+    }
+
+    #[test]
+    fn set_iminsert_global_copies_the_buffers_local_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_iminsert;
+
+        let buf = BufT {
+            b_p_iminsert: 2,
+            ..Default::default()
+        };
+        set_iminsert_global(&buf);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_iminsert, 2);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_iminsert = prev;
+    }
+
+    #[test]
+    fn set_imsearch_global_copies_the_buffers_local_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_imsearch;
+
+        let buf = BufT {
+            b_p_imsearch: 1,
+            ..Default::default()
+        };
+        set_imsearch_global(&buf);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_imsearch, 1);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_imsearch = prev;
     }
 
     #[test]
