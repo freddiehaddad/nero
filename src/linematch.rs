@@ -1,7 +1,9 @@
 //! Translated from `src/nvim/linematch.c`: the "linematch" algorithm used
 //! by diff mode to align individual lines within a diff hunk across 2 or
 //! more buffers (an `int**`-indexed dynamic-programming search over an
-//! N-dimensional tensor, one dimension per compared buffer).
+//! N-dimensional tensor, one dimension per compared buffer). Fully
+//! translated - a single, self-contained, pure computational algorithm
+//! with no dependency on any not-yet-translated subsystem.
 //!
 //! `mmfile_t` (the original's xdiff-derived `{ ptr, size }` byte-buffer
 //! type) is represented here simply as `&[u8]` - the same "idiomatic
@@ -13,36 +15,19 @@
 //! which already behaves correctly everywhere the original relies on
 //! `memchr`/pointer-arithmetic no-ops for a NULL/zero-size buffer.
 //!
-//! This file is a single, self-contained, pure computational algorithm
-//! with no dependency on any not-yet-translated subsystem - its only
-//! caller (`diff.c`'s `diff_read_line`/linematch integration) is part of
-//! the not-yet-translated real diff-computation engine (see `diff.rs`'s
-//! own module doc comment).
+//! The original's `diffcmppath_T *` sibling-node pointers (each node
+//! pointing at other nodes within the same single `xmalloc`ed array) are
+//! translated as plain `usize` indices into the owning
+//! `Vec<DiffCmpPath>` rather than raw pointers - the same index-based
+//! self-referential-structure translation this crate already uses for
+//! tree/graph-like data in `marktree.rs`.
 //!
-//! Translated so far: `line_len`/`matching_chars`/`matching_chars_iwhite`
-//! (the core "how well do these two lines match" primitives, a
-//! longest-common-subsequence-style character count), `count_n_matched_chars`
-//! (combines that pairwise across N participating lines), `unwrap_indexes`
-//! (flattens an N-dimensional tensor coordinate into a row-major index),
-//! and [`fastforward_buf_to_lnum`] (advances a multi-line buffer forward
-//! to the start of a given line number). The rest of the file (the
-//! tensor search itself) is translated incrementally in later commits.
-//!
-//! Also note: `LN_MAX_BUFS`/`LN_DECISION_MAX` are declared here even
-//! though only used by later additions to this file, since they are
-//! genuine top-of-file constants in the original (`#define`s just above
-//! `diffcmppath_S`) rather than something specific to any one function.
-
-// This file's only real entry point, `linematch_nbuffers`, is not
-// translated yet (it lands in a later commit) - until then, nothing
-// calls these `static`-in-the-original private helpers outside their own
-// tests. #[allow(dead_code)] instead of prematurely making them `pub`
-// (misrepresenting the original's intended visibility) or deleting them
-// (losing verified, tested translation work ahead of its eventual use) -
-// the same convention already established in marktree.rs/move.rs/
-// undo.rs/userfunc.rs for helpers harvested ahead of their real caller.
-#![allow(dead_code)]
-
+//! This file's only caller (`diff.c`'s `diff_read_line`/linematch
+//! integration) is part of the not-yet-translated real diff-computation
+//! engine (see `diff.rs`'s own module doc comment), so
+//! [`linematch_nbuffers`] and its helpers are translated here as
+//! free-standing, fully-tested functions, ready to be wired up once
+//! `diff.c` itself is tackled.
 /// Maximum number of buffers `linematch_nbuffers` can compare at once
 /// (`LN_MAX_BUFS`).
 pub const LN_MAX_BUFS: usize = 8;
@@ -218,6 +203,264 @@ pub fn fastforward_buf_to_lnum(mut s: &[u8], lnum: crate::pos_defs::LinenrT) -> 
     s
 }
 
+/// One node of the N-dimensional dynamic-programming tensor built by
+/// [`linematch_nbuffers`] (`diffcmppath_T`/`struct diffcmppath_S`).
+///
+/// The original's sibling-node pointers (`df_decision`, each pointing at
+/// another node within the very same single `xmalloc`ed array) are
+/// translated as plain `usize` indices into the owning
+/// `Vec<DiffCmpPath>` instead - the same index-based self-referential-
+/// structure translation this crate already uses for tree/graph-like
+/// data in `marktree.rs`, avoiding both unsafe code and any aliasing
+/// hazard from the tensor being (in principle) accessed at two indices
+/// "at once".
+#[derive(Clone, Copy)]
+struct DiffCmpPath {
+    /// Total matched-character score of the best path(s) found so far
+    /// leading to this node (`df_lev_score`).
+    df_lev_score: i32,
+    /// Number of valid entries in `df_choice`/`df_decision` (only the
+    /// first `df_path_n` of each are meaningful) (`df_path_n`).
+    df_path_n: usize,
+    /// Memoized [`test_charmatch_paths`] result per `lastdecision`
+    /// bitmask value; `-1` means "not yet computed" (`df_choice_mem`).
+    df_choice_mem: [i32; LN_DECISION_MAX + 1],
+    /// The "which buffers advanced" bitmask for each of the (tied-)best
+    /// incoming path(s) (`df_choice`).
+    df_choice: [i32; LN_DECISION_MAX],
+    /// The predecessor node's index for each of the (tied-)best incoming
+    /// path(s) (`df_decision`, originally `diffcmppath_T *[]`).
+    df_decision: [usize; LN_DECISION_MAX],
+    /// Which of the (tied-)best incoming paths [`test_charmatch_paths`]
+    /// picked as requiring the fewest "turns" (`df_optimal_choice`).
+    df_optimal_choice: usize,
+}
+
+impl DiffCmpPath {
+    /// A fresh tensor node: no score, no incoming paths yet, and every
+    /// `df_choice_mem` slot marked "not yet computed" - matching the
+    /// original's own explicit per-node initialization loop in
+    /// `linematch_nbuffers` (`xmalloc` does not zero memory, so the
+    /// original always initializes every node's fields itself too).
+    ///
+    /// The original only initializes the first `2^ndiffs` of
+    /// `df_choice_mem`'s `LN_DECISION_MAX + 1` slots (the only ones any
+    /// real `ndiffs <= LN_MAX_BUFS` bitmask value can ever index); this
+    /// initializes the whole array unconditionally instead, which is
+    /// equivalent (the remaining slots are simply never read) and avoids
+    /// threading `ndiffs` through this constructor.
+    fn new() -> Self {
+        Self {
+            df_lev_score: 0,
+            df_path_n: 0,
+            df_choice_mem: [-1; LN_DECISION_MAX + 1],
+            df_choice: [0; LN_DECISION_MAX],
+            df_decision: [0; LN_DECISION_MAX],
+            df_optimal_choice: 0,
+        }
+    }
+}
+
+/// Explores every non-empty subset ("choice" bitmask) of the axes listed
+/// in `paths` that could have decreased to reach the current tensor
+/// coordinate `df_iters`, scores each candidate predecessor path, and
+/// keeps the tensor node's best (or tied-best) incoming path(s)
+/// (`try_possible_paths`).
+///
+/// `path_idx`/`choice` thread a backtracking subset-enumeration
+/// recursion through, mirroring the original's own recursive/pointer-
+/// mutation structure exactly: at each level, first try including axis
+/// `paths[path_idx]` in the choice and recurse, then try excluding it
+/// and recurse again - once `path_idx == paths.len()`, `choice` holds one
+/// complete subset to evaluate.
+#[allow(clippy::too_many_arguments)]
+fn try_possible_paths(
+    df_iters: &[i32],
+    paths: &[usize],
+    path_idx: usize,
+    choice: &mut i32,
+    diffcmppath: &mut [DiffCmpPath],
+    diff_len: &[i32],
+    diff_blk: &[&[u8]],
+    iwhite: bool,
+) {
+    if path_idx == paths.len() {
+        if *choice > 0 {
+            let ndiffs = diff_len.len();
+            let mut from_vals = [0i32; LN_MAX_BUFS];
+            from_vals[..ndiffs].copy_from_slice(&df_iters[..ndiffs]);
+            let mut current_lines: [Option<&[u8]>; LN_MAX_BUFS] = [None; LN_MAX_BUFS];
+            for k in 0..ndiffs {
+                if *choice & (1 << k) != 0 {
+                    from_vals[k] -= 1;
+                    current_lines[k] = Some(fastforward_buf_to_lnum(diff_blk[k], df_iters[k]));
+                }
+            }
+            let unwrapped_idx_from = unwrap_indexes(&from_vals[..ndiffs], diff_len);
+            let unwrapped_idx_to = unwrap_indexes(df_iters, diff_len);
+            let matched_chars = count_n_matched_chars(&current_lines[..ndiffs], iwhite);
+            let score = diffcmppath[unwrapped_idx_from].df_lev_score + matched_chars;
+            if score > diffcmppath[unwrapped_idx_to].df_lev_score {
+                diffcmppath[unwrapped_idx_to].df_path_n = 1;
+                diffcmppath[unwrapped_idx_to].df_decision[0] = unwrapped_idx_from;
+                diffcmppath[unwrapped_idx_to].df_choice[0] = *choice;
+                diffcmppath[unwrapped_idx_to].df_lev_score = score;
+            } else if score == diffcmppath[unwrapped_idx_to].df_lev_score {
+                let k = diffcmppath[unwrapped_idx_to].df_path_n;
+                diffcmppath[unwrapped_idx_to].df_path_n += 1;
+                diffcmppath[unwrapped_idx_to].df_decision[k] = unwrapped_idx_from;
+                diffcmppath[unwrapped_idx_to].df_choice[k] = *choice;
+            }
+        }
+        return;
+    }
+    let bit_place = paths[path_idx];
+    *choice |= 1 << bit_place;
+    try_possible_paths(
+        df_iters, paths, path_idx + 1, choice, diffcmppath, diff_len, diff_blk, iwhite,
+    );
+    *choice &= !(1 << bit_place);
+    try_possible_paths(
+        df_iters, paths, path_idx + 1, choice, diffcmppath, diff_len, diff_blk, iwhite,
+    );
+}
+
+/// Recursively iterates every coordinate of the N-dimensional tensor
+/// (nesting `ch_dim` from `0` up to `diff_len.len()`, each level looping
+/// its own axis from `0` to `diff_len[ch_dim]` inclusive), and at each
+/// coordinate, explores every non-empty subset of "which axes could have
+/// decreased to reach here" via [`try_possible_paths`]
+/// (`populate_tensor`).
+fn populate_tensor(
+    df_iters: &mut [i32],
+    ch_dim: usize,
+    diffcmppath: &mut [DiffCmpPath],
+    diff_len: &[i32],
+    diff_blk: &[&[u8]],
+    iwhite: bool,
+) {
+    let ndiffs = diff_len.len();
+    if ch_dim == ndiffs {
+        let mut paths = [0usize; LN_MAX_BUFS];
+        let mut npaths = 0;
+        for (j, &iter) in df_iters.iter().enumerate().take(ndiffs) {
+            if iter > 0 {
+                paths[npaths] = j;
+                npaths += 1;
+            }
+        }
+        let mut choice = 0i32;
+        let unwrapped_idx_to = unwrap_indexes(df_iters, diff_len);
+        diffcmppath[unwrapped_idx_to].df_lev_score = -1;
+        try_possible_paths(
+            df_iters,
+            &paths[..npaths],
+            0,
+            &mut choice,
+            diffcmppath,
+            diff_len,
+            diff_blk,
+            iwhite,
+        );
+        return;
+    }
+
+    for i in 0..=diff_len[ch_dim] {
+        df_iters[ch_dim] = i;
+        populate_tensor(df_iters, ch_dim + 1, diffcmppath, diff_len, diff_blk, iwhite);
+    }
+}
+
+/// Given the tensor node at `node_idx`, memoized-recursively finds the
+/// minimum number of "turns" (bitmask changes between consecutive steps)
+/// needed along one of its best-scoring incoming paths back to the
+/// tensor's origin, breaking ties among multiple equally-good-scoring
+/// incoming paths in favor of fewer turns, and records the winning
+/// choice in that node's `df_optimal_choice` (`test_charmatch_paths`).
+fn test_charmatch_paths(diffcmppath: &mut [DiffCmpPath], node_idx: usize, lastdecision: i32) -> i32 {
+    let cached = diffcmppath[node_idx].df_choice_mem[lastdecision as usize];
+    if cached != -1 {
+        return cached;
+    }
+
+    let path_n = diffcmppath[node_idx].df_path_n;
+    let result = if path_n == 0 {
+        0
+    } else {
+        let mut minimum_turns = i32::MAX;
+        let mut best_choice = 0usize;
+        for i in 0..path_n {
+            let decision = diffcmppath[node_idx].df_decision[i];
+            let choice = diffcmppath[node_idx].df_choice[i];
+            let t = test_charmatch_paths(diffcmppath, decision, choice)
+                + i32::from(lastdecision != choice);
+            if t < minimum_turns {
+                best_choice = i;
+                minimum_turns = t;
+            }
+        }
+        diffcmppath[node_idx].df_optimal_choice = best_choice;
+        minimum_turns
+    };
+
+    diffcmppath[node_idx].df_choice_mem[lastdecision as usize] = result;
+    result
+}
+
+/// Finds an optimal line-by-line alignment of a diff hunk across 2 or
+/// more buffers (`linematch_nbuffers`).
+///
+/// `diff_blk[k]` is the entire remaining diff-block content for buffer
+/// `k` (its lines' own text, each newline-terminated) and `diff_len[k]`
+/// is how many lines it contains; `diff_blk` and `diff_len` must have
+/// the same length (the original's `ndiffs`, at most [`LN_MAX_BUFS`] -
+/// checked with `debug_assert!`, matching the original's own
+/// release-mode-compiled-out `assert()`; unlike the original, exceeding
+/// `LN_MAX_BUFS` in a release build safely panics here on the first
+/// fixed-size-array access rather than silently overflowing a stack
+/// array).
+///
+/// Returns a sequence of bitmask "decisions": each entry describes which
+/// buffers should each contribute one line to the next aligned row (bit
+/// `k` set means buffer `k` advances), in forward playback order.
+///
+/// For an explanation of the algorithm itself (a dynamic-programming
+/// search over an N-dimensional tensor, one dimension per compared
+/// buffer), see the original's own lengthy doc comment on
+/// `linematch_nbuffers` in `linematch.c`.
+pub fn linematch_nbuffers(diff_blk: &[&[u8]], diff_len: &[i32], iwhite: bool) -> Vec<i32> {
+    let ndiffs = diff_len.len();
+    debug_assert_eq!(diff_blk.len(), ndiffs);
+    debug_assert!(ndiffs <= LN_MAX_BUFS);
+    debug_assert!(diff_len.iter().all(|&n| n >= 0));
+
+    let memsize: usize = diff_len.iter().map(|&n| (n as usize) + 1).product();
+    let mut diffcmppath = vec![DiffCmpPath::new(); memsize];
+
+    let mut df_iters = [0i32; LN_MAX_BUFS];
+    populate_tensor(
+        &mut df_iters[..ndiffs],
+        0,
+        &mut diffcmppath,
+        diff_len,
+        diff_blk,
+        iwhite,
+    );
+
+    let u = unwrap_indexes(diff_len, diff_len);
+    test_charmatch_paths(&mut diffcmppath, u, 0);
+
+    let mut decisions = Vec::new();
+    let mut current_idx = u;
+    while diffcmppath[current_idx].df_path_n > 0 {
+        let j = diffcmppath[current_idx].df_optimal_choice;
+        decisions.push(diffcmppath[current_idx].df_choice[j]);
+        current_idx = diffcmppath[current_idx].df_decision[j];
+    }
+    decisions.reverse();
+    decisions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +609,72 @@ mod tests {
     fn fastforward_buf_to_lnum_empty_buffer() {
         assert_eq!(fastforward_buf_to_lnum(b"", 1), b"");
         assert_eq!(fastforward_buf_to_lnum(b"", 2), b"");
+    }
+
+    #[test]
+    fn linematch_nbuffers_no_buffers_is_empty() {
+        assert_eq!(linematch_nbuffers(&[], &[], false), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn linematch_nbuffers_both_empty_is_empty() {
+        // Two buffers with zero lines each: nothing to align.
+        assert_eq!(linematch_nbuffers(&[b"", b""], &[0, 0], false), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn linematch_nbuffers_two_identical_single_lines_align_together() {
+        // Both buffers have exactly 1 identical line - the only sensible
+        // alignment has both buffers contribute together in a single row
+        // (bit 0 and bit 1 both set = 3). Hand-traced against the
+        // algorithm's own DP recurrence before writing this assertion.
+        let decisions = linematch_nbuffers(&[b"hello\n", b"hello\n"], &[1, 1], false);
+        assert_eq!(decisions, vec![3]);
+    }
+
+    #[test]
+    fn linematch_nbuffers_one_buffer_has_no_lines() {
+        // Buffer 0 has 1 line, buffer 1 has none - the only possible
+        // decision is buffer 0 advancing alone (bit 0 only = 1).
+        let decisions = linematch_nbuffers(&[b"hello\n", b""], &[1, 0], false);
+        assert_eq!(decisions, vec![1]);
+    }
+
+    #[test]
+    fn linematch_nbuffers_two_matching_lines_each() {
+        // Both buffers have the same 2 identical lines - expect both
+        // rows to align together (buffer 0 and 1 both advancing each
+        // step).
+        let decisions = linematch_nbuffers(&[b"aaa\nbbb\n", b"aaa\nbbb\n"], &[2, 2], false);
+        assert_eq!(decisions, vec![3, 3]);
+    }
+
+    #[test]
+    fn linematch_nbuffers_three_buffers_all_identical() {
+        // 3-way comparison, all identical single lines - all 3 buffers
+        // should advance together (bits 0, 1, 2 set = 7).
+        let decisions =
+            linematch_nbuffers(&[b"same\n", b"same\n", b"same\n"], &[1, 1, 1], false);
+        assert_eq!(decisions, vec![7]);
+    }
+
+    #[test]
+    fn linematch_nbuffers_decisions_account_for_every_line() {
+        // However the lines get grouped into rows, every buffer's own
+        // line count must be exactly covered once each decision bit is
+        // tallied up across the whole returned sequence - a structural
+        // invariant that must hold for any valid input, regardless of
+        // the specific grouping chosen.
+        let diff_len = [3, 2];
+        let decisions = linematch_nbuffers(&[b"a1\na2\na3\n", b"b1\nb2\n"], &diff_len, false);
+        let mut counts = [0i32; 2];
+        for &d in &decisions {
+            for (k, count) in counts.iter_mut().enumerate() {
+                if d & (1 << k) != 0 {
+                    *count += 1;
+                }
+            }
+        }
+        assert_eq!(counts, diff_len);
     }
 }
