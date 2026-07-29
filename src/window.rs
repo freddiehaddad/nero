@@ -146,6 +146,19 @@
 //! `GLOBALS.restart_edit`/`mode_displayed`/`clear_cmdline`/`Ins`/
 //! `State`, `BufT.b_prompt_insert`).
 //!
+//! Also translated: `trigger_winnewpre`/`do_autocmd_winclosed`/
+//! `trigger_tabclosedpre` (autocmd-triggering wrappers around window/
+//! tabpage lifecycle events), via already-real
+//! `crate::autocmd::apply_autocmds`/`has_event`. `trigger_winnewpre`
+//! is a genuine, faithful no-op today (nothing can register a
+//! `WinNewPre` autocmd, matching `apply_autocmds`'s own already-real
+//! empty-registry fast path - not a stub). `do_autocmd_winclosed`/
+//! `trigger_tabclosedpre`'s own real autocmd-execution bodies
+//! `unimplemented!()` - unreachable today, since `has_event` is always
+//! false for every event - while their `recursive`-guard early returns
+//! (real, function-local C `static`s, translated as file-static
+//! `GlobalCell<bool>`s) are fully real and tested.
+//!
 //! Also translated, from `window.h` (not `window.c` - a tiny, self-
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
@@ -1916,6 +1929,62 @@ pub unsafe fn entering_window(win: *mut WinT) {
     if (g.State & crate::state_defs::mode::INSERT as i32) == 0 {
         g.restart_edit = buf.b_prompt_insert;
     }
+}
+
+/// Trigger the `WinNewPre` autocmd, wrapped in a window-layout lock
+/// (`trigger_winnewpre`). Since `apply_autocmds` is real but nothing
+/// in this crate can currently register a `WinNewPre` autocmd, this
+/// is (correctly, faithfully) a real no-op today - not a stub.
+pub fn trigger_winnewpre() {
+    window_layout_lock();
+    let _ =
+        crate::autocmd::apply_autocmds(crate::autocmd_defs::EventT::WinNewPre, None, None, false, None);
+    window_layout_unlock();
+}
+
+/// `recursive` guard for [`do_autocmd_winclosed`] (a real, function-
+/// local C `static`, matching the original exactly).
+static DO_AUTOCMD_WINCLOSED_RECURSIVE: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Trigger the `WinClosed` autocmd for `win` (`do_autocmd_winclosed`).
+/// The real autocmd-triggering body (formatting a winid string via
+/// `vim_snprintf` and calling `apply_autocmds`) is `unimplemented!()` -
+/// unreachable today, since nothing in this crate can currently
+/// register a real `WinClosed` autocmd (`has_event` is always false).
+#[allow(dead_code)]
+pub fn do_autocmd_winclosed(_win: *const WinT) {
+    // SAFETY: a plain read through one exclusive borrow.
+    let recursive = unsafe { *DO_AUTOCMD_WINCLOSED_RECURSIVE.get_mut() };
+    if recursive || !crate::autocmd::has_event(crate::autocmd_defs::EventT::WinClosed) {
+        return;
+    }
+    unimplemented!(
+        "do_autocmd_winclosed: real WinClosed autocmd execution needs vim_snprintf, \
+         unreachable today since has_event(WinClosed) is always false"
+    );
+}
+
+/// `recursive` guard for [`trigger_tabclosedpre`] (a real, function-
+/// local C `static`, matching the original exactly).
+static TRIGGER_TABCLOSEDPRE_RECURSIVE: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Trigger the `TabClosedPre` autocmd for tabpage `tp`
+/// (`trigger_tabclosedpre`). The real autocmd-triggering body (a
+/// tabpage switch via `goto_tabpage_tp`, not yet translated) is
+/// `unimplemented!()` - unreachable today, since nothing in this
+/// crate can currently register a real `TabClosedPre` autocmd
+/// (`has_event` is always false).
+#[allow(dead_code)]
+pub fn trigger_tabclosedpre(_tp: *const crate::buffer_defs::TabpageT) {
+    // SAFETY: a plain read through one exclusive borrow.
+    let recursive = unsafe { *TRIGGER_TABCLOSEDPRE_RECURSIVE.get_mut() };
+    if !crate::autocmd::has_event(crate::autocmd_defs::EventT::TabClosedPre) || recursive {
+        return;
+    }
+    unimplemented!(
+        "trigger_tabclosedpre: real TabClosedPre autocmd execution needs goto_tabpage_tp, \
+         unreachable today since has_event(TabClosedPre) is always false"
+    );
 }
 
 #[cfg(test)]
@@ -4346,6 +4415,56 @@ mod tests {
         unsafe { entering_window(win_ptr) };
 
         assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit, 7);
+    }
+
+    // ---- trigger_winnewpre / do_autocmd_winclosed / trigger_tabclosedpre ----
+
+    #[test]
+    fn trigger_winnewpre_is_a_real_no_op_since_nothing_can_register_the_autocmd() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_split = unsafe { *SPLIT_DISALLOWED.get_mut() };
+        let prev_close = unsafe { *CLOSE_DISALLOWED.get_mut() };
+
+        trigger_winnewpre(); // must not panic
+
+        // window_layout_lock/unlock leave both counters exactly as
+        // they started (one increment, one matching decrement).
+        assert_eq!(unsafe { *SPLIT_DISALLOWED.get_mut() }, prev_split);
+        assert_eq!(unsafe { *CLOSE_DISALLOWED.get_mut() }, prev_close);
+    }
+
+    #[test]
+    fn do_autocmd_winclosed_returns_early_when_recursive() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *DO_AUTOCMD_WINCLOSED_RECURSIVE.get_mut() = true };
+        do_autocmd_winclosed(std::ptr::null()); // must not panic
+        unsafe { *DO_AUTOCMD_WINCLOSED_RECURSIVE.get_mut() = false };
+    }
+
+    #[test]
+    fn do_autocmd_winclosed_returns_early_when_has_event_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *DO_AUTOCMD_WINCLOSED_RECURSIVE.get_mut() = false };
+        // WinClosed's own registry is always empty today - has_event
+        // is always false, so this must not panic.
+        do_autocmd_winclosed(std::ptr::null());
+    }
+
+    #[test]
+    fn trigger_tabclosedpre_returns_early_when_recursive() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *TRIGGER_TABCLOSEDPRE_RECURSIVE.get_mut() = true };
+        trigger_tabclosedpre(std::ptr::null()); // must not panic
+        unsafe { *TRIGGER_TABCLOSEDPRE_RECURSIVE.get_mut() = false };
+    }
+
+    #[test]
+    fn trigger_tabclosedpre_returns_early_when_has_event_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *TRIGGER_TABCLOSEDPRE_RECURSIVE.get_mut() = false };
+        // TabClosedPre's own registry is always empty today -
+        // has_event is always false, so this must not panic.
+        trigger_tabclosedpre(std::ptr::null());
     }
 
     #[test]
