@@ -6,20 +6,22 @@
 //! (`get_special_key_name`/`find_special_key_in_table`, a large
 //! generated table not transcribed here).
 //!
-//! Translated: [`name_to_mod_mask`] and [`handle_x_keys`] - both pure,
-//! self-contained lookups needing only [`crate::keycodes_defs`]'s own
-//! (partial) constant/table translations.
+//! Translated: [`name_to_mod_mask`], [`handle_x_keys`], and
+//! [`simplify_key`] - all pure, self-contained lookups needing only
+//! [`crate::keycodes_defs`]'s own (partial) constant/table
+//! translations.
 //!
-//! Deferred: everything else - `simplify_key` (needs the much larger
-//! `modifier_keys_table`, ~90 entries, not transcribed), `get_special_key`/
-//! `get_special_key_name`/`find_special_key_in_table`/`find_special_key`/
-//! `replace_termcodes`/`trans_special`/`special_to_buf` (need the full
-//! generated key-name table), `get_mouse_button` (needs `mouse.c`).
+//! Deferred: everything else - `get_special_key`/`get_special_key_name`/
+//! `find_special_key_in_table`/`find_special_key`/`replace_termcodes`/
+//! `trans_special`/`special_to_buf` (need the full generated key-name
+//! table), `get_mouse_button` (needs `mouse.c`).
 
+use crate::ascii_defs::TAB;
 use crate::keycodes_defs::{
+    key2termcap0, key2termcap1, termcap2key, MODIFIER_KEYS_TABLE, MOD_MASK_CTRL, MOD_MASK_SHIFT,
     MOD_MASK_TABLE, K_DOWN, K_END, K_F1, K_F2, K_F3, K_F4, K_HOME, K_LEFT, K_RIGHT, K_S_F1,
-    K_S_F2, K_S_F3, K_S_F4, K_S_XF1, K_S_XF2, K_S_XF3, K_S_XF4, K_UP, K_XDOWN, K_XEND, K_XF1,
-    K_XF2, K_XF3, K_XF4, K_XHOME, K_XLEFT, K_XRIGHT, K_XUP, K_ZEND, K_ZHOME,
+    K_S_F2, K_S_F3, K_S_F4, K_S_TAB, K_S_XF1, K_S_XF2, K_S_XF3, K_S_XF4, K_UP, K_XDOWN, K_XEND,
+    K_XF1, K_XF2, K_XF3, K_XF4, K_XHOME, K_XLEFT, K_XRIGHT, K_XUP, K_ZEND, K_ZHOME,
 };
 
 /// Returns the [`crate::keycodes_defs::MOD_MASK_TABLE`] modifier-mask
@@ -62,6 +64,39 @@ pub fn handle_x_keys(key: i32) -> i32 {
         K_S_XF4 => K_S_F4,
         _ => key,
     }
+}
+
+/// Simplifies `key` + `*modifiers` into a single combined key code when
+/// there's a dedicated termcap code for that specific
+/// key-plus-one-modifier combination, clearing the now-redundant
+/// modifier bit from `*modifiers` (`simplify_key`). Returns `key`
+/// unchanged (and leaves `*modifiers` untouched) if no such combination
+/// applies.
+///
+/// TAB + Shift is a special case with its own dedicated check (matching
+/// the original) since `TAB`'s own plain ASCII value isn't itself a
+/// `termcap2key`-encoded "special key", unlike every other entry in
+/// [`MODIFIER_KEYS_TABLE`].
+pub fn simplify_key(key: i32, modifiers: &mut i32) -> i32 {
+    if *modifiers & i32::from(MOD_MASK_SHIFT | MOD_MASK_CTRL) == 0 {
+        return key;
+    }
+
+    // TAB is a special case.
+    if key == i32::from(TAB) && *modifiers & i32::from(MOD_MASK_SHIFT) != 0 {
+        *modifiers &= !i32::from(MOD_MASK_SHIFT);
+        return K_S_TAB;
+    }
+
+    let key0 = key2termcap0(key);
+    let key1 = key2termcap1(key);
+    for &(mod_mask, with0, with1, without0, without1) in MODIFIER_KEYS_TABLE {
+        if key0 == without0 && key1 == without1 && *modifiers & i32::from(mod_mask) != 0 {
+            *modifiers &= !i32::from(mod_mask);
+            return termcap2key(with0, with1);
+        }
+    }
+    key
 }
 
 #[cfg(test)]
@@ -130,5 +165,52 @@ mod tests {
     fn handle_x_keys_leaves_unrelated_keys_unchanged() {
         assert_eq!(handle_x_keys(K_UP), K_UP);
         assert_eq!(handle_x_keys(42), 42);
+    }
+
+    #[test]
+    fn simplify_key_returns_key_unchanged_without_shift_or_ctrl() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_ALT);
+        assert_eq!(simplify_key(K_UP, &mut modifiers), K_UP);
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_ALT));
+    }
+
+    #[test]
+    fn simplify_key_tab_plus_shift_is_a_special_case() {
+        let mut modifiers = i32::from(MOD_MASK_SHIFT);
+        assert_eq!(simplify_key(i32::from(TAB), &mut modifiers), crate::keycodes_defs::K_S_TAB);
+        // The Shift bit is consumed - now folded into K_S_TAB itself.
+        assert_eq!(modifiers, 0);
+    }
+
+    #[test]
+    fn simplify_key_folds_ctrl_left_arrow() {
+        let mut modifiers = i32::from(MOD_MASK_CTRL);
+        assert_eq!(simplify_key(K_LEFT, &mut modifiers), crate::keycodes_defs::K_C_LEFT);
+        assert_eq!(modifiers, 0);
+    }
+
+    #[test]
+    fn simplify_key_folds_shift_up_arrow() {
+        let mut modifiers = i32::from(MOD_MASK_SHIFT);
+        assert_eq!(simplify_key(K_UP, &mut modifiers), crate::keycodes_defs::K_S_UP);
+        assert_eq!(modifiers, 0);
+    }
+
+    #[test]
+    fn simplify_key_preserves_other_modifier_bits_when_folding() {
+        // ALT should survive being combined with a Ctrl-Left fold.
+        let mut modifiers = i32::from(MOD_MASK_CTRL) | i32::from(crate::keycodes_defs::MOD_MASK_ALT);
+        assert_eq!(simplify_key(K_LEFT, &mut modifiers), crate::keycodes_defs::K_C_LEFT);
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_ALT));
+    }
+
+    #[test]
+    fn simplify_key_no_matching_table_entry_leaves_everything_unchanged() {
+        // K_F1 (a plain, un-simplifiable function key with no combined
+        // Ctrl form in the table) with Ctrl set: no match, nothing
+        // changes.
+        let mut modifiers = i32::from(MOD_MASK_CTRL);
+        assert_eq!(simplify_key(K_F1, &mut modifiers), K_F1);
+        assert_eq!(modifiers, i32::from(MOD_MASK_CTRL));
     }
 }

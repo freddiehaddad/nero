@@ -67,6 +67,46 @@ pub const KE_S_XF1: u8 = 71;
 pub const KE_S_XF2: u8 = 72;
 pub const KE_S_XF3: u8 = 73;
 pub const KE_S_XF4: u8 = 74;
+pub const KE_S_UP: u8 = 4;
+pub const KE_S_DOWN: u8 = 5;
+pub const KE_S_F5: u8 = 10;
+pub const KE_S_F6: u8 = 11;
+pub const KE_S_F7: u8 = 12;
+pub const KE_S_F8: u8 = 13;
+pub const KE_S_F9: u8 = 14;
+pub const KE_S_F10: u8 = 15;
+pub const KE_S_F11: u8 = 16;
+pub const KE_S_F12: u8 = 17;
+pub const KE_S_F13: u8 = 18;
+pub const KE_S_F14: u8 = 19;
+pub const KE_S_F15: u8 = 20;
+pub const KE_S_F16: u8 = 21;
+pub const KE_S_F17: u8 = 22;
+pub const KE_S_F18: u8 = 23;
+pub const KE_S_F19: u8 = 24;
+pub const KE_S_F20: u8 = 25;
+pub const KE_S_F21: u8 = 26;
+pub const KE_S_F22: u8 = 27;
+pub const KE_S_F23: u8 = 28;
+pub const KE_S_F24: u8 = 29;
+pub const KE_S_F25: u8 = 30;
+pub const KE_S_F26: u8 = 31;
+pub const KE_S_F27: u8 = 32;
+pub const KE_S_F28: u8 = 33;
+pub const KE_S_F29: u8 = 34;
+pub const KE_S_F30: u8 = 35;
+pub const KE_S_F31: u8 = 36;
+pub const KE_S_F32: u8 = 37;
+pub const KE_S_F33: u8 = 38;
+pub const KE_S_F34: u8 = 39;
+pub const KE_S_F35: u8 = 40;
+pub const KE_S_F36: u8 = 41;
+pub const KE_S_F37: u8 = 42;
+pub const KE_TAB: u8 = 54;
+pub const KE_C_LEFT: u8 = 85;
+pub const KE_C_RIGHT: u8 = 86;
+pub const KE_C_HOME: u8 = 87;
+pub const KE_C_END: u8 = 88;
 
 /// arrow/function/home/end key codes (`K_UP`/`K_DOWN`/etc.) - a subset
 /// of the original's much larger `K_*` constant list, matching the
@@ -101,6 +141,12 @@ pub const K_S_XF1: i32 = termcap2key(KS_EXTRA, KE_S_XF1);
 pub const K_S_XF2: i32 = termcap2key(KS_EXTRA, KE_S_XF2);
 pub const K_S_XF3: i32 = termcap2key(KS_EXTRA, KE_S_XF3);
 pub const K_S_XF4: i32 = termcap2key(KS_EXTRA, KE_S_XF4);
+pub const K_S_UP: i32 = termcap2key(KS_EXTRA, KE_S_UP);
+pub const K_S_DOWN: i32 = termcap2key(KS_EXTRA, KE_S_DOWN);
+pub const K_C_LEFT: i32 = termcap2key(KS_EXTRA, KE_C_LEFT);
+pub const K_C_RIGHT: i32 = termcap2key(KS_EXTRA, KE_C_RIGHT);
+pub const K_C_HOME: i32 = termcap2key(KS_EXTRA, KE_C_HOME);
+pub const K_C_END: i32 = termcap2key(KS_EXTRA, KE_C_END);
 
 /// Bit-mask/bit-value pairs for key modifiers (`MOD_MASK_*`).
 pub const MOD_MASK_SHIFT: u16 = 0x02;
@@ -150,6 +196,104 @@ pub const MOD_MASK_TABLE: &[ModMaskEntry] = &[
     ModMaskEntry { mod_mask: MOD_MASK_ALT, mod_flag: MOD_MASK_ALT, name: b'A' },
 ];
 
+/// Shifted TAB (`K_S_TAB`).
+pub const K_S_TAB: i32 = termcap2key(b'k', b'B');
+
+/// One entry of [`MODIFIER_KEYS_TABLE`]: an unmodified key that has its
+/// own dedicated termcap code when combined with a specific single
+/// modifier (the original's flat 5-`uint8_t` grouping,
+/// `MOD_KEYS_ENTRY_SIZE`): `(mod_mask, with_modifier0, with_modifier1,
+/// without_modifier0, without_modifier1)`. A plain tuple is used rather
+/// than a named struct, matching the original's own flat/positional
+/// array shape closely given its sheer size (75 entries).
+pub type ModifierKeyEntry = (u16, u8, u8, u8, u8);
+
+/// `modifier_keys_table` - shifted/ctrl'd terminal codes and their
+/// unshifted equivalent, used by `simplify_key` to fold a separate
+/// modifier bit into a single combined key code when the terminal (or
+/// this crate's own key-encoding) has a dedicated code for that
+/// combination. Mouse codes are handled separately (not listed here,
+/// matching the original's own comment).
+pub const MODIFIER_KEYS_TABLE: &[ModifierKeyEntry] = &[
+    (MOD_MASK_SHIFT, b'&', b'9', b'@', b'1'), // begin
+    (MOD_MASK_SHIFT, b'&', b'0', b'@', b'2'), // cancel
+    (MOD_MASK_SHIFT, b'*', b'1', b'@', b'4'), // command
+    (MOD_MASK_SHIFT, b'*', b'2', b'@', b'5'), // copy
+    (MOD_MASK_SHIFT, b'*', b'3', b'@', b'6'), // create
+    (MOD_MASK_SHIFT, b'*', b'4', b'k', b'D'), // delete char
+    (MOD_MASK_SHIFT, b'*', b'5', b'k', b'L'), // delete line
+    (MOD_MASK_SHIFT, b'*', b'7', b'@', b'7'), // end
+    (MOD_MASK_CTRL, KS_EXTRA, KE_C_END, b'@', b'7'), // end
+    (MOD_MASK_SHIFT, b'*', b'9', b'@', b'9'), // exit
+    (MOD_MASK_SHIFT, b'*', b'0', b'@', b'0'), // find
+    (MOD_MASK_SHIFT, b'#', b'1', b'%', b'1'), // help
+    (MOD_MASK_SHIFT, b'#', b'2', b'k', b'h'), // home
+    (MOD_MASK_CTRL, KS_EXTRA, KE_C_HOME, b'k', b'h'), // home
+    (MOD_MASK_SHIFT, b'#', b'3', b'k', b'I'), // insert
+    (MOD_MASK_SHIFT, b'#', b'4', b'k', b'l'), // left arrow
+    (MOD_MASK_CTRL, KS_EXTRA, KE_C_LEFT, b'k', b'l'), // left arrow
+    (MOD_MASK_SHIFT, b'%', b'a', b'%', b'3'), // message
+    (MOD_MASK_SHIFT, b'%', b'b', b'%', b'4'), // move
+    (MOD_MASK_SHIFT, b'%', b'c', b'%', b'5'), // next
+    (MOD_MASK_SHIFT, b'%', b'd', b'%', b'7'), // options
+    (MOD_MASK_SHIFT, b'%', b'e', b'%', b'8'), // previous
+    (MOD_MASK_SHIFT, b'%', b'f', b'%', b'9'), // print
+    (MOD_MASK_SHIFT, b'%', b'g', b'%', b'0'), // redo
+    (MOD_MASK_SHIFT, b'%', b'h', b'&', b'3'), // replace
+    (MOD_MASK_SHIFT, b'%', b'i', b'k', b'r'), // right arr.
+    (MOD_MASK_CTRL, KS_EXTRA, KE_C_RIGHT, b'k', b'r'), // right arr.
+    (MOD_MASK_SHIFT, b'%', b'j', b'&', b'5'), // resume
+    (MOD_MASK_SHIFT, b'!', b'1', b'&', b'6'), // save
+    (MOD_MASK_SHIFT, b'!', b'2', b'&', b'7'), // suspend
+    (MOD_MASK_SHIFT, b'!', b'3', b'&', b'8'), // undo
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_UP, b'k', b'u'), // up arrow
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_DOWN, b'k', b'd'), // down arrow
+    // vt100 F1-F4
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_XF1, KS_EXTRA, KE_XF1),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_XF2, KS_EXTRA, KE_XF2),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_XF3, KS_EXTRA, KE_XF3),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_XF4, KS_EXTRA, KE_XF4),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F1, b'k', b'1'), // F1
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F2, b'k', b'2'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F3, b'k', b'3'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F4, b'k', b'4'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F5, b'k', b'5'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F6, b'k', b'6'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F7, b'k', b'7'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F8, b'k', b'8'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F9, b'k', b'9'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F10, b'k', b';'), // F10
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F11, b'F', b'1'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F12, b'F', b'2'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F13, b'F', b'3'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F14, b'F', b'4'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F15, b'F', b'5'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F16, b'F', b'6'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F17, b'F', b'7'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F18, b'F', b'8'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F19, b'F', b'9'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F20, b'F', b'A'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F21, b'F', b'B'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F22, b'F', b'C'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F23, b'F', b'D'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F24, b'F', b'E'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F25, b'F', b'F'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F26, b'F', b'G'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F27, b'F', b'H'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F28, b'F', b'I'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F29, b'F', b'J'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F30, b'F', b'K'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F31, b'F', b'L'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F32, b'F', b'M'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F33, b'F', b'N'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F34, b'F', b'O'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F35, b'F', b'P'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F36, b'F', b'Q'),
+    (MOD_MASK_SHIFT, KS_EXTRA, KE_S_F37, b'F', b'R'),
+    // TAB pseudo code
+    (MOD_MASK_SHIFT, b'k', b'B', KS_EXTRA, KE_TAB),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +317,19 @@ mod tests {
         // is a real, meaningful modifier mapping.
         assert_eq!(MOD_MASK_TABLE.len(), 9);
         assert!(MOD_MASK_TABLE.iter().all(|e| e.mod_flag != 0));
+    }
+
+    #[test]
+    fn modifier_keys_table_has_75_entries() {
+        // Hand-counted from the original's own modifier_keys_table
+        // initializer (32 named entries + 4 vt100 F1-4 + 33 F1-F37
+        // shifted function keys + 1 TAB pseudo-entry = 75), with no
+        // NUL-sentinel entry needed here.
+        assert_eq!(MODIFIER_KEYS_TABLE.len(), 75);
+    }
+
+    #[test]
+    fn modifier_keys_table_entries_have_a_nonzero_mod_mask() {
+        assert!(MODIFIER_KEYS_TABLE.iter().all(|&(mod_mask, ..)| mod_mask != 0));
     }
 }
