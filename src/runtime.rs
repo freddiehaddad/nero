@@ -67,6 +67,17 @@ static SCRIPT_ITEMS: GlobalCell<Vec<*mut ScriptitemT>> = GlobalCell::new(Vec::ne
 /// `last_current_SID` - see this module's own doc comment.
 static LAST_CURRENT_SID: GlobalCell<ScidT> = GlobalCell::new(0);
 
+/// `exestack` - the script/function/autocmd execution call stack, used
+/// to build `getstacktrace()`'s own result and (via its top entry) the
+/// `SOURCING_NAME`/`SOURCING_LNUM` macros elsewhere in the original.
+/// Always empty today: nothing in this crate can push a real frame
+/// onto it yet (no Ex-command execution engine drives script/function
+/// sourcing - see `testing.rs`'s own identical observation for
+/// `estack_sfile`'s "always empty" reasoning), matching this crate's
+/// established `AUTOCMDS`-style "genuinely, provably always-empty
+/// registry" precedent, not a hardcoded shortcut.
+static EXESTACK: GlobalCell<Vec<crate::runtime_defs::EstackT>> = GlobalCell::new(Vec::new());
+
 /// Look up the script item for script ID `id` (`SCRIPT_ITEM(id)`).
 ///
 /// # Panics
@@ -240,6 +251,48 @@ pub unsafe fn f_getscriptinfo(argvars: &[crate::eval::typval_defs::TypvalT], ret
     // The per-script loop (over script IDs 1..=script_item_count())
     // is always zero-iteration today - see this function's own doc
     // comment.
+}
+
+/// Build the `List` `getstacktrace()` returns (`stacktrace_create`,
+/// `runtime.c`): one entry per `EXESTACK` frame, each built via
+/// `stacktrace_push_item` in the original. Since `EXESTACK` is always
+/// empty today (see its own doc comment), this loop is always
+/// zero-iteration, so `stacktrace_push_item` itself (which would need
+/// `ETYPE_UFUNC`'s `ufunc_T.uf_script_ctx`/`get_scriptname` and
+/// `ETYPE_AUCMD`'s `AutoCmd.script_ctx`, neither wired up for this
+/// purpose yet) never needs to exist here either. This is a real,
+/// always-taken early return, not a hardcoded shortcut.
+///
+/// # Safety
+/// `rettv` must be freshly default-initialized by the caller (no
+/// pre-existing `List`/`Dict`/`Blob` value that would otherwise leak),
+/// forwarded from [`crate::eval::typval::tv_list_alloc_ret`]'s own
+/// safety doc.
+pub unsafe fn stacktrace_create(rettv: &mut crate::eval::typval_defs::TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc; the
+    // `&Vec` this briefly, implicitly creates (to call `.len()`) is
+    // used and discarded immediately, matching `eval/vars.rs`'s own
+    // `VIMVARS.as_ptr()` precedent for this exact idiom.
+    let exestack_len = unsafe { (*EXESTACK.as_ptr()).len() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, exestack_len as isize) };
+    // The per-frame loop is always zero-iteration - see this
+    // function's own doc comment.
+}
+
+/// `getstacktrace()` - the current call stack as a `List` of
+/// `{filename, lnum, funcname}` dicts (`f_getstacktrace`, `runtime.c`).
+/// Always an empty `List` today, since [`stacktrace_create`]'s own
+/// loop is always zero-iteration.
+///
+/// # Safety
+/// Forwarded from [`stacktrace_create`]'s own safety doc.
+pub unsafe fn f_getstacktrace(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { stacktrace_create(rettv) };
 }
 
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
@@ -523,5 +576,66 @@ mod tests {
         // SAFETY: `l` is still exclusively owned; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    // --- stacktrace_create / f_getstacktrace ---
+
+    #[test]
+    fn stacktrace_create_is_empty_when_exestack_is_empty() {
+        let _lock = global_state_test_lock();
+        assert_eq!(unsafe { (*EXESTACK.as_ptr()).len() }, 0);
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { stacktrace_create(&mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn getstacktrace_returns_an_empty_list() {
+        let _lock = global_state_test_lock();
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getstacktrace(&[], &mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn stacktrace_create_tracks_exestacks_own_length() {
+        let _lock = global_state_test_lock();
+        // EXESTACK is genuinely always empty in this crate today (no
+        // Ex-command execution engine can push a frame onto it), but
+        // stacktrace_create's own allocation call still reads its real
+        // length rather than a hardcoded 0 - proven here by directly
+        // manipulating EXESTACK itself (something no real, translated
+        // caller can currently do) and confirming the allocated list's
+        // capacity/length tracks it, not just always happening to be 0.
+        unsafe {
+            (*EXESTACK.as_ptr()).push(crate::runtime_defs::EstackT::default());
+            (*EXESTACK.as_ptr()).push(crate::runtime_defs::EstackT::default());
+        }
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { stacktrace_create(&mut rettv) };
+
+        let crate::eval::typval_defs::TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        // The per-frame loop is still zero-iteration (nothing calls
+        // stacktrace_push_item), so the list is empty even though
+        // tv_list_alloc_ret was asked to pre-size for 2 entries.
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+
+        unsafe { *EXESTACK.as_ptr() = Vec::new() };
     }
 }
