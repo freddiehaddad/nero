@@ -43,6 +43,12 @@
 //! (none of `winfloat.c`/`move.c`/`window.c`'s own diff-aware
 //! scroll-binding callers are translated yet).
 //!
+//! Also translated: [`diff_infold`] - its own `idx`/`other`-computing
+//! loop over `tp_diffbuf[]` is real, complete logic (not stubbed),
+//! since it only reads already-real fields; only its OWN early-return
+//! condition (`idx == -1 || !other`) happens to always be taken today,
+//! for the same underlying reason as the functions above.
+//!
 //! Deferred: everything else in the file - real diff computation/
 //! display/navigation, needing the internal xdiff algorithm or
 //! external `diff` process invocation, neither translated.
@@ -324,6 +330,52 @@ pub unsafe fn diff_lnum_win(
         "diff::diff_lnum_win: the real diff-block search is not yet translated - unreachable \
          in practice today since diff_buf_idx always returns DB_COUNT, see this module's own \
          doc comment"
+    );
+}
+
+/// Return `true` if `lnum` in window `wp` is hidden by folding due to
+/// a closed diff (`diff_infold`).
+///
+/// The "does this window's own buffer appear in `tp_diffbuf[]`, and is
+/// there at least one OTHER real diff buffer too" loop is translated
+/// in full (not stubbed) - it's genuine, self-contained logic over
+/// already-real fields, faithfully correct for any future test that
+/// manually populates `tp_diffbuf`. Its own early return (`idx == -1 ||
+/// !other`) is always taken today (nothing in this crate can currently
+/// register a buffer in `tp_diffbuf`, so `idx` always stays `-1`). The
+/// real diff-block search beyond that point is `unimplemented!()`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curtab` must be a valid, non-null pointer
+/// to a live [`crate::buffer_defs::TabpageT`].
+#[must_use]
+pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
+    // Return if 'diff' isn't set.
+    if wp.w_onebuf_opt.wo_diff == 0 {
+        return false;
+    }
+
+    let mut idx: i32 = -1;
+    let mut other = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { &*crate::globals::GLOBALS.get_mut().curtab };
+    for (i, &b) in curtab.tp_diffbuf.iter().enumerate() {
+        if b == wp.w_buffer {
+            idx = i32::try_from(i).expect("DB_COUNT is small, always fits in an i32");
+        } else if !b.is_null() {
+            other = true;
+        }
+    }
+
+    // return here if there are no diffs in the window
+    if idx == -1 || !other {
+        return false;
+    }
+
+    unimplemented!(
+        "diff::diff_infold: the real diff-block search is not yet translated - unreachable in \
+         practice today since idx==-1 is always true (nothing can register a buffer in \
+         tp_diffbuf), see this module's own doc comment"
     );
 }
 
@@ -630,5 +682,67 @@ mod tests {
 
         let mut wp = WinT::default();
         assert_eq!(unsafe { diff_lnum_win(5, &mut wp as *mut WinT) }, 0);
+    }
+
+    #[test]
+    fn diff_infold_false_when_diff_option_is_off() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let wp = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_diff: 0, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!unsafe { diff_infold(&wp, 1) });
+    }
+
+    #[test]
+    fn diff_infold_false_when_window_buffer_is_not_registered() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let wp = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!unsafe { diff_infold(&wp, 1) });
+    }
+
+    #[test]
+    fn diff_infold_false_when_no_other_buffer_is_registered() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = buf_ptr;
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let wp = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        assert!(!unsafe { diff_infold(&wp, 1) });
+    }
+
+    #[test]
+    #[should_panic(expected = "the real diff-block search is not yet translated")]
+    fn diff_infold_panics_when_both_idx_and_other_are_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = BufT::default();
+        let mut buf2 = BufT::default();
+        let buf1_ptr = &mut buf1 as *mut BufT;
+        let buf2_ptr = &mut buf2 as *mut BufT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = buf1_ptr;
+        tp.tp_diffbuf[1] = buf2_ptr;
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let wp = WinT {
+            w_buffer: buf1_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_diff: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let _ = unsafe { diff_infold(&wp, 1) };
     }
 }
