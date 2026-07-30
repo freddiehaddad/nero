@@ -13,8 +13,9 @@
 //! `"internal,filler,closeoff,indent-heuristic,inline:char,
 //! linematch:40"` - `indent-heuristic`/`linematch:40` affect other,
 //! not-yet-translated file-statics, not `diff_flags` itself), the
-//! `DIFF_*` flag constants, [`diffopt_filler`]/[`diffopt_closeoff`]
-//! (pure bit tests); and [`diff_check_with_linestatus`]/
+//! `DIFF_*` flag constants, [`diffopt_filler`]/[`diffopt_closeoff`]/
+//! [`diffopt_horizontal`]/[`diffopt_hiddenoff`] (pure bit tests);
+//! [`diff_check_with_linestatus`]/
 //! [`diff_check_fill`] - real, faithful translations of their "no
 //! diffs at all in this tab page" early-return path (`curtab.
 //! tp_first_diff.is_null()`, always true today since nothing in this
@@ -25,7 +26,13 @@
 //! path). The `curtab.tp_diff_invalid` check (which would call the
 //! substantial, untranslated `ex_diffupdate`) is ALSO always false
 //! today (nothing sets it), so it's checked for real too rather than
-//! assumed away.
+//! assumed away; and `diff_buf_idx`/[`diff_mode_buf`] - `diff_buf_idx`
+//! is a plain linear scan through `TabpageT.tp_diffbuf[]` (already a
+//! real field), and `diff_mode_buf` walks every tabpage via
+//! `GLOBALS.first_tabpage`/`tp_next` (the same walk already
+//! established by `window.rs`'s `win_valid_any_tab`) - genuinely
+//! COMPLETE translations, not fast-path-only, since nothing about
+//! either depends on a real diff actually existing.
 //!
 //! Deferred: everything else in the file - real diff computation/
 //! display/navigation, needing the internal xdiff algorithm or
@@ -97,6 +104,20 @@ pub fn diffopt_filler() -> bool {
     (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::FILLER != 0
 }
 
+/// Return `true` if `'diffopt'` contains `"horizontal"`
+/// (`diffopt_horizontal`).
+#[must_use]
+pub fn diffopt_horizontal() -> bool {
+    (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::HORIZONTAL != 0
+}
+
+/// Return `true` if `'diffopt'` contains `"hiddenoff"`
+/// (`diffopt_hiddenoff`).
+#[must_use]
+pub fn diffopt_hiddenoff() -> bool {
+    (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::HIDDEN_OFF != 0
+}
+
 /// Return the diff status of `lnum` in window `wp`'s buffer,
 /// optionally reporting a line-status code via `linestatus`
 /// (`diff_check_with_linestatus`). This should only be used for
@@ -104,12 +125,13 @@ pub fn diffopt_filler() -> bool {
 ///
 /// Only the "no diffs at all in this tab page" early-return path is
 /// translated (see this module's own doc comment) - the real diff-
-/// hunk search (`diff_buf_idx`/the `tp_first_diff` linked-list walk)
-/// is `unimplemented!()`, unreachable in practice today since nothing
-/// in this crate can create a diff. `lnum` is accepted for signature
-/// fidelity (the real function's own later "lnum must be a buffer
-/// line" safety check, and the diff-hunk search itself, both need it)
-/// but genuinely unused by the early-return path translated here.
+/// hunk search (the `tp_first_diff` linked-list walk, now using the
+/// already-real `diff_buf_idx`) is `unimplemented!()`, unreachable
+/// in practice today since nothing in this crate can create a diff.
+/// `lnum` is accepted for signature fidelity (the real function's own
+/// later "lnum must be a buffer line" safety check, and the diff-hunk
+/// search itself, both need it) but genuinely unused by the
+/// early-return path translated here.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curtab` must be a valid, non-null pointer
@@ -165,9 +187,48 @@ pub unsafe fn diff_check_fill(wp: &WinT, lnum: crate::pos_defs::LinenrT) -> i32 
     n.max(0)
 }
 
+/// Return the index of `buf` in `tp`'s `tp_diffbuf[]` array, or
+/// [`crate::buffer_defs::DB_COUNT`] if `buf` isn't currently
+/// registered there (`diff_buf_idx`).
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live
+/// [`crate::buffer_defs::TabpageT`].
+fn diff_buf_idx(buf: *mut crate::buffer_defs::BufT, tp: *mut crate::buffer_defs::TabpageT) -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let tp = unsafe { &*tp };
+    tp.tp_diffbuf
+        .iter()
+        .position(|&b| b == buf)
+        .unwrap_or(crate::buffer_defs::DB_COUNT)
+}
+
+/// Return `true` if `buf` is being diffed in any tab page
+/// (`diff_mode_buf`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage` must be null or a valid
+/// pointer to a live [`crate::buffer_defs::TabpageT`], and every
+/// tabpage transitively reachable through `tp_next` from there must
+/// likewise be valid.
+#[must_use]
+pub unsafe fn diff_mode_buf(buf: *mut crate::buffer_defs::BufT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        if diff_buf_idx(buf, tp) != crate::buffer_defs::DB_COUNT {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_defs::BufT;
 
     #[test]
     fn diff_flags_default_matches_the_real_diffopt_default() {
@@ -211,6 +272,41 @@ mod tests {
         let prev = unsafe { *DIFF_FLAGS.get_mut() };
         unsafe { *DIFF_FLAGS.get_mut() &= !diff_flag::FILLER };
         assert!(!diffopt_filler());
+        unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    #[test]
+    fn diffopt_horizontal_false_by_default() {
+        // "horizontal" is NOT part of the real 'diffopt' default
+        // string - see diff_flags_default_matches_the_real_diffopt_
+        // default's own comment for why this lock is required.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!diffopt_horizontal());
+    }
+
+    #[test]
+    fn diffopt_horizontal_true_when_flag_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *DIFF_FLAGS.get_mut() };
+        unsafe { *DIFF_FLAGS.get_mut() |= diff_flag::HORIZONTAL };
+        assert!(diffopt_horizontal());
+        unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    #[test]
+    fn diffopt_hiddenoff_false_by_default() {
+        // "hiddenoff" is NOT part of the real 'diffopt' default
+        // string either - same locking rationale as above.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!diffopt_hiddenoff());
+    }
+
+    #[test]
+    fn diffopt_hiddenoff_true_when_flag_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *DIFF_FLAGS.get_mut() };
+        unsafe { *DIFF_FLAGS.get_mut() |= diff_flag::HIDDEN_OFF };
+        assert!(diffopt_hiddenoff());
         unsafe { *DIFF_FLAGS.get_mut() = prev };
     }
 
@@ -298,5 +394,73 @@ mod tests {
         let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
         let wp = WinT::default();
         let _ = unsafe { diff_check_with_linestatus(&wp, 1, None) };
+    }
+
+    #[test]
+    fn diff_buf_idx_finds_a_registered_buffer() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[2] = buf_ptr;
+        assert_eq!(diff_buf_idx(buf_ptr, &mut tp as *mut crate::buffer_defs::TabpageT), 2);
+    }
+
+    #[test]
+    fn diff_buf_idx_returns_db_count_when_not_registered() {
+        let mut buf = BufT::default();
+        let mut other = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut other as *mut BufT;
+        assert_eq!(
+            diff_buf_idx(&mut buf as *mut BufT, &mut tp as *mut crate::buffer_defs::TabpageT),
+            crate::buffer_defs::DB_COUNT
+        );
+    }
+
+    /// Points `GLOBALS.first_tabpage` at `head` for the guard's
+    /// lifetime, restoring the previous value on drop. Callers must
+    /// hold `global_state_test_lock()` for the guard's whole lifetime.
+    struct FirstTabpageGuard {
+        previous: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl FirstTabpageGuard {
+        fn set(head: *mut crate::buffer_defs::TabpageT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+            unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = head;
+            FirstTabpageGuard { previous }
+        }
+    }
+
+    impl Drop for FirstTabpageGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = self.previous;
+        }
+    }
+
+    #[test]
+    fn diff_mode_buf_true_when_registered_in_a_non_first_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut tp2 = crate::buffer_defs::TabpageT::default();
+        tp2.tp_diffbuf[0] = buf_ptr;
+        let mut tp1 = crate::buffer_defs::TabpageT {
+            tp_next: &mut tp2 as *mut crate::buffer_defs::TabpageT,
+            ..Default::default()
+        };
+        let _guard = FirstTabpageGuard::set(&mut tp1 as *mut crate::buffer_defs::TabpageT);
+
+        assert!(unsafe { diff_mode_buf(buf_ptr) });
+    }
+
+    #[test]
+    fn diff_mode_buf_false_when_not_registered_anywhere() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        assert!(!unsafe { diff_mode_buf(&mut buf as *mut BufT) });
     }
 }
