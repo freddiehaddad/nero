@@ -911,6 +911,35 @@ pub enum OptIndex {
 /// Always update alongside [`OptIndex`] (`kOptCount`).
 pub const OPT_COUNT: usize = 377;
 
+impl OptIndex {
+    /// Converts a raw `0..OPT_COUNT` index back into its corresponding
+    /// [`OptIndex`] variant, or `None` if out of range (including
+    /// `OptIndex::Invalid`'s own `-1` discriminant, which is never a
+    /// valid forward index). Used by [`crate::option::get_winbuf_options`]'s
+    /// own `for (OptIndex opt_idx = 0; opt_idx < kOptCount; opt_idx++)`
+    /// loop, the first real caller needing to iterate every option.
+    ///
+    /// Sound because `OptIndex` is `#[repr(i32)]` with EVERY
+    /// discriminant from `0` to `OPT_COUNT - 1` assigned to exactly
+    /// one real variant, with no gaps - already mechanically verified
+    /// when this enum was first transcribed (see this enum's own doc
+    /// comment history), and re-confirmed here by the `debug_assert!`
+    /// below (checked in every debug/test build, not just trusted).
+    #[must_use]
+    pub fn from_index(idx: usize) -> Option<Self> {
+        if idx >= OPT_COUNT {
+            return None;
+        }
+        // SAFETY: `idx < OPT_COUNT` was just checked above, and every
+        // integer in `0..OPT_COUNT` is a genuine, valid `OptIndex`
+        // discriminant (mechanically verified, see this function's
+        // own doc comment).
+        let result = unsafe { std::mem::transmute::<i32, OptIndex>(idx as i32) };
+        debug_assert_eq!(result as usize, idx, "OptIndex discriminant must equal its own index");
+        Some(result)
+    }
+}
+
 /// Subset of [`OptIndex`] for options that have a global value
 /// (`GlobalOptIndex`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8178,5 +8207,27 @@ mod options_table_tests {
         let opts = unsafe { OPTIONS.get_mut() };
         assert!(opts.iter().all(|o| o.opt_did_set_cb.is_none()));
         assert!(opts.iter().all(|o| o.opt_expand_cb.is_none()));
+    }
+
+    #[test]
+    fn opt_index_from_index_round_trips_every_valid_index() {
+        for idx in 0..OPT_COUNT {
+            let opt_idx = OptIndex::from_index(idx).unwrap_or_else(|| {
+                panic!("from_index({idx}) unexpectedly returned None")
+            });
+            assert_eq!(opt_idx as usize, idx);
+        }
+    }
+
+    #[test]
+    fn opt_index_from_index_matches_known_entries() {
+        assert_eq!(OptIndex::from_index(0), Some(OptIndex::Aleph));
+        assert_eq!(OptIndex::from_index(376), Some(OptIndex::Writedelay));
+    }
+
+    #[test]
+    fn opt_index_from_index_out_of_range_is_none() {
+        assert_eq!(OptIndex::from_index(OPT_COUNT), None);
+        assert_eq!(OptIndex::from_index(OPT_COUNT + 100), None);
     }
 }

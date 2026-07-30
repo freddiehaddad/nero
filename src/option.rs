@@ -150,9 +150,11 @@
 //!   crate returns a fixed placeholder string instead, since nothing
 //!   here displays it to a real user yet (see `check_num_option_
 //!   bounds`'s own doc comment for the full reasoning).
-//! - `was_set_insecurely`/`insecure_flag` still need `OPTIONS[idx]
-//!   .flags`'s own `WAS_SET`/`INSECURE` bits threaded through a real
-//!   `:set` call site to have any meaningful test value.
+//! - `was_set_insecurely`/`insecure_flag` are now translated too (see
+//!   below) - `insecure_flag` returns a real `*mut u32` into the
+//!   correct `WAS_SET`/`INSECURE`-bit-bearing storage (global, or a
+//!   local override when one exists), and `was_set_insecurely` simply
+//!   checks the `INSECURE` bit through it.
 //! - `option_was_set`/`reset_option_was_set` are now translated too
 //!   (see below) - via a dedicated `OPTION_WAS_SET` side-table rather
 //!   than mutating `OPTIONS[idx].flags` directly (see
@@ -161,12 +163,16 @@
 //!   (`nvim_create_namespace`/`get_decor_provider`/`syn_check_group`/
 //!   `ns_hl_def`).
 //! - `do_set`/`ex_set`'s command-line parsing itself, plus
-//!   `get_winbuf_options`/`get_vimoption`/etc. (everything needing the
-//!   full parsed-`:set`-argument machinery, not just a resolved
-//!   storage address and a read/write).
+//!   `get_vimoption`/etc. (everything needing the full parsed-`:set`-
+//!   argument machinery, not just a resolved storage address and a
+//!   read/write). `get_winbuf_options` (below) does NOT need any of
+//!   this, though - it only needs a resolved storage address per
+//!   option (`get_varp`) plus the already-real `optval_from_varp`/
+//!   `optval_as_tv`/`tv_dict_add_tv`, so it is translated here despite
+//!   `do_set` itself still being deferred.
 
 use crate::buffer_defs::{BufT, WinT};
-use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS};
+use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS, OPT_COUNT};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
 use crate::types_defs::{OptInt, TriState};
 use std::ffi::c_void;
@@ -1240,6 +1246,57 @@ pub unsafe fn get_varp(opt_idx: OptIndex) -> *mut c_void {
     let globals = unsafe { crate::globals::GLOBALS.get_mut() };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { get_varp_from(opt_idx, globals.curbuf, globals.curwin) }
+}
+
+/// Get every buffer-local (`bufopt == true`) or window-local
+/// (`bufopt == false`) option's current effective value, as a real
+/// `name -> value` `Dict` (`get_winbuf_options`) - the current
+/// buffer's/window's own local option values, used by (in the
+/// original) `getbufvar()`/`getwinvar()`'s bare `"&"` (whole-options-
+/// dict) argument form.
+///
+/// # Safety
+/// Forwarded from [`get_varp`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_winbuf_options(bufopt: bool) -> *mut crate::eval::typval_defs::DictT {
+    let d = crate::eval::typval::tv_dict_alloc();
+
+    for idx in 0..OPT_COUNT {
+        // SAFETY: `idx < OPT_COUNT` by this loop's own range.
+        let opt_idx = OptIndex::from_index(idx).expect("0..OPT_COUNT is always a valid OptIndex");
+
+        let wanted_scope = if bufopt { OptScope::Buf } else { OptScope::Win };
+        if !option_has_scope(opt_idx, wanted_scope) {
+            continue;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let varp = unsafe { get_varp(opt_idx) };
+        if varp.is_null() {
+            continue;
+        }
+
+        // SAFETY: `varp` was just confirmed non-null above and
+        // resolved for `opt_idx` itself, matching this function's own
+        // established `optval_from_varp` calling convention.
+        let opt_val = unsafe { optval_from_varp(opt_idx, varp) };
+        let opt_tv = crate::eval::vars::optval_as_tv(opt_val, true);
+
+        let opt = get_option(opt_idx);
+        // SAFETY: `d` was just freshly allocated above, not yet
+        // shared with anything else; forwarded from `tv_dict_add_tv`'s
+        // own safety doc for `opt_tv` (a plain Number/String/Bool/Nil
+        // value here, never a raw pointer needing extra care).
+        unsafe { crate::eval::typval::tv_dict_add_tv(&mut *d, opt.fullname, &opt_tv) };
+        // `opt_tv` is dropped here at the end of the loop body,
+        // freeing its own owned String bytes (if any) via Rust's
+        // normal `Drop` - `tv_dict_add_tv` only ever *copies* `tv` in
+        // (see its own doc comment), it does not take ownership,
+        // matching the original's own identical `tv_copy`-based
+        // semantics for `tv_dict_add_tv`.
+    }
+
+    d
 }
 
 
@@ -4838,6 +4895,155 @@ mod find_option_tests {
         let (part, next) = copy_option_part(b"foo bar", 0, 30, b" ,");
         assert_eq!(part, b"foo");
         assert_eq!(next, 4);
+    }
+}
+
+#[cfg(test)]
+mod get_winbuf_options_tests {
+    use super::*;
+    use crate::eval::typval::{tv_dict_find, tv_dict_free};
+    use crate::eval::typval_defs::TypvalValue;
+
+    /// Points `GLOBALS.curbuf`/`curwin` at real, linked `buf`/`win`
+    /// instances for the guard's lifetime, restoring the previous
+    /// values on drop. Callers must hold `global_state_test_lock()`
+    /// for the guard's whole lifetime (matching this file's own
+    /// `CurbufGuard` precedent, widened to cover `curwin` too since
+    /// `get_winbuf_options` resolves both buffer-local and
+    /// window-local storage via `get_varp`, which reads through both).
+    struct CurBufWinGuard {
+        prev_buf: *mut BufT,
+        prev_win: *mut WinT,
+    }
+
+    impl CurBufWinGuard {
+        fn set(buf: *mut BufT, win: *mut WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_buf = globals.curbuf;
+            let prev_win = globals.curwin;
+            globals.curbuf = buf;
+            globals.curwin = win;
+            CurBufWinGuard { prev_buf, prev_win }
+        }
+    }
+
+    impl Drop for CurBufWinGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_buf;
+            globals.curwin = self.prev_win;
+        }
+    }
+
+    /// Reads back a `Number` value stored under `key` in `d`, panicking
+    /// if the key is absent or not a `Number` - keeps the tests below
+    /// focused on the one property they're actually checking.
+    fn dict_number(d: &mut crate::eval::typval_defs::DictT, key: &[u8]) -> crate::eval::typval_defs::VarnumberT {
+        let item = tv_dict_find(Some(d), key).unwrap_or_else(|| {
+            panic!("expected key {:?} to be present", String::from_utf8_lossy(key))
+        });
+        match unsafe { &(*item).di_tv }.value {
+            TypvalValue::Number(n) => n,
+            ref other => panic!("expected {:?} to be a Number, got {:?}", String::from_utf8_lossy(key), other),
+        }
+    }
+
+    #[test]
+    fn get_winbuf_options_bufopt_true_includes_tabstop_with_the_real_value() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT { b_p_ts: 12, ..Default::default() };
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let syn_ptr = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let mut win = WinT { w_buffer: buf_ptr, w_s: syn_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurBufWinGuard::set(buf_ptr, win_ptr);
+
+        // SAFETY: curbuf/curwin were just set to valid, linked
+        // instances above.
+        let d = unsafe { get_winbuf_options(true) };
+        assert_eq!(dict_number(unsafe { &mut *d }, b"tabstop"), 12);
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn get_winbuf_options_bufopt_true_excludes_window_local_wrap() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let syn_ptr = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let mut win = WinT { w_buffer: buf_ptr, w_s: syn_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurBufWinGuard::set(buf_ptr, win_ptr);
+
+        let d = unsafe { get_winbuf_options(true) };
+        assert!(tv_dict_find(Some(unsafe { &mut *d }), b"wrap").is_none());
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn get_winbuf_options_bufopt_false_includes_wrap_with_the_real_value() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let syn_ptr = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_s: syn_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wrap: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurBufWinGuard::set(buf_ptr, win_ptr);
+
+        let d = unsafe { get_winbuf_options(false) };
+        assert_eq!(dict_number(unsafe { &mut *d }, b"wrap"), 1);
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn get_winbuf_options_bufopt_false_excludes_buffer_local_tabstop() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT { b_p_ts: 8, ..Default::default() };
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let syn_ptr = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let mut win = WinT { w_buffer: buf_ptr, w_s: syn_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurBufWinGuard::set(buf_ptr, win_ptr);
+
+        let d = unsafe { get_winbuf_options(false) };
+        assert!(tv_dict_find(Some(unsafe { &mut *d }), b"tabstop").is_none());
+        unsafe { tv_dict_free(d) };
+    }
+
+    #[test]
+    fn get_winbuf_options_excludes_global_only_options_either_way() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let syn_ptr = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let mut win = WinT { w_buffer: buf_ptr, w_s: syn_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurBufWinGuard::set(buf_ptr, win_ptr);
+
+        // 'ignorecase' is Global-only (verified against option_defs.rs's
+        // own generated table) - must appear in neither dict.
+        let bufdict = unsafe { get_winbuf_options(true) };
+        assert!(tv_dict_find(Some(unsafe { &mut *bufdict }), b"ignorecase").is_none());
+        unsafe { tv_dict_free(bufdict) };
+
+        let windict = unsafe { get_winbuf_options(false) };
+        assert!(tv_dict_find(Some(unsafe { &mut *windict }), b"ignorecase").is_none());
+        unsafe { tv_dict_free(windict) };
     }
 }
 
