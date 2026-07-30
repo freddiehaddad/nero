@@ -14,7 +14,9 @@
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
 //! `os_isrealdir`, `os_mkdir`, `os_mkdir_recurse`, `os_rmdir`,
-//! `os_remove`, `os_rename`, `os_realpath`, `os_fsync`, `os_open`,
+//! `os_remove`, `os_rename`, `os_file_settime` (regular files only -
+//! see its own doc comment for why directories aren't supported on
+//! Windows), `os_realpath`, `os_fsync`, `os_open`,
 //! `os_file_is_readable`,
 //! `os_file_is_writable` (the latter two via `libc::access`, the
 //! same underlying syscall the original's own `uv_fs_access` wraps -
@@ -73,9 +75,6 @@
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
 //!   `os_file_owned`/`os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
-//! - `os_file_settime`: tractable in principle
-//!   (`std::fs::File::set_modified`), deferred only for lack of time
-//!   this pass - revisit alongside `os_getperm`.
 //! - `os_file_mkdir`/`os_mkdtemp`: build on the now-real
 //!   [`os_mkdir_recurse`], not ported this pass.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
@@ -595,6 +594,58 @@ pub fn os_rename(path: &Path, new_path: &Path) -> i32 {
     }
 }
 
+/// Converts a Unix timestamp (seconds since the epoch, possibly with
+/// a fractional part) into a `SystemTime`. Returns `None` for a
+/// negative value (a pre-1970 timestamp) instead of panicking -
+/// `Duration::from_secs_f64` itself panics on negative input, a case
+/// the original's own bare `double` parameter has no equivalent
+/// restriction against. Neither of [`os_file_settime`]'s own two real
+/// callers (both in `bufwrite.c`, not yet translated) can ever
+/// actually produce one in practice, since they always come from an
+/// existing file's own real `stat` timestamps, but this guards the
+/// theoretical case explicitly rather than relying on that.
+fn unix_timestamp_to_system_time(ts: f64) -> Option<std::time::SystemTime> {
+    if ts < 0.0 {
+        return None;
+    }
+    Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(ts))
+}
+
+/// Set the access and modification times of a file (`os_file_settime`).
+///
+/// `atime`/`mtime` are Unix timestamps in seconds (with a fractional
+/// part for sub-second precision), matching the original's own bare
+/// `double` parameters.
+///
+/// Only regular files are supported here, not directories: setting
+/// this requires opening the target first (`std::fs::File::
+/// set_times`, stable since Rust 1.75), and `std::fs::OpenOptions`
+/// cannot portably open a directory at all on Windows (confirmed via
+/// a standalone scratch program - `CreateFile` on a directory needs
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which Rust's std doesn't set) - a
+/// real, underlying platform-API limitation, not a shortcut taken
+/// here. Opening requires WRITE access specifically (also confirmed
+/// via a standalone scratch program - a read-only handle's
+/// `set_times` call fails with "Access is denied" on Windows), so
+/// this always opens with `.write(true)`.
+///
+/// @return `OK` for success, `FAIL` for failure.
+pub fn os_file_settime(path: &Path, atime: f64, mtime: f64) -> i32 {
+    let (Some(atime), Some(mtime)) = (unix_timestamp_to_system_time(atime), unix_timestamp_to_system_time(mtime))
+    else {
+        return FAIL;
+    };
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) else {
+        return FAIL;
+    };
+    let times = std::fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
+    if file.set_times(times).is_ok() {
+        OK
+    } else {
+        FAIL
+    }
+}
+
 /// Serializes tests that read or mutate the real, process-wide current
 /// working directory (`std::env::current_dir`/`set_current_dir`) -
 /// genuine OS-level global state shared by every thread in this test
@@ -967,6 +1018,51 @@ mod tests {
         let src = scratch.path.join("nope.txt");
         let dst = scratch.path.join("dst.txt");
         assert_eq!(os_rename(&src, &dst), FAIL);
+    }
+
+    #[test]
+    fn os_file_settime_sets_atime_and_mtime() {
+        let scratch = TempScratch::new("file_settime");
+        let path = scratch.path.join("target.txt");
+        std::fs::write(&path, b"hello").unwrap();
+
+        // An arbitrary, well-in-the-past timestamp - 2000-01-01
+        // 00:00:00 UTC - distinct from "now" so a real change is
+        // actually observable.
+        let target_secs: f64 = 946_684_800.0;
+
+        assert_eq!(os_file_settime(&path, target_secs, target_secs), OK);
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let expected = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs_f64(target_secs);
+        assert_eq!(mtime, expected);
+    }
+
+    #[test]
+    fn os_file_settime_fails_for_a_missing_file() {
+        let scratch = TempScratch::new("file_settime_missing");
+        let path = scratch.path.join("does_not_exist.txt");
+        assert_eq!(os_file_settime(&path, 1_000_000.0, 1_000_000.0), FAIL);
+    }
+
+    #[test]
+    fn os_file_settime_fails_for_a_negative_timestamp() {
+        let scratch = TempScratch::new("file_settime_negative");
+        let path = scratch.path.join("target.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        assert_eq!(os_file_settime(&path, -1.0, 1_000_000.0), FAIL);
+        assert_eq!(os_file_settime(&path, 1_000_000.0, -1.0), FAIL);
+    }
+
+    #[test]
+    fn unix_timestamp_to_system_time_rejects_negative_values() {
+        assert!(unix_timestamp_to_system_time(-0.001).is_none());
+    }
+
+    #[test]
+    fn unix_timestamp_to_system_time_accepts_zero_and_epoch() {
+        assert_eq!(unix_timestamp_to_system_time(0.0), Some(std::time::SystemTime::UNIX_EPOCH));
     }
 
     #[test]
