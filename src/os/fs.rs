@@ -14,7 +14,10 @@
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
 //! `os_isrealdir`, `os_mkdir`, `os_mkdir_recurse`, `os_file_mkdir`,
-//! `os_rmdir`,
+//! `os_mkdtemp` (unique temp-directory creation - delegates to the
+//! real libc `mkdtemp(3)` on Unix, hand-rolls libuv's own
+//! random-suffix-and-retry algorithm on Windows; see its own doc
+//! comment), `os_rmdir`,
 //! `os_remove`, `os_rename`, `os_file_settime` (regular files only -
 //! see its own doc comment for why directories aren't supported on
 //! Windows), `os_realpath`, `os_fsync`, `os_open`,
@@ -76,8 +79,6 @@
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
 //!   `os_file_owned`/`os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
-//! - `os_mkdtemp`: unique temp-directory creation via libuv's own
-//!   `uv_fs_mkdtemp` random-name generation, not yet ported.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
 //! - `os_resolve_shortcut`/`os_is_reparse_point_include`: Windows
@@ -611,6 +612,114 @@ pub fn os_file_mkdir(fname: &[u8], mode: i32) -> i32 {
     }
 }
 
+/// Create a unique temporary directory from a template ending in
+/// exactly 6 literal `X` characters (`os_mkdtemp`).
+///
+/// Matches the real `mkdtemp(3)`/libuv `fs__mktemp` contract: the
+/// trailing `"XXXXXX"` is replaced with a pseudo-random alphanumeric
+/// suffix, retrying on a name collision, until a genuinely new
+/// directory is created (or, on Windows, every retry is exhausted).
+/// Returns the real, final path (with the placeholder replaced,
+/// normalized to forward slashes via [`crate::path::path_to_slash`])
+/// on success, `None` on a malformed template or (Windows only) if
+/// every retry collided/failed for another reason.
+///
+/// On Unix, this delegates directly to the real libc `mkdtemp(3)`
+/// (matching real neovim's own Unix build, whose `uv__fs_mkdtemp`
+/// itself just calls `mkdtemp()`) - no hand-rolled randomness needed.
+/// On Windows (no native `mkdtemp`), this hand-rolls libuv's own
+/// algorithm (`fs__mktemp`, `src/win/fs.c`): repeatedly substitute a
+/// fresh pseudo-random 6-character `[a-zA-Z0-9]` suffix and attempt
+/// `CreateDirectoryW`-equivalent creation, retrying on an
+/// already-exists collision. `mkdtemp_suffix`'s own generator is
+/// deliberately a private, per-call-reseeded mix of the system clock,
+/// a process-lifetime atomic counter, and the process ID - NOT the
+/// same generator backing Vimscript's own scriptable `rand()`/
+/// `srand()` state (`eval/funcs.rs`'s `splitmix32`/
+/// `shuffle_xoshiro128starstar`), matching the original's own
+/// separation between libuv's OS-randomness-backed `uv_random` here
+/// and Vim's own independently-seeded `srand()` state. It need not be
+/// cryptographically secure, only different enough between rapid
+/// successive calls to avoid a collision in practice - any actual
+/// collision is still handled correctly by the retry loop.
+#[must_use]
+pub fn os_mkdtemp(templ: &[u8]) -> Option<Vec<u8>> {
+    const NUM_X: usize = 6;
+    if templ.len() < NUM_X || &templ[templ.len() - NUM_X..] != b"XXXXXX" {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        let mut buf: Vec<u8> = templ.to_vec();
+        buf.push(0);
+        // SAFETY: `buf` is a NUL-terminated, exclusively-owned byte
+        // buffer with no other live alias; `mkdtemp` is documented to
+        // only ever overwrite the trailing 6 'X' bytes in place, never
+        // read/write past the buffer's own NUL terminator.
+        let result = unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) };
+        if result.is_null() {
+            return None;
+        }
+        buf.truncate(templ.len());
+        crate::path::path_to_slash(&mut buf);
+        Some(buf)
+    }
+
+    #[cfg(windows)]
+    {
+        // Deliberately not the original's own literal `TMP_MAX` (a
+        // huge, Windows-UCRT-defined retry cap effectively "never
+        // realistically exhausted") - this many attempts already
+        // vastly exceeds any plausible real collision count given the
+        // 62^6 (~56 billion) suffix space, while staying a sensible,
+        // boundable loop rather than looping billions of times.
+        const MAX_TRIES: u32 = 1_000_000;
+        let prefix = &templ[..templ.len() - NUM_X];
+        for _ in 0..MAX_TRIES {
+            let mut candidate = prefix.to_vec();
+            candidate.extend_from_slice(&mkdtemp_suffix());
+            let candidate_str = std::str::from_utf8(&candidate).ok()?;
+            match std::fs::create_dir(candidate_str) {
+                Ok(()) => {
+                    crate::path::path_to_slash(&mut candidate);
+                    return Some(candidate);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+/// Generates 6 pseudo-random alphanumeric bytes for [`os_mkdtemp`]'s
+/// own Windows-only unique-suffix generation, matching libuv's own
+/// `fs__mktemp`'s `tempchars` alphabet (`[a-zA-Z0-9]`, 62 characters).
+#[cfg(windows)]
+fn mkdtemp_suffix() -> [u8; 6] {
+    const CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = u64::from(std::process::id());
+    let mut v = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ pid;
+    // A small xorshift64 mix so nearby nanosecond timestamps still
+    // produce visibly different digit sequences.
+    v ^= v << 13;
+    v ^= v >> 7;
+    v ^= v << 17;
+    let mut out = [0u8; 6];
+    for byte in &mut out {
+        *byte = CHARS[(v % 62) as usize];
+        v /= 62;
+    }
+    out
+}
+
 /// Remove a directory (`os_rmdir`).
 ///
 /// @return `0` for success, `-1` for failure.
@@ -1070,6 +1179,54 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         let fname = blocker.join("child").join("file.txt");
         assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), -1);
+    }
+
+    #[test]
+    fn os_mkdtemp_creates_a_real_unique_directory() {
+        let scratch = TempScratch::new("mkdtemp_basic");
+        let mut templ = path_bytes(&scratch.path.join("sub"));
+        templ.extend_from_slice(b"XXXXXX");
+        let created = os_mkdtemp(&templ).expect("should succeed");
+
+        // The placeholder was replaced (not left as literal X's) and
+        // the real directory now exists at that exact path.
+        assert_ne!(&created[created.len() - 6..], b"XXXXXX");
+        let created_str = std::str::from_utf8(&created).unwrap();
+        assert!(os_isdir(Path::new(created_str)));
+
+        // Normalized to forward slashes even on Windows.
+        assert!(!created.contains(&b'\\'));
+    }
+
+    #[test]
+    fn os_mkdtemp_two_calls_with_the_same_template_create_different_directories() {
+        let scratch = TempScratch::new("mkdtemp_unique");
+        let mut templ = path_bytes(&scratch.path.join("sub"));
+        templ.extend_from_slice(b"XXXXXX");
+
+        let first = os_mkdtemp(&templ).expect("first should succeed");
+        let second = os_mkdtemp(&templ).expect("second should succeed");
+
+        assert_ne!(first, second);
+        let first_str = std::str::from_utf8(&first).unwrap();
+        let second_str = std::str::from_utf8(&second).unwrap();
+        assert!(os_isdir(Path::new(first_str)));
+        assert!(os_isdir(Path::new(second_str)));
+    }
+
+    #[test]
+    fn os_mkdtemp_rejects_a_template_not_ending_in_six_xs() {
+        let scratch = TempScratch::new("mkdtemp_bad_template");
+        // Only 5 X's - a malformed template, matching the real
+        // mkdtemp(3)/libuv contract's own "EINVAL" rejection.
+        let mut templ = path_bytes(&scratch.path.join("sub"));
+        templ.extend_from_slice(b"XXXXX");
+        assert!(os_mkdtemp(&templ).is_none());
+    }
+
+    #[test]
+    fn os_mkdtemp_rejects_a_template_shorter_than_six_bytes() {
+        assert!(os_mkdtemp(b"XXXXX").is_none());
     }
 
     #[test]
