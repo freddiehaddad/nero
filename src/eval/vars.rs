@@ -4229,14 +4229,13 @@ mod eval_one_expr_in_str_tests {
 /// `do_change_curbuf` doesn't already sidestep it for `htname ==
 /// b'b'`) - needs the real `ctx_switch` (`context.c`), which itself
 /// needs window/tabpage-switching machinery (`goto_tabpage_tp`,
-/// `use_tabpage`/`unuse_tabpage`) not yet translated. Also panics if
-/// the bare `"&"` (whole window/buffer-local-options-dict) form is
-/// requested - needs `get_winbuf_options`, not yet translated.
-/// Neither panic is reachable via `getbufvar({buf}, "&optname")` (any
-/// `{buf}`, since `do_change_curbuf` always sidesteps the switch for
-/// `htname == b'b'`) or `getwinvar(0, ...)`/`gettabvar(tabnr-of-
-/// curtab, ...)` (the current window/tab, the overwhelmingly common
-/// invocation shape).
+/// `use_tabpage`/`unuse_tabpage`) not yet translated. Not reachable
+/// via `getbufvar({buf}, ...)` (any `{buf}`, since `do_change_curbuf`
+/// always sidesteps the switch for `htname == b'b'`) or
+/// `getwinvar(0, ...)`/`gettabvar(tabnr-of-curtab, ...)` (the current
+/// window/tab, the overwhelmingly common invocation shape). The bare
+/// `"&"` (whole window/buffer-local-options-dict) form is now real
+/// too, via `get_winbuf_options` - no longer a panic case.
 #[allow(clippy::too_many_arguments)]
 unsafe fn get_var_from(
     varname: Option<&[u8]>,
@@ -4276,10 +4275,26 @@ unsafe fn get_var_from(
                 }
 
                 if varname.len() == 1 {
-                    unimplemented!(
-                        "get_var_from: the bare \"&\" whole-options-dict form needs \
-                         get_winbuf_options, not yet translated"
-                    );
+                    // get all window-local or buffer-local options in
+                    // a dict.
+                    // SAFETY: forwarded from this function's own
+                    // safety doc - GLOBALS.curbuf/curwin were just
+                    // set up above (curbuf possibly swapped to `buf`
+                    // for the `do_change_curbuf` case).
+                    let opts = unsafe { crate::option::get_winbuf_options(htname == b'b') };
+                    // `get_winbuf_options` always returns a valid,
+                    // non-null `Box::into_raw` pointer in this crate
+                    // (Rust's allocator aborts rather than returning
+                    // null on failure, unlike the original's own
+                    // malloc-can-fail check) - the null guard is kept
+                    // anyway, faithfully mirroring the original's own
+                    // structure.
+                    if !opts.is_null() {
+                        // SAFETY: forwarded from this function's own
+                        // safety doc.
+                        unsafe { crate::eval::typval::tv_dict_set_ret(rettv, opts) };
+                        done = true;
+                    }
                 } else {
                     // SAFETY: forwarded from this function's own safety doc.
                     let (r, _) =
@@ -4974,18 +4989,125 @@ mod get_var_from_tests {
         assert_eq!(rettv.value, TypvalValue::Number(5));
     }
 
+    /// Sets `GLOBALS.curbuf`/`curwin`/`curtab` to freshly-allocated,
+    /// linked structs (`win.w_buffer`/`w_s` point at `buf`/a real
+    /// `SynblockT`) for the bare `"&"` whole-options-dict tests below,
+    /// restoring the previous values and freeing everything on drop.
+    ///
+    /// Deliberately built via `Box::into_raw` directly (never
+    /// `Box::new` + `.as_mut()` + separately storing the `Box`, as
+    /// `TestFixture` above does) - the latter creates a SEPARATE
+    /// reborrow tag from whatever gets stored into `GLOBALS`, which
+    /// trips a real Tree Borrows "double reborrow" violation the
+    /// moment a later write goes through a DIFFERENT reborrow of the
+    /// same allocation than the one `GLOBALS` holds. This matters
+    /// specifically here because `get_winbuf_options` (invoked
+    /// internally by `get_var_from`'s bare `"&"` branch) reads through
+    /// `GLOBALS.curbuf`/`curwin` directly, not through any explicit
+    /// parameter - unlike every other branch this file's `TestFixture`
+    /// was designed for, which only ever reads through the parameters
+    /// `get_var_from` is explicitly called with. Matches
+    /// `find_var_ht_dict`'s own `TestCurBufWinTab` established
+    /// precedent (same file, different `mod tests` block) for this
+    /// exact `Box::into_raw`-based pattern. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime.
+    struct OptDictTestFixture {
+        buf: *mut crate::buffer_defs::BufT,
+        win: *mut crate::buffer_defs::WinT,
+        tab: *mut crate::buffer_defs::TabpageT,
+        syn: *mut crate::buffer_defs::SynblockT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl OptDictTestFixture {
+        fn new() -> Self {
+            let buf = Box::into_raw(Box::new(crate::buffer_defs::BufT::default()));
+            let syn = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+            let win_val = crate::buffer_defs::WinT {
+                w_buffer: buf,
+                w_s: syn,
+                ..Default::default()
+            };
+            let win = Box::into_raw(Box::new(win_val));
+            let tab = Box::into_raw(Box::new(crate::buffer_defs::TabpageT::default()));
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_curbuf = g.curbuf;
+            let prev_curwin = g.curwin;
+            let prev_curtab = g.curtab;
+            g.curbuf = buf;
+            g.curwin = win;
+            g.curtab = tab;
+            OptDictTestFixture { buf, win, tab, syn, prev_curbuf, prev_curwin, prev_curtab }
+        }
+    }
+
+    impl Drop for OptDictTestFixture {
+        fn drop(&mut self) {
+            unsafe {
+                let g = crate::globals::GLOBALS.get_mut();
+                g.curbuf = self.prev_curbuf;
+                g.curwin = self.prev_curwin;
+                g.curtab = self.prev_curtab;
+                drop(Box::from_raw(self.buf));
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.tab));
+                drop(Box::from_raw(self.syn));
+            }
+        }
+    }
+
     #[test]
-    #[should_panic(expected = "get_winbuf_options")]
-    fn get_var_from_bare_ampersand_panics() {
+    fn get_var_from_bare_ampersand_returns_a_real_buffer_local_options_dict() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut fx = TestFixture::new();
-        let bp = fx.buf_ptr();
-        let wp = fx.win_ptr();
-        let tp = fx.tab_ptr();
+        let fx = OptDictTestFixture::new();
+        unsafe { (*fx.buf).b_p_ts = 12 };
 
         let mut rettv = TypvalT::default();
         let deftv = TypvalT::default();
-        unsafe { get_var_from(Some(b"&"), &mut rettv, &deftv, b'b', tp, wp, bp) };
+        unsafe { get_var_from(Some(b"&"), &mut rettv, &deftv, b'b', fx.tab, fx.win, fx.buf) };
+
+        let TypvalValue::Dict(d) = rettv.value else {
+            panic!("expected a Dict value, got {:?}", rettv.value);
+        };
+        assert!(!d.is_null());
+        assert_eq!(unsafe { (*d).dv_refcount }, 1);
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"tabstop")
+            .expect("'tabstop' should be present in a buffer-local options dict");
+        assert_eq!(unsafe { &(*item).di_tv }.value, TypvalValue::Number(12));
+        // A window-local-only option must NOT appear in the
+        // buffer-local dict.
+        assert!(crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"wrap").is_none());
+
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn get_var_from_bare_ampersand_returns_a_real_window_local_options_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = OptDictTestFixture::new();
+        unsafe { (*fx.win).w_onebuf_opt.wo_wrap = 1 };
+
+        let mut rettv = TypvalT::default();
+        let deftv = TypvalT::default();
+        unsafe {
+            get_var_from(Some(b"&"), &mut rettv, &deftv, b'w', fx.tab, fx.win, std::ptr::null_mut());
+        }
+
+        let TypvalValue::Dict(d) = rettv.value else {
+            panic!("expected a Dict value, got {:?}", rettv.value);
+        };
+        assert!(!d.is_null());
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"wrap")
+            .expect("'wrap' should be present in a window-local options dict");
+        assert_eq!(unsafe { &(*item).di_tv }.value, TypvalValue::Number(1));
+        // A buffer-local-only option must NOT appear in the
+        // window-local dict.
+        assert!(crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), b"tabstop").is_none());
+
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
     }
 
     #[test]
