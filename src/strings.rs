@@ -40,9 +40,13 @@
 //! into the same buffer" convention (e.g. `path.rs`'s `path_tail`/
 //! `get_past_head`).
 //!
+//! Also translated: `vim_strnsave_unquoted`/`del_trailing_spaces`
+//! (as [`del_trailing_spaces_len`]) - both are pure byte-level parsers
+//! with NO `charset.c`/`g_chartab` dependency at all, despite an
+//! earlier session's own deferral note claiming otherwise (corrected
+//! here after re-reading each real function body directly).
+//!
 //! Deferred:
-//! - `vim_strnsave_unquoted`, `del_trailing_spaces`: need `charset.c`'s
-//!   real `g_chartab`/`option.c`.
 //! - `vim_snprintf`/`vim_vsnprintf`/`kv_do_printf` and the whole custom
 //!   positional-argument printf machinery: Rust's native `format!`/
 //!   `write!` macros are the direct replacement for this (matching
@@ -94,6 +98,37 @@ pub fn xstrnsave(string: &[u8], len: usize) -> Vec<u8> {
     let mut ret = vec![0u8; len + 1];
     let n = string.len().min(len);
     ret[..n].copy_from_slice(&string[..n]);
+    ret
+}
+
+/// Remove quotes from `string`, unescaping a backslash-escaped `\` or
+/// `"` while inside a quoted section (`vim_strnsave_unquoted`).
+///
+/// A pure byte-level parser - no `charset.c`/`g_chartab` dependency at
+/// all (an earlier session's own deferral note claiming otherwise was
+/// stale, corrected here after re-reading the real function body).
+#[must_use]
+pub fn vim_strnsave_unquoted(string: &[u8]) -> Vec<u8> {
+    let mut ret = Vec::with_capacity(string.len());
+    let mut inquote = false;
+    let mut i = 0;
+    while i < string.len() {
+        let c = string[i];
+        if c == b'"' {
+            inquote = !inquote;
+            i += 1;
+        } else if c == b'\\'
+            && inquote
+            && i + 1 < string.len()
+            && (string[i + 1] == b'\\' || string[i + 1] == b'"')
+        {
+            ret.push(string[i + 1]);
+            i += 2;
+        } else {
+            ret.push(c);
+            i += 1;
+        }
+    }
     ret
 }
 
@@ -188,6 +223,38 @@ pub fn has_non_ascii(s: Option<&[u8]>) -> bool {
         Some(s) => s.iter().any(|&b| b >= 128),
         None => false,
     }
+}
+
+/// Return the length of `s` with trailing whitespace removed, unless
+/// it's escaped by a preceding `\` or Ctrl-V (`del_trailing_spaces`).
+///
+/// The original mutates a NUL-terminated C string in place, writing
+/// `NUL` bytes at the very end to shrink it; since a `&[u8]` slice
+/// already carries its own exact length (no NUL terminator needed),
+/// this returns the new, shorter length instead of writing anything -
+/// a caller wanting an in-place shrink can
+/// `s.truncate(del_trailing_spaces_len(&s))`. Always keeps at least
+/// the first byte (matching the original's own `q > ptr` bound, which
+/// never lets `q` reach the very first character).
+#[must_use]
+pub fn del_trailing_spaces_len(s: &[u8]) -> usize {
+    let mut len = s.len();
+    let mut q = s.len();
+    loop {
+        if q == 0 {
+            break;
+        }
+        q -= 1;
+        if q == 0 || !crate::ascii_defs::ascii_iswhite(i32::from(s[q])) {
+            break;
+        }
+        let prev = s[q - 1];
+        if prev == b'\\' || prev == crate::ascii_defs::CTRL_V {
+            break;
+        }
+        len = q;
+    }
+    len
 }
 
 /// Concatenate two strings and return the result in newly allocated memory
@@ -490,6 +557,74 @@ mod tests {
         let v2 = xstrnsave(b"abcdef", 3);
         assert_eq!(v2.len(), 4);
         assert_eq!(&v2[..3], b"abc");
+    }
+
+    #[test]
+    fn vim_strnsave_unquoted_strips_surrounding_quotes() {
+        assert_eq!(vim_strnsave_unquoted(b"\"hello\""), b"hello".to_vec());
+    }
+
+    #[test]
+    fn vim_strnsave_unquoted_unescapes_an_escaped_quote() {
+        assert_eq!(vim_strnsave_unquoted(b"\"a\\\"b\""), b"a\"b".to_vec());
+    }
+
+    #[test]
+    fn vim_strnsave_unquoted_unescapes_an_escaped_backslash() {
+        assert_eq!(vim_strnsave_unquoted(b"\"a\\\\b\""), b"a\\b".to_vec());
+    }
+
+    #[test]
+    fn vim_strnsave_unquoted_leaves_an_unquoted_string_untouched() {
+        // Outside quotes, a backslash is just a plain character - the
+        // escape condition only fires while `inquote` is true.
+        assert_eq!(vim_strnsave_unquoted(b"a\\b"), b"a\\b".to_vec());
+    }
+
+    #[test]
+    fn vim_strnsave_unquoted_only_unescapes_backslash_and_quote() {
+        // "\n" (backslash followed by a plain 'n', not \\ or ") does
+        // NOT match the escape condition even while inquote - the
+        // backslash is kept as a literal character.
+        assert_eq!(vim_strnsave_unquoted(b"\"a\\nb\""), b"a\\nb".to_vec());
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_strips_trailing_whitespace() {
+        assert_eq!(del_trailing_spaces_len(b"hello   "), 5);
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_unchanged_when_no_trailing_whitespace() {
+        assert_eq!(del_trailing_spaces_len(b"hello"), 5);
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_keeps_a_space_escaped_by_backslash() {
+        assert_eq!(del_trailing_spaces_len(b"a\\ "), 3);
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_keeps_a_space_escaped_by_ctrl_v() {
+        assert_eq!(
+            del_trailing_spaces_len(&[b'a', crate::ascii_defs::CTRL_V, b' ']),
+            3
+        );
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_all_whitespace_keeps_the_first_byte() {
+        assert_eq!(del_trailing_spaces_len(b"   "), 1);
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_empty_string_is_zero() {
+        assert_eq!(del_trailing_spaces_len(b""), 0);
+    }
+
+    #[test]
+    fn del_trailing_spaces_len_single_space_is_unchanged() {
+        assert_eq!(del_trailing_spaces_len(b" "), 1);
     }
 
     #[test]
