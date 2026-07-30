@@ -13,6 +13,12 @@
 //! earlier session, hosted in `mark.rs` alongside its only real
 //! consumer (`mark_forget_file`) rather than waiting for the rest of
 //! this file - see that module's own doc comment.
+//!
+//! Also translated: [`set_ref_in_tagfunc`] - marks the global
+//! `'tagfunc'` callback (`TFU_CB`) with a GC `copy_id` so it survives
+//! garbage collection. `TFU_CB` stays `Callback::None` forever today
+//! (see its own doc comment) - matches every real, unconfigured
+//! session.
 
 use crate::buffer_defs::{TaggyT, WinT};
 
@@ -97,6 +103,25 @@ pub fn tag_strnicmp(s1: &[u8], s2: &[u8], len: usize) -> i32 {
         }
     }
     0
+}
+
+/// The `'tagfunc'` callback (`tfu_cb`, a file-static `Callback`).
+/// Nothing in this crate can currently set a real value here - see
+/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
+/// `option_set_callback_func`, not translated).
+static TFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
+    crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Mark the global `'tagfunc'` callback with `copy_id` so that it is
+/// not garbage collected (`set_ref_in_tagfunc`).
+///
+/// # Safety
+/// Same as [`crate::eval::eval::set_ref_in_callback`].
+pub unsafe fn set_ref_in_tagfunc(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cb = unsafe { &*TFU_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
 }
 
 #[cfg(test)]
@@ -320,5 +345,13 @@ mod tests {
         // Both empty: comparing for a len longer than either produces
         // 0 immediately (both bytes default to 0 at every position).
         assert_eq!(tag_strnicmp(b"", b"", 5), 0);
+    }
+
+    #[test]
+    fn set_ref_in_tagfunc_is_always_false_since_tfu_cb_stays_none() {
+        // Nothing in this crate can populate TFU_CB with a real
+        // callback yet (needs option_set_callback_func) - it always
+        // stays Callback::None, matching a real, unconfigured session.
+        assert!(!unsafe { set_ref_in_tagfunc(1) });
     }
 }

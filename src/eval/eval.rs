@@ -295,7 +295,7 @@
 //! original, not a narrowing.
 
 use crate::charset::skipwhite;
-use crate::eval::typval_defs::{TypvalT, TypvalValue, VarLockStatus, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
+use crate::eval::typval_defs::{Callback, TypvalT, TypvalValue, VarLockStatus, VarnumberT, VARNUMBER_MAX, VARNUMBER_MIN};
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
@@ -1005,6 +1005,47 @@ pub unsafe fn set_ref_in_item(
         | TypvalValue::Number(_)
         | TypvalValue::String(_)
         | TypvalValue::Blob(_) => false,
+    }
+}
+
+/// Mark whatever `callback` refers to with `copy_id` so it survives
+/// garbage collection (`set_ref_in_callback`).
+///
+/// A `Funcref`/`None` callback holds no `List`/`Dict`/`Partial` value
+/// of its own to mark (a plain function name is looked up by name
+/// through `crate::eval::userfunc::FuncHashtab`, not reachable via
+/// `copy_id` marking). A `Partial` callback wraps its pointer in a
+/// throwaway [`TypvalT`] and defers to [`set_ref_in_item`] - the exact
+/// translation of the original's own `tv.v_type = VAR_PARTIAL; tv.vval
+/// .v_partial = ...` construction.
+///
+/// A `Lua` callback needs the Lua host (not yet translated) - matches
+/// [`crate::eval::typval::callback_free`]'s own already-established
+/// `unimplemented!()` treatment for the identical situation, rather
+/// than the original's `abort()` (which encodes "this should never
+/// happen" for a *complete* build, not "not yet supported here").
+///
+/// # Safety
+/// If `callback` is [`Callback::Partial`] with a non-null pointer,
+/// that pointer (and everything transitively reachable from it) must
+/// be valid. `ht_stack`/`list_stack`, if non-null, must point to valid
+/// slots.
+pub unsafe fn set_ref_in_callback(
+    callback: &Callback,
+    copy_id: i32,
+    ht_stack: *mut *mut crate::eval::typval_defs::HtStackT,
+    list_stack: *mut *mut crate::eval::typval_defs::ListStackT,
+) -> bool {
+    match callback {
+        Callback::None | Callback::Funcref(_) => false,
+        Callback::Partial(p) => {
+            let mut tv = TypvalT { value: TypvalValue::Partial(*p), ..Default::default() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_ref_in_item(&mut tv, copy_id, ht_stack, list_stack) }
+        }
+        Callback::Lua(_) => {
+            unimplemented!("set_ref_in_callback: Lua callbacks need the Lua host, not yet translated")
+        }
     }
 }
 
@@ -7155,6 +7196,79 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { set_ref_in_item(&mut tv, 1, std::ptr::null_mut(), std::ptr::null_mut()) });
+    }
+
+    #[test]
+    fn set_ref_in_callback_none_and_funcref_are_always_a_noop() {
+        assert!(!unsafe {
+            set_ref_in_callback(&Callback::None, 1, std::ptr::null_mut(), std::ptr::null_mut())
+        });
+        assert!(!unsafe {
+            set_ref_in_callback(
+                &Callback::Funcref(b"MyFunc".to_vec()),
+                1,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        });
+    }
+
+    #[test]
+    fn set_ref_in_callback_partial_marks_its_bound_dict() {
+        let _lock = crate::globals::global_state_test_lock();
+        // dv_refcount starts at 1, representing the Partial's own
+        // (sole) held reference - partial_unref's own internal
+        // partial_free already releases pt_dict via tv_dict_unref, so
+        // no SEPARATE tv_dict_unref call is needed here (that would
+        // double-free).
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*d).dv_refcount = 1 };
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            pt_dict: d,
+            ..Default::default()
+        }));
+
+        let aborted = unsafe {
+            set_ref_in_callback(
+                &Callback::Partial(pt),
+                9,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!aborted);
+        assert_eq!(unsafe { (*d).dv_copy_id }, 9);
+
+        unsafe { crate::eval::typval::partial_unref(pt) };
+    }
+
+    #[test]
+    fn set_ref_in_callback_partial_with_null_dict_is_a_noop() {
+        let pt = Box::into_raw(Box::new(crate::eval::typval_defs::PartialT {
+            pt_refcount: 1,
+            ..Default::default()
+        }));
+
+        let aborted = unsafe {
+            set_ref_in_callback(
+                &Callback::Partial(pt),
+                3,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!aborted);
+
+        unsafe { crate::eval::typval::partial_unref(pt) };
+    }
+
+    #[test]
+    #[should_panic(expected = "Lua callbacks need the Lua host")]
+    fn set_ref_in_callback_lua_panics_needing_the_lua_host() {
+        unsafe {
+            set_ref_in_callback(&Callback::Lua(0), 1, std::ptr::null_mut(), std::ptr::null_mut())
+        };
     }
 
     #[test]

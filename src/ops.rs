@@ -21,6 +21,14 @@
 //! own plain fields) and [`clear_oparg`] (a `CLEAR_POINTER` one-liner
 //! now that `normal_defs.rs`'s `OpargT` exists).
 //!
+//! Also translated: [`set_ref_in_opfunc`] - marks the global
+//! `'operatorfunc'` callback (`OPFUNC_CB`) with a GC `copy_id` so it
+//! survives garbage collection, via `eval/eval.rs`'s
+//! `set_ref_in_callback`. `OPFUNC_CB` stays `Callback::None` forever
+//! today (see its own doc comment) - matches every real, unconfigured
+//! session, since nothing here can populate a real `'operatorfunc'`
+//! value yet.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -219,6 +227,28 @@ pub unsafe fn restore_lbr(lbr_saved: bool) {
 /// `normal_defs.rs`'s own test asserting this).
 pub fn clear_oparg(oap: &mut crate::normal_defs::OpargT) {
     *oap = crate::normal_defs::OpargT::default();
+}
+
+/// The `'operatorfunc'` callback (`opfunc_cb`, a file-static
+/// `Callback`). Nothing in this crate can currently set a real value
+/// here: doing so needs `option_set_callback_func`, itself needing
+/// `eval_expr`/the full `:set`-parsing `Callback` machinery, none
+/// translated - so this stays [`crate::eval::typval_defs::Callback::None`]
+/// forever today, matching every real, unconfigured session before
+/// `'operatorfunc'` is ever assigned.
+static OPFUNC_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
+    crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Mark the global `'operatorfunc'` callback with `copy_id` so that it
+/// is not garbage collected (`set_ref_in_opfunc`).
+///
+/// # Safety
+/// Same as [`crate::eval::eval::set_ref_in_callback`].
+pub unsafe fn set_ref_in_opfunc(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cb = unsafe { &*OPFUNC_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
 }
 
 #[cfg(test)]
@@ -451,5 +481,13 @@ mod tests {
         assert_eq!(oap.line_count, 0);
         assert_eq!(oap.prev_opcount, 0);
         assert!(!oap.excl_tr_ws);
+    }
+
+    #[test]
+    fn set_ref_in_opfunc_is_always_false_since_opfunc_cb_stays_none() {
+        // Nothing in this crate can populate OPFUNC_CB with a real
+        // callback yet (needs option_set_callback_func) - it always
+        // stays Callback::None, matching a real, unconfigured session.
+        assert!(!unsafe { set_ref_in_opfunc(1) });
     }
 }

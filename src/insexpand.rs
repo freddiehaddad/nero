@@ -25,6 +25,15 @@
 //! assumption as a low-risk future follow-up - not done here, to keep
 //! this change scoped to `insexpand.c` itself.
 //!
+//! Also translated: [`set_ref_in_cpt_callbacks`]/
+//! [`set_ref_in_insexpand_funcs`] - mark the global `'completefunc'`/
+//! `'omnifunc'`/`'thesaurusfunc'`/`'complete'`-`F{func}` callbacks with
+//! a GC `copy_id` so they survive garbage collection, via
+//! `eval/eval.rs`'s `set_ref_in_callback`. Every one of `CFU_CB`/
+//! `OFU_CB`/`TSRFU_CB`/`CPT_CB` stays at its own empty default forever
+//! today (see each one's own doc comment) - matches every real,
+//! unconfigured session.
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -223,6 +232,94 @@ pub unsafe fn ctrl_x_mode_not_defined_yet() -> bool {
     unsafe { ctrl_x_mode() == CTRL_X_NOT_DEFINED_YET }
 }
 
+/// The `'completefunc'` callback (`cfu_cb`, a file-static `Callback`).
+/// Nothing in this crate can currently set a real value here - see
+/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
+/// `option_set_callback_func`, not translated).
+static CFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
+    GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// The `'omnifunc'` callback (`ofu_cb`). See [`CFU_CB`].
+static OFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
+    GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// The `'thesaurusfunc'` callback (`tsrfu_cb`). See [`CFU_CB`].
+static TSRFU_CB: GlobalCell<crate::eval::typval_defs::Callback> =
+    GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// The `'completefunc'`-style callbacks associated with each `F{func}`
+/// entry in `'complete'`/`'completeopt'` (`cpt_cb`/`cpt_cb_count`
+/// collapsed into one `Vec`, matching this crate's established
+/// "translate a `T*`+count pair as a `Vec<T>` when nothing needs the
+/// original's raw-pointer/manual-count shape" precedent - e.g.
+/// `runtime.rs`'s own `SCRIPT_ITEMS`). Always empty today: nothing in
+/// this crate can currently populate it.
+static CPT_CB: GlobalCell<Vec<crate::eval::typval_defs::Callback>> = GlobalCell::new(Vec::new());
+
+/// Mark `copy_id` on every callback in `callbacks` so none of them are
+/// garbage collected (`set_ref_in_cpt_callbacks`).
+///
+/// Uses `||`'s own short-circuit evaluation (matching the original's
+/// `abort = abort || set_ref_in_callback(...)`): once `abort` becomes
+/// `true`, later callbacks in `callbacks` are NOT visited at all for
+/// this call - a faithful translation of the original's real
+/// structure, even though nothing in this crate can currently make
+/// `abort` become `true` at all (every callback here is always
+/// [`crate::eval::typval_defs::Callback::None`] today).
+///
+/// # Safety
+/// Same as [`crate::eval::eval::set_ref_in_callback`].
+pub unsafe fn set_ref_in_cpt_callbacks(
+    callbacks: &[crate::eval::typval_defs::Callback],
+    copy_id: i32,
+) -> bool {
+    let mut abort = false;
+    for cb in callbacks {
+        abort = abort
+            // SAFETY: forwarded from this function's own safety doc.
+            || unsafe {
+                crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut())
+            };
+    }
+    abort
+}
+
+/// Mark the global `'completefunc'`/`'omnifunc'`/`'thesaurusfunc'`
+/// callbacks, plus every `F{func}` callback in `'complete'`, with
+/// `copy_id` so none of them are garbage collected
+/// (`set_ref_in_insexpand_funcs`).
+///
+/// # Safety
+/// Same as [`crate::eval::eval::set_ref_in_callback`].
+pub unsafe fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cfu = unsafe { &*CFU_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let ofu = unsafe { &*OFU_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let tsrfu = unsafe { &*TSRFU_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let cpt = unsafe { &*CPT_CB.as_ptr() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut abort = unsafe {
+        crate::eval::eval::set_ref_in_callback(cfu, copy_id, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    abort = abort
+        // SAFETY: forwarded from this function's own safety doc.
+        || unsafe {
+            crate::eval::eval::set_ref_in_callback(ofu, copy_id, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+    abort = abort
+        // SAFETY: forwarded from this function's own safety doc.
+        || unsafe {
+            crate::eval::eval::set_ref_in_callback(tsrfu, copy_id, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+    abort = abort || unsafe { set_ref_in_cpt_callbacks(cpt, copy_id) };
+
+    abort
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +485,29 @@ mod tests {
         assert_eq!(CTRL_X_CMDLINE_CTRL_X, 17);
         assert_eq!(CTRL_X_BUFNAMES, 18);
         assert_eq!(CTRL_X_REGISTER, 19);
+    }
+
+    #[test]
+    fn set_ref_in_insexpand_funcs_is_always_false_since_every_callback_stays_empty() {
+        // Nothing in this crate can populate CFU_CB/OFU_CB/TSRFU_CB/
+        // CPT_CB with a real callback yet (needs
+        // option_set_callback_func) - they always stay at their own
+        // empty defaults, matching a real, unconfigured session.
+        let _lock = global_state_test_lock();
+        assert!(!unsafe { set_ref_in_insexpand_funcs(1) });
+    }
+
+    #[test]
+    fn set_ref_in_cpt_callbacks_empty_slice_is_always_false() {
+        assert!(!unsafe { set_ref_in_cpt_callbacks(&[], 1) });
+    }
+
+    #[test]
+    fn set_ref_in_cpt_callbacks_none_callbacks_are_always_false() {
+        let callbacks = [
+            crate::eval::typval_defs::Callback::None,
+            crate::eval::typval_defs::Callback::Funcref(b"MyFunc".to_vec()),
+        ];
+        assert!(!unsafe { set_ref_in_cpt_callbacks(&callbacks, 1) });
     }
 }

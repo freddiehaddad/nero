@@ -24,6 +24,12 @@
 //! Also translated: `find_cmdline_var` - a small, self-contained
 //! `spec_str[]` table lookup (`%`/`#`/`<cword>`/`<sfile>`/etc.), needed
 //! by `strings.c`'s `vim_strsave_shellescape()` (`shellescape()`).
+//!
+//! Also translated: `set_ref_in_findfunc` - marks the global
+//! `'findfunc'` callback (`ffu_cb`) with a GC `copy_id` so it survives
+//! garbage collection. `ffu_cb` stays `Callback::None` forever today
+//! (see `FFU_CB`'s own doc comment) - matches every real,
+//! unconfigured session.
 
 use crate::buffer_defs::b_flags;
 
@@ -152,6 +158,25 @@ pub fn find_cmdline_var(src: &[u8]) -> Option<(CmdlineSpecialVar, usize)> {
         }
     }
     None
+}
+
+/// The `'findfunc'` callback (`ffu_cb`, a file-static `Callback`).
+/// Nothing in this crate can currently set a real value here - see
+/// `ops.rs`'s `OPFUNC_CB` for the identical reasoning (needs
+/// `option_set_callback_func`, not translated).
+static FFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
+    crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Mark the global `'findfunc'` callback with `copy_id` so that it is
+/// not garbage collected (`set_ref_in_findfunc`).
+///
+/// # Safety
+/// Same as [`crate::eval::eval::set_ref_in_callback`].
+pub unsafe fn set_ref_in_findfunc(copy_id: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cb = unsafe { &*FFU_CB.as_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
 }
 
 #[cfg(test)]
@@ -302,5 +327,13 @@ mod tests {
         // "<cword>" is a real prefix of "<cwordXYZ>" - starts_with
         // matches regardless of what follows.
         assert_eq!(find_cmdline_var(b"<cword>XYZ"), Some((CmdlineSpecialVar::Cword, 7)));
+    }
+
+    #[test]
+    fn set_ref_in_findfunc_is_always_false_since_ffu_cb_stays_none() {
+        // Nothing in this crate can populate FFU_CB with a real
+        // callback yet (needs option_set_callback_func) - it always
+        // stays Callback::None, matching a real, unconfigured session.
+        assert!(!unsafe { set_ref_in_findfunc(1) });
     }
 }
