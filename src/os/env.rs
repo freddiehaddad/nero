@@ -29,6 +29,15 @@
 //! `vim_get_prefix_from_exepath`, real runtime-path auto-discovery,
 //! not yet translated).
 //!
+//! Also translated: `restore_env_var` (`#ifdef MSWIN`-only in the
+//! original, matched here via `#[cfg(windows)]`) and
+//! `os_shell_is_cmdexe` - re-examined an earlier session's "needs
+//! `'shell'` parsing logic not yet translated" note and found it was
+//! about a hypothetical CALLER needing a real `'shell'` option value,
+//! not this function's own logic (a pure function of its own `sh`
+//! parameter, needing only the already-real `striequal`/`os_getenv`/
+//! `path_tail`).
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `os_getenv_buf`/`os_getenv_noalloc`: write into `NameBuff`
 //!   (`crate::globals::GLOBALS`) - tractable in principle, deferred only
@@ -54,10 +63,15 @@
 //! - `vim_env_iter`/`vim_env_iter_rev`: only consumed by
 //!   `set_runtimepath_default`/similar (not yet translated).
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
-//! - `os_setenv_append_path`/`os_shell_is_cmdexe`: need `'shell'`
-//!   parsing logic not yet translated, and `os/fs.c` real I/O.
-//! - `restore_env_var`: `#ifdef MSWIN`-only, needs a not-yet-translated
-//!   caller to validate the save/restore contract against.
+//! - `os_setenv_append_path`: needs `path_is_absolute`/a file-static
+//!   `os_buf` scratch buffer/`ENV_SEPCHAR`/`ENV_SEPSTR` PATH-list
+//!   manipulation - genuinely more involved than its sibling
+//!   `os_shell_is_cmdexe` (now translated below, a pure function of
+//!   its own `sh` parameter needing only `striequal`/`os_getenv`/
+//!   `path_tail` - re-examined and found the earlier "needs `'shell'`
+//!   parsing logic" note above was about the CALLER needing to supply
+//!   a real `'shell'` option value, not a real blocker on this
+//!   function's own, already-tractable logic).
 
 use super::os::NVIM_TESTING;
 use crate::globals::GlobalCell;
@@ -214,6 +228,58 @@ pub unsafe fn vim_setenv_ext(name: &[u8], val: &[u8]) {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { crate::globals::GLOBALS.get_mut() }.didset_vimruntime = false;
     }
+}
+
+/// Restores a previous environment variable value, or unsets it if
+/// `old_value` is `None` (`restore_env_var`, `#ifdef MSWIN`-only in
+/// the original).
+///
+/// # Safety
+/// Same requirement as [`os_setenv`]/[`os_unsetenv`].
+#[cfg(windows)]
+pub unsafe fn restore_env_var(name: &[u8], old_value: Option<&[u8]>) {
+    match old_value {
+        Some(v) => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { os_setenv(name, v, 1) };
+        }
+        None => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { os_unsetenv(name) };
+        }
+    }
+}
+
+/// Whether `sh` refers to the Windows `"cmd.exe"` shell - directly,
+/// via the bare name `"cmd"`, or (recursively) via the special
+/// `"$COMSPEC"` token (`os_shell_is_cmdexe`).
+///
+/// Reads the real `$COMSPEC` environment variable (via [`os_getenv`],
+/// matching the original's own established "`os_getenv_noalloc`'s
+/// 'borrow, don't allocate' optimization is never separately
+/// translated" convention - see this module's own doc comment) only
+/// when `sh` is literally `"$COMSPEC"`.
+#[must_use]
+pub fn os_shell_is_cmdexe(sh: &[u8]) -> bool {
+    if sh.is_empty() {
+        return false;
+    }
+    if crate::strings::striequal(Some(sh), Some(b"$COMSPEC")) {
+        let comspec = os_getenv(b"COMSPEC");
+        // `path_tail(NULL)` returns `""` in the original - modeled
+        // here as an empty tail when `$COMSPEC` itself is unset.
+        let tail: &[u8] = match &comspec {
+            Some(c) => &c[crate::path::path_tail(c)..],
+            None => b"",
+        };
+        return crate::strings::striequal(Some(b"cmd.exe"), Some(tail));
+    }
+    if crate::strings::striequal(Some(sh), Some(b"cmd.exe"))
+        || crate::strings::striequal(Some(sh), Some(b"cmd"))
+    {
+        return true;
+    }
+    crate::strings::striequal(Some(b"cmd.exe"), Some(&sh[crate::path::path_tail(sh)..]))
 }
 
 /// Gets the hostname of the current machine (`os_get_hostname`).
@@ -1221,5 +1287,93 @@ pub(crate) mod tests {
         // normally on the very next loop iteration, so this traces
         // through as a plain "no expansion happened" case either way.
         assert_eq!(result, b"foo\\$bar");
+    }
+
+    // --- os_shell_is_cmdexe ---
+
+    #[test]
+    fn os_shell_is_cmdexe_false_for_empty_string() {
+        assert!(!os_shell_is_cmdexe(b""));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_true_for_bare_cmd_and_cmd_exe() {
+        assert!(os_shell_is_cmdexe(b"cmd"));
+        assert!(os_shell_is_cmdexe(b"cmd.exe"));
+        // Case-insensitive, matching striequal's own semantics.
+        assert!(os_shell_is_cmdexe(b"CMD.EXE"));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_true_for_a_path_ending_in_cmd_exe() {
+        // Forward slashes deliberately: they're a valid path separator
+        // on BOTH Windows and Unix (unlike backslash, which path_tail
+        // only recognizes as a separator on Windows - vim_ispathsep's
+        // own platform split) - matters here since this test itself
+        // runs on both platforms, not just Windows (os_shell_is_cmdexe
+        // is a plain, portably-compiled predicate in the original,
+        // even though it only ever returns true in practice on a real
+        // Windows build).
+        assert!(os_shell_is_cmdexe(b"C:/Windows/System32/cmd.exe"));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_false_for_an_unrelated_shell() {
+        assert!(!os_shell_is_cmdexe(b"/bin/bash"));
+        assert!(!os_shell_is_cmdexe(b"C:/Windows/System32/powershell.exe"));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_dollar_comspec_follows_the_real_env_var() {
+        let _lock = homedir_test_lock();
+        // Forward slashes - see os_shell_is_cmdexe_true_for_a_path_ending_in_cmd_exe's
+        // own comment for why.
+        let _guard = EnvVarGuard::set(&[("COMSPEC", Some("C:/Windows/System32/cmd.exe"))]);
+        assert!(os_shell_is_cmdexe(b"$COMSPEC"));
+        // Case-insensitive on the "$COMSPEC" token itself too.
+        assert!(os_shell_is_cmdexe(b"$comspec"));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_dollar_comspec_false_when_it_points_elsewhere() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("COMSPEC", Some("C:/tools/4nt.exe"))]);
+        assert!(!os_shell_is_cmdexe(b"$COMSPEC"));
+    }
+
+    #[test]
+    fn os_shell_is_cmdexe_dollar_comspec_false_when_unset() {
+        // path_tail(NULL) == "" in the original; striequal("cmd.exe", "")
+        // is false, so an unset $COMSPEC never matches.
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("COMSPEC", None)]);
+        assert!(!os_shell_is_cmdexe(b"$COMSPEC"));
+    }
+
+    // --- restore_env_var ---
+
+    #[test]
+    #[cfg(windows)]
+    fn restore_env_var_sets_the_value_when_some() {
+        let name = b"NERO_TEST_ENV_RESTORE_SOME";
+        // SAFETY: single test-owned variable name.
+        unsafe {
+            os_unsetenv(name);
+            restore_env_var(name, Some(b"restored-value"));
+            assert_eq!(os_getenv(name), Some(b"restored-value".to_vec()));
+            os_unsetenv(name);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restore_env_var_unsets_when_none() {
+        let name = b"NERO_TEST_ENV_RESTORE_NONE";
+        // SAFETY: single test-owned variable name.
+        unsafe {
+            os_setenv(name, b"will-be-removed", 1);
+            restore_env_var(name, None);
+            assert_eq!(os_getenv(name), None);
+        }
     }
 }
