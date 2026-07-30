@@ -53,6 +53,7 @@ pub mod ex_docmd;
 pub mod ex_getln;
 pub mod ex_eval;
 pub mod ex_eval_defs;
+pub mod ex_session;
 pub mod extmark_defs;
 pub mod file_search;
 pub mod fileio;
