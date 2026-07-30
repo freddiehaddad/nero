@@ -728,6 +728,60 @@ pub fn get_option(opt_idx: OptIndex) -> &'static VimoptionT {
     unsafe { &*opt_ptr(opt_idx) }
 }
 
+/// Get a pointer to the flags used for the `kOptFlagInsecure`/
+/// `opt_flags::INSECURE` flag of `opt_idx`. For some local options a
+/// local flags field is used instead of the global `options[]` table's
+/// own (`insecure_flag`). Every branch below mirrors the original's own
+/// `switch`es exactly.
+///
+/// NOTE (matches the original's own comment): caller must make sure
+/// `wp` is the window the option is actually being used from.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` (and, for
+/// the `OPT_LOCAL` branches touching `w_buffer`, its own `w_buffer`
+/// must also be a valid, non-null pointer to a live `BufT`).
+#[must_use]
+pub unsafe fn insecure_flag(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u32) -> *mut u32 {
+    if opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        match opt_idx {
+            OptIndex::Wrap => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_wrap_flags),
+            OptIndex::Statusline => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_stl_flags),
+            OptIndex::Winbar => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_wbr_flags),
+            OptIndex::Foldexpr => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_fde_flags),
+            OptIndex::Foldtext => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_fdt_flags),
+            OptIndex::Indentexpr => return std::ptr::addr_of_mut!((*(*wp).w_buffer).b_p_inde_flags),
+            OptIndex::Formatexpr => return std::ptr::addr_of_mut!((*(*wp).w_buffer).b_p_fex_flags),
+            OptIndex::Includeexpr => return std::ptr::addr_of_mut!((*(*wp).w_buffer).b_p_inex_flags),
+            _ => {}
+        }
+    } else {
+        // For global value of window-local options, use flags in w_allbuf_opt.
+        match opt_idx {
+            OptIndex::Wrap => return std::ptr::addr_of_mut!((*wp).w_allbuf_opt.wo_wrap_flags),
+            OptIndex::Foldexpr => return std::ptr::addr_of_mut!((*wp).w_allbuf_opt.wo_fde_flags),
+            OptIndex::Foldtext => return std::ptr::addr_of_mut!((*wp).w_allbuf_opt.wo_fdt_flags),
+            _ => {}
+        }
+    }
+    // Nothing special, return global flags field.
+    std::ptr::addr_of_mut!((*opt_ptr(opt_idx)).flags)
+}
+
+/// Check whether option `opt_idx` was set insecurely (e.g. from a
+/// modeline) (`was_set_insecurely`).
+///
+/// # Safety
+/// Forwarded from [`insecure_flag`]'s own safety doc.
+#[must_use]
+pub unsafe fn was_set_insecurely(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u32) -> bool {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: forwarded from this function's own safety doc.
+    let flagp = unsafe { insecure_flag(wp, opt_idx, opt_flags) };
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *flagp } & crate::option_defs::opt_flags::INSECURE) != 0
+}
+
 /// Get pointer to option variable, given the option and the buffer/
 /// window it should be resolved against (`get_varp_from`). Every
 /// branch below mirrors the original's own big `switch` exactly - see
@@ -4017,6 +4071,93 @@ mod varp_tests {
             as *mut Option<Vec<u8>>;
         unsafe { *varp = Some(b"foo".to_vec()) };
         assert_eq!(syn.b_p_spc, Some(b"foo".to_vec()));
+    }
+
+    #[test]
+    fn insecure_flag_local_wrap_goes_through_w_onebuf_opt() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_onebuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::INSECURE;
+
+        let flagp = unsafe {
+            insecure_flag(&mut win as *mut WinT, OptIndex::Wrap, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        };
+        assert_eq!(unsafe { *flagp }, crate::option_defs::opt_flags::INSECURE);
+    }
+
+    #[test]
+    fn insecure_flag_local_indentexpr_goes_through_w_buffer() {
+        let mut buf = BufT { b_p_inde_flags: crate::option_defs::opt_flags::INSECURE, ..Default::default() };
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+        let flagp = unsafe {
+            insecure_flag(&mut win as *mut WinT, OptIndex::Indentexpr, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        };
+        assert_eq!(unsafe { *flagp }, crate::option_defs::opt_flags::INSECURE);
+    }
+
+    #[test]
+    fn insecure_flag_global_wrap_goes_through_w_allbuf_opt() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_allbuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::INSECURE;
+        // Deliberately leave w_onebuf_opt's own copy clear, to prove
+        // the OPT_GLOBAL branch reads w_allbuf_opt specifically, not
+        // w_onebuf_opt.
+        win.w_onebuf_opt.wo_wrap_flags = 0;
+
+        let flagp = unsafe { insecure_flag(&mut win as *mut WinT, OptIndex::Wrap, 0) };
+        assert_eq!(unsafe { *flagp }, crate::option_defs::opt_flags::INSECURE);
+    }
+
+    #[test]
+    fn insecure_flag_falls_back_to_the_global_options_table() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+
+        // 'tabstop' is a plain option with no window/buffer-local
+        // insecure-flags field of its own, so this exercises the
+        // "nothing special" fallback to the global OPTIONS[] table.
+        let flagp = unsafe { insecure_flag(&mut win as *mut WinT, OptIndex::Tabstop, 0) };
+        let prev = unsafe { *flagp };
+        unsafe { *flagp |= crate::option_defs::opt_flags::INSECURE };
+        assert_ne!(unsafe { *flagp } & crate::option_defs::opt_flags::INSECURE, 0);
+        // Restore, since OPTIONS is genuinely global/shared state.
+        unsafe { *flagp = prev };
+    }
+
+    #[test]
+    fn was_set_insecurely_true_when_the_insecure_bit_is_set() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_onebuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::INSECURE;
+
+        assert!(unsafe {
+            was_set_insecurely(&mut win as *mut WinT, OptIndex::Wrap, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        });
+    }
+
+    #[test]
+    fn was_set_insecurely_false_when_the_insecure_bit_is_clear() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        win.w_onebuf_opt.wo_wrap_flags = 0;
+
+        assert!(!unsafe {
+            was_set_insecurely(&mut win as *mut WinT, OptIndex::Wrap, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        });
+    }
+
+    #[test]
+    fn was_set_insecurely_ignores_unrelated_bits() {
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        // Some other, unrelated flag bit set, but NOT the insecure one.
+        win.w_onebuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::REDR_WIN;
+
+        assert!(!unsafe {
+            was_set_insecurely(&mut win as *mut WinT, OptIndex::Wrap, crate::option_defs::opt_set_flags::OPT_LOCAL)
+        });
     }
 
     #[cfg(windows)]
