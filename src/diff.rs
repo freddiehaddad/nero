@@ -34,11 +34,11 @@
 //! COMPLETE translations, not fast-path-only, since nothing about
 //! either depends on a real diff actually existing.
 //!
-//! Also translated: [`diff_get_corresponding_line`]/[`diff_lnum_win`]
-//! (plus the private `diff_get_corresponding_line_int`) - real,
-//! faithful translations of their "current buffer isn't a diff buffer"
-//! early-return path (always taken today since `diff_buf_idx` always
-//! returns `DB_COUNT`, matching the same reasoning as
+//! Also translated: [`diff_get_corresponding_line`]/[`diff_lnum_win`]/
+//! [`diff_move_to`] (plus the private `diff_get_corresponding_line_int`) -
+//! real, faithful translations of their "current buffer isn't a diff
+//! buffer" early-return path (always taken today since `diff_buf_idx`
+//! always returns `DB_COUNT`, matching the same reasoning as
 //! `diff_check_with_linestatus`), translated ahead of any real caller
 //! (none of `winfloat.c`/`move.c`/`window.c`'s own diff-aware
 //! scroll-binding callers are translated yet).
@@ -330,6 +330,37 @@ pub unsafe fn diff_lnum_win(
         "diff::diff_lnum_win: the real diff-block search is not yet translated - unreachable \
          in practice today since diff_buf_idx always returns DB_COUNT, see this module's own \
          doc comment"
+    );
+}
+
+/// Move `count` times in direction `dir` to the next diff block
+/// (`diff_move_to`).
+///
+/// Only the "current buffer isn't a diff buffer, or there are no
+/// diffs at all" early-return path is translated - always taken today
+/// since `diff_buf_idx` always returns `DB_COUNT` (see this module's
+/// own doc comment). The real diff-block search/cursor-move logic
+/// beyond that point is `unimplemented!()`.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin`/`curtab` must each be a valid, non-null
+/// pointer to a live value.
+#[must_use]
+pub unsafe fn diff_move_to(_dir: i32, _count: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let idx = diff_buf_idx(g.curbuf, g.curtab);
+    // SAFETY: forwarded from this function's own safety doc.
+    let tp_first_diff_is_null = unsafe { &*g.curtab }.tp_first_diff.is_null();
+
+    if idx == crate::buffer_defs::DB_COUNT || tp_first_diff_is_null {
+        return crate::vim_defs::FAIL;
+    }
+
+    unimplemented!(
+        "diff::diff_move_to: the real diff-block search/cursor-move logic is not yet \
+         translated - unreachable in practice today since diff_buf_idx always returns \
+         DB_COUNT, see this module's own doc comment"
     );
 }
 
@@ -682,6 +713,40 @@ mod tests {
 
         let mut wp = WinT::default();
         assert_eq!(unsafe { diff_lnum_win(5, &mut wp as *mut WinT) }, 0);
+    }
+
+    #[test]
+    fn diff_move_to_returns_fail_via_no_diffs_fast_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curbuf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(&mut curbuf as *mut BufT);
+
+        assert_eq!(unsafe { diff_move_to(1, 1) }, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    #[should_panic(expected = "the real diff-block search/cursor-move logic is not yet translated")]
+    fn diff_move_to_panics_when_a_real_diff_search_would_be_needed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curbuf = BufT::default();
+        let buf_ptr = &mut curbuf as *mut BufT;
+        let mut dp = crate::buffer_defs::DiffT {
+            df_next: std::ptr::null_mut(),
+            df_lnum: [0; crate::buffer_defs::DB_COUNT],
+            df_count: [0; crate::buffer_defs::DB_COUNT],
+            is_linematched: false,
+            has_changes: false,
+            df_changes: crate::garray_defs::GarrayT::default(),
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = buf_ptr;
+        tp.tp_first_diff = &mut dp as *mut crate::buffer_defs::DiffT;
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(buf_ptr);
+
+        let _ = unsafe { diff_move_to(1, 1) };
     }
 
     #[test]
