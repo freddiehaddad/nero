@@ -715,6 +715,24 @@ pub(crate) unsafe fn f_haslocaldir(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(has));
 }
 
+/// `browse({save}, {title}, {initdir}, {default})` - put up a file
+/// requester (`f_browse`, `eval/fs.c`). A GUI-only feature - this
+/// crate never runs a GUI, so `has('browse')` is always false and
+/// this always returns an empty string, matching the original's own
+/// real, unconditional body exactly (it never even inspects its own
+/// arguments).
+pub(crate) fn f_browse(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::String(None);
+}
+
+/// `browsedir({title}, {initdir})` - put up a directory requester
+/// (`f_browsedir`, `eval/fs.c`) - a thin, real delegate to
+/// [`f_browse`] in the original itself (not just "the same
+/// behavior") - GUI-only, always an empty string here.
+pub(crate) fn f_browsedir(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    f_browse(argvars, rettv);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -980,6 +998,25 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_pathshorten(&[string(b"foo/bar/baz.txt"), num(0)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(Some(b"f/b/baz.txt".to_vec())));
+    }
+
+    // --- f_browse / f_browsedir ---
+
+    #[test]
+    fn browse_always_returns_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        f_browse(
+            &[num(0), string(b"title"), string(b"/tmp"), string(b"default.txt")],
+            &mut rettv,
+        );
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn browsedir_always_returns_an_empty_string() {
+        let mut rettv = TypvalT::default();
+        f_browsedir(&[string(b"title"), string(b"/tmp")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
     }
 
     // --- f_filereadable ---

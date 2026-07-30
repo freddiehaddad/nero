@@ -416,6 +416,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"tr"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_tr });
         m.insert(&b"isdirectory"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_isdirectory });
         m.insert(&b"isabsolutepath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_isabsolutepath });
+        m.insert(&b"browse"[..], EvalFuncDefT { min_argc: 4, max_argc: 4, base_arg: BASE_NONE, func: crate::eval::fs::f_browse });
+        m.insert(&b"browsedir"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: BASE_NONE, func: crate::eval::fs::f_browsedir });
         m.insert(&b"delete"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_delete });
         m.insert(&b"filereadable"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_filereadable });
         m.insert(&b"filewritable"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_filewritable });
@@ -8062,6 +8064,8 @@ mod tests {
             "tr",
             "isdirectory",
             "isabsolutepath",
+            "browse",
+            "browsedir",
             "delete",
             "filereadable",
             "filewritable",
