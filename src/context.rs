@@ -23,6 +23,14 @@
 //! (translated near-verbatim below) which explicitly names exactly
 //! this "skipped `ctx_switch()`" usage pattern as a first-class,
 //! intentional no-op case - not an edge case being special-cased away.
+//!
+//! `ctx_free` (frees a `Context`'s own `regs`/`jumps`/`bufs`/`gvars`/
+//! `funcs` fields) needs NO Rust equivalent at all: `context_defs.rs`'s
+//! `Context` already models every one of those fields as an owned
+//! `Option<Vec<u8>>`/`Vec<Object>`, so Rust's own `Drop` impl already
+//! performs the exact same cleanup automatically - the same reasoning
+//! already established for `optval_free`/`ga_clear_strings` elsewhere
+//! in this crate.
 
 use crate::context_defs::{CtxSwitch, CtxSwitchMode, CtxWin};
 
