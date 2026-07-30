@@ -400,6 +400,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"strchars"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strchars });
         m.insert(&b"strwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strwidth });
         m.insert(&b"strdisplaywidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strdisplaywidth });
+        m.insert(&b"strutf16len"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strutf16len });
         m.insert(&b"stridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_stridx });
         m.insert(&b"strridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_strridx });
         m.insert(&b"strgetchar"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strgetchar });
@@ -408,6 +409,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"byteidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidx });
         m.insert(&b"byteidxcomp"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_byteidxcomp });
         m.insert(&b"charidx"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_charidx });
+        m.insert(&b"utf16idx"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_utf16idx });
         m.insert(&b"strcharpart"[..], EvalFuncDefT { min_argc: 2, max_argc: 4, base_arg: 1, func: f_strcharpart });
         m.insert(&b"getpid"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getpid });
         m.insert(&b"tr"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_tr });
@@ -4404,6 +4406,40 @@ unsafe fn f_strdisplaywidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(width - col));
 }
 
+/// `strutf16len({string} [, {countcc}])` - the number of UTF-16 code
+/// units `{string}` would occupy after converting it to UTF-16
+/// (`f_strutf16len`, `strings.c`). When `{countcc}` is truthy,
+/// composing characters are counted separately; otherwise (the
+/// default) they're folded into the preceding base character, per
+/// [`crate::mbyte::mb_ptr2char_adv`]/[`crate::mbyte::mb_cptr2char_adv`].
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `{countcc}` is falsy (the default),
+/// forwarded from [`crate::mbyte::mb_ptr2char_adv`]'s own safety doc.
+unsafe fn f_strutf16len(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let countcc = argvars.len() > 1 && crate::eval::typval::tv_get_bool(&argvars[1]) != 0;
+
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut len: i64 = 0;
+    let mut p = 0usize;
+    while p < s.len() {
+        let (ch, adv) = if countcc {
+            crate::mbyte::mb_cptr2char_adv(&s[p..])
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mbyte::mb_ptr2char_adv(&s[p..]) }
+        };
+        if ch > 0xFFFF {
+            len += 1;
+        }
+        len += 1;
+        p += adv.max(1);
+    }
+    rettv.value = TypvalValue::Number(len);
+}
+
 /// Byte-level `strstr()` equivalent: the first index where `needle`
 /// occurs in `haystack`, or `None`. An empty `needle` matches at index
 /// `0`, matching C's own `strstr("", "")`/`strstr(anything, "")`
@@ -4696,6 +4732,77 @@ unsafe fn f_charidx(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 
     rettv.value = TypvalValue::Number(if len > 0 { len - 1 } else { 0 });
+}
+
+/// `utf16idx({string}, {idx} [, {countcc} [, {charidx}]])` - the
+/// UTF-16 code unit index of the byte (or, when `{charidx}` is
+/// truthy, character) at `{idx}` in `{string}` (`f_utf16idx`,
+/// `strings.c`) - the companion of [`f_charidx`], converting to
+/// UTF-16 code units instead of characters. An `{idx}` in the middle
+/// of a UTF-8 sequence is rounded down to the start of that sequence.
+///
+/// # Safety
+/// Touches `OPTION_VARS` whenever `{countcc}` is falsy (the default),
+/// forwarded from [`crate::mbyte::utfc_ptr2len`]'s own safety doc.
+unsafe fn f_utf16idx(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let mut idx = crate::eval::typval::tv_get_number(&argvars[1]);
+    if idx < 0 {
+        return;
+    }
+
+    let mut countcc = false;
+    let mut charidx = false;
+    if argvars.len() > 2 {
+        countcc = crate::eval::typval::tv_get_bool(&argvars[2]) != 0;
+        if argvars.len() > 3 {
+            charidx = crate::eval::typval::tv_get_bool(&argvars[3]) != 0;
+        }
+    }
+
+    let mut p = 0usize;
+    let mut len: i64 = 0;
+    let mut utf16idx: i64 = 0;
+    loop {
+        let keep_going = if charidx { idx >= 0 } else { p as i64 <= idx };
+        if !keep_going {
+            break;
+        }
+
+        if p >= s.len() {
+            let matched = if charidx { idx == 0 } else { p as i64 == idx };
+            if matched {
+                rettv.value = TypvalValue::Number(len);
+            }
+            return;
+        }
+
+        // Captured BEFORE this character's own possible surrogate-pair
+        // increment below, matching the original's exact placement -
+        // this is what makes an `{idx}` landing mid-character round
+        // DOWN to that character's own start.
+        utf16idx = len;
+
+        let clen = if countcc {
+            crate::mbyte::utf_ptr2len(&s[p..])
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) }
+        };
+        let c = if clen > 1 { crate::mbyte::utf_ptr2char(&s[p..]) } else { i32::from(s[p]) };
+        if c > 0xFFFF {
+            len += 1;
+        }
+        p += usize::try_from(clen).unwrap_or(1).max(1);
+        if charidx {
+            idx -= 1;
+        }
+        len += 1;
+    }
+
+    rettv.value = TypvalValue::Number(utf16idx);
 }
 
 /// `strcharpart({src}, {start} [, {len} [, {skipcc}]])` - like
@@ -7938,6 +8045,7 @@ mod tests {
             "strchars",
             "strwidth",
             "strdisplaywidth",
+            "strutf16len",
             "stridx",
             "strridx",
             "strgetchar",
@@ -7946,6 +8054,7 @@ mod tests {
             "byteidx",
             "byteidxcomp",
             "charidx",
+            "utf16idx",
             "strcharpart",
             "getpid",
             "tr",
@@ -12594,6 +12703,161 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_charidx(&[string(b"abc"), num(-1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    // --- f_strutf16len ---
+
+    #[test]
+    fn strutf16len_plain_ascii_one_unit_per_byte() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strutf16len(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn strutf16len_empty_string_is_zero() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_strutf16len(&[string(b"")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn strutf16len_char_above_bmp_needs_a_surrogate_pair() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // U+1F600 (an emoji) is above the Basic Multilingual Plane, so
+        // it needs 2 UTF-16 code units (a surrogate pair).
+        unsafe { f_strutf16len(&[string("\u{1F600}".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn strutf16len_default_folds_a_composing_mark_into_the_base_char() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // Default (countcc omitted/falsy): "e" + COMBINING ACUTE ACCENT
+        // is folded into ONE unit via mb_ptr2char_adv (its own base
+        // codepoint, 0x65, is well under 0xFFFF - no surrogate needed).
+        let s = "e\u{0301}".as_bytes();
+        unsafe { f_strutf16len(&[string(s)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn strutf16len_countcc_counts_the_composing_mark_separately() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        let s = "e\u{0301}".as_bytes();
+        unsafe { f_strutf16len(&[string(s), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    // --- f_utf16idx ---
+
+    #[test]
+    fn utf16idx_ascii_byte_index_equals_utf16_index() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        // Every ASCII byte is its own 1-unit character, so byte index 2
+        // ('l' in "hello") is also UTF-16 index 2.
+        unsafe { f_utf16idx(&[string(b"hello"), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn utf16idx_exactly_at_the_byte_length_returns_the_utf16_length() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(b"hi"), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn utf16idx_past_the_byte_length_is_negative_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(b"hi"), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn utf16idx_negative_index_is_negative_one() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(b"hi"), num(-1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn utf16idx_a_byte_index_mid_surrogate_char_rounds_down_to_its_start() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "a" (1 byte, 1 unit) + U+1F600 (4 UTF-8 bytes, 2 UTF-16
+        // units) + "b" (1 byte, 1 unit): byte offsets are a=0,
+        // emoji=1..=4, b=5.
+        let s = "a\u{1F600}b".as_bytes();
+        assert_eq!(s.len(), 6);
+
+        // Byte index 2 (mid-way through the emoji's own 4 UTF-8 bytes)
+        // rounds DOWN to the emoji's own start: UTF-16 index 1 (right
+        // after "a"'s single unit).
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(2)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        // Byte index 5 ("b") lands after "a" (1 unit) + the emoji's
+        // surrogate pair (2 units) = UTF-16 index 3.
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        // Exactly at the byte length (6) reports the whole string's
+        // UTF-16 length: 1 + 2 + 1 = 4.
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(6)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+    }
+
+    #[test]
+    fn utf16idx_charidx_true_treats_idx_as_a_character_index() {
+        let _guard = crate::globals::global_state_test_lock();
+        let s = "a\u{1F600}b".as_bytes();
+
+        // Character index 1 (the emoji itself, 0-based: a=0, emoji=1,
+        // b=2) resolves to UTF-16 index 1, matching the byte-index
+        // result for landing on/inside the same character.
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(1), num(0), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        // Character index 2 ("b") resolves to UTF-16 index 3, matching
+        // the byte-index-5 result above.
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(2), num(0), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+    }
+
+    #[test]
+    fn utf16idx_countcc_changes_which_byte_starts_a_new_unit() {
+        let _guard = crate::globals::global_state_test_lock();
+        // "e" + COMBINING ACUTE ACCENT: 1 + 2 = 3 bytes total.
+        let s = "e\u{0301}".as_bytes();
+        assert_eq!(s.len(), 3);
+
+        // Default (countcc=false, folded): the whole 3-byte sequence
+        // counts as ONE UTF-16 unit, so byte index 1 (mid-sequence,
+        // the start of the combining mark) rounds down to unit 0.
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        // countcc=true (separate): the combining mark is its own
+        // character, so byte index 1 (its own start) is UTF-16 unit 1
+        // (right after "e"'s own unit 0).
+        let mut rettv = TypvalT::default();
+        unsafe { f_utf16idx(&[string(s), num(1), num(1)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
     }
 
     // --- f_strcharpart ---
