@@ -228,11 +228,13 @@
 //! (character count, composing-aware via the new
 //! [`crate::mbyte::mb_ptr2char_adv`]/[`crate::mbyte::mb_cptr2char_adv`]),
 //! `strwidth()` (display cells, via the new
-//! [`crate::mbyte::mb_string2cells`]), `stridx()`/`strridx()`
-//! (forward/reverse substring search), `strgetchar()` (character at a
-//! character index), `strpart()` (byte or, with `{chars}`, character-
-//! counted substring extraction), and `strtrans()` (unprintable-
-//! character escaping, via the already-translated
+//! [`crate::mbyte::mb_string2cells`]), `strdisplaywidth()` (display
+//! cells if shown starting at a given screen column, accounting for
+//! `'tabstop'`, via `crate::plines::linetabsize_col`), `stridx()`/
+//! `strridx()` (forward/reverse substring search), `strgetchar()`
+//! (character at a character index), `strpart()` (byte or, with
+//! `{chars}`, character-counted substring extraction), and
+//! `strtrans()` (unprintable-character escaping, via the already-translated
 //! [`crate::charset::transstr`]).
 //!
 //! Also `byteidx()`/`byteidxcomp()` (the byte index of the Nth
@@ -397,6 +399,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"strcharlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strcharlen });
         m.insert(&b"strchars"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strchars });
         m.insert(&b"strwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strwidth });
+        m.insert(&b"strdisplaywidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strdisplaywidth });
         m.insert(&b"stridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_stridx });
         m.insert(&b"strridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_strridx });
         m.insert(&b"strgetchar"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: f_strgetchar });
@@ -4373,6 +4376,34 @@ unsafe fn f_strwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(unsafe { crate::mbyte::mb_string2cells(&s) } as i64);
 }
 
+/// `strdisplaywidth({string} [, {col}])` - the number of display cells
+/// `{string}` would occupy if displayed starting at screen column
+/// `{col}` (default `0`), accounting for `'tabstop'` (`f_strdisplaywidth`,
+/// `strings.c`), via `crate::plines::linetabsize_col`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid (forwarded from
+/// [`crate::plines::linetabsize_col`]'s own safety doc).
+unsafe fn f_strdisplaywidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let s = crate::eval::typval::tv_get_string(&argvars[0]);
+    let col = if argvars.len() > 1 {
+        crate::eval::typval::tv_get_number(&argvars[1]) as i32
+    } else {
+        0
+    };
+    // linetabsize_col's own scan relies on a NUL terminator to know
+    // where to stop (it passes MAXCOL, not s.len(), as its own upper
+    // bound) - tv_get_string's returned Vec<u8> carries no trailing
+    // NUL of its own (a different convention from line-storage
+    // Vec<u8>s), so one must be appended explicitly here.
+    let mut s_nul = s;
+    s_nul.push(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let width = unsafe { crate::plines::linetabsize_col(col, &s_nul) };
+    rettv.value = TypvalValue::Number(i64::from(width - col));
+}
+
 /// Byte-level `strstr()` equivalent: the first index where `needle`
 /// occurs in `haystack`, or `None`. An empty `needle` matches at index
 /// `0`, matching C's own `strstr("", "")`/`strstr(anything, "")`
@@ -7906,6 +7937,7 @@ mod tests {
             "strcharlen",
             "strchars",
             "strwidth",
+            "strdisplaywidth",
             "stridx",
             "strridx",
             "strgetchar",
@@ -12288,6 +12320,44 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_strwidth(&[string("一".as_bytes())], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn strdisplaywidth_plain_ascii_no_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _globals_guard =
+            WinGlobalsGuard::set(&mut win as *mut crate::buffer_defs::WinT, &mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_strdisplaywidth(&[string(b"hello")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(5));
+    }
+
+    #[test]
+    fn strdisplaywidth_tab_accounts_for_the_starting_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _globals_guard =
+            WinGlobalsGuard::set(&mut win as *mut crate::buffer_defs::WinT, &mut tp as *mut crate::buffer_defs::TabpageT);
+
+        // A tab starting at column 0 fills to the next 8-column tab
+        // stop: 8 cells.
+        let mut rettv = TypvalT::default();
+        unsafe { f_strdisplaywidth(&[string(b"\t")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(8));
+
+        // The same tab starting at column 3 only needs 5 more cells to
+        // reach the next 8-column tab stop (column 8).
+        let mut rettv2 = TypvalT::default();
+        unsafe { f_strdisplaywidth(&[string(b"\t"), num(3)], &mut rettv2) };
+        assert_eq!(rettv2.value, TypvalValue::Number(5));
     }
 
     // --- f_stridx / f_strridx ---
