@@ -75,6 +75,16 @@
 //! complete, faithful translation of every branch, not a narrowing;
 //! see this function's own doc comment for the full reasoning).
 //!
+//! Also translated: `mark_buffer_iter` (+ its own private
+//! `next_buffer_mark` helper) - iterates a buffer's own local marks
+//! (`b_last_cursor`/`b_last_insert`/`b_last_change`/
+//! `b_namedm['a'..='z']`), skipping unset (`lnum == 0`) ones. Replaces
+//! the original's own `const void *iter` pointer-identity-based state
+//! machine with a safe `MarkBufferIter` enum instead of literal
+//! pointer-arithmetic tricks - see that type's own doc comment. No
+//! real translated caller yet (needs `shada.c`) - harvested anyway,
+//! matching this crate's established ahead-of-caller precedent.
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
 //!   `nvim_del_mark`'s own API-layer helpers (`api/extmark.c`, not
@@ -896,6 +906,84 @@ pub fn clrallmarks(buf: &mut crate::buffer_defs::BufT, timestamp: Timestamp) {
         clear_fmark(&mut buf.b_changelist[i], timestamp);
     }
     buf.b_changelistlen = 0;
+}
+
+/// Safe, explicit iteration state for [`mark_buffer_iter`], replacing
+/// the original's own `const void *iter` pointer-identity-based state
+/// machine (`iter == &(buf->b_last_cursor)`/etc., plus raw pointer
+/// arithmetic - `(const fmark_T *)iter - &(buf->b_namedm[0])` - to
+/// recover a named-mark index from an opaque pointer). Matches this
+/// crate's established "safe enum instead of a literal pointer-
+/// arithmetic trick" precedent (e.g. `DictitemVariant`); sound because
+/// every real caller only ever passes this value back verbatim,
+/// never interprets its bits directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkBufferIter {
+    /// `buf.b_last_cursor` (`"`).
+    LastCursor,
+    /// `buf.b_last_insert` (`^`).
+    LastInsert,
+    /// `buf.b_last_change` (`.`).
+    LastChange,
+    /// `buf.b_namedm[0..=25]` (`'a'..='z'`).
+    Named(u8),
+}
+
+/// Advance the buffer-mark iteration state by exactly one step,
+/// returning the next mark's own 1-byte name, the state to pass back
+/// on the NEXT call, and the mark itself (`next_buffer_mark`).
+/// `state == None` means "start from the very beginning" (matching the
+/// original's own `NUL` sentinel for `*mark_name`); `None` is also this
+/// function's own return value once iteration exhausts `'z'`
+/// (matching the original's own `case 'z': return NULL;`).
+fn next_buffer_mark(buf: &BufT, state: Option<MarkBufferIter>) -> Option<(u8, MarkBufferIter, &FmarkT)> {
+    let next_state = match state {
+        None => MarkBufferIter::LastCursor,
+        Some(MarkBufferIter::LastCursor) => MarkBufferIter::LastInsert,
+        Some(MarkBufferIter::LastInsert) => MarkBufferIter::LastChange,
+        Some(MarkBufferIter::LastChange) => MarkBufferIter::Named(0),
+        Some(MarkBufferIter::Named(25)) => return None,
+        Some(MarkBufferIter::Named(i)) => MarkBufferIter::Named(i + 1),
+    };
+    let (name, fm) = match next_state {
+        MarkBufferIter::LastCursor => (b'"', &buf.b_last_cursor),
+        MarkBufferIter::LastInsert => (b'^', &buf.b_last_insert),
+        MarkBufferIter::LastChange => (b'.', &buf.b_last_change),
+        MarkBufferIter::Named(i) => (b'a' + i, &buf.b_namedm[i as usize]),
+    };
+    Some((name, next_state, fm))
+}
+
+/// Iterate over a buffer's own local marks (`b_last_cursor`/
+/// `b_last_insert`/`b_last_change`/`b_namedm['a'..='z']`), skipping any
+/// with `mark.lnum == 0` (unset) (`mark_buffer_iter`).
+///
+/// `iter` is `None` to start a fresh iteration; every subsequent call
+/// passes back whatever this function itself returned as its own
+/// `MarkBufferIter` last time. Returns `None` once iteration is
+/// exhausted, or `Some((next_iter, name, fm))` otherwise - `fm` is an
+/// owned clone of the mark (`FmarkT` isn't `Copy`, given its own
+/// `additional_data: Option<Box<AdditionalData>>` field; a caller only
+/// ever reads this value, never mutates it back into the buffer, so an
+/// owned clone is a faithful, safe substitute for the original's own
+/// `*fm = *iter_mark;` struct-copy-out).
+///
+/// Collapses the original's own `char *name`/`fmark_T *fm` OUT
+/// parameters (plus its own `mark_name`-vs-`iter_off` reconstruction
+/// dance, unreachable in practice since `next_buffer_mark` already
+/// always sets a valid name before returning a non-null mark) into one
+/// return value, since this crate's `next_buffer_mark` already
+/// carries the matching name directly, needing no reconstruction.
+#[must_use]
+pub fn mark_buffer_iter(buf: &BufT, iter: Option<MarkBufferIter>) -> Option<(MarkBufferIter, u8, FmarkT)> {
+    let mut state = iter;
+    loop {
+        let (name, next_state, fm) = next_buffer_mark(buf, state)?;
+        if fm.mark.lnum != 0 {
+            return Some((next_state, name, fm.clone()));
+        }
+        state = Some(next_state);
+    }
 }
 
 /// A static scratch `fmark_T` reused by [`pos_to_mark`] when its caller
@@ -2528,6 +2616,92 @@ mod tests {
         assert_eq!(buf.b_op_end.lnum, 0);
         assert_eq!(buf.b_changelistlen, 0);
         assert_eq!(buf.b_last_cursor.timestamp, 999);
+    }
+
+    #[test]
+    fn next_buffer_mark_starting_state_walks_the_3_special_marks_in_order() {
+        let buf = BufT::default();
+        let (name1, state1, _) = next_buffer_mark(&buf, None).unwrap();
+        assert_eq!(name1, b'"');
+        assert_eq!(state1, MarkBufferIter::LastCursor);
+
+        let (name2, state2, _) = next_buffer_mark(&buf, Some(state1)).unwrap();
+        assert_eq!(name2, b'^');
+        assert_eq!(state2, MarkBufferIter::LastInsert);
+
+        let (name3, state3, _) = next_buffer_mark(&buf, Some(state2)).unwrap();
+        assert_eq!(name3, b'.');
+        assert_eq!(state3, MarkBufferIter::LastChange);
+
+        let (name4, state4, _) = next_buffer_mark(&buf, Some(state3)).unwrap();
+        assert_eq!(name4, b'a');
+        assert_eq!(state4, MarkBufferIter::Named(0));
+    }
+
+    #[test]
+    fn next_buffer_mark_after_named_z_returns_none() {
+        let buf = BufT::default();
+        assert!(next_buffer_mark(&buf, Some(MarkBufferIter::Named(25))).is_none());
+    }
+
+    #[test]
+    fn next_buffer_mark_named_sequence_reaches_z_at_index_25() {
+        let buf = BufT::default();
+        let (name, state, _) = next_buffer_mark(&buf, Some(MarkBufferIter::Named(24))).unwrap();
+        assert_eq!(name, b'z');
+        assert_eq!(state, MarkBufferIter::Named(25));
+    }
+
+    #[test]
+    fn mark_buffer_iter_totally_unset_buffer_returns_none_immediately() {
+        let buf = BufT::default();
+        assert!(mark_buffer_iter(&buf, None).is_none());
+    }
+
+    #[test]
+    fn mark_buffer_iter_skips_unset_special_marks_to_find_the_first_set_one() {
+        let mut buf = BufT::default();
+        buf.b_last_change.mark.lnum = 5;
+        let (state, name, fm) = mark_buffer_iter(&buf, None).unwrap();
+        assert_eq!(name, b'.');
+        assert_eq!(fm.mark.lnum, 5);
+        assert_eq!(state, MarkBufferIter::LastChange);
+        // Iteration continues into the (all-unset) named marks and
+        // finds nothing further.
+        assert!(mark_buffer_iter(&buf, Some(state)).is_none());
+    }
+
+    #[test]
+    fn mark_buffer_iter_skips_unset_named_marks_to_find_a_set_one() {
+        let mut buf = BufT::default();
+        buf.b_namedm[3].mark.lnum = 7; // 'd'
+        let (state, name, fm) = mark_buffer_iter(&buf, None).unwrap();
+        assert_eq!(name, b'd');
+        assert_eq!(fm.mark.lnum, 7);
+        assert_eq!(state, MarkBufferIter::Named(3));
+        assert!(mark_buffer_iter(&buf, Some(state)).is_none());
+    }
+
+    #[test]
+    fn mark_buffer_iter_walks_the_full_sequence_when_everything_is_set() {
+        let mut buf = BufT::default();
+        buf.b_last_cursor.mark.lnum = 1;
+        buf.b_last_insert.mark.lnum = 2;
+        buf.b_last_change.mark.lnum = 3;
+        for i in 0..26 {
+            buf.b_namedm[i].mark.lnum = 100 + i as i32;
+        }
+
+        let mut names = Vec::new();
+        let mut state = None;
+        while let Some((next_state, name, _fm)) = mark_buffer_iter(&buf, state) {
+            names.push(name);
+            state = Some(next_state);
+        }
+
+        let mut expected = vec![b'"', b'^', b'.'];
+        expected.extend((b'a'..=b'z').collect::<Vec<u8>>());
+        assert_eq!(names, expected);
     }
 
     #[test]
