@@ -47,6 +47,7 @@ pub mod drawscreen;
 pub mod errors;
 pub mod eval;
 pub mod ex_cmds;
+pub mod ex_cmds2;
 pub mod ex_cmds_defs;
 pub mod ex_docmd;
 pub mod ex_getln;
