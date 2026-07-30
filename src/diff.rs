@@ -43,6 +43,13 @@
 //! (none of `winfloat.c`/`move.c`/`window.c`'s own diff-aware
 //! scroll-binding callers are translated yet).
 //!
+//! Also translated: [`diff_update_line`] - notably, its OWN first
+//! early return (`!(diff_flags & ALL_INLINE_DIFF)`) is genuinely NOT
+//! always taken today (the real `'diffopt'` default includes
+//! `inline:char`) - translated for real rather than assumed; it's the
+//! SECOND check (`diff_buf_idx` returning `DB_COUNT`) that is always
+//! taken today, for the same reason as the functions above.
+//!
 //! Also translated: [`diff_infold`] - its own `idx`/`other`-computing
 //! loop over `tp_diffbuf[]` is real, complete logic (not stubbed),
 //! since it only reads already-real fields; only its OWN early-return
@@ -94,6 +101,9 @@ pub mod diff_flag {
     /// use `'diffanchors'` to anchor the diff (`DIFF_ANCHOR`).
     pub const ANCHOR: i32 = 0x20000;
 }
+
+/// Combination of both inline-diff-caching flags (`ALL_INLINE_DIFF`).
+pub const ALL_INLINE_DIFF: i32 = diff_flag::INLINE_CHAR | diff_flag::INLINE_WORD;
 
 /// `diff_flags` - the parsed bit-flag form of `'diffopt'`. A file-
 /// static in the original; translated as a `pub` `GlobalCell` since
@@ -361,6 +371,45 @@ pub unsafe fn diff_move_to(_dir: i32, _count: i32) -> i32 {
         "diff::diff_move_to: the real diff-block search/cursor-move logic is not yet \
          translated - unreachable in practice today since diff_buf_idx always returns \
          DB_COUNT, see this module's own doc comment"
+    );
+}
+
+/// Called when a line has been updated - clears the cached inline
+/// diff for the diff block containing it, if any, so it is recomputed
+/// (`diff_update_line`).
+///
+/// Unlike this file's other `diff_buf_idx`-gated functions, the FIRST
+/// early return here (`!(diff_flags & ALL_INLINE_DIFF)`) is genuinely
+/// NOT always taken today: the real `'diffopt'` default includes
+/// `inline:char`, setting `DIFF_INLINE_CHAR` - so this crate's own
+/// `DIFF_FLAGS` default already has a bit of `ALL_INLINE_DIFF` set,
+/// and this check is translated for real rather than assumed always
+/// true. It is the SECOND check (`diff_buf_idx` returning `DB_COUNT`)
+/// that is always taken today, for the same reason as this file's
+/// other `diff_buf_idx`-gated functions. The real diff-block search
+/// beyond both checks is `unimplemented!()`.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curtab` must each be a valid, non-null pointer to
+/// a live value.
+pub unsafe fn diff_update_line(_lnum: crate::pos_defs::LinenrT) {
+    // We only care if we are doing inline-diff where we cache the diff results
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *DIFF_FLAGS.get_mut() } & ALL_INLINE_DIFF == 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let idx = diff_buf_idx(g.curbuf, g.curtab);
+    if idx == crate::buffer_defs::DB_COUNT {
+        return;
+    }
+
+    unimplemented!(
+        "diff::diff_update_line: the real diff-block search is not yet translated - \
+         unreachable in practice today since diff_buf_idx always returns DB_COUNT, see this \
+         module's own doc comment"
     );
 }
 
@@ -747,6 +796,48 @@ mod tests {
         let _curbuf_guard = CurbufGuard::set(buf_ptr);
 
         let _ = unsafe { diff_move_to(1, 1) };
+    }
+
+    #[test]
+    fn diff_update_line_returns_early_when_no_inline_diff_flags_are_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *DIFF_FLAGS.get_mut() };
+        unsafe { *DIFF_FLAGS.get_mut() &= !ALL_INLINE_DIFF };
+        // curbuf/curtab left at their bare defaults - if this reached
+        // the diff_buf_idx check (or beyond) it would either return
+        // silently anyway or panic; the point of THIS test is that the
+        // very first check alone already returns, before either.
+        unsafe { diff_update_line(1) };
+        unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    #[test]
+    fn diff_update_line_is_a_noop_when_curbuf_is_not_a_diff_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Default DIFF_FLAGS already has DIFF_INLINE_CHAR set, so this
+        // exercises the SECOND check (diff_buf_idx == DB_COUNT), not
+        // the first.
+        assert_ne!(unsafe { *DIFF_FLAGS.get_mut() } & ALL_INLINE_DIFF, 0);
+        let mut curbuf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(&mut curbuf as *mut BufT);
+
+        unsafe { diff_update_line(1) };
+    }
+
+    #[test]
+    #[should_panic(expected = "the real diff-block search is not yet translated")]
+    fn diff_update_line_panics_when_curbuf_is_a_diff_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curbuf = BufT::default();
+        let buf_ptr = &mut curbuf as *mut BufT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = buf_ptr;
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(buf_ptr);
+
+        unsafe { diff_update_line(1) };
     }
 
     #[test]
