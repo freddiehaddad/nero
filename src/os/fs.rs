@@ -13,7 +13,8 @@
 //! now instead of waiting on that decision.
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
-//! `os_isrealdir`, `os_mkdir`, `os_mkdir_recurse`, `os_rmdir`,
+//! `os_isrealdir`, `os_mkdir`, `os_mkdir_recurse`, `os_file_mkdir`,
+//! `os_rmdir`,
 //! `os_remove`, `os_rename`, `os_file_settime` (regular files only -
 //! see its own doc comment for why directories aren't supported on
 //! Windows), `os_realpath`, `os_fsync`, `os_open`,
@@ -75,8 +76,8 @@
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
 //!   `os_file_owned`/`os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
-//! - `os_file_mkdir`/`os_mkdtemp`: build on the now-real
-//!   [`os_mkdir_recurse`], not ported this pass.
+//! - `os_mkdtemp`: unique temp-directory creation via libuv's own
+//!   `uv_fs_mkdtemp` random-name generation, not yet ported.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
 //! - `os_resolve_shortcut`/`os_is_reparse_point_include`: Windows
@@ -563,6 +564,53 @@ pub fn os_mkdir_recurse(dir: &[u8], mode: i32) -> Result<Option<Vec<u8>>, Vec<u8
     Ok(created)
 }
 
+/// Create the parent directory of a file if it does not exist
+/// (`os_file_mkdir`).
+///
+/// @param fname Full path of the file name whose parent directories
+///              we want to create
+/// @param mode  Permissions for the newly-created directory.
+///
+/// @return `0` for success, `-1` for failure - matches
+/// [`os_mkdir_recurse`]'s own already-established simplification of
+/// the original's separate libuv error code (never surfaced anywhere
+/// in this crate). NOTE: this is the plain `0`/`-1` libuv-style
+/// convention (same as [`os_mkdir`]/[`os_mkdir_recurse`]), NOT the
+/// Vimscript `OK`(`1`)/`FAIL`(`0`) boolean convention - the original's
+/// own doc comment says exactly "0 for success, libuv error code for
+/// failure", not "OK"/"FAIL". The original's own `emsg`/`semsg`
+/// message-display calls on both failure branches are skipped,
+/// keeping the exact same `-1` return value (this crate's established
+/// "skip the deferred message-display side effect" policy).
+#[must_use]
+pub fn os_file_mkdir(fname: &[u8], mode: i32) -> i32 {
+    if crate::path::dir_of_file_exists(fname) {
+        return 0;
+    }
+
+    let tail = crate::path::path_tail_with_sep(fname);
+
+    // The original's own `*last_char = tail + strlen(tail) - 1`
+    // reads `fname`'s OWN LAST byte (since `tail` always points at or
+    // before the very end) - checking whether `fname` ends in a path
+    // separator itself, i.e. has no real file-name component at all
+    // (e.g. "/foo/bar/"). An empty `fname` can never reach here in
+    // practice (the `dir_of_file_exists` check above already returns
+    // `true` for it via `path_tail_with_sep`'s own `tail == 0` fast
+    // path, matching the original's own control flow exactly), but
+    // `fname.last()` is still guarded defensively rather than
+    // unwrapped blindly.
+    if fname.last().is_none_or(|&b| crate::path::vim_ispathsep(i32::from(b))) {
+        // E32: No file name.
+        return -1;
+    }
+
+    match os_mkdir_recurse(&fname[..tail], mode) {
+        Ok(_) => 0,
+        Err(_failed_dir) => -1,
+    }
+}
+
 /// Remove a directory (`os_rmdir`).
 ///
 /// @return `0` for success, `-1` for failure.
@@ -981,6 +1029,47 @@ mod tests {
 
         assert!(os_isdir(&target));
         assert!(created.is_some(), "the real levels should still have been created");
+    }
+
+    #[test]
+    fn os_file_mkdir_is_a_noop_when_parent_already_exists() {
+        let scratch = TempScratch::new("file_mkdir_parent_exists");
+        let fname = scratch.path.join("file.txt");
+        assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), 0);
+        // Nothing besides the already-existing scratch dir should
+        // exist - os_file_mkdir never creates the FILE itself, only
+        // parent directories.
+        assert!(!os_path_exists(&fname));
+    }
+
+    #[test]
+    fn os_file_mkdir_creates_missing_parent_directories() {
+        let scratch = TempScratch::new("file_mkdir_creates_parents");
+        let fname = scratch.path.join("a").join("b").join("file.txt");
+        assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), 0);
+        assert!(os_isdir(&scratch.path.join("a")));
+        assert!(os_isdir(&scratch.path.join("a").join("b")));
+        assert!(!os_path_exists(&fname), "the FILE itself is never created");
+    }
+
+    #[test]
+    fn os_file_mkdir_fails_when_fname_has_no_real_file_name() {
+        let scratch = TempScratch::new("file_mkdir_no_filename");
+        // Ends in a trailing separator: "a/b/" - the "file name"
+        // portion is empty, matching the original's own "E32: No file
+        // name" branch.
+        let mut fname_bytes = path_bytes(&scratch.path.join("a").join("b"));
+        fname_bytes.push(b'/');
+        assert_eq!(os_file_mkdir(&fname_bytes, 0o755), -1);
+    }
+
+    #[test]
+    fn os_file_mkdir_fails_when_a_file_blocks_an_intermediate_level() {
+        let scratch = TempScratch::new("file_mkdir_blocked");
+        let blocker = scratch.path.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let fname = blocker.join("child").join("file.txt");
+        assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), -1);
     }
 
     #[test]
