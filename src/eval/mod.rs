@@ -12,6 +12,7 @@ pub mod eval;
 pub mod executor;
 pub mod buffer;
 pub mod decode;
+pub mod deprecated;
 pub mod encode;
 pub mod fs;
 pub mod funcs;
