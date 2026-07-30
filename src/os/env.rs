@@ -30,13 +30,16 @@
 //! not yet translated).
 //!
 //! Also translated: `restore_env_var` (`#ifdef MSWIN`-only in the
-//! original, matched here via `#[cfg(windows)]`) and
-//! `os_shell_is_cmdexe` - re-examined an earlier session's "needs
-//! `'shell'` parsing logic not yet translated" note and found it was
-//! about a hypothetical CALLER needing a real `'shell'` option value,
-//! not this function's own logic (a pure function of its own `sh`
-//! parameter, needing only the already-real `striequal`/`os_getenv`/
-//! `path_tail`).
+//! original, matched here via `#[cfg(windows)]`), `os_shell_is_cmdexe`
+//! (re-examined an earlier session's "needs `'shell'` parsing logic
+//! not yet translated" note and found it was about a hypothetical
+//! CALLER needing a real `'shell'` option value, not this function's
+//! own logic - a pure function of its own `sh` parameter, needing
+//! only the already-real `striequal`/`os_getenv`/`path_tail`), and
+//! `os_setenv_append_path` (its own sibling deferral note about
+//! needing `path_is_absolute`/a scratch buffer/`ENV_SEPCHAR`
+//! PATH-list manipulation - all either already real or, for the
+//! scratch buffer, unnecessary in Rust; see its own doc comment).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `os_getenv_buf`/`os_getenv_noalloc`: write into `NameBuff`
@@ -63,15 +66,6 @@
 //! - `vim_env_iter`/`vim_env_iter_rev`: only consumed by
 //!   `set_runtimepath_default`/similar (not yet translated).
 //! - `get_env_name`: needs `expand_T` (cmdline completion, phase 7).
-//! - `os_setenv_append_path`: needs `path_is_absolute`/a file-static
-//!   `os_buf` scratch buffer/`ENV_SEPCHAR`/`ENV_SEPSTR` PATH-list
-//!   manipulation - genuinely more involved than its sibling
-//!   `os_shell_is_cmdexe` (now translated below, a pure function of
-//!   its own `sh` parameter needing only `striequal`/`os_getenv`/
-//!   `path_tail` - re-examined and found the earlier "needs `'shell'`
-//!   parsing logic" note above was about the CALLER needing to supply
-//!   a real `'shell'` option value, not a real blocker on this
-//!   function's own, already-tractable logic).
 
 use super::os::NVIM_TESTING;
 use crate::globals::GlobalCell;
@@ -280,6 +274,71 @@ pub fn os_shell_is_cmdexe(sh: &[u8]) -> bool {
         return true;
     }
     crate::strings::striequal(Some(b"cmd.exe"), Some(&sh[crate::path::path_tail(sh)..]))
+}
+
+/// Prepends `fname`'s own containing directory onto `$PATH`
+/// (`os_setenv_append_path`).
+///
+/// `fname` must be an absolute path (matches the original's own
+/// `FUNC_ATTR_NONNULL_ALL`/`path_is_absolute` assertion, returning
+/// `false` if not) - the original's own `internal_error()` message-
+/// display call on that branch is skipped, keeping the exact same
+/// `false` return value (this crate's established "skip the deferred
+/// message-display side effect, keep the exact same state/return
+/// value" policy).
+///
+/// The original's own fixed-size, global `os_buf` scratch buffer has
+/// no equivalent here - a local, dynamically-sized `Vec<u8>` is used
+/// instead, matching this module's own established "`os_getenv_noalloc`'s
+/// 'borrow, don't allocate' optimization is never separately
+/// translated" convention for the same class of C-buffer-reuse
+/// micro-optimization.
+///
+/// `MAX_ENVPATHLEN` (`8192` on Windows, effectively unbounded
+/// elsewhere) is preserved exactly: if appending would meet or exceed
+/// it, nothing is changed and this returns `false`.
+///
+/// # Safety
+/// Same requirement as [`os_setenv`].
+pub unsafe fn os_setenv_append_path(fname: &[u8]) -> bool {
+    // `INT_MAX` in the original (NOT `SIZE_MAX`/`usize::MAX` - a real
+    // bug caught here via a genuine `clippy::absurd_extreme_comparisons`
+    // deny-level error on Unix, where `usize::MAX` made the `>=` check
+    // below vacuously almost-always-false).
+    #[cfg(windows)]
+    const MAX_ENVPATHLEN: usize = 8192;
+    #[cfg(not(windows))]
+    const MAX_ENVPATHLEN: usize = i32::MAX as usize;
+
+    if !crate::path::path_is_absolute(fname) {
+        return false;
+    }
+
+    let tail = crate::path::path_tail_with_sep(fname);
+    let dir = &fname[..tail];
+
+    let path = os_getenv(b"PATH");
+    let path_len = path.as_deref().map_or(0, <[u8]>::len);
+    let new_len = path_len + dir.len() + 2;
+
+    if new_len >= MAX_ENVPATHLEN {
+        return false;
+    }
+
+    let mut temp = Vec::with_capacity(new_len);
+    if let Some(path) = path.as_deref() {
+        if !path.is_empty() {
+            temp.extend_from_slice(path);
+            if path.last() != Some(&(crate::os::os_defs::ENV_SEPCHAR as u8)) {
+                temp.push(crate::os::os_defs::ENV_SEPCHAR as u8);
+            }
+        }
+    }
+    temp.extend_from_slice(dir);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { os_setenv(b"PATH", &temp, 1) };
+    true
 }
 
 /// Gets the hostname of the current machine (`os_get_hostname`).
@@ -1348,6 +1407,54 @@ pub(crate) mod tests {
         let _lock = homedir_test_lock();
         let _guard = EnvVarGuard::set(&[("COMSPEC", None)]);
         assert!(!os_shell_is_cmdexe(b"$COMSPEC"));
+    }
+
+    // --- os_setenv_append_path ---
+
+    #[test]
+    fn os_setenv_append_path_false_for_a_relative_path() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("PATH", Some("existing"))]);
+        assert!(!unsafe { os_setenv_append_path(b"relative/nvim") });
+        // PATH must be left completely untouched.
+        assert_eq!(os_getenv(b"PATH"), Some(b"existing".to_vec()));
+    }
+
+    #[test]
+    fn os_setenv_append_path_sets_path_directly_when_unset() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("PATH", None)]);
+        assert!(unsafe { os_setenv_append_path(b"/tmp/somedir/nvim") });
+        assert_eq!(os_getenv(b"PATH"), Some(b"/tmp/somedir".to_vec()));
+    }
+
+    #[test]
+    fn os_setenv_append_path_appends_with_a_separator_when_path_is_set() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("PATH", Some("/usr/bin"))]);
+        assert!(unsafe { os_setenv_append_path(b"/tmp/somedir/nvim") });
+        let expected = format!("/usr/bin{}/tmp/somedir", crate::os::os_defs::ENV_SEPCHAR);
+        assert_eq!(os_getenv(b"PATH"), Some(expected.into_bytes()));
+    }
+
+    #[test]
+    fn os_setenv_append_path_does_not_double_up_an_existing_trailing_separator() {
+        let _lock = homedir_test_lock();
+        let existing = format!("/usr/bin{}", crate::os::os_defs::ENV_SEPCHAR);
+        let _guard = EnvVarGuard::set(&[("PATH", Some(&existing))]);
+        assert!(unsafe { os_setenv_append_path(b"/tmp/somedir/nvim") });
+        let expected = format!("/usr/bin{}/tmp/somedir", crate::os::os_defs::ENV_SEPCHAR);
+        assert_eq!(os_getenv(b"PATH"), Some(expected.into_bytes()));
+    }
+
+    #[test]
+    fn os_setenv_append_path_extracts_only_the_containing_directory() {
+        let _lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("PATH", None)]);
+        // The FILE component ("nvim.exe") itself must never appear in
+        // the appended PATH entry - only its containing directory.
+        assert!(unsafe { os_setenv_append_path(b"/opt/nvim-nightly/bin/nvim.exe") });
+        assert_eq!(os_getenv(b"PATH"), Some(b"/opt/nvim-nightly/bin".to_vec()));
     }
 
     // --- restore_env_var ---
