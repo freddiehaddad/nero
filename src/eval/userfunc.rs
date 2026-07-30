@@ -237,6 +237,19 @@
 //! in its own right, not yet translated) - both are translated ahead
 //! of that real caller, matching this crate's established "small
 //! self-contained helper ahead of its larger caller" precedent.
+//!
+//! Also translated: `translated_function_exists` - whether an
+//! ALREADY-RESOLVED name (a builtin verbatim, or a script-local
+//! function's own `<SNR>{sid}_{name}` form) genuinely exists, via
+//! `builtin_function` + `crate::eval::funcs::find_internal_func` +
+//! `find_func`. Its own real caller, `function_exists`, needs
+//! `trans_function_name` (a substantial name-resolution/scoping
+//! function built on `get_lval`, not yet translated) - correctly left
+//! deferred, but `translated_function_exists` itself needed no new
+//! infrastructure at all (every one of its own dependencies already
+//! existed), matching this crate's established "small,
+//! self-contained, no design freedom to get wrong" precedent for
+//! translating ahead of a real caller.
 
 use crate::ascii_defs::ascii_isdigit;
 use crate::eval::typval_defs::{
@@ -740,6 +753,31 @@ pub fn builtin_function(name: &[u8]) -> bool {
         return false;
     }
     !name.contains(&b'#')
+}
+
+/// Whether a function whose ALREADY-RESOLVED name is `name` genuinely
+/// exists - either a real, registered builtin (via
+/// [`builtin_function`]/`crate::eval::funcs::find_internal_func`), or
+/// a real user-defined function found in the function hash table (via
+/// [`find_func`]) - `translated_function_exists`.
+///
+/// `name` must already be in its "real" form (e.g. a builtin name
+/// verbatim, or `<SNR>{sid}_{name}` for a script-local user function);
+/// this function does no name resolution/scoping of its own, matching
+/// the original's own contract (its real caller, `function_exists`,
+/// does that resolution first via `trans_function_name`, not yet
+/// translated - a substantial, separate undertaking). Translated
+/// ahead of that real caller since every one of ITS OWN dependencies
+/// (`builtin_function`, `find_internal_func`, `find_func`) already
+/// exists, matching this crate's established "small, self-contained,
+/// no design freedom to get wrong" precedent for such functions.
+#[must_use]
+pub fn translated_function_exists(name: &[u8]) -> bool {
+    if builtin_function(name) {
+        crate::eval::funcs::find_internal_func(name).is_some()
+    } else {
+        !find_func(name).is_null()
+    }
 }
 
 /// Errors for when calling a function (`FnameTransError`).
@@ -3973,6 +4011,37 @@ mod tests {
         // name[1] doesn't exist (matches the original's own read of a
         // C string's NUL terminator, which is never ':').
         assert!(builtin_function(b"x"));
+    }
+
+    #[test]
+    fn translated_function_exists_true_for_a_real_builtin() {
+        assert!(translated_function_exists(b"len"));
+        assert!(translated_function_exists(b"type"));
+    }
+
+    #[test]
+    fn translated_function_exists_false_for_an_unknown_builtin_shaped_name() {
+        // Lowercase-starting, no ':'/'#' - builtin_function's own
+        // "could be a builtin" heuristic accepts the shape, but no
+        // such builtin is actually registered.
+        assert!(!translated_function_exists(b"not_a_real_builtin_or_userfunc"));
+    }
+
+    #[test]
+    fn translated_function_exists_true_for_a_registered_user_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp =
+            Box::new(UfuncT { uf_name: b"TranslatedExistsUserFunc\0".to_vec(), ..Default::default() });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+        assert!(translated_function_exists(b"TranslatedExistsUserFunc"));
+    }
+
+    #[test]
+    fn translated_function_exists_false_for_an_unregistered_user_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        assert!(!translated_function_exists(b"NoSuchUserFunctionAtAll"));
     }
 
     #[test]

@@ -7058,6 +7058,10 @@ mod tests {
 
     #[test]
     fn var_item_copy_of_a_number_is_a_plain_value_copy() {
+        // var_item_copy always increments/decrements the shared
+        // VAR_ITEM_COPY_RECURSE counter around its own body (even for
+        // a plain scalar), regardless of `deep` - needs the lock.
+        let _lock = crate::globals::global_state_test_lock();
         let mut to = TypvalT::default();
         let from = TypvalT { value: TypvalValue::Number(42), ..Default::default() };
         let ret = unsafe { var_item_copy(std::ptr::null(), &from, &mut to, false, 0) };
@@ -7067,6 +7071,7 @@ mod tests {
 
     #[test]
     fn var_item_copy_of_a_null_list_is_a_null_list() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut to = TypvalT::default();
         let from = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
         let ret = unsafe { var_item_copy(std::ptr::null(), &from, &mut to, false, 0) };
@@ -7123,6 +7128,11 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "var_item_copy(UNKNOWN)")]
     fn var_item_copy_of_unknown_panics_in_debug() {
+        // Also touches the shared VAR_ITEM_COPY_RECURSE counter (the
+        // increment happens before the match on `from.value`, so even
+        // this panicking path bumps it) - needs the lock like every
+        // other direct var_item_copy call in this file.
+        let _lock = crate::globals::global_state_test_lock();
         let mut to = TypvalT::default();
         let from = TypvalT::default();
         unsafe { var_item_copy(std::ptr::null(), &from, &mut to, false, 0) };
