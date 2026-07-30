@@ -111,6 +111,39 @@ fn cmdline_is_active() -> bool {
     state & crate::state_defs::mode::CMDLINE as i32 != 0
 }
 
+/// `getcmdcomplpat()` - the current command-line completion pattern
+/// (`f_getcmdcomplpat`, `ex_getln.c`) - always empty today, since
+/// `cmdline_is_active` is always `false` (the original's own
+/// `get_cmdline_completion_pattern` checks `cmdline_star > 0` first -
+/// always false, `GLOBALS.cmdline_star` defaults to `0` and nothing
+/// yet sets it - then falls through to the same "no active command
+/// line" `NULL` result either way).
+pub fn f_getcmdcomplpat(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = if cmdline_is_active() {
+        unimplemented!("getcmdcomplpat(): needs a real, live command-line-editing state")
+    } else {
+        crate::eval::typval_defs::TypvalValue::String(None)
+    };
+}
+
+/// `getcmdcompltype()` - the current command-line completion type
+/// (`f_getcmdcompltype`, `ex_getln.c`) - always empty today, matching
+/// [`f_getcmdcomplpat`]'s own exact reasoning (`get_cmdline_completion`
+/// has the identical `cmdline_star`/`get_ccline_ptr` structure).
+pub fn f_getcmdcompltype(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = if cmdline_is_active() {
+        unimplemented!("getcmdcompltype(): needs a real, live command-line-editing state")
+    } else {
+        crate::eval::typval_defs::TypvalValue::String(None)
+    };
+}
+
 /// `getcmdline()` - the current command-line input (`f_getcmdline`,
 /// `ex_getln.c`) - always empty today, since `cmdline_is_active` is
 /// always `false`.
@@ -261,6 +294,28 @@ mod tests {
 
         // SAFETY: forwarded from the lock reasoning above.
         unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn getcmdcomplpat_is_empty_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdcomplpat(&[], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
+        );
+    }
+
+    #[test]
+    fn getcmdcompltype_is_empty_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdcompltype(&[], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
+        );
     }
 
     #[test]
