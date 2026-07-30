@@ -13,6 +13,17 @@
 //! (`check_arglist_locked`) they and future arglist-mutating functions
 //! share.
 //!
+//! Also translated: [`do_one_arg`] - isolates one whitespace-separated
+//! (outside backtick-quoted spans) argument from a command-line-style
+//! byte string, respecting backslash-escaped characters via the
+//! already-real `charset::rem_backslash`. Needed only already-real
+//! `charset::rem_backslash`/`skipwhite` and `ascii_defs::ascii_isspace`,
+//! making it genuinely standalone even though its own real caller
+//! (`get_arglist`, same file) needs `GA_APPEND`/real argument-list
+//! building not yet translated. See its own doc comment for a real,
+//! hand-traced observation about its apparent "compaction" never
+//! actually shifting anything.
+//!
 //! `al_ga` is stored (see `arglist_defs.rs`) as a byte-erased `GarrayT`,
 //! matching the original's own generic growarray machinery, with no
 //! typed accessor yet for reading/writing real `AentryT` bytes through
@@ -25,10 +36,10 @@
 //! do for any `al_ga` this crate can actually construct today - calling
 //! `ga_clear` alone is behaviorally equivalent.
 //!
-//! Deferred: everything else - `alist_new`/`alist_expand`/`alist_add`/
-//! `alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/`ex_args`/
-//! `ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing real
-//! buffer/window/path-expansion machinery.
+//! Deferred: everything else - `get_arglist`/`alist_new`/`alist_expand`/
+//! `alist_add`/`alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/
+//! `ex_args`/`ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing
+//! real buffer/window/path-expansion machinery.
 
 use crate::arglist_defs::{AentryT, AlistT};
 use crate::globals::GlobalCell;
@@ -109,6 +120,72 @@ pub unsafe fn alist_unlink(al: *mut AlistT) {
         // `Box::into_raw`.
         drop(unsafe { Box::from_raw(al) });
     }
+}
+
+/// Isolates one whitespace-separated (outside backtick-quoted spans)
+/// argument from `str`, respecting backslash-escaped characters via
+/// [`crate::charset::rem_backslash`], NUL-terminating it in place at
+/// the position where it ends, and returning the byte offset in
+/// `str` where the NEXT argument (if any) begins (`do_one_arg`).
+///
+/// Mirrors the original's own two-cursor (`p` write / read cursor)
+/// structure exactly, even though - verified by hand-tracing every
+/// branch before writing this - `p` and the read cursor always stay
+/// numerically equal to each other throughout: every branch reads and
+/// writes the SAME number of bytes (the "keep this backslash" branch
+/// copies 2 bytes in, 2 bytes out; every other branch copies 1 byte
+/// in, 1 byte out), so despite its "compaction" APPEARANCE this
+/// function never actually shifts anything leftward for any input.
+/// Kept structurally faithful to the original anyway (both cursors
+/// present, not collapsed into one), matching this crate's own
+/// literal-translation mandate rather than simplifying based on this
+/// derived (if verified) observation.
+///
+/// Unlike the original's own `char *` return value (a pointer INTO
+/// the same buffer), returns a plain byte offset - `str` already
+/// carries its own bounds as a Rust slice, with no NUL terminator to
+/// scan for (`str.len()` is the true end of the remaining input). The
+/// final `*p = NUL` write is skipped when the write cursor lands
+/// exactly at `str.len()` (the whole remaining input was consumed
+/// with no break) - the original always has room for this because a
+/// real C string keeps its own trailing NUL byte one past the last
+/// real character; a Rust slice representing "exactly the meaningful
+/// bytes, no more" has no such spare byte to (harmlessly) overwrite.
+pub fn do_one_arg(str: &mut [u8]) -> usize {
+    let mut inbacktick = false;
+    let mut p = 0usize;
+    let mut i = 0usize;
+
+    while i < str.len() {
+        // When the backslash is used for escaping the special
+        // meaning of a character we need to keep it until wildcard
+        // expansion.
+        if crate::charset::rem_backslash(&str[i..]) {
+            str[p] = str[i];
+            p += 1;
+            i += 1;
+            str[p] = str[i];
+            p += 1;
+            i += 1;
+        } else {
+            // An item ends at a space not in backticks.
+            if !inbacktick && crate::ascii_defs::ascii_isspace(i32::from(str[i])) {
+                break;
+            }
+            if str[i] == b'`' {
+                inbacktick = !inbacktick;
+            }
+            str[p] = str[i];
+            p += 1;
+            i += 1;
+        }
+    }
+
+    let next = i + crate::charset::skipwhite(&str[i..]);
+    if p < str.len() {
+        str[p] = 0;
+    }
+    next
 }
 
 #[cfg(test)]
@@ -211,5 +288,76 @@ mod tests {
         let al_ptr = &mut al as *mut AlistT;
         unsafe { alist_unlink(al_ptr) };
         assert_eq!(al.al_refcount, 1);
+    }
+
+    #[test]
+    fn do_one_arg_single_word_consumes_the_whole_input() {
+        let mut buf = b"foo".to_vec();
+        let next = do_one_arg(&mut buf);
+        assert_eq!(buf, b"foo");
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn do_one_arg_stops_at_an_unquoted_space_and_skips_it() {
+        let mut buf = b"foo bar".to_vec();
+        let next = do_one_arg(&mut buf);
+        // The space at index 3 is overwritten with NUL, terminating
+        // "foo" in place; "bar" (untouched) starts at index 4.
+        assert_eq!(buf, b"foo\0bar");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn do_one_arg_skips_multiple_spaces_between_arguments() {
+        let mut buf = b"foo   bar".to_vec();
+        let next = do_one_arg(&mut buf);
+        assert_eq!(&buf[..3], b"foo");
+        assert_eq!(buf[3], 0);
+        assert_eq!(next, 6); // skipwhite skips all 3 spaces
+        assert_eq!(&buf[next..], b"bar");
+    }
+
+    #[test]
+    fn do_one_arg_backtick_quoted_span_protects_an_embedded_space() {
+        let mut buf = b"`foo bar` baz".to_vec();
+        let next = do_one_arg(&mut buf);
+        // The whole backtick-quoted span (9 bytes: ` f o o ' ' b a r `)
+        // is one argument; the space right after it breaks, and
+        // skipwhite lands on "baz".
+        assert_eq!(&buf[..9], b"`foo bar`");
+        assert_eq!(buf[9], 0);
+        assert_eq!(next, 10);
+        assert_eq!(&buf[next..], b"baz");
+    }
+
+    #[test]
+    fn do_one_arg_backslash_escaped_space_is_kept_and_does_not_break() {
+        // "\<space>" is always kept (rem_backslash treats an escaped
+        // space specially on every platform, not just non-Windows) -
+        // so the whole thing is ONE argument, the embedded space is
+        // NOT treated as a separator.
+        let mut buf = b"foo\\ bar".to_vec();
+        let next = do_one_arg(&mut buf);
+        assert_eq!(buf, b"foo\\ bar");
+        assert_eq!(next, 8);
+    }
+
+    #[test]
+    fn do_one_arg_no_input_returns_zero() {
+        let mut buf: Vec<u8> = Vec::new();
+        let next = do_one_arg(&mut buf);
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn do_one_arg_leading_space_is_itself_the_immediate_break() {
+        // A leading space breaks on the very first iteration (nothing
+        // consumed into the argument at all) - next skips past it.
+        let mut buf = b" foo".to_vec();
+        let next = do_one_arg(&mut buf);
+        assert_eq!(buf[0], 0);
+        assert_eq!(next, 1);
+        assert_eq!(&buf[next..], b"foo");
     }
 }
