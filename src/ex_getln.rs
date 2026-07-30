@@ -94,6 +94,99 @@ pub unsafe fn vim_strsave_fnameescape(fname: &[u8], what: VseWhat) -> Vec<u8> {
     p
 }
 
+/// Whether a command line is currently being edited (`get_ccline_ptr`,
+/// `ex_getln.c`) - the original resolves to one of 3 further branches
+/// (a live `ccline`, a saved `ccline.prev_ccline`, or `NULL`) ONLY
+/// after first checking `(State & MODE_CMDLINE) == 0` - and since
+/// nothing in this crate can ever set the `MODE_CMDLINE` bit on
+/// `GLOBALS.State` (no `:`/`/`-style command-line entry mode exists
+/// yet), that check is always true, making every real caller's own
+/// "is a command line active" question always `false` today - a
+/// faithful, always-taken early return, not a hardcoded shortcut
+/// (matching this crate's established `AUTOCMDS`/`ctx_restore`
+/// precedent for this exact pattern).
+fn cmdline_is_active() -> bool {
+    // SAFETY: reading a plain `i32` field, no aliasing hazard.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    state & crate::state_defs::mode::CMDLINE as i32 != 0
+}
+
+/// `getcmdline()` - the current command-line input (`f_getcmdline`,
+/// `ex_getln.c`) - always empty today, since `cmdline_is_active` is
+/// always `false`.
+pub fn f_getcmdline(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = if cmdline_is_active() {
+        unimplemented!("getcmdline(): needs a real, live command-line-editing state")
+    } else {
+        crate::eval::typval_defs::TypvalValue::String(None)
+    };
+}
+
+/// `getcmdpos()` - the cursor's byte position (1-based) in the
+/// command line (`f_getcmdpos`, `ex_getln.c`) - always `0` today
+/// (no active command line), since `cmdline_is_active` is always
+/// `false`.
+pub fn f_getcmdpos(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let n: i64 = if cmdline_is_active() {
+        unimplemented!("getcmdpos(): needs a real, live command-line-editing state")
+    } else {
+        0
+    };
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(n);
+}
+
+/// `getcmdprompt()` - the current command-line prompt (`f_getcmdprompt`,
+/// `ex_getln.c`) - always empty today, since `cmdline_is_active` is
+/// always `false`.
+pub fn f_getcmdprompt(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = if cmdline_is_active() {
+        unimplemented!("getcmdprompt(): needs a real, live command-line-editing state")
+    } else {
+        crate::eval::typval_defs::TypvalValue::String(None)
+    };
+}
+
+/// `getcmdscreenpos()` - the cursor's screen position (1-based) in the
+/// command line (`f_getcmdscreenpos`, `ex_getln.c`) - always `0` today
+/// (no active command line), since `cmdline_is_active` is always
+/// `false`.
+pub fn f_getcmdscreenpos(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let n: i64 = if cmdline_is_active() {
+        unimplemented!("getcmdscreenpos(): needs a real, live command-line-editing state")
+    } else {
+        0
+    };
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(n);
+}
+
+/// `getcmdtype()` - the current command-line type (`f_getcmdtype`,
+/// `ex_getln.c`) - always an empty string today, since
+/// `cmdline_is_active` is always `false` (the original's own
+/// `get_cmdline_type` returns `NUL`, a genuinely empty string, for
+/// this exact "no active command line" case).
+pub fn f_getcmdtype(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = if cmdline_is_active() {
+        unimplemented!("getcmdtype(): needs a real, live command-line-editing state")
+    } else {
+        crate::eval::typval_defs::TypvalValue::String(None)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +235,101 @@ mod tests {
     fn vim_strsave_fnameescape_escapes_a_leading_plus() {
         let _guard = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { vim_strsave_fnameescape(b"+foo", VseWhat::None) }, b"\\+foo".to_vec());
+    }
+
+    // --- cmdline_is_active / f_getcmdline / f_getcmdpos / f_getcmdprompt
+    // / f_getcmdscreenpos / f_getcmdtype ---
+
+    #[test]
+    fn cmdline_is_active_is_false_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        // GLOBALS.State defaults to mode::NORMAL (no MODE_CMDLINE bit),
+        // matching this crate's own established `Globals::default`
+        // convention.
+        assert!(!cmdline_is_active());
+    }
+
+    #[test]
+    fn cmdline_is_active_is_true_when_the_cmdline_bit_is_set() {
+        let _guard = crate::globals::global_state_test_lock();
+        // SAFETY: `global_state_test_lock()` held for this whole test.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        assert!(cmdline_is_active());
+
+        // SAFETY: forwarded from the lock reasoning above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn getcmdline_is_empty_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdline(&[], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
+        );
+    }
+
+    #[test]
+    fn getcmdpos_is_zero_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdpos(&[], &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn getcmdprompt_is_empty_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdprompt(&[], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
+        );
+    }
+
+    #[test]
+    fn getcmdscreenpos_is_zero_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdscreenpos(&[], &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn getcmdtype_is_empty_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_getcmdtype(&[], &mut rettv);
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(None)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "getcmdtype(): needs a real, live command-line-editing state")]
+    fn getcmdtype_panics_when_a_command_line_is_genuinely_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        // SAFETY: `global_state_test_lock()` held for this whole test.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f_getcmdtype(&[], &mut rettv);
+        }));
+
+        // SAFETY: forwarded from the lock reasoning above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
