@@ -103,6 +103,7 @@ pub mod message;
 pub mod r#move;
 pub mod normal_defs;
 pub mod option;
+pub mod optionstr;
 pub mod option_defs;
 pub mod option_vars;
 pub mod ops;
