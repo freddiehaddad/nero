@@ -55,8 +55,13 @@
 //!   actually need formatted output when those are translated.
 //! - Every `f_*` function (Vimscript builtins operating on `typval_T`):
 //!   belongs with the eval engine, phase 5.
-//! - `reverse_text`, `strrep`, `cmp_keyvalue_value*`: not yet reached: no
-//!   caller translated yet that needs them.
+//! - `cmp_keyvalue_value*`: not yet reached: no caller translated yet
+//!   that needs them.
+//!
+//! Also translated: [`strrep`] - `reverse_text` (its own file
+//! neighbor in the original) was already translated in an earlier
+//! session, hosted in `eval/funcs.rs` alongside the `reverse()`
+//! builtin that needs it rather than here.
 //!
 //! Also translated: `vim_strsave_escaped` (used by `escape()`) and
 //! `vim_strsave_shellescape` (used by `shellescape()`) - re-examined
@@ -405,6 +410,39 @@ pub fn vim_strchr(string: &[u8], c: i32) -> Option<usize> {
         return None;
     }
     string.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Replace all occurrences of `what` with `rep` in `src`. Returns
+/// `None` if no replacement happens, matching the original's `NULL`
+/// return when there's nothing to replace (`strrep`).
+///
+/// A genuinely empty `what` would make the original's own `strstr`-
+/// based loop spin forever (an empty needle "matches" at every
+/// position without ever advancing `pos`) - not reachable from this
+/// function's real caller (`ex_docmd.c`'s `:redir`, not yet
+/// translated), so this is guarded explicitly here as a documented
+/// precondition instead of literally reproducing the hang.
+#[must_use]
+pub fn strrep(src: &[u8], what: &[u8], rep: &[u8]) -> Option<Vec<u8>> {
+    if what.is_empty() {
+        return None;
+    }
+
+    let mut found_any = false;
+    let mut ret = Vec::with_capacity(src.len());
+    let mut remaining = src;
+    while let Some(pos) = remaining.windows(what.len()).position(|w| w == what) {
+        found_any = true;
+        ret.extend_from_slice(&remaining[..pos]);
+        ret.extend_from_slice(rep);
+        remaining = &remaining[pos + what.len()..];
+    }
+
+    if !found_any {
+        return None;
+    }
+    ret.extend_from_slice(remaining);
+    Some(ret)
 }
 
 /// Escape every character in `string` that also appears in
@@ -769,6 +807,42 @@ mod tests {
     #[test]
     fn vim_strchr_multibyte_not_found() {
         assert_eq!(vim_strchr("hello\0".as_bytes(), 0xe9), None);
+    }
+
+    #[test]
+    fn strrep_replaces_a_single_occurrence() {
+        assert_eq!(
+            strrep(b"hello world", b"world", b"there"),
+            Some(b"hello there".to_vec())
+        );
+    }
+
+    #[test]
+    fn strrep_replaces_all_non_overlapping_occurrences() {
+        assert_eq!(strrep(b"aaa", b"a", b"bb"), Some(b"bbbbbb".to_vec()));
+    }
+
+    #[test]
+    fn strrep_none_when_not_found() {
+        assert_eq!(strrep(b"hello", b"xyz", b"abc"), None);
+    }
+
+    #[test]
+    fn strrep_none_on_empty_source() {
+        assert_eq!(strrep(b"", b"a", b"b"), None);
+    }
+
+    #[test]
+    fn strrep_none_on_empty_what() {
+        assert_eq!(strrep(b"hello", b"", b"x"), None);
+    }
+
+    #[test]
+    fn strrep_matches_are_non_overlapping() {
+        // "aa" matches once at position 0 in "aaa" (consuming both a's),
+        // leaving only the last "a" - which is too short for a second
+        // "aa" match.
+        assert_eq!(strrep(b"aaa", b"aa", b"b"), Some(b"ba".to_vec()));
     }
 
     #[test]
