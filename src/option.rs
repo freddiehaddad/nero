@@ -153,13 +153,17 @@
 //! - `was_set_insecurely`/`insecure_flag` still need `OPTIONS[idx]
 //!   .flags`'s own `WAS_SET`/`INSECURE` bits threaded through a real
 //!   `:set` call site to have any meaningful test value.
+//! - `option_was_set`/`reset_option_was_set` are now translated too
+//!   (see below) - via a dedicated `OPTION_WAS_SET` side-table rather
+//!   than mutating `OPTIONS[idx].flags` directly (see
+//!   [`option_was_set`]'s own doc comment for why).
 //! - `parse_winhl_opt` needs the decoration/highlight-group subsystem
 //!   (`nvim_create_namespace`/`get_decor_provider`/`syn_check_group`/
 //!   `ns_hl_def`).
 //! - `do_set`/`ex_set`'s command-line parsing itself, plus
-//!   `option_was_set`/`get_winbuf_options`/`get_vimoption`/etc.
-//!   (everything needing the full parsed-`:set`-argument machinery,
-//!   not just a resolved storage address and a read/write).
+//!   `get_winbuf_options`/`get_vimoption`/etc. (everything needing the
+//!   full parsed-`:set`-argument machinery, not just a resolved
+//!   storage address and a read/write).
 
 use crate::buffer_defs::{BufT, WinT};
 use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS};
@@ -780,6 +784,60 @@ pub unsafe fn was_set_insecurely(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u3
     let flagp = unsafe { insecure_flag(wp, opt_idx, opt_flags) };
     // SAFETY: forwarded from this function's own safety doc.
     (unsafe { *flagp } & crate::option_defs::opt_flags::INSECURE) != 0
+}
+
+/// Per-option "was this option ever explicitly `:set`?" bits
+/// (`kOptFlagWasSet`, backing [`option_was_set`]/
+/// [`reset_option_was_set`]). Modeled as its OWN parallel side-table,
+/// rather than a bit mutated directly on `OPTIONS[idx].flags` the way
+/// the original's `options[opt_idx].flags |= kOptFlagWasSet` does:
+/// [`get_option`]'s own safety doc relies on `VimoptionT` NEVER being
+/// mutated once `OPTIONS` is built, so introducing the first real
+/// write through a raw pointer into that array (as opposed to
+/// `insecure_flag`'s own pre-existing, so-far read-only, forward-
+/// looking `*mut u32` return value) would risk violating that
+/// existing, load-bearing invariant. A dedicated side-table sidesteps
+/// this entirely, matching this crate's own established "necessarily-
+/// adapted representation, not a literal reinterpretation" precedent
+/// (e.g. `DictitemVariant`, `BhData`).
+static OPTION_WAS_SET: crate::globals::GlobalCell<[bool; crate::option_defs::OPT_COUNT]> =
+    crate::globals::GlobalCell::new([false; crate::option_defs::OPT_COUNT]);
+
+/// Whether option `opt_idx` has ever been explicitly `:set`
+/// (`option_was_set`). Always `false` today: nothing in this crate can
+/// currently set this bit (only `option.c`'s own not-yet-translated
+/// `did_set_option`, via `opt->flags |= kOptFlagWasSet`, ever does) -
+/// a faithful, always-taken consequence of the current state, not a
+/// hardcoded stub (matching this crate's established `AUTOCMDS`/
+/// `get_hislen` precedent for this exact pattern).
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
+/// original's own `assert(opt_idx != kOptInvalid)`.
+#[must_use]
+pub fn option_was_set(opt_idx: OptIndex) -> bool {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: a plain bool copy-out read through one exclusive borrow,
+    // no aliasing hazard.
+    let table = unsafe { OPTION_WAS_SET.get_mut() };
+    table[opt_idx as usize]
+}
+
+/// Reset the flag indicating option `opt_idx` was set
+/// (`reset_option_was_set`). A real, faithful no-op today (the flag
+/// is always already `false` - see [`option_was_set`]'s own doc
+/// comment), kept as a real function (not omitted) since a future
+/// session's `did_set_option` will make it a genuine state change.
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
+/// original's own `assert(opt_idx != kOptInvalid)`.
+pub fn reset_option_was_set(opt_idx: OptIndex) {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: a plain bool write-through-exclusive-borrow, no
+    // aliasing hazard.
+    let table = unsafe { OPTION_WAS_SET.get_mut() };
+    table[opt_idx as usize] = false;
 }
 
 /// Get pointer to option variable, given the option and the buffer/
@@ -4158,6 +4216,42 @@ mod varp_tests {
         assert!(!unsafe {
             was_set_insecurely(&mut win as *mut WinT, OptIndex::Wrap, crate::option_defs::opt_set_flags::OPT_LOCAL)
         });
+    }
+
+    // --- option_was_set / reset_option_was_set ---
+
+    #[test]
+    fn option_was_set_is_false_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!option_was_set(OptIndex::Wrap));
+        assert!(!option_was_set(OptIndex::Tabstop));
+    }
+
+    #[test]
+    fn reset_option_was_set_is_a_no_op_since_nothing_can_set_it_yet() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!option_was_set(OptIndex::Window));
+        reset_option_was_set(OptIndex::Window);
+        assert!(!option_was_set(OptIndex::Window));
+    }
+
+    #[test]
+    fn option_was_set_tracks_each_option_independently() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Directly manipulate the side-table (something no real,
+        // translated caller can currently do, since nothing sets this
+        // bit yet) to prove option_was_set reads the RIGHT index, not
+        // just always returning a hardcoded false.
+        {
+            let table = unsafe { OPTION_WAS_SET.get_mut() };
+            table[OptIndex::Tabstop as usize] = true;
+        }
+
+        assert!(option_was_set(OptIndex::Tabstop));
+        assert!(!option_was_set(OptIndex::Wrap));
+
+        reset_option_was_set(OptIndex::Tabstop);
+        assert!(!option_was_set(OptIndex::Tabstop));
     }
 
     #[cfg(windows)]
