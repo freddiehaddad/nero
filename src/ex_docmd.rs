@@ -30,6 +30,12 @@
 //! garbage collection. `ffu_cb` stays `Callback::None` forever today
 //! (see `FFU_CB`'s own doc comment) - matches every real,
 //! unconfigured session.
+//!
+//! Also translated: `modifier_len` - the length of a command modifier
+//! (e.g. `silent`/`vertical`/`3tab`) at the start of a `:` command
+//! line, via the small, self-contained `cmdmods[]` table (mechanically
+//! transcribed 1:1). Needed by `ex_eval.c`'s `has_loop_cmd`
+//! (`crate::ex_eval`).
 
 use crate::buffer_defs::b_flags;
 
@@ -177,6 +183,85 @@ pub unsafe fn set_ref_in_findfunc(copy_id: i32) -> bool {
     let cb = unsafe { &*FFU_CB.as_ptr() };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
+}
+
+/// A single entry in [`CMDMODS`] (`struct cmdmod` - an internal,
+/// file-static type in the original, not to be confused with the
+/// public `cmdmod_T`/`CmdmodT` from `ex_cmds_defs.h`).
+struct CmdMod {
+    /// Full modifier name (`name`).
+    name: &'static [u8],
+    /// Minimum number of leading characters that must match for this
+    /// to count as an abbreviation of `name` (`minlen`).
+    minlen: usize,
+    /// Whether an optional leading count is accepted (e.g. `:3tab`,
+    /// `:123verbose`) (`has_count`).
+    has_count: bool,
+}
+
+/// The command-modifier name table (`cmdmods[]`), mechanically
+/// transcribed from the original 1:1 (same order, same literal
+/// text/lengths).
+const CMDMODS: &[CmdMod] = &[
+    CmdMod { name: b"aboveleft", minlen: 3, has_count: false },
+    CmdMod { name: b"belowright", minlen: 3, has_count: false },
+    CmdMod { name: b"botright", minlen: 2, has_count: false },
+    CmdMod { name: b"browse", minlen: 3, has_count: false },
+    CmdMod { name: b"confirm", minlen: 4, has_count: false },
+    CmdMod { name: b"filter", minlen: 4, has_count: false },
+    CmdMod { name: b"hide", minlen: 3, has_count: false },
+    CmdMod { name: b"horizontal", minlen: 3, has_count: false },
+    CmdMod { name: b"keepalt", minlen: 5, has_count: false },
+    CmdMod { name: b"keepjumps", minlen: 5, has_count: false },
+    CmdMod { name: b"keepmarks", minlen: 3, has_count: false },
+    CmdMod { name: b"keeppatterns", minlen: 5, has_count: false },
+    CmdMod { name: b"leftabove", minlen: 5, has_count: false },
+    CmdMod { name: b"lockmarks", minlen: 3, has_count: false },
+    CmdMod { name: b"noautocmd", minlen: 3, has_count: false },
+    CmdMod { name: b"noswapfile", minlen: 3, has_count: false },
+    CmdMod { name: b"rightbelow", minlen: 6, has_count: false },
+    CmdMod { name: b"sandbox", minlen: 3, has_count: false },
+    CmdMod { name: b"silent", minlen: 3, has_count: false },
+    CmdMod { name: b"tab", minlen: 3, has_count: true },
+    CmdMod { name: b"topleft", minlen: 2, has_count: false },
+    CmdMod { name: b"unsilent", minlen: 3, has_count: false },
+    CmdMod { name: b"verbose", minlen: 4, has_count: true },
+    CmdMod { name: b"vertical", minlen: 4, has_count: false },
+];
+
+/// Length of a command modifier (including an optional leading count)
+/// at the start of `cmd`, or `0` when it isn't one (`modifier_len`).
+///
+/// Returns a byte length within `cmd` itself (not a pointer), matching
+/// this crate's established "offset, not pointer" idiom for this exact
+/// class of C string-scanning function.
+#[must_use]
+pub fn modifier_len(cmd: &[u8]) -> usize {
+    // An optional leading count (e.g. the "3" in ":3tab") followed by
+    // whitespace - `p_start` is 0 when there's no such count, matching
+    // the original's own `p == cmd` check below.
+    let mut p_start = 0;
+    if cmd.first().is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))) {
+        let after_digits = 1 + crate::charset::skipdigits(&cmd[1..]);
+        p_start = after_digits + crate::charset::skipwhite(&cmd[after_digits..]);
+    }
+    let p = &cmd[p_start..];
+
+    for m in CMDMODS {
+        // The length of the matching prefix between `p` and `m.name`,
+        // capped at `m.name.len()` - `.zip()`'s own "stop at the
+        // shorter iterator" behavior already replicates the original's
+        // `p[j] != NUL` bound (a Rust slice has no implicit NUL
+        // terminator to run past in the first place).
+        let j = p.iter().zip(m.name.iter()).take_while(|(a, b)| a == b).count();
+        if j >= m.minlen
+            && !p.get(j).is_some_and(|&c| crate::macros_defs::ascii_isalpha(i32::from(c)))
+            && (p_start == 0 || m.has_count)
+        {
+            return j + p_start;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -335,5 +420,58 @@ mod tests {
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
         assert!(!unsafe { set_ref_in_findfunc(1) });
+    }
+
+    #[test]
+    fn modifier_len_full_name_before_a_space() {
+        assert_eq!(modifier_len(b"silent echo 1"), 6);
+    }
+
+    #[test]
+    fn modifier_len_abbreviated_to_its_minlen() {
+        assert_eq!(modifier_len(b"sil echo 1"), 3);
+    }
+
+    #[test]
+    fn modifier_len_shorter_than_minlen_is_not_recognized() {
+        assert_eq!(modifier_len(b"si echo 1"), 0);
+    }
+
+    #[test]
+    fn modifier_len_zero_for_a_plain_command() {
+        assert_eq!(modifier_len(b"echo 1"), 0);
+    }
+
+    #[test]
+    fn modifier_len_followed_by_more_alpha_chars_is_not_a_match() {
+        // "silentx" isn't "silent" followed by a non-alpha boundary -
+        // the whole prefix must be immediately followed by something
+        // that isn't itself a letter (e.g. space, end of input, digit).
+        assert_eq!(modifier_len(b"silentx"), 0);
+    }
+
+    #[test]
+    fn modifier_len_at_the_very_end_of_the_slice() {
+        // No trailing byte at all after "silent" - out-of-bounds reads
+        // must behave like the original's own implicit NUL check.
+        assert_eq!(modifier_len(b"silent"), 6);
+    }
+
+    #[test]
+    fn modifier_len_with_count_on_a_count_capable_modifier() {
+        assert_eq!(modifier_len(b"3tab split"), 4);
+        assert_eq!(modifier_len(b"123verbose echo 1"), 10);
+    }
+
+    #[test]
+    fn modifier_len_with_count_on_a_non_count_capable_modifier_is_rejected() {
+        // 'silent' has no count support - "3silent" must not match it.
+        assert_eq!(modifier_len(b"3silent echo"), 0);
+    }
+
+    #[test]
+    fn modifier_len_two_word_modifier_names() {
+        assert_eq!(modifier_len(b"belowright split"), 10);
+        assert_eq!(modifier_len(b"rightbelow split"), 10);
     }
 }

@@ -1,15 +1,19 @@
 //! Translated from `src/nvim/ex_eval.c` (tractable core only).
 //!
 //! `ex_eval.c` (~2000 lines) implements `:try`/`:catch`/`:finally`/
-//! `:throw` exception handling for Ex commands. Only 3 small,
-//! self-contained predicate functions are translated here:
-//! [`aborting`]/[`should_abort`] (needed by
+//! `:throw` exception handling for Ex commands. Only 4 small,
+//! self-contained functions are translated here: [`aborting`]/
+//! [`should_abort`] (needed by
 //! [`crate::autocmd::apply_autocmds_retval`], their first real
-//! caller) and [`aborted_in_try`] (needed by `eval/userfunc.c`'s
-//! `func_has_ended`). All 3 need only already-existing `GLOBALS`
+//! caller), [`aborted_in_try`] (needed by `eval/userfunc.c`'s
+//! `func_has_ended`), and [`has_loop_cmd`] (whether a `:` command,
+//! after skipping leading modifiers/whitespace/`:`, starts a
+//! `:while`/`:for` loop - needs `ex_docmd.c`'s `modifier_len`,
+//! `crate::ex_docmd`). All 4 need only already-existing `GLOBALS`
 //! fields (`did_emsg`/`force_abort`/`got_int`/`did_throw`/`trylevel`/
-//! `emsg_silent`) - no `:try`/`:catch` parsing or exception-stack
-//! machinery is needed for any of them.
+//! `emsg_silent`) or the small, self-contained `modifier_len` - no
+//! `:try`/`:catch` parsing or exception-stack machinery is needed for
+//! any of them.
 //!
 //! Deferred: everything else in this file (the actual `:try`/`:catch`/
 //! `:throw` command handlers, `cstack_T` exception-stack management,
@@ -44,6 +48,27 @@ pub fn should_abort(retcode: i32) -> bool {
 #[must_use]
 pub fn aborted_in_try() -> bool {
     unsafe { crate::globals::GLOBALS.get_mut() }.force_abort
+}
+
+/// Check if `p`, after skipping any leading command modifiers
+/// (`:silent`, `:vertical`, etc.), whitespace, and `:` separators,
+/// starts a `:while` or `:for` loop command (`has_loop_cmd`).
+#[must_use]
+pub fn has_loop_cmd(p: &[u8]) -> bool {
+    let mut i = 0;
+    loop {
+        while matches!(p.get(i), Some(&b' ') | Some(&b'\t') | Some(&b':')) {
+            i += 1;
+        }
+        let len = crate::ex_docmd::modifier_len(&p[i..]);
+        if len == 0 {
+            break;
+        }
+        i += len;
+    }
+    let rest = &p[i..];
+    (rest.first() == Some(&b'w') && rest.get(1) == Some(&b'h'))
+        || (rest.first() == Some(&b'f') && rest.get(1) == Some(&b'o') && rest.get(2) == Some(&b'r'))
 }
 
 #[cfg(test)]
@@ -192,5 +217,35 @@ mod tests {
         assert!(!aborted_in_try());
         unsafe { GLOBALS.get_mut() }.force_abort = true;
         assert!(aborted_in_try());
+    }
+
+    #[test]
+    fn has_loop_cmd_recognizes_while_directly() {
+        assert!(has_loop_cmd(b"while 1"));
+    }
+
+    #[test]
+    fn has_loop_cmd_recognizes_for_directly() {
+        assert!(has_loop_cmd(b"for x in y"));
+    }
+
+    #[test]
+    fn has_loop_cmd_false_for_an_unrelated_command() {
+        assert!(!has_loop_cmd(b"echo 1"));
+    }
+
+    #[test]
+    fn has_loop_cmd_skips_a_single_modifier_and_whitespace() {
+        assert!(has_loop_cmd(b"silent while 1"));
+    }
+
+    #[test]
+    fn has_loop_cmd_skips_several_chained_modifiers_and_colons() {
+        assert!(has_loop_cmd(b"silent:vertical: for x in y"));
+    }
+
+    #[test]
+    fn has_loop_cmd_false_when_modifiers_precede_an_unrelated_command() {
+        assert!(!has_loop_cmd(b"silent echo 1"));
     }
 }
