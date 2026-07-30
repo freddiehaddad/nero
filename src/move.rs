@@ -87,6 +87,14 @@
 //! `redraw_later(wp, UPD_SOME_VALID)` call, matching this file's own
 //! established policy.
 //!
+//! Also translated: **`adjust_skipcol`** - the real, always-taken-
+//! today early-return fast path (`'smoothscroll'` defaults off, and
+//! nothing can currently turn it on), with the rest of the algorithm
+//! (unreachable today, but faithfully translated in full rather than
+//! stubbed) computing the real screen-scroll adjustment for when
+//! `'smoothscroll'` and `'wrap'` are both set. Unlocked `insert.c`'s
+//! `beginline`/`oneright`/`oneleft`.
+//!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
 //! `validate_cursor`/`curs_rows`/`validate_cheight`/`validate_botline_win`,
@@ -278,6 +286,186 @@ pub fn reset_skipcol(wp: &mut WinT) {
         return;
     }
     wp.w_skipcol = 0;
+}
+
+/// Adjust `GLOBALS.curwin`'s own `w_skipcol` for smooth-scrolling
+/// display (`adjust_skipcol`).
+///
+/// Only relevant when `'wrap'` AND `'smoothscroll'` are both set for
+/// the current window AND the cursor sits on the topmost displayed
+/// line - `'smoothscroll'` (`w_onebuf_opt.wo_sms`) defaults off, and
+/// nothing in this crate can currently turn it on (no `:set` command
+/// parser yet), so every real invocation today hits this exact
+/// early-return fast path, matching the original's own behavior for
+/// an unconfigured session precisely. The rest of the algorithm is
+/// still translated in full (not skipped), so a future session that
+/// DOES support `'smoothscroll'` gets a faithful, already-verified
+/// implementation rather than a fresh gap.
+///
+/// Omits the original's `redraw_later(curwin, UPD_NOT_VALID)` calls -
+/// pure redraw-scheduling side effects, matching this file's own
+/// established policy - the identical `w_skipcol` state changes are
+/// kept.
+///
+/// Every touch of `GLOBALS.curwin`'s own fields is deliberately
+/// re-derived fresh (via a small scoped block or an inline
+/// dereference) rather than held across a call to another
+/// `*mut WinT`-taking helper (`validate_cheight`/`validate_virtcol`/
+/// `plines_win`/`linetabsize_eol`/`sms_marker_overlap`), matching this
+/// crate's established aliasing discipline for this exact situation
+/// (see `plines.rs`'s `win_text_height`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+pub unsafe fn adjust_skipcol() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    let should_return = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        wp.w_onebuf_opt.wo_wrap == 0
+            || wp.w_onebuf_opt.wo_sms == 0
+            || wp.w_cursor.lnum != wp.w_topline
+    };
+    if should_return {
+        return;
+    }
+
+    let width1 = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &mut *curwin };
+        // SAFETY: forwarded from this function's own safety doc.
+        wp.w_view_width - unsafe { win_col_off(wp) }
+    };
+    if width1 <= 0 {
+        return; // no text will be displayed
+    }
+    let width2 = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &mut *curwin };
+        // SAFETY: forwarded from this function's own safety doc.
+        width1 + unsafe { win_col_off2(wp) }
+    };
+    let so: i64 = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::option::get_scrolloff_value(wp) }
+    };
+    let scrolloff_cols: i64 =
+        if so == 0 { 0 } else { i64::from(width1) + (so - 1) * i64::from(width2) };
+    let mut scrolled = false;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { validate_cheight(curwin) };
+    let (cline_height, view_height, cursor_lnum) = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        (wp.w_cline_height, wp.w_view_height, wp.w_cursor.lnum)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if cline_height == view_height
+        && unsafe { crate::plines::plines_win(curwin, cursor_lnum, false) } <= view_height
+    {
+        // the line just fits in the window, don't scroll
+        // SAFETY: forwarded from this function's own safety doc.
+        reset_skipcol(unsafe { &mut *curwin });
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { validate_virtcol(curwin) };
+    let overlap = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &mut *curwin };
+        let extra2 = wp.w_view_width - width2;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { sms_marker_overlap(wp, extra2) }
+    };
+    loop {
+        let (skipcol, virtcol) = {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wp = unsafe { &*curwin };
+            (wp.w_skipcol, wp.w_virtcol)
+        };
+        if !(skipcol > 0
+            && i64::from(virtcol) < i64::from(skipcol) + i64::from(overlap) + scrolloff_cols)
+        {
+            break;
+        }
+        // scroll a screen line down
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &mut *curwin };
+        if wp.w_skipcol >= width1 + width2 {
+            wp.w_skipcol -= width2;
+        } else {
+            wp.w_skipcol -= width1;
+        }
+        scrolled = true;
+    }
+    if scrolled {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { validate_virtcol(curwin) };
+        return; // don't scroll in the other direction now
+    }
+
+    let mut row = 0i32;
+    let mut col: i64 = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        i64::from(wp.w_virtcol) + scrolloff_cols
+    };
+
+    // Avoid adjusting for 'scrolloff' beyond the text line height.
+    if scrolloff_cols > 0 {
+        let topline = {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wp = unsafe { &*curwin };
+            wp.w_topline
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut size = unsafe { crate::plines::linetabsize_eol(curwin, topline) };
+        size = width1 + width2 * ((size - width1 + width2 - 1) / width2);
+        while col > i64::from(size) {
+            col -= i64::from(width2);
+        }
+    }
+    col -= {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        i64::from(wp.w_skipcol)
+    };
+
+    if col >= i64::from(width1) {
+        col -= i64::from(width1);
+        row += 1;
+    }
+    if col > i64::from(width2) {
+        row += (col / i64::from(width2)) as i32;
+    }
+
+    let view_height2 = {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wp = unsafe { &*curwin };
+        wp.w_view_height
+    };
+    if row >= view_height2 {
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wp = unsafe { &mut *curwin };
+            if wp.w_skipcol == 0 {
+                wp.w_skipcol += width1;
+                row -= 1;
+            }
+        }
+        if row >= view_height2 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wp = unsafe { &mut *curwin };
+            wp.w_skipcol += (row - view_height2) * width2;
+        }
+    }
 }
 
 /// Return `true` when `'scrolloffpad'` may augment `'scrolloff'` -
@@ -949,6 +1137,28 @@ mod tests {
     impl Drop for CurtabGuard {
         fn drop(&mut self) {
             unsafe { crate::globals::GLOBALS.get_mut() }.curtab = self.previous;
+        }
+    }
+
+    /// Points `GLOBALS.curwin` at `wp` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime,
+    /// matching `ops.rs`'s/`insert.rs`'s own identically-named helper.
+    struct CurwinGuard {
+        previous: *mut WinT,
+    }
+
+    impl CurwinGuard {
+        fn set(new_curwin: *mut WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = new_curwin;
+            CurwinGuard { previous }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
         }
     }
 
@@ -1682,6 +1892,102 @@ mod tests {
         win.w_skipcol = 42;
         reset_skipcol(&mut win);
         assert_eq!(win.w_skipcol, 0);
+    }
+
+    #[test]
+    fn adjust_skipcol_noop_when_wrap_is_off() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 0;
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_skipcol = 7;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        unsafe { adjust_skipcol() };
+        assert_eq!(win.w_skipcol, 7);
+    }
+
+    #[test]
+    fn adjust_skipcol_noop_by_default_since_smoothscroll_defaults_off() {
+        // This is the REAL, always-taken-today fast path: 'wrap' can
+        // be on, but 'smoothscroll' (wo_sms) defaults to 0 and nothing
+        // in this crate can currently turn it on.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_sms = 0;
+        win.w_skipcol = 7;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        unsafe { adjust_skipcol() };
+        assert_eq!(win.w_skipcol, 7);
+    }
+
+    #[test]
+    fn adjust_skipcol_noop_when_cursor_not_on_topline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_topline = 5;
+        win.w_cursor.lnum = 1; // != w_topline
+        win.w_skipcol = 7;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        unsafe { adjust_skipcol() };
+        assert_eq!(win.w_skipcol, 7);
+    }
+
+    #[test]
+    fn adjust_skipcol_noop_when_width1_is_not_positive() {
+        // w_view_width smaller than win_col_off's own contribution
+        // (a number column here) makes width1 <= 0 - another real,
+        // early-return fast path.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_onebuf_opt.wo_nu = 1;
+        win.w_nrwidth_line_count = -1; // force a genuine number_width recompute
+        win.w_view_width = 1; // smaller than the resulting number column
+        win.w_topline = 1;
+        win.w_cursor.lnum = 1;
+        win.w_skipcol = 7;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        unsafe { adjust_skipcol() };
+        assert_eq!(win.w_skipcol, 7);
+    }
+
+    #[test]
+    fn adjust_skipcol_resets_skipcol_when_the_line_fits_the_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"hello\0") },
+            crate::vim_defs::OK
+        );
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 1; // must EXACTLY match the computed w_cline_height (1 unwrapped line)
+        win.w_topline = 1;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        win.w_skipcol = 3; // pre-set, must be reset to 0
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        unsafe { adjust_skipcol() };
+        assert_eq!(win.w_skipcol, 0);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 
     #[test]

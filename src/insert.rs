@@ -15,8 +15,19 @@
 //! others in this same file, none translated), matching this crate's
 //! established "small, self-contained, no design freedom to get
 //! wrong" precedent for translating ahead of a real caller.
+//!
+//! Also translated: [`beginline`]/[`oneright`]/[`oneleft`] - cursor-
+//! movement helpers used well beyond Insert mode itself (also real
+//! callers in `normal.c`/`ops.c`, neither translated yet). Needed
+//! `move.c`'s `adjust_skipcol` (harvested alongside, in `move.rs`,
+//! its own real home - see that file's own module doc), plus already-
+//! real `state.c`'s `virtual_active`, `cursor.c`'s `coladvance`/
+//! `getviscol`/`get_cursor_line_ptr`/`get_cursor_pos_ptr`, `mbyte.c`'s
+//! `utf_ptr2char`/`utfc_ptr2len`/`mb_adjust_cursor`, `charset.c`'s
+//! `vim_isprintc`/`ptr2cells`, and `option.c`'s `get_ve_flags`.
 
 use crate::pos_defs::ColnrT;
+use crate::vim_defs::{FAIL, OK};
 
 /// Get the value `w_virtcol` would have if `'list'` were off, unless
 /// `'cpo'` contains the `'L'` flag (`get_nolist_virtcol`).
@@ -58,6 +69,210 @@ pub unsafe fn get_nolist_virtcol() -> ColnrT {
     win.w_virtcol
 }
 
+/// `beginline`'s own bit flags (`insert.h`'s anonymous enum:
+/// `BL_WHITE`/`BL_SOL`/`BL_FIX`).
+mod bl {
+    /// Cursor on first non-white in the line.
+    pub const WHITE: i32 = 1;
+    /// Use `'startofline'`.
+    pub const SOL: i32 = 2;
+    /// Don't leave cursor on a NUL.
+    pub const FIX: i32 = 4;
+}
+pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
+
+/// Move the cursor to the start of the line, according to `flags`
+/// (a combination of [`BL_WHITE`]/[`BL_SOL`]/[`BL_FIX`]) (`beginline`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid - same
+/// requirement as [`crate::cursor::get_cursor_line_ptr`]/
+/// `crate::move::adjust_skipcol`.
+pub unsafe fn beginline(flags: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let p_sol = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sol;
+
+    if (flags & BL_SOL) != 0 && p_sol == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curswant = unsafe { &*curwin }.w_curswant;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(curwin, curswant) };
+    } else {
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let wp = unsafe { &mut *curwin };
+            wp.w_cursor.col = 0;
+            wp.w_cursor.coladd = 0;
+        }
+
+        if (flags & (BL_WHITE | BL_SOL)) != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+            let mut i: usize = 0;
+            while line
+                .get(i)
+                .is_some_and(|&b| crate::ascii_defs::ascii_iswhite(i32::from(b)))
+                && !((flags & BL_FIX) != 0 && line.get(i + 1) == Some(&0))
+            {
+                i += 1;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *curwin }.w_cursor.col += i as ColnrT;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_set_curswant = true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::adjust_skipcol() };
+}
+
+/// Move the cursor one character right, unless it would land on the
+/// NUL past the end of the line (unless `'virtualedit'` contains
+/// `"onemore"`) (`oneright`).
+///
+/// Returns [`OK`] if the cursor moved, [`FAIL`] at the window/line
+/// edge.
+///
+/// # Safety
+/// Same requirement as [`beginline`].
+pub unsafe fn oneright() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_virtual = crate::state::virtual_active(unsafe { &*curwin });
+    if is_virtual {
+        // SAFETY: forwarded from this function's own safety doc.
+        let prevpos = unsafe { &*curwin }.w_cursor;
+
+        // Adjust for multi-wide char (excluding TAB)
+        // SAFETY: forwarded from this function's own safety doc.
+        let ptr = unsafe { crate::cursor::get_cursor_pos_ptr() };
+        // SAFETY: forwarded from this function's own safety doc.
+        let viscol = unsafe { crate::cursor::getviscol() };
+        let extra = if ptr.first() != Some(&crate::ascii_defs::TAB)
+            && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr))
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::charset::ptr2cells(&ptr) }
+        } else {
+            1
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(curwin, viscol + extra) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_set_curswant = true;
+        // Return OK if the cursor moved, FAIL otherwise (at window edge).
+        // SAFETY: forwarded from this function's own safety doc.
+        let now = unsafe { &*curwin }.w_cursor;
+        return if prevpos.col != now.col || prevpos.coladd != now.coladd { OK } else { FAIL };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ptr = unsafe { crate::cursor::get_cursor_pos_ptr() };
+    if ptr.first() == Some(&0) {
+        return FAIL; // already at the very end
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { crate::mbyte::utfc_ptr2len(&ptr) };
+
+    // move "l" bytes right, but don't end up on the NUL, unless
+    // 'virtualedit' contains "onemore".
+    // SAFETY: forwarded from this function's own safety doc.
+    let ve_flags = crate::option::get_ve_flags(unsafe { &*curwin });
+    if ptr.get(l as usize) == Some(&0)
+        && (ve_flags & crate::option_vars::opt_ve_flag::ONEMORE) == 0
+    {
+        return FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { &mut *curwin };
+    wp.w_cursor.col += l;
+    wp.w_set_curswant = true;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::adjust_skipcol() };
+    OK
+}
+
+/// Move the cursor one character left (`oneleft`).
+///
+/// Returns [`OK`] if the cursor moved, [`FAIL`] at the start of the
+/// line.
+///
+/// # Safety
+/// Same requirement as [`beginline`].
+pub unsafe fn oneleft() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_virtual = crate::state::virtual_active(unsafe { &*curwin });
+    if is_virtual {
+        // SAFETY: forwarded from this function's own safety doc.
+        let v = unsafe { crate::cursor::getviscol() };
+        if v == 0 {
+            return FAIL;
+        }
+
+        // We might get stuck on 'showbreak', skip over it.
+        let mut width = 1;
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::coladvance(curwin, v - width) };
+            // getviscol() is slow, skip it when 'showbreak' is empty,
+            // 'breakindent' is not set and there are no multi-byte
+            // characters
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::cursor::getviscol() } < v {
+                break;
+            }
+            width += 1;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*curwin }.w_cursor.coladd == 1 {
+            // Adjust for multi-wide char (not a TAB)
+            // SAFETY: forwarded from this function's own safety doc.
+            let ptr = unsafe { crate::cursor::get_cursor_pos_ptr() };
+            if ptr.first() != Some(&crate::ascii_defs::TAB)
+                && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr))
+                // SAFETY: forwarded from this function's own safety doc.
+                && unsafe { crate::charset::ptr2cells(&ptr) } > 1
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &mut *curwin }.w_cursor.coladd = 0;
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_set_curswant = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::adjust_skipcol() };
+        return OK;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*curwin }.w_cursor.col == 0 {
+        return FAIL;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { &mut *curwin };
+    wp.w_set_curswant = true;
+    wp.w_cursor.col -= 1;
+
+    // if the character on the left of the current cursor is a
+    // multi-byte character, move to its first byte
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::adjust_skipcol() };
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,10 +301,89 @@ mod tests {
         }
     }
 
+    /// Points `GLOBALS.curtab` at `tp` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching `move.rs`'s/`plines.rs`'s own identically-named
+    /// helper - needed defensively for any test reaching
+    /// `coladvance`/`getviscol`, which may transitively touch
+    /// `win_get_fill`/`diff_check_fill`'s own `curtab` read).
+    struct CurtabGuard {
+        previous: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl CurtabGuard {
+        fn set(new_curtab: *mut crate::buffer_defs::TabpageT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = new_curtab;
+            CurtabGuard { previous }
+        }
+    }
+
+    impl Drop for CurtabGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curtab = self.previous;
+        }
+    }
+
+    /// RAII guard restoring `GLOBALS.curbuf`/`curwin` on drop (even on
+    /// panic) - self-locking, matching `eval/funcs.rs`'s own
+    /// identically-named, identically-shaped precedent. Needed by
+    /// `beginline`/`oneright`/`oneleft`'s own tests: unlike
+    /// `get_nolist_virtcol` (which reads `win.w_buffer` directly),
+    /// `get_cursor_line_ptr`/`get_cursor_pos_ptr`/`mb_adjust_cursor`
+    /// all read `GLOBALS.curbuf` SEPARATELY from `GLOBALS.curwin`.
+    struct CurbufCurwinGuard {
+        prev_curbuf: *mut BufT,
+        prev_curwin: *mut WinT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurbufCurwinGuard {
+        fn set(buf: *mut BufT, win: *mut WinT) -> Self {
+            let _lock = global_state_test_lock();
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard =
+                CurbufCurwinGuard { prev_curbuf: globals.curbuf, prev_curwin: globals.curwin, _lock };
+            globals.curbuf = buf;
+            globals.curwin = win;
+            guard
+        }
+    }
+
+    impl Drop for CurbufCurwinGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_curbuf;
+            globals.curwin = self.prev_curwin;
+        }
+    }
+
     fn buf_with_one_real_line() -> BufT {
         BufT {
             b_ml: MemlineT { ml_mfp: std::ptr::NonNull::dangling().as_ptr(), ml_line_count: 1, ..Default::default() },
             ..Default::default()
+        }
+    }
+
+    /// Opens a REAL memline (unlike [`buf_with_one_real_line`]'s
+    /// dangling placeholder) with `content` as its one line -
+    /// needed by any test that actually reads line text (`beginline`/
+    /// `oneright`/`oneleft` all do, via `get_cursor_line_ptr`/
+    /// `get_cursor_pos_ptr`). Callers must close the returned buffer's
+    /// memfile before the test ends (see existing `move.rs`
+    /// precedent) to avoid leaking the backing `MemfileT`.
+    fn buf_with_real_line(content: &[u8]) -> BufT {
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, OK);
+        assert_eq!(unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, content) }, OK);
+        buf
+    }
+
+    fn close_real_line_buf(buf: BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
         }
     }
 
@@ -165,5 +459,219 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    // --- beginline ---
+
+    #[test]
+    fn beginline_no_flags_moves_to_column_zero() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = buf_with_real_line(b"  hello\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 3 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _curtab_guard = CurtabGuard::set(&mut tp);
+
+        unsafe { beginline(0) };
+
+        assert_eq!(win.w_cursor.col, 0);
+        assert_eq!(win.w_cursor.coladd, 0);
+        assert!(win.w_set_curswant);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn beginline_white_skips_leading_whitespace() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = buf_with_real_line(b"  hello\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 6, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _curtab_guard = CurtabGuard::set(&mut tp);
+
+        unsafe { beginline(BL_WHITE) };
+
+        assert_eq!(win.w_cursor.col, 2); // lands on 'h', past the 2 leading spaces
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn beginline_white_fix_stops_before_trailing_nul_when_all_whitespace() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        // A line that is ENTIRELY whitespace - without BL_FIX, the
+        // scan would walk all the way to the trailing NUL; WITH
+        // BL_FIX, it must stop one byte short (on the last space).
+        let mut buf = buf_with_real_line(b"   \0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _curtab_guard = CurtabGuard::set(&mut tp);
+
+        unsafe { beginline(BL_WHITE | BL_FIX) };
+
+        assert_eq!(win.w_cursor.col, 2); // stops on the LAST space, not the NUL
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn beginline_white_without_fix_reaches_the_trailing_nul_when_all_whitespace() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = buf_with_real_line(b"   \0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _curtab_guard = CurtabGuard::set(&mut tp);
+
+        unsafe { beginline(BL_WHITE) };
+
+        assert_eq!(win.w_cursor.col, 3); // walks all the way to the NUL
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn beginline_sol_with_default_p_sol_restores_curswant_column() {
+        // 'startofline' defaults OFF (p_sol == 0) - matching the
+        // original's own `(flags & BL_SOL) && !p_sol` condition, this
+        // takes the coladvance(curwin, w_curswant) branch, NOT the
+        // "jump to column 0" branch. Set p_sol explicitly (not just
+        // relying on its default) to stay correct regardless of test
+        // execution order.
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = buf_with_real_line(b"hello\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        win.w_curswant = 3;
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+        let _curtab_guard = CurtabGuard::set(&mut tp);
+        let previous_sol = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sol;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sol = 0;
+
+        unsafe { beginline(BL_SOL) };
+
+        assert_eq!(win.w_cursor.col, 3); // NOT 0 - restored to w_curswant instead
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sol = previous_sol;
+        close_real_line_buf(buf);
+    }
+
+    // --- oneright ---
+
+    #[test]
+    fn oneright_fails_at_the_end_of_the_line() {
+        let mut buf = buf_with_real_line(b"hi\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 }; // on the NUL
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneright() }, FAIL);
+        assert_eq!(win.w_cursor.col, 2);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn oneright_moves_one_byte_for_an_ascii_char() {
+        let mut buf = buf_with_real_line(b"hi\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneright() }, OK);
+        assert_eq!(win.w_cursor.col, 1);
+        assert!(win.w_set_curswant);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn oneright_fails_on_the_last_char_without_virtualedit_onemore() {
+        // Moving right from the last real character would land
+        // exactly ON the trailing NUL - FAIL unless 've' contains
+        // "onemore" (defaults off).
+        let mut buf = buf_with_real_line(b"hi\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 }; // on 'i'
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneright() }, FAIL);
+        assert_eq!(win.w_cursor.col, 1);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn oneright_moves_a_multibyte_char_by_its_full_byte_length() {
+        // "é" (U+00E9) is 2 bytes in UTF-8, followed by another
+        // ASCII byte so landing after it doesn't hit the NUL.
+        let mut buf = buf_with_real_line("é!\0".as_bytes());
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneright() }, OK);
+        assert_eq!(win.w_cursor.col, 2); // moved past both UTF-8 bytes of 'é'
+        close_real_line_buf(buf);
+    }
+
+    // --- oneleft ---
+
+    #[test]
+    fn oneleft_fails_at_column_zero() {
+        let mut buf = buf_with_real_line(b"hi\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneleft() }, FAIL);
+        assert_eq!(win.w_cursor.col, 0);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn oneleft_moves_one_byte_for_an_ascii_char() {
+        let mut buf = buf_with_real_line(b"hi\0");
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneleft() }, OK);
+        assert_eq!(win.w_cursor.col, 1);
+        assert!(win.w_set_curswant);
+        close_real_line_buf(buf);
+    }
+
+    #[test]
+    fn oneleft_lands_on_the_first_byte_of_a_multibyte_char() {
+        // Starting right after "é" (2 UTF-8 bytes) and moving left
+        // must land on 'é''s OWN first byte (col 0), not its second
+        // (continuation) byte - mb_adjust_cursor's own job.
+        let mut buf = buf_with_real_line("é!\0".as_bytes());
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 }; // on '!'
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurbufCurwinGuard::set(buf_ptr, win_ptr);
+
+        assert_eq!(unsafe { oneleft() }, OK);
+        assert_eq!(win.w_cursor.col, 0); // 'é''s own first byte, not byte 1
+        close_real_line_buf(buf);
     }
 }
