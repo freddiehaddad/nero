@@ -72,6 +72,7 @@ pub mod iconv_defs;
 pub mod indent;
 pub mod indent_c;
 pub mod input_defs;
+pub mod insert;
 pub mod insexpand;
 pub mod keycodes;
 pub mod keycodes_defs;
