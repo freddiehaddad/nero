@@ -1,19 +1,27 @@
 //! Translated from `src/nvim/garray.c` ("Functions for handling growing
 //! arrays") and the macros in `src/nvim/garray.h`.
 //!
-//! - Real forward dependencies not yet translated: `ga_concat_strings`,
-//!   `ga_clear_strings`, `ga_remove_duplicate_strings`,
-//!   `GA_DEEP_CLEAR`/`GA_DEEP_CLEAR_PTR`: these all treat `ga_data` as an
-//!   array of *string pointers* (`char **`/`const char **`), a completely
-//!   different usage of `garray_T` than "one flat byte buffer" (which is
-//!   what the rest of this file's functions treat it as, and what this
-//!   translation's `GarrayT.ga_data: Vec<u8>` models directly). When a
-//!   caller that uses `garray_T` as a string list is translated, it should
-//!   become a plain `Vec<Vec<u8>>` directly rather than routing through
-//!   `GarrayT` - so these functions aren't given a home here. Also,
-//!   `ga_remove_duplicate_strings` needs `path_fnamecmp` (`path.c`, phase
-//!   8, not yet translated) in addition to `sort_strings`
-//!   (`strings.c::sort_strings`, now translated).
+//! [`remove_duplicate_strings`]/[`concat_strings`] (`ga_remove_duplicate_
+//! strings`/`ga_concat_strings`) ARE translated, but as plain
+//! `Vec<Vec<u8>>`-operating functions rather than `GarrayT` methods:
+//! the original treats `ga_data` as an array of *string pointers*
+//! (`char **`/`const char **`) for these two, a completely different
+//! usage of `garray_T` than "one flat byte buffer" (which is what the
+//! rest of this file's functions treat it as, and what this
+//! translation's `GarrayT.ga_data: Vec<u8>` models directly) -
+//! translated ahead of a real caller (`path.c`/`runtime.c`, neither
+//! translated yet), matching this crate's established "small,
+//! self-contained piece ahead of the surrounding engine" precedent,
+//! now that both real dependencies (`path.c`'s `path_fnamecmp`,
+//! `strings.c`'s `sort_strings`) exist.
+//!
+//! `ga_clear_strings`/`GA_DEEP_CLEAR`/`GA_DEEP_CLEAR_PTR` need NO Rust
+//! equivalent at all for the same reason `optval_free`/`tv_dict_clear`
+//! don't (see `option.rs`'s/`eval/typval.rs`'s own module docs): a
+//! `Vec<Vec<u8>>`'s own `Drop` (or a plain `.clear()`) already
+//! individually releases every owned string, exactly matching what the
+//! original's manual per-string `xfree` loop achieves by hand.
+//!
 //! - `WLOG(...)` calls now use `crate::log::logmsg` directly (`log.c` is
 //!   translated as of this revision).
 
@@ -168,6 +176,48 @@ impl GarrayT {
     }
 }
 
+/// Sort `names` and remove duplicate entries
+/// (`ga_remove_duplicate_strings`). `names` is expected to contain a
+/// list of file names.
+///
+/// Modeled as a plain `&mut Vec<Vec<u8>>`-operating function rather
+/// than a `GarrayT` method, per this module's own doc comment: a
+/// `garray_T` used as a string list is a fundamentally different shape
+/// than `GarrayT`'s own byte-buffer model. `Vec::remove`'s own
+/// built-in "shift everything after this index down by one" behavior
+/// already replicates the original's manual `for (j = i + 1; ...)`
+/// close-the-gap loop, so it isn't translated separately.
+///
+/// # Safety
+/// Same as [`crate::path::path_fnamecmp`] (every element of `names`
+/// must be a valid file-name byte string per that function's own
+/// contract - in practice, always true for a plain `Vec<u8>`).
+pub unsafe fn remove_duplicate_strings(names: &mut Vec<Vec<u8>>) {
+    // sort first, which puts duplicates next to each other
+    crate::strings::sort_strings(names);
+
+    // loop over the list in reverse
+    let mut i = names.len();
+    while i > 1 {
+        i -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::path::path_fnamecmp(&names[i - 1], &names[i]) } == 0 {
+            names.remove(i);
+        }
+    }
+}
+
+/// For a list of strings: concatenate all of them with `sep` as
+/// separator (`ga_concat_strings`). Modeled as a plain `&[Vec<u8>]`-
+/// taking function rather than a `GarrayT` method, per this module's
+/// own doc comment. Rust's own `[T]::join` already does exactly what
+/// the original's own manual length-then-copy two-pass loop achieves
+/// by hand.
+#[must_use]
+pub fn concat_strings(strings: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
+    strings.join(sep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +310,59 @@ mod tests {
         assert_eq!(ga.ga_maxlen, 0);
         assert_eq!(ga.ga_itemsize, 4); // preserved
         assert_eq!(ga.ga_growsize, 8); // preserved
+    }
+
+    #[test]
+    fn remove_duplicate_strings_sorts_and_dedups() {
+        let mut names: Vec<Vec<u8>> = vec![b"b.txt".to_vec(), b"a.txt".to_vec(), b"b.txt".to_vec()];
+        unsafe { remove_duplicate_strings(&mut names) };
+        assert_eq!(names, vec![b"a.txt".to_vec(), b"b.txt".to_vec()]);
+    }
+
+    #[test]
+    fn remove_duplicate_strings_no_duplicates_just_sorts() {
+        let mut names: Vec<Vec<u8>> = vec![b"b.txt".to_vec(), b"a.txt".to_vec()];
+        unsafe { remove_duplicate_strings(&mut names) };
+        assert_eq!(names, vec![b"a.txt".to_vec(), b"b.txt".to_vec()]);
+    }
+
+    #[test]
+    fn remove_duplicate_strings_collapses_3_consecutive_duplicates_to_1() {
+        let mut names: Vec<Vec<u8>> =
+            vec![b"c.txt".to_vec(), b"c.txt".to_vec(), b"c.txt".to_vec()];
+        unsafe { remove_duplicate_strings(&mut names) };
+        assert_eq!(names, vec![b"c.txt".to_vec()]);
+    }
+
+    #[test]
+    fn remove_duplicate_strings_empty_is_a_noop() {
+        let mut names: Vec<Vec<u8>> = vec![];
+        unsafe { remove_duplicate_strings(&mut names) };
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn remove_duplicate_strings_single_element_is_a_noop() {
+        let mut names: Vec<Vec<u8>> = vec![b"a.txt".to_vec()];
+        unsafe { remove_duplicate_strings(&mut names) };
+        assert_eq!(names, vec![b"a.txt".to_vec()]);
+    }
+
+    #[test]
+    fn concat_strings_joins_with_separator() {
+        let strings = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        assert_eq!(concat_strings(&strings, b","), b"a,b,c".to_vec());
+    }
+
+    #[test]
+    fn concat_strings_empty_list_is_empty_string() {
+        let strings: Vec<Vec<u8>> = vec![];
+        assert_eq!(concat_strings(&strings, b","), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn concat_strings_single_element_has_no_separator() {
+        let strings = vec![b"only".to_vec()];
+        assert_eq!(concat_strings(&strings, b","), b"only".to_vec());
     }
 }
