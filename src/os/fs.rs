@@ -13,8 +13,9 @@
 //! now instead of waiting on that decision.
 //!
 //! Translated: `os_chdir`, `os_dirname`, `os_path_exists`, `os_isdir`,
-//! `os_isrealdir`, `os_mkdir`, `os_rmdir`, `os_remove`, `os_rename`,
-//! `os_realpath`, `os_fsync`, `os_open`, `os_file_is_readable`,
+//! `os_isrealdir`, `os_mkdir`, `os_mkdir_recurse`, `os_rmdir`,
+//! `os_remove`, `os_rename`, `os_realpath`, `os_fsync`, `os_open`,
+//! `os_file_is_readable`,
 //! `os_file_is_writable` (the latter two via `libc::access`, the
 //! same underlying syscall the original's own `uv_fs_access` wraps -
 //! needs a `Path` -> `CString` conversion, requiring valid UTF-8, a
@@ -75,8 +76,8 @@
 //! - `os_file_settime`: tractable in principle
 //!   (`std::fs::File::set_modified`), deferred only for lack of time
 //!   this pass - revisit alongside `os_getperm`.
-//! - `os_mkdir_recurse`/`os_file_mkdir`/`os_mkdtemp`: build on
-//!   `os_mkdir` plus recursive-creation logic not ported this pass.
+//! - `os_file_mkdir`/`os_mkdtemp`: build on the now-real
+//!   [`os_mkdir_recurse`], not ported this pass.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
 //! - `os_resolve_shortcut`/`os_is_reparse_point_include`: Windows
@@ -460,6 +461,109 @@ pub fn os_mkdir(path: &Path, #[cfg_attr(not(unix), allow(unused_variables))] mod
     }
 }
 
+/// Returns `true` if `&dir[..end]` is valid UTF-8 and names an
+/// existing directory - the "no directory found yet" test both
+/// phases of [`os_mkdir_recurse`] need. Invalid UTF-8 is treated as
+/// "not a directory" (this crate's established "invalid UTF-8 is
+/// treated the same as a nonexistent path" convention - see
+/// `path.rs`'s own `dir_of_file_exists`).
+fn is_dir_prefix(dir: &[u8], end: usize) -> bool {
+    match std::str::from_utf8(&dir[..end]) {
+        Ok(s) => os_isdir(Path::new(s)),
+        Err(_) => false,
+    }
+}
+
+/// Make a directory, with higher levels when needed
+/// (`os_mkdir_recurse`).
+///
+/// Returns `Ok(created)` on success - `created` is the full path of
+/// the first directory this call actually created (`None` if `dir`
+/// already existed and nothing needed to be created), matching the
+/// original's own `*created` out-parameter (left `NULL` in that same
+/// case). Returns `Err(failed_dir)` on failure - `failed_dir` is the
+/// specific directory `os_mkdir` itself failed on (may be an
+/// intermediate level, not necessarily `dir` itself), matching the
+/// original's own `*failed_dir` out-parameter. The original's own
+/// separate libuv error code is folded into this simple `Ok`/`Err`
+/// split, matching [`os_mkdir`]'s own already-established "0 success /
+/// -1 failure" simplification (no specific error CAUSE is surfaced
+/// anywhere in this crate yet).
+///
+/// # Algorithm
+/// Mirrors the original's own two-phase pointer-truncation walk, but
+/// using a `Vec<usize>` of byte offsets ("boundaries") into `dir`
+/// instead of embedding NUL bytes into a mutable buffer (a Rust slice
+/// already supports cheap, safe truncation by index, with no sentinel
+/// byte needed - the original's own repeated `*e = NUL`/`*e =
+/// PATHSEP` byte-patching is really just recomputing "how much of
+/// `dir`, from the start, should currently be considered live"):
+///
+/// 1. Shrinking phase: starting from `boundaries = [dir.len()]`,
+///    while `dir[..*last boundary]` does NOT already name an existing
+///    directory, shrink by one more trailing path component (via
+///    [`crate::path::path_tail_with_sep`]) and push the new boundary
+///      - until an existing directory IS found (the loop stops,
+///        keeping that boundary as the last element), or the boundary
+///        has shrunk back to [`crate::path::get_past_head`] (the
+///        root), in which case `past_head` itself becomes the final
+///        boundary and the loop stops unconditionally (matching the
+///        original's own early `break`, with no further `os_isdir`
+///        re-check of the root).
+/// 2. Creation phase: walk the recorded boundaries, EXCLUDING the
+///    last one (already confirmed to exist, or the assumed-to-exist
+///    root), from shallowest to deepest - i.e. in the REVERSE of the
+///    order they were pushed - calling [`os_mkdir`] at each
+///    successively longer prefix. This creates every missing
+///    intermediate level, matching the original's own "restore one
+///    truncation point, `os_mkdir`, repeat" loop exactly. The
+///    original's own "the path ends in trailing separators only"
+///    special case (silently skip creating a final, all-separator
+///    segment, e.g. a trailing `"///"`) is checked only for the LAST
+///    creation step (the one reaching `dir.len()` exactly), matching
+///    the original's own `e == real_end` guard.
+pub fn os_mkdir_recurse(dir: &[u8], mode: i32) -> Result<Option<Vec<u8>>, Vec<u8>> {
+    let past_head = crate::path::get_past_head(dir);
+    let real_end = dir.len();
+
+    let mut boundaries = vec![real_end];
+    loop {
+        let cur_end = *boundaries.last().unwrap();
+        if is_dir_prefix(dir, cur_end) {
+            break;
+        }
+        let e = crate::path::path_tail_with_sep(&dir[..cur_end]);
+        if e <= past_head {
+            boundaries.push(past_head);
+            break;
+        }
+        boundaries.push(e);
+    }
+
+    let mut created = None;
+    for i in (0..boundaries.len().saturating_sub(1)).rev() {
+        let end = boundaries[i];
+        if end == real_end {
+            // Path ends with something like "////" - ignore this.
+            let segment = &dir[boundaries[i + 1]..end];
+            if !segment.is_empty() && crate::memory::memcnt(segment, crate::ascii_defs::PATHSEP) == segment.len() {
+                break;
+            }
+        }
+        let Ok(prefix_str) = std::str::from_utf8(&dir[..end]) else {
+            return Err(dir[..end].to_vec());
+        };
+        if os_mkdir(Path::new(prefix_str), mode) != 0 {
+            return Err(dir[..end].to_vec());
+        }
+        if created.is_none() {
+            created = crate::path::full_name_save(Some(&dir[..end]), false);
+        }
+    }
+
+    Ok(created)
+}
+
 /// Remove a directory (`os_rmdir`).
 ///
 /// @return `0` for success, `-1` for failure.
@@ -725,6 +829,107 @@ mod tests {
         let scratch = TempScratch::new("mkdir_fail");
         let deep = scratch.path.join("missing_parent").join("child");
         assert_eq!(os_mkdir(&deep, 0o755), -1);
+    }
+
+    /// Converts a `Path` into the `&[u8]`-based representation
+    /// `os_mkdir_recurse` (and most of this crate's other path-taking
+    /// functions) expects. Every scratch-directory path in these tests
+    /// is built from plain ASCII components, so this always succeeds.
+    fn path_bytes(p: &std::path::Path) -> Vec<u8> {
+        p.to_str().unwrap().as_bytes().to_vec()
+    }
+
+    /// Like [`path_bytes`], but additionally normalizes to
+    /// forward-slash separators - matching `full_name_save`'s own
+    /// unconditional `path_to_slash` normalization (via
+    /// `vim_full_name`), so this can be compared byte-for-byte against
+    /// `os_mkdir_recurse`'s own returned `created` path on EVERY
+    /// platform, including Windows (where a plain `Path`/`PathBuf`
+    /// would otherwise stringify with backslashes).
+    fn full_name_bytes(p: &std::path::Path) -> Vec<u8> {
+        p.to_str().unwrap().replace('\\', "/").into_bytes()
+    }
+
+    #[test]
+    fn os_mkdir_recurse_creates_every_missing_level() {
+        let scratch = TempScratch::new("mkdir_recurse_all_missing");
+        let target = scratch.path.join("a").join("b").join("c");
+        let target_bytes = path_bytes(&target);
+
+        let created = os_mkdir_recurse(&target_bytes, 0o755).expect("should succeed");
+
+        assert!(os_isdir(&target));
+        assert!(os_isdir(&scratch.path.join("a")));
+        assert!(os_isdir(&scratch.path.join("a").join("b")));
+        // The FIRST directory actually created is the shallowest
+        // missing one ("a"), matching the original's own *created
+        // out-parameter semantics.
+        assert_eq!(created, Some(full_name_bytes(&scratch.path.join("a"))));
+    }
+
+    #[test]
+    fn os_mkdir_recurse_is_a_noop_when_the_full_path_already_exists() {
+        let scratch = TempScratch::new("mkdir_recurse_already_exists");
+        let target = scratch.path.join("already").join("here");
+        std::fs::create_dir_all(&target).unwrap();
+        let target_bytes = path_bytes(&target);
+
+        let created = os_mkdir_recurse(&target_bytes, 0o755).expect("should succeed");
+
+        assert!(created.is_none(), "nothing should have been created");
+        assert!(os_isdir(&target));
+    }
+
+    #[test]
+    fn os_mkdir_recurse_creates_only_the_missing_tail() {
+        let scratch = TempScratch::new("mkdir_recurse_partial");
+        // "a" already exists; "a/b/c" does not.
+        let existing = scratch.path.join("a");
+        std::fs::create_dir_all(&existing).unwrap();
+        let target = existing.join("b").join("c");
+        let target_bytes = path_bytes(&target);
+
+        let created = os_mkdir_recurse(&target_bytes, 0o755).expect("should succeed");
+
+        assert!(os_isdir(&target));
+        // The first NEW directory created is "a/b" (the shallowest
+        // missing level), not "a" (already existed) or "a/b/c".
+        assert_eq!(created, Some(full_name_bytes(&existing.join("b"))));
+    }
+
+    #[test]
+    fn os_mkdir_recurse_fails_when_a_file_blocks_an_intermediate_level() {
+        let scratch = TempScratch::new("mkdir_recurse_blocked");
+        // Create a plain FILE at "blocker", then try to create
+        // "blocker/child" underneath it - "blocker" can never become a
+        // directory, so os_mkdir must fail at exactly that level (the
+        // shallowest missing one, processed BEFORE "blocker/child" is
+        // ever attempted).
+        let blocker = scratch.path.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let target = blocker.join("child");
+        let target_bytes = path_bytes(&target);
+
+        let err = os_mkdir_recurse(&target_bytes, 0o755).expect_err("should fail");
+        assert_eq!(err, path_bytes(&blocker));
+        assert!(!os_isdir(&target));
+    }
+
+    #[test]
+    fn os_mkdir_recurse_ignores_trailing_separators() {
+        let scratch = TempScratch::new("mkdir_recurse_trailing_sep");
+        let target = scratch.path.join("a").join("b");
+        // Deliberately append a trailing separator run - matches the
+        // original's own "path ends with something like '////'" case,
+        // which must be silently ignored rather than attempted as its
+        // own (nonsensical, already-covered) creation step.
+        let mut target_bytes = path_bytes(&target);
+        target_bytes.extend_from_slice(b"///");
+
+        let created = os_mkdir_recurse(&target_bytes, 0o755).expect("should succeed");
+
+        assert!(os_isdir(&target));
+        assert!(created.is_some(), "the real levels should still have been created");
     }
 
     #[test]
