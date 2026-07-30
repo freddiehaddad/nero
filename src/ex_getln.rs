@@ -220,6 +220,26 @@ pub fn f_getcmdtype(
     };
 }
 
+/// `wildtrigger()` - start wildcard expansion in the command line
+/// (`f_wildtrigger`, `ex_getln.c`) - a real no-op today: the
+/// original's own FIRST disjunct, `!(State & MODE_CMDLINE)`, is
+/// exactly `!cmdline_is_active()`, always `true` today - and since
+/// C's `||` short-circuits, `char_avail()`/`wild_menu_showing`/
+/// `cmdline_pum_active()` are NEVER even evaluated once that first
+/// disjunct is true, so none of those need to exist here either.
+/// `rettv` is left completely untouched, matching the original's own
+/// body (which never assigns to `rettv` at all - `call_func`'s own
+/// caller already initializes it to `VAR_UNKNOWN` before dispatch).
+pub fn f_wildtrigger(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    _rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    if !cmdline_is_active() {
+        return;
+    }
+    unimplemented!("wildtrigger(): needs a real, live command-line-editing state")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +399,37 @@ mod tests {
         let mut rettv = crate::eval::typval_defs::TypvalT::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f_getcmdtype(&[], &mut rettv);
+        }));
+
+        // SAFETY: forwarded from the lock reasoning above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn wildtrigger_is_a_no_op_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_wildtrigger(&[], &mut rettv);
+        // rettv is left completely untouched, matching the original's
+        // own body (which never assigns to it at all).
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Unknown);
+    }
+
+    #[test]
+    #[should_panic(expected = "wildtrigger(): needs a real, live command-line-editing state")]
+    fn wildtrigger_panics_when_a_command_line_is_genuinely_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        // SAFETY: `global_state_test_lock()` held for this whole test.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f_wildtrigger(&[], &mut rettv);
         }));
 
         // SAFETY: forwarded from the lock reasoning above.
