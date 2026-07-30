@@ -34,6 +34,15 @@
 //! COMPLETE translations, not fast-path-only, since nothing about
 //! either depends on a real diff actually existing.
 //!
+//! Also translated: [`diff_get_corresponding_line`]/[`diff_lnum_win`]
+//! (plus the private `diff_get_corresponding_line_int`) - real,
+//! faithful translations of their "current buffer isn't a diff buffer"
+//! early-return path (always taken today since `diff_buf_idx` always
+//! returns `DB_COUNT`, matching the same reasoning as
+//! `diff_check_with_linestatus`), translated ahead of any real caller
+//! (none of `winfloat.c`/`move.c`/`window.c`'s own diff-aware
+//! scroll-binding callers are translated yet).
+//!
 //! Deferred: everything else in the file - real diff computation/
 //! display/navigation, needing the internal xdiff algorithm or
 //! external `diff` process invocation, neither translated.
@@ -223,6 +232,99 @@ pub unsafe fn diff_mode_buf(buf: *mut crate::buffer_defs::BufT) -> bool {
         tp = unsafe { &*tp }.tp_next;
     }
     false
+}
+
+/// Find the corresponding line in a diff (`diff_get_corresponding_line_int`).
+///
+/// Only the "no diffs at all" early-return path is translated (see
+/// this module's own doc comment) - the real diff-block search
+/// (walking `tp_first_diff`) is `unimplemented!()`, unreachable in
+/// practice today since `diff_buf_idx` always returns `DB_COUNT`
+/// (nothing in this crate can currently register a buffer as a diff
+/// buffer).
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin`/`curtab` must each be a valid, non-null
+/// pointer to a live value.
+unsafe fn diff_get_corresponding_line_int(
+    buf1: *mut crate::buffer_defs::BufT,
+    lnum1: crate::pos_defs::LinenrT,
+) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let idx1 = diff_buf_idx(buf1, g.curtab);
+    let idx2 = diff_buf_idx(g.curbuf, g.curtab);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let tp_first_diff_is_null = unsafe { &*g.curtab }.tp_first_diff.is_null();
+
+    if idx1 == crate::buffer_defs::DB_COUNT
+        || idx2 == crate::buffer_defs::DB_COUNT
+        || tp_first_diff_is_null
+    {
+        return lnum1;
+    }
+
+    unimplemented!(
+        "diff::diff_get_corresponding_line_int: the real diff-block search is not yet \
+         translated - unreachable in practice today since diff_buf_idx always returns \
+         DB_COUNT, see this module's own doc comment"
+    );
+}
+
+/// Find the corresponding line in a diff, clamped so it never lands
+/// past the end of the current buffer (`diff_get_corresponding_line`).
+/// Translated ahead of a real caller (none of `winfloat.c`/
+/// `move.c`/`window.c`'s own diff-aware scroll-binding callers are
+/// translated yet), matching this crate's established "small,
+/// self-contained piece ahead of the surrounding engine" precedent.
+///
+/// # Safety
+/// Same as `diff_get_corresponding_line_int`.
+#[must_use]
+pub unsafe fn diff_get_corresponding_line(
+    buf1: *mut crate::buffer_defs::BufT,
+    lnum1: crate::pos_defs::LinenrT,
+) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { diff_get_corresponding_line_int(buf1, lnum1) };
+    // don't end up past the end of the file
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    lnum.min(curbuf.b_ml.ml_line_count)
+}
+
+/// For line `lnum` in the current window, find the equivalent line
+/// number in window `wp`, compensating for inserted/deleted lines
+/// (`diff_lnum_win`).
+///
+/// Only the "current buffer isn't a diff buffer" safety-check
+/// early-return is translated - always taken today since
+/// `diff_buf_idx` always returns `DB_COUNT` (see this module's own
+/// doc comment). The real diff-block search is `unimplemented!()`.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curtab` must each be a valid, non-null pointer to
+/// a live value.
+#[must_use]
+pub unsafe fn diff_lnum_win(
+    _lnum: crate::pos_defs::LinenrT,
+    _wp: *mut WinT,
+) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let idx = diff_buf_idx(g.curbuf, g.curtab);
+
+    if idx == crate::buffer_defs::DB_COUNT {
+        // safety check
+        return 0;
+    }
+
+    unimplemented!(
+        "diff::diff_lnum_win: the real diff-block search is not yet translated - unreachable \
+         in practice today since diff_buf_idx always returns DB_COUNT, see this module's own \
+         doc comment"
+    );
 }
 
 #[cfg(test)]
@@ -462,5 +564,71 @@ mod tests {
         let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
 
         assert!(!unsafe { diff_mode_buf(&mut buf as *mut BufT) });
+    }
+
+    /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime
+    /// (matches this file's own `CurtabGuard`/`FirstTabpageGuard`
+    /// convention: does NOT acquire its own lock).
+    struct CurbufGuard {
+        previous: *mut BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn diff_get_corresponding_line_returns_lnum_unchanged_via_no_diffs_fast_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = BufT::default();
+        let mut curbuf = BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 100, ..Default::default() },
+            ..Default::default()
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(&mut curbuf as *mut BufT);
+
+        assert_eq!(unsafe { diff_get_corresponding_line(&mut buf1 as *mut BufT, 42) }, 42);
+    }
+
+    #[test]
+    fn diff_get_corresponding_line_clamps_to_the_buffers_own_line_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf1 = BufT::default();
+        let mut curbuf = BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 10, ..Default::default() },
+            ..Default::default()
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(&mut curbuf as *mut BufT);
+
+        // lnum1 (999) exceeds curbuf's own line count (10) - clamped.
+        assert_eq!(unsafe { diff_get_corresponding_line(&mut buf1 as *mut BufT, 999) }, 10);
+    }
+
+    #[test]
+    fn diff_lnum_win_returns_zero_via_no_diffs_fast_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut curbuf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let _curbuf_guard = CurbufGuard::set(&mut curbuf as *mut BufT);
+
+        let mut wp = WinT::default();
+        assert_eq!(unsafe { diff_lnum_win(5, &mut wp as *mut WinT) }, 0);
     }
 }
