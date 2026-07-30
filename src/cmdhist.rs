@@ -8,14 +8,19 @@
 //!
 //! Translated: [`HistoryType`], [`HIST_COUNT`], [`get_hislen`] (reading
 //! a new file-static `HISLEN`, always `0` today since nothing can add a
-//! history entry yet), and [`hist_char2type`] - a pure character-to-enum
-//! mapping with no dependencies at all.
+//! history entry yet), [`hist_char2type`] - a pure character-to-enum
+//! mapping with no dependencies at all - and [`get_histtype`]/
+//! [`get_history_idx`]/[`f_histnr`] (`histnr()`): tractable now that
+//! `HISLEN` exists (making `get_history_idx`'s own real early-return
+//! always taken today) and `ex_getln.rs` gained
+//! `get_cmdline_firstc()`.
 //!
 //! Deferred: everything else - `get_histentry`/`set_histentry`/
 //! `get_hisidx`/`get_hisnum`/`get_history_arg`/`init_history`/
-//! `add_to_history`/`clr_history`/`f_hist*`/`ex_history` (need
-//! `histentry_T`'s own `AdditionalData`/full history-table storage, and
-//! the command-line editing subsystem to ever populate it).
+//! `add_to_history`/`clr_history`/`f_histget`/`f_histadd`/`f_histdel`/
+//! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
+//! history-table storage, and the command-line editing subsystem to
+//! ever populate it).
 
 use crate::globals::GlobalCell;
 
@@ -77,6 +82,93 @@ pub fn hist_char2type(c: i32) -> HistoryType {
     }
 }
 
+/// Table of history names (`history_names[]`), used by
+/// [`get_histtype`] and (in the original) `:history`'s own argument
+/// completion.
+const HISTORY_NAMES: [&[u8]; HIST_COUNT] = [b"cmd", b"search", b"expr", b"input", b"debug"];
+
+/// The corresponding [`HistoryType`] for each entry of
+/// `HISTORY_NAMES`, in the same order.
+const HISTORY_NAME_TYPES: [HistoryType; HIST_COUNT] = [
+    HistoryType::Cmd,
+    HistoryType::Search,
+    HistoryType::Expr,
+    HistoryType::Input,
+    HistoryType::Debug,
+];
+
+/// Parses a history-name argument into its [`HistoryType`]
+/// (`get_histtype`) - a case-insensitive prefix match against
+/// `HISTORY_NAMES` (e.g. `"s"`/`"sea"`/`"search"` all match
+/// `Search`), or a single history-marker character (`:`/`=`/`@`/`>`/
+/// `/`/`?`). An empty `name` resolves to either [`HistoryType::Default`]
+/// (when `return_default` is set) or the CURRENT command line's own
+/// leading character via [`crate::ex_getln::get_cmdline_firstc`]/
+/// [`hist_char2type`] - always resolves to [`HistoryType::Search`]
+/// today, since `get_cmdline_firstc()` is always `0` (NUL) and
+/// `hist_char2type(0)` is `Search`.
+#[must_use]
+pub fn get_histtype(name: &[u8], return_default: bool) -> HistoryType {
+    if name.is_empty() {
+        return if return_default {
+            HistoryType::Default
+        } else {
+            hist_char2type(crate::ex_getln::get_cmdline_firstc())
+        };
+    }
+
+    for (hn, ty) in HISTORY_NAMES.iter().zip(HISTORY_NAME_TYPES.iter()) {
+        // `STRNICMP(name, hn, name.len())`: a case-insensitive
+        // comparison of `name`'s own full length against `hn`'s FIRST
+        // `name.len()` bytes - only meaningful (and only ever matches)
+        // when `name` is no longer than `hn` itself, since C's
+        // `strncasecmp` would otherwise compare past `hn`'s own NUL
+        // terminator against a byte that can never be NUL in `name`.
+        if name.len() <= hn.len() && name.eq_ignore_ascii_case(&hn[..name.len()]) {
+            return *ty;
+        }
+    }
+
+    if name.len() == 1 && b":=@>?/".contains(&name[0]) {
+        return hist_char2type(i32::from(name[0]));
+    }
+
+    HistoryType::Invalid
+}
+
+/// Gets the identifier of the newest entry in history table `histype`
+/// (`get_history_idx`). Always `-1` today: [`get_hislen`] always
+/// returns `0` (no history entry can exist yet), so this function's
+/// own real early-return condition is always taken - a faithful,
+/// always-taken early return (matching this crate's established
+/// `AUTOCMDS`/`cmdline_is_active` precedent), not a hardcoded
+/// shortcut. The real per-table `hisidx[]` lookup (reached only once
+/// `init_history`/`add_to_history` exist) is `unimplemented!()`.
+#[must_use]
+pub fn get_history_idx(histype: HistoryType) -> i32 {
+    if get_hislen() == 0 || (histype as i32) < 0 || (histype as i32) >= HIST_COUNT as i32 {
+        return -1;
+    }
+    unimplemented!("get_history_idx: needs the real hisidx[]/history[] table, not yet translated")
+}
+
+/// `histnr({history})` - the identifier of the newest entry in the
+/// given history table, or `-1` for an unknown history name
+/// (`f_histnr`, `cmdhist.c`). Always `-1` today, since
+/// [`get_history_idx`]'s own real early-return is always taken.
+pub fn f_histnr(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let histname = crate::eval::typval::tv_get_string_chk(&argvars[0]);
+    let i = match &histname {
+        Some(name) => get_histtype(name, false),
+        None => HistoryType::Invalid,
+    };
+    let n = if i == HistoryType::Invalid { HistoryType::Invalid as i32 } else { get_history_idx(i) };
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -123,5 +215,121 @@ pub(crate) mod tests {
     fn hist_char2type_unknown_char_is_invalid() {
         assert_eq!(hist_char2type(i32::from(b'x')), HistoryType::Invalid);
         assert_eq!(hist_char2type(-1), HistoryType::Invalid);
+    }
+
+    // --- get_histtype ---
+
+    #[test]
+    fn get_histtype_matches_full_names_case_insensitively() {
+        assert_eq!(get_histtype(b"cmd", false), HistoryType::Cmd);
+        assert_eq!(get_histtype(b"CMD", false), HistoryType::Cmd);
+        assert_eq!(get_histtype(b"search", false), HistoryType::Search);
+        assert_eq!(get_histtype(b"expr", false), HistoryType::Expr);
+        assert_eq!(get_histtype(b"input", false), HistoryType::Input);
+        assert_eq!(get_histtype(b"debug", false), HistoryType::Debug);
+    }
+
+    #[test]
+    fn get_histtype_matches_a_significant_prefix() {
+        // "It is sufficient to give the significant prefix of a
+        // history name" (the original's own comment on
+        // `history_names[]`).
+        assert_eq!(get_histtype(b"s", false), HistoryType::Search);
+        assert_eq!(get_histtype(b"sea", false), HistoryType::Search);
+        assert_eq!(get_histtype(b"c", false), HistoryType::Cmd);
+    }
+
+    #[test]
+    fn get_histtype_a_name_longer_than_any_table_entry_does_not_match() {
+        // "searching" is longer than "search" itself - STRNICMP would
+        // compare past "search"'s own NUL terminator and fail, so this
+        // must NOT match Search (or anything else).
+        assert_eq!(get_histtype(b"searching", false), HistoryType::Invalid);
+    }
+
+    #[test]
+    fn get_histtype_matches_a_single_marker_character() {
+        assert_eq!(get_histtype(b":", false), HistoryType::Cmd);
+        assert_eq!(get_histtype(b"=", false), HistoryType::Expr);
+        assert_eq!(get_histtype(b"@", false), HistoryType::Input);
+        assert_eq!(get_histtype(b">", false), HistoryType::Debug);
+        assert_eq!(get_histtype(b"/", false), HistoryType::Search);
+        assert_eq!(get_histtype(b"?", false), HistoryType::Search);
+    }
+
+    #[test]
+    fn get_histtype_unrecognized_name_is_invalid() {
+        assert_eq!(get_histtype(b"bogus", false), HistoryType::Invalid);
+        assert_eq!(get_histtype(b"x", false), HistoryType::Invalid);
+    }
+
+    #[test]
+    fn get_histtype_empty_name_resolves_via_cmdline_firstc() {
+        let _lock = crate::globals::global_state_test_lock();
+        // get_cmdline_firstc() is always 0 (NUL) today, and
+        // hist_char2type(0) is Search.
+        assert_eq!(get_histtype(b"", false), HistoryType::Search);
+    }
+
+    #[test]
+    fn get_histtype_empty_name_with_return_default_is_default() {
+        assert_eq!(get_histtype(b"", true), HistoryType::Default);
+    }
+
+    // --- get_history_idx / f_histnr ---
+
+    #[test]
+    fn get_history_idx_is_negative_one_when_hislen_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(get_hislen(), 0);
+        assert_eq!(get_history_idx(HistoryType::Cmd), -1);
+        assert_eq!(get_history_idx(HistoryType::Search), -1);
+    }
+
+    #[test]
+    fn get_history_idx_is_negative_one_for_an_out_of_range_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(get_history_idx(HistoryType::Invalid), -1);
+        assert_eq!(get_history_idx(HistoryType::Default), -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "get_history_idx: needs the real hisidx")]
+    fn get_history_idx_panics_when_hislen_is_genuinely_nonzero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = set_hislen(10);
+        let result = std::panic::catch_unwind(|| get_history_idx(HistoryType::Cmd));
+        set_hislen(old);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn histnr_of_a_known_history_name_is_negative_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_histnr(
+            &[crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"cmd".to_vec())),
+                ..Default::default()
+            }],
+            &mut rettv,
+        );
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(-1));
+    }
+
+    #[test]
+    fn histnr_of_an_unknown_history_name_is_also_negative_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_histnr(
+            &[crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"bogus".to_vec())),
+                ..Default::default()
+            }],
+            &mut rettv,
+        );
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(-1));
     }
 }

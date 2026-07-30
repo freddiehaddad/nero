@@ -111,6 +111,26 @@ fn cmdline_is_active() -> bool {
     state & crate::state_defs::mode::CMDLINE as i32 != 0
 }
 
+/// `ccline.cmdfirstc` - the leading character of the CURRENTLY-being-
+/// edited command line (`:`/`=`/`@`/`>`/`/`/`?`), read via
+/// [`get_cmdline_firstc`]. This is a plain `i32` field of the
+/// original's own file-static `ccline` (not gated behind
+/// `get_ccline_ptr`'s `MODE_CMDLINE` check the way `cmdline_is_active`
+/// is) - so it's modeled directly as its own file-static, matching
+/// `cmdline_star`'s own precedent in `GLOBALS`, rather than the full
+/// `CmdlineInfo` struct (not needed for this one field). Always `0`
+/// (NUL) today: a fresh, zero-initialized `ccline.cmdfirstc`, since
+/// nothing in this crate can start real command-line editing yet.
+static CMDLINE_FIRSTC: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// `get_cmdline_firstc()` - the leading character of the current
+/// command line, or `0` (NUL) when none is active (`ex_getln.c`).
+/// Always `0` today - see `CMDLINE_FIRSTC`'s own doc comment.
+pub fn get_cmdline_firstc() -> i32 {
+    // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
+    unsafe { *CMDLINE_FIRSTC.get_mut() }
+}
+
 /// `getcmdcomplpat()` - the current command-line completion pattern
 /// (`f_getcmdcomplpat`, `ex_getln.c`) - always empty today, since
 /// `cmdline_is_active` is always `false` (the original's own
