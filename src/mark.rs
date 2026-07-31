@@ -85,6 +85,23 @@
 //! real translated caller yet (needs `shada.c`) - harvested anyway,
 //! matching this crate's established ahead-of-caller precedent.
 //!
+//! Also translated: `mark_col_adjust` (+ its own private `COL_ADJUST`
+//! macro, as `col_adjust`) - adjusts every mark/cursor position
+//! touching line `lnum` at or after `mincol` when text is inserted/
+//! deleted on that line. Needs only already-real fields
+//! (`b_namedm`/`b_last_insert`/`b_last_change`/`b_prompt_start`/
+//! `b_changelist`/`b_visual`, `NAMEDFM`, `w_pcmark`/`w_prev_pcmark`,
+//! `GLOBALS.saved_cursor`/`cmdmod`, `w_jumplist`/`w_tagstack`) plus
+//! `crate::buffer::bt_prompt`. The original's own
+//! `FOR_ALL_WINDOWS_IN_TAB(win, curtab)` always takes its `firstwin`
+//! branch here (`curtab` compared to itself) - matches
+//! `fmarks_check_one`/`fmarks_check_names`'s own already-established
+//! simplification (walks `GLOBALS.firstwin`/`w_next` directly, no
+//! `TabpageT`/multi-tab handling needed). No real translated caller
+//! yet (needs `del_bytes`/`ins_char`/etc., real buffer modification,
+//! none translated) - harvested ahead of it, matching the established
+//! "translate ahead of a real caller" precedent.
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
 //!   `nvim_del_mark`'s own API-layer helpers (`api/extmark.c`, not
@@ -1745,6 +1762,181 @@ pub unsafe fn mark_mb_adjustpos(buf: &mut BufT, lp: &mut PosT) {
         {
             lp.coladd = 0;
         }
+    }
+}
+
+/// Applies [`mark_col_adjust`]'s own `COL_ADJUST` macro logic to a
+/// single position: skip unless it's on `lnum` at or after `mincol`,
+/// then shift the line by `lnum_amount` and the column by
+/// `col_amount` (clamped to `0` if that would go negative, or offset
+/// by `spaces_removed` if the column sits within the removed span).
+fn col_adjust(
+    posp: &mut PosT,
+    lnum: crate::pos_defs::LinenrT,
+    mincol: crate::pos_defs::ColnrT,
+    lnum_amount: crate::pos_defs::LinenrT,
+    col_amount: crate::pos_defs::ColnrT,
+    spaces_removed: i32,
+) {
+    if posp.lnum == lnum && posp.col >= mincol {
+        posp.lnum += lnum_amount;
+        debug_assert!(col_amount > crate::pos_defs::ColnrT::MIN);
+        if col_amount < 0 && posp.col <= -col_amount {
+            posp.col = 0;
+        } else if posp.col < spaces_removed {
+            posp.col = col_amount + spaces_removed;
+        } else {
+            posp.col += col_amount;
+        }
+    }
+}
+
+/// Adjust marks in line `lnum` at column `mincol` and further: add
+/// `lnum_amount` to the line number and add `col_amount` to the
+/// column position. `spaces_removed` is the number of spaces that
+/// were removed - matters when the cursor is inside them
+/// (`mark_col_adjust`).
+///
+/// The original's own `FOR_ALL_WINDOWS_IN_TAB(win, curtab)` always
+/// takes its `firstwin` branch here (`curtab` compared to itself) -
+/// matches `fmarks_check_one`/`fmarks_check_names`'s own already-
+/// established simplification (walks `GLOBALS.firstwin`/`w_next`
+/// directly).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must each be a valid,
+/// non-null pointer to their own live structs. `GLOBALS.firstwin`'s
+/// own `w_next` chain must consist of valid, live `WinT` pointers.
+#[allow(dead_code)]
+pub unsafe fn mark_col_adjust(
+    lnum: crate::pos_defs::LinenrT,
+    mincol: crate::pos_defs::ColnrT,
+    lnum_amount: crate::pos_defs::LinenrT,
+    col_amount: crate::pos_defs::ColnrT,
+    spaces_removed: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let fnum = unsafe { (*curbuf).handle };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cmod_flags = unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags;
+    if (col_amount == 0 && lnum_amount == 0) || (cmod_flags & cmod::LOCKMARKS) != 0 {
+        return; // nothing to do
+    }
+
+    // named marks, lower case and upper case
+    for i in 0..(NMARKS as usize) {
+        // SAFETY: forwarded from this function's own safety doc.
+        col_adjust(unsafe { &mut (*curbuf).b_namedm[i].mark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+        // SAFETY: forwarded from this function's own safety doc.
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        if namedfm[i].fmark.fnum == fnum {
+            col_adjust(&mut namedfm[i].fmark.mark, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+        }
+    }
+    for i in (NMARKS as usize)..(NGLOBALMARKS as usize) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        if namedfm[i].fmark.fnum == fnum {
+            col_adjust(&mut namedfm[i].fmark.mark, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+        }
+    }
+
+    // last Insert position
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curbuf).b_last_insert.mark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // last change position
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curbuf).b_last_change.mark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::buffer::bt_prompt(Some(unsafe { &*curbuf })) {
+        // SAFETY: forwarded from this function's own safety doc.
+        col_adjust(unsafe { &mut (*curbuf).b_prompt_start.mark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+    }
+
+    // list of change positions
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_changelistlen = unsafe { (*curbuf).b_changelistlen };
+    for i in 0..(b_changelistlen as usize) {
+        // SAFETY: forwarded from this function's own safety doc.
+        col_adjust(unsafe { &mut (*curbuf).b_changelist[i].mark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+    }
+
+    // Visual area
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curbuf).b_visual.vi_start }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curbuf).b_visual.vi_end }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // previous context mark
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curwin).w_pcmark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // previous pcmark
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(unsafe { &mut (*curwin).w_prev_pcmark }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // saved cursor for formatting
+    // SAFETY: forwarded from this function's own safety doc.
+    col_adjust(&mut unsafe { GLOBALS.get_mut() }.saved_cursor, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+
+    // Adjust items in all windows related to the current buffer.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // marks in the jumplist
+        // SAFETY: forwarded from this function's own safety doc.
+        let w_jumplistlen = unsafe { (*wp).w_jumplistlen };
+        for i in 0..(w_jumplistlen as usize) {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*wp).w_jumplist[i].fmark.fnum } == fnum {
+                // SAFETY: forwarded from this function's own safety doc.
+                col_adjust(
+                    unsafe { &mut (*wp).w_jumplist[i].fmark.mark },
+                    lnum,
+                    mincol,
+                    lnum_amount,
+                    col_amount,
+                    spaces_removed,
+                );
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*wp).w_buffer } == curbuf {
+            // marks in the tag stack
+            // SAFETY: forwarded from this function's own safety doc.
+            let w_tagstacklen = unsafe { (*wp).w_tagstacklen };
+            for i in 0..(w_tagstacklen as usize) {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { (*wp).w_tagstack[i].fmark.fnum } == fnum {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    col_adjust(
+                        unsafe { &mut (*wp).w_tagstack[i].fmark.mark },
+                        lnum,
+                        mincol,
+                        lnum_amount,
+                        col_amount,
+                        spaces_removed,
+                    );
+                }
+            }
+
+            // cursor position for other windows with the same buffer
+            if !std::ptr::eq(wp, curwin) {
+                // SAFETY: forwarded from this function's own safety doc.
+                col_adjust(unsafe { &mut (*wp).w_cursor }, lnum, mincol, lnum_amount, col_amount, spaces_removed);
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
     }
 }
 
@@ -4109,5 +4301,206 @@ mod tests {
 
             tv_list_free(l);
         }
+    }
+
+    // ---- col_adjust ----
+
+    #[test]
+    fn col_adjust_skips_non_matching_line() {
+        let mut pos = PosT { lnum: 5, col: 3, coladd: 0 };
+        col_adjust(&mut pos, 10, 0, 100, 100, 0);
+        assert_eq!(pos, PosT { lnum: 5, col: 3, coladd: 0 });
+    }
+
+    #[test]
+    fn col_adjust_skips_column_before_mincol() {
+        let mut pos = PosT { lnum: 5, col: 2, coladd: 0 };
+        col_adjust(&mut pos, 5, 3, 100, 100, 0);
+        assert_eq!(pos, PosT { lnum: 5, col: 2, coladd: 0 });
+    }
+
+    #[test]
+    fn col_adjust_shifts_matching_position() {
+        let mut pos = PosT { lnum: 5, col: 10, coladd: 0 };
+        col_adjust(&mut pos, 5, 3, 2, 4, 0);
+        assert_eq!(pos, PosT { lnum: 7, col: 14, coladd: 0 });
+    }
+
+    #[test]
+    fn col_adjust_clamps_to_zero_when_col_amount_negative_and_col_too_small() {
+        // col=3, col_amount=-5: col(3) <= -col_amount(5) -> clamp to 0.
+        let mut pos = PosT { lnum: 5, col: 3, coladd: 0 };
+        col_adjust(&mut pos, 5, 0, 0, -5, 0);
+        assert_eq!(pos.col, 0);
+    }
+
+    #[test]
+    fn col_adjust_does_not_clamp_when_col_exceeds_the_negative_amount() {
+        // col=10, col_amount=-5: col(10) > -col_amount(5) -> col += -5 = 5.
+        let mut pos = PosT { lnum: 5, col: 10, coladd: 0 };
+        col_adjust(&mut pos, 5, 0, 0, -5, 0);
+        assert_eq!(pos.col, 5);
+    }
+
+    #[test]
+    fn col_adjust_uses_spaces_removed_when_col_is_within_removed_span() {
+        // col=2 < spaces_removed=4 -> col = col_amount(7) + spaces_removed(4) = 11.
+        let mut pos = PosT { lnum: 5, col: 2, coladd: 0 };
+        col_adjust(&mut pos, 5, 0, 0, 7, 4);
+        assert_eq!(pos.col, 11);
+    }
+
+    #[test]
+    fn mark_col_adjust_noop_when_both_amounts_are_zero() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let curbuf = unsafe { &mut *GLOBALS.get_mut().curbuf };
+        curbuf.b_namedm[0].mark = PosT { lnum: 5, col: 0, coladd: 0 };
+
+        unsafe { mark_col_adjust(5, 0, 0, 0, 0) };
+
+        assert_eq!(unsafe { &*GLOBALS.get_mut().curbuf }.b_namedm[0].mark, PosT { lnum: 5, col: 0, coladd: 0 });
+    }
+
+    #[test]
+    fn mark_col_adjust_noop_when_lockmarks_flag_set() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags = cmod::LOCKMARKS;
+        unsafe { &mut *GLOBALS.get_mut().curbuf }.b_namedm[0].mark = PosT { lnum: 5, col: 0, coladd: 0 };
+
+        unsafe { mark_col_adjust(5, 0, 0, 3, 0) };
+
+        assert_eq!(unsafe { &*GLOBALS.get_mut().curbuf }.b_namedm[0].mark, PosT { lnum: 5, col: 0, coladd: 0 });
+    }
+
+    #[test]
+    fn mark_col_adjust_touches_buffer_level_fields() {
+        let mut buf = BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_changelistlen: 1,
+            ..Default::default()
+        };
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 }; // 'a'
+        buf.b_last_insert.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_last_change.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_prompt_start.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_changelist[0].mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_visual.vi_start = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_visual.vi_end = PosT { lnum: 5, col: 2, coladd: 0 };
+        // A non-matching mark ('b') must stay untouched.
+        buf.b_namedm[1].mark = PosT { lnum: 99, col: 2, coladd: 0 };
+
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { mark_col_adjust(5, 0, 1, 10, 0) };
+
+        let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+        let expected = PosT { lnum: 6, col: 12, coladd: 0 };
+        assert_eq!(curbuf.b_namedm[0].mark, expected);
+        assert_eq!(curbuf.b_last_insert.mark, expected);
+        assert_eq!(curbuf.b_last_change.mark, expected);
+        assert_eq!(curbuf.b_prompt_start.mark, expected);
+        assert_eq!(curbuf.b_changelist[0].mark, expected);
+        assert_eq!(curbuf.b_visual.vi_start, expected);
+        assert_eq!(curbuf.b_visual.vi_end, expected);
+        assert_eq!(curbuf.b_namedm[1].mark, PosT { lnum: 99, col: 2, coladd: 0 });
+    }
+
+    #[test]
+    fn mark_col_adjust_skips_prompt_start_for_non_prompt_buffers() {
+        let mut buf = BufT::default(); // b_p_bt unset - not a prompt buffer
+        buf.b_prompt_start.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+
+        unsafe { mark_col_adjust(5, 0, 1, 10, 0) };
+
+        assert_eq!(
+            unsafe { &*GLOBALS.get_mut().curbuf }.b_prompt_start.mark,
+            PosT { lnum: 5, col: 2, coladd: 0 } // untouched
+        );
+    }
+
+    #[test]
+    fn mark_col_adjust_touches_global_marks_only_for_current_buffer_fnum() {
+        let mut buf = BufT { handle: 7, ..Default::default() };
+        let mut win = WinT::default();
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        let _namedfm_guard = NamedfmGuard::acquire();
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fmark.fnum = 7; // same buffer - should be adjusted
+        namedfm[0].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        namedfm[1] = XfmarkT::default();
+        namedfm[1].fmark.fnum = 8; // different buffer - untouched
+        namedfm[1].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+
+        unsafe { mark_col_adjust(5, 0, 1, 10, 0) };
+
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.mark, PosT { lnum: 6, col: 12, coladd: 0 });
+        assert_eq!(namedfm[1].fmark.mark, PosT { lnum: 5, col: 2, coladd: 0 });
+    }
+
+    #[test]
+    fn mark_col_adjust_touches_curwin_pcmark_and_saved_cursor() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_pcmark: PosT { lnum: 5, col: 2, coladd: 0 },
+            w_prev_pcmark: PosT { lnum: 5, col: 2, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        unsafe { GLOBALS.get_mut() }.saved_cursor = PosT { lnum: 5, col: 2, coladd: 0 };
+
+        unsafe { mark_col_adjust(5, 0, 1, 10, 0) };
+
+        let expected = PosT { lnum: 6, col: 12, coladd: 0 };
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        assert_eq!(curwin.w_pcmark, expected);
+        assert_eq!(curwin.w_prev_pcmark, expected);
+        assert_eq!(unsafe { GLOBALS.get_mut() }.saved_cursor, expected);
+    }
+
+    #[test]
+    fn mark_col_adjust_touches_other_windows_jumplist_and_tagstack_but_not_curwin_cursor() {
+        let mut buf = BufT { handle: 3, ..Default::default() };
+        let mut other_win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        other_win.w_jumplistlen = 1;
+        other_win.w_jumplist[0].fmark.fnum = 3;
+        other_win.w_jumplist[0].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        other_win.w_tagstacklen = 1;
+        other_win.w_tagstack[0].fmark.fnum = 3;
+        other_win.w_tagstack[0].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        other_win.w_cursor = PosT { lnum: 5, col: 2, coladd: 0 };
+
+        let mut curwin = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_next: &mut other_win as *mut WinT,
+            ..Default::default()
+        };
+        curwin.w_cursor = PosT { lnum: 5, col: 2, coladd: 0 };
+
+        let _guard = MarkTestGuard::set(&mut curwin as *mut WinT, &mut buf as *mut BufT);
+        let _firstwin_guard = FirstwinGuard::set(&mut curwin as *mut WinT);
+
+        unsafe { mark_col_adjust(5, 0, 1, 10, 0) };
+
+        let expected = PosT { lnum: 6, col: 12, coladd: 0 };
+        // Reached via GLOBALS.firstwin -> other_win (curwin itself is
+        // firstwin here, but its own w_cursor is skipped since
+        // `wp == curwin`).
+        assert_eq!(other_win.w_jumplist[0].fmark.mark, expected);
+        assert_eq!(other_win.w_tagstack[0].fmark.mark, expected);
+        assert_eq!(other_win.w_cursor, expected); // other window's cursor IS adjusted
+        assert_eq!(
+            unsafe { &*GLOBALS.get_mut().curwin }.w_cursor,
+            PosT { lnum: 5, col: 2, coladd: 0 } // curwin's OWN cursor is skipped
+        );
     }
 }
