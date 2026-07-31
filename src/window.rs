@@ -265,6 +265,18 @@
 //! matching this crate's established policy for real internal-
 //! invariant checks.
 //!
+//! Also translated: `make_win_info_dict` (builds a
+//! `{width, height, topline, topfill, leftcol, skipcol}` dict
+//! describing a window's size/scroll-position change), via already-
+//! real `crate::eval::typval::tv_dict_alloc`/`tv_dict_add_nr`/
+//! `tv_dict_unref`. Translated ahead of its real caller
+//! (`check_window_scroll_resize`, needing `event_ignored`'s real
+//! `'eventignorewin'` parsing plus `list_T`/`dict_T` accumulation
+//! across every window in a tab - not yet translated), matching this
+//! crate's established "translate ahead of a real caller" precedent
+//! for small, self-contained pieces with no design freedom of their
+//! own.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2671,6 +2683,56 @@ pub unsafe fn last_stl_height(morewin: bool) -> i32 {
             // SAFETY: forwarded from this function's own safety doc.
             && (morewin || !unsafe { one_window(firstwin, std::ptr::null()) }));
     if show { STATUS_HEIGHT } else { 0 }
+}
+
+/// Build a dict describing a window's size/scroll-position change:
+/// `{width, height, topline, topfill, leftcol, skipcol}`
+/// (`make_win_info_dict`). Returns `None` if any entry could not be
+/// added, matching the original's own real (if practically
+/// unreachable) `tv_dict_add_tv` failure path - every key here is a
+/// distinct literal, so `tv_dict_add`'s only failure mode (a
+/// duplicate key already present) can never actually occur, but the
+/// original's own "stop at the first failure, release the dict,
+/// return NULL" structure is preserved faithfully anyway via `&&`'s
+/// own left-to-right short-circuit evaluation.
+///
+/// The returned dict (if any) is a freshly-allocated dict the caller
+/// now owns and must eventually release via `tv_dict_unref`.
+#[must_use]
+pub fn make_win_info_dict(
+    width: i32,
+    height: i32,
+    topline: i32,
+    topfill: i32,
+    leftcol: i32,
+    skipcol: i32,
+) -> Option<*mut crate::eval::typval_defs::DictT> {
+    let d = crate::eval::typval::tv_dict_alloc();
+    // SAFETY: `d` was just allocated above, so it's a valid, exclusive,
+    // not-yet-shared pointer.
+    let dict = unsafe { &mut *d };
+    dict.dv_refcount = 1;
+
+    let ok = crate::eval::typval::tv_dict_add_nr(dict, b"width", i64::from(width))
+        != crate::vim_defs::FAIL
+        && crate::eval::typval::tv_dict_add_nr(dict, b"height", i64::from(height))
+            != crate::vim_defs::FAIL
+        && crate::eval::typval::tv_dict_add_nr(dict, b"topline", i64::from(topline))
+            != crate::vim_defs::FAIL
+        && crate::eval::typval::tv_dict_add_nr(dict, b"topfill", i64::from(topfill))
+            != crate::vim_defs::FAIL
+        && crate::eval::typval::tv_dict_add_nr(dict, b"leftcol", i64::from(leftcol))
+            != crate::vim_defs::FAIL
+        && crate::eval::typval::tv_dict_add_nr(dict, b"skipcol", i64::from(skipcol))
+            != crate::vim_defs::FAIL;
+
+    if ok {
+        Some(d)
+    } else {
+        // SAFETY: `d` is a freshly-allocated, exclusively-owned dict.
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+        None
+    }
 }
 
 #[cfg(test)]
@@ -6457,5 +6519,39 @@ mod tests {
 
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    // ---- make_win_info_dict ----
+
+    #[test]
+    fn make_win_info_dict_builds_all_six_keys_with_the_given_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = make_win_info_dict(10, 20, 30, 40, 50, 60).expect("should succeed");
+
+        // SAFETY: `d` is a freshly-allocated, exclusively-owned dict.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"width"), 10);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"height"), 20);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"topline"), 30);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"topfill"), 40);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"leftcol"), 50);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"skipcol"), 60);
+            assert_eq!((*d).dv_refcount, 1);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    fn make_win_info_dict_handles_zero_and_negative_values() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = make_win_info_dict(0, 0, 1, 0, -5, -1).expect("should succeed");
+
+        // SAFETY: `d` is a freshly-allocated, exclusively-owned dict.
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"width"), 0);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"leftcol"), -5);
+            assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"skipcol"), -1);
+            crate::eval::typval::tv_dict_unref(d);
+        }
     }
 }
