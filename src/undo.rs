@@ -731,7 +731,7 @@ pub unsafe fn u_savecommon(
         let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
         if std::ptr::eq(buf as *const BufT, curbuf.cast_const()) {
             // SAFETY: forwarded from this function's own safety doc.
-            unsafe { crate::change::change_warning(buf, 0) };
+            unsafe { crate::change::change_warning(buf as *mut BufT, 0) };
         }
 
         if bot > buf.b_ml.ml_line_count + 1 {
