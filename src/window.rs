@@ -334,6 +334,17 @@
 //! matching the established "translate ahead of a real caller"
 //! precedent.
 //!
+//! Also translated: `cmd_with_count` (build a command string with an
+//! optional count suffix appended, e.g. `"quit"` + count `3` becomes
+//! `"quit3"`) - a pure string-formatting helper with no dependencies
+//! at all, returning an owned `Vec<u8>` rather than writing into the
+//! original's own fixed-size `bufp`/`bufsize` output buffer, matching
+//! this crate's established "return an owned collection instead of a
+//! bounded out-buffer" idiom. Translated ahead of its real caller
+//! (`do_window`, the large Normal-mode window-command dispatcher, not
+//! yet translated), matching the established "translate ahead of a
+//! real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -3052,6 +3063,18 @@ pub unsafe fn win_altframe(
     }
 
     target_fr
+}
+
+/// Build a command string with an optional count suffix appended
+/// (e.g. `"quit"` with count `3` becomes `"quit3"`) (`cmd_with_count`).
+/// `prenum <= 0` leaves `cmd` unchanged.
+#[must_use]
+pub fn cmd_with_count(cmd: &[u8], prenum: i64) -> Vec<u8> {
+    let mut out = cmd.to_vec();
+    if prenum > 0 {
+        out.extend_from_slice(prenum.to_string().as_bytes());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -7516,5 +7539,27 @@ mod tests {
         // Default target is fr_next (fixed width) - reversed to
         // fr_prev since it is NOT fixed width.
         assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, prev_ptr);
+    }
+
+    // ---- cmd_with_count ----
+
+    #[test]
+    fn cmd_with_count_appends_a_positive_count() {
+        assert_eq!(cmd_with_count(b"quit", 3), b"quit3".to_vec());
+    }
+
+    #[test]
+    fn cmd_with_count_zero_leaves_cmd_unchanged() {
+        assert_eq!(cmd_with_count(b"quit", 0), b"quit".to_vec());
+    }
+
+    #[test]
+    fn cmd_with_count_negative_leaves_cmd_unchanged() {
+        assert_eq!(cmd_with_count(b"quit", -1), b"quit".to_vec());
+    }
+
+    #[test]
+    fn cmd_with_count_multi_digit_count() {
+        assert_eq!(cmd_with_count(b"split", 42), b"split42".to_vec());
     }
 }
