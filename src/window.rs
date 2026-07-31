@@ -227,10 +227,30 @@
 //! `frame_fixed_height`/`frame_fixed_width` - each only walks its own
 //! `FR_ROW`/`FR_COL` case (matching the original's own single `if`
 //! guard exactly; a mismatched child inside the OTHER layout kind is
-//! genuinely invisible to this specific check, not a bug). Translated
-//! ahead of a real caller (`check_colorcolumn`'s own `qsort`-based
-//! sibling, not yet translated - needs `int_cmp`, a trivial `qsort`
-//! comparator with no standalone value of its own).
+//! genuinely invisible to this specific check, not a bug).
+//!
+//! Also translated: `check_colorcolumn` (parses `'colorcolumn'`'s
+//! comma-separated column list, e.g. `"+1,-1,80"`, into
+//! `WinT.w_p_cc_cols` - called when `'colorcolumn'`/`'textwidth'` is
+//! changed), via already-real `WinT.w_onebuf_opt.wo_cc`/`w_buffer`,
+//! `BufT.b_p_tw`, `charset.rs`'s `getdigits_int`,
+//! `ascii_defs.rs`'s `ascii_isdigit`. Returns a plain `bool` (`true`
+//! = valid, matching the original's own `NULL` return) rather than a
+//! `Result<(), ()>`, matching `valid_name`/`check_ff_value`'s own
+//! precedent for this exact "valid or not, no other payload" shape -
+//! the message text itself (`e_invarg`) is omitted, matching the
+//! established "skip the deferred message-display side effect, keep
+//! the exact same return value" policy. `int_cmp` (a trivial `qsort`
+//! comparator) needs no Rust equivalent at all: `Vec::sort_unstable`
+//! already sorts the collected columns directly. The original's own
+//! `xfree(wp->w_p_cc_cols)` before reassigning likewise needs no
+//! equivalent - a plain Rust assignment to `Option<Vec<i32>>` already
+//! drops the old `Vec` automatically. Translated ahead of its real
+//! callers (`optionstr.c`'s `did_set_colorcolumn`/`did_set_textwidth`,
+//! both still blocked on `optset_T`, the option-setting-context
+//! struct only the not-yet-translated `:set` engine can construct),
+//! matching this crate's established "translate ahead of a real
+//! caller" precedent.
 //!
 //! Deferred: everything else in the file.
 
@@ -2462,6 +2482,130 @@ pub unsafe fn frame_check_width(topfrp: *const crate::buffer_defs::FrameT, width
             frp = fr.fr_next;
         }
     }
+    true
+}
+
+/// Check `cc` as `'colorcolumn'` and update the members of `wp`. This
+/// is called when `'colorcolumn'` or `'textwidth'` is changed
+/// (`check_colorcolumn`).
+///
+/// `cc`: when `None`, use `wp`'s own `'colorcolumn'` value.
+///
+/// `wp`: when `None`, only parse `cc` (don't update anything).
+///
+/// Returns `false` on a malformed `'colorcolumn'` value, matching the
+/// original's own real, non-null-vs-null error-message return (`true`
+/// = `NULL` = valid) - the message text itself (`e_invarg`) is
+/// omitted, matching this crate's established "skip the deferred
+/// message-display side effect, keep the exact same return value"
+/// policy, and matching `valid_name`/`check_ff_value`'s own precedent
+/// of a plain `bool` for this exact "valid or not" shape. The
+/// original's own debug-only overflow-safety `assert()` before
+/// `col += (int)tw` has no Rust equivalent needed: `wrapping_add`
+/// below makes the addition itself well-defined (never UB) regardless,
+/// unlike the original's plain `+=`.
+///
+/// # Safety
+/// If `wp` is `Some`, its own `w_buffer` must either be null (meaning
+/// "buffer was closed") or a valid, live `BufT` pointer.
+#[must_use]
+pub unsafe fn check_colorcolumn(cc: Option<&[u8]>, wp: Option<&mut WinT>) -> bool {
+    if let Some(ref w) = wp {
+        if w.w_buffer.is_null() {
+            return true; // buffer was closed
+        }
+    }
+
+    // Resolve the effective string to parse: cc if given, else wp's
+    // own w_p_cc, else empty.
+    let owned_cc;
+    let s: &[u8] = if let Some(cc) = cc {
+        cc
+    } else if let Some(ref w) = wp {
+        owned_cc = w.w_onebuf_opt.wo_cc.clone().unwrap_or_default();
+        &owned_cc
+    } else {
+        &[]
+    };
+
+    let tw: crate::types_defs::OptInt = if let Some(ref w) = wp {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*w.w_buffer }.b_p_tw
+    } else {
+        0 // buffer-local value not set, assume zero
+    };
+
+    let mut color_cols: Vec<i32> = Vec::new();
+    let mut pos = 0;
+    while pos < s.len() && color_cols.len() < 255 {
+        // Whether this item should actually be added to color_cols -
+        // false mirrors the original's own `goto skip;` (the item is
+        // silently dropped, but parsing continues).
+        let mut pushed = true;
+        let col = if s[pos] == b'-' || s[pos] == b'+' {
+            // -N and +N: add to 'textwidth'.
+            let sign: i32 = if s[pos] == b'-' { -1 } else { 1 };
+            pos += 1;
+            if !(pos < s.len() && crate::ascii_defs::ascii_isdigit(i32::from(s[pos]))) {
+                return false;
+            }
+            let (digits, consumed) = crate::charset::getdigits_int(&s[pos..], true, 0);
+            pos += consumed;
+            let col = sign * digits;
+            if tw == 0 {
+                // 'textwidth' not set, skip this item.
+                pushed = false;
+                0
+            } else {
+                let col = col.wrapping_add(tw as i32);
+                if col < 0 {
+                    pushed = false;
+                }
+                col
+            }
+        } else if crate::ascii_defs::ascii_isdigit(i32::from(s[pos])) {
+            let (digits, consumed) = crate::charset::getdigits_int(&s[pos..], true, 0);
+            pos += consumed;
+            digits
+        } else {
+            return false;
+        };
+        if pushed {
+            color_cols.push(col - 1); // 1-based to 0-based
+        }
+
+        if pos >= s.len() {
+            break;
+        }
+        if s[pos] != b',' {
+            return false;
+        }
+        pos += 1;
+        if pos >= s.len() {
+            return false; // illegal trailing comma as in "set cc=80,"
+        }
+    }
+
+    let Some(w) = wp else {
+        return true; // only parse cc
+    };
+
+    if color_cols.is_empty() {
+        w.w_p_cc_cols = None;
+    } else {
+        // sort the columns for faster usage on screen redraw inside
+        // win_line()
+        color_cols.sort_unstable();
+        let mut deduped: Vec<i32> = Vec::with_capacity(color_cols.len());
+        for c in color_cols {
+            // skip duplicates
+            if deduped.last() != Some(&c) {
+                deduped.push(c);
+            }
+        }
+        w.w_p_cc_cols = Some(deduped);
+    }
+
     true
 }
 
@@ -5960,5 +6104,153 @@ mod tests {
         let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
 
         assert!(!unsafe { frame_check_width(leaf_ptr, 21) });
+    }
+
+    // ---- check_colorcolumn ----
+
+    fn buf_with_tw(tw: crate::types_defs::OptInt) -> crate::buffer_defs::BufT {
+        crate::buffer_defs::BufT { b_p_tw: tw, ..Default::default() }
+    }
+
+    #[test]
+    fn check_colorcolumn_buffer_was_closed_returns_true_without_changing_anything() {
+        let mut win = WinT {
+            w_buffer: std::ptr::null_mut(),
+            w_p_cc_cols: Some(vec![1, 2]),
+            ..Default::default()
+        };
+
+        assert!(unsafe { check_colorcolumn(Some(b"5"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn check_colorcolumn_only_parses_when_wp_is_none() {
+        assert!(unsafe { check_colorcolumn(Some(b"5,10"), None) });
+        assert!(!unsafe { check_colorcolumn(Some(b"x"), None) });
+    }
+
+    #[test]
+    fn check_colorcolumn_parses_plain_digit_columns_1_based_to_0_based() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(unsafe { check_colorcolumn(Some(b"5,10"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, Some(vec![4, 9]));
+    }
+
+    #[test]
+    fn check_colorcolumn_relative_plus_minus_add_to_textwidth() {
+        let mut buf = buf_with_tw(80);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        // "+1" -> 1 + 80 = 81 -> 0-based 80. "-1" -> -1 + 80 = 79 ->
+        // 0-based 78. Sorted ascending: [78, 80].
+        assert!(unsafe { check_colorcolumn(Some(b"+1,-1"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, Some(vec![78, 80]));
+    }
+
+    #[test]
+    fn check_colorcolumn_skips_relative_column_when_textwidth_is_zero() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(unsafe { check_colorcolumn(Some(b"+1"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, None);
+    }
+
+    #[test]
+    fn check_colorcolumn_skips_relative_column_that_goes_negative() {
+        let mut buf = buf_with_tw(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        // "-100" -> -100 + 5 = -95 < 0 -> silently dropped.
+        assert!(unsafe { check_colorcolumn(Some(b"-100"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, None);
+    }
+
+    #[test]
+    fn check_colorcolumn_sorts_and_dedups() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(unsafe { check_colorcolumn(Some(b"10,5,10,5"), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, Some(vec![4, 9]));
+    }
+
+    #[test]
+    fn check_colorcolumn_invalid_leading_character_returns_false() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(!unsafe { check_colorcolumn(Some(b"x"), Some(&mut win)) });
+    }
+
+    #[test]
+    fn check_colorcolumn_missing_digit_after_sign_returns_false() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(!unsafe { check_colorcolumn(Some(b"+"), Some(&mut win)) });
+    }
+
+    #[test]
+    fn check_colorcolumn_missing_comma_between_items_returns_false() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(!unsafe { check_colorcolumn(Some(b"5x10"), Some(&mut win)) });
+    }
+
+    #[test]
+    fn check_colorcolumn_trailing_comma_returns_false() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+
+        assert!(!unsafe { check_colorcolumn(Some(b"80,"), Some(&mut win)) });
+    }
+
+    #[test]
+    fn check_colorcolumn_empty_string_clears_a_previous_value() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win =
+            WinT { w_buffer: buf_ptr, w_p_cc_cols: Some(vec![1, 2]), ..Default::default() };
+
+        assert!(unsafe { check_colorcolumn(Some(b""), Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, None);
+    }
+
+    #[test]
+    fn check_colorcolumn_uses_wp_own_wo_cc_when_cc_is_none() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_cc: Some(b"3".to_vec()), ..Default::default() },
+            ..Default::default()
+        };
+
+        assert!(unsafe { check_colorcolumn(None, Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, Some(vec![2]));
+    }
+
+    #[test]
+    fn check_colorcolumn_uses_empty_when_wo_cc_and_cc_are_both_none() {
+        let mut buf = buf_with_tw(0);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT { w_buffer: buf_ptr, w_p_cc_cols: Some(vec![1]), ..Default::default() };
+
+        assert!(unsafe { check_colorcolumn(None, Some(&mut win)) });
+        assert_eq!(win.w_p_cc_cols, None);
     }
 }
