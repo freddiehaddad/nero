@@ -62,6 +62,15 @@
 //! (`block_prep`, `init_charsize_arg`-driven column arithmetic, real
 //! buffer modification) and remains fully blocked too.
 //!
+//! Also translated: [`mb_adjust_opend`] - extends an inclusive
+//! `oparg_T.end.col` to the last byte of the (possibly multi-byte,
+//! possibly composing-character) character it currently points into,
+//! needing only already-real `crate::memline::ml_get`/
+//! `crate::mbyte::utf_head_off`/`utfc_ptr2len`. Its own real callers
+//! (`op_delete`/`op_yank`/etc., none translated) remain blocked -
+//! translated ahead of them, matching the established "translate
+//! ahead of a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -500,6 +509,37 @@ unsafe fn get_new_vts_indent(
         }
     } else {
         i64::from(get_vts_sum(vts, vtsi + amount)) + offset
+    }
+}
+
+/// If `oap.inclusive`, extend `oap.end.col` to the LAST byte of the
+/// (possibly multi-byte, possibly composing-character) character it
+/// currently points into (`mb_adjust_opend`) - operators normally work
+/// on a single base character's own leading byte; this fixes up the
+/// end position so a multi-byte character isn't only partially
+/// included.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` whose `b_ml.ml_mfp`, if non-null, points to a live
+/// `MemfileT` (forwarded from `crate::memline::ml_get`'s own safety
+/// doc).
+#[allow(dead_code)]
+pub unsafe fn mb_adjust_opend(oap: &mut crate::normal_defs::OpargT) {
+    if !oap.inclusive {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(oap.end.lnum) };
+    let col = oap.end.col as usize;
+    if line.get(col).copied().unwrap_or(0) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let head_off = unsafe { crate::mbyte::utf_head_off(&line, col) } as usize;
+        let new_start = col - head_off;
+        // SAFETY: forwarded from this function's own safety doc.
+        let char_len = unsafe { crate::mbyte::utfc_ptr2len(&line[new_start..]) };
+        oap.end.col = new_start as crate::pos_defs::ColnrT + char_len - 1;
     }
 }
 
@@ -1009,6 +1049,110 @@ mod tests {
         // Same setup as above, but shifting LEFT by 1 from the first
         // tabstop boundary lands at column 0.
         assert_eq!(unsafe { get_new_vts_indent(true, false, 1, &[4, 8]) }, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    // ---- mb_adjust_opend ----
+
+    #[test]
+    fn mb_adjust_opend_noop_when_not_inclusive() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        let mut oap = crate::normal_defs::OpargT {
+            inclusive: false,
+            end: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { mb_adjust_opend(&mut oap) };
+        assert_eq!(oap.end.col, 1);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn mb_adjust_opend_ascii_character_is_unchanged() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+
+        // 'e' at index 1 is already its own single-byte "last byte".
+        let mut oap = crate::normal_defs::OpargT {
+            inclusive: true,
+            end: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { mb_adjust_opend(&mut oap) };
+        assert_eq!(oap.end.col, 1);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn mb_adjust_opend_multibyte_character_from_its_lead_byte() {
+        // "日本\0" = [E6,97,A5, E6,9C,AC, 00] - same verified bytes as
+        // mbyte.rs's own utf_head_off_does_not_merge_two_independent_
+        // cjk_characters test.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, "\u{65E5}\u{672C}\0".as_bytes());
+
+        // col=3 is the LEAD byte of 本 (the second character) - the
+        // last byte of that same 3-byte character is at col=5.
+        let mut oap = crate::normal_defs::OpargT {
+            inclusive: true,
+            end: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { mb_adjust_opend(&mut oap) };
+        assert_eq!(oap.end.col, 5);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn mb_adjust_opend_multibyte_character_from_a_continuation_byte() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, "\u{65E5}\u{672C}\0".as_bytes());
+
+        // col=4 is the SECOND byte of 本 - mb_adjust_opend must first
+        // walk back to the lead byte (col=3), then land at the SAME
+        // final position (col=5) as starting from the lead byte
+        // itself.
+        let mut oap = crate::normal_defs::OpargT {
+            inclusive: true,
+            end: crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { mb_adjust_opend(&mut oap) };
+        assert_eq!(oap.end.col, 5);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn mb_adjust_opend_noop_at_end_of_line() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, "\u{65E5}\u{672C}\0".as_bytes());
+
+        // col=6 points AT the trailing NUL - *ptr == NUL, so this is a
+        // no-op (matches the original's own `if (*ptr != NUL)` guard).
+        let mut oap = crate::normal_defs::OpargT {
+            inclusive: true,
+            end: crate::pos_defs::PosT { lnum: 1, col: 6, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { mb_adjust_opend(&mut oap) };
+        assert_eq!(oap.end.col, 6);
 
         drop(guard);
         close_buf_with_memline(buf);
