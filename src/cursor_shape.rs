@@ -2,10 +2,10 @@
 //!
 //! `cursor_shape.c` handles cursor/mouse-pointer shape configuration via
 //! the `'guicursor'`/`'mouseshape'` options. The option-string *parser*
-//! (`parse_shape_opt`, needing `cmdline_at_end`/`cmdline_overstrike`/
-//! `syn_check_group`/UI mode-info plumbing, none translated) and
-//! everything depending on real syntax-highlight attribute lookup
-//! (`syn_id2attr`, needing the syntax subsystem) are not attempted here.
+//! (`parse_shape_opt`, needing `syn_check_group`/UI mode-info plumbing,
+//! neither translated) and everything depending on real syntax-
+//! highlight attribute lookup (`syn_id2attr`, needing the syntax
+//! subsystem) are not attempted here.
 //!
 //! Translated: `SHAPE_TABLE` (`shape_table`, with its own real static
 //! initializer values - `parse_shape_opt`, the only thing that would
@@ -22,6 +22,16 @@
 //! `blinkon == 0` condition never holds - a real, faithful consequence
 //! of `shape_table` not yet being reparsed from option values, not a
 //! hardcoded stub.
+//!
+//! Also translated: [`clear_shape_table`] (resets every `SHAPE_TABLE`
+//! entry's `shape`/`blinkwait`/`blinkon`/`blinkoff`/`id`/`id_lm`
+//! fields, deliberately NOT `full_name`/`mshape`/`percentage`/`name`/
+//! `used_for`, matching the original's own exact field list) and
+//! [`cursor_get_mode_idx`] (the `SHAPE_TABLE` index for the current
+//! mode), via already-real `crate::globals::GLOBALS.State`/
+//! `finish_op`/`Visual.active`, `crate::state_defs::mode`'s flag
+//! constants, `crate::option_vars::OPTION_VARS.p_sel`, and
+//! `crate::ex_getln`'s newly-real `cmdline_at_end`/`cmdline_overstrike`.
 //!
 //! Deferred: `mode_style_array` (needs `Arena`/`Dict`/`Array`, the API
 //! layer), `parse_shape_opt`, `update_mouseshape`/`ui_cursor_shape_*`
@@ -335,6 +345,73 @@ static SHAPE_TABLE: GlobalCell<[CursorentryT; SHAPE_IDX_COUNT]> = GlobalCell::ne
     },
 ]);
 
+/// Clears all entries in `SHAPE_TABLE` to block, blinkon0, and default
+/// color (`clear_shape_table`).
+pub fn clear_shape_table() {
+    // SAFETY: a plain write through one exclusive borrow.
+    let table = unsafe { SHAPE_TABLE.get_mut() };
+    for entry in table.iter_mut() {
+        entry.shape = CursorShape::Block;
+        entry.blinkwait = 0;
+        entry.blinkon = 0;
+        entry.blinkoff = 0;
+        entry.id = 0;
+        entry.id_lm = 0;
+    }
+}
+
+/// Return the index into `SHAPE_TABLE` for the current mode
+/// (`cursor_get_mode_idx`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`.
+// The VREPLACE_FLAG and REPLACE_FLAG branches both resolve to
+// SHAPE_IDX_R - clippy's `if_same_then_else` flags this as
+// suspicious, but it's a faithful match to the original's own 2
+// separate `else if` branches: VREPLACE mode always also sets
+// REPLACE_FLAG (VREPLACE = REPLACE_FLAG | VREPLACE_FLAG | INSERT), so
+// checking VREPLACE_FLAG first is a real, independently-meaningful
+// distinction in the original that just happens to produce the same
+// index today, not an accidental copy-paste duplication.
+#[allow(clippy::if_same_then_else)]
+#[must_use]
+pub unsafe fn cursor_get_mode_idx() -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let state = g.State;
+    if state == crate::state_defs::mode::SHOWMATCH as i32 {
+        SHAPE_IDX_SM
+    } else if state == crate::state_defs::mode::TERMINAL as i32 {
+        SHAPE_IDX_TERM
+    } else if state & crate::state_defs::mode::VREPLACE_FLAG as i32 != 0 {
+        SHAPE_IDX_R
+    } else if state & crate::state_defs::mode::REPLACE_FLAG as i32 != 0 {
+        SHAPE_IDX_R
+    } else if state & crate::state_defs::mode::INSERT as i32 != 0 {
+        SHAPE_IDX_I
+    } else if state & crate::state_defs::mode::CMDLINE as i32 != 0 {
+        if crate::ex_getln::cmdline_at_end() {
+            SHAPE_IDX_C
+        } else if crate::ex_getln::cmdline_overstrike() {
+            SHAPE_IDX_CR
+        } else {
+            SHAPE_IDX_CI
+        }
+    } else if g.finish_op {
+        SHAPE_IDX_O
+    } else if g.Visual.active {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p_sel_is_exclusive = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sel
+            .as_deref()
+            .and_then(<[u8]>::first)
+            == Some(&b'e');
+        if p_sel_is_exclusive { SHAPE_IDX_VE } else { SHAPE_IDX_V }
+    } else {
+        SHAPE_IDX_N
+    }
+}
+
 /// Whether the cursor is a block cursor with blinking disabled during
 /// Visual mode - `exclusive` selects `'selection'` exclusive
 /// ([`SHAPE_IDX_VE`]) vs. inclusive ([`SHAPE_IDX_V`])
@@ -502,5 +579,180 @@ pub(crate) mod tests {
 
         set_shape_table_entry(SHAPE_IDX_N, old);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_guicursor = None;
+    }
+
+    // ---- clear_shape_table ----
+
+    #[test]
+    fn clear_shape_table_resets_shape_blink_and_id_but_not_other_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        // clear_shape_table() resets EVERY entry, not just one - save
+        // and restore the whole table, not only SHAPE_IDX_N (a real
+        // test-fixture bug caught via the FULL test suite: an earlier
+        // version of this test left every OTHER entry's blinkon/etc.
+        // zeroed out, which broke cursor_is_block_during_visual's own
+        // "blinkon == 400 by default" assumption in a later test).
+        // SAFETY: a plain read through one exclusive borrow.
+        let saved_table = unsafe { *SHAPE_TABLE.get_mut() };
+        set_shape_table_entry(
+            SHAPE_IDX_N,
+            CursorentryT {
+                full_name: "normal",
+                shape: CursorShape::Ver,
+                mshape: 5,
+                percentage: 50,
+                blinkwait: 700,
+                blinkon: 400,
+                blinkoff: 250,
+                id: 42,
+                id_lm: 7,
+                name: "n",
+                used_for: SHAPE_CURSOR + SHAPE_MOUSE,
+            },
+        );
+
+        clear_shape_table();
+
+        // SAFETY: a plain read through one exclusive borrow.
+        let entry = unsafe { SHAPE_TABLE.get_mut()[SHAPE_IDX_N] };
+        assert_eq!(entry.shape, CursorShape::Block);
+        assert_eq!(entry.blinkwait, 0);
+        assert_eq!(entry.blinkon, 0);
+        assert_eq!(entry.blinkoff, 0);
+        assert_eq!(entry.id, 0);
+        assert_eq!(entry.id_lm, 0);
+        // Not touched by clear_shape_table.
+        assert_eq!(entry.full_name, "normal");
+        assert_eq!(entry.mshape, 5);
+        assert_eq!(entry.percentage, 50);
+        assert_eq!(entry.name, "n");
+        assert_eq!(entry.used_for, SHAPE_CURSOR + SHAPE_MOUSE);
+
+        // SAFETY: a plain write through one exclusive borrow.
+        unsafe { *SHAPE_TABLE.get_mut() = saved_table };
+    }
+
+    // ---- cursor_get_mode_idx ----
+
+    /// RAII guard for `cursor_get_mode_idx` tests: saves/restores
+    /// every `GLOBALS`/`OPTION_VARS` field it reads.
+    struct CursorModeIdxGuard {
+        prev_state: i32,
+        prev_finish_op: bool,
+        prev_visual_active: bool,
+        prev_p_sel: Option<Vec<u8>>,
+    }
+    impl CursorModeIdxGuard {
+        fn set(state: i32, finish_op: bool, visual_active: bool, p_sel: Option<&[u8]>) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = CursorModeIdxGuard {
+                prev_state: g.State,
+                prev_finish_op: g.finish_op,
+                prev_visual_active: g.Visual.active,
+                prev_p_sel: opts.p_sel.clone(),
+            };
+            g.State = state;
+            g.finish_op = finish_op;
+            g.Visual.active = visual_active;
+            opts.p_sel = p_sel.map(<[u8]>::to_vec);
+            guard
+        }
+    }
+    impl Drop for CursorModeIdxGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            g.State = self.prev_state;
+            g.finish_op = self.prev_finish_op;
+            g.Visual.active = self.prev_visual_active;
+            opts.p_sel = self.prev_p_sel.take();
+        }
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_showmatch() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(
+            crate::state_defs::mode::SHOWMATCH as i32,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_SM);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_terminal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            CursorModeIdxGuard::set(crate::state_defs::mode::TERMINAL as i32, false, false, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_TERM);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_vreplace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(
+            crate::state_defs::mode::VREPLACE as i32,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_R);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_replace_without_vreplace() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            CursorModeIdxGuard::set(crate::state_defs::mode::REPLACE as i32, false, false, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_R);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_insert() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            CursorModeIdxGuard::set(crate::state_defs::mode::INSERT as i32, false, false, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_I);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_cmdline_uses_cmdline_at_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard =
+            CursorModeIdxGuard::set(crate::state_defs::mode::CMDLINE as i32, false, false, None);
+        // cmdline_at_end() is always true today (both CMDLINE_CMDPOS
+        // and CMDLINE_CMDLEN default to 0).
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_C);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_finish_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(0, true, false, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_O);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_visual_inclusive_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(0, false, true, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_V);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_visual_exclusive_when_p_sel_starts_with_e() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(0, false, true, Some(b"exclusive"));
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_VE);
+    }
+
+    #[test]
+    fn cursor_get_mode_idx_normal_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CursorModeIdxGuard::set(0, false, false, None);
+        assert_eq!(unsafe { cursor_get_mode_idx() }, SHAPE_IDX_N);
     }
 }
