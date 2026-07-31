@@ -16,6 +16,18 @@
 //! `crate::menu_defs::menu_index`/`menu_mode` (both already
 //! translated ahead of this file, from `menu_defs.h`).
 //!
+//! Also translated: [`menu_skip_part`] (skip one dot-separated menu-
+//! name part, honoring backslash/`Ctrl-V`-escaped characters), via
+//! already-real `crate::ascii_defs::ascii_iswhite`/`CTRL_V`. Modeled
+//! on a plain `&[u8]` starting at the position of interest, returning
+//! the number of bytes consumed, matching this crate's established
+//! "operate on indices into a byte slice, not raw pointers" idiom for
+//! string-scanning functions (e.g. `charset.rs`'s `getdigits_int`).
+//! Translated ahead of its real callers (`ex_menu`/`menu_namecmp`'s
+//! own callers in the not-yet-translated menu-command parser),
+//! matching the established "translate ahead of a real caller"
+//! precedent.
+//!
 //! Deferred: everything else - the whole menu tree (`root_menu`/
 //! `get_root_menu`), `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
 //! `menu_find`/`get_menu_cmd_modes`/`menu_text`/`menuitem_getinfo`, all
@@ -175,6 +187,23 @@ pub unsafe fn get_menu_mode_flag() -> i32 {
         return 0;
     }
     1 << mode
+}
+
+/// Skip one dot-separated menu-name part of `s`, honoring backslash/
+/// `Ctrl-V`-escaped characters (skipped over rather than treated as a
+/// terminator), and return the number of bytes making up that part
+/// (up to, but not including, the first unescaped `.`/whitespace, or
+/// the end of `s` if neither ever occurs) (`menu_skip_part`).
+#[must_use]
+pub fn menu_skip_part(s: &[u8]) -> usize {
+    let mut p = 0;
+    while p < s.len() && s[p] != b'.' && !crate::ascii_defs::ascii_iswhite(i32::from(s[p])) {
+        if (s[p] == b'\\' || s[p] == crate::ascii_defs::CTRL_V) && p + 1 < s.len() {
+            p += 1;
+        }
+        p += 1;
+    }
+    p
 }
 
 #[cfg(test)]
@@ -402,5 +431,48 @@ mod tests {
         // happens to also be active.
         let _guard = MenuModeGuard::set(crate::state_defs::mode::TERMINAL as i32, true, false, false);
         assert_eq!(unsafe { get_menu_mode_flag() }, crate::menu_defs::menu_mode::TERMINAL);
+    }
+
+    // ---- menu_skip_part ----
+
+    #[test]
+    fn menu_skip_part_stops_at_a_dot() {
+        assert_eq!(menu_skip_part(b"File.Edit"), 4);
+    }
+
+    #[test]
+    fn menu_skip_part_stops_at_whitespace() {
+        assert_eq!(menu_skip_part(b"File Edit"), 4);
+    }
+
+    #[test]
+    fn menu_skip_part_consumes_the_whole_slice_when_no_terminator() {
+        assert_eq!(menu_skip_part(b"File"), 4);
+    }
+
+    #[test]
+    fn menu_skip_part_skips_a_backslash_escaped_dot() {
+        // "File\.Edit.More" - the escaped dot at index 5 is NOT a
+        // terminator, so the part continues through "Edit" and stops
+        // at the SECOND (unescaped) dot, index 10.
+        assert_eq!(menu_skip_part(b"File\\.Edit.More"), 10);
+    }
+
+    #[test]
+    fn menu_skip_part_skips_a_ctrl_v_escaped_whitespace() {
+        // "File\x16 Edit More" - Ctrl-V escapes the space at index 5,
+        // so the part continues through "Edit" and stops at the next
+        // (unescaped) whitespace, index 10.
+        let mut s = b"File".to_vec();
+        s.push(crate::ascii_defs::CTRL_V);
+        s.extend_from_slice(b" Edit More");
+        assert_eq!(menu_skip_part(&s), 10);
+    }
+
+    #[test]
+    fn menu_skip_part_lone_trailing_backslash_is_not_an_escape() {
+        // A backslash as the very LAST byte has no next byte to
+        // escape, so it's just consumed like any other character.
+        assert_eq!(menu_skip_part(b"File\\"), 5);
     }
 }
