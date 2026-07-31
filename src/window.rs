@@ -380,6 +380,27 @@
 //! generic `:set` engine, not yet translated), matching the
 //! established "translate ahead of a real caller" precedent.
 //!
+//! Also translated: [`frame_add_hsep`] - adds a horizontal separator
+//! to windows at the bottom of a frame, a trivial `w_hsep_height = 1`
+//! sibling of the already-translated `frame_add_statusline` (same
+//! FR_LEAF-sets-directly/FR_ROW-recurses-into-every-child/
+//! FR_COL-only-recurses-into-the-last-child structure, needing no
+//! not-yet-translated dependency at all). Its own real callers
+//! (`win_remove_status_line`, `last_status_rec`) both remain blocked
+//! on `win_new_height`/`resize_frame_for_status` - translated ahead
+//! of them, matching the established "translate ahead of a real
+//! caller" precedent. `frame_add_height`/`frame_set_vsep`
+//! investigated and confirmed still blocked (both need
+//! `frame_new_height`/`win_new_width`, real window-resizing
+//! machinery, neither translated); `command_height`/`last_status`/
+//! `last_status_rec` also confirmed still blocked for the same
+//! reason (`win_comp_pos`/`win_fix_scroll`/`win_remove_status_line`/
+//! `resize_frame_for_status`, none translated) - `int_cmp` needs no
+//! Rust equivalent at all (a plain `qsort` comparator; Rust's own
+//! `Vec::sort_by`/`i32::cmp` already replace it, and its only real
+//! caller, the `'colorcolumn'` `did_set_*` callback, is not
+//! translated).
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -1608,6 +1629,40 @@ pub unsafe fn frame_add_statusline(frp: *mut crate::buffer_defs::FrameT) {
         }
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { frame_add_statusline(child) };
+    }
+}
+
+/// Add a horizontal separator to windows at the bottom of `frp`
+/// (`frame_add_hsep`).
+///
+/// # Safety
+/// Same as [`frame_add_statusline`].
+pub unsafe fn frame_add_hsep(frp: *const crate::buffer_defs::FrameT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*frp };
+    if fr.fr_layout == crate::buffer_defs::FR_LEAF {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *fr.fr_win }.w_hsep_height = 1;
+    } else if fr.fr_layout == crate::buffer_defs::FR_ROW {
+        // Handle all the frames in the row.
+        let mut child = fr.fr_child;
+        while !child.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { frame_add_hsep(child) };
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+    } else {
+        debug_assert_eq!(fr.fr_layout, crate::buffer_defs::FR_COL);
+        // Only need to handle the last frame in the column.
+        let mut child = fr.fr_child;
+        // SAFETY: forwarded from this function's own safety doc.
+        while !unsafe { &*child }.fr_next.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            child = unsafe { &*child }.fr_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { frame_add_hsep(child) };
     }
 }
 
@@ -5213,6 +5268,62 @@ mod tests {
         // "Only need to handle the last frame in the column" comment).
         assert_eq!(unsafe { &*win1_ptr }.w_status_height, 0);
         assert_eq!(unsafe { &*win2_ptr }.w_status_height, STATUS_HEIGHT);
+    }
+
+    // ---- frame_add_hsep ----
+
+    #[test]
+    fn frame_add_hsep_leaf_sets_the_window_hsep_height() {
+        let mut win = WinT { w_hsep_height: 0, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &mut leaf as *mut crate::buffer_defs::FrameT;
+        unsafe { frame_add_hsep(leaf_ptr) };
+        assert_eq!(unsafe { &*win_ptr }.w_hsep_height, 1);
+    }
+
+    #[test]
+    fn frame_add_hsep_row_sets_every_child() {
+        let mut win1 = WinT { handle: 1, w_hsep_height: 0, ..Default::default() };
+        let mut win2 = WinT { handle: 2, w_hsep_height: 0, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let mut leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let mut row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf1 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let row_ptr = &mut row as *mut crate::buffer_defs::FrameT;
+        unsafe { frame_add_hsep(row_ptr) };
+        assert_eq!(unsafe { &*win1_ptr }.w_hsep_height, 1);
+        assert_eq!(unsafe { &*win2_ptr }.w_hsep_height, 1);
+    }
+
+    #[test]
+    fn frame_add_hsep_col_only_sets_the_last_child() {
+        let mut win1 = WinT { handle: 1, w_hsep_height: 0, ..Default::default() };
+        let mut win2 = WinT { handle: 2, w_hsep_height: 0, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut leaf2 = crate::buffer_defs::FrameT { fr_win: win2_ptr, ..Default::default() };
+        let leaf2_ptr = &mut leaf2 as *mut crate::buffer_defs::FrameT;
+        let mut leaf1 =
+            crate::buffer_defs::FrameT { fr_win: win1_ptr, fr_next: leaf2_ptr, ..Default::default() };
+        let mut col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &mut leaf1 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let col_ptr = &mut col as *mut crate::buffer_defs::FrameT;
+        unsafe { frame_add_hsep(col_ptr) };
+        // Only the LAST frame in the column gets a horizontal
+        // separator - the first is left untouched.
+        assert_eq!(unsafe { &*win1_ptr }.w_hsep_height, 0);
+        assert_eq!(unsafe { &*win2_ptr }.w_hsep_height, 1);
     }
 
     // ---- find_tabwin ----
