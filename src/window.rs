@@ -307,6 +307,19 @@
 //! not-yet-translated window-splitting/closing machinery), matching
 //! the established "translate ahead of a real caller" precedent.
 //!
+//! Also translated: `frame_has_win` (whether a frame subtree contains
+//! a given window, a pure recursive predicate over the already-real
+//! `FrameT.fr_layout`/`fr_win`/`fr_child`/`fr_next`) and `set_fraction`
+//! (recompute `WinT.w_fraction` - the cursor's relative vertical
+//! position on a `0..=FRACTION_MULT` scale, used to keep the cursor's
+//! relative position stable across a resize - via already-real
+//! `WinT.w_wrow`/`w_view_height`, plus a new `FRACTION_MULT` constant
+//! mirroring the original's own `#define`). Translated ahead of their
+//! real callers (`win_equal_rec`'s own `next_curwin` membership checks
+//! for the former, `win_split_ins`/`win_new_height` for the latter,
+//! none yet translated), matching the established "translate ahead of
+//! a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2889,6 +2902,53 @@ pub unsafe fn frame_remove(frp: *mut crate::buffer_defs::FrameT) {
     if !frp_ref.fr_next.is_null() {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { &mut *frp_ref.fr_next }.fr_prev = frp_ref.fr_prev;
+    }
+}
+
+/// Whether frame `frp` (or one of its descendants) directly contains
+/// window `wp` (`frame_has_win`).
+///
+/// # Safety
+/// `frp` must be a valid, non-null pointer to a live `FrameT`, whose
+/// own `fr_child`/`fr_next` chain (if any) consists entirely of valid,
+/// live `FrameT` pointers.
+#[must_use]
+pub unsafe fn frame_has_win(frp: *const crate::buffer_defs::FrameT, wp: *const WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*frp };
+    if fr.fr_layout == crate::buffer_defs::FR_LEAF {
+        return std::ptr::eq(fr.fr_win, wp);
+    }
+    let mut p = fr.fr_child;
+    while !p.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { frame_has_win(p, wp) } {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { &*p }.fr_next;
+    }
+    false
+}
+
+/// `w_fraction`'s own scale: `w_fraction` ranges from `0` (cursor on
+/// the window's first display row) to `FRACTION_MULT` (last row)
+/// (`FRACTION_MULT`).
+pub const FRACTION_MULT: i32 = 16384;
+
+/// Compute `wp.w_fraction` - the cursor's relative vertical position
+/// within the window, on a `0..=`[`FRACTION_MULT`] scale, used to keep
+/// the cursor's relative position stable across a window resize
+/// (`set_fraction`). A no-op when the window has 1 or fewer display
+/// rows (dividing by `w_view_height` would be meaningless there).
+pub fn set_fraction(wp: &mut WinT) {
+    if wp.w_view_height > 1 {
+        // When cursor is in the first line the percentage is computed
+        // as if it's halfway that line. Thus with two lines it is
+        // 25%, with three lines 17%, etc. Similarly for the last
+        // line: 75%, 83%, etc.
+        wp.w_fraction =
+            (wp.w_wrow * FRACTION_MULT + FRACTION_MULT / 2) / wp.w_view_height;
     }
 }
 
@@ -7037,5 +7097,99 @@ mod tests {
         unsafe { frame_remove(b_ptr) };
 
         assert!(unsafe { &*a_ptr }.fr_next.is_null());
+    }
+
+    // ---- frame_has_win ----
+
+    #[test]
+    fn frame_has_win_leaf_matches_its_own_window() {
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win_ptr,
+            ..Default::default()
+        };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_has_win(leaf_ptr, win_ptr) });
+    }
+
+    #[test]
+    fn frame_has_win_leaf_does_not_match_a_different_window() {
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut other = WinT { handle: 2, ..Default::default() };
+        let other_ptr = &mut other as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win_ptr,
+            ..Default::default()
+        };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
+
+        assert!(!unsafe { frame_has_win(leaf_ptr, other_ptr) });
+    }
+
+    #[test]
+    fn frame_has_win_finds_a_window_in_a_nested_child() {
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: win_ptr,
+            ..Default::default()
+        };
+        let leaf_ptr = &mut leaf as *mut crate::buffer_defs::FrameT;
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: leaf_ptr,
+            ..Default::default()
+        };
+        let row_ptr = &row as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_has_win(row_ptr, win_ptr) });
+    }
+
+    #[test]
+    fn frame_has_win_false_when_no_child_matches() {
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut other = WinT { handle: 2, ..Default::default() };
+        let other_ptr = &mut other as *mut WinT;
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: other_ptr,
+            ..Default::default()
+        };
+        let leaf_ptr = &mut leaf as *mut crate::buffer_defs::FrameT;
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: leaf_ptr,
+            ..Default::default()
+        };
+        let row_ptr = &row as *const crate::buffer_defs::FrameT;
+
+        assert!(!unsafe { frame_has_win(row_ptr, win_ptr) });
+    }
+
+    // ---- set_fraction ----
+
+    #[test]
+    fn set_fraction_computes_the_relative_row() {
+        let mut win = WinT { w_wrow: 5, w_view_height: 20, ..Default::default() };
+        set_fraction(&mut win);
+        assert_eq!(win.w_fraction, 4505);
+    }
+
+    #[test]
+    fn set_fraction_no_op_when_view_height_is_one_or_less() {
+        let mut win = WinT { w_wrow: 5, w_view_height: 1, w_fraction: 999, ..Default::default() };
+        set_fraction(&mut win);
+        assert_eq!(win.w_fraction, 999);
+
+        win.w_view_height = 0;
+        set_fraction(&mut win);
+        assert_eq!(win.w_fraction, 999);
     }
 }
