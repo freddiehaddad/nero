@@ -221,6 +221,17 @@
 //! precedent for small, self-contained pieces with no design freedom
 //! of their own.
 //!
+//! Also translated: `frame_check_height`/`frame_check_width` (whether
+//! every frame in a row/column has exactly a given height/width),
+//! using the same `fr_child`/`fr_next` walk already established by
+//! `frame_fixed_height`/`frame_fixed_width` - each only walks its own
+//! `FR_ROW`/`FR_COL` case (matching the original's own single `if`
+//! guard exactly; a mismatched child inside the OTHER layout kind is
+//! genuinely invisible to this specific check, not a bug). Translated
+//! ahead of a real caller (`check_colorcolumn`'s own `qsort`-based
+//! sibling, not yet translated - needs `int_cmp`, a trivial `qsort`
+//! comparator with no standalone value of its own).
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2398,6 +2409,60 @@ pub unsafe fn reset_lnums() {
         // SAFETY: forwarded from this function's own safety doc.
         tp = unsafe { &*tp }.tp_next;
     }
+}
+
+/// Return `true` if every frame in a row starting at `topfrp` has
+/// exactly `height` (`frame_check_height`).
+///
+/// # Safety
+/// `topfrp` must be a valid, non-null pointer to a live `FrameT`,
+/// whose own `fr_child`/`fr_next` chain (if any) consists entirely of
+/// valid, live `FrameT` pointers.
+#[must_use]
+pub unsafe fn frame_check_height(topfrp: *const crate::buffer_defs::FrameT, height: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let topfr = unsafe { &*topfrp };
+    if topfr.fr_height != height {
+        return false;
+    }
+    if topfr.fr_layout == crate::buffer_defs::FR_ROW {
+        let mut frp = topfr.fr_child;
+        while !frp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let fr = unsafe { &*frp };
+            if fr.fr_height != height {
+                return false;
+            }
+            frp = fr.fr_next;
+        }
+    }
+    true
+}
+
+/// Return `true` if every frame in a column starting at `topfrp` has
+/// exactly `width` (`frame_check_width`).
+///
+/// # Safety
+/// Same as [`frame_check_height`].
+#[must_use]
+pub unsafe fn frame_check_width(topfrp: *const crate::buffer_defs::FrameT, width: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let topfr = unsafe { &*topfrp };
+    if topfr.fr_width != width {
+        return false;
+    }
+    if topfr.fr_layout == crate::buffer_defs::FR_COL {
+        let mut frp = topfr.fr_child;
+        while !frp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let fr = unsafe { &*frp };
+            if fr.fr_width != width {
+                return false;
+            }
+            frp = fr.fr_next;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -5776,5 +5841,124 @@ mod tests {
         // win shows other_buf, not curbuf - reset_lnums must not
         // touch it even though w_cursor_save.lnum != 0.
         assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 5);
+    }
+
+    // ---- frame_check_height / frame_check_width ----
+
+    #[test]
+    fn frame_check_height_true_for_a_single_leaf_matching_height() {
+        let leaf =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_height: 10, ..Default::default() };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_check_height(leaf_ptr, 10) });
+    }
+
+    #[test]
+    fn frame_check_height_false_for_a_single_leaf_with_a_different_height() {
+        let leaf =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_height: 10, ..Default::default() };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
+
+        assert!(!unsafe { frame_check_height(leaf_ptr, 5) });
+    }
+
+    #[test]
+    fn frame_check_height_row_requires_every_child_to_match() {
+        let mut child2 =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_height: 10, ..Default::default() };
+        let child2_ptr = &mut child2 as *mut crate::buffer_defs::FrameT;
+        let mut child1 = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_height: 10,
+            fr_next: child2_ptr,
+            ..Default::default()
+        };
+        let child1_ptr = &mut child1 as *mut crate::buffer_defs::FrameT;
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_height: 10,
+            fr_child: child1_ptr,
+            ..Default::default()
+        };
+        let row_ptr = &row as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_check_height(row_ptr, 10) });
+
+        // Make ONE child disagree - the whole row is no longer
+        // "every frame has this exact height".
+        unsafe { &mut *child2_ptr }.fr_height = 9;
+        assert!(!unsafe { frame_check_height(row_ptr, 10) });
+    }
+
+    #[test]
+    fn frame_check_height_col_only_checks_the_top_frame_itself() {
+        // A FR_COL's own children are NOT walked by frame_check_height
+        // (only FR_ROW children are, per the original's own `if
+        // (topfrp->fr_layout == FR_ROW)` guard) - a mismatched child
+        // inside a FR_COL is invisible to this specific check.
+        let mut child =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_height: 3, ..Default::default() };
+        let child_ptr = &mut child as *mut crate::buffer_defs::FrameT;
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_height: 10,
+            fr_child: child_ptr,
+            ..Default::default()
+        };
+        let col_ptr = &col as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_check_height(col_ptr, 10) });
+    }
+
+    #[test]
+    fn frame_check_width_col_requires_every_child_to_match() {
+        let mut child2 =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_width: 20, ..Default::default() };
+        let child2_ptr = &mut child2 as *mut crate::buffer_defs::FrameT;
+        let mut child1 = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_width: 20,
+            fr_next: child2_ptr,
+            ..Default::default()
+        };
+        let child1_ptr = &mut child1 as *mut crate::buffer_defs::FrameT;
+        let col = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_width: 20,
+            fr_child: child1_ptr,
+            ..Default::default()
+        };
+        let col_ptr = &col as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_check_width(col_ptr, 20) });
+
+        unsafe { &mut *child2_ptr }.fr_width = 19;
+        assert!(!unsafe { frame_check_width(col_ptr, 20) });
+    }
+
+    #[test]
+    fn frame_check_width_row_only_checks_the_top_frame_itself() {
+        let mut child =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_width: 3, ..Default::default() };
+        let child_ptr = &mut child as *mut crate::buffer_defs::FrameT;
+        let row = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_width: 20,
+            fr_child: child_ptr,
+            ..Default::default()
+        };
+        let row_ptr = &row as *const crate::buffer_defs::FrameT;
+
+        assert!(unsafe { frame_check_width(row_ptr, 20) });
+    }
+
+    #[test]
+    fn frame_check_width_false_when_the_top_frame_itself_disagrees() {
+        let leaf =
+            crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_LEAF, fr_width: 20, ..Default::default() };
+        let leaf_ptr = &leaf as *const crate::buffer_defs::FrameT;
+
+        assert!(!unsafe { frame_check_width(leaf_ptr, 21) });
     }
 }
