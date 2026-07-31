@@ -34,6 +34,10 @@
 //! today (see each one's own doc comment) - matches every real,
 //! unconfigured session.
 //!
+//! Also translated, from `insexpand.h` (not `insexpand.c` - a tiny,
+//! self-contained enum needed by `popupmenu.c`'s `pum_align_order`):
+//! [`CPT_ABBR`]/[`CPT_KIND`]/[`CPT_MENU`]/[`CPT_INFO`]/[`CPT_COUNT`].
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -81,6 +85,23 @@ pub const CTRL_X_CMDLINE_CTRL_X: i32 = 17;
 pub const CTRL_X_BUFNAMES: i32 = 18;
 /// Complete words from registers (`CTRL_X_REGISTER`).
 pub const CTRL_X_REGISTER: i32 = 19;
+
+/// Indices into a completion match's own `cp_text` array, and into
+/// `'completeitemalign'`'s own display-order array (`CPT_*`,
+/// `insexpand.h`). Kept as `i32` (matching the original's own plain C
+/// `enum`, implicitly `int`) rather than `usize`, since real callers
+/// use these both as array indices and in `int`-typed arithmetic
+/// (e.g. `popupmenu.rs`'s `pum_align_order`, comparing against
+/// `cia_flags / 100`).
+pub const CPT_ABBR: i32 = 0;
+/// (`CPT_KIND`).
+pub const CPT_KIND: i32 = 1;
+/// (`CPT_MENU`).
+pub const CPT_MENU: i32 = 2;
+/// (`CPT_INFO`).
+pub const CPT_INFO: i32 = 3;
+/// Number of `CPT_*` entries (`CPT_COUNT`).
+pub const CPT_COUNT: i32 = 4;
 
 /// Which Ctrl-X mode are we in? (`ctrl_x_mode`). Always
 /// [`CTRL_X_NORMAL`] today - see this module's own doc comment.
