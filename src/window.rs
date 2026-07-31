@@ -320,6 +320,20 @@
 //! none yet translated), matching the established "translate ahead of
 //! a real caller" precedent.
 //!
+//! Also translated: `win_altframe` (the frame that should be resized
+//! to take over the space occupied by a window about to be closed),
+//! via already-real `one_window`/`alt_tabpage`/`frame_fixed_width`/
+//! `frame_fixed_height` (all translated earlier in this same file/
+//! segment), `TabpageT.tp_curwin`, `WinT.w_frame`,
+//! `crate::option_vars::OPTION_VARS.p_sb`/`p_spr`. Its own debug-only
+//! `assert()` (never pass `tp` explicitly equal to `curtab`) is
+//! preserved as a `debug_assert!`, matching `lastwin_nofloating`'s own
+//! already-established precedent for this exact pattern. Translated
+//! ahead of its real callers (`win_close`/`winframe_remove`, both
+//! needing the whole window-closing machinery, not yet translated),
+//! matching the established "translate ahead of a real caller"
+//! precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2950,6 +2964,94 @@ pub fn set_fraction(wp: &mut WinT) {
         wp.w_fraction =
             (wp.w_wrow * FRACTION_MULT + FRACTION_MULT / 2) / wp.w_view_height;
     }
+}
+
+/// Return the frame that should be resized to take over the space
+/// occupied by `win` (assumed about to be closed) in tabpage `tp`, or
+/// the current tabpage if `tp` is null (`win_altframe`).
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT`, whose own
+/// `w_frame` chain (`fr_prev`/`fr_next`/`fr_parent`) consists of
+/// valid, live pointers. If `tp` is non-null, it must be distinct from
+/// `GLOBALS.curtab`. Every safety requirement of [`one_window`]/
+/// [`alt_tabpage`]/[`frame_fixed_width`]/[`frame_fixed_height`] also
+/// applies.
+pub unsafe fn win_altframe(
+    win: *const WinT,
+    tp: *const crate::buffer_defs::TabpageT,
+) -> *mut crate::buffer_defs::FrameT {
+    debug_assert!(
+        tp.is_null() || !std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab)
+    );
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { one_window(win, tp) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        let alt_tp = unsafe { alt_tabpage() };
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { &*(*alt_tp).tp_curwin }.w_frame;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let frp = unsafe { &*win }.w_frame;
+    // SAFETY: forwarded from this function's own safety doc.
+    let fr = unsafe { &*frp };
+
+    if fr.fr_prev.is_null() {
+        return fr.fr_next;
+    }
+    if fr.fr_next.is_null() {
+        return fr.fr_prev;
+    }
+
+    // By default the next window will get the space that was
+    // abandoned by this window.
+    let mut target_fr = fr.fr_next;
+    let mut other_fr = fr.fr_prev;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let (p_sb, p_spr) = (opts.p_sb, opts.p_spr);
+
+    // If this is part of a column of windows and 'splitbelow' is true
+    // then the previous window will get the space.
+    if !fr.fr_parent.is_null()
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { &*fr.fr_parent }.fr_layout == crate::buffer_defs::FR_COL
+        && p_sb != 0
+    {
+        target_fr = fr.fr_prev;
+        other_fr = fr.fr_next;
+    }
+
+    // If this is part of a row of windows, and 'splitright' is true
+    // then the previous window will get the space.
+    if !fr.fr_parent.is_null()
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { &*fr.fr_parent }.fr_layout == crate::buffer_defs::FR_ROW
+        && p_spr != 0
+    {
+        target_fr = fr.fr_prev;
+        other_fr = fr.fr_next;
+    }
+
+    // If 'wfh' or 'wfw' is set for the target and not for the
+    // alternate window, reverse the selection.
+    if !fr.fr_parent.is_null()
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { &*fr.fr_parent }.fr_layout == crate::buffer_defs::FR_ROW
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { frame_fixed_width(target_fr) } && !unsafe { frame_fixed_width(other_fr) } {
+            target_fr = other_fr;
+        }
+    // SAFETY: forwarded from this function's own safety doc.
+    } else if unsafe { frame_fixed_height(target_fr) } && !unsafe { frame_fixed_height(other_fr) } {
+        target_fr = other_fr;
+    }
+
+    target_fr
 }
 
 #[cfg(test)]
@@ -7191,5 +7293,228 @@ mod tests {
         win.w_view_height = 0;
         set_fraction(&mut win);
         assert_eq!(win.w_fraction, 999);
+    }
+
+    // ---- win_altframe ----
+
+    /// RAII guard for `win_altframe` tests: saves/restores every
+    /// `GLOBALS`/`OPTION_VARS` field it reads.
+    struct WinAltframeGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut WinT,
+        prev_lastused_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_tcl_flags: u32,
+        prev_p_sb: i32,
+        prev_p_spr: i32,
+    }
+    impl WinAltframeGuard {
+        fn set(
+            first_tabpage: *mut crate::buffer_defs::TabpageT,
+            curtab: *mut crate::buffer_defs::TabpageT,
+            firstwin: *mut WinT,
+            p_sb: i32,
+            p_spr: i32,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = WinAltframeGuard {
+                prev_first_tabpage: g.first_tabpage,
+                prev_curtab: g.curtab,
+                prev_firstwin: g.firstwin,
+                prev_lastused_tabpage: g.lastused_tabpage,
+                prev_tcl_flags: opts.tcl_flags,
+                prev_p_sb: opts.p_sb,
+                prev_p_spr: opts.p_spr,
+            };
+            g.first_tabpage = first_tabpage;
+            g.curtab = curtab;
+            g.firstwin = firstwin;
+            g.lastused_tabpage = std::ptr::null_mut();
+            opts.tcl_flags = 0;
+            opts.p_sb = p_sb;
+            opts.p_spr = p_spr;
+            guard
+        }
+    }
+    impl Drop for WinAltframeGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            g.first_tabpage = self.prev_first_tabpage;
+            g.curtab = self.prev_curtab;
+            g.firstwin = self.prev_firstwin;
+            g.lastused_tabpage = self.prev_lastused_tabpage;
+            opts.tcl_flags = self.prev_tcl_flags;
+            opts.p_sb = self.prev_p_sb;
+            opts.p_spr = self.prev_p_spr;
+        }
+    }
+
+    #[test]
+    fn win_altframe_one_window_uses_alt_tabpage_curwin_frame() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut alt_frame = crate::buffer_defs::FrameT::default();
+        let alt_frame_ptr = &mut alt_frame as *mut crate::buffer_defs::FrameT;
+        let mut alt_win = WinT { w_frame: alt_frame_ptr, ..Default::default() };
+        let alt_win_ptr = &mut alt_win as *mut WinT;
+        let mut tp2 = crate::buffer_defs::TabpageT { tp_curwin: alt_win_ptr, ..Default::default() };
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        let mut win = WinT { handle: 1, w_next: std::ptr::null_mut(), ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp1 =
+            crate::buffer_defs::TabpageT { tp_next: tp2_ptr, tp_firstwin: win_ptr, ..Default::default() };
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinAltframeGuard::set(tp1_ptr, tp1_ptr, win_ptr, 0, 0);
+
+        // win is the ONLY window (firstwin == win, w_next null) - alt
+        // tabpage (tp2, since curtab.tp_next is non-null and no LEFT
+        // flag) provides the result via its own tp_curwin.w_frame.
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, alt_frame_ptr);
+    }
+
+    #[test]
+    fn win_altframe_no_prev_returns_next() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut next = crate::buffer_defs::FrameT::default();
+        let next_ptr = &mut next as *mut crate::buffer_defs::FrameT;
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_prev: std::ptr::null_mut(),
+            fr_next: next_ptr,
+            ..Default::default()
+        };
+        // A second window keeps one_window() false.
+        let mut second = WinT { handle: 2, ..Default::default() };
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { handle: 1, w_frame: &mut frame as *mut _, w_next: second_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinAltframeGuard::set(tp_ptr, tp_ptr, win_ptr, 0, 0);
+
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, next_ptr);
+    }
+
+    #[test]
+    fn win_altframe_no_next_returns_prev() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut prev = crate::buffer_defs::FrameT::default();
+        let prev_ptr = &mut prev as *mut crate::buffer_defs::FrameT;
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_prev: prev_ptr,
+            fr_next: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let mut second = WinT { handle: 2, ..Default::default() };
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { handle: 1, w_frame: &mut frame as *mut _, w_next: second_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinAltframeGuard::set(tp_ptr, tp_ptr, win_ptr, 0, 0);
+
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, prev_ptr);
+    }
+
+    #[test]
+    fn win_altframe_default_uses_next_frame() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut prev = crate::buffer_defs::FrameT::default();
+        let prev_ptr = &mut prev as *mut crate::buffer_defs::FrameT;
+        let mut next = crate::buffer_defs::FrameT::default();
+        let next_ptr = &mut next as *mut crate::buffer_defs::FrameT;
+        // No parent at all - the splitbelow/splitright/reversal
+        // checks are all skipped (fr_parent.is_null()).
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_prev: prev_ptr,
+            fr_next: next_ptr,
+            fr_parent: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let mut second = WinT { handle: 2, ..Default::default() };
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { handle: 1, w_frame: &mut frame as *mut _, w_next: second_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinAltframeGuard::set(tp_ptr, tp_ptr, win_ptr, 0, 0);
+
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, next_ptr);
+    }
+
+    #[test]
+    fn win_altframe_splitbelow_in_a_column_uses_prev_frame() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut parent = crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_COL, ..Default::default() };
+        let parent_ptr = &mut parent as *mut crate::buffer_defs::FrameT;
+        let mut prev = crate::buffer_defs::FrameT::default();
+        let prev_ptr = &mut prev as *mut crate::buffer_defs::FrameT;
+        let mut next = crate::buffer_defs::FrameT::default();
+        let next_ptr = &mut next as *mut crate::buffer_defs::FrameT;
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_prev: prev_ptr,
+            fr_next: next_ptr,
+            fr_parent: parent_ptr,
+            ..Default::default()
+        };
+        let mut second = WinT { handle: 2, ..Default::default() };
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { handle: 1, w_frame: &mut frame as *mut _, w_next: second_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        // 'splitbelow' is set (p_sb=1).
+        let _guard = WinAltframeGuard::set(tp_ptr, tp_ptr, win_ptr, 1, 0);
+
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, prev_ptr);
+    }
+
+    #[test]
+    fn win_altframe_reverses_when_target_has_fixed_width_and_other_does_not() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut parent = crate::buffer_defs::FrameT { fr_layout: crate::buffer_defs::FR_ROW, ..Default::default() };
+        let parent_ptr = &mut parent as *mut crate::buffer_defs::FrameT;
+
+        // fr_next (the default target) is a LEAF with 'winfixwidth'
+        // set; fr_prev (other) is a LEAF without it.
+        let mut fixed_win = WinT {
+            handle: 3,
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_wfw: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let fixed_win_ptr = &mut fixed_win as *mut WinT;
+        let mut next_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: fixed_win_ptr,
+            ..Default::default()
+        };
+        let next_ptr = &mut next_frame as *mut crate::buffer_defs::FrameT;
+
+        let mut movable_win = WinT { handle: 4, ..Default::default() };
+        let movable_win_ptr = &mut movable_win as *mut WinT;
+        let mut prev_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: movable_win_ptr,
+            ..Default::default()
+        };
+        let prev_ptr = &mut prev_frame as *mut crate::buffer_defs::FrameT;
+
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_prev: prev_ptr,
+            fr_next: next_ptr,
+            fr_parent: parent_ptr,
+            ..Default::default()
+        };
+        let mut second = WinT { handle: 2, ..Default::default() };
+        let second_ptr = &mut second as *mut WinT;
+        let mut win = WinT { handle: 1, w_frame: &mut frame as *mut _, w_next: second_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = WinAltframeGuard::set(tp_ptr, tp_ptr, win_ptr, 0, 0);
+
+        // Default target is fr_next (fixed width) - reversed to
+        // fr_prev since it is NOT fixed width.
+        assert_eq!(unsafe { win_altframe(win_ptr, std::ptr::null()) }, prev_ptr);
     }
 }
