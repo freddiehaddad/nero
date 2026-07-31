@@ -38,6 +38,16 @@
 //! matching `marktree.rs`'s own `itr_eq` precedent for a small, simple,
 //! no-design-freedom function translated ahead of its real caller.
 //!
+//! Also translated: [`skip_comment`] - unblocked by `change.c`'s
+//! `get_last_leader_offset`/`get_leader_len`. Returns `(new_offset,
+//! is_comment)` instead of the original's own advanced-or-unchanged
+//! `char *line` return, matching this crate's byte-offset-instead-of-
+//! pointer idiom (`0` means "unchanged", matching every real
+//! non-advancing return path). Its only real caller
+//! (`do_join`/`ops.c`'s own line-joining logic) is not translated -
+//! translated ahead of it, matching the same precedent as
+//! `is_ex_cmdchar` above.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -273,6 +283,84 @@ pub unsafe fn set_ref_in_opfunc(copy_id: i32) -> bool {
 #[must_use]
 fn is_ex_cmdchar(cap: &crate::normal_defs::CmdargT) -> bool {
     cap.cmdchar == i32::from(b':') || cap.cmdchar == crate::keycodes_defs::K_COMMAND
+}
+
+/// If `process` is `true` and `line` begins with a comment leader
+/// (possibly after some white space), returns the byte offset into
+/// `line` right after it (`0` if unchanged). Also reports whether the
+/// current line ends with an unclosed comment (`skip_comment`).
+///
+/// @param line - line to be processed
+/// @param process - if `false`, only checks whether the line ends
+///   with an unclosed comment
+/// @param include_space - whether to skip space following the comment
+///   leader
+///
+/// @return `(new_offset, is_comment)`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (touched transitively via
+/// `crate::change::get_last_leader_offset`/`get_leader_len`, and
+/// directly here to re-scan `b_p_com`'s own flags).
+#[allow(dead_code)]
+pub unsafe fn skip_comment(line: &[u8], process: bool, include_space: bool) -> (usize, bool) {
+    use crate::option_vars::COM_END;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    let com: &[u8] = curbuf.b_p_com.as_deref().unwrap_or(&[]);
+
+    let mut comment_flags: usize = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let leader_offset =
+        unsafe { crate::change::get_last_leader_offset(line, Some(&mut comment_flags)) };
+
+    let mut is_comment = false;
+    if leader_offset.is_some() {
+        // Let's check whether the line ends with an unclosed comment.
+        // If the last comment leader has COM_END in flags, there's no
+        // comment.
+        let mut cf = comment_flags;
+        while crate::change::byte_at(com, cf) != 0 {
+            if crate::change::byte_at(com, cf) == COM_END || crate::change::byte_at(com, cf) == b':' {
+                break;
+            }
+            cf += 1;
+        }
+        if crate::change::byte_at(com, cf) != COM_END {
+            is_comment = true;
+        }
+    }
+
+    if !process {
+        return (0, is_comment);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lead_len =
+        unsafe { crate::change::get_leader_len(line, Some(&mut comment_flags), false, include_space) };
+
+    if lead_len == 0 {
+        return (0, is_comment);
+    }
+
+    // Find COM_END or a colon, whichever comes first.
+    let mut cf = comment_flags;
+    while crate::change::byte_at(com, cf) != 0 {
+        if crate::change::byte_at(com, cf) == COM_END || crate::change::byte_at(com, cf) == b':' {
+            break;
+        }
+        cf += 1;
+    }
+
+    // If we found a colon, we are not processing a line starting with
+    // the closing part of a three-part comment - that's good, we
+    // don't want to remove those (it would be annoying).
+    if crate::change::byte_at(com, cf) == b':' || crate::change::byte_at(com, cf) == 0 {
+        return (lead_len, is_comment);
+    }
+    (0, is_comment)
 }
 
 #[cfg(test)]
@@ -540,5 +628,65 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_ex_cmdchar(&cap));
+    }
+
+    // ---- skip_comment ----
+
+    /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime (this
+    /// guard does NOT acquire its own lock, matching `change.rs`'s own
+    /// established convention for this exact helper).
+    struct CurbufGuard {
+        previous: *mut crate::buffer_defs::BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut crate::buffer_defs::BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    fn buf_with_com(com: &[u8]) -> crate::buffer_defs::BufT {
+        crate::buffer_defs::BufT { b_p_com: Some(com.to_vec()), ..Default::default() }
+    }
+
+    #[test]
+    fn skip_comment_no_leader_at_all() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"://");
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+
+        assert_eq!(unsafe { skip_comment(b"plain code", false, false) }, (0, false));
+    }
+
+    #[test]
+    fn skip_comment_process_false_detects_an_unclosed_comment() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "s1:/*" - an opening-style comment leader with NO COM_END
+        // ('e') flag at all, so the scan hits the colon before ever
+        // finding COM_END, correctly reporting the comment as open.
+        let mut buf = buf_with_com(b"s1:/*");
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+
+        assert_eq!(unsafe { skip_comment(b"code /*", false, false) }, (0, true));
+    }
+
+    #[test]
+    fn skip_comment_process_true_advances_past_the_leader() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"://");
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+
+        assert_eq!(unsafe { skip_comment(b"// hello", true, false) }, (2, true));
+        assert_eq!(unsafe { skip_comment(b"// hello", true, true) }, (3, true));
     }
 }

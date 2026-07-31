@@ -206,8 +206,9 @@ pub unsafe fn change_warning(buf: *mut BufT, _col: i32) {
 /// as a real NUL terminator, matching how a C string naturally reads
 /// as `0` at and past its own logical end - robust regardless of
 /// whether the caller's slice includes its own trailing NUL byte or
-/// not).
-fn byte_at(s: &[u8], i: usize) -> u8 {
+/// not). `pub(crate)` since `ops.rs`'s `skip_comment` also needs to
+/// scan `b_p_com` by offset the same NUL-safe way.
+pub(crate) fn byte_at(s: &[u8], i: usize) -> u8 {
     s.get(i).copied().unwrap_or(0)
 }
 
@@ -415,6 +416,220 @@ pub unsafe fn get_leader_len(
         };
         if vim_strchr(last_part_flags, i32::from(COM_NEST)).is_none() {
             break;
+        }
+    }
+    result
+}
+
+/// NUL-safe byte at signed index `i` into `s` - `0` for any negative
+/// or out-of-bounds index, matching how a C string reads as `0` both
+/// before its start is never touched and past its own NUL terminator
+/// (`get_last_leader_offset`'s own `i`/`off` arithmetic can transiently
+/// go negative as pure loop-control values, never as a real byte
+/// position).
+fn byte_at_signed(s: &[u8], i: isize) -> u8 {
+    if i < 0 {
+        0
+    } else {
+        byte_at(s, i as usize)
+    }
+}
+
+/// Return the offset at which the LAST comment in `line` starts,
+/// scanning backward from the end (`get_last_leader_offset`). Returns
+/// `None` if there is no comment in the whole line.
+///
+/// When `flags` is `Some`, set to the byte offset (into
+/// `crate::globals::GLOBALS.curbuf`'s `b_p_com`) where the recognized
+/// comment leader's flags begin - same convention as
+/// [`get_leader_len`]'s own `flags` parameter.
+///
+/// Shares [`get_leader_len`]'s own basic per-part matching logic
+/// (colon-parsing, whitespace-matching, `COM_BLANK`/`COM_MIDDLE`
+/// checks) but scans backward and has NO middle-match-fallback
+/// mechanism at all (a real, faithfully-preserved structural
+/// difference between the two functions in the original, not an
+/// oversight) - the first part that matches wins outright. After a
+/// non-nesting match, a second inner pass verifies whether any OTHER
+/// `'comments'` entry's own string ends with a substring that is a
+/// prefix of the matched leader, adjusting how far back a FUTURE
+/// (nested, `'O'` = wait, `COM_NEST`) search may need to go to avoid
+/// mistaking an unrelated leader's tail for this one's start. The
+/// original's own `string++` in this second pass (with no
+/// null-terminator check, unlike the first pass's explicit one) is
+/// translated as a graceful skip instead of blindly assuming a colon
+/// exists - memory-safe and behaviorally identical for any
+/// well-formed `'comments'` value (the original's own comment there -
+/// "if everything is fine, this cannot actually happen" - already
+/// states this is a defensive-only case).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+pub unsafe fn get_last_leader_offset(line: &[u8], mut flags: Option<&mut usize>) -> Option<usize> {
+    use crate::option_vars::{COM_BLANK, COM_MAX_LEN, COM_MIDDLE, COM_NEST};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    let com: &[u8] = curbuf.b_p_com.as_deref().unwrap_or(&[]);
+
+    let mut result: Option<usize> = None;
+    let mut lower_check_bound: isize = 0;
+    let mut i: isize = line.len() as isize;
+
+    loop {
+        i -= 1;
+        if i < lower_check_bound {
+            break;
+        }
+
+        let mut found_one = false;
+        // Only captured once a real match is found - owned copies,
+        // since the original's own `part_buf` must survive past this
+        // inner loop into the LATER substring-verification pass,
+        // which uses its own separate buffer (`part_buf2` there).
+        let mut match_flags_offset: usize = 0;
+        let mut match_com_flags: Vec<u8> = Vec::new();
+        let mut com_leader: Vec<u8> = Vec::new();
+
+        let mut list: usize = 0;
+        while byte_at(com, list) != 0 {
+            let flags_save = list;
+            let (part_buf, next_list) = copy_option_part(com, list, COM_MAX_LEN as usize, b",");
+            list = next_list;
+
+            let colon = match vim_strchr(&part_buf, i32::from(b':')) {
+                Some(p) => p,
+                None => continue, // missing ':', ignore this part
+            };
+            let com_flags = &part_buf[..colon];
+            let mut string_start = colon + 1;
+
+            // Line contents and string must match (same whitespace
+            // rule as get_leader_len).
+            if ascii_iswhite(i32::from(byte_at(&part_buf, string_start))) {
+                if i == 0 || !ascii_iswhite(i32::from(byte_at_signed(line, i - 1))) {
+                    continue;
+                }
+                while ascii_iswhite(i32::from(byte_at(&part_buf, string_start))) {
+                    string_start += 1;
+                }
+            }
+            let mut j: isize = 0;
+            while byte_at(&part_buf, string_start + j as usize) != 0
+                && byte_at(&part_buf, string_start + j as usize) == byte_at_signed(line, i + j)
+            {
+                j += 1;
+            }
+            if byte_at(&part_buf, string_start + j as usize) != 0 {
+                continue; // string doesn't match
+            }
+
+            // When 'b' flag used, there must be white space or an
+            // end-of-line after the string in the line.
+            if vim_strchr(com_flags, i32::from(COM_BLANK)).is_some()
+                && !ascii_iswhite(i32::from(byte_at_signed(line, i + j)))
+                && byte_at_signed(line, i + j) != 0
+            {
+                continue;
+            }
+
+            if vim_strchr(com_flags, i32::from(COM_MIDDLE)).is_some() {
+                // For a middlepart comment, only consider it to match
+                // if everything before the current position in the
+                // line is whitespace.
+                let mut jj: isize = 0;
+                while jj <= i && ascii_iswhite(i32::from(byte_at_signed(line, jj))) {
+                    jj += 1;
+                }
+                if jj < i {
+                    continue;
+                }
+            }
+
+            // We have found a match, stop searching (no middle-match
+            // fallback in this function, unlike get_leader_len).
+            found_one = true;
+            match_flags_offset = flags_save;
+            match_com_flags = com_flags.to_vec();
+            com_leader = part_buf[string_start..].to_vec();
+            break;
+        }
+
+        if found_one {
+            if let Some(f) = flags.as_mut() {
+                **f = match_flags_offset;
+            }
+
+            result = Some(i as usize);
+
+            // If this comment nests, continue searching (further
+            // back, toward the start of the line).
+            if vim_strchr(&match_com_flags, i32::from(COM_NEST)).is_some() {
+                continue;
+            }
+
+            lower_check_bound = i;
+
+            // Let's verify whether the comment leader found is a
+            // substring of other comment leaders. If it is, adjust
+            // lower_check_bound so a future search doesn't mistake an
+            // unrelated leader's own tail for this one's start.
+            let mut cl_start = 0;
+            while ascii_iswhite(i32::from(byte_at(&com_leader, cl_start))) {
+                cl_start += 1;
+            }
+            let com_leader = &com_leader[cl_start..];
+            let len1 = com_leader.len() as isize;
+
+            let mut list2: usize = 0;
+            while byte_at(com, list2) != 0 {
+                let flags_save2 = list2;
+                let (part_buf2, next_list2) = copy_option_part(com, list2, COM_MAX_LEN as usize, b",");
+                list2 = next_list2;
+
+                if flags_save2 == match_flags_offset {
+                    continue;
+                }
+                let colon2 = match vim_strchr(&part_buf2, i32::from(b':')) {
+                    Some(p) => p,
+                    // The original does NOT check this (a bare
+                    // `string++` with no null check) - its own comment
+                    // on the FIRST loop's equivalent check already
+                    // states this "cannot actually happen" for a
+                    // well-formed 'comments' value; skipping
+                    // gracefully here is memory-safe and behaviorally
+                    // identical for any real input.
+                    None => continue,
+                };
+                let mut string2_start = colon2 + 1;
+                while ascii_iswhite(i32::from(byte_at(&part_buf2, string2_start))) {
+                    string2_start += 1;
+                }
+                let string2 = &part_buf2[string2_start..];
+                let len2 = string2.len() as isize;
+                if len2 == 0 {
+                    continue;
+                }
+
+                // Now verify whether string2 ends with a substring
+                // beginning com_leader.
+                let mut off: isize = if len2 > i { i } else { len2 };
+                while off > 0 && off + len1 > len2 {
+                    off -= 1;
+                    let cmplen = (len2 - off) as usize; // == string2.len() - off, always
+                    // cmplen > com_leader.len() can never match (the
+                    // original's own strncmp would compare
+                    // com_leader's NUL terminator against a real,
+                    // non-NUL byte of string2 at that position) -
+                    // skip rather than panic on a too-long slice.
+                    if cmplen <= com_leader.len()
+                        && string2[off as usize..] == com_leader[..cmplen]
+                    {
+                        lower_check_bound = lower_check_bound.min(i - off);
+                    }
+                }
+            }
         }
     }
     result
@@ -753,5 +968,70 @@ mod tests {
         assert_eq!(unsafe { get_leader_len(b"X trailing", None, false, false) }, 1);
         // backward=true skips any part flagged 'O' (COM_NOBACK).
         assert_eq!(unsafe { get_leader_len(b"X trailing", None, true, false) }, 0);
+    }
+
+    // ---- get_last_leader_offset ----
+
+    #[test]
+    fn get_last_leader_offset_finds_a_trailing_comment() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"://");
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        // "code // comment" - the "//" pair starts at byte offset 5.
+        assert_eq!(unsafe { get_last_leader_offset(b"code // comment", None) }, Some(5));
+    }
+
+    #[test]
+    fn get_last_leader_offset_no_comment_returns_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"://");
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        assert_eq!(unsafe { get_last_leader_offset(b"just code here", None) }, None);
+    }
+
+    #[test]
+    fn get_last_leader_offset_sets_flags_to_the_matching_parts_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"://");
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        let mut flags_offset = usize::MAX;
+        let result = unsafe { get_last_leader_offset(b"code // comment", Some(&mut flags_offset)) };
+        assert_eq!(result, Some(5));
+        assert_eq!(flags_offset, 0);
+    }
+
+    #[test]
+    fn get_last_leader_offset_substring_verification_prefers_the_longer_overlapping_leader() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Two comment definitions: "ab" (offset 0) and "b" (offset 4).
+        // "b" is a suffix of "ab" - without the substring-verification
+        // pass adjusting lower_check_bound, the backward scan would
+        // stop at the SHORTER "b" match (byte offset 2) and never look
+        // further back to find the real, longer "ab" leader starting
+        // at byte offset 1.
+        let mut buf = buf_with_com(b":ab,:b");
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        let mut flags_offset = usize::MAX;
+        let result = unsafe { get_last_leader_offset(b"xab", Some(&mut flags_offset)) };
+        assert_eq!(result, Some(1));
+        // flags now correctly reflects the LONGER "ab" leader's own
+        // offset (0), not the shorter "b" leader's offset (4).
+        assert_eq!(flags_offset, 0);
+    }
+
+    #[test]
+    fn get_last_leader_offset_nested_marker_finds_the_leftmost_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_com(b"n:>");
+        let _guard = CurbufGuard::set(&mut buf as *mut BufT);
+
+        // The 'n' (nest) flag lets the scan keep looking further back
+        // for more nested markers - the LEFTMOST (second) '>' is the
+        // true start of the nested-marker run.
+        assert_eq!(unsafe { get_last_leader_offset(b"text >>", None) }, Some(5));
     }
 }
