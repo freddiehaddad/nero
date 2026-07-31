@@ -48,6 +48,20 @@
 //! translated ahead of it, matching the same precedent as
 //! `is_ex_cmdchar` above.
 //!
+//! Also translated: `get_vts`/`get_vts_sum` (variable-tabstop-array
+//! width/cumulative-sum lookups, matching `indent.rs`'s own
+//! established "no leading count element" `vts` slice convention) and
+//! their real consumers `get_new_sw_indent`/`get_new_vts_indent` (pure
+//! new-indent computation for `'<'`/`'>'` shift commands, needing only
+//! already-real `crate::indent::get_indent`/`crate::math::trim_to_int`).
+//! Their own real caller, `shift_line` (which actually WRITES the new
+//! indent via `change_indent`/`set_indent`, neither translated), stays
+//! blocked - translated ahead of it, matching the established
+//! "translate ahead of a real caller" precedent. `shift_block` (the
+//! Visual-block-mode sibling) needs substantially more machinery
+//! (`block_prep`, `init_charsize_arg`-driven column arithmetic, real
+//! buffer modification) and remains fully blocked too.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -363,9 +377,136 @@ pub unsafe fn skip_comment(line: &[u8], process: bool, include_space: bool) -> (
     (0, is_comment)
 }
 
+/// Return the tabstop width at `index` (1-based) of the variable
+/// tabstop array `vts` (`get_vts`). If `index` exceeds the array's own
+/// length, the LAST tabstop width is returned.
+///
+/// `vts` mirrors this crate's own established "no leading count
+/// element" convention (`indent.rs`'s `tabstop_padding`) - a plain
+/// slice instead of the original's own `vts_array[0]`-prefixed C
+/// array. Callers must ensure `vts` is non-empty whenever `index >= 1`
+/// is reachable (matching the original's own implicit assumption via
+/// `vts_array[0]` indexing) - `index < 1` never touches `vts` at all.
+fn get_vts(vts: &[crate::pos_defs::ColnrT], index: i32) -> i32 {
+    if index < 1 {
+        0
+    } else if (index as usize) <= vts.len() {
+        vts[(index - 1) as usize]
+    } else {
+        vts[vts.len() - 1]
+    }
+}
+
+/// Return the sum of all the tabstops through the `index`-th, in the
+/// variable tabstop array `vts` (`get_vts_sum`). Same `vts` convention
+/// as [`get_vts`].
+fn get_vts_sum(vts: &[crate::pos_defs::ColnrT], index: i32) -> i32 {
+    let mut sum: i32 = 0;
+    let mut i: i32 = 1;
+    while i <= index && (i as usize) <= vts.len() {
+        sum += vts[(i - 1) as usize];
+        i += 1;
+    }
+    if i <= index {
+        sum += vts[vts.len() - 1] * (index - vts.len() as i32);
+    }
+    sum
+}
+
+/// Compute the new indent for shifting the current line by `amount`
+/// `'shiftwidth'`s, when a fixed width (`'shiftwidth'`/`'tabstop'`, not
+/// `'vartabstop'`) determines the shift size (`get_new_sw_indent`).
+///
+/// @param left true if shift is to the left
+/// @param round true if the new indent is to be rounded to a tabstop
+/// @param amount number of shifts
+///
+/// # Safety
+/// Same as `crate::indent::get_indent`.
+#[allow(dead_code)]
+unsafe fn get_new_sw_indent(left: bool, round: bool, amount: i64, sw_val: i64) -> i64 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut count: i64 = i64::from(unsafe { crate::indent::get_indent() });
+
+    if round {
+        let mut i: i64 = i64::from(crate::math::trim_to_int(count / sw_val));
+        let j: i64 = i64::from(crate::math::trim_to_int(count % sw_val));
+        let mut amount = amount;
+        if j != 0 && left {
+            amount -= 1;
+        }
+        if left {
+            i = (i - amount).max(0);
+        } else {
+            i += amount;
+        }
+        count = i * sw_val;
+    } else if left {
+        count = (count - sw_val * amount).max(0);
+    } else {
+        count += sw_val * amount;
+    }
+
+    count
+}
+
+/// Compute the new indent for shifting the current line by `amount`
+/// `'shiftwidth'`s, when `'vartabstop'` (variable tabstops) determines
+/// the shift size (`get_new_vts_indent`). Same `vts` convention as
+/// [`get_vts`].
+///
+/// # Safety
+/// Same as `crate::indent::get_indent`.
+#[allow(dead_code)]
+unsafe fn get_new_vts_indent(
+    left: bool,
+    round: bool,
+    amount: i32,
+    vts: &[crate::pos_defs::ColnrT],
+) -> i64 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let indent: i64 = i64::from(unsafe { crate::indent::get_indent() });
+    let mut vtsi: i32 = 0;
+    let mut vts_indent: i32 = 0;
+    let mut ts: i32 = 0;
+
+    // Find the tabstop at or to the left of the current indent.
+    while i64::from(vts_indent) <= indent {
+        vtsi += 1;
+        ts = get_vts(vts, vtsi);
+        vts_indent += ts;
+    }
+    vts_indent -= ts;
+    vtsi -= 1;
+
+    // Extra indent spaces to the right of the tabstop.
+    let offset: i64 = indent - i64::from(vts_indent);
+
+    if round {
+        if left {
+            if offset == 0 {
+                i64::from(get_vts_sum(vts, vtsi - amount))
+            } else {
+                i64::from(get_vts_sum(vts, vtsi - (amount - 1)))
+            }
+        } else {
+            i64::from(get_vts_sum(vts, vtsi + amount))
+        }
+    } else if left {
+        if amount > vtsi {
+            0
+        } else {
+            i64::from(get_vts_sum(vts, vtsi - amount)) + offset
+        }
+    } else {
+        i64::from(get_vts_sum(vts, vtsi + amount)) + offset
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer_defs::WinT;
 
     #[test]
     fn get_op_type_single_char_operators() {
@@ -688,5 +829,188 @@ mod tests {
 
         assert_eq!(unsafe { skip_comment(b"// hello", true, false) }, (2, true));
         assert_eq!(unsafe { skip_comment(b"// hello", true, true) }, (3, true));
+    }
+
+    // ---- get_vts / get_vts_sum ----
+
+    #[test]
+    fn get_vts_index_less_than_one_is_zero() {
+        assert_eq!(get_vts(&[4, 8, 12], 0), 0);
+        assert_eq!(get_vts(&[4, 8, 12], -1), 0);
+    }
+
+    #[test]
+    fn get_vts_in_range_returns_that_width() {
+        assert_eq!(get_vts(&[4, 8, 12], 1), 4);
+        assert_eq!(get_vts(&[4, 8, 12], 3), 12);
+    }
+
+    #[test]
+    fn get_vts_out_of_range_returns_the_last_width() {
+        assert_eq!(get_vts(&[4, 8, 12], 5), 12);
+    }
+
+    #[test]
+    fn get_vts_sum_index_zero_or_less_is_zero() {
+        assert_eq!(get_vts_sum(&[4, 8, 12], 0), 0);
+        assert_eq!(get_vts_sum(&[4, 8, 12], -1), 0);
+    }
+
+    #[test]
+    fn get_vts_sum_in_range_sums_up_to_the_index() {
+        assert_eq!(get_vts_sum(&[4, 8, 12], 2), 12); // 4+8
+        assert_eq!(get_vts_sum(&[4, 8, 12], 3), 24); // 4+8+12
+    }
+
+    #[test]
+    fn get_vts_sum_out_of_range_extends_with_the_last_width() {
+        // 4+8+12 + 12*(5-3) = 24+24 = 48
+        assert_eq!(get_vts_sum(&[4, 8, 12], 5), 48);
+    }
+
+    // ---- get_new_sw_indent / get_new_vts_indent ----
+
+    /// RAII guard installing `win`/`buf` as curwin/curbuf, restoring
+    /// the previous pointers on drop. Holds `global_state_test_lock`
+    /// for its entire lifetime, matching `indent.rs`'s own
+    /// `CursorTestGuard` precedent (needed since `ml_open`, used to
+    /// build the test memline below, touches shared `GLOBALS.got_int`
+    /// internally).
+    struct CursorTestGuard {
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CursorTestGuard {
+        fn set(win: *mut WinT, buf: *mut crate::buffer_defs::BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CursorTestGuard { prev_curwin: globals.curwin, prev_curbuf: globals.curbuf, _lock };
+            globals.curwin = win;
+            globals.curbuf = buf;
+            guard
+        }
+    }
+
+    impl Drop for CursorTestGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curwin = self.prev_curwin;
+            globals.curbuf = self.prev_curbuf;
+        }
+    }
+
+    /// Installs `win`/`buf` as curwin/curbuf, then opens a fresh
+    /// memline for `buf` and replaces line 1 with `line` (matching
+    /// `indent.rs`'s own `open_and_set_test_buf` precedent). Callers
+    /// must close `buf.b_ml.ml_mfp` themselves after the guard drops.
+    fn open_and_set_test_buf(
+        win: &mut WinT,
+        buf: &mut crate::buffer_defs::BufT,
+        line: &[u8],
+    ) -> CursorTestGuard {
+        let guard = CursorTestGuard::set(win as *mut WinT, buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        guard
+    }
+
+    fn close_buf_with_memline(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn get_new_sw_indent_shift_right_adds_sw_val() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        assert_eq!(unsafe { get_new_sw_indent(false, false, 1, 4) }, 8);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_new_sw_indent_shift_left_subtracts_sw_val_clamped_at_zero() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        assert_eq!(unsafe { get_new_sw_indent(true, false, 1, 4) }, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_new_sw_indent_round_shift_right_rounds_up_to_the_next_tabstop() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        // indent=4 is already an exact multiple of sw_val=4, so
+        // rounding right just adds one full shiftwidth: 4+4=8.
+        assert_eq!(unsafe { get_new_sw_indent(false, true, 1, 4) }, 8);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_new_sw_indent_round_shift_left_removes_the_remainder_first() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        // indent=4, sw_val=3: 4/3=1 remainder 1. The remainder makes
+        // the first "shift" just remove it (rounding down to 3), so
+        // amount=1 consumes exactly that removal - final indent=3.
+        assert_eq!(unsafe { get_new_sw_indent(true, true, 1, 3) }, 3);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_new_vts_indent_shift_right_moves_to_the_next_tabstop() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        // vts=[4,8]: indent=4 sits exactly at the first tabstop
+        // boundary; shifting right by 1 moves to the SECOND tabstop's
+        // own cumulative offset (4+8=12).
+        assert_eq!(unsafe { get_new_vts_indent(false, false, 1, &[4, 8]) }, 12);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_new_vts_indent_shift_left_moves_to_the_previous_tabstop() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0"); // indent=4
+        win.w_cursor.lnum = 1;
+
+        // Same setup as above, but shifting LEFT by 1 from the first
+        // tabstop boundary lands at column 0.
+        assert_eq!(unsafe { get_new_vts_indent(true, false, 1, &[4, 8]) }, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
     }
 }
