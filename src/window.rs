@@ -252,6 +252,19 @@
 //! matching this crate's established "translate ahead of a real
 //! caller" precedent.
 //!
+//! Also translated: `lastwin_nofloating` (the last non-floating
+//! window in a tabpage, walking `w_prev` past any floating windows at
+//! the end of the list) and `last_stl_height` (the height reserved
+//! for the last window's own status line, via `'laststatus'` and
+//! [`one_window`]) - both via already-real
+//! `crate::globals::GLOBALS.lastwin`/`firstwin`,
+//! `TabpageT.tp_lastwin`, `WinT.w_prev`/`w_floating`,
+//! `crate::option_vars::OPTION_VARS.p_ls`. `lastwin_nofloating`'s own
+//! debug-only `assert()` (never pass `tp` explicitly equal to
+//! `curtab` - pass `NULL` instead) is preserved as a `debug_assert!`,
+//! matching this crate's established policy for real internal-
+//! invariant checks.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2607,6 +2620,57 @@ pub unsafe fn check_colorcolumn(cc: Option<&[u8]>, wp: Option<&mut WinT>) -> boo
     }
 
     true
+}
+
+/// Return the last non-floating window in tabpage `tp`, or in the
+/// current tab page if `tp` is null (`lastwin_nofloating`).
+///
+/// # Safety
+/// `tp` (if non-null) must be a valid, live `TabpageT` pointer, and
+/// its own `tp_lastwin`, or `crate::globals::GLOBALS.lastwin` when
+/// `tp` is null, must start a `w_prev` chain consisting entirely of
+/// valid, live `WinT` pointers with at least one non-floating entry.
+#[must_use]
+pub unsafe fn lastwin_nofloating(tp: *const crate::buffer_defs::TabpageT) -> *mut WinT {
+    debug_assert!(
+        tp.is_null() || !std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab),
+        "lastwin_nofloating: pass null instead of curtab explicitly"
+    );
+    let mut res = if !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*tp }.tp_lastwin
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    while unsafe { &*res }.w_floating {
+        // SAFETY: forwarded from this function's own safety doc.
+        res = unsafe { &*res }.w_prev;
+    }
+    res
+}
+
+/// Return the height reserved for the last window's status line, or
+/// `0` if none is shown (`last_stl_height`).
+///
+/// `morewin`: when `true`, count as if there will always be more than
+/// one window (used when about to add a new one).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain (used by
+/// [`one_window`]) must consist of valid, live `WinT` pointers.
+#[must_use]
+pub unsafe fn last_stl_height(morewin: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+    // SAFETY: forwarded from this function's own safety doc.
+    let firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    let show = p_ls > 1
+        || (p_ls == 1
+            // SAFETY: forwarded from this function's own safety doc.
+            && (morewin || !unsafe { one_window(firstwin, std::ptr::null()) }));
+    if show { STATUS_HEIGHT } else { 0 }
 }
 
 #[cfg(test)]
@@ -6252,5 +6316,146 @@ mod tests {
 
         assert!(unsafe { check_colorcolumn(None, Some(&mut win)) });
         assert_eq!(win.w_p_cc_cols, None);
+    }
+
+    // ---- lastwin_nofloating ----
+
+    #[test]
+    fn lastwin_nofloating_null_tp_uses_globals_lastwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let prev_lastwin = unsafe { crate::globals::GLOBALS.get_mut() }.lastwin;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = win_ptr;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert_eq!(unsafe { lastwin_nofloating(std::ptr::null()) }, win_ptr);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = prev_lastwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn lastwin_nofloating_skips_floating_windows_via_w_prev() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut non_floating = focusable_win(1);
+        let non_floating_ptr = &mut non_floating as *mut WinT;
+        let mut floating = WinT { w_floating: true, w_prev: non_floating_ptr, ..focusable_win(2) };
+        let floating_ptr = &mut floating as *mut WinT;
+        let prev_lastwin = unsafe { crate::globals::GLOBALS.get_mut() }.lastwin;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = floating_ptr;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = std::ptr::null_mut();
+
+        assert_eq!(unsafe { lastwin_nofloating(std::ptr::null()) }, non_floating_ptr);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.lastwin = prev_lastwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    fn lastwin_nofloating_uses_tp_own_tp_lastwin_when_non_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut other_tp = crate::buffer_defs::TabpageT { tp_lastwin: win_ptr, ..Default::default() };
+        let other_tp_ptr = &mut other_tp as *mut crate::buffer_defs::TabpageT;
+        let mut cur_tp = crate::buffer_defs::TabpageT::default();
+        let cur_tp_ptr = &mut cur_tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = cur_tp_ptr;
+
+        // curtab is cur_tp_ptr, NOT other_tp_ptr - proving other_tp's
+        // own tp_lastwin is used, not GLOBALS.lastwin.
+        assert_eq!(unsafe { lastwin_nofloating(other_tp_ptr) }, win_ptr);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn lastwin_nofloating_debug_panics_when_tp_equals_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        // tp_lastwin points at a real, non-floating window so this
+        // stays memory-safe even if the debug_assert! were ever
+        // weakened - the test's own point is the panic, not a crash.
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_lastwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let prev_curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = tp_ptr;
+
+        // catch_unwind (rather than #[should_panic]) so curtab is
+        // always restored before this test returns, even though the
+        // call panics - see move.rs's own established precedent for
+        // this exact pattern. This whole test is #[cfg(debug_assertions)]
+        // since the panic itself comes from a debug_assert!, which
+        // compiles out entirely in --release (a plain #[should_panic]
+        // would spuriously fail there).
+        let result =
+            std::panic::catch_unwind(|| unsafe { lastwin_nofloating(tp_ptr.cast_const()) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+
+        assert!(result.is_err(), "expected a debug_assert! panic");
+    }
+
+    // ---- last_stl_height ----
+
+    #[test]
+    fn last_stl_height_zero_when_laststatus_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 0;
+
+        assert_eq!(unsafe { last_stl_height(false) }, 0);
+        assert_eq!(unsafe { last_stl_height(true) }, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    #[test]
+    fn last_stl_height_full_when_laststatus_is_greater_than_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 2;
+
+        // Always STATUS_HEIGHT with laststatus=2, regardless of
+        // window count or morewin.
+        assert_eq!(unsafe { last_stl_height(false) }, STATUS_HEIGHT);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    #[test]
+    fn last_stl_height_laststatus_one_needs_morewin_or_multiple_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 1;
+
+        // A single window, morewin=false: one_window() is true, so
+        // !one_window() is false, and morewin is false -> no status
+        // line reserved.
+        let mut win = focusable_win(1);
+        let win_ptr = &mut win as *mut WinT;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+        assert_eq!(unsafe { last_stl_height(false) }, 0);
+
+        // Same single-window setup, but morewin=true - always shown,
+        // since a second window is about to be added.
+        assert_eq!(unsafe { last_stl_height(true) }, STATUS_HEIGHT);
+
+        // Two windows, morewin=false: one_window() is now false, so
+        // !one_window() is true -> shown.
+        let mut second = focusable_win(2);
+        let second_ptr = &mut second as *mut WinT;
+        unsafe { &mut *win_ptr }.w_next = second_ptr;
+        assert_eq!(unsafe { last_stl_height(false) }, STATUS_HEIGHT);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
     }
 }
