@@ -345,6 +345,16 @@
 //! yet translated), matching the established "translate ahead of a
 //! real caller" precedent.
 //!
+//! Also translated: `win_find_tabpage` (the tabpage containing a given
+//! window, or null if not found), reusing the exact `first_tabpage`/
+//! `tp_next` + per-tabpage window-list walk already established by
+//! `check_lnums_both`/`valid_tabpage_win` (the original's own
+//! `FOR_ALL_TAB_WINDOWS(tp, wp)` macro, walked identically here).
+//! Translated ahead of its real caller (`win_set_buf`, needing
+//! `RedrawingDisabled`/`ctx_switch`/real buffer-switching, not yet
+//! translated), matching the established "translate ahead of a real
+//! caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -3075,6 +3085,41 @@ pub fn cmd_with_count(cmd: &[u8], prenum: i64) -> Vec<u8> {
         out.extend_from_slice(prenum.to_string().as_bytes());
     }
     out
+}
+
+/// Return the tabpage containing window `win`, or null if not found
+/// (`win_find_tabpage`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers. For each such tabpage,
+/// its own window list (`tp_firstwin`/`w_next`, or
+/// `GLOBALS.firstwin`/`w_next` when it's the current tabpage) must
+/// consist of valid, live `WinT` pointers.
+#[must_use]
+pub unsafe fn win_find_tabpage(win: *const WinT) -> *mut crate::buffer_defs::TabpageT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let mut tp = globals.first_tabpage;
+    while !tp.is_null() {
+        let is_curtab = std::ptr::eq(tp, globals.curtab);
+        let mut wp = if is_curtab {
+            globals.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            if std::ptr::eq(wp, win) {
+                return tp;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    std::ptr::null_mut()
 }
 
 #[cfg(test)]
@@ -7561,5 +7606,80 @@ mod tests {
     #[test]
     fn cmd_with_count_multi_digit_count() {
         assert_eq!(cmd_with_count(b"split", 42), b"split42".to_vec());
+    }
+
+    // ---- win_find_tabpage ----
+
+    #[test]
+    fn win_find_tabpage_finds_a_window_in_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { handle: 1, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first_tabpage, prev_curtab, prev_firstwin) = (g.first_tabpage, g.curtab, g.firstwin);
+        g.first_tabpage = tp_ptr;
+        g.curtab = tp_ptr;
+        g.firstwin = win_ptr;
+
+        assert_eq!(unsafe { win_find_tabpage(win_ptr) }, tp_ptr);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = prev_first_tabpage;
+        g.curtab = prev_curtab;
+        g.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn win_find_tabpage_finds_a_window_in_a_non_curtab_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other_win = WinT { handle: 2, ..Default::default() };
+        let other_win_ptr = &mut other_win as *mut WinT;
+        let mut other_tp =
+            crate::buffer_defs::TabpageT { tp_firstwin: other_win_ptr, ..Default::default() };
+        let other_tp_ptr = &mut other_tp as *mut crate::buffer_defs::TabpageT;
+
+        let mut cur_win = WinT { handle: 1, ..Default::default() };
+        let cur_win_ptr = &mut cur_win as *mut WinT;
+        let mut cur_tp =
+            crate::buffer_defs::TabpageT { tp_next: other_tp_ptr, ..Default::default() };
+        let cur_tp_ptr = &mut cur_tp as *mut crate::buffer_defs::TabpageT;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first_tabpage, prev_curtab, prev_firstwin) = (g.first_tabpage, g.curtab, g.firstwin);
+        g.first_tabpage = cur_tp_ptr;
+        g.curtab = cur_tp_ptr;
+        g.firstwin = cur_win_ptr;
+
+        assert_eq!(unsafe { win_find_tabpage(other_win_ptr) }, other_tp_ptr);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = prev_first_tabpage;
+        g.curtab = prev_curtab;
+        g.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn win_find_tabpage_null_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut listed = WinT { handle: 1, ..Default::default() };
+        let listed_ptr = &mut listed as *mut WinT;
+        let not_listed = WinT { handle: 2, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first_tabpage, prev_curtab, prev_firstwin) = (g.first_tabpage, g.curtab, g.firstwin);
+        g.first_tabpage = tp_ptr;
+        g.curtab = tp_ptr;
+        g.firstwin = listed_ptr;
+
+        assert!(unsafe { win_find_tabpage(&not_listed as *const WinT) }.is_null());
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = prev_first_tabpage;
+        g.curtab = prev_curtab;
+        g.firstwin = prev_firstwin;
     }
 }
