@@ -20,6 +20,17 @@
 //! verbatim, matching this crate's established "fixed default rule"
 //! pattern (`vim_isprintc`/`vim_isbreak`/`vim_isidc`) rather than the
 //! general `g_chartab`-dependent mechanism.
+//!
+//! Also translated: [`cmdline_overstrike`]/[`cmdline_at_end`] - each
+//! reads a single narrow field of the original's own file-static
+//! `ccline` (`overstrike`/`cmdpos`/`cmdlen` respectively), modeled as
+//! their own standalone file-statics rather than a full `CmdlineInfo`
+//! struct, matching [`get_cmdline_firstc`]'s own already-established
+//! `CMDLINE_FIRSTC` precedent. Both always return their real, current
+//! answer for these fields' always-zero/false initial state (`true`
+//! for `cmdline_at_end`, `false` for `cmdline_overstrike`), since
+//! nothing in this crate can start real command-line editing yet -
+//! not a hardcoded shortcut.
 
 /// What [`vim_strsave_fnameescape`] is escaping for (`VSE_NONE`/
 /// `VSE_SHELL`/`VSE_BUFFER`, `ex_getln.h`).
@@ -129,6 +140,41 @@ static CMDLINE_FIRSTC: crate::globals::GlobalCell<i32> = crate::globals::GlobalC
 pub fn get_cmdline_firstc() -> i32 {
     // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
     unsafe { *CMDLINE_FIRSTC.get_mut() }
+}
+
+/// `ccline.overstrike` - whether the command line is in Insert
+/// (`false`) or Replace (`true`) submode, read via
+/// [`cmdline_overstrike`]. Modeled as its own file-static, matching
+/// [`CMDLINE_FIRSTC`]'s own established precedent for a single
+/// `ccline` field. Always `false` today, since nothing in this crate
+/// can start real command-line editing yet.
+static CMDLINE_OVERSTRIKE: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Return `true` if the command line is in Replace mode
+/// (`cmdline_overstrike`). Always `false` today - see
+/// `CMDLINE_OVERSTRIKE`'s own doc comment.
+#[must_use]
+pub fn cmdline_overstrike() -> bool {
+    // SAFETY: a plain `bool` copy-out read, no aliasing hazard.
+    unsafe { *CMDLINE_OVERSTRIKE.get_mut() }
+}
+
+/// `ccline.cmdpos`/`ccline.cmdlen` - the cursor's byte position in,
+/// and the total byte length of, the command line, read via
+/// [`cmdline_at_end`]. Modeled as their own file-statics, matching
+/// [`CMDLINE_FIRSTC`]'s own established precedent. Both always `0`
+/// today, since nothing in this crate can start real command-line
+/// editing yet.
+static CMDLINE_CMDPOS: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+static CMDLINE_CMDLEN: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Return `true` if the cursor is at the end of the command line
+/// (`cmdline_at_end`). Always `true` today (`0 >= 0`) - see
+/// `CMDLINE_CMDPOS`'s own doc comment.
+#[must_use]
+pub fn cmdline_at_end() -> bool {
+    // SAFETY: plain `i32` copy-out reads, no aliasing hazard.
+    unsafe { *CMDLINE_CMDPOS.get_mut() >= *CMDLINE_CMDLEN.get_mut() }
 }
 
 /// `getcmdcomplpat()` - the current command-line completion pattern
@@ -334,6 +380,20 @@ mod tests {
 
         // SAFETY: forwarded from the lock reasoning above.
         unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn cmdline_overstrike_is_false_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert!(!cmdline_overstrike());
+    }
+
+    #[test]
+    fn cmdline_at_end_is_true_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        // Both CMDLINE_CMDPOS and CMDLINE_CMDLEN default to 0, and
+        // 0 >= 0 is true.
+        assert!(cmdline_at_end());
     }
 
     #[test]
