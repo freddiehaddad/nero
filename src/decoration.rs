@@ -24,6 +24,12 @@
 //!   function always returns `0` immediately without touching its
 //!   `num_below`/`lines` out-parameters or the marktree at all.
 //!
+//! Also translated: [`win_lines_concealed`] - fully real and complete
+//! (not a "real early-return path" translation like the two above),
+//! since its only two dependencies, `crate::fold::has_any_folding`
+//! and `wp.w_onebuf_opt.wo_cole`, are both already real. Used by
+//! `move.c`'s `check_top_offset`.
+//!
 //! Deferred: everything else in the file - real virtual-text/
 //! highlight/conceal rendering, needing the marktree query machinery
 //! and decoration-provider Lua callbacks, neither translated.
@@ -92,6 +98,20 @@ pub unsafe fn decor_virt_lines(
     );
 }
 
+/// Return `true` when `wp` may have concealed lines: either real
+/// folds exist, or `'conceallevel'` hides whole lines (`>= 2`)
+/// (`win_lines_concealed`). Fully real and complete - needs only
+/// already-translated [`crate::fold::has_any_folding`] and
+/// `wp.w_onebuf_opt.wo_cole`.
+///
+/// # Safety
+/// Same as [`crate::fold::has_any_folding`].
+#[must_use]
+pub unsafe fn win_lines_concealed(wp: &WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { crate::fold::has_any_folding(wp) }) || wp.w_onebuf_opt.wo_cole >= 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +165,34 @@ mod tests {
         buf.b_marktree.meta_root[MetaIndex::Lines as usize] = 1;
         let wp = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
         let _ = unsafe { decor_virt_lines(&wp, 0, 1, None, None, true) };
+    }
+
+    #[test]
+    fn win_lines_concealed_false_by_default() {
+        let mut buf = BufT::default();
+        let wp = win_with_cole(0, &mut buf as *mut BufT);
+        assert!(!unsafe { win_lines_concealed(&wp) });
+    }
+
+    #[test]
+    fn win_lines_concealed_true_when_conceallevel_is_2_or_higher() {
+        let mut buf = BufT::default();
+        let wp = win_with_cole(2, &mut buf as *mut BufT);
+        assert!(unsafe { win_lines_concealed(&wp) });
+    }
+
+    #[test]
+    fn win_lines_concealed_true_when_folding_may_exist_even_with_conceallevel_0() {
+        let mut buf = BufT::default();
+        let wp = WinT {
+            // 'foldenable' on, 'foldmethod' unset (NOT "manual" by
+            // default) - has_any_folding's own "no folds" fast path
+            // only applies when foldmethod IS manual with no real
+            // folds, so this genuinely reports true.
+            w_onebuf_opt: WinoptT { wo_fen: 1, ..Default::default() },
+            w_buffer: &mut buf as *mut BufT,
+            ..Default::default()
+        };
+        assert!(unsafe { win_lines_concealed(&wp) });
     }
 }

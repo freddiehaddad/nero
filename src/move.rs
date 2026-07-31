@@ -937,6 +937,40 @@ pub unsafe fn changed_window_setting(wp: *mut WinT) {
         !(i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP) | i32::from(w_valid::VALID_TOPLINE));
 }
 
+/// Call [`changed_window_setting`] for every window in every tabpage
+/// (`changed_window_setting_all`), matching `window.rs`'s own
+/// established `FOR_ALL_TAB_WINDOWS`-walk idiom (e.g.
+/// `win_valid_any_tab`/`tabpage_win_valid`).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// own window list (`GLOBALS.firstwin`/`tp_firstwin`, then `w_next`),
+/// must consist of valid, live pointers.
+#[allow(dead_code)]
+pub unsafe fn changed_window_setting_all() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { changed_window_setting(wp) };
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+}
+
 /// Convert a virtual (screen) column to a character column. The first
 /// column is zero (`vcol2col`, `mouse.c`).
 ///
@@ -1221,6 +1255,46 @@ pub unsafe fn topline_back_winheight(wp: *mut WinT, lp: &mut LineoffT, winheight
 pub unsafe fn topline_back(wp: *mut WinT, lp: &mut LineoffT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { topline_back_winheight(wp, lp, true) };
+}
+
+/// Whether `wp`'s cursor is close enough to the top of the window that
+/// `'scrolloff'` requires scrolling up (`check_top_offset`), counting
+/// visible screen lines above the cursor line via [`topline_back`].
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid.
+#[allow(dead_code)]
+unsafe fn check_top_offset(wp: *mut WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let so = unsafe { crate::option::get_scrolloff_value(&*wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (w_cursor_lnum, w_topline, w_topfill) = {
+        let w = unsafe { &*wp };
+        (w.w_cursor.lnum, w.w_topline, w.w_topfill)
+    };
+
+    if i64::from(w_cursor_lnum) < i64::from(w_topline) + so
+        // SAFETY: forwarded from this function's own safety doc.
+        || unsafe { crate::decoration::win_lines_concealed(&*wp) }
+    {
+        let mut loff = LineoffT { lnum: w_cursor_lnum, fill: 0, ..Default::default() };
+        let mut n = w_topfill; // always have this context
+        // Count the visible screen lines above the cursor line.
+        while i64::from(n) < so {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { topline_back(wp, &mut loff) };
+            // Stop when included a line above the window.
+            if loff.lnum < w_topline || (loff.lnum == w_topline && loff.fill > 0) {
+                break;
+            }
+            n += loff.height;
+        }
+        if i64::from(n) < so {
+            return true;
+        }
+    }
+    false
 }
 
 /// Add one line below `lp.lnum` - a filler line, a closed fold, or a
@@ -2946,6 +3020,163 @@ mod tests {
         // after the reposition.
         assert_eq!(unsafe { &*win_ptr }.w_valid, 0);
 
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    // ---- changed_window_setting_all ----
+
+    #[test]
+    fn changed_window_setting_all_touches_every_window_in_every_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut win_c = WinT { w_lines_valid: 5, w_valid: -1, ..Default::default() };
+        let mut other_tp = crate::buffer_defs::TabpageT {
+            tp_firstwin: &mut win_c as *mut WinT,
+            ..Default::default()
+        };
+        let mut win_b = WinT { w_lines_valid: 5, w_valid: -1, ..Default::default() };
+        let mut win_a = WinT {
+            w_lines_valid: 5,
+            w_valid: -1,
+            w_next: &mut win_b as *mut WinT,
+            ..Default::default()
+        };
+        let mut curtab = crate::buffer_defs::TabpageT {
+            tp_next: &mut other_tp as *mut crate::buffer_defs::TabpageT,
+            ..Default::default()
+        };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first_tabpage, prev_curtab, prev_firstwin) = (g.first_tabpage, g.curtab, g.firstwin);
+        g.first_tabpage = &mut curtab as *mut crate::buffer_defs::TabpageT;
+        g.curtab = &mut curtab as *mut crate::buffer_defs::TabpageT;
+        g.firstwin = &mut win_a as *mut WinT; // GLOBALS.firstwin backs the CURRENT tabpage's own list
+
+        unsafe { changed_window_setting_all() };
+
+        for w in [&win_a, &win_b, &win_c] {
+            assert_eq!(w.w_lines_valid, 0);
+            assert_eq!(
+                w.w_valid
+                    & (i32::from(w_valid::VALID_BOTLINE)
+                        | i32::from(w_valid::VALID_BOTLINE_AP)
+                        | i32::from(w_valid::VALID_TOPLINE)),
+                0
+            );
+        }
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = prev_first_tabpage;
+        g.curtab = prev_curtab;
+        g.firstwin = prev_firstwin;
+    }
+
+    // ---- check_top_offset ----
+
+    #[test]
+    fn check_top_offset_far_from_top_returns_false_without_scanning() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_so = 0; // 'scrolloff'=0
+        win.w_topline = 1;
+        win.w_cursor.lnum = 1; // at topline already
+
+        assert!(!unsafe { check_top_offset(&mut win as *mut WinT) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn check_top_offset_near_top_returns_true_via_early_break() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0") }, crate::vim_defs::OK);
+        for (after, line) in [(1, b"two\0" as &[u8]), (2, b"three\0"), (3, b"four\0")] {
+            assert_eq!(
+                unsafe { crate::memline::ml_append_buf(&mut buf, after, line, line.len() as i32, false) },
+                crate::vim_defs::OK
+            );
+        }
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+        win.w_onebuf_opt.wo_so = 2; // 'scrolloff'=2
+        win.w_topline = 3;
+        win.w_cursor.lnum = 4; // one line below topline
+        win.w_topfill = 0;
+
+        // Hand-traced: guard passes (4 < 3+2=5). Loop iteration 1:
+        // topline_back moves loff to lnum=3/height=1 - not above
+        // w_topline(3), so n becomes 1. Iteration 2: topline_back
+        // moves loff to lnum=2/height=1 - THIS time loff.lnum(2) <
+        // w_topline(3), so it breaks BEFORE adding height. Final
+        // n=1 < so=2 -> true.
+        assert!(unsafe { check_top_offset(&mut win as *mut WinT) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn check_top_offset_wrapped_line_accumulates_enough_height_in_one_step() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::NORMAL as i32;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        // 20 'a's - at w_view_width=5 with wrap on, this line alone
+        // occupies ceil(20/5)=4 screen rows.
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"aaaaaaaaaaaaaaaaaaaa\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) }, crate::vim_defs::OK);
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 5;
+        win.w_view_height = 20; // large enough that limit_winheight never clamps
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_onebuf_opt.wo_so = 3; // 'scrolloff'=3
+        win.w_topline = 1;
+        win.w_cursor.lnum = 2; // one raw line below topline - guard passes via distance
+        win.w_topfill = 0;
+
+        // Hand-traced: guard passes (2 < 1+3=4). The loop's FIRST
+        // topline_back call walks from line 2 back to line 1 (still
+        // >= w_topline, so no break) and computes its height via
+        // plines_win_nofill as 4 (the wrapped line above) - already
+        // >= so(3) after just one iteration, so the loop exits via the
+        // while condition (not a break) without ever needing a second
+        // step. Enough real (wrapped) height exists above the cursor,
+        // so no scroll is needed.
+        assert!(!unsafe { check_top_offset(&mut win as *mut WinT) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
