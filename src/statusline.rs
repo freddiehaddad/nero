@@ -27,6 +27,17 @@
 //! does the same job automatically. See each function's own doc
 //! comment for exactly which C-specific bookkeeping this replaces.
 //!
+//! Also translated: [`fillchar_status`] (the character and highlight-
+//! flag group to use in a status line, based on whether `wp` is the
+//! current window), via already-real `crate::globals::GLOBALS.curwin`,
+//! `WinT.w_p_fcs_chars.stl`/`stlnc`, `crate::highlight_defs::HlfT::S`/
+//! `Snc`. Returns `(fillchar, group)` as an owned tuple rather than
+//! writing through the original's own `hlf_T *group` out-parameter,
+//! matching this crate's established "return an owned value instead
+//! of an out-parameter" idiom. No real caller yet, translated ahead
+//! of the surrounding engine matching the same precedent as
+//! `stl_connected`.
+//!
 //! Deferred: everything else - `win_redr_stl_expr`/`win_redr_status`/
 //! `win_redr_winbar`/`redraw_ruler`/`draw_tabline`/`build_statuscol_str`/
 //! `build_stl_str_hl`/`stl_truncate`/`stl_expand`/`get_trans_bufname`
@@ -156,6 +167,29 @@ pub unsafe fn stl_connected(wp: &WinT) -> bool {
         }
     }
     false
+}
+
+/// Get the character (and its highlight-flag group) to use in a
+/// status line for window `wp` - `wp == curwin` uses the "current
+/// window" style (`'fillchars'` `stl`/`HLF_S`), any other window uses
+/// the "not current" style (`stlnc`/`HLF_SNC`) (`fillchar_status`).
+/// Returns `(fillchar, group)`.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn fillchar_status(
+    wp: *const WinT,
+) -> (crate::types_defs::ScharT, crate::highlight_defs::HlfT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &*wp };
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_curwin = std::ptr::eq(wp, unsafe { crate::globals::GLOBALS.get_mut() }.curwin);
+    if is_curwin {
+        (w.w_p_fcs_chars.stl, crate::highlight_defs::HlfT::S)
+    } else {
+        (w.w_p_fcs_chars.stlnc, crate::highlight_defs::HlfT::Snc)
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +369,46 @@ mod tests {
         };
         let wp = WinT { w_frame: &mut leaf as *mut FrameT, ..WinT::default() };
         assert!(unsafe { stl_connected(&wp) });
+    }
+
+    // ---- fillchar_status ----
+
+    #[test]
+    fn fillchar_status_current_window_uses_stl_and_hlf_s() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_p_fcs_chars: crate::buffer_defs::FcsCharsT { stl: 11, stlnc: 22, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = win_ptr;
+
+        let result = unsafe { fillchar_status(win_ptr) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+
+        assert_eq!(result, (11, crate::highlight_defs::HlfT::S));
+    }
+
+    #[test]
+    fn fillchar_status_non_current_window_uses_stlnc_and_hlf_snc() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut other = WinT { handle: 1, ..Default::default() };
+        let other_ptr = &mut other as *mut WinT;
+        let mut win = WinT {
+            w_p_fcs_chars: crate::buffer_defs::FcsCharsT { stl: 11, stlnc: 22, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // curwin is a DIFFERENT window than win_ptr.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = other_ptr;
+
+        let result = unsafe { fillchar_status(win_ptr) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+
+        assert_eq!(result, (22, crate::highlight_defs::HlfT::Snc));
     }
 }
