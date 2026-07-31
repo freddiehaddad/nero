@@ -95,11 +95,32 @@
 //! `'smoothscroll'` and `'wrap'` are both set. Unlocked `insert.c`'s
 //! `beginline`/`oneright`/`oneleft`.
 //!
+//! Also translated: **`scrolljump_value`** (a small `'scrolljump'`
+//! effective-value helper, needing only `option_vars::OPTION_VARS.p_sj`
+//! and `WinT.w_view_height`) and **`topline_back_winheight`/
+//! `topline_back`/`botline_forw`** (+ a new `LineoffT` struct mirroring
+//! the original's own `lineoff_T`) - move a line offset up/down by one
+//! (screen-)line, computing its own resulting height. Needed only
+//! already-real `plines.c`'s `win_get_fill`/`plines_win_nofill`,
+//! `fold.c`'s `has_folding`, and `decoration.c`'s `decor_conceal_line`.
+//! None has a real translated caller yet (their own real callers all
+//! still need the redraw pipeline) - harvested anyway, matching this
+//! crate's established ahead-of-caller precedent. `win_get_fill`
+//! always returns `0` today (nothing can attach virtual lines or
+//! create a diff yet - see `plines.rs`'s/`diff.rs`'s own doc comments),
+//! so the "add a filler line" branch in each of these 3 functions is
+//! provably unreachable for any `LineoffT` this crate can construct
+//! (its own `fill` field always starts at, and stays, `>= 0`) - not
+//! separately tested for that specific reason, matching this crate's
+//! established policy of not testing a provably-unreachable branch.
+//!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
-//! `validate_cursor`/`curs_rows`/`validate_cheight`/`validate_botline_win`,
-//! all needing `fold.c`'s real fold-tree search and/or the redraw
-//! pipeline).
+//! `validate_cursor`/`curs_rows`/`validate_botline_win`, all needing
+//! `fold.c`'s real fold-tree search and/or the redraw pipeline).
+//! `validate_cheight` (mentioned above) is NOT among these - fixed a
+//! stale duplicate reference here that still listed it as deferred
+//! after it was already translated.
 
 use crate::buffer_defs::{w_valid, WinT};
 use crate::types_defs::SIGN_WIDTH;
@@ -1104,6 +1125,122 @@ pub unsafe fn textpos2screenpos(
     *scolp = scol + coloff;
     *ccolp = ccol + coloff;
     *ecolp = ecol + coloff;
+}
+
+/// Line offset used by [`topline_back`]/[`topline_back_winheight`]/
+/// [`botline_forw`] to describe one added line's own filler-line count
+/// and screen height (`lineoff_T`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LineoffT {
+    /// Line number.
+    pub lnum: crate::pos_defs::LinenrT,
+    /// Filler lines.
+    pub fill: i32,
+    /// Height of the added line.
+    pub height: i32,
+}
+
+/// Compute the effective `'scrolljump'` value for window `wp`: the
+/// option's own value directly when non-negative, or a percentage of
+/// the window's height when negative (`scrolljump_value`).
+#[must_use]
+pub fn scrolljump_value(wp: &WinT) -> i32 {
+    let p_sj = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj;
+    if p_sj >= 0 {
+        p_sj as i32
+    } else {
+        (wp.w_view_height * -(p_sj as i32)) / 100
+    }
+}
+
+/// Move `lp` one line up (or add one more filler line), setting its
+/// own resulting screen height (`topline_back_winheight`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` with a
+/// valid, non-null `w_buffer`.
+pub unsafe fn topline_back_winheight(wp: *mut WinT, lp: &mut LineoffT, winheight: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fill_above = unsafe { crate::plines::win_get_fill(&*wp, lp.lnum) };
+    if lp.fill < fill_above {
+        // Add a filler line.
+        lp.fill += 1;
+        lp.height = 1;
+    } else {
+        lp.lnum -= 1;
+        lp.fill = 0;
+        if lp.lnum < 1 {
+            lp.height = crate::pos_defs::MAXCOL;
+        } else {
+            let mut first = lp.lnum;
+            // SAFETY: forwarded from this function's own safety doc.
+            let folded =
+                unsafe { crate::fold::has_folding(&mut *wp, lp.lnum, Some(&mut first), None) };
+            lp.lnum = first;
+            if folded {
+                // Add a closed fold unless concealed.
+                // SAFETY: forwarded from this function's own safety doc.
+                lp.height = i32::from(
+                    !unsafe { crate::decoration::decor_conceal_line(&*wp, lp.lnum - 1, false) },
+                );
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                lp.height = unsafe { crate::plines::plines_win_nofill(wp, lp.lnum, winheight) };
+            }
+        }
+    }
+}
+
+/// [`topline_back_winheight`] with `winheight` always `true`
+/// (`topline_back`).
+///
+/// # Safety
+/// Same as [`topline_back_winheight`].
+pub unsafe fn topline_back(wp: *mut WinT, lp: &mut LineoffT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { topline_back_winheight(wp, lp, true) };
+}
+
+/// Add one line below `lp.lnum` - a filler line, a closed fold, or a
+/// (wrapped) text line, updating `lp.fill` and setting `lp.height` to
+/// the added line's own screen height. Lines below the last one get
+/// an incredibly high height (`MAXCOL`) (`botline_forw`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` with a
+/// valid, non-null `w_buffer`.
+pub unsafe fn botline_forw(wp: *mut WinT, lp: &mut LineoffT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fill_below = unsafe { crate::plines::win_get_fill(&*wp, lp.lnum + 1) };
+    if lp.fill < fill_below {
+        // Add a filler line.
+        lp.fill += 1;
+        lp.height = 1;
+    } else {
+        lp.lnum += 1;
+        lp.fill = 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        let ml_line_count = unsafe { (*(*wp).w_buffer).b_ml.ml_line_count };
+        if lp.lnum > ml_line_count {
+            lp.height = crate::pos_defs::MAXCOL;
+        } else {
+            let mut last = lp.lnum;
+            // SAFETY: forwarded from this function's own safety doc.
+            let folded =
+                unsafe { crate::fold::has_folding(&mut *wp, lp.lnum, None, Some(&mut last)) };
+            lp.lnum = last;
+            if folded {
+                // Add a closed fold unless concealed.
+                // SAFETY: forwarded from this function's own safety doc.
+                lp.height = i32::from(
+                    !unsafe { crate::decoration::decor_conceal_line(&*wp, lp.lnum - 1, false) },
+                );
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                lp.height = unsafe { crate::plines::plines_win_nofill(wp, lp.lnum, true) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2332,6 +2469,176 @@ mod tests {
         }
 
         assert_eq!((row, scol, ccol, ecol), (0, 0, 0, 0));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn scrolljump_value_returns_the_option_directly_when_non_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj = 5;
+
+        let win = WinT::default();
+        assert_eq!(scrolljump_value(&win), 5);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj = prev;
+    }
+
+    #[test]
+    fn scrolljump_value_computes_a_percentage_of_window_height_when_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj = -50;
+
+        let win = WinT { w_view_height: 20, ..Default::default() };
+        assert_eq!(scrolljump_value(&win), 10); // (20 * 50) / 100
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sj = prev;
+    }
+
+    #[test]
+    fn topline_back_winheight_moves_up_one_line_and_computes_its_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+
+        let mut lp = LineoffT { lnum: 2, fill: 0, height: 0 };
+        unsafe { topline_back_winheight(&mut win as *mut WinT, &mut lp, true) };
+
+        assert_eq!(lp.lnum, 1);
+        assert_eq!(lp.fill, 0);
+        assert_eq!(lp.height, 1); // "one" fits on one screen line
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn topline_back_winheight_stops_before_line_1_with_maxcol_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+
+        let mut lp = LineoffT { lnum: 1, fill: 0, height: 0 };
+        unsafe { topline_back_winheight(&mut win as *mut WinT, &mut lp, true) };
+
+        assert_eq!(lp.lnum, 0);
+        assert_eq!(lp.height, crate::pos_defs::MAXCOL);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn topline_back_delegates_with_winheight_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+
+        let mut lp = LineoffT { lnum: 2, fill: 0, height: 0 };
+        unsafe { topline_back(&mut win as *mut WinT, &mut lp) };
+
+        assert_eq!(lp.lnum, 1);
+        assert_eq!(lp.height, 1);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn botline_forw_moves_down_one_line_and_computes_its_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append_buf(&mut buf, 1, b"two\0", 4, false) },
+            crate::vim_defs::OK
+        );
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+
+        let mut lp = LineoffT { lnum: 1, fill: 0, height: 0 };
+        unsafe { botline_forw(&mut win as *mut WinT, &mut lp) };
+
+        assert_eq!(lp.lnum, 2);
+        assert_eq!(lp.fill, 0);
+        assert_eq!(lp.height, 1); // "two" fits on one screen line
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn botline_forw_stops_past_the_last_line_with_maxcol_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_width = 10;
+
+        let mut lp = LineoffT { lnum: 1, fill: 0, height: 0 };
+        unsafe { botline_forw(&mut win as *mut WinT, &mut lp) };
+
+        assert_eq!(lp.lnum, 2);
+        assert_eq!(lp.height, crate::pos_defs::MAXCOL);
 
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
