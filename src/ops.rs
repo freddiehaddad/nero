@@ -84,6 +84,16 @@
 //! splicing/`truncate_line`) - translated ahead of them, matching the
 //! established "translate ahead of a real caller" precedent.
 //!
+//! Also translated: `get_op_vcol` (a `static` helper - computes a
+//! blockwise-Visual operator's virtual-column extent and converts it
+//! into real character positions in `oap.start`/`oap.end`), needing
+//! only already-real `crate::mark::mark_mb_adjustpos`/
+//! `crate::plines::getvvcol`/`crate::cursor::coladvance`. Its own real
+//! caller (`do_pending_operator`, the "an operator finished, act on
+//! it" dispatcher) is not translated - kept `#[allow(dead_code)]` for
+//! now, matching the same "translate ahead of a real caller"
+//! precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ascii_defs::ascii_isspace;
@@ -555,6 +565,126 @@ pub unsafe fn mb_adjust_opend(oap: &mut crate::normal_defs::OpargT) {
         let char_len = unsafe { crate::mbyte::utfc_ptr2len(&line[new_start..]) };
         oap.end.col = new_start as crate::pos_defs::ColnrT + char_len - 1;
     }
+}
+
+/// Compute a block-wise operator's virtual-column extent and convert
+/// it into real character positions (`get_op_vcol`, a `static` helper
+/// in `ops.c`). Only meaningful in blockwise-Visual mode
+/// (`Visual.mode == Ctrl_V`); every other mode leaves `oap` untouched.
+///
+/// Its only real caller, `do_pending_operator` (the "an operator
+/// finished, act on it" dispatcher), is not translated - kept
+/// `#[allow(dead_code)]` for now, matching this file's own established
+/// "translate ahead of a real caller" precedent (`is_ex_cmdchar`,
+/// `skip_comment`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+#[allow(dead_code)]
+unsafe fn get_op_vcol(
+    oap: &mut crate::normal_defs::OpargT,
+    redo_visual_vcol: crate::pos_defs::ColnrT,
+    initial: bool,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_view_width = unsafe { (*curwin).w_view_width };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let visual_mode = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.mode;
+    if visual_mode != i32::from(crate::ascii_defs::CTRL_V) || (!initial && oap.end.col < w_view_width) {
+        return;
+    }
+
+    oap.motion_type = crate::normal_defs::MotionType::BlockWise;
+
+    // Prevent from moving onto a trail byte.
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(*curwin).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::mark_mb_adjustpos(buf, &mut oap.end) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::plines::getvvcol(
+            curwin,
+            &mut oap.start,
+            Some(&mut oap.start_vcol),
+            None,
+            Some(&mut oap.end_vcol),
+            0,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let redo_busy = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.redo_busy;
+    if !redo_busy {
+        let mut start: crate::pos_defs::ColnrT = 0;
+        let mut end: crate::pos_defs::ColnrT = 0;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::plines::getvvcol(curwin, &mut oap.end, Some(&mut start), None, Some(&mut end), 0);
+        }
+
+        oap.start_vcol = oap.start_vcol.min(start);
+        if end > oap.end_vcol {
+            // SAFETY: forwarded from this function's own safety doc.
+            let sel_is_exclusive = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                .p_sel
+                .as_deref()
+                .and_then(<[u8]>::first)
+                == Some(&b'e');
+            if initial && sel_is_exclusive && start >= 1 && start > oap.end_vcol {
+                oap.end_vcol = start - 1;
+            } else {
+                oap.end_vcol = end;
+            }
+        }
+    }
+
+    // If '$' was used, get oap.end_vcol from the longest line.
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_curswant = unsafe { (*curwin).w_curswant };
+    if w_curswant == crate::pos_defs::MAXCOL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor.col = crate::pos_defs::MAXCOL };
+        oap.end_vcol = 0;
+        let mut lnum = oap.start.lnum;
+        while lnum <= oap.end.lnum {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*curwin).w_cursor.lnum = lnum };
+            let mut end: crate::pos_defs::ColnrT = 0;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::plines::getvvcol(curwin, &mut (*curwin).w_cursor, None, None, Some(&mut end), 0);
+            }
+            oap.end_vcol = oap.end_vcol.max(end);
+            lnum += 1;
+        }
+    } else if redo_busy {
+        oap.end_vcol = oap.start_vcol + redo_visual_vcol - 1;
+    }
+
+    // Correct oap.end.col and oap.start.col to be the upper-left and
+    // lower-right corner of the block area.
+    //
+    // (Actually, this does convert column positions into character
+    // positions.)
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_cursor.lnum = oap.end.lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::coladvance(curwin, oap.end_vcol) };
+    // SAFETY: forwarded from this function's own safety doc.
+    oap.end = unsafe { (*curwin).w_cursor };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_cursor = oap.start };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::coladvance(curwin, oap.start_vcol) };
+    // SAFETY: forwarded from this function's own safety doc.
+    oap.start = unsafe { (*curwin).w_cursor };
 }
 
 /// Count words/chars/bytes in `line` (`line_count_info`). Return
@@ -1256,6 +1386,222 @@ mod tests {
         };
         unsafe { mb_adjust_opend(&mut oap) };
         assert_eq!(oap.end.col, 6);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    // ---- get_op_vcol ----
+
+    /// Sets `GLOBALS.Visual.mode`/`redo_busy` for a test, wrapping the
+    /// required `unsafe` access in one place. Callers must already
+    /// hold `global_state_test_lock()` (via a self-locking guard like
+    /// `CursorTestGuard`) for their whole body.
+    fn set_visual_state(mode: u8, redo_busy: bool) {
+        // SAFETY: forwarded from this function's own doc comment.
+        let visual = &mut unsafe { crate::globals::GLOBALS.get_mut() }.Visual;
+        visual.mode = i32::from(mode);
+        visual.redo_busy = redo_busy;
+    }
+
+    /// Sets `OPTION_VARS.p_sel` for a test, wrapping the required
+    /// `unsafe` access in one place. Same locking obligation as
+    /// [`set_visual_state`].
+    fn set_p_sel(value: Option<&[u8]>) {
+        // SAFETY: forwarded from this function's own doc comment.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = value.map(<[u8]>::to_vec);
+    }
+
+    /// Same as [`open_and_set_test_buf`], but replaces line 1 with
+    /// `lines[0]`, appends each remaining entry of `lines` in order
+    /// (matching `plines.rs`'s own `buf_with_lines` precedent), and
+    /// wires `win.w_buffer` to point at `buf` (needed since
+    /// `get_op_vcol` itself reads `(*curwin).w_buffer` directly,
+    /// matching the original's own `curwin->w_buffer` usage - unlike
+    /// every OTHER function tested via `open_and_set_test_buf`, which
+    /// only ever needs `GLOBALS.curbuf`). `win.w_buffer` is wired
+    /// LAST, after every other reborrow of `buf`, to avoid the
+    /// "raw pointer invalidated by a later reborrow of the same local"
+    /// Tree Borrows hazard already documented elsewhere in this crate.
+    fn open_and_set_test_buf_lines(
+        win: &mut WinT,
+        buf: &mut crate::buffer_defs::BufT,
+        lines: &[&[u8]],
+    ) -> CursorTestGuard {
+        let guard = open_and_set_test_buf(win, buf, lines[0]);
+        for (after, line) in (1..).zip(lines[1..].iter()) {
+            assert_eq!(
+                unsafe { crate::memline::ml_append_buf(buf, after, line, line.len() as i32, false) },
+                crate::vim_defs::OK
+            );
+        }
+        win.w_buffer = buf as *mut crate::buffer_defs::BufT;
+        guard
+    }
+
+    #[test]
+    fn get_op_vcol_wrong_visual_mode_is_a_no_op() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"abcde\0"]);
+        set_visual_state(b'v', false); // charwise, not Ctrl-V
+
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 0, true) };
+
+        // Completely untouched: motion_type stays the default CharWise.
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::CharWise);
+        assert_eq!(oap.start.col, 1);
+        assert_eq!(oap.end.col, 3);
+        assert_eq!(oap.start_vcol, 0);
+        assert_eq!(oap.end_vcol, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_op_vcol_narrow_selection_is_a_no_op_when_not_initial() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT { w_view_width: 10, ..Default::default() };
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"abcde\0"]);
+        set_visual_state(crate::ascii_defs::CTRL_V, false);
+
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 }, // 3 < w_view_width(10)
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 0, false) };
+
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::CharWise);
+        assert_eq!(oap.end.col, 3);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_op_vcol_normalizes_start_and_end_vcol_and_converts_to_positions() {
+        // Passes the early-return guard via `oap.end.col >= w_view_width`
+        // (not via `initial`), unlike the other tests below.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT { w_view_width: 0, ..Default::default() };
+        let guard =
+            open_and_set_test_buf_lines(&mut win, &mut buf, &[b"abcdefgh\0", b"ijklmnop\0"]);
+        set_visual_state(crate::ascii_defs::CTRL_V, false);
+
+        // start.col(5) > end.col(1): hand-traced (see the commit
+        // history) that the function still normalizes these into the
+        // upper-left(vcol1)/lower-right(vcol5) corners regardless of
+        // which one was given as "start" vs. "end".
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 2, col: 1, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 0, false) };
+
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::BlockWise);
+        assert_eq!(oap.start_vcol, 1);
+        assert_eq!(oap.end_vcol, 5);
+        assert_eq!(oap.start, crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 });
+        assert_eq!(oap.end, crate::pos_defs::PosT { lnum: 2, col: 5, coladd: 0 });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_op_vcol_exclusive_selection_excludes_the_last_column() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard =
+            open_and_set_test_buf_lines(&mut win, &mut buf, &[b"abcdefgh\0", b"abcdefgh\0"]);
+        set_visual_state(crate::ascii_defs::CTRL_V, false);
+        set_p_sel(Some(b"exclusive"));
+
+        // start vcol=2, end vcol=6: with 'selection'=exclusive and
+        // initial=true, the trailing column is excluded (end_vcol
+        // becomes end's own start(6) - 1 = 5, not 6).
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 2, col: 6, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 0, true) };
+
+        assert_eq!(oap.start_vcol, 2);
+        assert_eq!(oap.end_vcol, 5);
+
+        set_p_sel(None);
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_op_vcol_redo_busy_computes_end_vcol_arithmetically() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(
+            &mut win,
+            &mut buf,
+            &[b"xyz\0", b"abcdefghijklmnop\0"],
+        );
+        set_visual_state(crate::ascii_defs::CTRL_V, true);
+
+        // redo_busy=true skips the "getvvcol(oap.end)" block entirely:
+        // oap.end_vcol is computed purely as
+        // start_vcol(2) + redo_visual_vcol(10) - 1 = 11, regardless of
+        // oap.end's own original column.
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 10, true) };
+
+        assert_eq!(oap.start_vcol, 2);
+        assert_eq!(oap.end_vcol, 11);
+        assert_eq!(oap.end.lnum, 2);
+        assert_eq!(oap.end.col, 11); // vcol 11 in "abcdefghijklmnop" is 'l'
+
+        set_visual_state(crate::ascii_defs::CTRL_V, false);
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_op_vcol_dollar_motion_uses_the_longest_line_in_range() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(
+            &mut win,
+            &mut buf,
+            &[b"ab\0", b"abcdefgh\0", b"abcd\0"],
+        );
+        set_visual_state(crate::ascii_defs::CTRL_V, false);
+        win.w_curswant = crate::pos_defs::MAXCOL;
+
+        let mut oap = crate::normal_defs::OpargT {
+            start: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            end: crate::pos_defs::PosT { lnum: 3, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        unsafe { get_op_vcol(&mut oap, 0, true) };
+
+        // Scans every line from oap.start.lnum..=oap.end.lnum (1..=3)
+        // via curwin.w_cursor mutation, keeping the MAXIMUM
+        // end-of-line vcol seen: line 2 ("abcdefgh", 8 chars) is the
+        // longest, so end_vcol == 8 (its own NUL-terminator vcol),
+        // even though oap.end itself points at line 3.
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::BlockWise);
+        assert_eq!(oap.start_vcol, 0);
+        assert_eq!(oap.end_vcol, 8);
 
         drop(guard);
         close_buf_with_memline(buf);
