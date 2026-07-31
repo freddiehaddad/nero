@@ -291,6 +291,22 @@
 //! not yet translated), matching the established "translate ahead of
 //! a real caller" precedent.
 //!
+//! Also translated: `frame_append`/`frame_insert`/`frame_remove` (the
+//! low-level frame-tree linked-list splice/unlink primitives, using
+//! already-real `FrameT.fr_next`/`fr_prev`/`fr_parent`/`fr_child`).
+//! Caught a real test-design mistake (not an implementation bug) via
+//! a null-pointer-dereference crash on the first test run:
+//! `frame_insert`'s own "no previous sibling" branch reads `frp`'s OWN
+//! `fr_parent` field (`frp->fr_parent->fr_child = frp;`), NOT
+//! `before`'s - a genuine, easy-to-miss precondition of the original
+//! (the caller must already have set the new frame's own `fr_parent`
+//! before insertion whenever it might become the new head) -
+//! documented explicitly in `frame_insert`'s own safety doc rather
+//! than silently worked around. Translated ahead of their real
+//! callers (`win_split_ins`/`winframe_remove`, both part of the
+//! not-yet-translated window-splitting/closing machinery), matching
+//! the established "translate ahead of a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2790,6 +2806,89 @@ pub unsafe fn alt_tabpage() -> *mut crate::buffer_defs::TabpageT {
             tp = unsafe { &*tp }.tp_next;
         }
         tp
+    }
+}
+
+/// Insert frame `frp` in a frame list, right after `after`
+/// (`frame_append`).
+///
+/// # Safety
+/// `after` must be a valid, non-null pointer to a live `FrameT`,
+/// distinct from `frp`. `frp` must be a valid, non-null pointer to a
+/// live `FrameT` not already linked into any frame list. If `after`
+/// has a next sibling, that sibling must also be a valid, live
+/// `FrameT` pointer.
+pub unsafe fn frame_append(
+    after: *mut crate::buffer_defs::FrameT,
+    frp: *mut crate::buffer_defs::FrameT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let after_ref = unsafe { &mut *after };
+    // SAFETY: forwarded from this function's own safety doc.
+    let frp_ref = unsafe { &mut *frp };
+    frp_ref.fr_next = after_ref.fr_next;
+    after_ref.fr_next = frp;
+    if !frp_ref.fr_next.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_next }.fr_prev = frp;
+    }
+    frp_ref.fr_prev = after;
+}
+
+/// Insert frame `frp` in a frame list, right before `before`
+/// (`frame_insert`).
+///
+/// # Safety
+/// `before` must be a valid, non-null pointer to a live `FrameT`,
+/// distinct from `frp`, whose own `fr_prev` (if non-null) is also a
+/// valid, live pointer. `frp` must be a valid, non-null pointer to a
+/// live `FrameT` not already linked into any frame list; if `before`
+/// has no previous sibling (`frp` will become the new head), `frp`'s
+/// own `fr_parent` must already be set to a valid, live `FrameT`
+/// pointer by the caller before calling this function (matching the
+/// original's own `frp->fr_parent->fr_child = frp;` - it reads `frp`'s
+/// OWN `fr_parent` field, not `before`'s).
+pub unsafe fn frame_insert(
+    before: *mut crate::buffer_defs::FrameT,
+    frp: *mut crate::buffer_defs::FrameT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let before_ref = unsafe { &mut *before };
+    // SAFETY: forwarded from this function's own safety doc.
+    let frp_ref = unsafe { &mut *frp };
+    frp_ref.fr_next = before;
+    frp_ref.fr_prev = before_ref.fr_prev;
+    before_ref.fr_prev = frp;
+    if !frp_ref.fr_prev.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_prev }.fr_next = frp;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_parent }.fr_child = frp;
+    }
+}
+
+/// Remove frame `frp` from its frame list (`frame_remove`).
+///
+/// # Safety
+/// `frp` must be a valid, non-null pointer to a live `FrameT`
+/// currently linked into a frame list, whose own `fr_prev` (if
+/// non-null) or `fr_parent` (if `fr_prev` is null) is also a valid,
+/// live pointer, and whose own `fr_next` (if non-null) is also a
+/// valid, live pointer.
+pub unsafe fn frame_remove(frp: *mut crate::buffer_defs::FrameT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let frp_ref = unsafe { &mut *frp };
+    if !frp_ref.fr_prev.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_prev }.fr_next = frp_ref.fr_next;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_parent }.fr_child = frp_ref.fr_next;
+    }
+    if !frp_ref.fr_next.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *frp_ref.fr_next }.fr_prev = frp_ref.fr_prev;
     }
 }
 
@@ -6798,5 +6897,145 @@ mod tests {
 
         // Walk from tp1 until tp.tp_next == tp3 -> tp2.
         assert_eq!(unsafe { alt_tabpage() }, tp2_ptr);
+    }
+
+    // ---- frame_append / frame_insert / frame_remove ----
+
+    #[test]
+    fn frame_append_splices_into_the_middle_of_a_list() {
+        let mut c = crate::buffer_defs::FrameT::default();
+        let c_ptr = &mut c as *mut crate::buffer_defs::FrameT;
+        let mut a =
+            crate::buffer_defs::FrameT { fr_next: c_ptr, ..Default::default() };
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *c_ptr }.fr_prev = a_ptr;
+        let mut b = crate::buffer_defs::FrameT::default();
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+
+        unsafe { frame_append(a_ptr, b_ptr) };
+
+        assert_eq!(unsafe { &*a_ptr }.fr_next, b_ptr);
+        assert_eq!(unsafe { &*b_ptr }.fr_prev, a_ptr);
+        assert_eq!(unsafe { &*b_ptr }.fr_next, c_ptr);
+        assert_eq!(unsafe { &*c_ptr }.fr_prev, b_ptr);
+    }
+
+    #[test]
+    fn frame_append_at_the_end_of_a_list() {
+        let mut a = crate::buffer_defs::FrameT::default();
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        let mut b = crate::buffer_defs::FrameT::default();
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+
+        unsafe { frame_append(a_ptr, b_ptr) };
+
+        assert_eq!(unsafe { &*a_ptr }.fr_next, b_ptr);
+        assert_eq!(unsafe { &*b_ptr }.fr_prev, a_ptr);
+        assert!(unsafe { &*b_ptr }.fr_next.is_null());
+    }
+
+    #[test]
+    fn frame_insert_splices_into_the_middle_of_a_list() {
+        let mut a = crate::buffer_defs::FrameT::default();
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        let mut c =
+            crate::buffer_defs::FrameT { fr_prev: a_ptr, ..Default::default() };
+        let c_ptr = &mut c as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *a_ptr }.fr_next = c_ptr;
+        let mut b = crate::buffer_defs::FrameT::default();
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+
+        unsafe { frame_insert(c_ptr, b_ptr) };
+
+        assert_eq!(unsafe { &*a_ptr }.fr_next, b_ptr);
+        assert_eq!(unsafe { &*b_ptr }.fr_prev, a_ptr);
+        assert_eq!(unsafe { &*b_ptr }.fr_next, c_ptr);
+        assert_eq!(unsafe { &*c_ptr }.fr_prev, b_ptr);
+    }
+
+    #[test]
+    fn frame_insert_at_the_start_of_a_list_updates_fr_parent_fr_child() {
+        let mut parent = crate::buffer_defs::FrameT::default();
+        let parent_ptr = &mut parent as *mut crate::buffer_defs::FrameT;
+        let mut before = crate::buffer_defs::FrameT {
+            fr_prev: std::ptr::null_mut(),
+            fr_parent: parent_ptr,
+            ..Default::default()
+        };
+        let before_ptr = &mut before as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *parent_ptr }.fr_child = before_ptr;
+        // frame_insert's own "no previous sibling" branch reads
+        // frp->fr_parent (the NEW frame's own field, matching the
+        // original exactly) - the caller must set this before
+        // insertion whenever frp might end up as the new head.
+        let mut frp = crate::buffer_defs::FrameT { fr_parent: parent_ptr, ..Default::default() };
+        let frp_ptr = &mut frp as *mut crate::buffer_defs::FrameT;
+
+        unsafe { frame_insert(before_ptr, frp_ptr) };
+
+        assert_eq!(unsafe { &*parent_ptr }.fr_child, frp_ptr);
+        assert_eq!(unsafe { &*frp_ptr }.fr_next, before_ptr);
+        assert!(unsafe { &*frp_ptr }.fr_prev.is_null());
+        assert_eq!(unsafe { &*before_ptr }.fr_prev, frp_ptr);
+    }
+
+    #[test]
+    fn frame_remove_from_the_middle_relinks_both_neighbors() {
+        let mut a = crate::buffer_defs::FrameT::default();
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        let mut c = crate::buffer_defs::FrameT::default();
+        let c_ptr = &mut c as *mut crate::buffer_defs::FrameT;
+        let mut b = crate::buffer_defs::FrameT {
+            fr_prev: a_ptr,
+            fr_next: c_ptr,
+            ..Default::default()
+        };
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *a_ptr }.fr_next = b_ptr;
+        unsafe { &mut *c_ptr }.fr_prev = b_ptr;
+
+        unsafe { frame_remove(b_ptr) };
+
+        assert_eq!(unsafe { &*a_ptr }.fr_next, c_ptr);
+        assert_eq!(unsafe { &*c_ptr }.fr_prev, a_ptr);
+    }
+
+    #[test]
+    fn frame_remove_the_first_node_updates_fr_parent_fr_child() {
+        let mut parent = crate::buffer_defs::FrameT::default();
+        let parent_ptr = &mut parent as *mut crate::buffer_defs::FrameT;
+        let mut b = crate::buffer_defs::FrameT::default();
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+        let mut a = crate::buffer_defs::FrameT {
+            fr_prev: std::ptr::null_mut(),
+            fr_next: b_ptr,
+            fr_parent: parent_ptr,
+            ..Default::default()
+        };
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *parent_ptr }.fr_child = a_ptr;
+        unsafe { &mut *b_ptr }.fr_prev = a_ptr;
+
+        unsafe { frame_remove(a_ptr) };
+
+        assert_eq!(unsafe { &*parent_ptr }.fr_child, b_ptr);
+        assert!(unsafe { &*b_ptr }.fr_prev.is_null());
+    }
+
+    #[test]
+    fn frame_remove_the_last_node_leaves_prev_fr_next_null() {
+        let mut a = crate::buffer_defs::FrameT::default();
+        let a_ptr = &mut a as *mut crate::buffer_defs::FrameT;
+        let mut b = crate::buffer_defs::FrameT {
+            fr_prev: a_ptr,
+            fr_next: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let b_ptr = &mut b as *mut crate::buffer_defs::FrameT;
+        unsafe { &mut *a_ptr }.fr_next = b_ptr;
+
+        unsafe { frame_remove(b_ptr) };
+
+        assert!(unsafe { &*a_ptr }.fr_next.is_null());
     }
 }
