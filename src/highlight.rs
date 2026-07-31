@@ -15,6 +15,15 @@
 //! "translate ahead of a real caller" precedent for small,
 //! self-contained pieces with no design freedom of their own.
 //!
+//! Also translated: [`hl_combine_ae`] (combine two attribute-flag
+//! bitmasks, e.g. for spelling combined with syntax highlighting - the
+//! underline-kind bits in `prim_ae` overrule `char_ae`'s, every other
+//! bit is a plain bitwise OR), via already-real
+//! `crate::highlight_defs::HL_UNDERLINE_MASK`. Translated ahead of its
+//! real caller (`hl_combine_attr`, needing the `combine_attr_entries`
+//! hashmap and `syn_attr2entry`'s own `attr_entries` table, neither
+//! translated), matching the same precedent.
+//!
 //! Deferred: everything else in the file.
 
 /// Convert an 8-bit terminal color number (0-255) to a packed RGB
@@ -108,6 +117,21 @@ pub fn cterm_blend(ratio: i32, c1: i16, c2: i16) -> i32 {
     let rgb2 = hl_cterm2rgb_color(i32::from(c2));
     let rgb_blended = rgb_blend(ratio, rgb1, rgb2);
     hl_rgb2cterm_color(rgb_blended)
+}
+
+/// Combine two [`crate::highlight_defs`] attribute-flag bitmasks
+/// (e.g. for spelling combined with syntax highlighting). The
+/// underline-kind bits (`HL_UNDERLINE_MASK`) in `prim_ae` overrule the
+/// ones in `char_ae` if both are present; every other bit is a plain
+/// bitwise OR of both masks (`hl_combine_ae`).
+#[must_use]
+pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
+    let char_ul = char_ae & (crate::highlight_defs::HL_UNDERLINE_MASK as i32);
+    let prim_ul = prim_ae & (crate::highlight_defs::HL_UNDERLINE_MASK as i32);
+    let new_ul = if prim_ul != 0 { prim_ul } else { char_ul };
+    (char_ae & !(crate::highlight_defs::HL_UNDERLINE_MASK as i32))
+        | (prim_ae & !(crate::highlight_defs::HL_UNDERLINE_MASK as i32))
+        | new_ul
 }
 
 #[cfg(test)]
@@ -227,5 +251,31 @@ mod tests {
             hl_cterm2rgb_color(231),
         ));
         assert_eq!(cterm_blend(50, 16, 231), expected);
+    }
+
+    // ---- hl_combine_ae ----
+
+    #[test]
+    fn hl_combine_ae_prim_underline_overrules_char_underline() {
+        use crate::highlight_defs::{HL_BOLD, HL_ITALIC, HL_UNDERCURL, HL_UNDERLINE};
+        let char_ae = (HL_BOLD | HL_UNDERLINE) as i32;
+        let prim_ae = (HL_ITALIC | HL_UNDERCURL) as i32;
+        // Non-underline bits OR together (HL_BOLD | HL_ITALIC), and
+        // the underline-kind bits come from prim_ae (HL_UNDERCURL),
+        // NOT char_ae's own HL_UNDERLINE.
+        assert_eq!(hl_combine_ae(char_ae, prim_ae), 0x16);
+    }
+
+    #[test]
+    fn hl_combine_ae_keeps_char_underline_when_prim_has_none() {
+        use crate::highlight_defs::{HL_BOLD, HL_ITALIC, HL_UNDERLINE};
+        let char_ae = (HL_BOLD | HL_UNDERLINE) as i32;
+        let prim_ae = HL_ITALIC as i32;
+        assert_eq!(hl_combine_ae(char_ae, prim_ae), 0x0E);
+    }
+
+    #[test]
+    fn hl_combine_ae_both_zero_is_zero() {
+        assert_eq!(hl_combine_ae(0, 0), 0);
     }
 }
