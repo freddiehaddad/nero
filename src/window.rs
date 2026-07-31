@@ -355,6 +355,31 @@
 //! translated), matching the established "translate ahead of a real
 //! caller" precedent.
 //!
+//! Also translated: `did_set_winminheight`/`did_set_winminwidth` (the
+//! `'winminheight'`/`'winminwidth'` `did_set_*` option-setting
+//! callbacks - re-verified tractable now that `min_rows_for_all_tabpages`/
+//! `frame_minwidth` both exist, unlike this session's own earlier,
+//! more general "`did_set_*` callbacks are uniformly not tractable"
+//! finding, which predates those two functions). Both take an
+//! `optset_T *args` parameter the original itself marks
+//! `FUNC_ATTR_UNUSED` (never read in either body), so `_args: &mut
+//! crate::option_defs::OptsetT` is accepted purely for signature
+//! fidelity, matching `OptDidSetCbT`'s own parameter/return shape
+//! (`&mut OptsetT -> Option<&'static [u8]>`) - though each function
+//! itself stays `unsafe fn` (dereferences `GLOBALS`' raw pointers via
+//! `min_rows_for_all_tabpages`/`frame_minwidth`), unlike
+//! `OptDidSetCbT`'s own plain safe `fn` type, so a small safe shim
+//! will be needed once these are wired into a real `opt_did_set_cb`
+//! entry. Both always return `None` (`NULL` in the original, meaning
+//! "no error") - the real `emsg(_(e_noroom))` display is skipped
+//! (message.c's pipeline not tractable), while the identical state
+//! mutation (`OPTION_VARS.p_wmh`/`p_wmw` decremented until enough room
+//! exists, or reaching `0`) is kept exactly, matching the established
+//! `mf_write`/`ml_open`/`u_get_headentry` policy. Translated ahead of
+//! their real caller (`did_set_option`'s dispatch table, needing the
+//! generic `:set` engine, not yet translated), matching the
+//! established "translate ahead of a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -1468,6 +1493,84 @@ pub unsafe fn min_rows_for_all_tabpages() -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     total += unsafe { tabline_height() } + unsafe { global_stl_height() };
     total
+}
+
+/// Check `'winminheight'` for a valid value and reduce it if needed
+/// (`did_set_winminheight`).
+///
+/// `args` is accepted for signature fidelity only (the original marks
+/// its own `optset_T *args` parameter `FUNC_ATTR_UNUSED` - neither
+/// body ever reads it) - its type/mutability match
+/// [`crate::option_defs::OptDidSetCbT`]'s own `&mut OptsetT`
+/// parameter, and the return type matches its `Option<&'static [u8]>`
+/// too, for eventual real wiring into a `VimoptionT.opt_did_set_cb`
+/// entry. This function itself is `unsafe fn` (not a plain,
+/// `OptDidSetCbT`-compatible safe `fn`), since its body genuinely
+/// dereferences `GLOBALS`' raw window/frame pointers via
+/// `min_rows_for_all_tabpages` - a real future dispatch wiring would
+/// need a small safe shim bridging the two, matching how any other
+/// genuinely-unsafe operation gets bridged to a safe call site in a
+/// real running editor.
+///
+/// Always returns `None` (`NULL`/"no error" in the original) - the
+/// real `emsg(_(e_noroom))` display is skipped (message.c's pipeline
+/// not tractable), while the identical `OPTION_VARS.p_wmh` reduction
+/// is kept exactly.
+///
+/// # Safety
+/// Same as [`min_rows_for_all_tabpages`]. Touches
+/// `crate::option_vars::OPTION_VARS`.
+pub unsafe fn did_set_winminheight(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        if opts.p_wmh <= 0 {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let room = globals.Rows - opts.p_ch as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        let needed = unsafe { min_rows_for_all_tabpages() };
+        if room >= needed {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh -= 1;
+    }
+    None
+}
+
+/// Check `'winminwidth'` for a valid value and reduce it if needed
+/// (`did_set_winminwidth`).
+///
+/// # Safety
+/// Same as [`did_set_winminheight`]. Touches
+/// `crate::option_vars::OPTION_VARS`/`crate::globals::GLOBALS.topframe`.
+pub unsafe fn did_set_winminwidth(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        if opts.p_wmw <= 0 {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let room = unsafe { crate::globals::GLOBALS.get_mut() }.Columns;
+        // SAFETY: forwarded from this function's own safety doc.
+        let topframe = unsafe { crate::globals::GLOBALS.get_mut() }.topframe;
+        // SAFETY: forwarded from this function's own safety doc.
+        let needed = unsafe { frame_minwidth(topframe, std::ptr::null_mut()) };
+        if room >= needed {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw -= 1;
+    }
+    None
 }
 
 /// Add a status line to windows at the bottom of `frp`
@@ -4871,6 +4974,188 @@ mod tests {
         globals.firstwin = prev_firstwin;
         globals.curtab = prev_curtab;
         globals.first_tabpage = prev_first_tabpage;
+    }
+
+    // ---- did_set_winminheight / did_set_winminwidth ----
+
+    /// RAII guard temporarily setting `OPTION_VARS.p_ch`, restoring
+    /// the previous value on drop. Caller must hold
+    /// `global_state_test_lock()` for the whole lifetime.
+    struct PChGuard {
+        prev: crate::types_defs::OptInt,
+    }
+    impl PChGuard {
+        fn set(ch: i64) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = PChGuard { prev: opts.p_ch };
+            opts.p_ch = ch;
+            guard
+        }
+    }
+    impl Drop for PChGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = self.prev;
+        }
+    }
+
+    /// Sets up `GLOBALS.firstwin`/`curtab`/`first_tabpage`/`curwin`
+    /// for a single-tabpage, single-leaf-frame session (so
+    /// `min_rows_for_all_tabpages`/`frame_minwidth` compute a real,
+    /// non-`MIN_LINES`-fallback value), restoring the previous
+    /// `GLOBALS` fields on drop. Caller must hold
+    /// `global_state_test_lock()` for the whole lifetime; `tp_ptr`/
+    /// `win_ptr` must outlive the guard.
+    struct SingleLeafSessionGuard {
+        prev_firstwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curwin: *mut WinT,
+        prev_topframe: *mut crate::buffer_defs::FrameT,
+    }
+    impl SingleLeafSessionGuard {
+        fn set(
+            win_ptr: *mut WinT,
+            tp_ptr: *mut crate::buffer_defs::TabpageT,
+            topframe: *mut crate::buffer_defs::FrameT,
+        ) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = SingleLeafSessionGuard {
+                prev_firstwin: globals.firstwin,
+                prev_curtab: globals.curtab,
+                prev_first_tabpage: globals.first_tabpage,
+                prev_curwin: globals.curwin,
+                prev_topframe: globals.topframe,
+            };
+            globals.firstwin = win_ptr;
+            globals.curtab = std::ptr::null_mut(); // tp is NOT curtab
+            globals.first_tabpage = tp_ptr;
+            globals.curwin = std::ptr::null_mut(); // win_ptr is NOT curwin
+            globals.topframe = topframe;
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            opts.p_stal = 0; // tabline_height == 0
+            opts.p_ls = 0; // global_stl_height == 0
+            guard
+        }
+    }
+    impl Drop for SingleLeafSessionGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.firstwin = self.prev_firstwin;
+            globals.curtab = self.prev_curtab;
+            globals.first_tabpage = self.prev_first_tabpage;
+            globals.curwin = self.prev_curwin;
+            globals.topframe = self.prev_topframe;
+        }
+    }
+
+    #[test]
+    fn did_set_winminheight_noop_when_p_wmh_already_non_positive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 0, 20, 5); // p_wmh = 0
+        // The loop's own `while (p_wmh > 0)` never enters - nothing
+        // else needs to be set up at all (GLOBALS/OPTION_VARS.p_ch
+        // are never even read).
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_winminheight(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh, 0);
+    }
+
+    #[test]
+    fn did_set_winminheight_no_reduction_when_room_already_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 5, 20, 5); // p_wmh = 5
+        let _pch = PChGuard::set(0);
+        let mut win =
+            WinT { w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &leaf as *const _ as *mut crate::buffer_defs::FrameT;
+        let mut tp =
+            crate::buffer_defs::TabpageT { tp_topframe: leaf_ptr, tp_ch_used: 0, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _session = SingleLeafSessionGuard::set(win_ptr, tp_ptr, leaf_ptr);
+
+        let prev_rows = unsafe { crate::globals::GLOBALS.get_mut() }.Rows;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Rows = 24;
+
+        // needed = min_rows_for_all_tabpages() = p_wmh(5) + extras(0) = 5;
+        // room = Rows(24) - p_ch(0) = 24 >= 5, so the loop breaks on
+        // its very first check - p_wmh stays untouched.
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_winminheight(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh, 5);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn did_set_winminheight_reduces_p_wmh_until_room_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 5, 20, 5); // p_wmh = 5
+        let _pch = PChGuard::set(0);
+        let mut win =
+            WinT { w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &leaf as *const _ as *mut crate::buffer_defs::FrameT;
+        let mut tp =
+            crate::buffer_defs::TabpageT { tp_topframe: leaf_ptr, tp_ch_used: 0, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _session = SingleLeafSessionGuard::set(win_ptr, tp_ptr, leaf_ptr);
+
+        let prev_rows = unsafe { crate::globals::GLOBALS.get_mut() }.Rows;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Rows = 3;
+
+        // room = Rows(3) - p_ch(0) = 3.
+        // Iteration 1: needed = p_wmh(5) => 5 > 3, p_wmh -= 1 => 4.
+        // Iteration 2: needed = p_wmh(4) => 4 > 3, p_wmh -= 1 => 3.
+        // Iteration 3: needed = p_wmh(3) => 3 <= 3, break. Final: 3.
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_winminheight(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmh, 3);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn did_set_winminwidth_noop_when_p_wmw_already_non_positive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 0); // p_wmw = 0
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_winminwidth(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw, 0);
+    }
+
+    #[test]
+    fn did_set_winminwidth_reduces_p_wmw_until_room_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _opts = MinSizeOptsGuard::set(10, 2, 20, 6); // p_wmw = 6
+        let mut win =
+            WinT { w_winbar_height: 0, w_hsep_height: 0, w_status_height: 0, w_vsep_width: 0, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let leaf = crate::buffer_defs::FrameT { fr_win: win_ptr, ..Default::default() };
+        let leaf_ptr = &leaf as *const _ as *mut crate::buffer_defs::FrameT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_topframe = globals.topframe;
+        let prev_curwin = globals.curwin;
+        let prev_columns = globals.Columns;
+        globals.topframe = leaf_ptr;
+        globals.curwin = std::ptr::null_mut(); // win_ptr is NOT curwin
+        globals.Columns = 4;
+
+        // room = Columns(4).
+        // Iteration 1: needed = frame_minwidth(leaf, null) = p_wmw(6) => 6 > 4, p_wmw -= 1 => 5.
+        // Iteration 2: needed = p_wmw(5) => 5 > 4, p_wmw -= 1 => 4.
+        // Iteration 3: needed = p_wmw(4) => 4 <= 4, break. Final: 4.
+        let mut args = crate::option_defs::OptsetT::default();
+        assert_eq!(unsafe { did_set_winminwidth(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw, 4);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.topframe = prev_topframe;
+        globals.curwin = prev_curwin;
+        globals.Columns = prev_columns;
     }
 
     // ---- frame_add_statusline ----
