@@ -107,6 +107,7 @@ pub const KE_C_LEFT: u8 = 85;
 pub const KE_C_RIGHT: u8 = 86;
 pub const KE_C_HOME: u8 = 87;
 pub const KE_C_END: u8 = 88;
+pub const KE_COMMAND: u8 = 104;
 
 /// arrow/function/home/end key codes (`K_UP`/`K_DOWN`/etc.) - a subset
 /// of the original's much larger `K_*` constant list, matching the
@@ -147,6 +148,8 @@ pub const K_C_LEFT: i32 = termcap2key(KS_EXTRA, KE_C_LEFT);
 pub const K_C_RIGHT: i32 = termcap2key(KS_EXTRA, KE_C_RIGHT);
 pub const K_C_HOME: i32 = termcap2key(KS_EXTRA, KE_C_HOME);
 pub const K_C_END: i32 = termcap2key(KS_EXTRA, KE_C_END);
+/// `<Cmd>` special key (`K_COMMAND`), used by `ops.rs`'s `is_ex_cmdchar`.
+pub const K_COMMAND: i32 = termcap2key(KS_EXTRA, KE_COMMAND);
 
 /// Bit-mask/bit-value pairs for key modifiers (`MOD_MASK_*`).
 pub const MOD_MASK_SHIFT: u16 = 0x02;

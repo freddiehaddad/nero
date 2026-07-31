@@ -29,6 +29,15 @@
 //! session, since nothing here can populate a real `'operatorfunc'`
 //! value yet.
 //!
+//! Also translated: `is_ex_cmdchar` (a `static` predicate - whether a
+//! `cmdarg_T`'s `cmdchar` started a `:`-command-line-shaped operator,
+//! e.g. `:'<,'>d` or a `<Cmd>` mapping). Trivial and self-contained
+//! (just compares `cap.cmdchar` against `':'`/`K_COMMAND`), but its
+//! only real caller, `op_function` (the `g@` operator-function
+//! dispatcher), is not translated - kept `#[allow(dead_code)]` for now,
+//! matching `marktree.rs`'s own `itr_eq` precedent for a small, simple,
+//! no-design-freedom function translated ahead of its real caller.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ops_defs::OpType;
@@ -249,6 +258,21 @@ pub unsafe fn set_ref_in_opfunc(copy_id: i32) -> bool {
     let cb = unsafe { &*OPFUNC_CB.as_ptr() };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
+}
+
+/// Whether `cap.cmdchar` started a `:`-command-line-shaped operator
+/// invocation (`is_ex_cmdchar`) - either a real `:` (e.g. `:'<,'>d`)
+/// or a `<Cmd>` mapping (`K_COMMAND`).
+///
+/// `static` in the original; kept private-but-reachable here
+/// (`#[allow(dead_code)]`) since its only real caller, `op_function`,
+/// is not translated yet - matches `marktree.rs`'s own `itr_eq`
+/// precedent for a small, simple function with no design freedom of
+/// its own, translated ahead of its real caller.
+#[allow(dead_code)]
+#[must_use]
+fn is_ex_cmdchar(cap: &crate::normal_defs::CmdargT) -> bool {
+    cap.cmdchar == i32::from(b':') || cap.cmdchar == crate::keycodes_defs::K_COMMAND
 }
 
 #[cfg(test)]
@@ -489,5 +513,32 @@ mod tests {
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
         assert!(!unsafe { set_ref_in_opfunc(1) });
+    }
+
+    #[test]
+    fn is_ex_cmdchar_true_for_colon() {
+        let cap = crate::normal_defs::CmdargT {
+            cmdchar: i32::from(b':'),
+            ..Default::default()
+        };
+        assert!(is_ex_cmdchar(&cap));
+    }
+
+    #[test]
+    fn is_ex_cmdchar_true_for_k_command() {
+        let cap = crate::normal_defs::CmdargT {
+            cmdchar: crate::keycodes_defs::K_COMMAND,
+            ..Default::default()
+        };
+        assert!(is_ex_cmdchar(&cap));
+    }
+
+    #[test]
+    fn is_ex_cmdchar_false_for_an_ordinary_command_char() {
+        let cap = crate::normal_defs::CmdargT {
+            cmdchar: i32::from(b'd'),
+            ..Default::default()
+        };
+        assert!(!is_ex_cmdchar(&cap));
     }
 }
