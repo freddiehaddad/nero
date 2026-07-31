@@ -687,6 +687,85 @@ unsafe fn get_op_vcol(
     oap.start = unsafe { (*curwin).w_cursor };
 }
 
+/// When the cursor is on the NUL past the end of the line and it
+/// should not be there, move it left (`adjust_cursor_eol`).
+///
+/// Note a real, verified upstream quirk found while translating this:
+/// the `adj_cursor` guard REQUIRES `(cur_ve_flags &
+/// opt_ve_flag::ALL) == 0` - but `opt_ve_flag::ALL`/`BLOCK`/`INSERT`
+/// all share bit `0x04` (`BLOCK = 0x05`, `INSERT = 0x06`, both
+/// `0x04`-inclusive), so `cur_ve_flags == opt_ve_flag::ALL` exactly
+/// (0x04) already implies that bit is set, making the guard's OWN
+/// `(cur_ve_flags & opt_ve_flag::ALL) == 0` check false whenever
+/// `cur_ve_flags == opt_ve_flag::ALL` - i.e. the function can NEVER
+/// reach its own later `if cur_ve_flags == opt_ve_flag::ALL` branch.
+/// This is a genuine property of the real upstream C source (not a
+/// translation artifact - verified against the real `kOptVeFlagAll`/
+/// `kOptVeFlagBlock`/`kOptVeFlagInsert` values in
+/// `option_vars.generated.h`), so the branch is translated faithfully
+/// as dead code rather than removed, matching this crate's mission to
+/// translate literally, quirks included.
+///
+/// Calls `crate::cursor::gchar_cursor()` lazily, only when
+/// `w_cursor.col > 0` (matching the original's own short-circuiting
+/// `&&` chain exactly) - NOT unconditionally, since it needs a valid
+/// buffer read that the original itself never performs when the
+/// cursor is already at column 0.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` whose own `w_buffer` is also valid.
+#[allow(dead_code)]
+pub unsafe fn adjust_cursor_eol() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur_ve_flags = unsafe { crate::option::get_ve_flags(&*curwin) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_cursor_col = unsafe { (*curwin).w_cursor.col };
+    // SAFETY: forwarded from this function's own safety doc.
+    let (state, restart_edit) = {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        (g.State, g.restart_edit)
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let adj_cursor = w_cursor_col > 0
+        && unsafe { crate::cursor::gchar_cursor() } == 0
+        && (cur_ve_flags & crate::option_vars::opt_ve_flag::ONEMORE) == 0
+        && (cur_ve_flags & crate::option_vars::opt_ve_flag::ALL) == 0
+        && !(restart_edit != 0 || (state & crate::state_defs::mode::INSERT as i32) != 0);
+
+    if !adj_cursor {
+        return;
+    }
+
+    // Put the cursor on the last character in the line.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::dec_cursor() };
+
+    if cur_ve_flags == crate::option_vars::opt_ve_flag::ALL {
+        let mut scol: crate::pos_defs::ColnrT = 0;
+        let mut ecol: crate::pos_defs::ColnrT = 0;
+
+        // Coladd is set to the width of the last character.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::plines::getvcol(
+                curwin,
+                &mut (*curwin).w_cursor,
+                Some(&mut scol),
+                None,
+                Some(&mut ecol),
+                0,
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor.coladd = ecol - scol + 1 };
+    }
+}
+
 /// Count words/chars/bytes in `line` (`line_count_info`). Return
 /// value is the byte count; word count for the line is added to
 /// `*wc`. Char count is added to `*cc`.
@@ -1602,6 +1681,178 @@ mod tests {
         assert_eq!(oap.motion_type, crate::normal_defs::MotionType::BlockWise);
         assert_eq!(oap.start_vcol, 0);
         assert_eq!(oap.end_vcol, 8);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    // ---- adjust_cursor_eol ----
+
+    /// Sets `GLOBALS.State`/`restart_edit` for a test, wrapping the
+    /// required `unsafe` access in one place. Same locking obligation
+    /// as [`set_visual_state`].
+    fn set_state_and_restart_edit(state: i32, restart_edit: i32) {
+        // SAFETY: forwarded from this function's own doc comment.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.State = state;
+        g.restart_edit = restart_edit;
+    }
+
+    #[test]
+    fn adjust_cursor_eol_not_at_eol_is_a_no_op() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, 0);
+
+        // col=1 points at 'b' - not the trailing NUL, so gchar_cursor()
+        // != 0 and the whole check short-circuits to false.
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 };
+
+        unsafe { adjust_cursor_eol() };
+
+        assert_eq!(
+            unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.col,
+            1
+        );
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_at_column_zero_is_a_no_op() {
+        // col=0 short-circuits before gchar_cursor() is ever called -
+        // no real memline needed at all (matching the original's own
+        // short-circuiting && chain, faithfully preserved in this
+        // translation).
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        let guard = CursorTestGuard::set(&mut win as *mut WinT, buf_ptr);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, 0);
+
+        unsafe { adjust_cursor_eol() };
+        assert_eq!(win.w_cursor.col, 0);
+
+        drop(guard);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_onemore_flag_is_a_no_op() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_ve_flags: crate::option_vars::opt_ve_flag::ONEMORE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, 0);
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 }; // at the trailing NUL
+
+        unsafe { adjust_cursor_eol() };
+
+        assert_eq!(
+            unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.col,
+            2
+        );
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_all_flag_is_a_no_op_the_dead_branch_is_never_reached() {
+        // Demonstrates the real upstream quirk documented on
+        // adjust_cursor_eol's own doc comment: 'virtualedit'=all
+        // itself disables the whole adjustment (the guard's own
+        // `(cur_ve_flags & opt_ve_flag::ALL) == 0` check fails), so
+        // the coladd-computing branch further down is unreachable.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_ve_flags: crate::option_vars::opt_ve_flag::ALL,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, 0);
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+
+        unsafe { adjust_cursor_eol() };
+
+        let w_cursor = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor;
+        assert_eq!(w_cursor.col, 2); // unchanged
+        assert_eq!(w_cursor.coladd, 0); // the dead branch never ran
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_insert_mode_is_a_no_op() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::INSERT as i32, 0);
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+
+        unsafe { adjust_cursor_eol() };
+
+        assert_eq!(
+            unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.col,
+            2
+        );
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_restart_edit_is_a_no_op() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, i32::from(b'i'));
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+
+        unsafe { adjust_cursor_eol() };
+
+        assert_eq!(
+            unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.col,
+            2
+        );
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn adjust_cursor_eol_moves_cursor_left_when_conditions_are_met() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"ab\0"]);
+        set_state_and_restart_edit(crate::state_defs::mode::NORMAL as i32, 0);
+        unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin }.w_cursor =
+            crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 }; // at the trailing NUL
+
+        unsafe { adjust_cursor_eol() };
+
+        let w_cursor = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor;
+        assert_eq!(w_cursor.col, 1); // moved back onto 'b'
+        assert_eq!(w_cursor.coladd, 0);
 
         drop(guard);
         close_buf_with_memline(buf);
