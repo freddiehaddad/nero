@@ -277,6 +277,20 @@
 //! for small, self-contained pieces with no design freedom of their
 //! own.
 //!
+//! Also translated: `alt_tabpage` (the tabpage to switch to when
+//! closing the current one - prefers the last-accessed tabpage if
+//! `'tabclose'` says so and it's still valid, else the next tabpage,
+//! else the previous one), via already-real
+//! `crate::globals::GLOBALS.curtab`/`first_tabpage`/
+//! `lastused_tabpage`, `TabpageT.tp_next`,
+//! `crate::option_vars::OPTION_VARS.tcl_flags`/`opt_tcl_flag`, and
+//! [`valid_tabpage`]. Translated ahead of its real caller
+//! (`close_last_window_tabpage`, needing `goto_tabpage_tp`/
+//! `win_close_othertab`/`entering_window`/`apply_autocmds` for
+//! multiple events - a substantial window/tabpage-closing function,
+//! not yet translated), matching the established "translate ahead of
+//! a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2732,6 +2746,50 @@ pub fn make_win_info_dict(
         // SAFETY: `d` is a freshly-allocated, exclusively-owned dict.
         unsafe { crate::eval::typval::tv_dict_unref(d) };
         None
+    }
+}
+
+/// Return the tabpage to switch to when closing the current tab page
+/// (`alt_tabpage`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curtab` must be a valid, non-null pointer
+/// to a live `TabpageT`. `GLOBALS.first_tabpage`'s own `tp_next` chain
+/// must consist of valid, live `TabpageT` pointers and must contain
+/// `curtab` somewhere in that chain.
+#[must_use]
+pub unsafe fn alt_tabpage() -> *mut crate::buffer_defs::TabpageT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let tcl_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tcl_flags;
+
+    // Use the last accessed tab page, if possible.
+    if tcl_flags & crate::option_vars::opt_tcl_flag::USELAST != 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { valid_tabpage(globals.lastused_tabpage) }
+    {
+        return globals.lastused_tabpage;
+    }
+
+    // Use the next tab page, if possible.
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab_next = unsafe { &*globals.curtab }.tp_next;
+    let forward = !curtab_next.is_null()
+        && (tcl_flags & crate::option_vars::opt_tcl_flag::LEFT == 0
+            || std::ptr::eq(globals.curtab, globals.first_tabpage));
+
+    if forward {
+        curtab_next
+    } else {
+        // Use the previous tab page.
+        let mut tp = globals.first_tabpage;
+        // SAFETY: forwarded from this function's own safety doc.
+        while !std::ptr::eq(unsafe { &*tp }.tp_next, globals.curtab) {
+            // SAFETY: forwarded from this function's own safety doc.
+            tp = unsafe { &*tp }.tp_next;
+        }
+        tp
     }
 }
 
@@ -6553,5 +6611,192 @@ mod tests {
             assert_eq!(crate::eval::typval::tv_dict_get_number(Some(&mut *d), b"skipcol"), -1);
             crate::eval::typval::tv_dict_unref(d);
         }
+    }
+
+    // ---- alt_tabpage ----
+
+    /// RAII guard for `alt_tabpage` tests: saves/restores every
+    /// `GLOBALS`/`OPTION_VARS` field it reads.
+    struct AltTabpageGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_lastused_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_tcl_flags: u32,
+    }
+    impl AltTabpageGuard {
+        fn set(
+            first_tabpage: *mut crate::buffer_defs::TabpageT,
+            curtab: *mut crate::buffer_defs::TabpageT,
+            lastused_tabpage: *mut crate::buffer_defs::TabpageT,
+            tcl_flags: u32,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = AltTabpageGuard {
+                prev_first_tabpage: g.first_tabpage,
+                prev_curtab: g.curtab,
+                prev_lastused_tabpage: g.lastused_tabpage,
+                prev_tcl_flags: opts.tcl_flags,
+            };
+            g.first_tabpage = first_tabpage;
+            g.curtab = curtab;
+            g.lastused_tabpage = lastused_tabpage;
+            opts.tcl_flags = tcl_flags;
+            guard
+        }
+    }
+    impl Drop for AltTabpageGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            g.first_tabpage = self.prev_first_tabpage;
+            g.curtab = self.prev_curtab;
+            g.lastused_tabpage = self.prev_lastused_tabpage;
+            opts.tcl_flags = self.prev_tcl_flags;
+        }
+    }
+
+    /// Builds a 3-tabpage chain `tp1 (first) -> tp2 -> tp3 (last)`.
+    fn three_tabpage_chain() -> (
+        crate::buffer_defs::TabpageT,
+        crate::buffer_defs::TabpageT,
+        crate::buffer_defs::TabpageT,
+    ) {
+        let tp3 = crate::buffer_defs::TabpageT { tp_next: std::ptr::null_mut(), ..Default::default() };
+        (crate::buffer_defs::TabpageT::default(), crate::buffer_defs::TabpageT::default(), tp3)
+    }
+
+    #[test]
+    fn alt_tabpage_uses_lastused_when_flag_set_and_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = AltTabpageGuard::set(
+            tp1_ptr,
+            tp2_ptr,
+            tp3_ptr,
+            crate::option_vars::opt_tcl_flag::USELAST,
+        );
+
+        assert_eq!(unsafe { alt_tabpage() }, tp3_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_ignores_lastused_when_flag_not_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        // lastused_tabpage is valid (tp3), but USELAST is NOT set -
+        // must fall through to the forward/backward logic instead.
+        let _guard = AltTabpageGuard::set(tp1_ptr, tp1_ptr, tp3_ptr, 0);
+
+        // curtab is tp1 (== first_tabpage), forward -> tp1.tp_next = tp2.
+        assert_eq!(unsafe { alt_tabpage() }, tp2_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_ignores_lastused_when_not_a_valid_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        // A standalone tabpage, never linked into the first_tabpage
+        // chain - valid_tabpage() must report it as NOT valid.
+        let mut unrelated = crate::buffer_defs::TabpageT::default();
+        let unrelated_ptr = &mut unrelated as *mut crate::buffer_defs::TabpageT;
+        let _guard = AltTabpageGuard::set(
+            tp1_ptr,
+            tp1_ptr,
+            unrelated_ptr,
+            crate::option_vars::opt_tcl_flag::USELAST,
+        );
+
+        assert_eq!(unsafe { alt_tabpage() }, tp2_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_forward_when_no_left_flag_and_curtab_has_a_next() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = AltTabpageGuard::set(tp1_ptr, tp2_ptr, std::ptr::null_mut(), 0);
+
+        // curtab = tp2, no LEFT flag -> forward -> tp2.tp_next = tp3.
+        assert_eq!(unsafe { alt_tabpage() }, tp3_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_forward_when_left_flag_set_but_curtab_is_first_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = AltTabpageGuard::set(
+            tp1_ptr,
+            tp1_ptr,
+            std::ptr::null_mut(),
+            crate::option_vars::opt_tcl_flag::LEFT,
+        );
+
+        // curtab = tp1 = first_tabpage - forward despite the LEFT
+        // flag, since "curtab == first_tabpage" is the OR condition.
+        assert_eq!(unsafe { alt_tabpage() }, tp2_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_backward_when_left_flag_set_and_curtab_is_not_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = AltTabpageGuard::set(
+            tp1_ptr,
+            tp2_ptr,
+            std::ptr::null_mut(),
+            crate::option_vars::opt_tcl_flag::LEFT,
+        );
+
+        // curtab = tp2 (not first), LEFT flag set, tp2 has a next
+        // (tp3) - backward: walk from tp1 until tp.tp_next == tp2 ->
+        // tp1 itself.
+        assert_eq!(unsafe { alt_tabpage() }, tp1_ptr);
+    }
+
+    #[test]
+    fn alt_tabpage_backward_when_curtab_has_no_next_regardless_of_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut tp1, mut tp2, mut tp3) = three_tabpage_chain();
+        let tp3_ptr = &mut tp3 as *mut crate::buffer_defs::TabpageT;
+        tp2.tp_next = tp3_ptr;
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        tp1.tp_next = tp2_ptr;
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        // curtab = tp3, the LAST tabpage (tp_next is null) - forced
+        // backward even with no LEFT flag at all.
+        let _guard = AltTabpageGuard::set(tp1_ptr, tp3_ptr, std::ptr::null_mut(), 0);
+
+        // Walk from tp1 until tp.tp_next == tp3 -> tp2.
+        assert_eq!(unsafe { alt_tabpage() }, tp2_ptr);
     }
 }
