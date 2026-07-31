@@ -28,6 +28,19 @@
 //! matching the established "translate ahead of a real caller"
 //! precedent.
 //!
+//! Also translated: [`get_menu_mode_str`] (a short mode-indicator
+//! string for a `menu_mode` bitmask, matching `:menu`'s own listing
+//! form's letters), via already-real `crate::menu_defs::menu_mode`;
+//! and [`is_menus_locked`] (whether menu changes are currently
+//! disallowed), via a new `MENUS_LOCKED` depth counter mirroring the
+//! original's own file-static `menus_locked` int - only ever mutated
+//! by `ex_menu`'s listing form, not yet translated, so it stays `0`
+//! forever today, matching `window.rs`'s `FRAME_LOCKED`'s own
+//! established "untranslated mutator, provably-zero-today counter"
+//! precedent. `is_menus_locked`'s own real `emsg` call when locked is
+//! omitted, matching the established "skip the deferred message-
+//! display side effect, keep the exact same return value" policy.
+//!
 //! Deferred: everything else - the whole menu tree (`root_menu`/
 //! `get_root_menu`), `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
 //! `menu_find`/`get_menu_cmd_modes`/`menu_text`/`menuitem_getinfo`, all
@@ -204,6 +217,75 @@ pub fn menu_skip_part(s: &[u8]) -> usize {
         p += 1;
     }
     p
+}
+
+/// Return a short mode-indicator string for a `modes`
+/// ([`crate::menu_defs::menu_mode`]) bitmask, matching the letters
+/// `:menu`'s own listing form uses (`get_menu_mode_str`).
+#[must_use]
+pub fn get_menu_mode_str(modes: i32) -> &'static str {
+    use crate::menu_defs::menu_mode::{CMDLINE, INSERT, NORMAL, OP_PENDING, SELECT, TERMINAL, TIP, VISUAL};
+
+    if modes & (INSERT | CMDLINE | NORMAL | VISUAL | SELECT | OP_PENDING)
+        == (INSERT | CMDLINE | NORMAL | VISUAL | SELECT | OP_PENDING)
+    {
+        return "a";
+    }
+    if modes & (NORMAL | VISUAL | SELECT | OP_PENDING) == (NORMAL | VISUAL | SELECT | OP_PENDING) {
+        return " ";
+    }
+    if modes & (INSERT | CMDLINE) == (INSERT | CMDLINE) {
+        return "!";
+    }
+    if modes & (VISUAL | SELECT) == (VISUAL | SELECT) {
+        return "v";
+    }
+    if modes & VISUAL != 0 {
+        return "x";
+    }
+    if modes & SELECT != 0 {
+        return "s";
+    }
+    if modes & OP_PENDING != 0 {
+        return "o";
+    }
+    if modes & INSERT != 0 {
+        return "i";
+    }
+    if modes & TERMINAL != 0 {
+        return "tl";
+    }
+    if modes & CMDLINE != 0 {
+        return "c";
+    }
+    if modes & NORMAL != 0 {
+        return "n";
+    }
+    if modes & TIP != 0 {
+        return "t";
+    }
+
+    ""
+}
+
+/// `menus_locked` - depth counter; `> 0` means menu changes are
+/// currently disallowed (e.g. while `:menu`'s own listing form is
+/// executing). In the original, only ever incremented/decremented by
+/// `ex_menu`'s listing form, not yet translated - so this stays `0`
+/// forever in this crate today, matching the real state of any
+/// session that can't yet run that form, the same "untranslated
+/// mutator, provably-zero-today counter" pattern already established
+/// by `window.rs`'s `FRAME_LOCKED`.
+static MENUS_LOCKED: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Whether menu changes are currently locked (`is_menus_locked`). The
+/// original's own `emsg` call when locked is omitted, matching this
+/// crate's established "skip the deferred message-display side
+/// effect, keep the exact same return value" policy.
+#[must_use]
+pub fn is_menus_locked() -> bool {
+    // SAFETY: a plain read through one exclusive borrow.
+    unsafe { *MENUS_LOCKED.get_mut() > 0 }
 }
 
 #[cfg(test)]
@@ -474,5 +556,89 @@ mod tests {
         // A backslash as the very LAST byte has no next byte to
         // escape, so it's just consumed like any other character.
         assert_eq!(menu_skip_part(b"File\\"), 5);
+    }
+
+    // ---- get_menu_mode_str ----
+
+    use crate::menu_defs::menu_mode;
+
+    #[test]
+    fn get_menu_mode_str_all_six_main_modes_is_a() {
+        let modes = menu_mode::INSERT
+            | menu_mode::CMDLINE
+            | menu_mode::NORMAL
+            | menu_mode::VISUAL
+            | menu_mode::SELECT
+            | menu_mode::OP_PENDING;
+        assert_eq!(get_menu_mode_str(modes), "a");
+    }
+
+    #[test]
+    fn get_menu_mode_str_normal_visual_select_op_pending_is_space() {
+        let modes = menu_mode::NORMAL | menu_mode::VISUAL | menu_mode::SELECT | menu_mode::OP_PENDING;
+        assert_eq!(get_menu_mode_str(modes), " ");
+    }
+
+    #[test]
+    fn get_menu_mode_str_insert_and_cmdline_is_bang() {
+        assert_eq!(get_menu_mode_str(menu_mode::INSERT | menu_mode::CMDLINE), "!");
+    }
+
+    #[test]
+    fn get_menu_mode_str_visual_and_select_is_v() {
+        assert_eq!(get_menu_mode_str(menu_mode::VISUAL | menu_mode::SELECT), "v");
+    }
+
+    #[test]
+    fn get_menu_mode_str_visual_only_is_x() {
+        assert_eq!(get_menu_mode_str(menu_mode::VISUAL), "x");
+    }
+
+    #[test]
+    fn get_menu_mode_str_select_only_is_s() {
+        assert_eq!(get_menu_mode_str(menu_mode::SELECT), "s");
+    }
+
+    #[test]
+    fn get_menu_mode_str_op_pending_only_is_o() {
+        assert_eq!(get_menu_mode_str(menu_mode::OP_PENDING), "o");
+    }
+
+    #[test]
+    fn get_menu_mode_str_insert_only_is_i() {
+        assert_eq!(get_menu_mode_str(menu_mode::INSERT), "i");
+    }
+
+    #[test]
+    fn get_menu_mode_str_terminal_only_is_tl() {
+        assert_eq!(get_menu_mode_str(menu_mode::TERMINAL), "tl");
+    }
+
+    #[test]
+    fn get_menu_mode_str_cmdline_only_is_c() {
+        assert_eq!(get_menu_mode_str(menu_mode::CMDLINE), "c");
+    }
+
+    #[test]
+    fn get_menu_mode_str_normal_only_is_n() {
+        assert_eq!(get_menu_mode_str(menu_mode::NORMAL), "n");
+    }
+
+    #[test]
+    fn get_menu_mode_str_tip_only_is_t() {
+        assert_eq!(get_menu_mode_str(menu_mode::TIP), "t");
+    }
+
+    #[test]
+    fn get_menu_mode_str_zero_is_empty() {
+        assert_eq!(get_menu_mode_str(0), "");
+    }
+
+    // ---- is_menus_locked ----
+
+    #[test]
+    fn is_menus_locked_is_false_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!is_menus_locked());
     }
 }
