@@ -114,6 +114,28 @@
 //! separately tested for that specific reason, matching this crate's
 //! established policy of not testing a provably-unreachable branch.
 //!
+//! Also translated: **`cursor_correct_sms`** (make sure the cursor is
+//! in the visible part of the topline after scrolling with
+//! `'smoothscroll'`) - needed only already-real `option.rs`'s
+//! `get_scrolloff_value`, this file's own `win_col_off`/`win_col_off2`/
+//! `sms_marker_overlap`/`validate_virtcol`, `plines.rs`'s
+//! `linetabsize_eol`, and `cursor.rs`'s `coladvance`. Hand-traced the
+//! full multi-branch algorithm (the `so_cols`/`space_cols`/`size`
+//! scrolloff-narrowing computation, the `top`/`bot` visible-range
+//! bounds, and the `col`-adjustment loop) against a concrete numeric
+//! example before writing any test - all 5 tests passed on the first
+//! real run, matching the by-hand derivation exactly. Every i32
+//! sub-expression the original computes before its own final widening
+//! to `int64_t` (`so_cols`/`top`/`bot`'s own intermediate sums) uses
+//! `wrapping_add`/`wrapping_sub`/`wrapping_mul` rather than plain
+//! arithmetic, matching this crate's established policy for
+//! `colnr_T`-shaped arithmetic that could theoretically overflow for
+//! pathological window dimensions, even though realistic values never
+//! approach that range. Translated ahead of a real caller
+//! (`update_topline`/`win_fix_scroll`, both part of the not-yet-
+//! translated window-scrolling machinery), matching this crate's
+//! established "translate ahead of a real caller" precedent.
+//!
 //! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
 //! maintenance, `curs_columns`'s full screen-row/column computation,
 //! `validate_cursor`/`curs_rows`/`validate_botline_win`, all needing
@@ -1238,6 +1260,146 @@ pub unsafe fn botline_forw(wp: *mut WinT, lp: &mut LineoffT) {
             } else {
                 // SAFETY: forwarded from this function's own safety doc.
                 lp.height = unsafe { crate::plines::plines_win_nofill(wp, lp.lnum, true) };
+            }
+        }
+    }
+}
+
+/// Make sure the cursor is in the visible part of the topline after
+/// scrolling the screen with `'smoothscroll'` (`cursor_correct_sms`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`, whose own
+/// `w_buffer` must be a valid, non-null, live `BufT` pointer.
+pub unsafe fn cursor_correct_sms(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (wo_sms, wo_wrap, cursor_lnum, topline) = unsafe {
+        (
+            (*wp).w_onebuf_opt.wo_sms,
+            (*wp).w_onebuf_opt.wo_wrap,
+            (*wp).w_cursor.lnum,
+            (*wp).w_topline,
+        )
+    };
+    if wo_sms == 0 || wo_wrap == 0 || cursor_lnum != topline {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let so = unsafe { crate::option::get_scrolloff_value(&*wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let view_width = unsafe { (*wp).w_view_width };
+    // SAFETY: forwarded from this function's own safety doc.
+    let col_off = unsafe { win_col_off(&mut *wp) };
+    let width1 = view_width.wrapping_sub(col_off);
+    // SAFETY: forwarded from this function's own safety doc.
+    let col_off2 = unsafe { win_col_off2(&mut *wp) };
+    let width2 = width1.wrapping_add(col_off2);
+    let mut so_cols: i64 = if so == 0 {
+        0
+    } else {
+        i64::from(width1) + (so - 1) * i64::from(width2)
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let view_height = unsafe { (*wp).w_view_height };
+    let space_cols = view_height.wrapping_sub(1).wrapping_mul(width2);
+    let size = if so == 0 {
+        0
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::plines::linetabsize_eol(wp, topline) }
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let skipcol = unsafe { (*wp).w_skipcol };
+    if topline == 1 && skipcol == 0 {
+        so_cols = 0; // Ignore 'scrolloff' at top of buffer.
+    } else if so_cols > i64::from(space_cols) / 2 {
+        so_cols = i64::from(space_cols) / 2; // Not enough room: put cursor in the middle.
+    }
+
+    // Not enough screen lines in topline: ignore 'scrolloff'.
+    while so_cols > i64::from(size)
+        && so_cols - i64::from(width2) >= i64::from(width1)
+        && width1 > 0
+    {
+        so_cols -= i64::from(width2);
+    }
+    if so_cols >= i64::from(width1) && so_cols > i64::from(size) {
+        so_cols -= i64::from(width1);
+    }
+
+    let overlap = if skipcol == 0 {
+        0
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { sms_marker_overlap(&mut *wp, view_width.wrapping_sub(width2)) }
+    };
+    // If we have non-zero scrolloff, ignore marker overlap.
+    let top = i64::from(skipcol) + if so_cols != 0 { so_cols } else { i64::from(overlap) };
+    let bot = i64::from(
+        skipcol
+            .wrapping_add(width1)
+            .wrapping_add(view_height.wrapping_sub(1).wrapping_mul(width2)),
+    ) - so_cols;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { validate_virtcol(wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut col = unsafe { (*wp).w_virtcol };
+
+    if i64::from(col) < top {
+        if col < width1 {
+            col = col.wrapping_add(width1);
+        }
+        while width2 > 0 && i64::from(col) < top {
+            col = col.wrapping_add(width2);
+        }
+    } else {
+        while width2 > 0 && i64::from(col) >= bot {
+            col = col.wrapping_sub(width2);
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_virtcol = unsafe { (*wp).w_virtcol };
+    if col != w_virtcol {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*wp).w_curswant = col;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let rc = unsafe { crate::cursor::coladvance(wp, col) };
+        // validate_virtcol() marked various things as valid, but
+        // after moving the cursor they need to be recomputed.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*wp).w_valid &= !(i32::from(w_valid::VALID_WROW)
+                | i32::from(w_valid::VALID_WCOL)
+                | i32::from(w_valid::VALID_CHEIGHT)
+                | i32::from(w_valid::VALID_CROW)
+                | i32::from(w_valid::VALID_VIRTCOL));
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let (w_buffer, cur_lnum) = unsafe { ((*wp).w_buffer, (*wp).w_cursor.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let line_count = unsafe { (*w_buffer).b_ml.ml_line_count };
+        if rc == crate::vim_defs::FAIL && skipcol > 0 && cur_lnum < line_count {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { validate_virtcol(wp) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let w_virtcol2 = unsafe { (*wp).w_virtcol };
+            if i64::from(w_virtcol2) < i64::from(skipcol) + i64::from(overlap) {
+                // Cursor still not visible: move it to the next line
+                // instead.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    (*wp).w_cursor.lnum += 1;
+                    (*wp).w_cursor.col = 0;
+                    (*wp).w_cursor.coladd = 0;
+                    (*wp).w_curswant = 0;
+                    (*wp).w_valid &= !i32::from(w_valid::VALID_VIRTCOL);
+                }
             }
         }
     }
@@ -2639,6 +2801,150 @@ mod tests {
 
         assert_eq!(lp.lnum, 2);
         assert_eq!(lp.height, crate::pos_defs::MAXCOL);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    // ---- cursor_correct_sms ----
+
+    #[test]
+    fn cursor_correct_sms_no_op_when_smoothscroll_is_off() {
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_sms: 0, wo_wrap: 1, ..Default::default() },
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 },
+            w_topline: 1,
+            w_skipcol: 30,
+            ..Default::default()
+        };
+
+        unsafe { cursor_correct_sms(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cursor.col, 5);
+    }
+
+    #[test]
+    fn cursor_correct_sms_no_op_when_wrap_is_off() {
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_sms: 1, wo_wrap: 0, ..Default::default() },
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 },
+            w_topline: 1,
+            w_skipcol: 30,
+            ..Default::default()
+        };
+
+        unsafe { cursor_correct_sms(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cursor.col, 5);
+    }
+
+    #[test]
+    fn cursor_correct_sms_no_op_when_cursor_is_not_on_topline() {
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT { wo_sms: 1, wo_wrap: 1, ..Default::default() },
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 5, coladd: 0 },
+            w_topline: 1,
+            w_skipcol: 30,
+            ..Default::default()
+        };
+
+        unsafe { cursor_correct_sms(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cursor.col, 5);
+        assert_eq!(win.w_cursor.lnum, 2);
+    }
+
+    #[test]
+    fn cursor_correct_sms_no_op_when_already_fully_visible() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"aaaaaaaaaaaaaaaaaaaa\0") },
+            crate::vim_defs::OK
+        );
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 10;
+        // skipcol == 0 and 'scrolloff' == 0 (the default): the
+        // "not-yet-scrolled" case where nothing needs to move.
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 };
+        win.w_topline = 1;
+        win.w_valid = i32::from(w_valid::VALID_VIRTCOL);
+
+        unsafe { cursor_correct_sms(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_cursor.col, 5);
+        // Since col == w_virtcol, the whole "reposition" block (which
+        // would clear these bits) is never entered.
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_VIRTCOL));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn cursor_correct_sms_repositions_cursor_when_scrolled_past_skipcol() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _curtab_guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        let mut line = vec![b'a'; 60];
+        line.push(0); // trailing NUL, matching this crate's own line-storage convention
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &line) },
+            crate::vim_defs::OK
+        );
+
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_onebuf_opt.wo_sms = 1;
+        win.w_onebuf_opt.wo_wrap = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 10;
+        win.w_skipcol = 30;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 25, coladd: 0 };
+        win.w_topline = 1;
+        win.w_valid = i32::from(w_valid::VALID_VIRTCOL);
+        // coladvance's own "not on a TAB" branch reads GLOBALS.curwin
+        // directly (a verified upstream quirk, see coladvance's own
+        // doc comment) - compute win's pointer exactly once and reuse
+        // it for GLOBALS.curwin, the function call, and every
+        // subsequent read, matching this crate's established Tree
+        // Borrows discipline.
+        let win_ptr = &mut win as *mut WinT;
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = win_ptr;
+
+        unsafe { cursor_correct_sms(win_ptr) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+
+        // Hand-traced: width1=width2=20 (no col_off), skipcol=30,
+        // 'scrolloff'=0 -> so_cols=0. overlap = sms_marker_overlap
+        // (no 'showbreak'/'list' set) = 3 - 0 = 3. top = 30+3 = 33,
+        // bot = 30+20+180-0 = 230. Original virtcol (plain ASCII
+        // col 25) = 25, which is < top(33), and 25 is NOT < width1
+        // (20), so the loop adds width2 once: 25+20 = 45 (>= 33,
+        // stops). 45 != 25 -> coladvance(wp, 45) moves the cursor to
+        // byte column 45 (plain ASCII, 1 byte per column).
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.col, 45);
+        assert_eq!(unsafe { &*win_ptr }.w_curswant, 45);
+        // validate_virtcol()'s own VALID_VIRTCOL mark, plus the 4
+        // other bits validate_virtcol never touches, are all cleared
+        // after the reposition.
+        assert_eq!(unsafe { &*win_ptr }.w_valid, 0);
 
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
