@@ -71,8 +71,22 @@
 //! translated ahead of them, matching the established "translate
 //! ahead of a real caller" precedent.
 //!
+//! Also translated: `line_count_info` (word/char/byte counting for one
+//! line, used by `cursor_pos_info`'s "g CTRL-G" word/char/byte-count
+//! display) and [`get_region_bytecount`] (a buffer-region's total byte
+//! count, used by `op_delete`'s own "deleting characters between
+//! lines" branch). Both are pure computation needing only already-real
+//! `crate::ascii_defs::ascii_isspace`/`crate::mbyte::utfc_ptr2len`/
+//! `crate::memline::ml_get_buf_len`. Their own real callers
+//! (`cursor_pos_info`, `op_delete`) remain blocked (the former needs
+//! the eval engine's `dict_T` output plus the message-display pipeline
+//! for `:g CTRL-G`'s own status line; the latter needs real buffer
+//! splicing/`truncate_line`) - translated ahead of them, matching the
+//! established "translate ahead of a real caller" precedent.
+//!
 //! Deferred: everything else in the file.
 
+use crate::ascii_defs::ascii_isspace;
 use crate::ops_defs::OpType;
 
 /// `OPF_*` flags for [`OPCHARS`]' third element (`OPF_LINES`/
@@ -541,6 +555,95 @@ pub unsafe fn mb_adjust_opend(oap: &mut crate::normal_defs::OpargT) {
         let char_len = unsafe { crate::mbyte::utfc_ptr2len(&line[new_start..]) };
         oap.end.col = new_start as crate::pos_defs::ColnrT + char_len - 1;
     }
+}
+
+/// Count words/chars/bytes in `line` (`line_count_info`). Return
+/// value is the byte count; word count for the line is added to
+/// `*wc`. Char count is added to `*cc`.
+///
+/// Only examines the first `limit` characters in the line, stopping
+/// if it encounters the end of the line (matching this crate's own
+/// "line slices include their own trailing NUL" convention, e.g.
+/// `crate::memline::ml_get`'s return value). In that case, `eol_size`
+/// is added to the character count to account for the size of the
+/// EOL character.
+#[allow(dead_code)]
+fn line_count_info(line: &[u8], wc: &mut i64, cc: &mut i64, limit: i64, eol_size: i32) -> i64 {
+    let mut i: i64 = 0;
+    let mut words: i64 = 0;
+    let mut chars: i64 = 0;
+    let mut is_word = false;
+
+    while i < limit && line.get(i as usize).copied().unwrap_or(0) != 0 {
+        let c = line[i as usize];
+        if is_word {
+            if ascii_isspace(i32::from(c)) {
+                words += 1;
+                is_word = false;
+            }
+        } else if !ascii_isspace(i32::from(c)) {
+            is_word = true;
+        }
+        chars += 1;
+        // SAFETY: `line[i as usize]` is confirmed non-NUL by the loop
+        // condition above, so `utfc_ptr2len` always returns >= 1 here
+        // (no infinite-loop risk from a zero advance).
+        i += i64::from(unsafe { crate::mbyte::utfc_ptr2len(&line[i as usize..]) });
+    }
+
+    if is_word {
+        words += 1;
+    }
+    *wc += words;
+
+    // Add eol_size if the end of line was reached before hitting limit.
+    if i < limit && line.get(i as usize).copied().unwrap_or(0) == 0 {
+        i += i64::from(eol_size);
+        chars += i64::from(eol_size);
+    }
+    *cc += chars;
+    i
+}
+
+/// Get the byte count of a buffer region, end-exclusive
+/// (`get_region_bytecount`).
+///
+/// # Safety
+/// Same as `crate::memline::ml_get_buf_len`.
+#[allow(dead_code)]
+pub unsafe fn get_region_bytecount(
+    buf: &mut crate::buffer_defs::BufT,
+    start_lnum: crate::pos_defs::LinenrT,
+    end_lnum: crate::pos_defs::LinenrT,
+    start_col: crate::pos_defs::ColnrT,
+    end_col: crate::pos_defs::ColnrT,
+) -> crate::extmark_defs::BcountT {
+    let max_lnum = buf.b_ml.ml_line_count;
+    if start_lnum > max_lnum {
+        return 0;
+    }
+    if start_lnum == end_lnum {
+        return (end_col - start_col) as crate::extmark_defs::BcountT;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut deleted_bytes: crate::extmark_defs::BcountT =
+        (unsafe { crate::memline::ml_get_buf_len(buf, start_lnum) } - start_col + 1)
+            as crate::extmark_defs::BcountT;
+
+    let mut i: crate::pos_defs::LinenrT = 1;
+    while i < end_lnum - start_lnum {
+        if start_lnum + i > max_lnum {
+            return deleted_bytes;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        deleted_bytes += (unsafe { crate::memline::ml_get_buf_len(buf, start_lnum + i) } + 1)
+            as crate::extmark_defs::BcountT;
+        i += 1;
+    }
+    if end_lnum > max_lnum {
+        return deleted_bytes;
+    }
+    deleted_bytes + end_col as crate::extmark_defs::BcountT
 }
 
 #[cfg(test)]
@@ -1156,5 +1259,168 @@ mod tests {
 
         drop(guard);
         close_buf_with_memline(buf);
+    }
+
+    // ---- line_count_info ----
+
+    #[test]
+    fn line_count_info_counts_words_and_chars_and_adds_eol_size() {
+        // "hello world\0": 11 real chars + 2 words, then the trailing
+        // NUL confirms end-of-line was reached before `limit`, so
+        // `eol_size` is added to both the char count and the return
+        // value (matching the doc comment's own description).
+        let mut wc: i64 = 0;
+        let mut cc: i64 = 0;
+        let n = line_count_info(b"hello world\0", &mut wc, &mut cc, 1000, 1);
+        assert_eq!(wc, 2);
+        assert_eq!(cc, 12); // 11 chars + 1 for eol_size
+        assert_eq!(n, 12);
+    }
+
+    #[test]
+    fn line_count_info_truncated_by_limit_before_eol_omits_eol_size() {
+        // limit=3 stops scanning after 'h','e','l' - never reaches the
+        // trailing NUL, so eol_size must NOT be added (this is the
+        // "stopped because of limit, not because of EOL" branch).
+        let mut wc: i64 = 0;
+        let mut cc: i64 = 0;
+        let n = line_count_info(b"hello\0", &mut wc, &mut cc, 3, 1);
+        assert_eq!(wc, 1); // still mid-word when truncated: counts as 1 word
+        assert_eq!(cc, 3);
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn line_count_info_accumulates_into_existing_wc_and_cc() {
+        // *wc/*cc are ADDED to, not overwritten - matches the doc
+        // comment's own "added to `*wc`"/"added to `*cc`" wording.
+        let mut wc: i64 = 10;
+        let mut cc: i64 = 20;
+        let n = line_count_info(b"hi\0", &mut wc, &mut cc, 1000, 1);
+        assert_eq!(wc, 11); // +1 word
+        assert_eq!(cc, 23); // +2 chars +1 eol_size
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn line_count_info_empty_line_still_counts_the_eol() {
+        let mut wc: i64 = 0;
+        let mut cc: i64 = 0;
+        let n = line_count_info(b"\0", &mut wc, &mut cc, 1000, 1);
+        assert_eq!(wc, 0);
+        assert_eq!(cc, 1); // no real characters, just eol_size
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn line_count_info_counts_a_multibyte_character_as_one_char() {
+        // "日\0" (U+65E5, 3 UTF-8 bytes) - chars must count 1 for the
+        // whole character, not 3 for its bytes; the return value still
+        // advances by the full byte length (3) plus eol_size (1).
+        let mut wc: i64 = 0;
+        let mut cc: i64 = 0;
+        let n = line_count_info("\u{65E5}\0".as_bytes(), &mut wc, &mut cc, 1000, 1);
+        assert_eq!(wc, 1);
+        assert_eq!(cc, 2); // 1 char + 1 eol_size
+        assert_eq!(n, 4); // 3 bytes + 1 eol_size
+    }
+
+    // ---- get_region_bytecount ----
+
+    /// Opens `buf` (real block 0/data block allocation via `ml_open`)
+    /// with `first_line` as line 1, then appends each of `rest` in
+    /// order, matching `plines.rs`'s own `buf_with_lines` precedent.
+    /// Callers must hold `crate::globals::global_state_test_lock()`
+    /// for their whole test body (touches `mf_sync` internally via
+    /// `ml_open`) and clean up via [`close_buf`].
+    unsafe fn buf_with_lines(first_line: &[u8], rest: &[&[u8]]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, first_line) },
+            crate::vim_defs::OK
+        );
+        for (after, line) in (1..).zip(rest.iter()) {
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_append_buf(&mut buf, after, line, line.len() as i32, false)
+                },
+                crate::vim_defs::OK
+            );
+        }
+        buf
+    }
+
+    unsafe fn close_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn get_region_bytecount_start_lnum_beyond_buffer_returns_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"x\0", &[]);
+            assert_eq!(get_region_bytecount(&mut buf, 5, 5, 0, 0), 0);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn get_region_bytecount_same_line_is_just_the_column_difference() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[]);
+            assert_eq!(get_region_bytecount(&mut buf, 1, 1, 1, 4), 3);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn get_region_bytecount_spans_multiple_full_lines() {
+        // "hello"/"world"/"abc", region from (1,2) to (3,1):
+        // line 1 tail ("llo", 3 bytes) + 1 newline = 4,
+        // line 2 in full ("world", 5 bytes) + 1 newline = 6,
+        // line 3 up to (exclusive) column 1 = 1 byte ('a').
+        // Total: 4 + 6 + 1 = 11.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"hello\0", &[b"world\0", b"abc\0"]);
+            assert_eq!(get_region_bytecount(&mut buf, 1, 3, 2, 1), 11);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn get_region_bytecount_end_lnum_far_beyond_buffer_stops_mid_loop() {
+        // end_lnum=10 is far past max_lnum=2: the interior-line bounds
+        // check inside the loop (not the one after it) catches this,
+        // returning the running total without ever consulting end_col.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"hi\0", &[b"yo\0"]);
+            // deleted_bytes = (2 - 0 + 1) = 3 from line 1, then i=1
+            // (start_lnum+i=2 <= max_lnum=2) adds (2 + 1) = 3 -> 6,
+            // then i=2 (start_lnum+i=3 > max_lnum=2) returns 6 early.
+            assert_eq!(get_region_bytecount(&mut buf, 1, 10, 0, 999), 6);
+            close_buf(buf);
+        }
+    }
+
+    #[test]
+    fn get_region_bytecount_end_lnum_exactly_one_past_buffer_skips_end_col() {
+        // end_lnum = max_lnum + 1 exactly: every INTERIOR line (2, 3)
+        // is in range, so the loop completes normally: only the final
+        // `end_lnum > max_lnum` check (after the loop) catches this,
+        // and `end_col` is never added.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut buf = buf_with_lines(b"aa\0", &[b"bb\0", b"cc\0"]);
+            // (2-0+1)=3, then +(2+1)=3 twice more -> 3+3+3=9.
+            assert_eq!(get_region_bytecount(&mut buf, 1, 4, 0, 5), 9);
+            close_buf(buf);
+        }
     }
 }
