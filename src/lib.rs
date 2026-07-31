@@ -68,6 +68,7 @@ pub mod grid_defs;
 pub mod hashtab;
 pub mod hashtab_defs;
 pub mod help;
+pub mod highlight;
 pub mod highlight_defs;
 pub mod iconv_defs;
 pub mod indent;
