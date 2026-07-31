@@ -204,6 +204,23 @@
 //! contained enum needed by `option.c`'s `check_num_option_bounds`):
 //! `MIN_COLUMNS`/`MIN_LINES`/`STATUS_HEIGHT`.
 //!
+//! Also translated: `check_lnums`/`check_lnums_nested`/`reset_lnums`
+//! (via their own shared `check_lnums_both` helper) - correct/save/
+//! restore the cursor line number and topline in every window showing
+//! the current buffer, used around buffer-switch autocommands, via
+//! already-real `crate::globals::GLOBALS.first_tabpage`/`firstwin`/
+//! `curtab`/`curwin`/`curbuf`, `TabpageT.tp_next`/`tp_firstwin`,
+//! `WinT.w_next`/`w_buffer`/`w_cursor`/`w_topline`/`w_save_cursor`/
+//! `w_valid`, `BufT.b_ml.ml_line_count`, `crate::mark_defs::equalpos`,
+//! matching `valid_tabpage_win`'s own established "walk every
+//! tabpage, walk each one's own window list" nested-loop precedent
+//! (the original's own `FOR_ALL_TAB_WINDOWS(tp, wp)` macro literally
+//! expands to that exact nesting). Translated ahead of a real caller
+//! (`ex_docmd.c`'s buffer-switching commands, not yet translated),
+//! matching the established "translate ahead of a real caller"
+//! precedent for small, self-contained pieces with no design freedom
+//! of their own.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -2243,6 +2260,144 @@ pub unsafe fn valid_tabpage_win(tpc: *const crate::buffer_defs::TabpageT) -> boo
     }
     // shouldn't happen
     false
+}
+
+/// Implementation of [`check_lnums`] and [`check_lnums_nested`]
+/// (`check_lnums_both`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers. For each such tabpage,
+/// its own window list (`tp_firstwin`/`w_next`, or
+/// `GLOBALS.firstwin`/`w_next` when it's the current tabpage) must
+/// consist of valid, live `WinT` pointers, and `GLOBALS.curbuf` must
+/// be a valid, live `BufT` pointer.
+unsafe fn check_lnums_both(do_curwin: bool, nested: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = globals.curwin;
+    let curbuf = globals.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*curbuf }.b_ml.ml_line_count;
+
+    let mut tp = globals.first_tabpage;
+    while !tp.is_null() {
+        let is_curtab = std::ptr::eq(tp, globals.curtab);
+        let mut wp = if is_curtab {
+            globals.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            if (do_curwin || !std::ptr::eq(wp, curwin)) && std::ptr::eq(w.w_buffer, curbuf) {
+                if !nested {
+                    // save the original cursor position and topline
+                    w.w_save_cursor.w_cursor_save = w.w_cursor;
+                    w.w_save_cursor.w_topline_save = w.w_topline;
+                }
+
+                let mut need_adjust = w.w_cursor.lnum > line_count;
+                if need_adjust {
+                    w.w_cursor.lnum = line_count;
+                }
+                if need_adjust || !nested {
+                    // save the (corrected) cursor position
+                    w.w_save_cursor.w_cursor_corr = w.w_cursor;
+                }
+
+                need_adjust = w.w_topline > line_count;
+                if need_adjust {
+                    w.w_topline = line_count;
+                }
+                if need_adjust || !nested {
+                    // save the (corrected) topline
+                    w.w_save_cursor.w_topline_corr = w.w_topline;
+                }
+            }
+            wp = w.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+}
+
+/// Correct the cursor line number in other windows. Used after
+/// changing the current buffer, and before applying autocommands
+/// (`check_lnums`).
+///
+/// `do_curwin`: when `true`, also check the current window.
+///
+/// # Safety
+/// Same as `check_lnums_both`.
+pub unsafe fn check_lnums(do_curwin: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_lnums_both(do_curwin, false) };
+}
+
+/// Like [`check_lnums`] but for when `check_lnums` was already called
+/// (`check_lnums_nested`).
+///
+/// # Safety
+/// Same as `check_lnums_both`.
+pub unsafe fn check_lnums_nested(do_curwin: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_lnums_both(do_curwin, true) };
+}
+
+/// Reset cursor and topline to their stored values from
+/// [`check_lnums`]. `check_lnums` must have been called first
+/// (`reset_lnums`).
+///
+/// # Safety
+/// Same as `check_lnums_both`.
+pub unsafe fn reset_lnums() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curbuf = globals.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*curbuf }.b_ml.ml_line_count;
+
+    let mut tp = globals.first_tabpage;
+    while !tp.is_null() {
+        let is_curtab = std::ptr::eq(tp, globals.curtab);
+        let mut wp = if is_curtab {
+            globals.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            if std::ptr::eq(w.w_buffer, curbuf) {
+                // Restore the value if the autocommand didn't change
+                // it and it was set.
+                //
+                // Note: this triggers e.g. on BufReadPre, when the
+                // buffer is not yet loaded, so cannot validate the
+                // buffer line.
+                if crate::mark_defs::equalpos(w.w_save_cursor.w_cursor_corr, w.w_cursor)
+                    && w.w_save_cursor.w_cursor_save.lnum != 0
+                {
+                    w.w_cursor = w.w_save_cursor.w_cursor_save;
+                }
+                if w.w_save_cursor.w_topline_corr == w.w_topline
+                    && w.w_save_cursor.w_topline_save != 0
+                {
+                    w.w_topline = w.w_save_cursor.w_topline_save;
+                }
+                if w.w_save_cursor.w_topline_save > line_count {
+                    w.w_valid &= !i32::from(crate::buffer_defs::w_valid::VALID_TOPLINE);
+                }
+            }
+            wp = w.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
 }
 
 #[cfg(test)]
@@ -5234,5 +5389,392 @@ mod tests {
 
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
         unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = prev_first_tabpage;
+    }
+
+    // ---- check_lnums / check_lnums_nested / reset_lnums ----
+
+    /// RAII guard for `check_lnums`/`reset_lnums` tests: saves/restores
+    /// every `GLOBALS` field these functions read
+    /// (`first_tabpage`/`curtab`/`firstwin`/`curwin`/`curbuf`).
+    struct CheckLnumsGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut WinT,
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+    }
+    impl CheckLnumsGuard {
+        fn set(
+            first_tabpage: *mut crate::buffer_defs::TabpageT,
+            curtab: *mut crate::buffer_defs::TabpageT,
+            firstwin: *mut WinT,
+            curwin: *mut WinT,
+            curbuf: *mut crate::buffer_defs::BufT,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CheckLnumsGuard {
+                prev_first_tabpage: g.first_tabpage,
+                prev_curtab: g.curtab,
+                prev_firstwin: g.firstwin,
+                prev_curwin: g.curwin,
+                prev_curbuf: g.curbuf,
+            };
+            g.first_tabpage = first_tabpage;
+            g.curtab = curtab;
+            g.firstwin = firstwin;
+            g.curwin = curwin;
+            g.curbuf = curbuf;
+            guard
+        }
+    }
+    impl Drop for CheckLnumsGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.first_tabpage = self.prev_first_tabpage;
+            g.curtab = self.prev_curtab;
+            g.firstwin = self.prev_firstwin;
+            g.curwin = self.prev_curwin;
+            g.curbuf = self.prev_curbuf;
+        }
+    }
+
+    fn buf_with_line_count(line_count: i32) -> crate::buffer_defs::BufT {
+        crate::buffer_defs::BufT {
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: line_count, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    fn win_showing(buf: *mut crate::buffer_defs::BufT, lnum: i32, topline: i32) -> WinT {
+        WinT {
+            w_buffer: buf,
+            w_cursor: crate::pos_defs::PosT { lnum, col: 0, coladd: 0 },
+            w_topline: topline,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn check_lnums_do_curwin_false_skips_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win2 = win_showing(buf_ptr, 10, 1);
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_next: win2_ptr, ..win_showing(buf_ptr, 3, 1) };
+        let win1_ptr = &mut win1 as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win1_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win1_ptr, win1_ptr, buf_ptr);
+
+        unsafe { check_lnums(false) };
+
+        // win1 IS curwin, and do_curwin was false - completely untouched.
+        assert_eq!(unsafe { &*win1_ptr }.w_cursor.lnum, 3);
+        assert_eq!(unsafe { &*win1_ptr }.w_save_cursor.w_cursor_save.lnum, 0);
+
+        // win2 is not curwin - clamped and saved.
+        assert_eq!(unsafe { &*win2_ptr }.w_cursor.lnum, 5);
+        assert_eq!(unsafe { &*win2_ptr }.w_save_cursor.w_cursor_save.lnum, 10);
+        assert_eq!(unsafe { &*win2_ptr }.w_save_cursor.w_topline_save, 1);
+        assert_eq!(unsafe { &*win2_ptr }.w_save_cursor.w_cursor_corr.lnum, 5);
+        assert_eq!(unsafe { &*win2_ptr }.w_save_cursor.w_topline_corr, 1);
+    }
+
+    #[test]
+    fn check_lnums_do_curwin_true_also_updates_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_showing(buf_ptr, 3, 1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 3);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_save.lnum, 3);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_topline_save, 1);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_corr.lnum, 3);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_topline_corr, 1);
+    }
+
+    #[test]
+    fn check_lnums_clamps_cursor_and_topline_when_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_showing(buf_ptr, 100, 200);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 5);
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 5);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_save.lnum, 100);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_topline_save, 200);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_corr.lnum, 5);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_topline_corr, 5);
+    }
+
+    #[test]
+    fn check_lnums_skips_a_window_showing_a_different_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut other_buf = buf_with_line_count(5);
+        let other_buf_ptr = &mut other_buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_showing(other_buf_ptr, 3, 1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+
+        // win shows other_buf, not curbuf - untouched.
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_save.lnum, 0);
+    }
+
+    #[test]
+    fn check_lnums_walks_windows_in_every_tabpage_not_just_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win2 = win_showing(buf_ptr, 100, 1);
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut tp2 = crate::buffer_defs::TabpageT { tp_firstwin: win2_ptr, ..Default::default() };
+        let tp2_ptr = &mut tp2 as *mut crate::buffer_defs::TabpageT;
+        let mut win1 = win_showing(buf_ptr, 3, 1);
+        let win1_ptr = &mut win1 as *mut WinT;
+        let mut tp1 =
+            crate::buffer_defs::TabpageT { tp_next: tp2_ptr, tp_firstwin: win1_ptr, ..Default::default() };
+        let tp1_ptr = &mut tp1 as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp1_ptr, tp1_ptr, win1_ptr, win1_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+
+        // win1 is in curtab (tp1) - touched.
+        assert_eq!(unsafe { &*win1_ptr }.w_save_cursor.w_cursor_save.lnum, 3);
+        // win2 is in a DIFFERENT tabpage (tp2), but shows curbuf too -
+        // FOR_ALL_TAB_WINDOWS walks every tabpage, so it's touched.
+        assert_eq!(unsafe { &*win2_ptr }.w_cursor.lnum, 5);
+        assert_eq!(unsafe { &*win2_ptr }.w_save_cursor.w_cursor_save.lnum, 100);
+    }
+
+    #[test]
+    fn check_lnums_nested_does_not_resave_when_no_adjustment_is_needed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_showing(buf_ptr, 3, 1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+        // Overwrite the corrected values with a sentinel to detect
+        // whether the nested call below re-saves them.
+        unsafe { &mut *win_ptr }.w_save_cursor.w_cursor_corr.lnum = 99;
+        unsafe { &mut *win_ptr }.w_save_cursor.w_topline_corr = 99;
+
+        // Cursor/topline are STILL within bounds - no adjustment
+        // needed, and nested=true means neither branch re-saves.
+        unsafe { check_lnums_nested(true) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_corr.lnum, 99);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_topline_corr, 99);
+    }
+
+    #[test]
+    fn check_lnums_nested_still_resaves_when_adjustment_is_needed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = win_showing(buf_ptr, 3, 1);
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { check_lnums(true) };
+        // Shrink the buffer so the SAME cursor now needs clamping.
+        unsafe { &mut *buf_ptr }.b_ml.ml_line_count = 2;
+        unsafe { &mut *win_ptr }.w_save_cursor.w_cursor_corr.lnum = 99;
+
+        unsafe { check_lnums_nested(true) };
+
+        // need_adjust was true this time (3 > 2), so the corrected
+        // value IS re-saved even though nested=true.
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 2);
+        assert_eq!(unsafe { &*win_ptr }.w_save_cursor.w_cursor_corr.lnum, 2);
+    }
+
+    #[test]
+    fn reset_lnums_restores_cursor_and_topline_when_autocmd_did_not_change_them() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(20);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            w_topline: 3,
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_TOPLINE),
+            w_save_cursor: crate::buffer_defs::PosSaveT {
+                w_topline_save: 7,
+                w_topline_corr: 3,
+                w_cursor_save: crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                w_cursor_corr: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { reset_lnums() };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 10);
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 7);
+        assert_ne!(
+            unsafe { &*win_ptr }.w_valid & i32::from(crate::buffer_defs::w_valid::VALID_TOPLINE),
+            0,
+            "topline_save (7) <= line_count (20) - VALID_TOPLINE must stay set"
+        );
+    }
+
+    #[test]
+    fn reset_lnums_does_not_restore_when_autocmd_changed_the_cursor() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(20);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            // The autocmd moved the cursor to line 8 - no longer
+            // equal to w_cursor_corr (5), so no restore happens.
+            w_cursor: crate::pos_defs::PosT { lnum: 8, col: 0, coladd: 0 },
+            w_topline: 3,
+            w_save_cursor: crate::buffer_defs::PosSaveT {
+                w_topline_save: 7,
+                w_topline_corr: 3,
+                w_cursor_save: crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                w_cursor_corr: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { reset_lnums() };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 8);
+    }
+
+    #[test]
+    fn reset_lnums_does_not_restore_when_cursor_save_lnum_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(20);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            w_topline: 3,
+            w_save_cursor: crate::buffer_defs::PosSaveT {
+                // w_cursor_save.lnum == 0: check_lnums was never
+                // meaningfully called for this window - no restore.
+                w_topline_save: 0,
+                w_topline_corr: 3,
+                w_cursor_save: crate::pos_defs::PosT::default(),
+                w_cursor_corr: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { reset_lnums() };
+
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 5);
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 3);
+    }
+
+    #[test]
+    fn reset_lnums_clears_valid_topline_when_saved_topline_exceeds_new_line_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Buffer shrunk to 5 lines since check_lnums saved topline 50.
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            // topline_corr != w_topline (2 != 3) - the topline branch
+            // itself does not fire, isolating the VALID_TOPLINE check.
+            w_topline: 3,
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_TOPLINE),
+            w_save_cursor: crate::buffer_defs::PosSaveT {
+                w_topline_save: 50,
+                w_topline_corr: 2,
+                w_cursor_save: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+                w_cursor_corr: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { reset_lnums() };
+
+        // Topline itself is untouched (topline_corr didn't match)...
+        assert_eq!(unsafe { &*win_ptr }.w_topline, 3);
+        // ...but VALID_TOPLINE is cleared regardless, since
+        // w_topline_save (50) > the buffer's new line_count (5).
+        assert_eq!(
+            unsafe { &*win_ptr }.w_valid & i32::from(crate::buffer_defs::w_valid::VALID_TOPLINE),
+            0
+        );
+    }
+
+    #[test]
+    fn reset_lnums_skips_a_window_showing_a_different_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_line_count(5);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut other_buf = buf_with_line_count(5);
+        let other_buf_ptr = &mut other_buf as *mut crate::buffer_defs::BufT;
+        let mut win = WinT {
+            w_buffer: other_buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            w_topline: 3,
+            w_save_cursor: crate::buffer_defs::PosSaveT {
+                w_topline_save: 7,
+                w_topline_corr: 3,
+                w_cursor_save: crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                w_cursor_corr: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_firstwin: win_ptr, ..Default::default() };
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = CheckLnumsGuard::set(tp_ptr, tp_ptr, win_ptr, win_ptr, buf_ptr);
+
+        unsafe { reset_lnums() };
+
+        // win shows other_buf, not curbuf - reset_lnums must not
+        // touch it even though w_cursor_save.lnum != 0.
+        assert_eq!(unsafe { &*win_ptr }.w_cursor.lnum, 5);
     }
 }

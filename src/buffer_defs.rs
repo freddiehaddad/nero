@@ -682,7 +682,7 @@ impl Default for WinConfig {
 }
 
 /// Structure to store last cursor position and topline (`pos_save_T`).
-/// Used by `check_lnums()` and `reset_lnums()` (not yet translated).
+/// Used by `check_lnums()` and `reset_lnums()` (`window.rs`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PosSaveT {
     /// original topline value
