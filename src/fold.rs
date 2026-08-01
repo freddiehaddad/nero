@@ -364,6 +364,91 @@ pub unsafe fn fold_adjust_cursor(wp: &mut WinT) {
     wp.w_cursor.lnum = new_lnum;
 }
 
+/// Adjust fold info in window `wp` for a change in line numbers
+/// (`foldMarkAdjust`). Must be called BEFORE actually changing the
+/// line count (matching `mark_adjust_buf`'s own doc comment, its one
+/// real caller).
+///
+/// Only ever reaches `fold_mark_adjust_recurse`'s "no folds at all"
+/// fast path today (an empty `wp.w_folds`), for the same reason
+/// [`get_deepest_nesting`]'s own doc comment already explains: nothing
+/// in this crate can currently create a fold. The `line1`/`line2`
+/// adjustment computed here is real and exact regardless (it's pure
+/// arithmetic on the function's own parameters, no fold-tree access
+/// involved) - only the final recursive step is limited to the empty
+/// case.
+///
+/// # Safety
+/// Same as [`has_any_folding`].
+pub unsafe fn fold_mark_adjust(
+    wp: &WinT,
+    line1: crate::pos_defs::LinenrT,
+    line2: crate::pos_defs::LinenrT,
+    amount: crate::pos_defs::LinenrT,
+    amount_after: crate::pos_defs::LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    let insert_mode = (state & crate::state_defs::mode::INSERT as i32) != 0;
+    let (line1, line2) = fold_mark_adjust_effective_range(line1, line2, amount, amount_after, insert_mode);
+    fold_mark_adjust_recurse(&wp.w_folds, line1, line2, amount, amount_after);
+}
+
+/// Computes `foldMarkAdjust`'s own local `line1`/`line2` adjustments
+/// (the part of the original function that doesn't touch the fold
+/// tree at all - pure arithmetic on the function's own parameters),
+/// extracted into its own directly-testable helper since
+/// `fold_mark_adjust_recurse`'s current "no folds at all" fast path
+/// discards both values without ever observing them.
+#[must_use]
+fn fold_mark_adjust_effective_range(
+    mut line1: crate::pos_defs::LinenrT,
+    mut line2: crate::pos_defs::LinenrT,
+    amount: crate::pos_defs::LinenrT,
+    amount_after: crate::pos_defs::LinenrT,
+    insert_mode: bool,
+) -> (crate::pos_defs::LinenrT, crate::pos_defs::LinenrT) {
+    // If deleting marks from line1 to line2, but not deleting all those
+    // lines, set line2 so that only deleted lines have their folds removed.
+    if amount == crate::pos_defs::MAXLNUM && line2 >= line1 && line2 - line1 >= -amount_after {
+        line2 = line1 - amount_after - 1;
+    }
+    if line2 < line1 {
+        line2 = line1;
+    }
+    // If appending a line in Insert mode, it should be included in the fold
+    // just above the line.
+    if insert_mode && amount == 1 && line2 == crate::pos_defs::MAXLNUM {
+        line1 -= 1;
+    }
+    (line1, line2)
+}
+
+/// Recursive per-`garray_T` step of [`fold_mark_adjust`]
+/// (`foldMarkAdjustRecurse`).
+///
+/// The real recursive line-number-adjustment-within-nested-folds body
+/// is `unimplemented!()` - this crate has no `fold_T`/nested-fold
+/// equivalent type yet (matching [`fold_mark_adjust`]'s own doc
+/// comment) - but the "no folds at all" fast path (an empty `gap`) is
+/// real and exact: the original's own `if (gap->ga_len == 0) return;`
+/// is its own very first statement, taken unconditionally today.
+fn fold_mark_adjust_recurse(
+    gap: &crate::garray_defs::GarrayT,
+    _line1: crate::pos_defs::LinenrT,
+    _line2: crate::pos_defs::LinenrT,
+    _amount: crate::pos_defs::LinenrT,
+    _amount_after: crate::pos_defs::LinenrT,
+) {
+    if gap.is_empty() {
+        return;
+    }
+    unimplemented!(
+        "fold::fold_mark_adjust_recurse: no fold_T/nested-fold equivalent type exists yet to \
+         recurse into"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +807,104 @@ mod tests {
             ..Default::default()
         };
         unsafe { fold_adjust_cursor(&mut win) };
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_normal_insert_leaves_range_as_is_when_ordered() {
+        // amount != MAXLNUM (a plain insert/adjustment, not a delete) and
+        // line1 <= line2 already - neither special-case branch fires.
+        assert_eq!(fold_mark_adjust_effective_range(5, 8, 2, 0, false), (5, 8));
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_clamps_line2_up_to_line1_when_reversed() {
+        // line2 < line1 with a non-delete amount: line2 is clamped up to
+        // line1 (the second `if` branch), independent of the first.
+        assert_eq!(fold_mark_adjust_effective_range(20, 15, 3, 0, false), (20, 20));
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_delete_narrows_line2_when_net_removal_is_smaller() {
+        // Hand-traced: line1=10, line2=20 (11 lines nominally marked),
+        // amount=MAXLNUM (delete), amount_after=-5 (only 5 lines actually
+        // net-removed, e.g. some replacement content was inserted in their
+        // place). The original's own guard:
+        //   line2 - line1 (10) >= -amount_after (5) -> true
+        //   => line2 = line1 - amount_after - 1 = 10 - (-5) - 1 = 14
+        assert_eq!(
+            fold_mark_adjust_effective_range(10, 20, crate::pos_defs::MAXLNUM, -5, false),
+            (10, 14)
+        );
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_delete_leaves_line2_when_narrowing_condition_is_false() {
+        // Hand-traced against the module's own doc-comment example:
+        // "Delete lines 34 and 35: mark_adjust(34, 35, MAXLNUM, -2)".
+        // line2 - line1 (1) >= -amount_after (2) -> false, so line2 stays
+        // 35 unchanged (and line2 (35) is not < line1 (34) either).
+        assert_eq!(
+            fold_mark_adjust_effective_range(34, 35, crate::pos_defs::MAXLNUM, -2, false),
+            (34, 35)
+        );
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_insert_mode_appended_line_includes_the_line_above() {
+        // Hand-traced: amount=1, line2=MAXLNUM (append), insert_mode=true
+        // -> line1 -= 1, so the appended line is included in the fold
+        // just above it.
+        assert_eq!(
+            fold_mark_adjust_effective_range(5, crate::pos_defs::MAXLNUM, 1, 0, true),
+            (4, crate::pos_defs::MAXLNUM)
+        );
+    }
+
+    #[test]
+    fn fold_mark_adjust_effective_range_insert_mode_branch_requires_insert_mode() {
+        // Same shape as the previous test, but insert_mode=false - line1
+        // must NOT be decremented.
+        assert_eq!(
+            fold_mark_adjust_effective_range(5, crate::pos_defs::MAXLNUM, 1, 0, false),
+            (5, crate::pos_defs::MAXLNUM)
+        );
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_is_a_no_op_when_gap_is_empty() {
+        let gap = crate::garray_defs::GarrayT::default();
+        fold_mark_adjust_recurse(&gap, 1, 5, 2, 0); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    fn fold_mark_adjust_recurse_panics_when_gap_is_non_empty() {
+        let gap = crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() };
+        fold_mark_adjust_recurse(&gap, 1, 5, 2, 0);
+    }
+
+    #[test]
+    fn fold_mark_adjust_is_a_no_op_when_win_has_no_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let win = WinT { w_folds: crate::garray_defs::GarrayT::default(), ..Default::default() };
+        // A representative spread of amount/line1/line2/amount_after
+        // combinations, covering every branch of the internal
+        // effective-range computation - none should panic, since
+        // `w_folds` stays empty throughout.
+        unsafe { fold_mark_adjust(&win, 5, 8, 2, 0) };
+        unsafe { fold_mark_adjust(&win, 20, 15, 3, 0) };
+        unsafe { fold_mark_adjust(&win, 10, 20, crate::pos_defs::MAXLNUM, -5) };
+        unsafe { fold_mark_adjust(&win, 5, crate::pos_defs::MAXLNUM, 1, 0) };
+    }
+
+    #[test]
+    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    fn fold_mark_adjust_panics_when_win_has_real_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let win = WinT {
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        unsafe { fold_mark_adjust(&win, 1, 5, 2, 0) };
     }
 }
