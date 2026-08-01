@@ -41,11 +41,18 @@
 //! omitted, matching the established "skip the deferred message-
 //! display side effect, keep the exact same return value" policy.
 //!
+//! Also translated: [`get_menu_cmd_modes`] (parses a `:menu`-family
+//! command name like `"nmenu"`/`"noremenu"`/`"tlunmenu"` into its
+//! `menu_mode` bit-flags plus `noremap`/`unmenu` flags) - a pure,
+//! self-contained byte-parsing function with no `vimmenu_T` tree
+//! dependency at all, needing only already-real
+//! `crate::menu_defs::menu_mode` and `crate::input_defs::RemapValues`.
+//!
 //! Deferred: everything else - the whole menu tree (`root_menu`/
 //! `get_root_menu`), `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
-//! `menu_find`/`get_menu_cmd_modes`/`menu_text`/`menuitem_getinfo`, all
-//! needing the menu tree/editor-command execution machinery and menu
-//! translation/remap state.
+//! `menu_find`/`menu_text`/`menuitem_getinfo`, all needing the menu
+//! tree/editor-command execution machinery and menu translation/remap
+//! state.
 
 use crate::menu_defs::{VimMenu, MNU_HIDDEN_CHAR};
 
@@ -217,6 +224,63 @@ pub fn menu_skip_part(s: &[u8]) -> usize {
         p += 1;
     }
     p
+}
+
+/// Returns the `\ref MENU_MODES` bit-flags specified by menu command
+/// `cmd` (e.g. `:menu!` returns `MENU_CMDLINE_MODE | MENU_INSERT_MODE`),
+/// along with the `noremap`/`unmenu` flags (`get_menu_cmd_modes`).
+///
+/// Returns `(modes, noremap, unmenu)` in place of the original's own
+/// `int *noremap`/`bool *unmenu` out-parameters. `cmd`'s own advancing-
+/// cursor walk (including the `default:` case's `cmd--`, which
+/// resets the cursor all the way back to the very first byte) is
+/// modeled as a plain `pos: usize` index into the slice, hand-traced
+/// against `"nmenu"`/`"noremenu"`/`"unmenu"`/`"tlmenu"`/`"tmenu"`
+/// before trusting the translation.
+#[must_use]
+pub fn get_menu_cmd_modes(cmd: &[u8], forceit: bool) -> (i32, crate::input_defs::RemapValues, bool) {
+    use crate::input_defs::RemapValues;
+    use crate::menu_defs::menu_mode::{CMDLINE, INSERT, NORMAL, OP_PENDING, SELECT, TERMINAL, TIP, VISUAL};
+
+    let mut pos = 1usize;
+    let modes = match cmd.first().copied().unwrap_or(0) {
+        b'v' => VISUAL | SELECT,
+        b'x' => VISUAL,
+        b's' => SELECT,
+        b'o' => OP_PENDING,
+        b'i' => INSERT,
+        b't' => {
+            if cmd.get(pos).copied() == Some(b'l') {
+                pos += 1;
+                TERMINAL
+            } else {
+                TIP
+            }
+        }
+        b'c' => CMDLINE,
+        b'a' => INSERT | CMDLINE | NORMAL | VISUAL | SELECT | OP_PENDING,
+        b'n' if cmd.get(pos).copied() != Some(b'o') => NORMAL,
+        _ => {
+            // `cmd--`: treat the whole original string as unconsumed
+            // (this also covers the `'n'` case's own fallthrough,
+            // e.g. "noremenu", and an empty `cmd`).
+            pos = 0;
+            if forceit {
+                INSERT | CMDLINE
+            } else {
+                NORMAL | VISUAL | SELECT | OP_PENDING
+            }
+        }
+    };
+
+    let noremap = if cmd.get(pos).copied() == Some(b'n') {
+        RemapValues::None
+    } else {
+        RemapValues::Yes
+    };
+    let unmenu = cmd.get(pos).copied() == Some(b'u');
+
+    (modes, noremap, unmenu)
 }
 
 /// Return a short mode-indicator string for a `modes`
@@ -556,6 +620,103 @@ mod tests {
         // A backslash as the very LAST byte has no next byte to
         // escape, so it's just consumed like any other character.
         assert_eq!(menu_skip_part(b"File\\"), 5);
+    }
+
+    // ---- get_menu_cmd_modes ----
+
+    #[test]
+    fn get_menu_cmd_modes_nmenu_is_normal_remap_yes() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::NORMAL;
+        assert_eq!(get_menu_cmd_modes(b"nmenu", false), (NORMAL, RemapValues::Yes, false));
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_noremenu_falls_through_to_default_with_remap_none() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{NORMAL, OP_PENDING, SELECT, VISUAL};
+        // "noremenu" - the 'n' case's own `*cmd != 'o'` guard fails
+        // (the very next byte IS 'o'), falling through to `default`,
+        // which resets the cursor all the way back to the start - so
+        // `noremap` is then decided by the FIRST byte ('n') again.
+        assert_eq!(
+            get_menu_cmd_modes(b"noremenu", false),
+            (NORMAL | VISUAL | SELECT | OP_PENDING, RemapValues::None, false)
+        );
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_unmenu_is_unmenu_true() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{NORMAL, OP_PENDING, SELECT, VISUAL};
+        assert_eq!(
+            get_menu_cmd_modes(b"unmenu", false),
+            (NORMAL | VISUAL | SELECT | OP_PENDING, RemapValues::Yes, true)
+        );
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_tlmenu_is_terminal() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::TERMINAL;
+        assert_eq!(get_menu_cmd_modes(b"tlmenu", false), (TERMINAL, RemapValues::Yes, false));
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_tmenu_is_tip() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::TIP;
+        assert_eq!(get_menu_cmd_modes(b"tmenu", false), (TIP, RemapValues::Yes, false));
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_vmenu_is_visual_and_select() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{SELECT, VISUAL};
+        assert_eq!(get_menu_cmd_modes(b"vmenu", false), (VISUAL | SELECT, RemapValues::Yes, false));
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_amenu_is_all_six_modes() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{CMDLINE, INSERT, NORMAL, OP_PENDING, SELECT, VISUAL};
+        assert_eq!(
+            get_menu_cmd_modes(b"amenu", false),
+            (INSERT | CMDLINE | NORMAL | VISUAL | SELECT | OP_PENDING, RemapValues::Yes, false)
+        );
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_bare_menu_without_forceit() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{NORMAL, OP_PENDING, SELECT, VISUAL};
+        // "menu" - 'm' matches none of the explicit cases, falling
+        // straight to `default` (no fallthrough needed this time).
+        assert_eq!(
+            get_menu_cmd_modes(b"menu", false),
+            (NORMAL | VISUAL | SELECT | OP_PENDING, RemapValues::Yes, false)
+        );
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_bare_menu_bang_with_forceit() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{CMDLINE, INSERT};
+        // "menu!!" (forceit=true) - the original's own ":menu!!" form.
+        assert_eq!(
+            get_menu_cmd_modes(b"menu!!", true),
+            (INSERT | CMDLINE, RemapValues::Yes, false)
+        );
+    }
+
+    #[test]
+    fn get_menu_cmd_modes_empty_string_behaves_like_default() {
+        use crate::input_defs::RemapValues;
+        use crate::menu_defs::menu_mode::{NORMAL, OP_PENDING, SELECT, VISUAL};
+        assert_eq!(
+            get_menu_cmd_modes(b"", false),
+            (NORMAL | VISUAL | SELECT | OP_PENDING, RemapValues::Yes, false)
+        );
     }
 
     // ---- get_menu_mode_str ----
