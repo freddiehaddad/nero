@@ -137,6 +137,7 @@ pub mod strings;
 pub mod tag;
 pub mod testing;
 pub mod textformat;
+pub mod textobject;
 pub mod types_defs;
 pub mod ui;
 pub mod undo;
