@@ -718,7 +718,21 @@ pub enum CallbackType {
 /// layout reason not to (e.g. `UhLink` in `undo_defs.rs`). The `Partial`
 /// variant stays a raw pointer to the not-yet-translated [`PartialT`],
 /// same as e.g. `SynblockT.b_syn_linecont_prog: *mut RegprogT` elsewhere.
-#[derive(Debug, Clone)]
+///
+/// `#[derive(PartialEq)]` needs no separate `tv_callback_equal`
+/// translation at all: Rust's own generated `==` already requires
+/// matching DISCRIMINANTS first (mirroring the original's own leading
+/// `cb1->type != cb2->type` check) and then compares each variant's
+/// payload the exact same way `tv_callback_equal` does by hand -
+/// `Vec<u8>: PartialEq` is a byte-for-byte comparison (matching
+/// `strcmp(...) == 0` for `Funcref`), `*mut PartialT`/`LuaRef` (`i32`)
+/// are both plain `Copy` types compared by value (matching the
+/// original's own `==` on `.partial`/`.luaref` exactly, INCLUDING its
+/// own documented `Partial` case being pointer identity, not deep
+/// content equality) - matching the already-established `OptVal`
+/// precedent (`optval_free`/`_copy`/`_equal` needing no Rust
+/// equivalent either, for the identical reason).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Callback {
     /// `kCallbackNone` / `CALLBACK_NONE`.
     None,
@@ -1167,6 +1181,47 @@ mod tests {
         assert_eq!(Callback::Funcref(b"MyFunc".to_vec()).kind(), CallbackType::Funcref);
         assert_eq!(Callback::Lua(0).kind(), CallbackType::Lua);
         assert_eq!(Callback::Partial(std::ptr::null_mut()).kind(), CallbackType::Partial);
+    }
+
+    // --- Callback's derived PartialEq matches tv_callback_equal exactly ---
+
+    #[test]
+    fn callback_none_variants_are_always_equal() {
+        assert_eq!(Callback::None, Callback::None);
+    }
+
+    #[test]
+    fn callback_funcref_compares_the_name_byte_for_byte() {
+        assert_eq!(Callback::Funcref(b"MyFunc".to_vec()), Callback::Funcref(b"MyFunc".to_vec()));
+        assert_ne!(Callback::Funcref(b"MyFunc".to_vec()), Callback::Funcref(b"OtherFunc".to_vec()));
+    }
+
+    #[test]
+    fn callback_lua_compares_the_luaref_by_value() {
+        assert_eq!(Callback::Lua(42), Callback::Lua(42));
+        assert_ne!(Callback::Lua(42), Callback::Lua(43));
+    }
+
+    #[test]
+    fn callback_partial_compares_pointer_identity_not_deep_content() {
+        // Matches tv_callback_equal's own documented, real quirk
+        // ("inconsistent with tv_equal but needed for precision"): two
+        // DIFFERENT (even if hypothetically identical-content)
+        // partials at different addresses are NOT equal - only the
+        // exact same pointer value is.
+        let mut p1 = PartialT::default();
+        let mut p2 = PartialT::default();
+        let ptr1 = &mut p1 as *mut PartialT;
+        let ptr2 = &mut p2 as *mut PartialT;
+        assert_eq!(Callback::Partial(ptr1), Callback::Partial(ptr1));
+        assert_ne!(Callback::Partial(ptr1), Callback::Partial(ptr2));
+    }
+
+    #[test]
+    fn callback_different_variants_are_never_equal() {
+        assert_ne!(Callback::None, Callback::Funcref(Vec::new()));
+        assert_ne!(Callback::Funcref(b"f".to_vec()), Callback::Lua(0));
+        assert_ne!(Callback::Lua(0), Callback::Partial(std::ptr::null_mut()));
     }
 
     #[test]
