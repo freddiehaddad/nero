@@ -612,10 +612,27 @@ pub fn printable_func_name(fp: &UfuncT) -> Vec<u8> {
     fp.uf_name_exp.clone().unwrap_or_else(|| fp.uf_name.clone())
 }
 
-/// Turn `rettv` (a `Func` or `Partial` value) into an auto-bound
-/// partial for `selfdict`, when `rettv`'s function is a "dict
-/// function" (declared with `function() dict`, `FC_DICT`) - the
+/// Turn `rettv` (a `Func`, `String`, or `Partial` value) into an
+/// auto-bound partial for `selfdict`, when `rettv`'s function is a
+/// "dict function" (declared with `function() dict`, `FC_DICT`) - the
 /// `"dict.Func"` -> bound-method conversion (`make_partial`).
+///
+/// `String` is treated identically to `Func` throughout (the original
+/// itself does this via one shared ternary,
+/// `rettv->v_type == VAR_FUNC || rettv->v_type == VAR_STRING ? rettv
+/// ->vval.v_string : ...` - a plain function-name string reaches this
+/// function whenever [`crate::eval::eval::set_selfdict`] is called
+/// with a dict-item value that passed
+/// `crate::eval::typval::tv_dict_get_callback`'s own
+/// `!tv_is_func(...) && v_type != VAR_STRING` gate, which explicitly
+/// accepts `String` too, not just `Func`/`Partial`). Every OTHER type
+/// (Number/Bool/List/Dict/Blob/Float) is genuinely unreachable here:
+/// this function's only two real callers
+/// ([`crate::eval::eval::set_selfdict`], called either from
+/// `handle_subscript`'s own `tv_is_func`-gated site or from
+/// `tv_dict_get_callback`'s own `tv_is_func`-or-`String`-gated site)
+/// never pass anything else - confirmed by reading both real call
+/// sites directly, not assumed.
 ///
 /// Faithfully preserves a genuinely-latent quirk of the original,
 /// confirmed directly against the real source rather than "fixed": if
@@ -635,16 +652,15 @@ pub fn printable_func_name(fp: &UfuncT) -> Vec<u8> {
 ///
 /// # Safety
 /// `selfdict`, if non-null, must be a valid, live [`DictT`]. `rettv`
-/// must currently hold a `Func` or `Partial` value - guaranteed by
-/// this function's own real caller, [`crate::eval::eval::set_selfdict`]
-/// (itself gated on `tv_is_func`).
+/// must currently hold a `Func`, `String`, or `Partial` value -
+/// guaranteed by this function's own real callers (see above).
 pub unsafe fn make_partial(selfdict: *mut DictT, rettv: &mut TypvalT) {
     let fp: *mut UfuncT = match &rettv.value {
         // SAFETY: forwarded from this function's own safety doc.
         TypvalValue::Partial(p) if !p.is_null() && !unsafe { (**p).pt_func }.is_null() => unsafe { (**p).pt_func },
         _ => {
             let fname: Option<Vec<u8>> = match &rettv.value {
-                TypvalValue::Func(name) => name.clone(),
+                TypvalValue::Func(name) | TypvalValue::String(name) => name.clone(),
                 // SAFETY: forwarded from this function's own safety doc.
                 TypvalValue::Partial(p) if !p.is_null() => unsafe { (**p).pt_name.clone() },
                 _ => None,
@@ -681,11 +697,13 @@ pub unsafe fn make_partial(selfdict: *mut DictT, rettv: &mut TypvalT) {
     pt.pt_auto = true;
 
     match &rettv.value {
-        TypvalValue::Func(_) => {
-            // Just a function: take over the function name directly
-            // and use selfdict.
-            let TypvalValue::Func(name) = std::mem::replace(&mut rettv.value, TypvalValue::Unknown) else {
-                unreachable!("matched TypvalValue::Func above");
+        TypvalValue::Func(_) | TypvalValue::String(_) => {
+            // Just a function (or a plain function-name string,
+            // treated identically - see this function's own doc
+            // comment): take over the name directly and use selfdict.
+            let name = match std::mem::replace(&mut rettv.value, TypvalValue::Unknown) {
+                TypvalValue::Func(name) | TypvalValue::String(name) => name,
+                _ => unreachable!("matched TypvalValue::Func | TypvalValue::String above"),
             };
             pt.pt_name = name;
         }
@@ -713,7 +731,7 @@ pub unsafe fn make_partial(selfdict: *mut DictT, rettv: &mut TypvalT) {
                 unsafe { crate::eval::typval::partial_unref(ret_pt) };
             }
         }
-        _ => unreachable!("make_partial's own safety doc guarantees rettv is Func or Partial here"),
+        _ => unreachable!("make_partial's own safety doc guarantees rettv is Func, String, or Partial here"),
     }
 
     rettv.value = TypvalValue::Partial(Box::into_raw(pt));
@@ -4533,6 +4551,40 @@ mod tests {
             assert!((*pt).pt_func.is_null());
             assert!((*pt).pt_argv.is_empty());
             // selfdict's own refcount was bumped by the new partial's hold.
+            assert_eq!((*d).dv_refcount, 2);
+            crate::eval::typval::partial_unref(pt);
+        }
+        unsafe { crate::eval::typval::tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn make_partial_treats_a_plain_string_identically_to_a_func_value() {
+        // A real, reachable input: tv_dict_get_callback's own gate
+        // accepts EITHER tv_is_func(...) (Func/Partial) OR a plain
+        // VAR_STRING value - the original's own make_partial handles
+        // both via one shared ternary (rettv->v_type == VAR_FUNC ||
+        // rettv->v_type == VAR_STRING ? rettv->vval.v_string : ...),
+        // so a String must bind into an auto-partial exactly like a
+        // Func does, not be silently discarded.
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp = Box::new(UfuncT {
+            uf_name: b"DictFunc\0".to_vec(),
+            uf_flags: fc_flags::DICT,
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        unsafe { (*d).dv_refcount = 1 };
+        let mut rettv = TypvalT { value: TypvalValue::String(Some(b"DictFunc".to_vec())), ..Default::default() };
+        unsafe { make_partial(d, &mut rettv) };
+
+        let TypvalValue::Partial(pt) = rettv.value else { panic!("expected a Partial") };
+        assert!(!pt.is_null());
+        unsafe {
+            assert_eq!((*pt).pt_name.as_deref(), Some(&b"DictFunc"[..]));
+            assert_eq!((*pt).pt_dict, d);
             assert_eq!((*d).dv_refcount, 2);
             crate::eval::typval::partial_unref(pt);
         }

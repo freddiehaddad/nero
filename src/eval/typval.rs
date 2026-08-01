@@ -1370,6 +1370,59 @@ pub fn callback_free(callback: &mut Callback) {
     *callback = Callback::None;
 }
 
+/// Get a function from a dictionary, storing it into `result`, and
+/// return whether this succeeded (`tv_dict_get_callback`).
+///
+/// `*result` is always set to [`Callback::None`] first, mirroring the
+/// original's own unconditional `result->type = kCallbackNone;` -
+/// stays that way both for the "key not found" (a real SUCCESS,
+/// matching the original's own `return true;` there) and the "found,
+/// but the wrong type" (a real FAILURE; the original's own
+/// `emsg("E6000: ...")` display is skipped, matching this module's
+/// established policy) cases. Only a genuinely successful Func/
+/// String/Partial value overwrites `*result`.
+///
+/// `tv_clear_simple` (not the generic, recursion-capable `tv_clear`)
+/// suffices for releasing the local, `tv_copy`'d working value at the
+/// end: by this point it can only be a `Func`/`String`/`Partial`
+/// (the earlier type check already ruled out everything else), none
+/// of which need `tv_clear`'s own recursive-tree-walk machinery -
+/// matching the same reasoning already established for
+/// `free_funccal_contents`.
+///
+/// # Safety
+/// `d`, if non-null, must be a valid, live [`crate::eval::typval_defs::DictT`].
+/// Forwards [`crate::eval::eval::set_selfdict`]/[`callback_from_typval`]'s
+/// own safety requirements for the found dictionary item's value.
+pub unsafe fn tv_dict_get_callback(d: *mut DictT, key: &[u8], result: &mut Callback) -> bool {
+    *result = Callback::None;
+
+    let d_opt = if d.is_null() { None } else { Some(unsafe { &mut *d }) };
+    let Some(di) = tv_dict_find(d_opt, key) else {
+        return true;
+    };
+
+    // SAFETY: `di` is a valid, live dictitem pointer, just found above.
+    let di_tv = unsafe { &(*di).di_tv };
+    if !tv_is_func(di_tv) && !matches!(di_tv.value, TypvalValue::String(_)) {
+        return false;
+    }
+
+    let mut tv = TypvalT::default();
+    tv_copy(di_tv, &mut tv);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::eval::set_selfdict(&mut tv, d) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let converted = unsafe { callback_from_typval(&tv) };
+    let ok = converted.is_some();
+    if let Some(cb) = converted {
+        *result = cb;
+    }
+    // SAFETY: `tv` is exclusively owned here, about to go out of scope.
+    unsafe { tv_clear_simple(&tv) };
+    ok
+}
+
 /// Free a dictionary item, also clearing the value (`tv_dict_item_free`).
 ///
 /// The original's `tv_clear(&item->di_tv)` is replicated via
@@ -6494,6 +6547,103 @@ mod tests {
         let mut cb = Callback::None;
         callback_free(&mut cb);
         assert_eq!(cb.kind(), CallbackType::None);
+    }
+
+    // ---- tv_dict_get_callback -----------------------------------------
+
+    #[test]
+    fn tv_dict_get_callback_missing_key_returns_true_with_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let mut result = Callback::Funcref(b"stale".to_vec());
+        let ok = unsafe { tv_dict_get_callback(d, b"MyCb", &mut result) };
+        assert!(ok, "a missing key is a real success, matching the original's own `return true;`");
+        assert_eq!(result.kind(), CallbackType::None, "must be reset even on the not-found path");
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_dict_get_callback_null_dict_returns_true_with_none() {
+        let mut result = Callback::Funcref(b"stale".to_vec());
+        let ok = unsafe { tv_dict_get_callback(std::ptr::null_mut(), b"MyCb", &mut result) };
+        assert!(ok);
+        assert_eq!(result.kind(), CallbackType::None);
+    }
+
+    #[test]
+    fn tv_dict_get_callback_wrong_type_returns_false_and_leaves_result_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        tv_dict_add_nr(unsafe { &mut *d }, b"MyCb", 42);
+        let mut result = Callback::None;
+        let ok = unsafe { tv_dict_get_callback(d, b"MyCb", &mut result) };
+        assert!(!ok, "a Number is neither tv_is_func nor a String - a real failure");
+        assert_eq!(result.kind(), CallbackType::None);
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_dict_get_callback_string_value_becomes_a_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        tv_dict_add_str(unsafe { &mut *d }, b"MyCb", Some(b"PlainFunc"));
+        let mut result = Callback::None;
+        let ok = unsafe { tv_dict_get_callback(d, b"MyCb", &mut result) };
+        assert!(ok);
+        assert!(matches!(&result, Callback::Funcref(name) if name == b"PlainFunc"));
+        callback_free(&mut result);
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_dict_get_callback_func_value_becomes_a_funcref() {
+        let _lock = crate::globals::global_state_test_lock();
+        let d = tv_dict_alloc();
+        let di = tv_dict_item_alloc(b"MyCb");
+        unsafe { (*di).di_tv.value = TypvalValue::Func(Some(b"PlainFunc".to_vec())) };
+        unsafe { tv_dict_add(&mut *d, di) };
+        let mut result = Callback::None;
+        let ok = unsafe { tv_dict_get_callback(d, b"MyCb", &mut result) };
+        assert!(ok);
+        assert!(matches!(&result, Callback::Funcref(name) if name == b"PlainFunc"));
+        callback_free(&mut result);
+        unsafe { tv_dict_unref(d) };
+    }
+
+    #[test]
+    fn tv_dict_get_callback_binds_selfdict_for_a_dict_function() {
+        // Exercises the exact real-world reason set_selfdict/
+        // make_partial must treat a plain String identically to a
+        // Func value (see make_partial's own doc comment) - a String
+        // naming a real FC_DICT function must come back as a Partial
+        // bound to `d`, not silently discarded.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::eval::userfunc::func_init();
+        let mut fp = Box::new(crate::eval::typval_defs::UfuncT {
+            uf_name: b"DictFunc\0".to_vec(),
+            uf_flags: crate::eval::userfunc::fc_flags::DICT,
+            ..Default::default()
+        });
+        unsafe { crate::eval::userfunc::func_hashtab_add(fp.as_mut() as *mut crate::eval::typval_defs::UfuncT) };
+
+        let d = tv_dict_alloc();
+        unsafe { (*d).dv_refcount = 1 };
+        tv_dict_add_str(unsafe { &mut *d }, b"MyCb", Some(b"DictFunc"));
+        let mut result = Callback::None;
+        let ok = unsafe { tv_dict_get_callback(d, b"MyCb", &mut result) };
+        assert!(ok);
+        let Callback::Partial(pt) = result else { panic!("expected a bound Partial") };
+        assert!(!pt.is_null());
+        unsafe {
+            assert_eq!((*pt).pt_dict, d);
+            assert!((*pt).pt_auto);
+            assert_eq!((*pt).pt_name.as_deref(), Some(&b"DictFunc"[..]));
+            // d's own refcount: 1 (test's own hold) + 1 (the new
+            // partial's own bound hold).
+            assert_eq!((*d).dv_refcount, 2);
+            partial_unref(pt);
+        }
+        unsafe { tv_dict_unref(d) };
     }
 
     #[test]
