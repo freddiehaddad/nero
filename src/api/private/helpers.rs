@@ -3,26 +3,25 @@
 //! machinery, `typval_T` <-> `Object` bridging, and the msgpack-rpc
 //! dispatch layer, none of which exist yet).
 //!
-//! Translated: [`find_window_by_handle`]/[`find_buffer_by_handle`]
-//! (the `window`/`buffer == 0 -> curwin`/`curbuf` special case, plus
-//! real, structured [`Error`] population on failure - matching the
+//! Translated: [`find_window_by_handle`]/[`find_buffer_by_handle`]/
+//! [`find_tab_by_handle`] (the `window`/`buffer`/`tabpage`
+//! `== 0 -> curwin`/`curbuf`/`curtab` special case, plus real,
+//! structured [`Error`] population on failure - matching the
 //! original's own `VALIDATE_INT`/`api_err_invalid` message format
 //! exactly, since `Error` is a real, returned value future API
 //! callers will read, not a skippable display side effect like
 //! `emsg()`).
 //!
-//! Deferred: `find_tabpage_by_handle` (same shape, not needed yet -
-//! `api/tabpage.c` hasn't been started), `api_set_error`/
-//! `api_err_invalid` themselves (both are generic, variadic/printf-
-//! style message formatters; this crate uses Rust's own `format!`
-//! directly at each real call site instead of translating the
-//! general mechanism, matching the established `fmt_g`-style "a
-//! narrow, purpose-built helper for one call site, not a general
-//! `vim_snprintf`" precedent - if/when a second real caller needs
-//! this, revisit whether a shared helper is worthwhile).
+//! Deferred: `api_set_error`/`api_err_invalid` themselves (both are
+//! generic, variadic/printf-style message formatters; this crate uses
+//! Rust's own `format!` directly at each real call site instead of
+//! translating the general mechanism, matching the established
+//! `fmt_g`-style "a narrow, purpose-built helper for one call site,
+//! not a general `vim_snprintf`" precedent - if/when a second real
+//! caller needs this, revisit whether a shared helper is worthwhile).
 
-use crate::api::private::defs::{Buffer, Error, ErrorType, Window};
-use crate::buffer_defs::{BufT, WinT};
+use crate::api::private::defs::{Buffer, Error, ErrorType, Tabpage, Window};
+use crate::buffer_defs::{BufT, TabpageT, WinT};
 
 /// Find window `window` (a real window handle, or `0` for the current
 /// window), populating `err` with a real, structured
@@ -66,6 +65,29 @@ pub unsafe fn find_buffer_by_handle(buffer: Buffer, err: &mut Error) -> *mut Buf
     if rv.is_null() {
         err.r#type = ErrorType::Validation;
         err.msg = Some(format!("Invalid buffer id: {buffer}"));
+    }
+    rv
+}
+
+/// Find tab page `tabpage` (a real tabpage handle, or `0` for the
+/// current tabpage), populating `err` with a real, structured
+/// `"Invalid tabpage id: {tabpage}"` message on failure
+/// (`find_tab_by_handle`).
+///
+/// # Safety
+/// Forwarded from [`crate::window::handle_get_tabpage`]'s own safety
+/// doc.
+pub unsafe fn find_tab_by_handle(tabpage: Tabpage, err: &mut Error) -> *mut TabpageT {
+    if tabpage == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let rv = unsafe { crate::window::handle_get_tabpage(tabpage) };
+    if rv.is_null() {
+        err.r#type = ErrorType::Validation;
+        err.msg = Some(format!("Invalid tabpage id: {tabpage}"));
     }
     rv
 }
@@ -265,6 +287,72 @@ mod tests {
             assert!(std::ptr::eq(found, curbuf_ptr));
             assert!(!std::ptr::eq(found, other_ptr));
             assert!(!err.is_set());
+        }
+    }
+
+    /// A `tabpage == 0` request always resolves to `GLOBALS.curtab`,
+    /// regardless of whether it is registered in
+    /// `GLOBALS.first_tabpage`'s own list (matching the original's
+    /// own unconditional `tabpage == 0` fast path).
+    #[test]
+    fn find_tab_by_handle_zero_resolves_to_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut tab = TabpageT { handle: 42, ..Default::default() };
+            let tab_ptr = std::ptr::addr_of_mut!(tab);
+            let prev_curtab = crate::globals::GLOBALS.get_mut().curtab;
+            crate::globals::GLOBALS.get_mut().curtab = tab_ptr;
+
+            let mut err = Error::default();
+            let found = find_tab_by_handle(0, &mut err);
+
+            crate::globals::GLOBALS.get_mut().curtab = prev_curtab;
+
+            assert!(std::ptr::eq(found, tab_ptr));
+            assert!(!err.is_set());
+        }
+    }
+
+    /// A real, positive handle resolves via [`crate::window::
+    /// handle_get_tabpage`]'s own tabpage-list walk, leaving `err`
+    /// untouched on success.
+    #[test]
+    fn find_tab_by_handle_resolves_a_real_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let mut tab = TabpageT { handle: 7, ..Default::default() };
+            let tab_ptr = std::ptr::addr_of_mut!(tab);
+            let prev_first_tabpage = crate::globals::GLOBALS.get_mut().first_tabpage;
+            crate::globals::GLOBALS.get_mut().first_tabpage = tab_ptr;
+
+            let mut err = Error::default();
+            let found = find_tab_by_handle(7, &mut err);
+
+            crate::globals::GLOBALS.get_mut().first_tabpage = prev_first_tabpage;
+
+            assert!(std::ptr::eq(found, tab_ptr));
+            assert!(!err.is_set());
+        }
+    }
+
+    /// An unrecognized tabpage handle returns null and populates
+    /// `err` with the exact original message format.
+    #[test]
+    fn find_tab_by_handle_reports_a_structured_error_for_an_unknown_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev_first_tabpage = crate::globals::GLOBALS.get_mut().first_tabpage;
+            crate::globals::GLOBALS.get_mut().first_tabpage = std::ptr::null_mut();
+
+            let mut err = Error::default();
+            let found = find_tab_by_handle(999, &mut err);
+
+            crate::globals::GLOBALS.get_mut().first_tabpage = prev_first_tabpage;
+
+            assert!(found.is_null());
+            assert!(err.is_set());
+            assert_eq!(err.r#type, ErrorType::Validation);
+            assert_eq!(err.msg.as_deref(), Some("Invalid tabpage id: 999"));
         }
     }
 }

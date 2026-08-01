@@ -4,4 +4,6 @@
 pub mod buffer;
 pub mod extmark;
 pub mod private;
+pub mod tabpage;
+pub mod vim;
 pub mod window;

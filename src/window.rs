@@ -1002,6 +1002,37 @@ pub unsafe fn find_tabpage(n: i32) -> *mut crate::buffer_defs::TabpageT {
     tp
 }
 
+/// Find tab page `handle` in `GLOBALS.first_tabpage`'s own `tp_next`
+/// list, or a null pointer if not found (`handle_get_tabpage`,
+/// `api/private/helpers.h`). A plain `pmap_get(int)(&tabpage_handles,
+/// (h))` in the original - this crate has no such registry, so this
+/// walks the real tabpage list directly instead, matching
+/// `handle_get_window`/`handle_get_buffer`'s own already-established
+/// treatment of the identical macro family. Unlike [`find_tabpage`]
+/// (which finds by 1-based POSITION), this finds by `TabpageT.handle`,
+/// genuinely different lookups the original itself keeps separate too
+/// (`find_tabpage`'s own real callers, e.g. `tabpagenr()`'s digit
+/// argument, never go through `handle_get_tabpage` at all).
+///
+/// # Safety
+/// Same as [`valid_tabpage`].
+#[must_use]
+pub unsafe fn handle_get_tabpage(
+    handle: crate::types_defs::HandleT,
+) -> *mut crate::buffer_defs::TabpageT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*tp }.handle == handle {
+            return tp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    std::ptr::null_mut()
+}
+
 /// Lowest real window handle used as a genuine window ID rather than
 /// a window NUMBER within the current tab page (`LOWEST_WIN_ID`,
 /// `window.h`).
@@ -3492,6 +3523,29 @@ mod tests {
         let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
 
         assert!(unsafe { find_tabpage(99) }.is_null());
+    }
+
+    #[test]
+    fn handle_get_tabpage_finds_a_matching_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = crate::buffer_defs::TabpageT { handle: 7, ..Default::default() };
+        let second_ptr = &mut second as *mut crate::buffer_defs::TabpageT;
+        let mut first =
+            crate::buffer_defs::TabpageT { handle: 3, tp_next: second_ptr, ..Default::default() };
+        let first_ptr = &mut first as *mut crate::buffer_defs::TabpageT;
+        let _guard = FirstTabpageGuard::set(first_ptr);
+
+        assert_eq!(unsafe { handle_get_tabpage(7) }, second_ptr);
+        assert_eq!(unsafe { handle_get_tabpage(3) }, first_ptr);
+    }
+
+    #[test]
+    fn handle_get_tabpage_null_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT { handle: 3, ..Default::default() };
+        let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        assert!(unsafe { handle_get_tabpage(99) }.is_null());
     }
 
     #[test]
