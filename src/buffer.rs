@@ -203,6 +203,39 @@ pub unsafe fn buflist_findnr(nr: i32) -> *mut BufT {
     std::ptr::null_mut()
 }
 
+/// Find buffer `handle` in the global buffer list, or a null pointer
+/// if not found (`handle_get_buffer`, `api/private/helpers.h`). A
+/// plain `pmap_get(int)(&buffer_handles, (h))` in the original - this
+/// crate has no such registry, so this walks `GLOBALS.lastbuf`/
+/// `b_prev` directly instead, matching the real registry's own
+/// observable content (every live buffer, and only live buffers).
+///
+/// Unlike [`buflist_findnr`], this has NO `handle == 0` special case
+/// at all - that special case belongs to `buflist_findnr` itself (its
+/// own `nr == 0` means "the alternate buffer"), not to the real
+/// `handle_get_buffer` macro this function translates (a buffer
+/// handle of `0` is simply never a real buffer, since handles start
+/// at `1`, so a bare `handle_get_buffer(0)` always correctly finds
+/// nothing).
+///
+/// # Safety
+/// `GLOBALS.lastbuf`'s own `b_prev` chain must consist of valid, live
+/// pointers.
+#[must_use]
+pub unsafe fn handle_get_buffer(handle: crate::types_defs::HandleT) -> *mut BufT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut bp: *mut BufT = unsafe { GLOBALS.get_mut() }.lastbuf;
+    while !bp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*bp }.handle == handle {
+            return bp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        bp = unsafe { &*bp }.b_prev;
+    }
+    std::ptr::null_mut()
+}
+
 /// `true` if `buf` is a prompt buffer (`bt_prompt`).
 #[must_use]
 pub fn bt_prompt(buf: Option<&BufT>) -> bool {
@@ -1169,6 +1202,52 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = self.previous;
         }
+    }
+
+    #[test]
+    fn handle_get_buffer_finds_the_lastbuf_head() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 9, ..Default::default() };
+        let _guard = LastbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(std::ptr::eq(unsafe { handle_get_buffer(9) }, &buf as *const BufT));
+    }
+
+    #[test]
+    fn handle_get_buffer_walks_the_b_prev_chain() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = BufT { handle: 7, ..Default::default() };
+        let mut first =
+            BufT { handle: 3, b_prev: &mut second as *mut BufT, ..Default::default() };
+        let _guard = LastbufGuard::set(&mut first as *mut BufT);
+
+        assert!(std::ptr::eq(unsafe { handle_get_buffer(7) }, &second as *const BufT));
+        assert!(std::ptr::eq(unsafe { handle_get_buffer(3) }, &first as *const BufT));
+    }
+
+    #[test]
+    fn handle_get_buffer_null_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 3, ..Default::default() };
+        let _guard = LastbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(unsafe { handle_get_buffer(99) }.is_null());
+    }
+
+    /// Unlike `buflist_findnr(0)` (which resolves `0` to
+    /// `curwin.w_alt_fnum`), `handle_get_buffer` has no `handle == 0`
+    /// special case at all - a `lastbuf` list containing a buffer
+    /// literally named handle `0` (never a real buffer number in
+    /// practice, but not disallowed by this function's own contract)
+    /// would still be found, confirming there is no hidden alt-fnum
+    /// substitution happening here.
+    #[test]
+    fn handle_get_buffer_has_no_zero_special_case_unlike_buflist_findnr() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { handle: 0, ..Default::default() };
+        let _guard = LastbufGuard::set(&mut buf as *mut BufT);
+
+        assert!(std::ptr::eq(unsafe { handle_get_buffer(0) }, &buf as *const BufT));
     }
 
     #[test]
