@@ -560,6 +560,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"histnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::cmdhist::f_histnr });
         m.insert(&b"histget"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::cmdhist::f_histget });
         m.insert(&b"undotree"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::undo::f_undotree });
+        m.insert(&b"undofile"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::undo::f_undofile });
         m.insert(&b"stdpath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: BASE_NONE, func: f_stdpath });
         m.insert(&b"winlayout"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_winlayout });
         m.insert(&b"winrestcmd"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_winrestcmd });
@@ -8265,6 +8266,7 @@ mod tests {
             "histnr",
             "histget",
             "undotree",
+            "undofile",
             "stdpath",
             "winlayout",
             "winrestcmd",

@@ -68,7 +68,20 @@
 //! `UndoCheckpoint` struct, `u_clearall`, and `buffer.rs`'s
 //! `buf_get_changedtick` - returns the checkpoint BY VALUE rather than
 //! through the original's own out-parameter, matching this crate's
-//! established convention).
+//! established convention); `u_get_undo_file_name`/`f_undofile`
+//! (`"undofile({name})"`) - re-investigated after being stale-bundled
+//! with its genuinely-still-blocked `u_write_undo`/`u_read_undo`
+//! siblings below (this specific function's own real body never
+//! actually needs `os_getperm`/`smsg`/the serialization format at
+//! all): needed only already-existing `option::copy_option_part`/
+//! `path::{path_tail, vim_ispathsep, vim_ispathsep_nocolon,
+//! concat_fnames, full_name_save}`/`os::fs::{os_isdir, os_path_exists,
+//! os_mkdir_recurse}`. The original's own non-Windows-only symlink-
+//! canonicalization step (`resolve_symlink`, gated behind `#ifdef
+//! HAVE_READLINK`, not yet translated) is NOT modeled - a documented,
+//! narrow gap, noted on `u_get_undo_file_name` itself. A real
+//! directory-creation-failure `emsg("E5003: ...")` has its display
+//! skipped, matching this file's own established policy (see below).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
@@ -81,18 +94,18 @@
 //!   `u_save*` family, which only *records* undo information) - need
 //!   `autocmd.c` triggers plus a substantial amount of cursor/screen
 //!   restoration logic - not (re-)examined in detail yet.
-//! - `u_compute_hash`/`u_get_undo_file_name`/`u_write_undo`/
-//!   `u_read_undo`/`serialize_*`/`unserialize_*`: undo-FILE
-//!   persistence. Re-checked after `os/fs.rs` gained real `os_open` -
-//!   the "blocked on the libuv FFI-vs-crate decision" framing was
-//!   stale (real file I/O is no longer the blocker), but these are
-//!   still genuinely blocked for other reasons: `u_write_undo` alone
-//!   needs real user-facing `smsg`/verbose messages (`message.c`,
-//!   still not tractable), `os_getperm` (still deferred, see
-//!   `os/fs.rs`'s own module doc), `'undodir'`-based directory search
-//!   (`u_get_undo_file_name`), and its own serialization format
-//!   (`serialize_header`/`serialize_uhp`/etc., not yet examined) -
-//!   still a substantial, separate undertaking.
+//! - `u_compute_hash`/`u_write_undo`/`u_read_undo`/`serialize_*`/
+//!   `unserialize_*`: undo-FILE persistence (distinct from the now-
+//!   translated `u_get_undo_file_name` above, which only computes the
+//!   file's own NAME, not its contents). Re-checked after `os/fs.rs`
+//!   gained real `os_open` - the "blocked on the libuv FFI-vs-crate
+//!   decision" framing was stale (real file I/O is no longer the
+//!   blocker), but these are still genuinely blocked for other
+//!   reasons: `u_write_undo` alone needs real user-facing `smsg`/
+//!   verbose messages (`message.c`, still not tractable), `os_getperm`
+//!   (still deferred, see `os/fs.rs`'s own module doc), and its own
+//!   serialization format (`serialize_header`/`serialize_uhp`/etc.,
+//!   not yet examined) - still a substantial, separate undertaking.
 //! - `u_undoline` (the "U" command's actual undo/redo-toggle logic,
 //!   distinct from the now-translated `u_saveline` save-side helper):
 //!   needs `extmark_splice_cols` (the extmark subsystem, not yet
@@ -1290,6 +1303,129 @@ pub fn u_checkpoint(buf: &mut BufT) -> UndoCheckpoint {
     buf.b_p_ul = i64::from(i32::MAX); // Make sure we can undo all changes.
 
     uc
+}
+
+/// Return an allocated string of the full path of the target undofile
+/// (`u_get_undo_file_name`), searching `'undodir'`'s comma-separated
+/// entries in order.
+///
+/// `buf_ffname` being `None` mirrors the original's own real
+/// `NULL`-checked parameter (its own early `if (ffname == NULL) return
+/// NULL;`).
+///
+/// The original's own non-Windows-only symlink-canonicalization step
+/// (`resolve_symlink`, gated behind `#ifdef HAVE_READLINK`, not yet
+/// translated) is NOT modeled here - a documented, narrow gap: on a
+/// real non-Windows session, two symlinks pointing at the same real
+/// file would share ONE undo file (computed from the resolved
+/// target's own directory/name); here, each symlink gets its own,
+/// separate undo file instead (computed from the symlink path
+/// itself) - a real, if rare, behavioral difference, not silently
+/// hidden.
+///
+/// A directory-creation failure has its real `emsg("E5003: ...")`
+/// display skipped (`message.c`'s pipeline is not tractable), matching
+/// this file's established policy elsewhere (`u_get_headentry`/
+/// `u_getbot`/`ex_undojoin`) - the exact same fallback control flow
+/// (treat the directory as still unusable, continue to the next
+/// `'undodir'` entry) is kept.
+#[must_use]
+pub fn u_get_undo_file_name(buf_ffname: Option<&[u8]>, reading: bool) -> Option<Vec<u8>> {
+    let ffname = buf_ffname?;
+
+    // SAFETY: momentary read of `OPTION_VARS`, cloned out immediately -
+    // no dangling reference, matching `option::csh_like_shell`'s own
+    // established pattern for this exact situation.
+    let p_udir = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_udir
+        .clone()
+        .unwrap_or_default();
+
+    let mut munged_name: Option<Vec<u8>> = None;
+    let mut undo_file_name: Option<Vec<u8>> = None;
+    let mut dirp = 0usize;
+
+    // Loop over 'undodir'. When reading, find the first file that
+    // exists. When not reading, use the first directory that exists
+    // (or create it, if it's the last one in the list).
+    while dirp < p_udir.len() {
+        let (mut dir_name, next_dirp) =
+            crate::option::copy_option_part(&p_udir, dirp, crate::os::os_defs::MAXPATHL as usize, b",");
+        dirp = next_dirp;
+
+        if dir_name.len() == 1 && dir_name[0] == b'.' {
+            // Use the same directory as ffname: "dir/name" -> "dir/.name.un~".
+            let tail = crate::path::path_tail(ffname);
+            let mut result = Vec::with_capacity(ffname.len() + 5);
+            result.extend_from_slice(&ffname[..tail]);
+            result.push(b'.');
+            result.extend_from_slice(&ffname[tail..]);
+            result.extend_from_slice(b".un~");
+            undo_file_name = Some(result);
+        } else {
+            // Remove trailing pathseps from the directory name.
+            while dir_name.len() > 1
+                && crate::path::vim_ispathsep_nocolon(i32::from(*dir_name.last().unwrap()))
+            {
+                dir_name.pop();
+            }
+
+            let mut has_directory = std::str::from_utf8(&dir_name)
+                .is_ok_and(|s| crate::os::fs::os_isdir(std::path::Path::new(s)));
+            if !has_directory && dirp >= p_udir.len() && !reading {
+                // Last directory in the list does not exist, create it.
+                if crate::os::fs::os_mkdir_recurse(&dir_name, 0o755).is_ok() {
+                    has_directory = true;
+                }
+            }
+            if has_directory {
+                if munged_name.is_none() {
+                    let mut m = ffname.to_vec();
+                    for b in &mut m {
+                        if crate::path::vim_ispathsep(i32::from(*b)) {
+                            *b = b'%';
+                        }
+                    }
+                    munged_name = Some(m);
+                }
+                undo_file_name = Some(crate::path::concat_fnames(&dir_name, munged_name.as_deref().unwrap(), true));
+            }
+        }
+
+        // When reading, check if the file exists.
+        if let Some(name) = &undo_file_name {
+            let exists =
+                std::str::from_utf8(name).is_ok_and(|s| crate::os::fs::os_path_exists(std::path::Path::new(s)));
+            if !reading || exists {
+                break;
+            }
+        }
+        undo_file_name = None;
+    }
+
+    undo_file_name
+}
+
+/// `undofile({name})` - the name of the undo file that would be used
+/// for a file named `{name}` when writing, per `'undodir'`
+/// (`f_undofile`), via the above [`u_get_undo_file_name`].
+///
+/// # Safety
+/// `argvars[0]` must be present (guaranteed by this function's own
+/// `min_argc: 1` registration).
+pub unsafe fn f_undofile(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let fname = crate::eval::typval::tv_get_string(&argvars[0]);
+
+    rettv.value = crate::eval::typval_defs::TypvalValue::String(if fname.is_empty() {
+        // If there is no file name there will be no undo file.
+        None
+    } else {
+        crate::path::full_name_save(Some(&fname), true)
+            .and_then(|ffname| u_get_undo_file_name(Some(&ffname), false))
+    });
 }
 
 #[cfg(test)]
@@ -2998,5 +3134,153 @@ mod tests {
         // SAFETY: `d` is still exclusively owned; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    // --- u_get_undo_file_name / f_undofile ---
+
+    fn set_p_udir(value: &[u8]) {
+        // SAFETY: momentary write, matching `set_p_sps`'s own
+        // established pattern in `spellsuggest.rs`.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_udir = Some(value.to_vec());
+    }
+
+    #[test]
+    fn u_get_undo_file_name_returns_none_for_no_ffname() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_p_udir(b".");
+        assert_eq!(u_get_undo_file_name(None, false), None);
+    }
+
+    #[test]
+    fn u_get_undo_file_name_dot_entry_uses_ffname_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_p_udir(b".");
+        // path_tail(b"/tmp/foo.txt") == 5 (just past the '/' before
+        // "foo.txt") - hand-traced: byte 4 is '/', byte 5 is 'f'.
+        let result = u_get_undo_file_name(Some(b"/tmp/foo.txt"), false);
+        assert_eq!(result, Some(b"/tmp/.foo.txt.un~".to_vec()));
+    }
+
+    #[test]
+    fn u_get_undo_file_name_dot_entry_with_no_directory_component() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_p_udir(b".");
+        // No path separator at all - path_tail returns 0, so the
+        // whole name becomes the "tail" and the directory part is
+        // empty: "foo.txt" -> ".foo.txt.un~".
+        let result = u_get_undo_file_name(Some(b"foo.txt"), false);
+        assert_eq!(result, Some(b".foo.txt.un~".to_vec()));
+    }
+
+    #[test]
+    fn u_get_undo_file_name_skips_a_nonexistent_non_last_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The first entry doesn't exist as a directory and ISN'T the
+        // last entry, so no creation is attempted for it - the loop
+        // falls through to the "." entry instead.
+        set_p_udir(b"/this/does/not/exist/nero_test,.");
+        let result = u_get_undo_file_name(Some(b"/tmp/foo.txt"), false);
+        assert_eq!(result, Some(b"/tmp/.foo.txt.un~".to_vec()));
+    }
+
+    #[test]
+    fn u_get_undo_file_name_uses_a_real_existing_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let tempdir = std::env::temp_dir();
+        let tempdir_bytes = tempdir.to_string_lossy().as_bytes().to_vec();
+        set_p_udir(&tempdir_bytes);
+
+        let ffname = b"a/b.txt";
+        let result = u_get_undo_file_name(Some(ffname), false);
+
+        // Derive the expected value via the SAME already-tested
+        // building blocks. `std::env::temp_dir()` typically returns a
+        // path WITH a trailing separator on Windows - replicate
+        // `u_get_undo_file_name`'s own trailing-pathsep-stripping step
+        // first (it always strips before calling `concat_fnames`),
+        // rather than hardcoding which separator `concat_fnames`
+        // itself would add.
+        let mut dir_name = tempdir_bytes.clone();
+        while dir_name.len() > 1 && crate::path::vim_ispathsep_nocolon(i32::from(*dir_name.last().unwrap())) {
+            dir_name.pop();
+        }
+        let munged: Vec<u8> = ffname.iter().map(|&b| if crate::path::vim_ispathsep(i32::from(b)) { b'%' } else { b }).collect();
+        let expected = crate::path::concat_fnames(&dir_name, &munged, true);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn u_get_undo_file_name_creates_a_missing_last_directory_when_not_reading() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dir = std::env::temp_dir().join("nero_undofile_test_create_not_reading");
+        // Clean up any stale directory from a prior interrupted run.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        let dir_bytes = dir.to_string_lossy().as_bytes().to_vec();
+        set_p_udir(&dir_bytes);
+
+        let result = u_get_undo_file_name(Some(b"a/b.txt"), false);
+        assert!(result.is_some(), "should have created the directory and produced a name");
+        assert!(dir.is_dir(), "the missing directory should now exist");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn u_get_undo_file_name_does_not_create_a_missing_directory_when_reading() {
+        let _lock = crate::globals::global_state_test_lock();
+        let dir = std::env::temp_dir().join("nero_undofile_test_no_create_reading");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+
+        let dir_bytes = dir.to_string_lossy().as_bytes().to_vec();
+        set_p_udir(&dir_bytes);
+
+        let result = u_get_undo_file_name(Some(b"a/b.txt"), true);
+        assert_eq!(result, None, "reading=true must never create a directory, and the file can't possibly exist");
+        assert!(!dir.exists(), "the directory must NOT have been created");
+    }
+
+    #[test]
+    fn f_undofile_empty_name_returns_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::String(Some(Vec::new())),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undofile(std::slice::from_ref(&arg), &mut rettv) };
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::String(None));
+    }
+
+    #[test]
+    fn f_undofile_resolves_a_real_relative_name_via_full_name_save() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_p_udir(b".");
+
+        let arg = crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::String(Some(b"nero_undofile_f_test.txt".to_vec())),
+            ..Default::default()
+        };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_undofile(std::slice::from_ref(&arg), &mut rettv) };
+
+        // f_undofile resolves the name to an absolute path via
+        // full_name_save first, then applies the exact same
+        // ".name.un~" transform u_get_undo_file_name_dot_entry_*
+        // already verified directly - re-derive the expected value
+        // via the SAME already-tested full_name_save/path_tail
+        // building blocks, rather than hardcoding a CWD-dependent
+        // absolute path.
+        let ffname = crate::path::full_name_save(Some(b"nero_undofile_f_test.txt"), true).unwrap();
+        let tail = crate::path::path_tail(&ffname);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&ffname[..tail]);
+        expected.push(b'.');
+        expected.extend_from_slice(&ffname[tail..]);
+        expected.extend_from_slice(b".un~");
+
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::String(Some(expected)));
     }
 }
