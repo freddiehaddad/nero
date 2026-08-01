@@ -286,6 +286,13 @@
 //! `v:register` when `{regname}` is omitted). The `{list}`-truthy
 //! path panics inside `get_reg_contents` itself, matching that
 //! function's own already-documented `kGRegList` deferral.
+//!
+//! Also `buffer_exists()`/`buffer_name()`/`buffer_number()` -
+//! `eval.lua`'s own deprecated aliases for `bufexists()`/`bufname()`/
+//! `bufnr()` (`func = 'f_bufexists'`/`'f_bufname'`/`'f_bufnr'` in the
+//! generator data - the LITERAL SAME C function, just registered a
+//! second time under an obsolete name), registered pointing at the
+//! exact same already-translated `f_bufexists`/`f_bufname`/`f_bufnr`.
 
 use crate::eval::typval_defs::{TypvalT, TypvalValue};
 use crate::eval::userfunc::FnameTransError;
@@ -435,6 +442,13 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"bufloaded"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufloaded });
         m.insert(&b"bufname"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufname });
         m.insert(&b"bufnr"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_bufnr });
+        // Deprecated aliases (eval.lua: buffer_exists/buffer_name/buffer_number)
+        // - literally the SAME C function pointer as their modern
+        // counterparts (f_bufexists/f_bufname/f_bufnr), just registered
+        // under an obsolete name too.
+        m.insert(&b"buffer_exists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufexists });
+        m.insert(&b"buffer_name"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufname });
+        m.insert(&b"buffer_number"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: crate::eval::buffer::f_bufnr });
         m.insert(&b"bufwinid"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufwinid });
         m.insert(&b"bufwinnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufwinnr });
         m.insert(&b"swapname"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_swapname });
@@ -8259,9 +8273,68 @@ mod tests {
             "getmatches",
             "sort",
             "uniq",
+            "buffer_exists",
+            "buffer_name",
+            "buffer_number",
         ] {
             assert!(find_internal_func(name.as_bytes()).is_some(), "{name} should be registered");
         }
+    }
+
+    #[test]
+    fn buffer_exists_name_number_alias_the_same_functions_as_bufexists_bufname_bufnr() {
+        // Deprecated aliases (eval.lua's own `buffer_exists`/
+        // `buffer_name`/`buffer_number`) must be registered with the
+        // exact same argument-count bounds AND produce IDENTICAL
+        // observable behavior as their modern counterparts - not just
+        // "some function is registered under this name". Deliberately
+        // does NOT compare `.func` function-pointer VALUES for
+        // equality (via `==`/`as usize`/`std::ptr::fn_addr_eq`): this
+        // is a genuine Rust-level non-guarantee, not just a style
+        // preference - confirmed directly via `cargo miri test`
+        // (which does not perform the same codegen-unit merging real
+        // native compilation does, so the SAME function coerced to a
+        // pointer at 2 different call sites can legitimately compare
+        // as unequal under Miri) AND rustc's own
+        // `unpredictable_function_pointer_comparisons` lint
+        // ("different functions could have the same address after
+        // being merged together" - the inverse risk). Calling both
+        // and comparing their OUTPUT is the only semantically
+        // meaningful - and Miri-safe - way to verify "these 2
+        // registrations behave identically".
+        let alias_exists = find_internal_func(b"buffer_exists").unwrap();
+        let modern_exists = find_internal_func(b"bufexists").unwrap();
+        assert_eq!(alias_exists.min_argc, modern_exists.min_argc);
+        assert_eq!(alias_exists.max_argc, modern_exists.max_argc);
+        assert_eq!(alias_exists.base_arg, modern_exists.base_arg);
+        let args = [num(999_999)];
+        let mut rettv1 = TypvalT::default();
+        let mut rettv2 = TypvalT::default();
+        unsafe { (alias_exists.func)(&args, &mut rettv1) };
+        unsafe { (modern_exists.func)(&args, &mut rettv2) };
+        assert_eq!(rettv1.value, rettv2.value);
+
+        let alias_name = find_internal_func(b"buffer_name").unwrap();
+        let modern_name = find_internal_func(b"bufname").unwrap();
+        assert_eq!(alias_name.min_argc, modern_name.min_argc);
+        assert_eq!(alias_name.max_argc, modern_name.max_argc);
+        assert_eq!(alias_name.base_arg, modern_name.base_arg);
+        let mut rettv3 = TypvalT::default();
+        let mut rettv4 = TypvalT::default();
+        unsafe { (alias_name.func)(&args, &mut rettv3) };
+        unsafe { (modern_name.func)(&args, &mut rettv4) };
+        assert_eq!(rettv3.value, rettv4.value);
+
+        let alias_number = find_internal_func(b"buffer_number").unwrap();
+        let modern_number = find_internal_func(b"bufnr").unwrap();
+        assert_eq!(alias_number.min_argc, modern_number.min_argc);
+        assert_eq!(alias_number.max_argc, modern_number.max_argc);
+        assert_eq!(alias_number.base_arg, modern_number.base_arg);
+        let mut rettv5 = TypvalT::default();
+        let mut rettv6 = TypvalT::default();
+        unsafe { (alias_number.func)(&args, &mut rettv5) };
+        unsafe { (modern_number.func)(&args, &mut rettv6) };
+        assert_eq!(rettv5.value, rettv6.value);
     }
 
     // --- single-argument float math builtins ---

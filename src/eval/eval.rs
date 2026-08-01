@@ -9925,6 +9925,39 @@ mod tests {
         reset_globals_for_test();
     }
 
+    #[test]
+    fn e2e_buffer_exists_name_number_deprecated_aliases_match_their_modern_counterparts() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // A deliberately absurd buffer number that cannot exist in a
+        // fresh test session - the deprecated alias and its modern
+        // counterpart must agree exactly (they're literally the same
+        // C function, just registered under 2 different names).
+        let (ret1, tv1) = eval_str(b"bufexists(999999)");
+        let (ret2, tv2) = eval_str(b"buffer_exists(999999)");
+        assert_eq!(ret1, OK);
+        assert_eq!(ret2, OK);
+        assert_eq!(tv1.value, TypvalValue::Number(0));
+        assert_eq!(tv2.value, TypvalValue::Number(0));
+
+        let (ret3, tv3) = eval_str(b"bufname(999999)");
+        let (ret4, tv4) = eval_str(b"buffer_name(999999)");
+        assert_eq!(ret3, OK);
+        assert_eq!(ret4, OK);
+        assert_eq!(tv3.value, TypvalValue::String(None));
+        assert_eq!(tv4.value, TypvalValue::String(None));
+
+        let (ret5, tv5) = eval_str(b"bufnr(999999)");
+        let (ret6, tv6) = eval_str(b"buffer_number(999999)");
+        assert_eq!(ret5, OK);
+        assert_eq!(ret6, OK);
+        assert_eq!(tv5.value, TypvalValue::Number(-1));
+        assert_eq!(tv6.value, TypvalValue::Number(-1));
+
+        reset_globals_for_test();
+    }
+
     // --- get_literal_key ---
 
     #[test]
