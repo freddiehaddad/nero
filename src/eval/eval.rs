@@ -2815,6 +2815,28 @@ unsafe fn eval_index(
     (OK, pos)
 }
 
+/// `slice({expr}, {start} [, {end}])` - like `{expr}[{start} : {end}]`
+/// but with `{end}` EXCLUSIVE and, for a `String`, character (not
+/// byte) indices (`f_slice`, `eval.c`), via [`check_can_index`]/
+/// `tv_copy`/[`eval_index_inner`]. `rettv` is left at its caller's own
+/// default (`Unknown`) when `{expr}` isn't indexable at all
+/// (`check_can_index` returning `FAIL`) - the original's own bare
+/// `return;` for that case never touches `rettv` either.
+///
+/// # Safety
+/// Forwards `tv_copy`/[`eval_index_inner`]'s own safety docs for
+/// `argvars[0]`'s current value.
+pub(crate) unsafe fn f_slice(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if check_can_index(&argvars[0], true, false) != OK {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::typval::tv_copy(&argvars[0], rettv) };
+    let var2 = if argvars.len() > 2 { Some(&argvars[2]) } else { None };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { eval_index_inner(rettv, true, Some(&argvars[1]), var2, true, None, false) };
+}
+
 /// Turn `rettv`'s `"dict.Func"` value into a partial bound to
 /// `selfdict`, unless it is ALREADY a partial that was bound
 /// EXPLICITLY (`pt_auto == false`) rather than by this exact
@@ -10313,6 +10335,54 @@ mod tests {
         let (ret, tv) = eval_str(b"\"hello\"[1]");
         assert_eq!(ret, OK);
         assert_eq!(tv.value, TypvalValue::String(Some(b"e".to_vec())));
+    }
+
+    #[test]
+    fn e2e_slice_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        // A List: slice()'s own end index is EXCLUSIVE, unlike a
+        // plain [start:end] subscript's own inclusive end.
+        let (ret, tv) = eval_str(b"slice([1, 2, 3, 4, 5], 1, 3)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!((*l).lv_len, 2);
+            let first = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(2));
+            let second = (*first).li_next;
+            assert_eq!((*second).li_tv.value, TypvalValue::Number(3));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        // A List, 2-argument form (no {end}) - continues to the last
+        // item.
+        let (ret, tv) = eval_str(b"slice([1, 2, 3, 4, 5], 3)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!((*l).lv_len, 2);
+            let first = crate::eval::typval::tv_list_first(l);
+            assert_eq!((*first).li_tv.value, TypvalValue::Number(4));
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        // A String: slice() uses CHARACTER indices, not byte indices -
+        // contrast with e2e_string_index_subscript_is_byte_indexed's
+        // own plain-subscript, byte-indexed behavior above.
+        let (ret, tv) = eval_str(b"slice(\"hello\", 1, 3)");
+        assert_eq!(ret, OK);
+        assert_eq!(tv.value, TypvalValue::String(Some(b"el".to_vec())));
+
+        // {end} == -1: "the last item is omitted" (the doc's own
+        // wording) - indices 1..3 inclusive, excluding index 4.
+        let (ret, tv) = eval_str(b"slice([1, 2, 3, 4, 5], 1, -1)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!((*l).lv_len, 3);
+            crate::eval::typval::tv_list_unref(l);
+        }
     }
 
     #[test]
