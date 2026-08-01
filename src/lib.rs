@@ -116,6 +116,7 @@ pub mod plines;
 pub mod popupmenu;
 pub mod pos_defs;
 pub mod profile;
+pub mod quickfix;
 pub mod regexp_defs;
 pub mod register;
 pub mod register_defs;
