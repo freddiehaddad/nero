@@ -102,6 +102,27 @@
 //! none translated) - harvested ahead of it, matching the established
 //! "translate ahead of a real caller" precedent.
 //!
+//! Also translated: `mark_adjust`/`mark_adjust_nofold`/
+//! `mark_adjust_buf` (+ the private `ONE_ADJUST`/`ONE_ADJUST_NODEL`/
+//! `ONE_ADJUST_CURSOR` macros, as `one_adjust`/`one_adjust_nodel`/
+//! `one_adjust_cursor`) - adjusts every mark/cursor/window position
+//! touching a buffer when its line numbers shift (e.g. after a
+//! delete/insert). Needed 3 real prerequisites investigated and
+//! translated this session: `quickfix.c`'s `qf_mark_adjust` (always
+//! returns `false` today - nothing can set `BufT.b_has_qf_entry`
+//! nonzero yet), `fold.c`'s `foldMarkAdjust` (always a no-op today -
+//! nothing can create a fold), and `diff.c`'s `diff_mark_adjust`
+//! (always a no-op today - `diff_buf_idx` always returns `DB_COUNT`).
+//! `extmark.c`'s `extmark_adjust` (the fourth real dependency) is
+//! instead gated behind the caller-supplied `ExtmarkOp` parameter - a
+//! caller passing `ExtmarkOp::Noop` bypasses it entirely (matching
+//! the original's own `if (op != kExtmarkNOOP)` guard exactly), and
+//! every other part of this function works correctly end to end
+//! regardless; only a genuine non-`Noop` value reaches
+//! `unimplemented!()`. No real translated caller yet (needs
+//! `del_bytes`/`ins_char`/etc., same as `mark_col_adjust`) - harvested
+//! ahead of one, matching the established precedent.
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
 //!   `nvim_del_mark`'s own API-layer helpers (`api/extmark.c`, not
@@ -121,14 +142,15 @@
 //!   (`msg_puts`/`msg_ext_set_kind`/`msg_outtrans`, `message.c`, not
 //!   tractable) - `cleanup_jumplist` is no longer their blocker.
 
-use crate::buffer_defs::{BufT, TaggyT, WinT};
+use crate::buffer_defs::{BufT, TaggyT, WinT, BUF_HAS_LL_ENTRY, BUF_HAS_QF_ENTRY};
 use crate::ex_cmds_defs::cmod;
+use crate::extmark_defs::ExtmarkOp;
 use crate::globals::{GlobalCell, GLOBALS};
-use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, MarkGet, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS, NMARK_LOCAL_MAX};
+use crate::mark_defs::{equalpos, lt, FmarkT, FmarkvT, MarkAdjustMode, MarkGet, XfmarkT, JUMPLISTSIZE, NGLOBALMARKS, NMARKS, NMARK_LOCAL_MAX};
 use crate::option_vars::{opt_jop_flag, OPTION_VARS};
 use crate::os::time::os_time;
 use crate::os::time_defs::Timestamp;
-use crate::pos_defs::{PosT, MAXCOL};
+use crate::pos_defs::{LinenrT, PosT, MAXCOL, MAXLNUM};
 use crate::vim_defs::Direction;
 
 /// Convert mark name to the offset (`mark_global_index`).
@@ -1938,6 +1960,374 @@ pub unsafe fn mark_col_adjust(
         // SAFETY: forwarded from this function's own safety doc.
         wp = unsafe { (*wp).w_next };
     }
+}
+
+/// `ONE_ADJUST(add)` - adjust a plain line number for a change between
+/// `line1`/`line2`, deleting it (setting it to `0`) when it falls
+/// inside a deleted range.
+fn one_adjust(lp: &mut LinenrT, line1: LinenrT, line2: LinenrT, amount: LinenrT, amount_after: LinenrT) {
+    if *lp >= line1 && *lp <= line2 {
+        if amount == MAXLNUM {
+            *lp = 0;
+        } else {
+            *lp += amount;
+        }
+    } else if amount_after != 0 && *lp > line2 {
+        *lp += amount_after;
+    }
+}
+
+/// `ONE_ADJUST_NODEL(add)` - like [`one_adjust`], but a line number
+/// inside a deleted range is moved to `line1` (the first deleted
+/// line) instead of being zeroed out ("NO DELete": don't delete the
+/// mark, just put it at the first deleted line).
+fn one_adjust_nodel(lp: &mut LinenrT, line1: LinenrT, line2: LinenrT, amount: LinenrT, amount_after: LinenrT) {
+    if *lp >= line1 && *lp <= line2 {
+        if amount == MAXLNUM {
+            *lp = line1;
+        } else {
+            *lp += amount;
+        }
+    } else if amount_after != 0 && *lp > line2 {
+        *lp += amount_after;
+    }
+}
+
+/// `ONE_ADJUST_CURSOR(pp)` - like [`one_adjust_nodel`], but if the
+/// position is within the deleted range, move it to the start of the
+/// line before the range (clamped to line `1`) and reset its column,
+/// rather than moving it to `line1` itself.
+fn one_adjust_cursor(posp: &mut PosT, line1: LinenrT, line2: LinenrT, amount: LinenrT, amount_after: LinenrT) {
+    if posp.lnum >= line1 && posp.lnum <= line2 {
+        if amount == MAXLNUM {
+            // line with cursor is deleted
+            posp.lnum = (line1 - 1).max(1);
+            posp.col = 0;
+        } else {
+            // keep cursor on the same line
+            posp.lnum += amount;
+        }
+    } else if amount_after != 0 && posp.lnum > line2 {
+        posp.lnum += amount_after;
+    }
+}
+
+/// Adjust marks between `line1` and `line2` (inclusive) to move
+/// `amount` lines, in buffer `buf` (`mark_adjust_buf`). Must be called
+/// BEFORE `changed_*()`/`appended_lines()`/`deleted_lines()`. May be
+/// called before or after changing the text.
+///
+/// When deleting lines `line1` to `line2`, use an `amount` of
+/// [`MAXLNUM`]: the marks within this range are made invalid. If
+/// `amount_after` is non-zero, marks after `line2` are adjusted by it.
+///
+/// `op`'s own real effect (`extmark_adjust`, `extmark.c`) is
+/// `unimplemented!()` whenever `op != ExtmarkOp::Noop` - `extmark.c`
+/// itself is not translated; a caller passing `ExtmarkOp::Noop`
+/// bypasses it entirely, exactly matching the original's own `if (op
+/// != kExtmarkNOOP)` guard, and every other part of this function
+/// works correctly end to end regardless of `op`.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+/// `crate::globals::GLOBALS.curbuf`/`curwin`/`firstwin` must each be
+/// a valid, non-null pointer to their own live structs, and
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid,
+/// live `WinT` pointers.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn mark_adjust_buf(
+    buf: *mut BufT,
+    line1: LinenrT,
+    line2: LinenrT,
+    amount: LinenrT,
+    amount_after: LinenrT,
+    adjust_folds: bool,
+    mode: MarkAdjustMode,
+    op: ExtmarkOp,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fnum = unsafe { (*buf).handle };
+    const INITPOS: PosT = PosT { lnum: 1, col: 0, coladd: 0 };
+
+    if line2 < line1 && amount_after == 0 {
+        return; // nothing to do
+    }
+
+    let by_api = mode == MarkAdjustMode::Api;
+    let by_term = mode == MarkAdjustMode::Term;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cmod_flags = unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags;
+    if cmod_flags & cmod::LOCKMARKS == 0 {
+        // named marks, lower case and upper case
+        for i in 0..(NMARKS as usize) {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust(unsafe { &mut (*buf).b_namedm[i].mark.lnum }, line1, line2, amount, amount_after);
+            // SAFETY: forwarded from this function's own safety doc.
+            let namedfm = unsafe { NAMEDFM.get_mut() };
+            if namedfm[i].fmark.fnum == fnum {
+                one_adjust_nodel(&mut namedfm[i].fmark.mark.lnum, line1, line2, amount, amount_after);
+            }
+        }
+        for i in (NMARKS as usize)..(NGLOBALMARKS as usize) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let namedfm = unsafe { NAMEDFM.get_mut() };
+            if namedfm[i].fmark.fnum == fnum {
+                one_adjust_nodel(&mut namedfm[i].fmark.mark.lnum, line1, line2, amount, amount_after);
+            }
+        }
+
+        // last Insert position
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust(unsafe { &mut (*buf).b_last_insert.mark.lnum }, line1, line2, amount, amount_after);
+
+        // last change position
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust(unsafe { &mut (*buf).b_last_change.mark.lnum }, line1, line2, amount, amount_after);
+
+        // last cursor position, if it was set
+        // SAFETY: forwarded from this function's own safety doc.
+        let b_last_cursor_mark = unsafe { (*buf).b_last_cursor.mark };
+        // SAFETY: forwarded from this function's own safety doc.
+        let ml_line_count = unsafe { (*buf).b_ml.ml_line_count };
+        if !equalpos(b_last_cursor_mark, INITPOS) && (!by_term || b_last_cursor_mark.lnum < ml_line_count) {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust(unsafe { &mut (*buf).b_last_cursor.mark.lnum }, line1, line2, amount, amount_after);
+        }
+
+        // on prompt buffer adjust the last prompt start location mark
+        // SAFETY: forwarded from this function's own safety doc.
+        if crate::buffer::bt_prompt(Some(unsafe { &*buf })) {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust_nodel(unsafe { &mut (*buf).b_prompt_start.mark.lnum }, line1, line2, amount, amount_after);
+        }
+
+        // list of change positions
+        // SAFETY: forwarded from this function's own safety doc.
+        let b_changelistlen = unsafe { (*buf).b_changelistlen };
+        for i in 0..(b_changelistlen as usize) {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust_nodel(unsafe { &mut (*buf).b_changelist[i].mark.lnum }, line1, line2, amount, amount_after);
+        }
+
+        // Visual area
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust_nodel(unsafe { &mut (*buf).b_visual.vi_start.lnum }, line1, line2, amount, amount_after);
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust_nodel(unsafe { &mut (*buf).b_visual.vi_end.lnum }, line1, line2, amount, amount_after);
+
+        // quickfix marks
+        // SAFETY: forwarded from this function's own safety doc.
+        if !crate::quickfix::qf_mark_adjust(unsafe { &*buf }, None, line1, line2, amount, amount_after) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*buf).b_has_qf_entry &= !BUF_HAS_QF_ENTRY };
+        }
+        // location lists
+        let mut found_one = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut win = unsafe { GLOBALS.get_mut() }.firstwin;
+        while !win.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            found_one |= crate::quickfix::qf_mark_adjust(
+                unsafe { &*buf },
+                Some(unsafe { &*win }),
+                line1,
+                line2,
+                amount,
+                amount_after,
+            );
+            // SAFETY: forwarded from this function's own safety doc.
+            win = unsafe { (*win).w_next };
+        }
+        if !found_one {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*buf).b_has_qf_entry &= !BUF_HAS_LL_ENTRY };
+        }
+    }
+
+    if op != ExtmarkOp::Noop {
+        unimplemented!("mark::mark_adjust_buf: extmark_adjust (extmark.c) is not yet translated");
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*curwin).w_buffer } == buf {
+        // previous context mark
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust(unsafe { &mut (*curwin).w_pcmark.lnum }, line1, line2, amount, amount_after);
+
+        // previous pcmark
+        // SAFETY: forwarded from this function's own safety doc.
+        one_adjust(unsafe { &mut (*curwin).w_prev_pcmark.lnum }, line1, line2, amount, amount_after);
+
+        // saved cursor for formatting
+        // SAFETY: forwarded from this function's own safety doc.
+        let saved_cursor_lnum = unsafe { GLOBALS.get_mut() }.saved_cursor.lnum;
+        if saved_cursor_lnum != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust_nodel(&mut unsafe { GLOBALS.get_mut() }.saved_cursor.lnum, line1, line2, amount, amount_after);
+        }
+    }
+
+    // Adjust items in all windows related to the current buffer.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut win = unsafe { GLOBALS.get_mut() }.firstwin;
+    while !win.is_null() {
+        if cmod_flags & cmod::LOCKMARKS == 0 {
+            // Marks in the jumplist. When deleting lines, this may
+            // create duplicate marks in the jumplist, they will be
+            // removed later.
+            // SAFETY: forwarded from this function's own safety doc.
+            let w_jumplistlen = unsafe { (*win).w_jumplistlen };
+            for i in 0..(w_jumplistlen as usize) {
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { (*win).w_jumplist[i].fmark.fnum } == fnum {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    one_adjust_nodel(
+                        unsafe { &mut (*win).w_jumplist[i].fmark.mark.lnum },
+                        line1,
+                        line2,
+                        amount,
+                        amount_after,
+                    );
+                }
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*win).w_buffer } == buf {
+            if cmod_flags & cmod::LOCKMARKS == 0 {
+                // marks in the tag stack
+                // SAFETY: forwarded from this function's own safety doc.
+                let w_tagstacklen = unsafe { (*win).w_tagstacklen };
+                for i in 0..(w_tagstacklen as usize) {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    if unsafe { (*win).w_tagstack[i].fmark.fnum } == fnum {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        one_adjust_nodel(
+                            unsafe { &mut (*win).w_tagstack[i].fmark.mark.lnum },
+                            line1,
+                            line2,
+                            amount,
+                            amount_after,
+                        );
+                    }
+                }
+            }
+
+            // the displayed Visual area
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { (*win).w_old_cursor_lnum } != 0 {
+                // SAFETY: forwarded from this function's own safety doc.
+                one_adjust_nodel(unsafe { &mut (*win).w_old_cursor_lnum }, line1, line2, amount, amount_after);
+                // SAFETY: forwarded from this function's own safety doc.
+                one_adjust_nodel(unsafe { &mut (*win).w_old_visual_lnum }, line1, line2, amount, amount_after);
+            }
+
+            // topline and cursor position for windows with the same
+            // buffer other than the current window
+            // SAFETY: forwarded from this function's own safety doc.
+            let win_cursor_lnum = unsafe { (*win).w_cursor.lnum };
+            // SAFETY: forwarded from this function's own safety doc.
+            let ml_line_count = unsafe { (*buf).b_ml.ml_line_count };
+            let same_buf_other_win = if by_term { win_cursor_lnum < ml_line_count } else { !std::ptr::eq(win, curwin) };
+            if by_api || same_buf_other_win {
+                // SAFETY: forwarded from this function's own safety doc.
+                let w_topline = unsafe { (*win).w_topline };
+                if w_topline >= line1 && w_topline <= line2 {
+                    if amount == MAXLNUM {
+                        // topline is deleted
+                        if by_api && amount_after > line1 - line2 - 1 {
+                            // api: if the deleted region was replaced with new
+                            // contents, topline will get adjusted later as an
+                            // effect of the adjusted cursor in fix_cursor()
+                        } else {
+                            // SAFETY: forwarded from this function's own safety doc.
+                            unsafe { (*win).w_topline = (line1 - 1).max(1) };
+                        }
+                    } else if w_topline > line1 {
+                        // keep topline on the same line, unless inserting
+                        // just above it (we probably want to see that
+                        // line then)
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { (*win).w_topline += amount };
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*win).w_topfill = 0 };
+                } else if amount_after != 0
+                    // api: display new line if inserted right at topline
+                    && w_topline > line2 + if by_api && line2 < line1 { 1 } else { 0 }
+                {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*win).w_topline += amount_after };
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { (*win).w_topfill = 0 };
+                }
+            }
+            if !by_api && (if by_term { win_cursor_lnum < ml_line_count } else { !std::ptr::eq(win, curwin) }) {
+                // SAFETY: forwarded from this function's own safety doc.
+                one_adjust_cursor(unsafe { &mut (*win).w_cursor }, line1, line2, amount, amount_after);
+            }
+
+            if adjust_folds {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::fold::fold_mark_adjust(&*win, line1, line2, amount, amount_after) };
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        win = unsafe { (*win).w_next };
+    }
+
+    // adjust diffs
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::diff::diff_mark_adjust(buf, line1, line2, amount, amount_after) };
+
+    // adjust per-window "last cursor" positions
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_wininfo_len = unsafe { (*buf).b_wininfo.len() };
+    for i in 0..b_wininfo_len {
+        // SAFETY: forwarded from this function's own safety doc.
+        let wip = unsafe { (&(*buf).b_wininfo)[i] };
+        // SAFETY: forwarded from this function's own safety doc.
+        let wi_lnum = unsafe { (*wip).wi_mark.mark.lnum };
+        // SAFETY: forwarded from this function's own safety doc.
+        let ml_line_count = unsafe { (*buf).b_ml.ml_line_count };
+        if !by_term || wi_lnum < ml_line_count {
+            // SAFETY: forwarded from this function's own safety doc.
+            one_adjust_cursor(unsafe { &mut (*wip).wi_mark.mark }, line1, line2, amount, amount_after);
+        }
+    }
+}
+
+/// Adjust marks between `line1` and `line2` (inclusive) in `curbuf` to
+/// move `amount` lines (`mark_adjust`). See [`mark_adjust_buf`] for
+/// the full contract.
+///
+/// # Safety
+/// Same as [`mark_adjust_buf`].
+pub unsafe fn mark_adjust(line1: LinenrT, line2: LinenrT, amount: LinenrT, amount_after: LinenrT, op: ExtmarkOp) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { mark_adjust_buf(curbuf, line1, line2, amount, amount_after, true, MarkAdjustMode::Normal, op) };
+}
+
+/// Does the same as [`mark_adjust`] but without adjusting folds in any
+/// way (`mark_adjust_nofold`). Folds must be adjusted manually by the
+/// caller - only useful when folds need to be moved in a way
+/// different to calling `fold_mark_adjust` with the same arguments
+/// (see `do_move()` in the original for an example of why this may be
+/// necessary).
+///
+/// # Safety
+/// Same as [`mark_adjust_buf`].
+pub unsafe fn mark_adjust_nofold(line1: LinenrT, line2: LinenrT, amount: LinenrT, amount_after: LinenrT, op: ExtmarkOp) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { mark_adjust_buf(curbuf, line1, line2, amount, amount_after, false, MarkAdjustMode::Normal, op) };
 }
 
 #[cfg(test)]
@@ -4503,4 +4893,506 @@ mod tests {
             PosT { lnum: 5, col: 2, coladd: 0 } // curwin's OWN cursor is skipped
         );
     }
+
+    // ---- mark_adjust_buf / mark_adjust / mark_adjust_nofold ----
+
+    #[test]
+    fn mark_adjust_buf_noop_when_line2_less_than_line1_and_no_amount_after() {
+        let mut buf = BufT::default();
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+
+        // No GLOBALS setup needed: the early-return check runs before
+        // this function ever touches GLOBALS.
+        unsafe { mark_adjust_buf(buf_ptr, 10, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_namedm[0].mark, PosT { lnum: 5, col: 2, coladd: 0 });
+    }
+
+    #[test]
+    fn mark_adjust_buf_lockmarks_skips_named_marks_last_positions_and_qf_flags() {
+        let mut buf = BufT {
+            b_has_qf_entry: BUF_HAS_QF_ENTRY | BUF_HAS_LL_ENTRY,
+            ..Default::default()
+        };
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        buf.b_last_insert.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+        unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags = cmod::LOCKMARKS;
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 1, 10, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_namedm[0].mark, PosT { lnum: 5, col: 2, coladd: 0 }); // untouched
+        assert_eq!(buf.b_last_insert.mark, PosT { lnum: 5, col: 2, coladd: 0 }); // untouched
+        // The qf/ll flag-clearing is ALSO inside the LOCKMARKS-gated
+        // block - both bits stay set.
+        assert_eq!(buf.b_has_qf_entry, BUF_HAS_QF_ENTRY | BUF_HAS_LL_ENTRY);
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_named_marks_and_matching_global_marks() {
+        let mut buf = BufT { handle: 9, ..Default::default() };
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 }; // 'a'
+        buf.b_namedm[1].mark = PosT { lnum: 99, col: 2, coladd: 0 }; // 'b' - non-matching line
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+        let _namedfm_guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0] = XfmarkT::default();
+        namedfm[0].fmark.fnum = 9; // same buffer
+        namedfm[0].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        namedfm[1] = XfmarkT::default();
+        namedfm[1].fmark.fnum = 3; // different buffer - untouched
+        namedfm[1].fmark.mark = PosT { lnum: 5, col: 2, coladd: 0 };
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 1, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_namedm[0].mark.lnum, 6);
+        assert_eq!(buf.b_namedm[1].mark.lnum, 99); // non-matching line, untouched
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.mark.lnum, 6);
+        assert_eq!(namedfm[1].fmark.mark.lnum, 5); // different buffer, untouched
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_buffer_level_last_positions_prompt_changelist_and_visual() {
+        let mut buf = BufT { b_p_bt: Some(b"prompt".to_vec()), b_changelistlen: 1, ..Default::default() };
+        buf.b_last_insert.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        buf.b_last_change.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        buf.b_last_cursor.mark = PosT { lnum: 5, col: 0, coladd: 0 }; // != {1,0,0}, so eligible
+        buf.b_prompt_start.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        buf.b_changelist[0].mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        buf.b_visual.vi_start = PosT { lnum: 5, col: 0, coladd: 0 };
+        buf.b_visual.vi_end = PosT { lnum: 5, col: 0, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_last_insert.mark.lnum, 8);
+        assert_eq!(buf.b_last_change.mark.lnum, 8);
+        assert_eq!(buf.b_last_cursor.mark.lnum, 8);
+        assert_eq!(buf.b_prompt_start.mark.lnum, 8);
+        assert_eq!(buf.b_changelist[0].mark.lnum, 8);
+        assert_eq!(buf.b_visual.vi_start.lnum, 8);
+        assert_eq!(buf.b_visual.vi_end.lnum, 8);
+    }
+
+    #[test]
+    fn mark_adjust_buf_skips_last_cursor_when_it_equals_the_static_initpos() {
+        // b_last_cursor.mark defaults to {0,0,0} in this crate's own
+        // BufT::default() (matching raw C zero-init), which already
+        // differs from the original's {1,0,0} static sentinel - but
+        // explicitly set it to {1,0,0} here to exercise the real
+        // equalpos(...) == true skip condition directly.
+        let mut buf = BufT::default();
+        buf.b_last_cursor.mark = PosT { lnum: 1, col: 0, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 1, 1, 5, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_last_cursor.mark, PosT { lnum: 1, col: 0, coladd: 0 }); // untouched
+    }
+
+    #[test]
+    fn mark_adjust_buf_leaves_qf_and_ll_entry_flags_clear_via_qf_mark_adjust_always_false() {
+        // qf_mark_adjust's own early-return (`buf.b_has_qf_entry &
+        // buf_has_flag == 0`) is the ONLY non-panicking outcome today
+        // (see quickfix.rs's own doc comment - any NONZERO
+        // b_has_qf_entry reaches its `unreachable!()`, since real
+        // quickfix-entry tracking doesn't exist yet). This means
+        // mark_adjust_buf's own `buf.b_has_qf_entry &=
+        // !BUF_HAS_QF_ENTRY/!BUF_HAS_LL_ENTRY` clearing logic can only
+        // be exercised starting from an already-clear flag - verifying
+        // it stays clear (a real, if unexciting, idempotent no-op)
+        // rather than a "starts set, ends clear" transition, which
+        // would require a state qf_mark_adjust itself refuses to
+        // tolerate.
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(buf.b_has_qf_entry, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "extmark_adjust (extmark.c) is not yet translated")]
+    fn mark_adjust_buf_panics_for_a_non_noop_extmark_op() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Undo) };
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_curwin_pcmark_and_saved_cursor_only_for_the_current_buffer() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut other_buf = BufT::default();
+        let other_buf_ptr = &mut other_buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_pcmark: PosT { lnum: 5, col: 0, coladd: 0 },
+            w_prev_pcmark: PosT { lnum: 5, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+        unsafe { GLOBALS.get_mut() }.saved_cursor = PosT { lnum: 5, col: 0, coladd: 0 };
+
+        // Adjusting a DIFFERENT buffer must leave curwin's own pcmark/
+        // saved_cursor completely untouched (curwin.w_buffer != buf).
+        unsafe { mark_adjust_buf(other_buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+        assert_eq!(unsafe { &*win_ptr }.w_pcmark, PosT { lnum: 5, col: 0, coladd: 0 });
+        assert_eq!(unsafe { GLOBALS.get_mut() }.saved_cursor, PosT { lnum: 5, col: 0, coladd: 0 });
+
+        // Adjusting curwin's OWN buffer touches both.
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+        assert_eq!(unsafe { &*win_ptr }.w_pcmark.lnum, 8);
+        assert_eq!(unsafe { &*win_ptr }.w_prev_pcmark.lnum, 8);
+        assert_eq!(unsafe { GLOBALS.get_mut() }.saved_cursor.lnum, 8);
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_jumplist_across_windows_and_tagstack_only_on_same_buffer() {
+        let mut buf = BufT { handle: 4, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut other_buf = BufT { handle: 5, ..Default::default() };
+        let other_buf_ptr = &mut other_buf as *mut BufT;
+
+        let mut win2 = WinT { w_buffer: other_buf_ptr, ..Default::default() }; // different buffer
+        win2.w_jumplistlen = 1;
+        win2.w_jumplist[0].fmark.fnum = 4; // still matches buf's fnum
+        win2.w_jumplist[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        win2.w_tagstacklen = 1;
+        win2.w_tagstack[0].fmark.fnum = 4;
+        win2.w_tagstack[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        let win2_ptr = &mut win2 as *mut WinT;
+
+        let mut win1 = WinT { w_buffer: buf_ptr, w_next: win2_ptr, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        // Jumplist adjustment is by fnum, independent of the window's
+        // OWN w_buffer - win2's jumplist entry is adjusted even though
+        // win2 itself shows a different buffer.
+        assert_eq!(unsafe { &*win2_ptr }.w_jumplist[0].fmark.mark.lnum, 8);
+        // Tagstack adjustment additionally requires win.w_buffer == buf
+        // - win2 shows other_buf, so its tagstack entry stays untouched
+        // even though its own fnum matches.
+        assert_eq!(unsafe { &*win2_ptr }.w_tagstack[0].fmark.mark.lnum, 5);
+    }
+
+    #[test]
+    fn mark_adjust_buf_respects_lockmarks_for_jumplist_and_tagstack() {
+        let mut buf = BufT { handle: 4, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_jumplistlen = 1;
+        win.w_jumplist[0].fmark.fnum = 4;
+        win.w_jumplist[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        win.w_tagstacklen = 1;
+        win.w_tagstack[0].fmark.fnum = 4;
+        win.w_tagstack[0].fmark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+        unsafe { GLOBALS.get_mut() }.cmdmod.cmod_flags = cmod::LOCKMARKS;
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_jumplist[0].fmark.mark.lnum, 5); // untouched
+        assert_eq!(unsafe { &*win_ptr }.w_tagstack[0].fmark.mark.lnum, 5); // untouched
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_old_cursor_and_visual_lnum_when_set() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_old_cursor_lnum: 5,
+            w_old_visual_lnum: 5,
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win_ptr }.w_old_cursor_lnum, 8);
+        assert_eq!(unsafe { &*win_ptr }.w_old_visual_lnum, 8);
+    }
+
+    #[test]
+    fn mark_adjust_buf_deletes_topline_within_the_deleted_range() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        // win2 is NOT curwin, so it's eligible for the "other window,
+        // same buffer" topline/cursor adjustment branch.
+        let mut win2 = WinT { w_buffer: buf_ptr, w_topline: 12, w_topfill: 3, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_buffer: buf_ptr, w_next: win2_ptr, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        // Delete lines 10-15 (topline 12 falls within this range).
+        unsafe { mark_adjust_buf(buf_ptr, 10, 15, MAXLNUM, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win2_ptr }.w_topline, 9); // MAX(line1-1, 1) = MAX(9,1)
+        assert_eq!(unsafe { &*win2_ptr }.w_topfill, 0);
+    }
+
+    #[test]
+    fn mark_adjust_buf_shifts_topline_when_inserting_above_it() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win2 = WinT { w_buffer: buf_ptr, w_topline: 20, w_topfill: 3, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_buffer: buf_ptr, w_next: win2_ptr, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        // Insert 5 lines at line 10-15 (topline 20 is inside 10..=15?
+        // No - use a range that genuinely covers topline via a real
+        // insert: line1=10, line2=15, amount=5, topline=20 is NOT in
+        // [10,15], so instead trace the "topline > line1" shift branch
+        // directly with topline inside [line1,line2] via a plain
+        // insert (amount != MAXLNUM).
+        unsafe { mark_adjust_buf(buf_ptr, 15, 25, 5, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        // topline (20) is within [15,25] and w_topline(20) > line1(15)
+        // -> topline += amount (5) = 25.
+        assert_eq!(unsafe { &*win2_ptr }.w_topline, 25);
+        assert_eq!(unsafe { &*win2_ptr }.w_topfill, 0);
+    }
+
+    #[test]
+    fn mark_adjust_buf_shifts_topline_by_amount_after_when_beyond_line2() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win2 = WinT { w_buffer: buf_ptr, w_topline: 30, w_topfill: 3, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_buffer: buf_ptr, w_next: win2_ptr, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        // topline (30) is beyond line2 (15) - shifted by amount_after.
+        unsafe { mark_adjust_buf(buf_ptr, 10, 15, MAXLNUM, 4, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win2_ptr }.w_topline, 34);
+        assert_eq!(unsafe { &*win2_ptr }.w_topfill, 0);
+    }
+
+    #[test]
+    fn mark_adjust_buf_by_api_replaced_content_skips_topline_move_but_still_resets_topfill() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win2 = WinT { w_buffer: buf_ptr, w_topline: 12, w_topfill: 3, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT { w_buffer: buf_ptr, w_next: win2_ptr, ..Default::default() };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        // Delete lines 10-15 (topline 12 in range) via the API, with
+        // amount_after (6) > line1 - line2 - 1 (10-15-1 = -6): the
+        // deleted region was replaced with new content, so topline is
+        // left for fix_cursor() to adjust later - but w_topfill is
+        // STILL reset unconditionally.
+        unsafe { mark_adjust_buf(buf_ptr, 10, 15, MAXLNUM, 6, true, MarkAdjustMode::Api, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win2_ptr }.w_topline, 12); // untouched
+        assert_eq!(unsafe { &*win2_ptr }.w_topfill, 0); // still reset
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_cursor_for_other_windows_on_the_same_buffer() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win2 = WinT { w_buffer: buf_ptr, w_cursor: PosT { lnum: 8, col: 0, coladd: 0 }, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut WinT;
+        let mut win1 = WinT {
+            w_buffer: buf_ptr,
+            w_next: win2_ptr,
+            w_cursor: PosT { lnum: 8, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win1_ptr = &mut win1 as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win1_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win1_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 10, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*win2_ptr }.w_cursor.lnum, 10); // adjusted (not curwin)
+        assert_eq!(unsafe { &*win1_ptr }.w_cursor.lnum, 8); // curwin itself - skipped
+    }
+
+    #[test]
+    fn mark_adjust_buf_calls_fold_mark_adjust_only_when_adjust_folds_is_true() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        // A non-empty w_folds would make fold_mark_adjust panic if it
+        // were ever actually called (see fold.rs) - used here purely
+        // to detect whether the call happens at all.
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        // adjust_folds = false: fold_mark_adjust must NOT be called.
+        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, false, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+    }
+
+    #[test]
+    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    fn mark_adjust_buf_panics_via_fold_mark_adjust_when_adjust_folds_is_true_and_folds_exist() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        // adjust_folds = true: fold_mark_adjust IS called, and panics
+        // since w_folds is non-empty.
+        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+    }
+
+    #[test]
+    fn mark_adjust_buf_adjusts_per_window_last_cursor_positions_in_b_wininfo() {
+        let mut buf = BufT::default();
+        let mut wi = crate::buffer_defs::WinInfo::default();
+        wi.wi_mark.mark = PosT { lnum: 5, col: 0, coladd: 0 };
+        let wi_ptr = &mut wi as *mut crate::buffer_defs::WinInfo;
+        // Push onto `buf.b_wininfo` BEFORE taking `buf_ptr` below - a
+        // later direct write through the original `buf` variable
+        // (rather than through `buf_ptr`) is a foreign write under
+        // Tree Borrows that would invalidate `buf_ptr` (caught via
+        // `cargo miri test` on an earlier draft of this exact test).
+        buf.b_wininfo.push(wi_ptr);
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust_buf(buf_ptr, 5, 5, 3, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*wi_ptr }.wi_mark.mark.lnum, 8);
+    }
+
+    #[test]
+    fn mark_adjust_wraps_mark_adjust_buf_with_curbuf_and_folds_enabled() {
+        let mut buf = BufT::default();
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust(5, 5, 3, 0, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*GLOBALS.get_mut().curbuf }.b_namedm[0].mark.lnum, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    fn mark_adjust_enables_fold_adjustment_unlike_mark_adjust_nofold() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        unsafe { mark_adjust(5, 8, 2, 0, ExtmarkOp::Noop) };
+    }
+
+    #[test]
+    fn mark_adjust_nofold_does_not_adjust_folds() {
+        let mut buf = BufT::default();
+        buf.b_namedm[0].mark = PosT { lnum: 5, col: 2, coladd: 0 };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
+        let _firstwin_guard = FirstwinGuard::set(win_ptr);
+
+        // Would panic via fold_mark_adjust if it called it - proves
+        // mark_adjust_nofold really does pass adjust_folds=false.
+        unsafe { mark_adjust_nofold(5, 5, 3, 0, ExtmarkOp::Noop) };
+
+        assert_eq!(unsafe { &*GLOBALS.get_mut().curbuf }.b_namedm[0].mark.lnum, 8);
+    }
 }
+
