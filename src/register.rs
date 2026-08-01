@@ -11,8 +11,11 @@
 //! `valid_yank_reg`), the register storage array itself (`Y_REGS`,
 //! `y_previous` as `Y_PREVIOUS`) and [`get_yank_register`], the
 //! `"="`-register expression-source/result state ([`get_expr_line`]/
-//! [`get_expr_line_src`]/[`set_expr_line`]), and [`get_reg_contents`]/
-//! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller).
+//! [`get_expr_line_src`]/[`set_expr_line`]), [`get_reg_contents`]/
+//! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
+//! and `buffer.c`'s own `getaltfname` (`@#`) - now tractable IN FULL
+//! (not just its own always-`None`-today fast path) now that
+//! `buffer.rs`'s `buflist_findnr`/`buflist_name_nr` both exist.
 //! `get_clipboard` always returns `false` (no provider registered) -
 //! this crate has no clipboard-provider integration translated yet
 //! (`ui_client.c`/Lua `provider#clipboard#`, a separate, substantial
@@ -29,13 +32,6 @@
 //! put, or run an Ex command yet.
 //!
 //! Deferred:
-//! - `getaltfname` (`@#`, alternate file name): only its own
-//!   provably-always-reachable-today shortcut is modeled (`w_alt_fnum
-//!   == 0`, meaning "no alternate file" - the default and, since no
-//!   buffer-switching command exists yet, the ONLY reachable state);
-//!   the general case needs `buflist_findnr`/`handle_get_buffer`
-//!   (`buffer.c`, not yet translated), `unimplemented!()`s if ever
-//!   reached.
 //! - `@.` (last inserted text) needs a `last_insert` `String`
 //!   file-static (`insert.c`) populated only by real insert-mode text
 //!   entry, not yet translated - modeled as an always-`None`
@@ -242,16 +238,13 @@ fn get_last_insert_save() -> Option<Vec<u8>> {
 
 /// Get the alternate file name (`@#`) (`getaltfname`).
 ///
-/// Only the provably-always-reachable-today case is modeled: when
-/// `curwin`'s `w_alt_fnum` is `0` (the default, and - since no
-/// buffer-switching command exists yet - the ONLY value it can ever
-/// hold today), the original's own `buflist_findnr(0)` ->
-/// `curwin->w_alt_fnum` -> `handle_get_buffer(0)` chain always fails
-/// (buffer handle `0` is never a real buffer - handles start at `1`),
-/// so `getaltfname` always returns `None` here, matching that exactly.
-/// A real, non-zero `w_alt_fnum` would need `buflist_findnr`/
-/// `handle_get_buffer` (`buffer.c`, not yet translated) -
-/// `unimplemented!()`s if ever reached.
+/// `buflist_name_nr(0)` already resolves `fnum == 0` via
+/// `GLOBALS.curwin.w_alt_fnum` internally (matching the original's own
+/// `buflist_findnr`, whose own first statement is exactly `if (nr ==
+/// 0) { nr = curwin->w_alt_fnum; }`) - so this is a direct, complete
+/// translation, not the earlier narrower "only w_alt_fnum == 0"
+/// shortcut (now unblocked since `buflist_findnr`/`buflist_name_nr`
+/// both exist for real).
 ///
 /// `errmsg` (whether to report "no alternate file name" as an error)
 /// is accepted for signature fidelity but never actually matters yet:
@@ -261,19 +254,11 @@ fn get_last_insert_save() -> Option<Vec<u8>> {
 /// established policy elsewhere).
 ///
 /// # Safety
-/// Touches `crate::globals::GLOBALS.curwin` - must be a valid,
-/// non-null pointer to a live `WinT`.
+/// Forwarded from [`crate::buffer::buflist_name_nr`]'s own safety doc.
 #[must_use]
 unsafe fn getaltfname(_errmsg: bool) -> Option<Vec<u8>> {
     // SAFETY: forwarded from this function's own safety doc.
-    let w_alt_fnum = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_alt_fnum;
-    if w_alt_fnum == 0 {
-        return None;
-    }
-    unimplemented!(
-        "getaltfname: a real, non-zero w_alt_fnum needs buflist_findnr/handle_get_buffer \
-         (buffer.c), not yet translated"
-    );
+    unsafe { crate::buffer::buflist_name_nr(0) }.map(|(fname, _lnum)| fname)
 }
 
 /// Get the value of a special register, if `regname` names one
@@ -646,16 +631,53 @@ mod tests {
         });
     }
 
+    /// Points `GLOBALS.lastbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous value on drop - a `register.rs`-local
+    /// copy of `buffer.rs`'s own private `LastbufGuard` (not directly
+    /// reusable across files). Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime.
+    struct LastbufGuard {
+        previous: *mut crate::buffer_defs::BufT,
+    }
+
+    impl LastbufGuard {
+        fn set(new_lastbuf: *mut crate::buffer_defs::BufT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = new_lastbuf;
+            LastbufGuard { previous }
+        }
+    }
+
+    impl Drop for LastbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.lastbuf = self.previous;
+        }
+    }
+
     #[test]
-    fn get_spec_reg_hash_alternate_file_is_unimplemented_when_w_alt_fnum_is_set() {
+    fn get_spec_reg_hash_alternate_file_resolves_the_real_alternate_buffer() {
         let _lock = crate::globals::global_state_test_lock();
+        let mut alt_buf =
+            crate::buffer_defs::BufT { handle: 5, b_fname: Some(b"alt.txt".to_vec()), ..Default::default() };
+        let _lastbuf_guard = LastbufGuard::set(&mut alt_buf as *mut crate::buffer_defs::BufT);
+
         let mut buf = crate::buffer_defs::BufT::default();
         let mut win = crate::buffer_defs::WinT { w_alt_fnum: 5, ..Default::default() };
 
-        let result = with_curbuf_curwin(&mut buf, &mut win, || {
-            std::panic::catch_unwind(|| unsafe { get_spec_reg(i32::from(b'#'), false) })
-        });
-        assert!(result.is_err(), "expected a panic (buflist_findnr not yet translated)");
+        let result = with_curbuf_curwin(&mut buf, &mut win, || unsafe { get_spec_reg(i32::from(b'#'), false) });
+        assert_eq!(result, Some((Some(b"alt.txt".to_vec()), false)));
+    }
+
+    #[test]
+    fn get_spec_reg_hash_alternate_file_is_none_for_an_unknown_alternate_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf_guard = LastbufGuard::set(std::ptr::null_mut());
+        let mut buf = crate::buffer_defs::BufT::default();
+        // No buffer with handle 99 exists in the (empty) lastbuf list.
+        let mut win = crate::buffer_defs::WinT { w_alt_fnum: 99, ..Default::default() };
+
+        let result = with_curbuf_curwin(&mut buf, &mut win, || unsafe { get_spec_reg(i32::from(b'#'), false) });
+        assert_eq!(result, Some((None, false)));
     }
 
     #[test]
