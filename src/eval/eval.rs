@@ -10386,6 +10386,37 @@ mod tests {
     }
 
     #[test]
+    fn e2e_matcharg_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = globals.curwin;
+        globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        // No match has ever been set for this window (w_match_head is
+        // always null today) - matcharg(1..=3) is always a 2-element
+        // List of null strings.
+        let (ret, tv) = eval_str(b"matcharg(2)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!((*l).lv_len, 2);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        // An out-of-range {nr} is always an empty List.
+        let (ret, tv) = eval_str(b"matcharg(4)");
+        assert_eq!(ret, OK);
+        let TypvalValue::List(l) = tv.value else { panic!("expected a List") };
+        unsafe {
+            assert_eq!((*l).lv_len, 0);
+            crate::eval::typval::tv_list_unref(l);
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
     fn e2e_dict_of_lists_chained_dot_then_bracket_subscript() {
         let _lock = crate::globals::global_state_test_lock();
         let (ret, tv) = eval_str(b"#{items: [10, 20, 30]}.items[2]");

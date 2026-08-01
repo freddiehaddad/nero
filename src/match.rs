@@ -16,7 +16,10 @@
 //! "always-real-fast-path" pattern already established elsewhere in
 //! this crate (e.g. `autocmd.rs`'s `AUTOCMDS`). Translated on this
 //! basis: `get_optional_window` (`eval/funcs.c`), `clear_matches`/
-//! `f_clearmatches`/`f_getmatches`.
+//! `f_clearmatches`/`f_getmatches`/`get_match`/`f_matcharg`
+//! (`matcharg()` - its own `m != NULL` branch, needing `syn_id2name`/
+//! the highlight-group registry, is never reached since `get_match`
+//! always returns `null`).
 //!
 //! Deferred: `matchadd()`/`matchaddpos()`/`matchdelete()`/`getmatches()`'s
 //! own item-conversion loop body, `:match`/`:2match`/`:3match`, and
@@ -101,6 +104,55 @@ pub unsafe fn f_getmatches(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc.
     debug_assert!(unsafe { &*win }.w_match_head.is_null(), "f_getmatches: real matchitem_T support not yet translated");
     let _ = l;
+}
+
+/// Find match `id` for window `wp` (`get_match`). Always returns
+/// `null` today: the original's own loop walks `wp.w_match_head`
+/// looking for a `mit_id == id` entry, but since nothing in this
+/// crate can currently populate that list, its own loop condition
+/// (`cur != NULL && ...`) is false on the very first check - see this
+/// module's own doc comment.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn get_match(wp: *mut WinT, _id: i32) -> *mut crate::types_defs::MatchitemT {
+    // SAFETY: forwarded from this function's own safety doc.
+    debug_assert!(unsafe { &*wp }.w_match_head.is_null(), "get_match: real matchitem_T support not yet translated");
+    std::ptr::null_mut()
+}
+
+/// `"matcharg({nr})"` function (`f_matcharg`) - the highlight group
+/// name and pattern for match `{nr}` (`1`-`3`, for `:match`/`:2match`/
+/// `:3match`), as a 2-element `List`.
+///
+/// Since [`get_match`] always returns `null` today, this is ALWAYS a
+/// `[v:null, v:null]`-equivalent (2 null strings) List for `{nr}` in
+/// `1..=3` - the original's own `m != NULL` branch (needing
+/// `syn_id2name`, the highlight-group registry, not translated) is
+/// never reached. An out-of-range `{nr}` gets an empty List, matching
+/// the original's own `tv_list_alloc_ret(rettv, 0)` for that case.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curwin`. Forwarded from
+/// [`get_match`]'s own safety doc.
+pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let id = crate::eval::typval::tv_get_number(&argvars[0]);
+    let in_range = (1..=3).contains(&id);
+    // SAFETY: `rettv` is freshly default-initialized by the caller.
+    let l = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, if in_range { 2 } else { 0 }) };
+    if in_range {
+        // SAFETY: forwarded from this function's own safety doc.
+        let win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        let m = unsafe { get_match(win, id as i32) };
+        debug_assert!(m.is_null(), "f_matcharg: real matchitem_T support not yet translated");
+        // SAFETY: `l` was just freshly allocated above.
+        unsafe {
+            crate::eval::typval::tv_list_append_string(l, None);
+            crate::eval::typval::tv_list_append_string(l, None);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +283,51 @@ mod tests {
         unsafe {
             assert_eq!(crate::eval::typval::tv_list_len(l), 0);
             crate::eval::typval::tv_list_unref(l);
+        }
+    }
+
+    #[test]
+    fn get_match_is_always_null_when_no_matches_exist() {
+        let mut win = focusable_win(7);
+        assert!(win.w_match_head.is_null());
+        assert!(unsafe { get_match(&mut win as *mut WinT, 1) }.is_null());
+    }
+
+    #[test]
+    fn f_matcharg_in_range_returns_a_2_element_list_of_null_strings() {
+        let mut win = focusable_win(7);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win as *mut WinT, &mut tp);
+
+        for id in 1..=3 {
+            let mut rettv = TypvalT::default();
+            unsafe { f_matcharg(&[num(id)], &mut rettv) };
+            let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+            unsafe {
+                assert_eq!((*l).lv_len, 2);
+                let first = crate::eval::typval::tv_list_first(l);
+                assert_eq!((*first).li_tv.value, TypvalValue::String(None));
+                let second = (*first).li_next;
+                assert_eq!((*second).li_tv.value, TypvalValue::String(None));
+                crate::eval::typval::tv_list_unref(l);
+            }
+        }
+    }
+
+    #[test]
+    fn f_matcharg_out_of_range_returns_an_empty_list() {
+        let mut win = focusable_win(7);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win as *mut WinT, &mut tp);
+
+        for id in [0, 4, -1] {
+            let mut rettv = TypvalT::default();
+            unsafe { f_matcharg(&[num(id)], &mut rettv) };
+            let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+            unsafe {
+                assert_eq!((*l).lv_len, 0);
+                crate::eval::typval::tv_list_unref(l);
+            }
         }
     }
 }

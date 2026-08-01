@@ -395,6 +395,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"sort"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_sort });
         m.insert(&b"uniq"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_uniq });
         m.insert(&b"slice"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: crate::eval::eval::f_slice });
+        m.insert(&b"matcharg"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::r#match::f_matcharg });
         m.insert(&b"join"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_join });
         m.insert(&b"flatten"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flatten });
         m.insert(&b"flattennew"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_flattennew });
@@ -8290,6 +8291,7 @@ mod tests {
             "sort",
             "uniq",
             "slice",
+            "matcharg",
             "buffer_exists",
             "buffer_name",
             "buffer_number",
