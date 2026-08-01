@@ -9978,6 +9978,27 @@ mod tests {
         reset_globals_for_test();
     }
 
+    #[test]
+    fn e2e_histget_and_histnr_builtin_function_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // No history entry can exist in this crate today (nothing can
+        // add one yet) - histget() always returns an empty string for
+        // any real history name, and histnr() always returns -1.
+        assert_eq!(
+            eval_str(b"histget('search')").1.value,
+            TypvalValue::String(Some(Vec::new()))
+        );
+        assert_eq!(
+            eval_str(b"histget('cmd', -1)").1.value,
+            TypvalValue::String(Some(Vec::new()))
+        );
+        assert_eq!(eval_str(b"histnr('cmd')").1.value, TypvalValue::Number(-1));
+
+        reset_globals_for_test();
+    }
+
     // --- get_literal_key ---
 
     #[test]

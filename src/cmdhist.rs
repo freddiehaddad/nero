@@ -15,9 +15,20 @@
 //! always taken today) and `ex_getln.rs` gained
 //! `get_cmdline_firstc()`.
 //!
+//! Also `calc_hist_idx`/[`f_histget`] (`histget()`): `calc_hist_idx`'s
+//! own real early-return condition has `hislen == 0` as its FIRST,
+//! short-circuited disjunct - always true today, making the whole
+//! condition unconditionally true regardless of the other disjuncts
+//! (only the `hisidx[histype] < 0` one, needing the real, not-yet-
+//! populated `history[]`/`hisidx[]` arrays, is omitted from the
+//! translated condition for this reason - see its own doc comment).
+//! `histget()` itself is therefore always an empty string today
+//! (never a real history entry to return) unless `{history}` itself
+//! is a type error, matching the original's own `NULL`-string case.
+//!
 //! Deferred: everything else - `get_histentry`/`set_histentry`/
 //! `get_hisidx`/`get_hisnum`/`get_history_arg`/`init_history`/
-//! `add_to_history`/`clr_history`/`f_histget`/`f_histadd`/`f_histdel`/
+//! `add_to_history`/`clr_history`/`f_histadd`/`f_histdel`/
 //! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
 //! history-table storage, and the command-line editing subsystem to
 //! ever populate it).
@@ -167,6 +178,66 @@ pub fn f_histnr(
     };
     let n = if i == HistoryType::Invalid { HistoryType::Invalid as i32 } else { get_history_idx(i) };
     rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
+}
+
+/// Calculate an entry's index in the history array for a given
+/// history number (`calc_hist_idx`).
+///
+/// `hislen == 0` (see [`get_hislen`]) is ALWAYS true today - the FIRST
+/// short-circuited disjunct of the original's own condition
+/// (`hislen == 0 || histype < 0 || histype >= HIST_COUNT ||
+/// hisidx[histype] < 0 || num == 0`), so it alone makes the whole
+/// "-1, not found" early return unconditional today, regardless of
+/// every OTHER disjunct's own value. The `histype` bounds/`num == 0`
+/// checks are still translated faithfully (cheap, no blocked
+/// dependency, matching [`get_history_idx`]'s own identical
+/// treatment); only `hisidx[histype] < 0` is omitted, since it needs
+/// the real, not-yet-populated `history[]`/`hisidx[]` arrays and can
+/// NEVER be reached while `hislen` stays `0`. The function's own
+/// remaining body (walking `history[histype]` to find a matching
+/// entry) is `unimplemented!()`, unreachable for the same reason.
+fn calc_hist_idx(histype: HistoryType, num: i32) -> i32 {
+    if get_hislen() == 0 || (histype as i32) < 0 || (histype as i32) >= HIST_COUNT as i32 || num == 0 {
+        return -1;
+    }
+    unimplemented!(
+        "calc_hist_idx: needs the real history[]/hisidx[] arrays \
+         (init_history/add_to_history, not translated)"
+    )
+}
+
+/// `histget({history} [, {index}])` - an entry from the given
+/// command-line history, or an empty string if there is no such entry
+/// (`f_histget`, `cmdhist.c`). Always an empty string when `{history}`
+/// itself is valid, since `calc_hist_idx`'s own real early-return is
+/// always taken today (never a real history entry to return). A
+/// type-error on `{history}` itself (`tv_get_string_chk` returning
+/// `None`) resolves to a `None` (null) string, matching the original's
+/// own `rettv->vval.v_string = NULL` for that specific case.
+pub fn f_histget(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let histname = crate::eval::typval::tv_get_string_chk(&argvars[0]);
+    rettv.value = crate::eval::typval_defs::TypvalValue::String(match histname {
+        None => None,
+        Some(name) => {
+            let histype = get_histtype(&name, false);
+            let idx = if argvars.len() > 1 {
+                crate::eval::typval::tv_get_number_chk(&argvars[1], None) as i32
+            } else {
+                get_history_idx(histype)
+            };
+            if calc_hist_idx(histype, idx) < 0 {
+                Some(Vec::new())
+            } else {
+                unimplemented!(
+                    "f_histget: a real match needs the history[] array, unreachable today \
+                     since calc_hist_idx always returns -1"
+                )
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -331,5 +402,89 @@ pub(crate) mod tests {
             &mut rettv,
         );
         assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(-1));
+    }
+
+    // --- calc_hist_idx / f_histget ---
+
+    #[test]
+    fn calc_hist_idx_is_negative_one_when_hislen_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(get_hislen(), 0);
+        assert_eq!(calc_hist_idx(HistoryType::Cmd, 1), -1);
+        assert_eq!(calc_hist_idx(HistoryType::Search, -1), -1);
+    }
+
+    #[test]
+    fn calc_hist_idx_is_negative_one_for_an_out_of_range_type_or_zero_num() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(calc_hist_idx(HistoryType::Invalid, 1), -1);
+        assert_eq!(calc_hist_idx(HistoryType::Default, 1), -1);
+        assert_eq!(calc_hist_idx(HistoryType::Cmd, 0), -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "calc_hist_idx: needs the real history")]
+    fn calc_hist_idx_panics_when_hislen_is_genuinely_nonzero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let old = set_hislen(10);
+        let result = std::panic::catch_unwind(|| calc_hist_idx(HistoryType::Cmd, 1));
+        set_hislen(old);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn histget_of_a_known_history_name_is_an_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_histget(
+            &[crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"search".to_vec())),
+                ..Default::default()
+            }],
+            &mut rettv,
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(Some(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn histget_with_an_explicit_index_argument_is_also_an_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_histget(
+            &[
+                crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::String(Some(b"cmd".to_vec())),
+                    ..Default::default()
+                },
+                crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::Number(-2),
+                    ..Default::default()
+                },
+            ],
+            &mut rettv,
+        );
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::String(Some(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn histget_of_a_type_error_history_name_is_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        f_histget(
+            &[crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::List(std::ptr::null_mut()),
+                ..Default::default()
+            }],
+            &mut rettv,
+        );
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::String(None));
     }
 }
