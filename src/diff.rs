@@ -56,6 +56,14 @@
 //! condition (`idx == -1 || !other`) happens to always be taken today,
 //! for the same underlying reason as the functions above.
 //!
+//! Also translated: [`diff_mark_adjust`] - `mark_adjust_buf`'s
+//! (`mark.c`) own third real dependency (alongside `quickfix.c`'s
+//! `qf_mark_adjust` and `fold.c`'s `foldMarkAdjust`). Walks tab pages
+//! the same way [`diff_mode_buf`] already does; its own real
+//! per-tabpage adjustment (`diff_mark_adjust_tp`) is genuinely,
+//! provably unreachable today (same `diff_buf_idx` reasoning as
+//! everything else in this file) and is not translated at all.
+//!
 //! Deferred: everything else in the file - real diff computation/
 //! display/navigation, needing the internal xdiff algorithm or
 //! external `diff` process invocation, neither translated.
@@ -248,6 +256,43 @@ pub unsafe fn diff_mode_buf(buf: *mut crate::buffer_defs::BufT) -> bool {
         tp = unsafe { &*tp }.tp_next;
     }
     false
+}
+
+/// Adjust diffs in every tab page that has `buf` registered as one of
+/// its diff buffers, for a change in line numbers (`diff_mark_adjust`).
+///
+/// Walks tab pages the same way [`diff_mode_buf`] already does. The
+/// original's own real per-tabpage adjustment (`diff_mark_adjust_tp`)
+/// is called only when `diff_buf_idx(buf, tp) != DB_COUNT` - since
+/// that never happens today (see this module's own doc comment,
+/// nothing can register a buffer into any `tp_diffbuf[]`), this
+/// function's loop body never actually runs, and
+/// `diff_mark_adjust_tp` itself is not translated at all (not even as
+/// an `unimplemented!()` stub) - genuinely, provably unreachable
+/// today, matching `qf_mark_adjust`'s own established precedent for
+/// this exact situation.
+///
+/// # Safety
+/// Same as [`diff_mode_buf`].
+pub unsafe fn diff_mark_adjust(
+    buf: *mut crate::buffer_defs::BufT,
+    _line1: crate::pos_defs::LinenrT,
+    _line2: crate::pos_defs::LinenrT,
+    _amount: crate::pos_defs::LinenrT,
+    _amount_after: crate::pos_defs::LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        if diff_buf_idx(buf, tp) != crate::buffer_defs::DB_COUNT {
+            unreachable!(
+                "diff_mark_adjust: diff_buf_idx never returns anything but DB_COUNT today, see \
+                 this function's own doc comment"
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
 }
 
 /// Find the corresponding line in a diff (`diff_get_corresponding_line_int`).
@@ -696,6 +741,43 @@ mod tests {
         let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
 
         assert!(!unsafe { diff_mode_buf(&mut buf as *mut BufT) });
+    }
+
+    #[test]
+    fn diff_mark_adjust_is_a_no_op_when_no_tabpage_has_buf_registered() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut tp2 = crate::buffer_defs::TabpageT::default();
+        let mut tp1 = crate::buffer_defs::TabpageT {
+            tp_next: &mut tp2 as *mut crate::buffer_defs::TabpageT,
+            ..Default::default()
+        };
+        let _guard = FirstTabpageGuard::set(&mut tp1 as *mut crate::buffer_defs::TabpageT);
+
+        // Must walk both tabpages without panicking, since neither has
+        // `buf` registered in its own tp_diffbuf[].
+        unsafe { diff_mark_adjust(&mut buf as *mut BufT, 1, 5, 2, 0) };
+    }
+
+    #[test]
+    fn diff_mark_adjust_is_a_no_op_when_the_tabpage_list_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let _guard = FirstTabpageGuard::set(std::ptr::null_mut());
+        unsafe { diff_mark_adjust(&mut buf as *mut BufT, 1, 5, 2, 0) };
+    }
+
+    #[test]
+    #[should_panic(expected = "diff_buf_idx never returns anything but DB_COUNT today")]
+    fn diff_mark_adjust_panics_when_buf_is_actually_registered() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[1] = buf_ptr;
+        let _guard = FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        unsafe { diff_mark_adjust(buf_ptr, 1, 5, 2, 0) };
     }
 
     /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
