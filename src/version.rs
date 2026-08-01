@@ -5,9 +5,9 @@
 //! either large build-generated string constants (`longVersion`, etc.)
 //! or the `included_patchsets`/`num_patches` tables (a multi-thousand-
 //! entry, per-Vim-version list of individually-tracked upstream Vim
-//! patch numbers - not transcribed here: far too large and low-value
-//! to hand-copy faithfully, and it is itself build-generated in the
-//! original).
+//! patch numbers - not transcribed here in full: far too large and
+//! low-value to hand-copy faithfully for `has_vim_patch`'s own sake,
+//! and it is itself hand-maintained/regenerated upstream over time).
 //!
 //! Translated: [`has_nvim_version`] and [`min_vim_version`] - both need
 //! only the small `vim_versions` table (5 entries) and the current
@@ -16,10 +16,24 @@
 //! `CMakeLists.txt`, since they are build-generated in the original
 //! too - see [`NVIM_VERSION_MAJOR`]'s own doc comment).
 //!
-//! Deferred: everything else - `highest_patch`/`has_vim_patch` (need
-//! the `included_patchsets` table), the version/build-info string
-//! constants, `may_show_intro`/intro-screen display (needs the
-//! rendering pipeline).
+//! Also translated: [`highest_patch`] - the ORIGINAL's own
+//! `included_patchsets[0][0]` is a single, fixed, compile-time-constant
+//! leading value of the first row (the `"801"` row, whose own highest
+//! tracked patch is `2424` in this checkout's own current
+//! `version.c`) - `highest_patch()` needs ONLY this one leading value,
+//! not the whole multi-thousand-entry table, so it is transcribed
+//! directly as `HIGHEST_PATCH` rather than deferred alongside the
+//! full table `has_vim_patch` would need. This directly unblocks
+//! `eval/vars.rs`'s own `evalvars_init`, whose `v:version`/
+//! `v:versionlong` startup values need exactly `min_vim_version`/
+//! `highest_patch` and nothing else.
+//!
+//! Deferred: `has_vim_patch` (needs the FULL `included_patchsets`
+//! table, not just its own leading value, to check whether a
+//! SPECIFIC patch number is included for a given Vim version - no
+//! real caller yet, `has('patch-N')` isn't itself translated), the
+//! version/build-info string constants, `may_show_intro`/intro-screen
+//! display (needs the rendering pipeline).
 
 /// Current Nvim major version (`NVIM_VERSION_MAJOR`), matching this
 /// checkout's own `CMakeLists.txt` (`set(NVIM_VERSION_MAJOR 0)`) - a
@@ -37,6 +51,13 @@ pub const NVIM_VERSION_PATCH: i32 = 0;
 /// Vim major*100+minor versions Nvim has tracked patches against
 /// (`vim_versions`).
 const VIM_VERSIONS: &[i32] = &[801, 802, 900, 901, 902];
+
+/// `included_patchsets[0][0]` - the highest individual Vim patch
+/// number tracked for `vim_versions[0]` (Vim `8.1`), matching this
+/// checkout's own current `version.c` (`(const int[]) { // 801`
+/// `2424, 2423, ...`). See this module's own doc comment for why only
+/// this single leading value is transcribed, not the whole table.
+const HIGHEST_PATCH: i32 = 2424;
 
 /// Parses as many leading ASCII digits as possible from the start of
 /// `s` into an `i32`, saturating rather than overflowing/panicking on
@@ -94,6 +115,15 @@ pub fn min_vim_version() -> i32 {
     VIM_VERSIONS[0]
 }
 
+/// The highest individual Vim patch number Nvim has ever tracked
+/// (`highest_patch`). See `HIGHEST_PATCH`'s own doc comment for why
+/// this is a single transcribed constant rather than derived from the
+/// full `included_patchsets` table.
+#[must_use]
+pub fn highest_patch() -> i32 {
+    HIGHEST_PATCH
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +179,10 @@ mod tests {
     #[test]
     fn min_vim_version_is_the_oldest_tracked_version() {
         assert_eq!(min_vim_version(), 801);
+    }
+
+    #[test]
+    fn highest_patch_matches_the_first_row_leading_value() {
+        assert_eq!(highest_patch(), 2424);
     }
 }

@@ -906,20 +906,20 @@ pub fn del_menutrans_vars() {
 /// job is overriding several `VIMVARS` entries' bare static-initializer
 /// VALUES with real runtime startup values.
 ///
-/// Two pieces are deliberately deferred, each documented precisely:
-/// - `v:version`/`v:versionlong` need `min_vim_version`/
-///   `highest_patch` (`version.c`'s own generated `vim_versions[]`/
-///   `included_patchsets[][]` tables - a separate mechanical-
-///   transcription undertaking, not attempted here).
+/// `v:version`/`v:versionlong` are now real too, via
+/// `crate::version::min_vim_version`/`highest_patch` (previously
+/// deferred pending those two functions, which now exist). The
+/// `v:startreason` env-var-based OVERRIDE (checking `ENV_STARTREASON`
+/// for a `nvim --remote`-triggered restart) is also now real, via
+/// `crate::os::env::os_getenv`/`os_env_exists`/`os_unsetenv` (all
+/// already existed - this was a stale deferral note, not a genuine
+/// blocker).
+///
+/// One piece remains deliberately deferred, documented precisely:
 /// - `v:msgpack_types` needs a new `MessagePackType` enum/
 ///   `eval_msgpack_type_lists` array (`eval/decode.c`/`eval/encode.c`,
 ///   the JSON/msgpack encoding subsystem, not translated - nothing
 ///   would ever READ this array back today anyway).
-/// - The `v:startreason` env-var-based OVERRIDE (checking
-///   `ENV_STARTREASON` for a `nvim --remote`-triggered restart) needs
-///   `os_unsetenv` (not yet translated) - only the unconditional
-///   `"normal"` default (the original's own FIRST, unconditional
-///   `set_vim_var_string` call) is set here.
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS` and the shared `VIMVARDICT`/
@@ -928,6 +928,13 @@ pub fn del_menutrans_vars() {
 pub unsafe fn evalvars_init() {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe {
+        let vim_version = crate::version::min_vim_version();
+        set_vim_var_nr(VimVarIndex::Version, i64::from(vim_version));
+        set_vim_var_nr(
+            VimVarIndex::Versionlong,
+            i64::from(vim_version) * 10000 + i64::from(crate::version::highest_patch()),
+        );
+
         set_vim_var_dict(VimVarIndex::CompletedItem, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
         set_vim_var_dict(VimVarIndex::Event, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
 
@@ -975,6 +982,22 @@ pub unsafe fn evalvars_init() {
         set_vim_var_partial(VimVarIndex::Lua, vvlua_partial);
 
         set_reg_var(0); // default for v:register is not 0 but '"'
+
+        // Set v:startreason via environment variable (a real `nvim
+        // --remote`-triggered restart) - os_getenv_noalloc's own
+        // non-allocating pointer return is just a C memory-management
+        // detail this crate's already-Vec-returning os_getenv doesn't
+        // need to replicate.
+        if let Some(startreason) =
+            crate::os::env::os_getenv(crate::os::os::ENV_STARTREASON.as_bytes())
+        {
+            if startreason == b"restart!" || startreason == b"restart" {
+                set_vim_var_string(VimVarIndex::Startreason, Some(&startreason));
+            }
+        }
+        if crate::os::env::os_env_exists(crate::os::os::ENV_STARTREASON.as_bytes(), false) {
+            crate::os::env::os_unsetenv(crate::os::os::ENV_STARTREASON.as_bytes());
+        }
     }
 }
 
@@ -1042,6 +1065,13 @@ mod evalvars_init_tests {
             let errors = get_vim_var_list(VimVarIndex::Errors);
             assert!(!errors.is_null());
             assert_eq!((*errors).lv_len, 0);
+
+            // v:version / v:versionlong: real min_vim_version()/
+            // highest_patch()-derived values (801 / 8012424 in this
+            // checkout, per version.rs's own VIM_VERSIONS[0]/
+            // HIGHEST_PATCH constants).
+            assert_eq!(get_vim_var_nr(VimVarIndex::Version), 801);
+            assert_eq!(get_vim_var_nr(VimVarIndex::Versionlong), 8_012_424);
 
             // Simple numeric/string/special values.
             assert_eq!(get_vim_var_nr(VimVarIndex::Stderr), 2);
