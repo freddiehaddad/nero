@@ -26,6 +26,16 @@
 //! translated), matching the established "translate ahead of a real
 //! caller" precedent.
 //!
+//! Also translated: [`pum_drawn`] (via [`pum_visible`] plus a new
+//! `PUM_EXTERNAL` file-static, matching `pum_is_visible`'s own
+//! "only ever set by `pum_display`, not yet translated, always
+//! `false` today" treatment) and [`pum_get_height`] (via a new
+//! `PUM_HEIGHT` file-static - only ever set by
+//! `pum_compute_vertical_placement`/`pum_show_popupmenu`, neither
+//! translated, so it stays `0` today; its own `ui_pum_get_height()`
+//! branch, gated on `PUM_EXTERNAL`, is `unimplemented!()` -
+//! unreachable today since nothing can set `PUM_EXTERNAL` true yet).
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -35,11 +45,54 @@ use crate::globals::GlobalCell;
 /// stays `false` forever in this crate today.
 static PUM_IS_VISIBLE: GlobalCell<bool> = GlobalCell::new(false);
 
+/// `pum_external` - whether an attached UI client has its own native
+/// popup-menu rendering support (`ui_has(kUIPopupmenu)`). Only ever
+/// set by `pum_display`/`pum_undisplay`, neither translated, so this
+/// stays `false` forever in this crate today.
+static PUM_EXTERNAL: GlobalCell<bool> = GlobalCell::new(false);
+
+/// `pum_height` - the number of popup-menu entries currently
+/// displayed. Only ever set by `pum_compute_vertical_placement`
+/// (part of `pum_display`'s own layout computation) and
+/// `pum_show_popupmenu`, neither translated, so this stays `0`
+/// forever in this crate today.
+static PUM_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
+
 /// `true` if the popup menu is currently displayed (`pum_visible`).
 #[must_use]
 pub fn pum_visible() -> bool {
     // SAFETY: a plain read through one exclusive borrow.
     unsafe { *PUM_IS_VISIBLE.get_mut() }
+}
+
+/// `true` if the popup menu is displayed AND drawn on the grid, as
+/// opposed to an attached UI's own external, native rendering
+/// (`pum_drawn`).
+#[must_use]
+pub fn pum_drawn() -> bool {
+    // SAFETY: a plain read through one exclusive borrow.
+    pum_visible() && !unsafe { *PUM_EXTERNAL.get_mut() }
+}
+
+/// Get the height (number of visible entries) of the popup menu -
+/// only meaningful when [`pum_visible`] returns `true` (`pum_get_height`).
+///
+/// # Panics
+/// If `PUM_EXTERNAL` is ever `true` (unreachable today - nothing in
+/// this crate can currently set it - since that branch needs
+/// `ui_pum_get_height()`'s real UI-attach/ext-popupmenu event
+/// dispatch, not yet translated).
+#[must_use]
+pub fn pum_get_height() -> i32 {
+    // SAFETY: a plain read through one exclusive borrow.
+    if unsafe { *PUM_EXTERNAL.get_mut() } {
+        unimplemented!(
+            "pum_get_height: the ui_pum_get_height() branch needs the real UI-attach/ \
+             ext-popupmenu event dispatch, not yet translated"
+        );
+    }
+    // SAFETY: a plain read through one exclusive borrow.
+    unsafe { *PUM_HEIGHT.get_mut() }
 }
 
 /// Compute the popup menu's own border width in screen columns, based
@@ -114,6 +167,83 @@ pub(crate) mod tests {
         set_pum_is_visible(true);
         assert!(pum_visible());
         set_pum_is_visible(false);
+    }
+
+    // ---- pum_drawn / pum_get_height ----
+
+    fn set_pum_external(value: bool) -> bool {
+        std::mem::replace(unsafe { PUM_EXTERNAL.get_mut() }, value)
+    }
+
+    fn set_pum_height(value: i32) -> i32 {
+        std::mem::replace(unsafe { PUM_HEIGHT.get_mut() }, value)
+    }
+
+    #[test]
+    fn pum_drawn_false_when_not_visible_regardless_of_external() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_pum_is_visible(false);
+        let prev = set_pum_external(false);
+        assert!(!pum_drawn());
+        set_pum_external(prev);
+    }
+
+    #[test]
+    fn pum_drawn_true_when_visible_and_not_external() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_pum_is_visible(true);
+        let prev = set_pum_external(false);
+        assert!(pum_drawn());
+        set_pum_external(prev);
+        set_pum_is_visible(false);
+    }
+
+    #[test]
+    fn pum_drawn_false_when_visible_but_external() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_pum_is_visible(true);
+        let prev = set_pum_external(true);
+        assert!(!pum_drawn());
+        set_pum_external(prev);
+        set_pum_is_visible(false);
+    }
+
+    #[test]
+    fn pum_get_height_reads_the_real_static_when_not_external() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ext = set_pum_external(false);
+        let prev_h = set_pum_height(5);
+        assert_eq!(pum_get_height(), 5);
+        set_pum_height(prev_h);
+        set_pum_external(prev_ext);
+    }
+
+    /// Restores `PUM_EXTERNAL` to its previous value on drop, even
+    /// through a panic - needed since `pum_get_height`'s own
+    /// `#[should_panic]` test deliberately triggers a panic while
+    /// `PUM_EXTERNAL` is temporarily set `true`.
+    struct PumExternalGuard {
+        previous: bool,
+    }
+
+    impl PumExternalGuard {
+        fn set(value: bool) -> Self {
+            PumExternalGuard { previous: set_pum_external(value) }
+        }
+    }
+
+    impl Drop for PumExternalGuard {
+        fn drop(&mut self) {
+            set_pum_external(self.previous);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ui_pum_get_height")]
+    fn pum_get_height_panics_when_external() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = PumExternalGuard::set(true);
+        let _ = pum_get_height();
     }
 
     // ---- pum_border_width ----
