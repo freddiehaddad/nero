@@ -893,6 +893,46 @@ pub fn del_menutrans_vars() {
     }
 }
 
+/// All recognized msgpack types (`MessagePackType`, `eval_defs.h`).
+///
+/// The only real, currently-translated consumer is [`evalvars_init`]'s
+/// own construction of `v:msgpack_types`/`EVAL_MSGPACK_TYPE_LISTS` -
+/// the not-yet-translated `eval/decode.c`'s `msgpack_list_to_tv` and
+/// `eval/encode.c`'s/`typval_encode.c.h`'s own msgpack-special-value
+/// recognition are this enum's OTHER real consumers in the original.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum MessagePackType {
+    Nil = 0,
+    Boolean = 1,
+    Integer = 2,
+    Float = 3,
+    String = 4,
+    Array = 5,
+    Map = 6,
+    Ext = 7,
+}
+
+/// Number of msgpack types (`NUM_MSGPACK_TYPES`, `eval/vars.h`).
+pub const NUM_MSGPACK_TYPES: usize = 8;
+
+/// Display names for each `MessagePackType`, indexed by its own
+/// discriminant (`msgpack_type_names`, `eval/vars.c`).
+const MSGPACK_TYPE_NAMES: [&[u8]; NUM_MSGPACK_TYPES] =
+    [b"nil", b"boolean", b"integer", b"float", b"string", b"array", b"map", b"ext"];
+
+/// Array mapping each msgpack type (see `MessagePackType`) to its
+/// corresponding sentinel `List` pointer inside `v:msgpack_types`
+/// (`eval_msgpack_type_lists`, `eval/vars.c`/`eval/vars.h`) - populated
+/// once by [`evalvars_init`], consumed by the not-yet-translated
+/// `eval/decode.c`/`eval/encode.c` msgpack-special-value machinery to
+/// recognize/produce these sentinel lists later. All null until
+/// `evalvars_init` runs (matching the original's own static-
+/// initializer-all-`NULL` state before its own `evalvars_init` call).
+static EVAL_MSGPACK_TYPE_LISTS: std::sync::LazyLock<
+    crate::globals::GlobalCell<[*mut crate::eval::typval_defs::ListT; NUM_MSGPACK_TYPES]>,
+> = std::sync::LazyLock::new(|| crate::globals::GlobalCell::new([std::ptr::null_mut(); NUM_MSGPACK_TYPES]));
+
 /// Set every `v:` special variable to its real startup default
 /// (`evalvars_init`, `eval/vars.c`).
 ///
@@ -913,13 +953,18 @@ pub fn del_menutrans_vars() {
 /// for a `nvim --remote`-triggered restart) is also now real, via
 /// `crate::os::env::os_getenv`/`os_env_exists`/`os_unsetenv` (all
 /// already existed - this was a stale deferral note, not a genuine
-/// blocker).
+/// blocker). `v:msgpack_types` is now real too - its own construction
+/// only needed the small `MessagePackType` enum/`MSGPACK_TYPE_NAMES`
+/// array/`EVAL_MSGPACK_TYPE_LISTS` above, NOT the whole not-yet-
+/// translated `eval/decode.c`/`eval/encode.c` JSON/msgpack encoding
+/// subsystem (another stale deferral note - those files' OWN, separate
+/// use of `eval_msgpack_type_lists` remains untranslated, but that
+/// doesn't block THIS function's own job of just constructing the
+/// array and the dict).
 ///
-/// One piece remains deliberately deferred, documented precisely:
-/// - `v:msgpack_types` needs a new `MessagePackType` enum/
-///   `eval_msgpack_type_lists` array (`eval/decode.c`/`eval/encode.c`,
-///   the JSON/msgpack encoding subsystem, not translated - nothing
-///   would ever READ this array back today anyway).
+/// This means `evalvars_init` is now translated IN FULL - every single
+/// `set_vim_var_*` call in the real C function's own body has a real
+/// Rust equivalent above, with no remaining deferred pieces.
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS` and the shared `VIMVARDICT`/
@@ -934,6 +979,33 @@ pub unsafe fn evalvars_init() {
             VimVarIndex::Versionlong,
             i64::from(vim_version) * 10000 + i64::from(crate::version::highest_patch()),
         );
+
+        // v:msgpack_types: a real Fixed-locked dict of 8 Fixed-locked,
+        // empty sentinel Lists, one per MessagePackType - each List's
+        // own pointer is ALSO recorded in EVAL_MSGPACK_TYPE_LISTS,
+        // matching the original's own eval_msgpack_type_lists[] array,
+        // for the not-yet-translated eval/decode.c/eval/encode.c
+        // msgpack-special-value machinery to recognize later.
+        let msgpack_types_dict = crate::eval::typval::tv_dict_alloc();
+        {
+            let msgpack_lists = EVAL_MSGPACK_TYPE_LISTS.get_mut();
+            for i in 0..NUM_MSGPACK_TYPES {
+                let type_list = crate::eval::typval::tv_list_alloc(0);
+                crate::eval::typval::tv_list_set_lock(type_list, VarLockStatus::Fixed);
+                crate::eval::typval::tv_list_ref(type_list);
+                let di = crate::eval::typval::tv_dict_item_alloc(MSGPACK_TYPE_NAMES[i]);
+                (*di).di_flags |= dict_item_flags::RO | dict_item_flags::FIX;
+                (*di).di_tv.value = TypvalValue::List(type_list);
+                assert_ne!(
+                    crate::eval::typval::tv_dict_add(&mut *msgpack_types_dict, di),
+                    crate::vim_defs::FAIL,
+                    "there must not be duplicate items in this dictionary by definition"
+                );
+                msgpack_lists[i] = type_list;
+            }
+        }
+        (*msgpack_types_dict).dv_lock = VarLockStatus::Fixed;
+        set_vim_var_dict(VimVarIndex::MsgpackTypes, msgpack_types_dict);
 
         set_vim_var_dict(VimVarIndex::CompletedItem, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
         set_vim_var_dict(VimVarIndex::Event, crate::eval::typval::tv_dict_alloc_lock(VarLockStatus::Fixed));
@@ -1073,6 +1145,33 @@ mod evalvars_init_tests {
             assert_eq!(get_vim_var_nr(VimVarIndex::Version), 801);
             assert_eq!(get_vim_var_nr(VimVarIndex::Versionlong), 8_012_424);
 
+            // v:msgpack_types: a real, Fixed-locked dict of 8 real,
+            // Fixed-locked, empty sentinel Lists (one per
+            // MessagePackType), each ALSO recorded in
+            // EVAL_MSGPACK_TYPE_LISTS at the matching index.
+            let msgpack_types = get_vim_var_dict(VimVarIndex::MsgpackTypes);
+            assert!(!msgpack_types.is_null());
+            assert_eq!((*msgpack_types).dv_lock, VarLockStatus::Fixed);
+            assert_eq!((*msgpack_types).dv_index.len(), NUM_MSGPACK_TYPES);
+            for (i, name) in MSGPACK_TYPE_NAMES.iter().enumerate() {
+                let item = crate::eval::typval::tv_dict_find(Some(&mut *msgpack_types), name)
+                    .expect("every msgpack type name should be present");
+                assert_eq!(
+                    (*item).di_flags & (dict_item_flags::RO | dict_item_flags::FIX),
+                    dict_item_flags::RO | dict_item_flags::FIX
+                );
+                match (*item).di_tv.value {
+                    TypvalValue::List(l) => {
+                        assert!(!l.is_null());
+                        assert_eq!((*l).lv_len, 0);
+                        assert_eq!((*l).lv_lock, VarLockStatus::Fixed);
+                        assert_eq!((*l).lv_refcount, 1);
+                        assert_eq!(EVAL_MSGPACK_TYPE_LISTS.get_mut()[i], l);
+                    }
+                    _ => panic!("expected a List-typed msgpack type entry"),
+                }
+            }
+
             // Simple numeric/string/special values.
             assert_eq!(get_vim_var_nr(VimVarIndex::Stderr), 2);
             assert_eq!(get_vim_var_nr(VimVarIndex::Searchforward), 1);
@@ -1127,6 +1226,17 @@ mod evalvars_init_tests {
             // pointer back to null - avoiding both a permanent
             // GC_FIRST_DICT/GC_FIRST_LIST entry and a dangling pointer
             // left in VIMVARS for a later test to dereference.
+            //
+            // tv_dict_unref(msgpack_types) also releases all 8 of its
+            // own List-typed items (via tv_dict_free_contents's own
+            // per-item tv_clear_simple call, which calls tv_list_unref
+            // on a List value) - dropping each list's refcount from 1
+            // (set by the earlier tv_list_ref) to 0, freeing it. Reset
+            // EVAL_MSGPACK_TYPE_LISTS to all-null afterward too, to
+            // avoid leaving 8 dangling pointers of its own.
+            crate::eval::typval::tv_dict_unref(msgpack_types);
+            set_vim_var_dict(VimVarIndex::MsgpackTypes, std::ptr::null_mut());
+            *EVAL_MSGPACK_TYPE_LISTS.get_mut() = [std::ptr::null_mut(); NUM_MSGPACK_TYPES];
             crate::eval::typval::tv_dict_unref(completed_item);
             set_vim_var_dict(VimVarIndex::CompletedItem, std::ptr::null_mut());
             crate::eval::typval::tv_dict_unref(event);
