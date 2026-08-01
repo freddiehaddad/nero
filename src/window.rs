@@ -508,6 +508,48 @@ pub unsafe fn win_valid_any_tab(win: *const WinT) -> bool {
     false
 }
 
+/// Find window `handle` in ANY tab page, or a null pointer if not
+/// found (`handle_get_window`, `api/private/helpers.h`). The original
+/// is a `pmap_get(int)(&window_handles, (h))` lookup into a real,
+/// global registry populated whenever a window is created/closed;
+/// this crate has no such registry, so this instead walks every
+/// tabpage's own window list directly - an observably identical
+/// result for every window this crate can currently construct, since
+/// every live window is reachable this way and nothing here can leave
+/// a closed window's handle dangling in a registry (there is no
+/// registry to leave it dangling in).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// own window list, must consist of valid, live pointers.
+#[must_use]
+pub unsafe fn handle_get_window(handle: crate::types_defs::HandleT) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*wp }.handle == handle {
+                return wp;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    std::ptr::null_mut()
+}
+
 /// Return the number of windows in the current tab page (`win_count`).
 ///
 /// # Safety
@@ -3680,6 +3722,61 @@ mod tests {
         assert!(!unsafe { win_valid_any_tab(std::ptr::null()) });
         let stray = WinT::default();
         assert!(!unsafe { win_valid_any_tab(&stray) });
+    }
+
+    #[test]
+    fn handle_get_window_finds_a_window_in_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { handle: 9, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WindowListGuard::set(&mut win as *mut WinT, &mut tp);
+        let _first_tabpage_guard =
+            FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        assert!(std::ptr::eq(unsafe { handle_get_window(9) }, &win as *const WinT));
+    }
+
+    /// Unlike [`win_find_by_handle`] (deliberately scoped to the
+    /// current tab page only, matching the original's own
+    /// `win_find_by_handle`), `handle_get_window` finds a window in
+    /// ANY tab page, matching the real `handle_get_window` macro's
+    /// global-registry semantics.
+    #[test]
+    fn handle_get_window_finds_a_window_in_a_non_curtab_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { handle: 11, ..Default::default() };
+        let mut other_tp = crate::buffer_defs::TabpageT {
+            tp_firstwin: &mut win as *mut WinT,
+            ..Default::default()
+        };
+        let mut curtab = crate::buffer_defs::TabpageT {
+            tp_next: &mut other_tp as *mut crate::buffer_defs::TabpageT,
+            ..Default::default()
+        };
+        let _first_tabpage_guard =
+            FirstTabpageGuard::set(&mut curtab as *mut crate::buffer_defs::TabpageT);
+        // GLOBALS.firstwin is empty for curtab itself - win only exists
+        // in the SECOND tabpage's own tp_firstwin.
+        let _window_list_guard =
+            WindowListGuard::set(std::ptr::null_mut(), &mut curtab as *mut _);
+
+        assert!(std::ptr::eq(unsafe { handle_get_window(11) }, &win as *const WinT));
+        // The unrelated win_find_by_handle (curtab-only) correctly
+        // does NOT find it, confirming the two functions genuinely
+        // differ in scope.
+        assert!(unsafe { win_find_by_handle(11) }.is_null());
+    }
+
+    #[test]
+    fn handle_get_window_null_when_not_found() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT { handle: 3, ..Default::default() };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WindowListGuard::set(&mut win as *mut WinT, &mut tp);
+        let _first_tabpage_guard =
+            FirstTabpageGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+
+        assert!(unsafe { handle_get_window(99) }.is_null());
     }
 
     #[test]

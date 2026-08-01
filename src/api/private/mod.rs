@@ -2,3 +2,4 @@
 //! up the `api/private/` submodule tree in Rust.
 
 pub mod defs;
+pub mod helpers;

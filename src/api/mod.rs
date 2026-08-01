@@ -3,3 +3,4 @@
 
 pub mod extmark;
 pub mod private;
+pub mod window;
