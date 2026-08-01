@@ -19,6 +19,22 @@
 //! garbage collection. `TFU_CB` stays `Callback::None` forever today
 //! (see its own doc comment) - matches every real, unconfigured
 //! session.
+//!
+//! Also translated: the tag-stack WRITE side - [`set_tagstack`] (the
+//! `settagstack()` builtin's real dispatcher) plus its own private
+//! helpers `tagstack_clear`/`tagstack_shift`/`tagstack_push_item`/
+//! `tagstack_push_items`/`tagstack_set_curidx`. Unblocked now that
+//! `eval/eval.rs`'s `list2fpos` exists (called with `charcol = false`
+//! here, which never reaches that function's own still-deferred
+//! `buflist_findnr`-needing branch). `tfu_in_use` (a plain file-static
+//! `bool`, `TFU_IN_USE` here) matches `autocmd.rs`'s `AUTOCMD_BUSY`
+//! precedent for a currently-always-`false` guard flag: its only real
+//! setter, `find_tagfunc_tags`, needs the funcref-call machinery, not
+//! translated. The original's own `emsg()` calls (invalid-argument-
+//! type/recursive-tagfunc-modification errors) have their message
+//! display skipped, keeping the exact same `FAIL`/`OK` return value
+//! and every other state change - matching this crate's established
+//! policy.
 
 use crate::buffer_defs::{TaggyT, WinT};
 
@@ -122,6 +138,215 @@ pub unsafe fn set_ref_in_tagfunc(copy_id: i32) -> bool {
     let cb = unsafe { &*TFU_CB.as_ptr() };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::set_ref_in_callback(cb, copy_id, std::ptr::null_mut(), std::ptr::null_mut()) }
+}
+
+/// `tfu_in_use` - disallow modifying the tag stack from inside a
+/// `'tagfunc'` callback (`TFU_IN_USE`, a plain file-static `bool`).
+/// Always `false` today: its only real setter, `find_tagfunc_tags`,
+/// needs the funcref-call machinery, not translated - matches
+/// `autocmd.rs`'s `AUTOCMD_BUSY` precedent for a currently-always-
+/// `false` guard flag.
+static TFU_IN_USE: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Free the current tag stack of window `wp` (`tagstack_clear`).
+fn tagstack_clear(wp: &mut WinT) {
+    for i in 0..wp.w_tagstacklen as usize {
+        crate::mark::tagstack_clear_entry(&mut wp.w_tagstack[i]);
+    }
+    wp.w_tagstacklen = 0;
+    wp.w_tagstackidx = 0;
+}
+
+/// Remove the oldest entry from the tag stack and shift the rest of
+/// the entries down to fill the gap (`tagstack_shift`).
+fn tagstack_shift(wp: &mut WinT) {
+    crate::mark::tagstack_clear_entry(&mut wp.w_tagstack[0]);
+    for i in 1..wp.w_tagstacklen as usize {
+        wp.w_tagstack[i - 1] = wp.w_tagstack[i].clone();
+    }
+    wp.w_tagstacklen -= 1;
+}
+
+/// Push a new item to the tag stack of window `wp`
+/// (`tagstack_push_item`).
+#[allow(clippy::too_many_arguments)]
+fn tagstack_push_item(
+    wp: &mut WinT,
+    tagname: Vec<u8>,
+    cur_fnum: i32,
+    cur_match: i32,
+    mark: crate::pos_defs::PosT,
+    fnum: i32,
+    user_data: Option<Vec<u8>>,
+) {
+    let mut idx = wp.w_tagstacklen as usize; // top of the stack
+
+    // if the tagstack is full: remove the oldest entry
+    if idx >= crate::mark_defs::TAGSTACKSIZE as usize {
+        tagstack_shift(wp);
+        idx = crate::mark_defs::TAGSTACKSIZE as usize - 1;
+    }
+
+    wp.w_tagstacklen += 1;
+    wp.w_tagstack[idx] = TaggyT {
+        tagname,
+        cur_fnum,
+        cur_match: cur_match.max(0),
+        fmark: crate::mark_defs::FmarkT {
+            mark,
+            fnum,
+            view: crate::mark_defs::FmarkvT::default(),
+            ..Default::default()
+        },
+        user_data,
+    };
+}
+
+/// Add a list of items (each a Vimscript dict with `from`/`tagname`/
+/// `bufnr`/`matchnr`/`user_data` keys) to the tag stack of window `wp`
+/// (`tagstack_push_items`). Any non-dict item, or a dict missing
+/// `from`/`tagname`, is silently skipped, matching the original's own
+/// `continue` on every such case.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+unsafe fn tagstack_push_items(wp: &mut WinT, l: *mut crate::eval::typval_defs::ListT) {
+    use crate::eval::typval::{tv_dict_find, tv_dict_get_number, tv_dict_get_string, tv_list_first};
+    use crate::eval::typval_defs::TypvalValue;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut li = unsafe { tv_list_first(l) };
+    while !li.is_null() {
+        // SAFETY: `li` is a valid, live list-item pointer for the
+        // duration of this one iteration.
+        let item_value = unsafe { &(*li).li_tv.value };
+        let itemdict = match item_value {
+            TypvalValue::Dict(d) if !d.is_null() => *d,
+            _ => {
+                // SAFETY: forwarded from this function's own safety doc.
+                li = unsafe { (*li).li_next };
+                continue;
+            }
+        };
+
+        // SAFETY: `itemdict` is a valid, live dict pointer (checked
+        // non-null above).
+        let Some(from_di) = tv_dict_find(Some(unsafe { &mut *itemdict }), b"from") else {
+            // SAFETY: forwarded from this function's own safety doc.
+            li = unsafe { (*li).li_next };
+            continue;
+        };
+        let mut mark = crate::pos_defs::PosT::default();
+        let mut fnum = 0i32;
+        // SAFETY: `from_di` is a valid, live dictitem pointer, just
+        // found in `itemdict` above.
+        let from_ok = unsafe {
+            crate::eval::eval::list2fpos(&(*from_di).di_tv, &mut mark, Some(&mut fnum), None, false)
+        } == crate::vim_defs::OK;
+        if !from_ok {
+            // SAFETY: forwarded from this function's own safety doc.
+            li = unsafe { (*li).li_next };
+            continue;
+        }
+
+        // SAFETY: `itemdict` is still valid.
+        let Some(tagname) = (unsafe { tv_dict_get_string(Some(&mut *itemdict), b"tagname") }) else {
+            // SAFETY: forwarded from this function's own safety doc.
+            li = unsafe { (*li).li_next };
+            continue;
+        };
+
+        if mark.col > 0 {
+            mark.col -= 1;
+        }
+
+        // SAFETY: `itemdict` is still valid.
+        let cur_fnum = unsafe { tv_dict_get_number(Some(&mut *itemdict), b"bufnr") } as i32;
+        // SAFETY: `itemdict` is still valid.
+        let cur_match = unsafe { tv_dict_get_number(Some(&mut *itemdict), b"matchnr") } as i32 - 1;
+        // SAFETY: `itemdict` is still valid.
+        let user_data = unsafe { tv_dict_get_string(Some(&mut *itemdict), b"user_data") };
+
+        tagstack_push_item(wp, tagname, cur_fnum, cur_match, mark, fnum, user_data);
+
+        // SAFETY: forwarded from this function's own safety doc.
+        li = unsafe { (*li).li_next };
+    }
+}
+
+/// Set the current index in window `wp`'s tag stack, clamped to
+/// `[0, w_tagstacklen]` (`tagstack_set_curidx`).
+fn tagstack_set_curidx(wp: &mut WinT, curidx: i32) {
+    wp.w_tagstackidx = curidx.clamp(0, wp.w_tagstacklen);
+}
+
+/// Set the tag stack entries of window `wp` from a Vimscript dict
+/// description (`set_tagstack`, the `settagstack()` builtin's real
+/// dispatcher). `action` is one of `` b'a' `` (append), `` b'r' ``
+/// (replace), or `` b't' `` (truncate).
+///
+/// The original's own `emsg()` calls (recursive-tagfunc-modification,
+/// wrong-argument-type errors) have their message display skipped
+/// (`message.c`'s pipeline not tractable), keeping the exact same
+/// `FAIL`/`OK` return value and every other state change - matching
+/// this module's established policy.
+///
+/// # Safety
+/// `d` must be a valid, non-null pointer to a live `DictT`.
+pub unsafe fn set_tagstack(wp: &mut WinT, d: *mut crate::eval::typval_defs::DictT, action: u8) -> i32 {
+    use crate::eval::typval::{tv_dict_find, tv_get_number};
+    use crate::eval::typval_defs::TypvalValue;
+    use crate::vim_defs::{FAIL, OK};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *TFU_IN_USE.get_mut() } {
+        return FAIL;
+    }
+
+    let mut l: *mut crate::eval::typval_defs::ListT = std::ptr::null_mut();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(items_di) = tv_dict_find(Some(unsafe { &mut *d }), b"items") {
+        // SAFETY: `items_di` is a valid, live dictitem pointer, just
+        // found in `d` above.
+        let items_value = unsafe { &(*items_di).di_tv.value };
+        let TypvalValue::List(items_list) = items_value else {
+            return FAIL;
+        };
+        l = *items_list;
+    }
+
+    // SAFETY: `d` is still valid.
+    if let Some(curidx_di) = tv_dict_find(Some(unsafe { &mut *d }), b"curidx") {
+        // SAFETY: `curidx_di` is a valid, live dictitem pointer, just
+        // found in `d` above.
+        let n = tv_get_number(unsafe { &(*curidx_di).di_tv });
+        tagstack_set_curidx(wp, n as i32 - 1);
+    }
+
+    if action == b't' {
+        // truncate the stack: delete every entry above the current one
+        let tagstackidx = wp.w_tagstackidx;
+        let mut tagstacklen = wp.w_tagstacklen;
+        while tagstackidx < tagstacklen {
+            tagstacklen -= 1;
+            crate::mark::tagstack_clear_entry(&mut wp.w_tagstack[tagstacklen as usize]);
+        }
+        wp.w_tagstacklen = tagstacklen;
+    }
+
+    if !l.is_null() {
+        if action == b'r' {
+            // replace the stack
+            tagstack_clear(wp);
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { tagstack_push_items(wp, l) };
+        // set the current index after the last entry
+        wp.w_tagstackidx = wp.w_tagstacklen;
+    }
+
+    OK
 }
 
 #[cfg(test)]
@@ -353,5 +578,433 @@ mod tests {
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
         assert!(!unsafe { set_ref_in_tagfunc(1) });
+    }
+
+    // --- tagstack_clear / tagstack_shift / tagstack_push_item / tagstack_set_curidx ---
+
+    fn make_taggy(tagname: &[u8], cur_fnum: i32, cur_match: i32, lnum: i32, fnum: i32) -> TaggyT {
+        TaggyT {
+            tagname: tagname.to_vec(),
+            fmark: crate::mark_defs::FmarkT {
+                mark: crate::pos_defs::PosT { lnum, col: 0, coladd: 0 },
+                fnum,
+                ..Default::default()
+            },
+            cur_match,
+            cur_fnum,
+            user_data: None,
+        }
+    }
+
+    #[test]
+    fn tagstack_clear_empties_the_stack_and_resets_indices() {
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"a", 1, 0, 1, 1);
+        win.w_tagstack[1] = make_taggy(b"b", 2, 0, 2, 2);
+        win.w_tagstacklen = 2;
+        win.w_tagstackidx = 1;
+
+        tagstack_clear(&mut win);
+
+        assert_eq!(win.w_tagstacklen, 0);
+        assert_eq!(win.w_tagstackidx, 0);
+    }
+
+    #[test]
+    fn tagstack_shift_removes_the_oldest_entry_and_shifts_the_rest_down() {
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"a", 1, 0, 1, 1);
+        win.w_tagstack[1] = make_taggy(b"b", 2, 0, 2, 2);
+        win.w_tagstack[2] = make_taggy(b"c", 3, 0, 3, 3);
+        win.w_tagstacklen = 3;
+
+        tagstack_shift(&mut win);
+
+        assert_eq!(win.w_tagstacklen, 2);
+        assert_eq!(win.w_tagstack[0].tagname, b"b");
+        assert_eq!(win.w_tagstack[1].tagname, b"c");
+    }
+
+    #[test]
+    fn tagstack_push_item_appends_when_the_stack_is_not_full() {
+        let mut win = WinT::default();
+        let pos = crate::pos_defs::PosT { lnum: 4, col: 2, coladd: 0 };
+
+        tagstack_push_item(&mut win, b"myfunc".to_vec(), 8, 1, pos, 7, None);
+
+        assert_eq!(win.w_tagstacklen, 1);
+        let entry = &win.w_tagstack[0];
+        assert_eq!(entry.tagname, b"myfunc");
+        assert_eq!(entry.cur_fnum, 8);
+        assert_eq!(entry.cur_match, 1);
+        assert_eq!(entry.fmark.mark, pos);
+        assert_eq!(entry.fmark.fnum, 7);
+        assert_eq!(entry.user_data, None);
+    }
+
+    #[test]
+    fn tagstack_push_item_clamps_a_negative_cur_match_to_zero() {
+        let mut win = WinT::default();
+        tagstack_push_item(&mut win, b"f".to_vec(), 1, -1, crate::pos_defs::PosT::default(), 1, None);
+        assert_eq!(win.w_tagstack[0].cur_match, 0);
+    }
+
+    #[test]
+    fn tagstack_push_item_shifts_out_the_oldest_entry_once_the_stack_is_full() {
+        let mut win = WinT::default();
+        for i in 0..crate::mark_defs::TAGSTACKSIZE {
+            let name = format!("tag{i}");
+            tagstack_push_item(&mut win, name.into_bytes(), i, 0, crate::pos_defs::PosT::default(), i, None);
+        }
+        assert_eq!(win.w_tagstacklen, crate::mark_defs::TAGSTACKSIZE);
+        assert_eq!(win.w_tagstack[0].tagname, b"tag0");
+
+        // Pushing one more must shift "tag0" out; "tag1" becomes the
+        // new oldest entry, and the new item lands at the top.
+        tagstack_push_item(&mut win, b"tagNEW".to_vec(), 99, 0, crate::pos_defs::PosT::default(), 99, None);
+        assert_eq!(win.w_tagstacklen, crate::mark_defs::TAGSTACKSIZE);
+        assert_eq!(win.w_tagstack[0].tagname, b"tag1");
+        assert_eq!(win.w_tagstack[(crate::mark_defs::TAGSTACKSIZE - 1) as usize].tagname, b"tagNEW");
+    }
+
+    #[test]
+    fn tagstack_set_curidx_clamps_above_the_stack_length() {
+        let mut win = WinT { w_tagstacklen: 5, ..Default::default() };
+        tagstack_set_curidx(&mut win, 10);
+        assert_eq!(win.w_tagstackidx, 5);
+    }
+
+    #[test]
+    fn tagstack_set_curidx_clamps_below_zero() {
+        let mut win = WinT { w_tagstacklen: 5, ..Default::default() };
+        tagstack_set_curidx(&mut win, -3);
+        assert_eq!(win.w_tagstackidx, 0);
+    }
+
+    #[test]
+    fn tagstack_set_curidx_accepts_an_in_range_value() {
+        let mut win = WinT { w_tagstacklen: 5, ..Default::default() };
+        tagstack_set_curidx(&mut win, 3);
+        assert_eq!(win.w_tagstackidx, 3);
+    }
+
+    // --- tagstack_push_items ---
+
+    /// Builds a single tag-stack-item `Dict` matching `set_tagstack`'s
+    /// own expected shape (the inverse of `get_tag_details`'s own
+    /// construction): `{"from": [fnum, lnum, col, coladd], "tagname":
+    /// ..., "bufnr": ..., "matchnr": ..., "user_data": ...}`.
+    #[allow(clippy::too_many_arguments)]
+    fn make_stack_item_dict(
+        fnum: i64,
+        lnum: i64,
+        col: i64,
+        coladd: i64,
+        tagname: &[u8],
+        bufnr: i64,
+        matchnr: i64,
+        user_data: Option<&[u8]>,
+    ) -> *mut crate::eval::typval_defs::DictT {
+        use crate::eval::typval::{tv_dict_add_list, tv_dict_add_nr, tv_dict_add_str, tv_list_alloc, tv_list_append_number};
+        let d = crate::eval::typval::tv_dict_alloc();
+        let from = tv_list_alloc(4);
+        // SAFETY: `d`/`from` are both freshly allocated, not yet
+        // shared beyond each other.
+        unsafe {
+            tv_dict_add_list(&mut *d, b"from", from);
+            tv_list_append_number(from, fnum);
+            tv_list_append_number(from, lnum);
+            tv_list_append_number(from, col);
+            tv_list_append_number(from, coladd);
+        }
+        // SAFETY: `d` is still exclusively owned here.
+        let d_ref = unsafe { &mut *d };
+        tv_dict_add_str(d_ref, b"tagname", Some(tagname));
+        tv_dict_add_nr(d_ref, b"bufnr", bufnr);
+        tv_dict_add_nr(d_ref, b"matchnr", matchnr);
+        if let Some(ud) = user_data {
+            tv_dict_add_str(d_ref, b"user_data", Some(ud));
+        }
+        d
+    }
+
+    #[test]
+    fn tagstack_push_items_pushes_a_valid_entry_and_decrements_the_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        let d = make_stack_item_dict(7, 3, 5, 0, b"myfunc", 8, 2, None);
+        // SAFETY: `l`/`d` are both freshly allocated, `d` not yet
+        // shared beyond `l`.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstacklen, 1);
+        let entry = &win.w_tagstack[0];
+        assert_eq!(entry.tagname, b"myfunc");
+        assert_eq!(entry.cur_fnum, 8);
+        assert_eq!(entry.cur_match, 1); // matchnr(2) - 1
+        assert_eq!(entry.fmark.fnum, 7);
+        assert_eq!(entry.fmark.mark, crate::pos_defs::PosT { lnum: 3, col: 4, coladd: 0 }); // col(5) - 1
+
+        // SAFETY: `l` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_col_zero_stays_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        let d = make_stack_item_dict(1, 1, 0, 0, b"f", 1, 1, None);
+        // SAFETY: `l`/`d` are both freshly allocated.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstack[0].fmark.mark.col, 0);
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_carries_through_user_data() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        let d = make_stack_item_dict(1, 1, 1, 0, b"f", 1, 1, Some(b"extra"));
+        // SAFETY: `l`/`d` are both freshly allocated.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstack[0].user_data, Some(b"extra".to_vec()));
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_skips_a_non_dict_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        // SAFETY: `l` is freshly allocated.
+        unsafe { crate::eval::typval::tv_list_append_number(l, 42) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstacklen, 0);
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_skips_a_dict_missing_from() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `d` is freshly allocated.
+        crate::eval::typval::tv_dict_add_str(unsafe { &mut *d }, b"tagname", Some(b"f"));
+        // SAFETY: `l`/`d` are both freshly allocated.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstacklen, 0, "no 'from' key: item must be skipped");
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_skips_a_dict_missing_tagname() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(1);
+        let d = crate::eval::typval::tv_dict_alloc();
+        let from = crate::eval::typval::tv_list_alloc(3);
+        // SAFETY: `d`/`from` are both freshly allocated.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"from", from);
+            crate::eval::typval::tv_list_append_number(from, 1);
+            crate::eval::typval::tv_list_append_number(from, 1);
+            crate::eval::typval::tv_list_append_number(from, 1);
+        }
+        // SAFETY: `l`/`d` are both freshly allocated.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, d) };
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstacklen, 0, "no 'tagname' key: item must be skipped");
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn tagstack_push_items_pushes_multiple_entries_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        let l = crate::eval::typval::tv_list_alloc(2);
+        let d1 = make_stack_item_dict(1, 1, 1, 0, b"first", 1, 1, None);
+        let d2 = make_stack_item_dict(2, 2, 1, 0, b"second", 2, 1, None);
+        // SAFETY: `l`/`d1`/`d2` are all freshly allocated.
+        unsafe {
+            crate::eval::typval::tv_list_append_dict(l, d1);
+            crate::eval::typval::tv_list_append_dict(l, d2);
+        }
+
+        // SAFETY: `l` is a valid, live, exclusively-referenced list.
+        unsafe { tagstack_push_items(&mut win, l) };
+
+        assert_eq!(win.w_tagstacklen, 2);
+        assert_eq!(win.w_tagstack[0].tagname, b"first");
+        assert_eq!(win.w_tagstack[1].tagname, b"second");
+
+        // SAFETY: `l` is still exclusively owned.
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    // --- set_tagstack ---
+
+    #[test]
+    fn set_tagstack_fails_when_tfu_in_use() {
+        let _lock = crate::globals::global_state_test_lock();
+        // SAFETY: forwarded from TFU_IN_USE's own always-false doc -
+        // poked directly to prove set_tagstack's own short-circuit is
+        // faithfully translated, independent of how tfu_in_use
+        // eventually gets set for real.
+        unsafe { *TFU_IN_USE.get_mut() = true };
+        let mut win = WinT::default();
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `d` was just allocated, exclusively owned here; `win`
+        // is a valid, live window.
+        let rc = unsafe { set_tagstack(&mut win, d, b'r') };
+        unsafe { *TFU_IN_USE.get_mut() = false };
+        assert_eq!(rc, crate::vim_defs::FAIL);
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_tagstack_action_replace_clears_the_old_stack_before_pushing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"old", 1, 0, 1, 1);
+        win.w_tagstacklen = 1;
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let items = crate::eval::typval::tv_list_alloc(1);
+        let item = make_stack_item_dict(2, 2, 1, 0, b"new", 2, 1, None);
+        // SAFETY: `d`/`items`/`item` are all freshly allocated, none
+        // yet shared beyond each other.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"items", items);
+            crate::eval::typval::tv_list_append_dict(items, item);
+        }
+
+        // SAFETY: `win` is valid; `d` was just freshly allocated.
+        let rc = unsafe { set_tagstack(&mut win, d, b'r') };
+
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(win.w_tagstacklen, 1);
+        assert_eq!(win.w_tagstack[0].tagname, b"new", "the old entry must be cleared, not kept alongside");
+        assert_eq!(win.w_tagstackidx, 1);
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_tagstack_action_append_keeps_the_old_stack_and_appends() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"old", 1, 0, 1, 1);
+        win.w_tagstacklen = 1;
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let items = crate::eval::typval::tv_list_alloc(1);
+        let item = make_stack_item_dict(2, 2, 1, 0, b"new", 2, 1, None);
+        // SAFETY: `d`/`items`/`item` are all freshly allocated.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"items", items);
+            crate::eval::typval::tv_list_append_dict(items, item);
+        }
+
+        // SAFETY: `win` is valid; `d` was just freshly allocated.
+        let rc = unsafe { set_tagstack(&mut win, d, b'a') };
+
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(win.w_tagstacklen, 2);
+        assert_eq!(win.w_tagstack[0].tagname, b"old");
+        assert_eq!(win.w_tagstack[1].tagname, b"new");
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_tagstack_action_truncate_removes_entries_from_curidx_onward() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"a", 1, 0, 1, 1);
+        win.w_tagstack[1] = make_taggy(b"b", 2, 0, 2, 2);
+        win.w_tagstack[2] = make_taggy(b"c", 3, 0, 3, 3);
+        win.w_tagstacklen = 3;
+        win.w_tagstackidx = 1;
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `d` was just allocated, exclusively owned here.
+        let rc = unsafe { set_tagstack(&mut win, d, b't') };
+
+        assert_eq!(rc, crate::vim_defs::OK);
+        // Entries at/above tagstackidx (1) are removed - only index 0
+        // ("a") remains.
+        assert_eq!(win.w_tagstacklen, 1);
+        assert_eq!(win.w_tagstack[0].tagname, b"a");
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn set_tagstack_updates_curidx_from_the_dict_1_based() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT::default();
+        win.w_tagstack[0] = make_taggy(b"a", 1, 0, 1, 1);
+        win.w_tagstack[1] = make_taggy(b"b", 2, 0, 2, 2);
+        win.w_tagstack[2] = make_taggy(b"c", 3, 0, 3, 3);
+        win.w_tagstacklen = 3;
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: `d` is freshly allocated.
+        crate::eval::typval::tv_dict_add_nr(unsafe { &mut *d }, b"curidx", 2);
+        // SAFETY: `d` was just allocated, exclusively owned here.
+        let rc = unsafe { set_tagstack(&mut win, d, b'r') };
+
+        assert_eq!(rc, crate::vim_defs::OK);
+        // Vimscript's own 1-based "curidx" of 2 becomes the internal
+        // 0-based index 1.
+        assert_eq!(win.w_tagstackidx, 1);
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
     }
 }

@@ -537,6 +537,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"screenpos"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_screenpos });
         m.insert(&b"win_gettype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_win_gettype });
         m.insert(&b"gettagstack"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_gettagstack });
+        m.insert(&b"settagstack"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 2, func: f_settagstack });
         m.insert(&b"getscriptinfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: crate::runtime::f_getscriptinfo });
         m.insert(&b"getstacktrace"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::runtime::f_getstacktrace });
         m.insert(&b"histnr"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::cmdhist::f_histnr });
@@ -6594,6 +6595,53 @@ unsafe fn f_gettagstack(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: forwarded from this function's own safety doc; `d` was
     // just freshly allocated by `tv_dict_alloc_ret` above.
     unsafe { crate::tag::get_tagstack(&*wp, d) };
+}
+
+/// `settagstack({winnr}, {dict} [, {action}])` - set the tag stack of
+/// window `{winnr}` (`f_settagstack`, `funcs.c`), via the already-
+/// existing [`crate::tag::set_tagstack`]. `{action}` is `` "r" ``
+/// (replace, the default), `` "a" `` (append), or `` "t" ``
+/// (truncate); anything else is a real, reachable failure (message
+/// display skipped, matching this crate's established policy).
+///
+/// # Safety
+/// Forwarded from [`crate::window::find_win_by_nr_or_id`]/
+/// [`crate::tag::set_tagstack`]'s own safety docs.
+unsafe fn f_settagstack(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(-1);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
+    if wp.is_null() {
+        return;
+    }
+
+    if crate::eval::typval::tv_check_for_dict_arg(argvars, 1) == crate::vim_defs::FAIL {
+        return;
+    }
+    let TypvalValue::Dict(d) = argvars[1].value else { return };
+    if d.is_null() {
+        return;
+    }
+
+    let action = if argvars.len() > 2 {
+        if crate::eval::typval::tv_check_for_string_arg(argvars, 2) == crate::vim_defs::FAIL {
+            return;
+        }
+        let Some(actstr) = crate::eval::typval::tv_get_string_chk(&argvars[2]) else { return };
+        if actstr.len() == 1 && matches!(actstr[0], b'r' | b'a' | b't') {
+            actstr[0]
+        } else {
+            return;
+        }
+    } else {
+        b'r'
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::tag::set_tagstack(&mut *wp, d, action) } == crate::vim_defs::OK {
+        rettv.value = TypvalValue::Number(0);
+    }
 }
 
 /// Recursive frame-tree walk building `winlayout()`'s own nested
@@ -15617,6 +15665,200 @@ mod tests {
         // SAFETY: `d` is still exclusively owned; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    // --- f_settagstack ---
+
+    /// Builds a single tag-stack-item `Dict` matching `set_tagstack`'s
+    /// own expected shape: `{"from": [fnum, lnum, col, coladd],
+    /// "tagname": ..., "bufnr": ..., "matchnr": ...}`.
+    fn make_settagstack_item(fnum: i64, lnum: i64, col: i64, tagname: &[u8]) -> *mut crate::eval::typval_defs::DictT {
+        let d = crate::eval::typval::tv_dict_alloc();
+        let from = crate::eval::typval::tv_list_alloc(4);
+        // SAFETY: `d`/`from` are both freshly allocated, not yet
+        // shared beyond each other.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"from", from);
+            crate::eval::typval::tv_list_append_number(from, fnum);
+            crate::eval::typval::tv_list_append_number(from, lnum);
+            crate::eval::typval::tv_list_append_number(from, col);
+            crate::eval::typval::tv_list_append_number(from, 0);
+        }
+        // SAFETY: `d` is still exclusively owned here.
+        let d_ref = unsafe { &mut *d };
+        crate::eval::typval::tv_dict_add_str(d_ref, b"tagname", Some(tagname));
+        crate::eval::typval::tv_dict_add_nr(d_ref, b"bufnr", fnum);
+        crate::eval::typval::tv_dict_add_nr(d_ref, b"matchnr", 1);
+        d
+    }
+
+    #[test]
+    fn settagstack_replaces_the_stack_of_the_given_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        win.w_tagstack[0] = crate::buffer_defs::TaggyT { tagname: b"old".to_vec(), ..Default::default() };
+        win.w_tagstacklen = 1;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let items = crate::eval::typval::tv_list_alloc(1);
+        let item = make_settagstack_item(1, 5, 1, b"new");
+        // SAFETY: `d`/`items`/`item` are all freshly allocated, none
+        // yet shared beyond each other.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"items", items);
+            crate::eval::typval::tv_list_append_dict(items, item);
+        }
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        // SAFETY: window 1 resolves to `win` (the current window, via
+        // `WinGlobalsGuard`); `d` is a valid, freshly allocated dict.
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(win.w_tagstacklen, 1);
+        assert_eq!(win.w_tagstack[0].tagname, b"new", "default action 'r' replaces, not appends");
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn settagstack_action_append_keeps_the_old_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        win.w_tagstack[0] = crate::buffer_defs::TaggyT { tagname: b"old".to_vec(), ..Default::default() };
+        win.w_tagstacklen = 1;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let items = crate::eval::typval::tv_list_alloc(1);
+        let item = make_settagstack_item(1, 5, 1, b"new");
+        // SAFETY: `d`/`items`/`item` are all freshly allocated.
+        unsafe {
+            crate::eval::typval::tv_dict_add_list(&mut *d, b"items", items);
+            crate::eval::typval::tv_list_append_dict(items, item);
+        }
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d), ..Default::default() },
+            TypvalT { value: TypvalValue::String(Some(b"a".to_vec())), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        // SAFETY: window 1 resolves to `win`; `d` is a valid, freshly
+        // allocated dict.
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(win.w_tagstacklen, 2);
+        assert_eq!(win.w_tagstack[0].tagname, b"old");
+        assert_eq!(win.w_tagstack[1].tagname, b"new");
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn settagstack_invalid_action_string_returns_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d), ..Default::default() },
+            TypvalT { value: TypvalValue::String(Some(b"x".to_vec())), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        // SAFETY: window 1 resolves to `win`; `d` is a valid, freshly
+        // allocated dict.
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(-1), "'x' is not a recognized action");
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn settagstack_non_string_action_arg_returns_minus_1() {
+        // Distinct from the "wrong string value" case above: a
+        // Number third argument must be rejected by
+        // tv_check_for_string_arg BEFORE any stringification is
+        // attempted - not silently accepted via tv_get_string_chk's
+        // own, separate numeric-to-string coercion.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d), ..Default::default() },
+            TypvalT { value: TypvalValue::Number(0), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        // SAFETY: window 1 resolves to `win`; `d` is a valid, freshly
+        // allocated dict.
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn settagstack_unresolvable_window_returns_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let d = crate::eval::typval::tv_dict_alloc();
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(9999), ..Default::default() },
+            TypvalT { value: TypvalValue::Dict(d), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        // SAFETY: `d` is a valid, live dict; window 9999 does not
+        // resolve, so `set_tagstack` is never reached.
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
+
+        // SAFETY: `d` is still exclusively owned; nothing else
+        // references it.
+        unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    #[test]
+    fn settagstack_non_dict_second_arg_returns_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = focusable_win(1);
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let argvars = [
+            TypvalT { value: TypvalValue::Number(1), ..Default::default() },
+            TypvalT { value: TypvalValue::Number(42), ..Default::default() },
+        ];
+        let mut rettv = TypvalT::default();
+        unsafe { f_settagstack(&argvars, &mut rettv) };
+
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 
     // --- f_winlayout / get_framelayout ---
