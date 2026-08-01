@@ -36,6 +36,14 @@
 //! branch, gated on `PUM_EXTERNAL`, is `unimplemented!()` -
 //! unreachable today since nothing can set `PUM_EXTERNAL` true yet).
 //!
+//! Also [`pum_set_event_info`] (`pum_getpos()`'s own real backend) -
+//! its own FIRST check is `!pum_visible()`, always true today, so it
+//! always takes the "leave the dict empty" early return - the real
+//! body needing `ui_pum_get_pos`/`pum_width`/`pum_height`/`pum_row`/
+//! `pum_col`/`pum_size`/`pum_scrollbar` is `unimplemented!()`,
+//! unreachable for the same reason `pum_visible` itself never returns
+//! `true`.
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -141,6 +149,29 @@ pub unsafe fn pum_align_order() -> [i32; 3] {
     ]
 }
 
+/// Populate `dict` with the popup menu's own position/size info (for
+/// `pum_getpos()`/`v:event` during `CompleteChanged`), or leave it
+/// EMPTY if the popup menu isn't currently visible
+/// (`pum_set_event_info`).
+///
+/// Since [`pum_visible`] always returns `false` today (nothing in this
+/// crate can currently display a real popup menu), this always takes
+/// the early-return branch - a real, faithful consequence of the
+/// current state, matching this file's own established
+/// "always-empty" pattern, not a hardcoded stub. The real body
+/// (`ui_pum_get_pos`/`pum_width`/`pum_height`/`pum_row`/`pum_col`/
+/// `pum_size`/`pum_scrollbar`, none translated) is `unimplemented!()`,
+/// unreachable today for the same reason.
+pub fn pum_set_event_info(_dict: &mut crate::eval::typval_defs::DictT) {
+    if !pum_visible() {
+        return;
+    }
+    unimplemented!(
+        "pum_set_event_info: needs ui_pum_get_pos/pum_width/pum_height/pum_row/pum_col/ \
+         pum_size/pum_scrollbar, none translated"
+    );
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -152,6 +183,29 @@ pub(crate) mod tests {
     /// duration this value matters.
     pub(crate) fn set_pum_is_visible(value: bool) {
         unsafe { *PUM_IS_VISIBLE.get_mut() = value };
+    }
+
+    /// Restores `PUM_IS_VISIBLE` to `false` on drop, even through a
+    /// panic - needed for any `#[should_panic]` test (in this file or
+    /// another, e.g. `eval::funcs`'s own `f_pum_getpos` test)
+    /// deliberately triggering a panic while `PUM_IS_VISIBLE` is
+    /// temporarily set `true`. Unlike `PumExternalGuard`, always
+    /// restores to `false` specifically (not "whatever it was
+    /// before") since that's this whole test suite's own universal
+    /// default for this flag.
+    pub(crate) struct PumVisibleGuard;
+
+    impl PumVisibleGuard {
+        pub(crate) fn set(value: bool) -> Self {
+            set_pum_is_visible(value);
+            PumVisibleGuard
+        }
+    }
+
+    impl Drop for PumVisibleGuard {
+        fn drop(&mut self) {
+            set_pum_is_visible(false);
+        }
     }
 
     #[test]

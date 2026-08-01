@@ -458,6 +458,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"foreground"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_foreground });
         m.insert(&b"eventhandler"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_eventhandler });
         m.insert(&b"pumvisible"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pumvisible });
+        m.insert(&b"pum_getpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pum_getpos });
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
@@ -5502,6 +5503,17 @@ fn f_pumvisible(_argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 }
 
+/// `pum_getpos()` - a dict with the popup menu's own position/size
+/// info if it's visible, or an empty dict otherwise (`f_pum_getpos`,
+/// `funcs.c`), via the already-real
+/// `crate::popupmenu::pum_set_event_info`.
+fn f_pum_getpos(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: tv_dict_alloc_ret's own returned pointer is a fresh
+    // allocation not shared with anything else yet.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+    crate::popupmenu::pum_set_event_info(unsafe { &mut *d });
+}
+
 /// `did_filetype()` - whether the `FileType` autocommand event has
 /// been triggered at least once for the current buffer
 /// (`f_did_filetype`, `funcs.c`), via the already-real
@@ -8161,6 +8173,7 @@ mod tests {
             "foreground",
             "eventhandler",
             "pumvisible",
+            "pum_getpos",
             "did_filetype",
             "garbagecollect",
             "getcharsearch",
@@ -13484,6 +13497,61 @@ mod tests {
         assert_eq!(rettv.value, TypvalValue::Number(1));
 
         crate::popupmenu::tests::set_pum_is_visible(false);
+    }
+
+    // --- f_pum_getpos ---
+
+    #[test]
+    fn pum_getpos_returns_an_empty_dict_when_the_popup_menu_is_not_visible() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::popupmenu::tests::set_pum_is_visible(false);
+
+        let mut rettv = TypvalT::default();
+        f_pum_getpos(&[], &mut rettv);
+        let TypvalValue::Dict(d) = rettv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_len(d.as_ref()), 0);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "pum_set_event_info")]
+    fn pum_getpos_panics_when_the_popup_menu_is_visible() {
+        let _guard = crate::globals::global_state_test_lock();
+        // The real body needs ui_pum_get_pos/pum_width/pum_height/
+        // pum_row/pum_col/pum_size/pum_scrollbar - none translated,
+        // genuinely unreachable while pum_visible() always returns
+        // false in every OTHER test. PumVisibleGuard restores
+        // PUM_IS_VISIBLE to false on drop, even through this
+        // deliberate panic (Rust's own test harness runs Drop impls
+        // during unwinding).
+        //
+        // f_pum_getpos ALREADY allocates a real Dict (via
+        // tv_dict_alloc_ret, storing it into rettv) BEFORE the panic
+        // point inside pum_set_event_info - left unreleased, this
+        // would permanently leak into the shared GC_FIRST_DICT
+        // registry, corrupting any OTHER test asserting "GC_FIRST_DICT
+        // starts empty" (caught by exactly that happening on the very
+        // first real run of this test). catch_unwind + an explicit
+        // tv_dict_unref + resume_unwind (NOT `.unwrap()`, which would
+        // replace the panic's own message with a generic
+        // "called Result::unwrap() on an Err value" one, breaking
+        // #[should_panic]'s own message check) releases it while still
+        // preserving the exact original panic for the test harness to
+        // observe.
+        let _pum_guard = crate::popupmenu::tests::PumVisibleGuard::set(true);
+        let mut rettv = TypvalT::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f_pum_getpos(&[], &mut rettv);
+        }));
+        if let TypvalValue::Dict(d) = rettv.value {
+            unsafe { crate::eval::typval::tv_dict_unref(d) };
+        }
+        match result {
+            Ok(()) => panic!("expected a panic, but f_pum_getpos returned normally"),
+            Err(e) => std::panic::resume_unwind(e),
+        }
     }
 
     // --- f_did_filetype ---

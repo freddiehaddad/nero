@@ -9958,6 +9958,26 @@ mod tests {
         reset_globals_for_test();
     }
 
+    #[test]
+    fn e2e_pum_getpos_builtin_function_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_globals_for_test();
+
+        // The popup menu is never visible in this crate today (nothing
+        // can display one yet) - pum_getpos() always returns an empty
+        // dict, matching the real function's own documented behavior
+        // for that case.
+        let (ret, tv) = eval_str(b"pum_getpos()");
+        assert_eq!(ret, OK);
+        let TypvalValue::Dict(d) = tv.value else { panic!("expected a Dict") };
+        unsafe {
+            assert_eq!(crate::eval::typval::tv_dict_len(d.as_ref()), 0);
+            crate::eval::typval::tv_dict_unref(d);
+        }
+
+        reset_globals_for_test();
+    }
+
     // --- get_literal_key ---
 
     #[test]
