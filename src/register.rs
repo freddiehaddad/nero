@@ -9,7 +9,8 @@
 //!
 //! Translated: the register-name/index plumbing (`op_reg_index`,
 //! `valid_yank_reg`), the register storage array itself (`Y_REGS`,
-//! `y_previous` as `Y_PREVIOUS`) and [`get_yank_register`], the
+//! `y_previous` as `Y_PREVIOUS`) and [`get_yank_register`]/
+//! [`get_y_previous`], the
 //! `"="`-register expression-source/result state ([`get_expr_line`]/
 //! [`get_expr_line_src`]/[`set_expr_line`]), [`get_reg_contents`]/
 //! `get_spec_reg` (`@r` in expressions - `eval7`'s own real caller),
@@ -179,6 +180,23 @@ pub unsafe fn get_yank_register(regname: i32, mode: YregModeT) -> *mut YankregT 
         unsafe { *Y_PREVIOUS.get_mut() = Some(i) };
     }
     reg
+}
+
+/// Returns the previously-used yank register (`get_y_previous`), or a
+/// null pointer if none has been used yet (`Y_PREVIOUS` is `None`) -
+/// always null today, since nothing yet performs a real yank
+/// (`YREG_YANK` mode); see `Y_PREVIOUS`'s own doc comment.
+///
+/// # Safety
+/// Touches `Y_REGS`/`Y_PREVIOUS` (`GlobalCell`s) - no overlapping live
+/// access.
+#[must_use]
+pub unsafe fn get_y_previous() -> *mut YankregT {
+    match unsafe { *Y_PREVIOUS.get_mut() } {
+        // SAFETY: forwarded from this function's own safety doc.
+        Some(idx) => unsafe { &mut Y_REGS.get_mut()[idx] },
+        None => std::ptr::null_mut(),
+    }
 }
 
 /// The expression evaluated for the `"="` register (`expr_line`, a
@@ -561,6 +579,26 @@ mod tests {
         // resolve to the same register 'a' just written.
         let reg_unnamed = unsafe { get_yank_register(0, YregModeT::Put) };
         assert_eq!(reg_a, reg_unnamed);
+
+        unsafe { *Y_PREVIOUS.get_mut() = None };
+    }
+
+    // --- get_y_previous ---
+
+    #[test]
+    fn get_y_previous_is_null_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *Y_PREVIOUS.get_mut() = None };
+        assert!(unsafe { get_y_previous() }.is_null());
+    }
+
+    #[test]
+    fn get_y_previous_matches_the_register_yank_last_wrote_to() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *Y_PREVIOUS.get_mut() = None };
+
+        let reg_a = unsafe { get_yank_register(i32::from(b'a'), YregModeT::Yank) };
+        assert_eq!(unsafe { get_y_previous() }, reg_a);
 
         unsafe { *Y_PREVIOUS.get_mut() = None };
     }
