@@ -84,6 +84,7 @@ pub mod insert_defs;
 pub mod log;
 pub mod macros_defs;
 pub mod map;
+pub mod mapping;
 pub mod mark;
 pub mod mark_defs;
 pub mod marktree;
