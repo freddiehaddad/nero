@@ -67,19 +67,21 @@
 //! folding" fast path; the fold-skipping loop is now real too, via
 //! the same already-existing `has_folding`).
 //!
+//! Also translated: `foldManualAllowed` (as [`fold_manual_allowed`]) -
+//! its own real `emsg("E350"/"E351")` display (on the `false` path) is
+//! skipped, matching this crate's established policy; the boolean
+//! result itself (via already-real `foldmethod_is_manual`/
+//! `foldmethod_is_marker`) is kept exactly.
+//!
 //! Deferred: everything else (fold creation/opening/closing, the
 //! `foldUpdateIEMS` scanning engine, `foldtext`, `:fold`-family
-//! ex-commands), `foldManualAllowed` (needs
-//! `emsg` - message display, not yet translated - for its own two
-//! real, reachable error-message branches; otherwise a one-liner given
-//! `foldmethod_is_manual`/`foldmethod_is_marker` now both exist),
-//! `foldAdjustVisual` (its own "found a fold" branches are provably
-//! unreachable for the same reason as `fold_adjust_cursor`'s own doc
-//! comment explains, but its logic is substantially more involved -
-//! `Visual.start`/`w_cursor` pointer aliasing, `'selection'`-aware
-//! column adjustment - not worth hand-writing untestable speculative
-//! code for; a good candidate to revisit once the real fold-tree
-//! search exists).
+//! ex-commands), `foldAdjustVisual` (its own "found a fold" branches
+//! are provably unreachable for the same reason as
+//! `fold_adjust_cursor`'s own doc comment explains, but its logic is
+//! substantially more involved - `Visual.start`/`w_cursor` pointer
+//! aliasing, `'selection'`-aware column adjustment - not worth
+//! hand-writing untestable speculative code for; a good candidate to
+//! revisit once the real fold-tree search exists).
 
 use crate::buffer_defs::WinT;
 
@@ -117,6 +119,24 @@ pub fn foldmethod_is_syntax(wp: &WinT) -> bool {
 #[must_use]
 pub fn foldmethod_is_diff(wp: &WinT) -> bool {
     wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| s.first() == Some(&b'd'))
+}
+
+/// Returns `true` if creating/deleting a manual fold is allowed with
+/// `curwin`'s current `'foldmethod'` (`foldManualAllowed`). The
+/// original's own `emsg("E350"/"E351")` display (on the `false` path,
+/// selected by `create`) is skipped, matching this crate's established
+/// "skip the deferred-subsystem side effect, keep the state/return
+/// value correct" policy - `create` is accepted anyway (unused,
+/// prefixed `_`) for signature fidelity.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+#[must_use]
+pub unsafe fn fold_manual_allowed(_create: bool) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { &*crate::globals::GLOBALS.get_mut().curwin };
+    foldmethod_is_manual(curwin) || foldmethod_is_marker(curwin)
 }
 
 /// @return true if there may be folded lines in window `win`
@@ -906,5 +926,70 @@ mod tests {
             ..Default::default()
         };
         unsafe { fold_mark_adjust(&win, 1, 5, 2, 0) };
+    }
+
+    /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
+    /// restoring the previous value on drop. Callers must hold
+    /// `global_state_test_lock()` for the guard's whole lifetime.
+    struct CurwinGuard {
+        previous: *mut WinT,
+    }
+
+    impl CurwinGuard {
+        fn set(new_curwin: *mut WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = new_curwin;
+            CurwinGuard { previous }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+        }
+    }
+
+    #[test]
+    fn fold_manual_allowed_true_for_manual_foldmethod() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        assert!(unsafe { fold_manual_allowed(true) });
+        assert!(unsafe { fold_manual_allowed(false) });
+    }
+
+    #[test]
+    fn fold_manual_allowed_true_for_marker_foldmethod() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"marker".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        assert!(unsafe { fold_manual_allowed(true) });
+    }
+
+    #[test]
+    fn fold_manual_allowed_false_for_indent_foldmethod() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdm: Some(b"indent".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        assert!(!unsafe { fold_manual_allowed(true) });
+        assert!(!unsafe { fold_manual_allowed(false) });
     }
 }
