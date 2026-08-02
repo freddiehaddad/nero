@@ -5,21 +5,30 @@
 //! (`ml_replace`/`changed_bytes`) plus the C-indent (`indent_c.c`) and
 //! Lisp-indent engines.
 //!
-//! Translated: `tabstop_padding`/`tabstop_at`, `indent_size_no_ts`/
-//! `indent_size_ts` (needed by `plines.c`'s tab-width calculations and
-//! by `get_breakindent_win` below); `get_breakindent_win` (needed
-//! `buffer.c`'s `buf_get_changedtick`, now tractable since
-//! `eval/typval_defs.rs`'s `TypvalT` is real - see that function's own
-//! doc comment for its one deliberate gap, `'breakindentopt'="list"`,
-//! which needs the real regex engine); `get_indent`/`get_indent_lnum`/
-//! `get_indent_buf` (thin wrappers around `indent_size_ts` - needed
-//! only `cursor.rs`'s `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/
-//! `ml_get_buf`, all already real); `get_sw_value`/`get_sw_value_col`
-//! (the effective `'shiftwidth'` value, needed by `eval/funcs.c`'s
-//! `shiftwidth()` - only the `col`-based overloads, not
-//! `get_sw_value_pos`/`get_sw_value_indent`, which need
-//! `curwin.w_cursor`/`get_nolist_virtcol`/`getwhitecols_curline`, none
-//! of `shiftwidth()`'s own 2 real call shapes need those).
+//! Translated: `tabstop_padding`/`tabstop_at`/`tabstop_start`/
+//! `tabstop_fromto`, `indent_size_no_ts`/`indent_size_ts` (needed by
+//! `plines.c`'s tab-width calculations and by `get_breakindent_win`
+//! below); `get_breakindent_win` (needed `buffer.c`'s
+//! `buf_get_changedtick`, now tractable since `eval/typval_defs.rs`'s
+//! `TypvalT` is real - see that function's own doc comment for its one
+//! deliberate gap, `'breakindentopt'="list"`, which needs the real
+//! regex engine); `get_indent`/`get_indent_lnum`/`get_indent_buf`
+//! (thin wrappers around `indent_size_ts` - needed only `cursor.rs`'s
+//! `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/`ml_get_buf`, all
+//! already real); `get_sw_value`/`get_sw_value_col`/`get_sw_value_pos`/
+//! `get_sw_value_indent`/`get_sts_value` (the effective
+//! `'shiftwidth'`/`'softtabstop'` values, needed by `eval/funcs.c`'s
+//! `shiftwidth()` and, ahead of their own real callers - `insert.c`'s
+//! Insert-mode key handling and `ops.c`'s `shift_block`, neither
+//! translated - by the tab-stop-family functions above).
+//!
+//! `tabstop_eq`/`tabstop_copy`/`tabstop_count`/`tabstop_first` need NO
+//! Rust equivalent at all: given this crate's own `Option<&[ColnrT]>`/
+//! `Option<Vec<ColnrT>>` representation of `vts` (see below), plain
+//! `==`/`.to_vec()`/`.clone()`/`.map_or(0, |v| v.len())`/
+//! `.map_or(8, |v| v[0])` already do exactly what each one does by
+//! hand - the same reasoning already established for `optval_free`/
+//! `optval_copy`/`optval_equal` (`option.rs`).
 //!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
@@ -33,8 +42,8 @@
 //! earlier, before anything used them for real) are read the same way
 //! by this function, their first real consumer - established here as
 //! the fields' own convention going forward, not just a one-off
-//! choice for this call site. `tabstop_at` follows the exact same
-//! convention.
+//! choice for this call site. `tabstop_at`/`tabstop_start`/
+//! `tabstop_fromto` all follow the exact same convention.
 //!
 //! Deferred: everything else in the file.
 
@@ -166,6 +175,120 @@ pub fn tabstop_at(col: ColnrT, ts: OptInt, vts: Option<&[ColnrT]>, left: bool) -
     tab_size
 }
 
+/// Find the column on which a tab starts (`tabstop_start`).
+///
+/// See this module's own doc comment for how `vts` differs from the
+/// original's raw, self-counting `colnr_T *` array.
+#[must_use]
+pub fn tabstop_start(col: ColnrT, ts: i32, vts: Option<&[ColnrT]>) -> i32 {
+    let Some(vts) = vts.filter(|v| !v.is_empty()) else {
+        return col - col % ts;
+    };
+
+    let tabcount = vts.len();
+    let mut tabcol: i64 = 0;
+    for t in 1..=tabcount {
+        tabcol += i64::from(vts[t - 1]);
+        if tabcol > i64::from(col) {
+            return (tabcol - i64::from(vts[t - 1])) as i32;
+        }
+    }
+
+    let last = i64::from(vts[tabcount - 1]);
+    let excess = tabcol % last;
+    (i64::from(col) - (i64::from(col) - excess) % last) as i32
+}
+
+/// Find the number of tabs and spaces necessary to get from column
+/// `start_col` to `end_col` (`tabstop_fromto`).
+///
+/// See this module's own doc comment for how `vts` differs from the
+/// original's raw, self-counting `colnr_T *` array. Returns
+/// `(ntabs, nspcs)` instead of writing through 2 `int *` out-params.
+///
+/// # Safety
+/// If `ts_arg == 0`, `crate::globals::GLOBALS.curbuf` must be a
+/// valid, non-null pointer to a live `BufT` (used to look up the
+/// effective `'tabstop'` value, matching the original's own
+/// `curbuf->b_p_ts` fallback).
+pub unsafe fn tabstop_fromto(
+    start_col: ColnrT,
+    end_col: ColnrT,
+    ts_arg: i32,
+    vts: Option<&[ColnrT]>,
+) -> (i32, i32) {
+    let mut spaces = end_col - start_col;
+    let ts: i64 = if ts_arg == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_ts }
+    } else {
+        i64::from(ts_arg)
+    };
+    debug_assert!(ts != 0);
+
+    let Some(vts) = vts.filter(|v| !v.is_empty()) else {
+        let mut tabs = 0i32;
+        let initspc = (ts - (i64::from(start_col) % ts)) as i32;
+        if spaces >= initspc {
+            spaces -= initspc;
+            tabs += 1;
+        }
+        tabs += spaces / ts as i32;
+        spaces -= (spaces / ts as i32) * ts as i32;
+        return (tabs, spaces);
+    };
+
+    // Find the padding needed to reach the next tabstop.
+    let tabcount = vts.len();
+    let mut tabcol: i64 = 0;
+    let mut t = 1usize;
+    let mut found = false;
+    while t <= tabcount {
+        tabcol += i64::from(vts[t - 1]);
+        if tabcol > i64::from(start_col) {
+            found = true;
+            break;
+        }
+        t += 1;
+    }
+    let mut padding: i32 = if found {
+        (tabcol - i64::from(start_col)) as i32
+    } else {
+        let last = i64::from(vts[tabcount - 1]);
+        (last - ((i64::from(start_col) - tabcol) % last)) as i32
+    };
+
+    // If the space needed is less than the padding no tabs can be used.
+    if spaces < padding {
+        return (0, spaces);
+    }
+
+    let mut ntabs = 1;
+    spaces -= padding;
+
+    // At least one tab has been used. See if any more will fit.
+    loop {
+        if spaces == 0 {
+            break;
+        }
+        t += 1;
+        if t > tabcount {
+            break;
+        }
+        padding = vts[t - 1];
+        if spaces < padding {
+            return (ntabs, spaces);
+        }
+        ntabs += 1;
+        spaces -= padding;
+    }
+
+    let last = i64::from(vts[tabcount - 1]);
+    ntabs += (i64::from(spaces) / last) as i32;
+    let nspcs = (i64::from(spaces) % last) as i32;
+    (ntabs, nspcs)
+}
+
 /// Return the effective `'shiftwidth'` value for `buf`, using virtual
 /// column `col` to select among `'vartabstop'` entries when
 /// `'shiftwidth'` is zero (`get_sw_value_col`).
@@ -183,6 +306,77 @@ pub fn get_sw_value_col(buf: &BufT, col: ColnrT, left: bool) -> i32 {
 #[must_use]
 pub fn get_sw_value(buf: &BufT) -> i32 {
     get_sw_value_col(buf, 0, false)
+}
+
+/// Idem, using `pos` (`get_sw_value_pos`).
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` - same requirement as
+/// `crate::insert::get_nolist_virtcol`. `buf` is only dereferenced
+/// AFTER `get_nolist_virtcol` returns (never held as a live reference
+/// across that call), since a real call always has `buf` and
+/// `GLOBALS.curbuf`/`curwin.w_buffer` pointing at the very same
+/// buffer - holding a `&BufT` across `get_nolist_virtcol`'s own
+/// internal `GLOBALS.curbuf`-based access would be a genuine
+/// aliasing hazard.
+unsafe fn get_sw_value_pos(buf: *mut BufT, pos: &crate::pos_defs::PosT, left: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let save_cursor = unsafe { (*curwin).w_cursor };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*curwin).w_cursor = *pos;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let col = unsafe { crate::insert::get_nolist_virtcol() };
+    // SAFETY: forwarded from this function's own safety doc - `buf`
+    // is dereferenced fresh here, only after the call above.
+    let sw_value = get_sw_value_col(unsafe { &*buf }, col, left);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*curwin).w_cursor = save_cursor;
+    }
+    sw_value
+}
+
+/// Idem, using the first non-blank in the current line
+/// (`get_sw_value_indent`).
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT` with a valid `w_buffer` (forwarded from
+/// `crate::charset::getwhitecols_curline`'s own safety doc, plus
+/// `get_sw_value_pos`'s own).
+#[must_use]
+pub unsafe fn get_sw_value_indent(buf: *mut BufT, left: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut pos = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor };
+    // SAFETY: forwarded from this function's own safety doc.
+    pos.col = unsafe { crate::charset::getwhitecols_curline() } as ColnrT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_sw_value_pos(buf, &pos, left) }
+}
+
+/// Return the effective `'softtabstop'` value for the current buffer,
+/// using the `'shiftwidth'` value when `'softtabstop'` is negative
+/// (`get_sts_value`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn get_sts_value() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    if curbuf.b_p_sts < 0 {
+        get_sw_value(curbuf)
+    } else {
+        curbuf.b_p_sts as i32
+    }
 }
 
 /// Compute the size of the indent (in window cells) in `ptr`, without
@@ -902,6 +1096,101 @@ mod tests {
     }
 
     #[test]
+    fn tabstop_start_no_vts_rounds_down_to_a_tab_boundary() {
+        assert_eq!(tabstop_start(10, 8, None), 8);
+        assert_eq!(tabstop_start(8, 8, None), 8);
+        assert_eq!(tabstop_start(5, 8, None), 0);
+    }
+
+    #[test]
+    fn tabstop_start_within_explicit_stops() {
+        // vts = [4, 8]: tab stops at columns 4 and 4+8=12.
+        assert_eq!(tabstop_start(2, 8, Some(&[4, 8])), 0);
+        assert_eq!(tabstop_start(5, 8, Some(&[4, 8])), 4);
+    }
+
+    #[test]
+    fn tabstop_start_beyond_explicit_stops_repeats_last_width() {
+        // Beyond the last explicit stop (12), tabs repeat every 8
+        // columns: 12, 20, 28, ... col=15 falls in [12,20) -> 12;
+        // col=20 sits exactly on the next boundary -> starts there.
+        assert_eq!(tabstop_start(15, 8, Some(&[4, 8])), 12);
+        assert_eq!(tabstop_start(20, 8, Some(&[4, 8])), 20);
+    }
+
+    #[test]
+    fn tabstop_start_empty_vts_falls_back_to_ts() {
+        assert_eq!(tabstop_start(10, 8, Some(&[])), 8);
+    }
+
+    #[test]
+    fn tabstop_fromto_no_vts_simple_case() {
+        // start=0, end=10, ts=8: 1 tab (0->8) + 2 spaces (8->10).
+        assert_eq!(unsafe { tabstop_fromto(0, 10, 8, None) }, (1, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_no_vts_from_a_non_boundary_start() {
+        // start=2, end=10, ts=8: 1 tab (2->8) + 2 spaces (8->10).
+        assert_eq!(unsafe { tabstop_fromto(2, 10, 8, None) }, (1, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_no_vts_not_enough_room_for_a_tab() {
+        // start=2, end=5, ts=8: never reaches the tabstop at 8, so 3
+        // plain spaces only.
+        assert_eq!(unsafe { tabstop_fromto(2, 5, 8, None) }, (0, 3));
+    }
+
+    #[test]
+    fn tabstop_fromto_no_vts_multiple_tabs() {
+        // start=0, end=25, ts=8: 3 tabs (0->8->16->24) + 1 space.
+        assert_eq!(unsafe { tabstop_fromto(0, 25, 8, None) }, (3, 1));
+    }
+
+    #[test]
+    fn tabstop_fromto_zero_ts_arg_uses_curbufs_own_tabstop() {
+        let mut buf = BufT { b_p_ts: 4, ..Default::default() };
+        // Only `GLOBALS.curbuf` is touched (not `curwin`), matching
+        // this function's own narrower safety doc - `win` is null.
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        // ts=4 (from curbuf.b_p_ts): start=0,end=10 -> 2 tabs (0->4->8)
+        // + 2 spaces (8->10).
+        assert_eq!(unsafe { tabstop_fromto(0, 10, 0, None) }, (2, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_vts_within_explicit_stops() {
+        // vts=[4,8]: start=0,end=6 -> 1 tab (0->4) + 2 spaces (4->6);
+        // the next stop (12) needs 8 more spaces, out of reach.
+        assert_eq!(unsafe { tabstop_fromto(0, 6, 8, Some(&[4, 8])) }, (1, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_vts_spans_multiple_explicit_stops() {
+        // vts=[4,8]: start=0,end=14 -> 2 tabs (0->4->12) + 2 spaces.
+        assert_eq!(unsafe { tabstop_fromto(0, 14, 8, Some(&[4, 8])) }, (2, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_vts_starting_past_the_first_explicit_stop() {
+        // vts=[4,8]: start=5 (past the stop at 4), end=30 -> 3 tabs
+        // (5->12->20->28) + 2 spaces (28->30).
+        assert_eq!(unsafe { tabstop_fromto(5, 30, 8, Some(&[4, 8])) }, (3, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_vts_not_enough_room_for_even_one_tab() {
+        // vts=[4,8]: start=0,end=2 -> can't reach the first stop (4).
+        assert_eq!(unsafe { tabstop_fromto(0, 2, 8, Some(&[4, 8])) }, (0, 2));
+    }
+
+    #[test]
+    fn tabstop_fromto_empty_vts_falls_back_to_ts() {
+        assert_eq!(unsafe { tabstop_fromto(0, 10, 8, Some(&[])) }, (1, 2));
+    }
+
+    #[test]
     fn get_sw_value_col_uses_shiftwidth_when_nonzero() {
         let buf = BufT { b_p_sw: 4, b_p_ts: 8, ..Default::default() };
         // b_p_sw takes priority; col/left are ignored.
@@ -919,6 +1208,163 @@ mod tests {
         let buf = BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
         assert_eq!(get_sw_value(&buf), get_sw_value_col(&buf, 0, false));
         assert_eq!(get_sw_value(&buf), 4);
+    }
+
+    #[test]
+    fn get_sw_value_pos_saves_and_restores_the_cursor_without_a_real_memline() {
+        // Exercises `get_sw_value_pos`'s own raw-pointer cursor
+        // save/restore dance WITHOUT needing `ml_open` (kept as its
+        // own, separate, minimal test specifically so `cargo miri
+        // test` can verify this function's pointer manipulation is
+        // sound even though `open_and_set_test_buf`'s own `ml_open`
+        // call hits this crate's already-documented, pre-existing
+        // `libc::getpwuid` Miri-FFI limitation - see the sibling test
+        // below). `win.w_buffer` is deliberately left null, so
+        // `get_nolist_virtcol`'s own early-return kicks in (`col`
+        // always 0) - this test is about the pointer manipulation
+        // itself, not a specific virtual-column value.
+        let mut buf = BufT { b_p_sw: 4, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = CursorTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
+        unsafe {
+            (*crate::globals::GLOBALS.get_mut().curwin).w_cursor =
+                crate::pos_defs::PosT { lnum: 5, col: 3, coladd: 0 };
+        }
+
+        let buf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let target_pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        // b_p_sw=4 (nonzero) takes priority regardless of `col`.
+        assert_eq!(unsafe { get_sw_value_pos(buf_ptr, &target_pos, false) }, 4);
+
+        // The cursor is restored to its ORIGINAL value afterward.
+        let restored = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor };
+        assert_eq!(restored, crate::pos_defs::PosT { lnum: 5, col: 3, coladd: 0 });
+
+        drop(guard);
+    }
+
+    #[test]
+    fn get_sw_value_pos_uses_the_given_positions_column_and_restores_the_cursor() {
+        let mut buf = BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        // Wire `win.w_buffer` from `GLOBALS.curbuf`'s own stored
+        // value (never re-borrowed independently from `buf`), same
+        // discipline as `win_text_height`'s established `wref`
+        // pattern elsewhere in this crate.
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            (*g.curwin).w_buffer = g.curbuf;
+        }
+
+        let buf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        // No 'list', no 'cpo' L flag -> get_nolist_virtcol resolves
+        // via getvcol_nolist, matching plain byte columns here (all
+        // ASCII, no tabs) - target col=0, so tabstop_at(0, ts=8,
+        // vts=[4,8], left=false) = 4 (the first explicit stop).
+        let target_pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let sw = unsafe { get_sw_value_pos(buf_ptr, &target_pos, false) };
+        assert_eq!(sw, 4);
+
+        // The cursor is restored to its original column afterward.
+        let restored_col = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col };
+        assert_eq!(restored_col, 2);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_sw_value_pos_uses_the_real_shiftwidth_when_nonzero() {
+        let mut buf = BufT { b_p_sw: 4, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"hello\0");
+        win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            (*g.curwin).w_buffer = g.curbuf;
+        }
+
+        let buf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let target_pos = crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 };
+        // b_p_sw=4 (nonzero) always takes priority, regardless of
+        // the target column.
+        assert_eq!(unsafe { get_sw_value_pos(buf_ptr, &target_pos, false) }, 4);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_sw_value_indent_uses_the_first_non_blank_column() {
+        let mut buf = BufT { b_p_sw: 0, b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        win.w_cursor.lnum = 1;
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            (*g.curwin).w_buffer = g.curbuf;
+        }
+
+        let buf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        // The first non-blank is at column 4; no vts, so
+        // tabstop_at(4, ts=8, None, left=false) = 8.
+        assert_eq!(unsafe { get_sw_value_indent(buf_ptr, false) }, 8);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_sw_value_indent_left_true_returns_the_preceding_intervals_width() {
+        let mut buf =
+            BufT { b_p_sw: 0, b_p_ts: 8, b_p_vts_array: Some(vec![4, 8]), ..Default::default() };
+        let mut win = WinT::default();
+        // First non-blank at column 6 (between the stop at 4 and the
+        // stop at 12) - shifting left returns the PRECEDING
+        // interval's width (4), matching `tabstop_at`'s own
+        // `left=true` semantics.
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"      text\0");
+        win.w_cursor.lnum = 1;
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            (*g.curwin).w_buffer = g.curbuf;
+        }
+
+        let buf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        assert_eq!(unsafe { get_sw_value_indent(buf_ptr, true) }, 4);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn get_sts_value_uses_softtabstop_when_non_negative() {
+        let mut buf = BufT { b_p_sts: 4, b_p_sw: 8, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert_eq!(unsafe { get_sts_value() }, 4);
+    }
+
+    #[test]
+    fn get_sts_value_zero_is_returned_as_is() {
+        let mut buf = BufT { b_p_sts: 0, b_p_sw: 8, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert_eq!(unsafe { get_sts_value() }, 0);
+    }
+
+    #[test]
+    fn get_sts_value_negative_falls_back_to_shiftwidth() {
+        let mut buf = BufT { b_p_sts: -1, b_p_sw: 8, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert_eq!(unsafe { get_sts_value() }, 8);
+    }
+
+    #[test]
+    fn get_sts_value_negative_falls_back_to_tabstop_at_when_shiftwidth_is_zero() {
+        let mut buf = BufT { b_p_sts: -1, b_p_sw: 0, b_p_ts: 4, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert_eq!(unsafe { get_sts_value() }, 4);
     }
 
     #[test]

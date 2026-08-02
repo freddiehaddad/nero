@@ -49,7 +49,8 @@
 //!   `backslash_halve_save` (needing exactly this) and `vim_isfilec_or_wc`
 //!   (`"gf"`'s own file-or-wildcard-character predicate, needing
 //!   `crate::path::path_has_wildcard` too) are now translated alongside
-//!   it.
+//!   it. [`getwhitecols_curline`] (a thin wrapper over [`getwhitecols`]
+//!   and `crate::cursor::get_cursor_line_ptr`) is translated too.
 //! - `vim_iswordc`/`vim_iswordp` families: still need the real
 //!   `g_chartab` (built by `buf_init_chartab` above) - these depend on
 //!   `'iskeyword'`, whose own default (or per-buffer/filetype
@@ -127,11 +128,24 @@ pub fn skipwhite_len(p: &[u8], len: usize) -> usize {
 }
 
 /// Returns the number of whitespace columns (bytes) at the start of `p`
-/// (`getwhitecols`). (`getwhitecols_curline`, which calls this on the
-/// current line, is deferred - needs the cursor/buffer subsystem.)
+/// (`getwhitecols`).
 #[inline]
 pub fn getwhitecols(p: &[u8]) -> usize {
     skipwhite(p)
+}
+
+/// Returns the number of whitespace columns (bytes) at the start of
+/// the current line (`getwhitecols_curline`).
+///
+/// # Safety
+/// Forwards `crate::cursor::get_cursor_line_ptr`'s own safety doc
+/// (`crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT`).
+#[must_use]
+pub unsafe fn getwhitecols_curline() -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    getwhitecols(&line)
 }
 
 /// Skip over digits (`skipdigits`). Returns the offset of the first
