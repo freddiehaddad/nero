@@ -15,7 +15,12 @@
 //! `slang_T`'s own spell-file-loaded state - these two option-value
 //! validators actually need only already-existing
 //! `crate::option::{valid_name, copy_option_part}`/
-//! `crate::charset::vim_is_fname_char`).
+//! `crate::charset::vim_is_fname_char`). [`spell_check_window`]/
+//! [`no_spell_checking`] (whether spell checking is enabled/usable
+//! for a window - needed only already-real `WinT.w_onebuf_opt.
+//! wo_spell`/`w_s`'s own `b_p_spl`/`b_langp` fields; the latter's own
+//! real `emsg` display is skipped, matching this crate's established
+//! policy).
 //!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/`captype`/
@@ -96,6 +101,36 @@ pub fn valid_spellfile(val: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Whether spell checking is enabled for `wp` (`spell_check_window`):
+/// `'spell'` is set AND a `'spelllang'` value is loaded.
+///
+/// # Safety
+/// `wp.w_s` must be a valid, non-null pointer to a live
+/// `crate::buffer_defs::SynblockT`.
+#[must_use]
+pub unsafe fn spell_check_window(wp: &crate::buffer_defs::WinT) -> bool {
+    wp.w_onebuf_opt.wo_spell != 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { &*wp.w_s }.b_p_spl.as_deref().is_some_and(|v| !v.is_empty())
+}
+
+/// Whether spell checking is disabled (or no spell language is
+/// actually loaded) for `wp` (`no_spell_checking`). The original's own
+/// `emsg(_(e_no_spell))` display is skipped (`message.c`'s display
+/// pipeline is not tractable), matching this crate's established
+/// policy elsewhere - only the boolean OUTCOME is preserved.
+///
+/// # Safety
+/// Same as [`spell_check_window`].
+#[must_use]
+pub unsafe fn no_spell_checking(wp: &crate::buffer_defs::WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { spell_check_window(wp) } || unsafe { &*wp.w_s }.b_langp.is_empty() {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -224,5 +259,85 @@ mod tests {
     #[test]
     fn valid_spellfile_invalid_filename_character_is_rejected() {
         assert!(!valid_spellfile(b"a<b.add"));
+    }
+
+    // --- spell_check_window / no_spell_checking ---
+
+    #[test]
+    fn spell_check_window_true_when_spell_on_and_lang_set() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: Some(b"en".to_vec()), ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(unsafe { spell_check_window(&win) });
+    }
+
+    #[test]
+    fn spell_check_window_false_when_spell_option_off() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 0;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: Some(b"en".to_vec()), ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(!unsafe { spell_check_window(&win) });
+    }
+
+    #[test]
+    fn spell_check_window_false_when_spelllang_is_unset() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: None, ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(!unsafe { spell_check_window(&win) });
+    }
+
+    #[test]
+    fn spell_check_window_false_when_spelllang_is_empty_string() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: Some(Vec::new()), ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(!unsafe { spell_check_window(&win) });
+    }
+
+    #[test]
+    fn no_spell_checking_false_when_enabled_and_a_language_is_loaded() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let mut syn = crate::buffer_defs::SynblockT {
+            b_p_spl: Some(b"en".to_vec()),
+            b_langp: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(!unsafe { no_spell_checking(&win) });
+    }
+
+    #[test]
+    fn no_spell_checking_true_when_spell_checking_itself_is_disabled() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 0;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: Some(b"en".to_vec()), ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(unsafe { no_spell_checking(&win) });
+    }
+
+    #[test]
+    fn no_spell_checking_true_when_no_language_is_actually_loaded() {
+        // spell_check_window is true (spell on, a 'spelllang' value is
+        // set), but b_langp (the ACTUALLY LOADED languages) is empty -
+        // matching the real-world "spelllang set but the file hasn't
+        // loaded yet/failed to load" case.
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_spell = 1;
+        let mut syn = crate::buffer_defs::SynblockT { b_p_spl: Some(b"en".to_vec()), ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(unsafe { no_spell_checking(&win) });
     }
 }
