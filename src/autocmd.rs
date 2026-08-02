@@ -68,7 +68,10 @@
 //! `:augroup {name}`'s definition side, not yet translated) - so
 //! `augroup_find` always returns [`crate::autocmd_defs::augroup::ERROR`]
 //! and `augroup_exists` always `false` today, the same "always-empty-
-//! registry" pattern as `AUTOCMDS` itself.
+//! registry" pattern as `AUTOCMDS` itself. Also [`event_nr2name`] - a
+//! pure lookup using `EventT`'s own derived `Debug` impl in place of
+//! the original's `event_names[]` string table (see its own doc
+//! comment for why this is a faithful, not approximate, translation).
 //!
 //! Deferred: everything else - `apply_autocmds_group`'s real
 //! autocmd-matching-and-execution body (needs pattern matching,
@@ -434,6 +437,28 @@ pub fn augroup_exists(name: &[u8]) -> bool {
     augroup_find(name) > 0
 }
 
+/// Returns the display name of `event` (`event_nr2name`).
+///
+/// The original's own `event >= 0 && event < NUM_EVENTS` bounds check
+/// (falling back to `"Unknown"` otherwise) has no equivalent here:
+/// [`EventT`] is a real, exhaustive Rust enum, so every value is
+/// always in range by construction - there is no way to construct an
+/// "out-of-range" `EventT` in safe Rust, unlike the original's own
+/// plain `int`-typed `event_T`. Uses `EventT`'s own derived `Debug`
+/// impl, which is guaranteed to produce exactly the same string as
+/// the original's own `event_names[event].name` table: `EventT`'s own
+/// variants are themselves a direct, mechanical transcription of
+/// those exact same names (see `autocmd_defs.rs`'s own module doc for
+/// the cross-checked transcription methodology) - independently
+/// re-verified here (and by this function's own tests) against
+/// several tricky, easy-to-get-wrong capitalizations
+/// (`CmdlineChanged`, `CmdwinEnter`) directly against the generated
+/// `auevents_name_map.generated.h` table.
+#[must_use]
+pub fn event_nr2name(event: EventT) -> String {
+    format!("{event:?}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,5 +720,57 @@ mod tests {
         assert_eq!(augroup_find(b"GroupB"), 2);
         assert_eq!(augroup_find(b"GroupC"), augroup::ERROR);
         reset_augroup_map();
+    }
+
+    // --- event_nr2name ---
+
+    #[test]
+    fn event_nr2name_first_variant() {
+        assert_eq!(event_nr2name(EventT::BufAdd), "BufAdd");
+    }
+
+    #[test]
+    fn event_nr2name_last_variant() {
+        assert_eq!(event_nr2name(EventT::WinScrolled), "WinScrolled");
+    }
+
+    #[test]
+    fn event_nr2name_an_alias_variant_is_distinct_from_its_target() {
+        // BufCreate is a real, distinct EventT variant (an alias of
+        // BufAdd, per auevents.lua's own "aliases" table) - its own
+        // display name must be "BufCreate", not "BufAdd".
+        assert_eq!(event_nr2name(EventT::BufCreate), "BufCreate");
+        assert_ne!(event_nr2name(EventT::BufCreate), event_nr2name(EventT::BufAdd));
+    }
+
+    #[test]
+    fn event_nr2name_tricky_capitalizations_match_the_generated_table_exactly() {
+        // Hand-verified against auevents_name_map.generated.h's own
+        // exact "CmdlineChanged"/"CmdwinEnter" strings (lowercase 'l'/
+        // 'w' - NOT "CmdLineChanged"/"CmdWinEnter").
+        assert_eq!(event_nr2name(EventT::CmdlineChanged), "CmdlineChanged");
+        assert_eq!(event_nr2name(EventT::CmdwinEnter), "CmdwinEnter");
+    }
+
+    #[test]
+    fn event_nr2name_spot_checks_across_the_enum_produce_plain_ascii_names() {
+        // A spread of variants (early/middle/late, and the other 2
+        // aliases besides BufCreate) - each hand-verified against
+        // auevents_name_map.generated.h's own exact string, and none
+        // carrying a stray "EventT::" Debug-path prefix.
+        assert_eq!(event_nr2name(EventT::BufRead), "BufRead"); // alias of BufReadPost
+        assert_eq!(event_nr2name(EventT::BufReadPost), "BufReadPost");
+        assert_eq!(event_nr2name(EventT::VimEnter), "VimEnter");
+        assert_eq!(event_nr2name(EventT::TermResponse), "TermResponse");
+        assert_eq!(event_nr2name(EventT::WinResized), "WinResized");
+        for name in [
+            event_nr2name(EventT::BufAdd),
+            event_nr2name(EventT::VimEnter),
+            event_nr2name(EventT::WinScrolled),
+        ] {
+            assert!(!name.is_empty());
+            assert!(name.is_ascii());
+            assert!(!name.contains("::"));
+        }
     }
 }
