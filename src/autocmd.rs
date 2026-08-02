@@ -61,15 +61,24 @@
 //! since that needs real terminal I/O detecting a termcap response
 //! (`tui/*.c`, not yet translated) - provably unreachable today,
 //! matching the same "narrow, provably-unreachable branch" precedent
-//! used elsewhere in this crate).
+//! used elsewhere in this crate). Also [`augroup_find`]/
+//! [`augroup_exists`] - the augroup name-to-ID lookup, via a new
+//! `MAP_AUGROUP_NAME_TO_ID` registry that starts empty (matching the
+//! original's own `map_augroup_name_to_id`, only ever populated by
+//! `:augroup {name}`'s definition side, not yet translated) - so
+//! `augroup_find` always returns [`crate::autocmd_defs::augroup::ERROR`]
+//! and `augroup_exists` always `false` today, the same "always-empty-
+//! registry" pattern as `AUTOCMDS` itself.
 //!
 //! Deferred: everything else - `apply_autocmds_group`'s real
 //! autocmd-matching-and-execution body (needs pattern matching,
 //! `exec_autocmds`, script/function invocation via the not-yet-started
 //! parser), and the entire `:autocmd`/augroup definition/deletion
-//! side (needs the `:autocmd` command parser).
+//! side (needs the `:autocmd` command parser) - `augroup_name`/
+//! `do_augroup` themselves still need real `NEXT_AUGROUP_ID`/
+//! `CURRENT_AUGROUP` state tracking beyond just the name-to-ID map.
 
-use crate::autocmd_defs::{AutoCmdVec, AutoPatCmd, EventT, NUM_EVENTS};
+use crate::autocmd_defs::{augroup, AutoCmdVec, AutoPatCmd, EventT, NUM_EVENTS};
 use crate::buffer_defs::BufT;
 use crate::ex_cmds_defs::ExargT;
 use crate::globals::GlobalCell;
@@ -393,6 +402,38 @@ fn au_cleanup() {
     );
 }
 
+/// `map_augroup_name_to_id` - augroup name -> ID registry. Always
+/// empty today: nothing yet populates it (`:augroup {name}`'s
+/// definition side isn't translated).
+static MAP_AUGROUP_NAME_TO_ID: LazyLock<GlobalCell<std::collections::HashMap<Vec<u8>, i32>>> =
+    LazyLock::new(|| GlobalCell::new(std::collections::HashMap::new()));
+
+/// Find the ID of an autocmd group name, or
+/// [`crate::autocmd_defs::augroup::ERROR`] if not found
+/// (`augroup_find`).
+///
+/// Always returns [`crate::autocmd_defs::augroup::ERROR`] today: see
+/// this module's own doc comment for why `MAP_AUGROUP_NAME_TO_ID` can
+/// only currently be empty.
+#[must_use]
+pub fn augroup_find(name: &[u8]) -> i32 {
+    // SAFETY: momentary read.
+    let existing_id = unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.get(name).copied();
+    match existing_id {
+        Some(id) if id == augroup::DELETED => augroup::DELETED,
+        Some(id) if id > 0 => id,
+        _ => augroup::ERROR,
+    }
+}
+
+/// Whether augroup `name` exists (`augroup_exists`).
+///
+/// Always `false` today - see [`augroup_find`]'s own doc comment.
+#[must_use]
+pub fn augroup_exists(name: &[u8]) -> bool {
+    augroup_find(name) > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +649,51 @@ mod tests {
         unsafe { *TERMRESPONSE_CHANGED.get_mut() = false };
         unblock_autocmds();
         assert!(!is_autocmd_blocked());
+    }
+
+    // --- augroup_find / augroup_exists ---
+
+    fn reset_augroup_map() {
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.clear();
+    }
+
+    #[test]
+    fn augroup_find_not_found_is_error() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        assert_eq!(augroup_find(b"nonexistent"), augroup::ERROR);
+        assert!(!augroup_exists(b"nonexistent"));
+    }
+
+    #[test]
+    fn augroup_find_returns_a_real_positive_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"MyGroup".to_vec(), 5);
+        assert_eq!(augroup_find(b"MyGroup"), 5);
+        assert!(augroup_exists(b"MyGroup"));
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn augroup_find_returns_deleted_for_a_deleted_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"WasDeleted".to_vec(), augroup::DELETED);
+        assert_eq!(augroup_find(b"WasDeleted"), augroup::DELETED);
+        assert!(!augroup_exists(b"WasDeleted"), "a deleted group does not count as existing");
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn augroup_find_distinguishes_between_multiple_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"GroupA".to_vec(), 1);
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"GroupB".to_vec(), 2);
+        assert_eq!(augroup_find(b"GroupA"), 1);
+        assert_eq!(augroup_find(b"GroupB"), 2);
+        assert_eq!(augroup_find(b"GroupC"), augroup::ERROR);
+        reset_augroup_map();
     }
 }
