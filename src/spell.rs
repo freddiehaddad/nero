@@ -8,14 +8,20 @@
 //! Translated: [`byte_in_str`] (a pure `strchr`-equivalent),
 //! [`spell_valid_case`] (a pure bitflag check over a small subset of
 //! the original's `WF_*` word-flag bits - only the 4 needed here are
-//! transcribed, not the whole enum), and [`find_region`] (a pure
-//! lookup over a 2-byte-per-entry region-code string).
+//! transcribed, not the whole enum), [`find_region`] (a pure lookup
+//! over a 2-byte-per-entry region-code string), and
+//! [`valid_spelllang`]/[`valid_spellfile`] (re-investigated after
+//! being stale-grouped below with functions genuinely needing
+//! `slang_T`'s own spell-file-loaded state - these two option-value
+//! validators actually need only already-existing
+//! `crate::option::{valid_name, copy_option_part}`/
+//! `crate::charset::vim_is_fname_char`).
 //!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/`captype`/
-//! `spell_iswordp*`/`spell_casefold`/`check_need_cap`/`expand_spelling`/
-//! `valid_spelllang`/`valid_spellfile`, all needing `slang_T`'s own
-//! spell-file-loaded state or the buffer/window spell-option plumbing.
+//! `spell_iswordp*`/`spell_casefold`/`check_need_cap`/`expand_spelling`,
+//! all needing `slang_T`'s own spell-file-loaded state or the
+//! buffer/window spell-option plumbing.
 
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
@@ -63,6 +69,33 @@ pub fn find_region(rp: &[u8], region: [u8; 2]) -> i32 {
         }
         i += 2;
     }
+}
+
+/// Whether `val` is a valid `'spelllang'` value (`valid_spelllang`).
+#[must_use]
+pub fn valid_spelllang(val: &[u8]) -> bool {
+    crate::option::valid_name(val, b".-_,@")
+}
+
+/// Whether `val` is a valid `'spellfile'` value (`valid_spellfile`):
+/// every comma-separated part must be a `.add`-suffixed name made up
+/// entirely of valid filename characters.
+#[must_use]
+pub fn valid_spellfile(val: &[u8]) -> bool {
+    let maxpathl = crate::os::os_defs::MAXPATHL as usize;
+    let mut p = 0;
+    while p < val.len() {
+        let (spf_name, next_p) = crate::option::copy_option_part(val, p, maxpathl, b",");
+        p = next_p;
+        let l = spf_name.len();
+        if l >= maxpathl - 4 || l < 4 || spf_name[l - 4..] != *b".add" {
+            return false;
+        }
+        if !spf_name.iter().all(|&c| crate::charset::vim_is_fname_char(i32::from(c))) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -124,5 +157,72 @@ mod tests {
     fn find_region_not_found_is_region_all() {
         assert_eq!(find_region(b"usgbde", *b"xx"), REGION_ALL);
         assert_eq!(find_region(b"", *b"us"), REGION_ALL);
+    }
+
+    // --- valid_spelllang ---
+
+    #[test]
+    fn valid_spelllang_empty_is_valid() {
+        assert!(valid_spelllang(b""));
+    }
+
+    #[test]
+    fn valid_spelllang_plain_alnum_is_valid() {
+        assert!(valid_spelllang(b"en"));
+    }
+
+    #[test]
+    fn valid_spelllang_allowed_punctuation_is_valid() {
+        assert!(valid_spelllang(b"en_US.utf-8,de@quot"));
+    }
+
+    #[test]
+    fn valid_spelllang_space_is_invalid() {
+        assert!(!valid_spelllang(b"en US"));
+    }
+
+    // --- valid_spellfile ---
+
+    #[test]
+    fn valid_spellfile_empty_is_valid() {
+        assert!(valid_spellfile(b""));
+    }
+
+    #[test]
+    fn valid_spellfile_single_add_suffixed_part_is_valid() {
+        assert!(valid_spellfile(b"en.utf-8.add"));
+    }
+
+    #[test]
+    fn valid_spellfile_multiple_comma_separated_parts_all_valid() {
+        assert!(valid_spellfile(b"en.add,de.add"));
+    }
+
+    #[test]
+    fn valid_spellfile_bare_dot_add_is_valid() {
+        // l == 4 exactly: not "< 4" (rejected), the whole part IS the
+        // ".add" suffix with nothing before it - matches the
+        // original's own l < 4 (strictly-less) check precisely.
+        assert!(valid_spellfile(b".add"));
+    }
+
+    #[test]
+    fn valid_spellfile_too_short_is_invalid() {
+        assert!(!valid_spellfile(b"abc"));
+    }
+
+    #[test]
+    fn valid_spellfile_wrong_suffix_is_invalid() {
+        assert!(!valid_spellfile(b"foo.txt"));
+    }
+
+    #[test]
+    fn valid_spellfile_one_bad_part_among_several_invalidates_the_whole_value() {
+        assert!(!valid_spellfile(b"en.add,invalid"));
+    }
+
+    #[test]
+    fn valid_spellfile_invalid_filename_character_is_rejected() {
+        assert!(!valid_spellfile(b"a<b.add"));
     }
 }
