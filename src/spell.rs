@@ -27,6 +27,19 @@
 //! `spell_iswordp*`/`spell_casefold`/`check_need_cap`/`expand_spelling`,
 //! all needing `slang_T`'s own spell-file-loaded state or the
 //! buffer/window spell-option plumbing.
+//!
+//! Also translated: [`SpelltabT`]/[`clear_spell_chartab`]/
+//! [`init_spell_chartab`] (from `spell_defs.h`/`spell.c` - no
+//! dedicated `spell_defs.rs` module exists yet, matching
+//! `charset.h`'s own "embedded directly, documented" precedent for a
+//! header with no other translated members). Needed only already-real
+//! `mbyte.c`'s `utf_fold`/`mb_toupper`/`mb_isupper`/`mb_islower` -
+//! translated ahead of their own real caller (`spell_iswordp`/
+//! `spell_iswordp_nmw`, needing `mb_get_class`/`utf_class`'s own real
+//! `curbuf->b_chartab`, still not translated - the SAME `g_chartab`
+//! blocker documented throughout this crate's `charset.rs`), matching
+//! this crate's established "small, self-contained, no design freedom
+//! to get wrong" precedent.
 
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
@@ -39,6 +52,108 @@ pub const WF_KEEPCAP: i32 = 0x80;
 
 /// word valid in all regions (`REGION_ALL`).
 pub const REGION_ALL: i32 = 0xff;
+
+/// The tables used for recognizing word characters according to
+/// spelling. These are only used for the first 256 characters of
+/// `'encoding'` (`spelltab_T`, `spell_defs.h`).
+pub struct SpelltabT {
+    /// flags: is word char (`st_isw`)
+    pub st_isw: [bool; 256],
+    /// flags: is uppercase char (`st_isu`)
+    pub st_isu: [bool; 256],
+    /// chars: folded case (`st_fold`)
+    pub st_fold: [u8; 256],
+    /// chars: upper case (`st_upper`)
+    pub st_upper: [u8; 256],
+}
+
+impl SpelltabT {
+    /// A brand-new, all-zeroed table (matching the original's own
+    /// static/zero-initialized `spelltab_T spelltab;` - every field
+    /// starts `false`/`0` until [`clear_spell_chartab`]/
+    /// [`init_spell_chartab`] populates it for real).
+    #[must_use]
+    pub const fn new() -> Self {
+        SpelltabT { st_isw: [false; 256], st_isu: [false; 256], st_fold: [0; 256], st_upper: [0; 256] }
+    }
+}
+
+impl Default for SpelltabT {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The crate-wide `spelltab_T spelltab` global instance, matching
+/// this crate's established `GlobalCell`-backed file-static
+/// convention. Const-constructible (every field is a plain array),
+/// so no `LazyLock` wrapper is needed.
+static SPELLTAB: crate::globals::GlobalCell<SpelltabT> =
+    crate::globals::GlobalCell::new(SpelltabT::new());
+
+/// Whether a spell file has customized the chartab
+/// (`did_set_spelltab`, `spell.h`'s own real cross-file `extern bool`,
+/// also read/written by `spellfile.c`, not translated, so this is
+/// currently only ever written by [`init_spell_chartab`] itself).
+static DID_SET_SPELLTAB: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Resets `sp` to its baseline ASCII-only word-character table
+/// (`clear_spell_chartab`): digits/letters are word characters,
+/// `A`-`Z`/`a`-`z` fold to their opposite case, everything else
+/// starts as "not a word character" with an identity fold/upper
+/// mapping.
+pub fn clear_spell_chartab(sp: &mut SpelltabT) {
+    sp.st_isw = [false; 256];
+    sp.st_isu = [false; 256];
+
+    for i in 0..256usize {
+        sp.st_fold[i] = i as u8;
+        sp.st_upper[i] = i as u8;
+    }
+
+    for i in b'0'..=b'9' {
+        sp.st_isw[i as usize] = true;
+    }
+    for i in b'A'..=b'Z' {
+        sp.st_isw[i as usize] = true;
+        sp.st_isu[i as usize] = true;
+        sp.st_fold[i as usize] = i + 0x20;
+    }
+    for i in b'a'..=b'z' {
+        sp.st_isw[i as usize] = true;
+        sp.st_upper[i as usize] = i - 0x20;
+    }
+}
+
+/// Initializes the chartab used for spelling (`init_spell_chartab`).
+/// Called once while starting up. The default is ASCII-only (via
+/// [`clear_spell_chartab`]); for bytes 128..256 (`'encoding'`-
+/// dependent), uses the real case-folding/upper-casing functions.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via `mbyte::mb_toupper`/
+/// `mb_isupper`/`mb_islower`).
+pub unsafe fn init_spell_chartab() {
+    unsafe {
+        *DID_SET_SPELLTAB.get_mut() = false;
+    }
+    // SAFETY: a plain exclusive borrow of this file's own static.
+    let sp = unsafe { SPELLTAB.get_mut() };
+    clear_spell_chartab(sp);
+    for i in 128i32..256 {
+        let f = crate::mbyte::utf_fold(i);
+        // SAFETY: forwarded from this function's own safety doc.
+        let u = unsafe { crate::mbyte::mb_toupper(i) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let isu = unsafe { crate::mbyte::mb_isupper(i) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let isl = unsafe { crate::mbyte::mb_islower(i) };
+        sp.st_isu[i as usize] = isu;
+        sp.st_isw[i as usize] = isu || isl;
+        sp.st_fold[i as usize] = if f < 256 { f as u8 } else { i as u8 };
+        sp.st_upper[i as usize] = if u < 256 { u as u8 } else { i as u8 };
+    }
+}
 
 /// Whether byte value `n` appears anywhere in `s` (`byte_in_str`).
 ///
@@ -192,6 +307,70 @@ mod tests {
     fn find_region_not_found_is_region_all() {
         assert_eq!(find_region(b"usgbde", *b"xx"), REGION_ALL);
         assert_eq!(find_region(b"", *b"us"), REGION_ALL);
+    }
+
+    // --- clear_spell_chartab / init_spell_chartab ---
+
+    #[test]
+    fn clear_spell_chartab_digits_are_word_chars() {
+        let mut sp = SpelltabT::default();
+        clear_spell_chartab(&mut sp);
+        assert!(sp.st_isw[b'5' as usize]);
+        assert!(!sp.st_isw[b' ' as usize]);
+    }
+
+    #[test]
+    fn clear_spell_chartab_uppercase_letters_are_word_and_upper() {
+        let mut sp = SpelltabT::default();
+        clear_spell_chartab(&mut sp);
+        assert!(sp.st_isw[b'A' as usize]);
+        assert!(sp.st_isu[b'A' as usize]);
+        assert_eq!(sp.st_fold[b'A' as usize], b'a');
+    }
+
+    #[test]
+    fn clear_spell_chartab_lowercase_letters_are_word_not_upper() {
+        let mut sp = SpelltabT::default();
+        clear_spell_chartab(&mut sp);
+        assert!(sp.st_isw[b'a' as usize]);
+        assert!(!sp.st_isu[b'a' as usize]);
+        assert_eq!(sp.st_upper[b'a' as usize], b'A');
+    }
+
+    #[test]
+    fn clear_spell_chartab_non_letter_gets_identity_fold_and_upper() {
+        let mut sp = SpelltabT::default();
+        clear_spell_chartab(&mut sp);
+        assert!(!sp.st_isw[b' ' as usize]);
+        assert_eq!(sp.st_fold[b' ' as usize], b' ');
+        assert_eq!(sp.st_upper[b' ' as usize], b' ');
+    }
+
+    #[test]
+    fn clear_spell_chartab_resets_a_previously_dirty_table() {
+        // A table that was previously populated by init_spell_chartab
+        // (or hand-corrupted) is fully reset, not just "added to".
+        let mut sp = SpelltabT { st_isw: [true; 256], ..SpelltabT::default() };
+        clear_spell_chartab(&mut sp);
+        assert!(!sp.st_isw[b'!' as usize]);
+    }
+
+    #[test]
+    fn init_spell_chartab_resets_did_set_spelltab_and_matches_clear_for_ascii() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *DID_SET_SPELLTAB.get_mut() = true };
+
+        unsafe { init_spell_chartab() };
+
+        assert!(!unsafe { *DID_SET_SPELLTAB.get_mut() });
+        // Bytes 0..128 are untouched by init_spell_chartab's own loop
+        // (which only runs 128..256) - they must still match a plain
+        // clear_spell_chartab call exactly.
+        let sp = unsafe { SPELLTAB.get_mut() };
+        let mut expected = SpelltabT::default();
+        clear_spell_chartab(&mut expected);
+        assert_eq!(&sp.st_isw[0..128], &expected.st_isw[0..128]);
+        assert_eq!(&sp.st_fold[0..128], &expected.st_fold[0..128]);
     }
 
     // --- valid_spelllang ---
