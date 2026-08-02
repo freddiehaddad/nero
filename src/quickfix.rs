@@ -22,11 +22,25 @@
 //! `unimplemented!()` stub) - matching this crate's established
 //! "translate only the real, reachable fast path" precedent (e.g.
 //! `win_lines_concealed`/`decor_conceal_line`/the whole `AUTOCMDS`-
-//! empty-registry family).
+//! empty-registry family). Also [`qf_fmt_text`] - a pure string
+//! transform (collapse a newline plus any immediately-following
+//! whitespace/newlines into a single space) that only touches a
+//! caller-provided [`crate::garray_defs::GarrayT`] output buffer and a
+//! plain `&[u8]` input, with no dependency on `qf_info_T`/`qf_list_T`
+//! at all (unlike most of this file).
 //!
-//! Deferred: everything else in the file.
+//! Deferred: everything else in the file - in particular, every OTHER
+//! function operating on `qf_info_T`/`qf_list_T`'s own real fields
+//! (e.g. `qf_stack_empty`/`qf_list_empty`/`qf_cmdtitle`/
+//! `qf_store_title`) remains genuinely blocked: those structs are
+//! still just an opaque placeholder
+//! ([`crate::types_defs::QfInfoT`]) with no real fields translated -
+//! individually "small" helper functions built on top of them are NOT
+//! tractable until the underlying quickfix-list storage itself is
+//! translated (a separate, substantial undertaking).
 
 use crate::buffer_defs::{BufT, WinT, BUF_HAS_LL_ENTRY, BUF_HAS_QF_ENTRY};
+use crate::garray_defs::GarrayT;
 
 /// Adjust quickfix/location-list error entries for changed line numbers.
 ///
@@ -58,6 +72,25 @@ pub fn qf_mark_adjust(
          crate can set BufT.b_has_qf_entry to a nonzero value yet, see this module's own doc \
          comment"
     );
+}
+
+/// Convert `text`, replacing a newline and any immediately-following
+/// whitespace/newlines with a single space, appending the result byte
+/// by byte to `gap` (`qf_fmt_text`).
+pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == b'\n' {
+            gap.ga_append(b' ');
+            i += 1;
+            while i < text.len() && (crate::ascii_defs::ascii_iswhite(i32::from(text[i])) || text[i] == b'\n') {
+                i += 1;
+            }
+        } else {
+            gap.ga_append(text[i]);
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +136,64 @@ mod tests {
         // something set this flag for real.
         let buf = BufT { b_has_qf_entry: BUF_HAS_QF_ENTRY, ..BufT::default() };
         let _ = qf_mark_adjust(&buf, None, 1, 5, 2, 0);
+    }
+
+    // --- qf_fmt_text ---
+
+    fn fmt(text: &[u8]) -> Vec<u8> {
+        let mut gap = GarrayT::new(1, 4);
+        qf_fmt_text(&mut gap, text);
+        gap.ga_data[..gap.ga_len as usize].to_vec()
+    }
+
+    #[test]
+    fn qf_fmt_text_empty_is_unchanged() {
+        assert_eq!(fmt(b""), b"");
+    }
+
+    #[test]
+    fn qf_fmt_text_plain_text_with_no_newline_is_unchanged() {
+        assert_eq!(fmt(b"hello world"), b"hello world");
+    }
+
+    #[test]
+    fn qf_fmt_text_single_newline_becomes_a_space() {
+        assert_eq!(fmt(b"foo\nbar"), b"foo bar");
+    }
+
+    #[test]
+    fn qf_fmt_text_newline_followed_by_spaces_collapses_to_one_space() {
+        assert_eq!(fmt(b"foo\n   bar"), b"foo bar");
+    }
+
+    #[test]
+    fn qf_fmt_text_multiple_consecutive_newlines_collapse_to_one_space() {
+        assert_eq!(fmt(b"foo\n\n\nbar"), b"foo bar");
+    }
+
+    #[test]
+    fn qf_fmt_text_trailing_newline_with_nothing_after() {
+        assert_eq!(fmt(b"foo\n"), b"foo ");
+    }
+
+    #[test]
+    fn qf_fmt_text_leading_newline() {
+        assert_eq!(fmt(b"\nfoo"), b" foo");
+    }
+
+    #[test]
+    fn qf_fmt_text_mixed_whitespace_and_newline_run_all_absorbed() {
+        // space, tab, newline, space - all whitespace-or-newline, so
+        // ALL are absorbed after the first newline triggers the
+        // single space append.
+        assert_eq!(fmt(b"a\n \t\n b"), b"a b");
+    }
+
+    #[test]
+    fn qf_fmt_text_tab_alone_is_preserved_as_is_when_not_after_a_newline() {
+        // A tab NOT immediately following a newline is just a plain
+        // byte, copied through unchanged (only whitespace immediately
+        // AFTER a newline gets absorbed).
+        assert_eq!(fmt(b"a\tb"), b"a\tb");
     }
 }
