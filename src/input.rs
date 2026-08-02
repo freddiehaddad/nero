@@ -8,7 +8,7 @@
 //! (`vgetc`/`vgetorpeek`/the typeahead buffer/mapping application) not
 //! yet tractable.
 //!
-//! Translated: 4 small, self-contained predicate functions, none
+//! Translated: 7 small, self-contained predicate functions, none
 //! needing the input engine itself:
 //!
 //! - [`stuff_empty`]/[`readbuf1_empty`] - whether the "stuff"
@@ -32,21 +32,33 @@
 //!   `vgetc()` call cannot be remapped. `KEY_NOREMAP` starts at `0`
 //!   and is only ever changed inside `vgetc()` itself (not
 //!   translated), so this is always `false` today.
+//! - [`typebuf_typed`]/[`typebuf_maplen`] - whether there are (and how
+//!   many) untyped (mapped, or from `:normal`) characters in the
+//!   typeahead buffer. The new `TYPEBUF: GlobalCell<
+//!   crate::input_defs::TypebufT>` instance's own `tb_maplen` starts
+//!   at `0` and is only ever changed inside `ins_typebuf` (not yet
+//!   translated), so `typebuf_typed()` is always `true` and
+//!   `typebuf_maplen()` always `0` today.
+//! - [`typebuf_changed`] - whether the typeahead buffer changed since
+//!   a given `tb_change_cnt` snapshot (e.g. from a client message or
+//!   `feedkeys()`). A real, generically-callable predicate (depends on
+//!   its own `tb_change_cnt` parameter, not just untranslated internal
+//!   state), needing only `TYPEBUF.tb_change_cnt` plus the
+//!   already-existing `crate::globals::Globals::typebuf_was_filled`.
 //!
 //! Deferred: everything else - `vgetc`/`vgetorpeek` and the whole
 //! typeahead-buffer/mapping-application machinery, `stuffReadbuff`/
 //! `stuffcharReadbuff`/the `add_buff` family (would give
 //! `READBUF1`/`READBUF2` real, observable content, but nothing
 //! yet CONSUMES them either, since `vgetc` isn't translated - a good
-//! candidate for a dedicated future pass), `ins_typebuf`/the
-//! `typebuf`-instance itself (needs a new `TYPEBUF: GlobalCell<
-//! crate::input_defs::TypebufT>`, not yet added), `redobuff`/
-//! `old_redobuff`/`recordbuff` (the "." and macro-recording buffers),
-//! `openscript`/`open_scriptin`/`close_all_scripts` (real script-file
-//! I/O).
+//! candidate for a dedicated future pass), `ins_typebuf` itself (the
+//! real typeahead-buffer WRITE path - needs `state_no_longer_safe`,
+//! not yet examined), `redobuff`/`old_redobuff`/`recordbuff` (the "."
+//! and macro-recording buffers), `openscript`/`open_scriptin`/
+//! `close_all_scripts` (real script-file I/O).
 
 use crate::globals::GlobalCell;
-use crate::input_defs::BuffheaderT;
+use crate::input_defs::{BuffheaderT, TypebufT};
 
 /// First read ahead buffer. Used for translated commands
 /// (`readbuf1`). File-static in the original.
@@ -63,6 +75,21 @@ static CURSCRIPT: GlobalCell<i32> = GlobalCell::new(-1);
 /// Remapping flags for the next `vgetc()`-obtained character
 /// (`KeyNoremap`). File-static in the original.
 static KEY_NOREMAP: GlobalCell<i32> = GlobalCell::new(0);
+
+/// The typeahead buffer (`typebuf`). File-static in the original
+/// (`static typebuf_T typebuf = { ... }`, zero-initialized here as
+/// `TypebufT::default()` matches this crate's own "Default mirrors
+/// raw C zero-init" convention).
+static TYPEBUF: GlobalCell<TypebufT> = GlobalCell::new(TypebufT {
+    tb_buf: Vec::new(),
+    tb_noremap: Vec::new(),
+    tb_off: 0,
+    tb_len: 0,
+    tb_maplen: 0,
+    tb_silent: 0,
+    tb_no_abbr_cnt: 0,
+    tb_change_cnt: 0,
+});
 
 /// `tb_noremap`: don't remap (`RM_NONE`).
 pub const RM_NONE: i32 = 1;
@@ -99,6 +126,38 @@ pub fn noremap_keys() -> bool {
     (unsafe { *KEY_NOREMAP.get_mut() } & (RM_NONE | RM_SCRIPT)) != 0
 }
 
+/// Whether there are no characters in the typeahead buffer that have
+/// not been typed (result from a mapping or come from `:normal`)
+/// (`typebuf_typed`).
+#[must_use]
+pub fn typebuf_typed() -> bool {
+    // SAFETY: momentary read.
+    unsafe { TYPEBUF.get_mut() }.tb_maplen == 0
+}
+
+/// The number of characters that are mapped (or not typed)
+/// (`typebuf_maplen`).
+#[must_use]
+pub fn typebuf_maplen() -> i32 {
+    // SAFETY: momentary read.
+    unsafe { TYPEBUF.get_mut() }.tb_maplen
+}
+
+/// Whether the typeahead buffer was changed (while waiting for a
+/// character to arrive) since `tb_change_cnt` was snapshotted -
+/// happens when a message was received from a client or from
+/// `feedkeys()` (`typebuf_changed`).
+///
+/// `tb_change_cnt` is the caller's own OLD value of `typebuf`'s
+/// `tb_change_cnt` field (a snapshot taken before waiting).
+#[must_use]
+pub fn typebuf_changed(tb_change_cnt: i32) -> bool {
+    // SAFETY: momentary reads.
+    tb_change_cnt != 0
+        && (unsafe { TYPEBUF.get_mut() }.tb_change_cnt != tb_change_cnt
+            || unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +171,8 @@ mod tests {
             *READBUF2.get_mut() = BuffheaderT::default();
             *CURSCRIPT.get_mut() = -1;
             *KEY_NOREMAP.get_mut() = 0;
+            *TYPEBUF.get_mut() = TypebufT::default();
+            crate::globals::GLOBALS.get_mut().typebuf_was_filled = false;
         }
     }
 
@@ -206,6 +267,64 @@ mod tests {
         // RM_ABBR (4) alone, without RM_NONE|RM_SCRIPT, must not count.
         unsafe { *KEY_NOREMAP.get_mut() = 4 };
         assert!(!noremap_keys());
+        reset_buffers();
+    }
+
+    #[test]
+    fn typebuf_typed_true_by_default() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        assert!(typebuf_typed());
+        assert_eq!(typebuf_maplen(), 0);
+    }
+
+    #[test]
+    fn typebuf_typed_false_once_tb_maplen_is_nonzero() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_maplen = 3;
+        assert!(!typebuf_typed());
+        assert_eq!(typebuf_maplen(), 3);
+        reset_buffers();
+    }
+
+    #[test]
+    fn typebuf_changed_false_when_snapshot_is_zero() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        // The FIRST condition (tb_change_cnt != 0) short-circuits to
+        // false regardless of TYPEBUF's own state or typebuf_was_filled.
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 5;
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+        assert!(!typebuf_changed(0));
+        reset_buffers();
+    }
+
+    #[test]
+    fn typebuf_changed_false_when_matching_and_not_filled() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 7;
+        assert!(!typebuf_changed(7));
+        reset_buffers();
+    }
+
+    #[test]
+    fn typebuf_changed_true_when_snapshot_mismatches() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 9;
+        assert!(typebuf_changed(2));
+        reset_buffers();
+    }
+
+    #[test]
+    fn typebuf_changed_true_when_matching_but_typebuf_was_filled() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 4;
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+        assert!(typebuf_changed(4));
         reset_buffers();
     }
 }
