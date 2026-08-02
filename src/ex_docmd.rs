@@ -36,6 +36,19 @@
 //! line, via the small, self-contained `cmdmods[]` table (mechanically
 //! transcribed 1:1). Needed by `ex_eval.c`'s `has_loop_cmd`
 //! (`crate::ex_eval`).
+//!
+//! Also translated: [`current_win_nr`]/[`current_tab_nr`] - the window/
+//! tabpage-number-within-the-current-tab-list counters backing the
+//! original's own `CURRENT_WIN_NR`/`LAST_WIN_NR`/`CURRENT_TAB_NR`/
+//! `LAST_TAB_NR` macros. `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)`'s own
+//! `((tp) == curtab) ? firstwin : (tp)->tp_firstwin` ternary always
+//! resolves to `firstwin` here specifically (this function's own body
+//! always passes `curtab` as `tp`), matching `window.rs`'s own
+//! `win_count`'s exact traversal start point. Also
+//! [`get_pressedreturn`]/[`set_pressedreturn`] - a trivial getter/
+//! setter pair over a new `EX_PRESSEDRETURN` file-static (matching the
+//! original's own file-static `ex_pressedreturn`), starting `false`
+//! like the original.
 
 use crate::buffer_defs::b_flags;
 
@@ -264,6 +277,70 @@ pub fn modifier_len(cmd: &[u8]) -> usize {
     0
 }
 
+/// Returns the window number of `win` within the current tab page, or
+/// the total number of windows if `win` is null (`current_win_nr`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain must
+/// consist of valid, live `WinT` pointers.
+#[must_use]
+pub unsafe fn current_win_nr(win: *const crate::buffer_defs::WinT) -> i32 {
+    let mut nr = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        nr += 1;
+        if std::ptr::eq(wp, win) {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { &*wp }.w_next;
+    }
+    nr
+}
+
+/// Returns the tabpage number of `tab` within the global tabpage list,
+/// or the total number of tabpages if `tab` is null (`current_tab_nr`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.first_tabpage`'s own `tp_next` chain must
+/// consist of valid, live `TabpageT` pointers.
+#[must_use]
+pub unsafe fn current_tab_nr(tab: *const crate::buffer_defs::TabpageT) -> i32 {
+    let mut nr = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        nr += 1;
+        if std::ptr::eq(tp, tab) {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    nr
+}
+
+/// `ex_pressedreturn` - whether the last Ex command was entered as an
+/// empty command line (pressing `<CR>` at the `:` prompt), file-static
+/// in the original. Starts `false`, matching the original.
+static EX_PRESSEDRETURN: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Returns whether the last Ex command was an empty command line
+/// (`get_pressedreturn`).
+#[must_use]
+pub fn get_pressedreturn() -> bool {
+    // SAFETY: momentary read.
+    unsafe { *EX_PRESSEDRETURN.get_mut() }
+}
+
+/// Sets whether the last Ex command was an empty command line
+/// (`set_pressedreturn`).
+pub fn set_pressedreturn(val: bool) {
+    // SAFETY: momentary write.
+    unsafe { *EX_PRESSEDRETURN.get_mut() = val };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +550,116 @@ mod tests {
     fn modifier_len_two_word_modifier_names() {
         assert_eq!(modifier_len(b"belowright split"), 10);
         assert_eq!(modifier_len(b"rightbelow split"), 10);
+    }
+
+    // --- current_win_nr / current_tab_nr ---
+
+    struct FirstwinGuard {
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl FirstwinGuard {
+        fn set(head: *mut crate::buffer_defs::WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = head;
+            FirstwinGuard { previous }
+        }
+    }
+
+    impl Drop for FirstwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = self.previous;
+        }
+    }
+
+    struct FirstTabpageGuard {
+        previous: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl FirstTabpageGuard {
+        fn set(head: *mut crate::buffer_defs::TabpageT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+            unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = head;
+            FirstTabpageGuard { previous }
+        }
+    }
+
+    impl Drop for FirstTabpageGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = self.previous;
+        }
+    }
+
+    #[test]
+    fn current_win_nr_null_counts_every_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = crate::buffer_defs::WinT::default();
+        let mut second =
+            crate::buffer_defs::WinT { w_next: &mut third as *mut _, ..Default::default() };
+        let mut first =
+            crate::buffer_defs::WinT { w_next: &mut second as *mut _, ..Default::default() };
+        let _guard = FirstwinGuard::set(&mut first as *mut _);
+
+        assert_eq!(unsafe { current_win_nr(std::ptr::null()) }, 3);
+    }
+
+    #[test]
+    fn current_win_nr_zero_for_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = FirstwinGuard::set(std::ptr::null_mut());
+        assert_eq!(unsafe { current_win_nr(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn current_win_nr_stops_at_the_matching_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = crate::buffer_defs::WinT::default();
+        let mut second =
+            crate::buffer_defs::WinT { w_next: &mut third as *mut _, ..Default::default() };
+        let mut first =
+            crate::buffer_defs::WinT { w_next: &mut second as *mut _, ..Default::default() };
+        let _guard = FirstwinGuard::set(&mut first as *mut _);
+
+        assert_eq!(unsafe { current_win_nr(&first as *const _) }, 1);
+        assert_eq!(unsafe { current_win_nr(&second as *const _) }, 2);
+        assert_eq!(unsafe { current_win_nr(&third as *const _) }, 3);
+    }
+
+    #[test]
+    fn current_tab_nr_null_counts_every_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = crate::buffer_defs::TabpageT::default();
+        let mut second =
+            crate::buffer_defs::TabpageT { tp_next: &mut third as *mut _, ..Default::default() };
+        let mut first =
+            crate::buffer_defs::TabpageT { tp_next: &mut second as *mut _, ..Default::default() };
+        let _guard = FirstTabpageGuard::set(&mut first as *mut _);
+
+        assert_eq!(unsafe { current_tab_nr(std::ptr::null()) }, 3);
+    }
+
+    #[test]
+    fn current_tab_nr_stops_at_the_matching_tabpage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = crate::buffer_defs::TabpageT::default();
+        let mut first =
+            crate::buffer_defs::TabpageT { tp_next: &mut second as *mut _, ..Default::default() };
+        let _guard = FirstTabpageGuard::set(&mut first as *mut _);
+
+        assert_eq!(unsafe { current_tab_nr(&first as *const _) }, 1);
+        assert_eq!(unsafe { current_tab_nr(&second as *const _) }, 2);
+    }
+
+    // --- get_pressedreturn / set_pressedreturn ---
+
+    #[test]
+    fn pressedreturn_starts_false_and_round_trips() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_pressedreturn(false);
+        assert!(!get_pressedreturn());
+        set_pressedreturn(true);
+        assert!(get_pressedreturn());
+        set_pressedreturn(false);
+        assert!(!get_pressedreturn());
     }
 }
