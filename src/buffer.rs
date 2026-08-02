@@ -17,7 +17,8 @@
 //! already established by `window.rs`'s own `win_find_by_handle`),
 //! the `'buftype'`-testing predicate
 //! family `bt_prompt`/`bt_cmdwin`/`bt_help`/`bt_normal`/`bt_quickfix`/
-//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_dontwrite`/
+//! `bt_terminal`/`bt_nofilename`/`bt_nofile`/`bt_nofileread`/
+//! `bt_dontwrite`/
 //! `bt_dontwrite_msg` (the latter's real `emsg()` display omitted,
 //! matching the established "skip the deferred-subsystem side effect,
 //! keep the state/return value correct" policy), `buf_hide`,
@@ -299,6 +300,18 @@ pub fn bt_nofilename(buf: Option<&BufT>) -> bool {
 #[must_use]
 pub fn bt_nofile(buf: Option<&BufT>) -> bool {
     buf.is_some_and(|b| opt_byte(&b.b_p_bt, 0) == b'n' && opt_byte(&b.b_p_bt, 2) == b'f')
+}
+
+/// `true` if `buf` has `'buftype'` set to "nofile", "terminal",
+/// "quickfix", or "prompt" - i.e. a special buffer with no real
+/// backing file to read (`bt_nofileread`).
+#[must_use]
+pub fn bt_nofileread(buf: Option<&BufT>) -> bool {
+    bt_nofile(buf)
+        || buf.is_some_and(|b| {
+            let first = opt_byte(&b.b_p_bt, 0);
+            first == b't' || first == b'q' || first == b'p'
+        })
 }
 
 /// `true` if `buf` is "nowrite", "nofile", terminal, or prompt - i.e.
@@ -773,6 +786,17 @@ mod tests {
     fn bt_nofile_checks_no_and_f_bytes() {
         assert!(bt_nofile(Some(&buf_with_bt("nofile"))));
         assert!(!bt_nofile(Some(&buf_with_bt("nowrite"))));
+    }
+
+    #[test]
+    fn bt_nofileread_covers_nofile_terminal_quickfix_prompt() {
+        assert!(bt_nofileread(Some(&buf_with_bt("nofile"))));
+        assert!(bt_nofileread(Some(&buf_with_bt("terminal"))));
+        assert!(bt_nofileread(Some(&buf_with_bt("quickfix"))));
+        assert!(bt_nofileread(Some(&buf_with_bt("prompt"))));
+        assert!(!bt_nofileread(Some(&buf_with_bt("help"))));
+        assert!(!bt_nofileread(Some(&buf_with_bt(""))));
+        assert!(!bt_nofileread(None));
     }
 
     #[test]
