@@ -5202,6 +5202,32 @@ pub unsafe fn tv_is_luafunc(tv: &TypvalT) -> bool {
         unsafe { is_luafunc(p) })
 }
 
+/// Returns the index one past the last valid `v:lua` Lua-function-name
+/// character (alphanumeric, `_`, `-`, `.`, or `'`) starting at `p`
+/// (`skip_luafunc_name`).
+#[must_use]
+pub fn skip_luafunc_name(p: &[u8]) -> usize {
+    let mut i = 0;
+    while i < p.len() && (crate::macros_defs::ascii_isalnum(i32::from(p[i])) || matches!(p[i], b'_' | b'-' | b'.' | b'\'')) {
+        i += 1;
+    }
+    i
+}
+
+/// Check the function name after `v:lua.`: returns the length of the
+/// valid name portion of `str`, or `0` if it isn't immediately
+/// followed by `(` (when `paren` is `true`) or the end of `str` (when
+/// `paren` is `false`) (`check_luafunc_name`).
+#[must_use]
+pub fn check_luafunc_name(str: &[u8], paren: bool) -> usize {
+    let p = skip_luafunc_name(str);
+    let next_is_valid_end = if paren { str.get(p) == Some(&b'(') } else { p == str.len() };
+    if !next_is_valid_end {
+        return 0;
+    }
+    p
+}
+
 /// Get an lvalue: a variable (`"name"`), dict item (`"dict.key"`,
 /// `"dict['key']"`), list item (`"list[expr]"`), or list slice
 /// (`"list[expr:expr]"`) (`get_lval`).
@@ -10866,6 +10892,48 @@ mod tests {
         // per this function's own doc comment) - this only checks the
         // call itself doesn't panic/mutate anything observable.
         assert_eq!(lv.ll_newkey, Some(b"x".to_vec()));
+    }
+
+    // --- skip_luafunc_name / check_luafunc_name ---
+
+    #[test]
+    fn skip_luafunc_name_consumes_the_whole_dotted_name() {
+        assert_eq!(skip_luafunc_name(b"foo.bar"), 7);
+    }
+
+    #[test]
+    fn skip_luafunc_name_stops_at_an_invalid_character() {
+        assert_eq!(skip_luafunc_name(b"foo("), 3);
+        assert_eq!(skip_luafunc_name(b"foo bar"), 3);
+    }
+
+    #[test]
+    fn skip_luafunc_name_accepts_underscore_dash_and_quote() {
+        assert_eq!(skip_luafunc_name(b"a_b-c'd"), 7);
+    }
+
+    #[test]
+    fn skip_luafunc_name_empty_is_zero() {
+        assert_eq!(skip_luafunc_name(b""), 0);
+    }
+
+    #[test]
+    fn check_luafunc_name_without_paren_requires_the_whole_string_to_be_consumed() {
+        assert_eq!(check_luafunc_name(b"foo.bar", false), 7);
+        assert_eq!(check_luafunc_name(b"foo bar", false), 0);
+    }
+
+    #[test]
+    fn check_luafunc_name_with_paren_requires_a_trailing_open_paren() {
+        assert_eq!(check_luafunc_name(b"foo.bar(", true), 7);
+        // No trailing '(' at all - the whole string is consumed by
+        // skip_luafunc_name, so there's nothing left to be '(' - fails.
+        assert_eq!(check_luafunc_name(b"foo.bar", true), 0);
+    }
+
+    #[test]
+    fn check_luafunc_name_empty_string_is_a_valid_zero_length_name() {
+        assert_eq!(check_luafunc_name(b"", false), 0);
     }
 
     #[test]
