@@ -126,6 +126,19 @@
 //!   (`msg_start`/`msg_puts_hl`/`msg_putchar`/`msg_end`/`msg`,
 //!   `message.c`, not tractable) - `exarg_T` existing isn't enough to
 //!   unblock this one, unlike its sibling `ex_undojoin` above.
+//!
+//! `u_free_uhp` (frees a whole `u_header_T`'s own entries then itself)
+//! needs NO separate Rust equivalent: `u_freeentries`'s own
+//! `drop(Box::from_raw(uhp))` step already does the identical work
+//! (dropping `uh_entries`/`uh_extmark` automatically, then `uhp`
+//! itself), matching the established `ctx_free`/`optval_free`
+//! precedent for a C cleanup function whose whole job Rust's own
+//! ownership model already does for free. `u_free_uhp`'s own real
+//! callers are all inside `unserialize_uhp`/`u_read_undo` (the
+//! undo-FILE deserialization machinery, still genuinely blocked) - a
+//! future translation of that code can reuse the exact same
+//! `drop(Box::from_raw(...))` pattern directly, with no new function
+//! needed.
 
 
 use crate::buffer_defs::BufT;
