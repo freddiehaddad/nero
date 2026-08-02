@@ -39,7 +39,11 @@
 //! hand-traced expected offsets were cross-checked against those real
 //! values before being written into the permanent test suite - all
 //! passed on the first real run, confirming both the translation and
-//! the by-hand trace of the algorithm were correct.
+//! the by-hand trace of the algorithm were correct. Also
+//! [`mb_off_next`] - the offset from an arbitrary byte position to the
+//! start of the NEXT character, a thin wrapper reusing
+//! [`utf_head_off`]/[`utfc_ptr2len`] directly, needed by `drawline.c`/
+//! `ex_getln.c` (neither translated yet).
 //!
 //! `utf_ptr2char_info_impl` deliberately deviates from [`utf_ptr2char`]'s
 //! `wrapping_*`-arithmetic pattern only in *how little* it needs to
@@ -1483,6 +1487,26 @@ pub unsafe fn utf_head_off(base: &[u8], p_idx: usize) -> i32 {
     0
 }
 
+/// Return the offset from `p_idx` to the first byte of a character.
+/// When `p_idx` is at the start of a character `0` is returned,
+/// otherwise the offset to the next character (`mb_off_next`). Can
+/// start anywhere in a stream of bytes.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via [`utf_head_off`]/
+/// [`utfc_ptr2len`]).
+#[must_use]
+pub unsafe fn mb_off_next(base: &[u8], p_idx: usize) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let head_off = unsafe { utf_head_off(base, p_idx) };
+    if head_off == 0 {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { utfc_ptr2len(&base[p_idx - head_off as usize..]) };
+    len - head_off
+}
+
 /// Get the character at the start of `s` plus the byte length to
 /// advance past it - composing characters are SKIPPED (folded into
 /// the base character's own advance), matching the original's
@@ -2549,6 +2573,55 @@ mod tests {
         // ("p must be part of an illegal sequence").
         let base = [0x80u8, 0x00];
         assert_eq!(unsafe { utf_head_off(&base, 0) }, 0);
+    }
+
+    // --- mb_off_next ---
+
+    #[test]
+    fn mb_off_next_zero_for_ascii() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_off_next(b"hello", 2) }, 0);
+    }
+
+    #[test]
+    fn mb_off_next_zero_already_at_a_lead_byte() {
+        let _guard = option_vars_test_lock();
+        // "日" (U+65E5) = [0xE6, 0x97, 0xA5], a lone 3-byte character -
+        // same fixture as utf_head_off's own already-verified tests.
+        let base = "日\0".as_bytes();
+        assert_eq!(unsafe { mb_off_next(base, 0) }, 0);
+    }
+
+    #[test]
+    fn mb_off_next_from_continuation_bytes_of_a_lone_char() {
+        let _guard = option_vars_test_lock();
+        // utf_head_off(base, 1) == 1, utf_head_off(base, 2) == 2
+        // (already verified above); utfc_ptr2len(&base[0..]) == 3 (a
+        // lone character, nothing composes with it).
+        let base = "日\0".as_bytes();
+        assert_eq!(unsafe { mb_off_next(base, 1) }, 2); // 3 - 1
+        assert_eq!(unsafe { mb_off_next(base, 2) }, 1); // 3 - 2
+    }
+
+    #[test]
+    fn mb_off_next_walks_through_a_combining_mark() {
+        let _guard = option_vars_test_lock();
+        // 'e' + COMBINING ACUTE ACCENT (2 bytes) + NUL - same fixture
+        // as utf_head_off's own already-verified combining-mark test;
+        // utfc_ptr2len(&base[0..]) == 3 (the whole composed cluster).
+        let base = [0x65u8, 0xCC, 0x81, 0x00];
+        assert_eq!(unsafe { mb_off_next(&base, 1) }, 2); // 3 - 1
+        assert_eq!(unsafe { mb_off_next(&base, 2) }, 1); // 3 - 2
+    }
+
+    #[test]
+    fn mb_off_next_illegal_lone_continuation_byte_is_zero() {
+        let _guard = option_vars_test_lock();
+        // Same fixture as utf_head_off's own "illegal" test - head_off
+        // is 0, so mb_off_next short-circuits before ever calling
+        // utfc_ptr2len.
+        let base = [0x80u8, 0x00];
+        assert_eq!(unsafe { mb_off_next(&base, 0) }, 0);
     }
 
     #[test]
