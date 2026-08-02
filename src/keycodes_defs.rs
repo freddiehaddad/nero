@@ -1,5 +1,6 @@
 //! Translated from `src/nvim/keycodes.h` (partial: only the constants
-//! needed by `keycodes.rs`'s own translated functions so far).
+//! needed by `keycodes.rs`'s/`input.rs`'s own translated functions so
+//! far).
 //!
 //! Neovim represents "special" keys (function keys, arrow keys, etc,
 //! anything that doesn't fit in a single byte) as a 3-byte in-band
@@ -10,7 +11,12 @@
 //! kept exactly (not reinterpreted as some more "idiomatic" Rust enum),
 //! since downstream code (`simplify_key`, not yet translated,
 //! `getchar.c`'s input pipeline, also not yet translated) manipulates
-//! these codes arithmetically, not just symbolically.
+//! these codes arithmetically, not just symbolically. [`is_special`]/
+//! [`k_second`]/[`k_third`] (`IS_SPECIAL`/`K_SECOND`/`K_THIRD`) build on
+//! [`key2termcap0`]/[`key2termcap1`] to also handle the 2 real
+//! characters (`K_SPECIAL` itself, and a literal NUL byte) that need
+//! the SAME 3-byte escaping treatment as a genuine special key code,
+//! for `input.rs`'s `add_byte_buff`.
 
 /// Marks the start of a "special" (multi-byte-encoded) key sequence in
 /// the low-level input byte stream (`K_SPECIAL`).
@@ -36,6 +42,54 @@ pub const fn key2termcap0(x: i32) -> u8 {
 #[must_use]
 pub const fn key2termcap1(x: i32) -> u8 {
     (((-x) as u32 >> 8) & 0xff) as u8
+}
+
+/// Whether `c` is a "special" key code, i.e. one produced by
+/// [`termcap2key`] rather than a plain byte/character value
+/// (`IS_SPECIAL`).
+#[must_use]
+pub const fn is_special(c: i32) -> bool {
+    c < 0
+}
+
+/// First termcap byte meaning "this is `K_SPECIAL` itself, escaped so
+/// it isn't mistaken for the start of a special-key sequence"
+/// (`KS_SPECIAL`).
+pub const KS_SPECIAL: u8 = 254;
+
+/// First termcap byte meaning "this is a literal NUL byte, escaped the
+/// same way since a real NUL can't be stored in a NUL-terminated C
+/// string" (`KS_ZERO`).
+pub const KS_ZERO: u8 = 255;
+
+/// Filler second byte used after [`KS_SPECIAL`]/[`KS_ZERO`] (which
+/// don't need a second real termcap byte) - `'X'` (`KE_FILLER`).
+pub const KE_FILLER: u8 = b'X';
+
+/// Second byte of the 3-byte `K_SPECIAL` escape sequence for character
+/// or special key code `c` (`K_SECOND(c)`). See [`k_third`] for the
+/// third byte.
+#[must_use]
+pub const fn k_second(c: i32) -> u8 {
+    if c == K_SPECIAL as i32 {
+        KS_SPECIAL
+    } else if c == 0 {
+        KS_ZERO
+    } else {
+        key2termcap0(c)
+    }
+}
+
+/// Third byte of the 3-byte `K_SPECIAL` escape sequence for character
+/// or special key code `c` (`K_THIRD(c)`). See [`k_second`] for the
+/// second byte.
+#[must_use]
+pub const fn k_third(c: i32) -> u8 {
+    if c == K_SPECIAL as i32 || c == 0 {
+        KE_FILLER
+    } else {
+        key2termcap1(c)
+    }
 }
 
 /// First termcap byte meaning "this is one of the `KE_*` pseudo-keys
@@ -312,6 +366,40 @@ mod tests {
     fn termcap2key_is_always_negative_for_nonzero_input() {
         assert!(termcap2key(b'k', b'u') < 0);
         assert!(termcap2key(KS_EXTRA, KE_XUP) < 0);
+    }
+
+    #[test]
+    fn is_special_true_for_negative_key_codes() {
+        assert!(is_special(K_UP));
+        assert!(is_special(-1));
+        assert!(!is_special(0));
+        assert!(!is_special(b'a' as i32));
+    }
+
+    #[test]
+    fn k_second_k_third_of_k_special_itself() {
+        // c == K_SPECIAL is escaped via KS_SPECIAL/KE_FILLER, not the
+        // generic key2termcap0/1 bit-math path.
+        let c = i32::from(K_SPECIAL);
+        assert_eq!(k_second(c), KS_SPECIAL);
+        assert_eq!(k_third(c), KE_FILLER);
+    }
+
+    #[test]
+    fn k_second_k_third_of_a_literal_nul() {
+        assert_eq!(k_second(0), KS_ZERO);
+        assert_eq!(k_third(0), KE_FILLER);
+    }
+
+    #[test]
+    fn k_second_k_third_of_a_real_special_key_matches_key2termcap() {
+        // Any other (real, negative) special key falls through to the
+        // plain key2termcap0/1 bit-math, exactly like K_SECOND/K_THIRD
+        // do for the non-K_SPECIAL/non-NUL case.
+        assert_eq!(k_second(K_UP), key2termcap0(K_UP));
+        assert_eq!(k_third(K_UP), key2termcap1(K_UP));
+        assert_eq!(k_second(K_UP), b'k');
+        assert_eq!(k_third(K_UP), b'u');
     }
 
     #[test]
