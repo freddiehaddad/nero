@@ -24,6 +24,17 @@
 //! hand-traced observation about its apparent "compaction" never
 //! actually shifting anything.
 //!
+//! Also translated: [`alist_new`] - allocates a fresh, empty argument
+//! list and installs it as the current window's own `w_alist`, needing
+//! only already-real `crate::globals::GLOBALS.curwin`/`max_alist_id`
+//! and this file's own `alist_init`. Translated ahead of its own real
+//! caller (`ex_args`'s `":arglocal"` handling, `exarg_T`-based Ex-
+//! command dispatch, not translated) - faithfully does NOT release
+//! any previous `w_alist` value itself, matching the original exactly
+//! (verified via `ex_args`'s own real body: it always calls
+//! `alist_unlink` on the old value itself, first, before ever calling
+//! this function).
+//!
 //! `al_ga` is stored (see `arglist_defs.rs`) as a byte-erased `GarrayT`,
 //! matching the original's own generic growarray machinery, with no
 //! typed accessor yet for reading/writing real `AentryT` bytes through
@@ -36,10 +47,10 @@
 //! do for any `al_ga` this crate can actually construct today - calling
 //! `ga_clear` alone is behaviorally equivalent.
 //!
-//! Deferred: everything else - `get_arglist`/`alist_new`/`alist_expand`/
-//! `alist_add`/`alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/
-//! `ex_args`/`ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing
-//! real buffer/window/path-expansion machinery.
+//! Deferred: everything else - `get_arglist`/`alist_expand`/`alist_add`/
+//! `alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/`ex_args`/
+//! `ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing real
+//! buffer/window/path-expansion machinery.
 
 use crate::arglist_defs::{AentryT, AlistT};
 use crate::globals::GlobalCell;
@@ -119,6 +130,33 @@ pub unsafe fn alist_unlink(al: *mut AlistT) {
         // this function's own safety doc it must have been allocated via
         // `Box::into_raw`.
         drop(unsafe { Box::from_raw(al) });
+    }
+}
+
+/// Creates a new argument list and uses it for the current window
+/// (`alist_new`). The original's own `xmalloc`-then-assign, with no
+/// prior release of `curwin->w_alist` - callers are responsible for
+/// that themselves first (matching `ex_args`'s own real call site,
+/// which always calls `alist_unlink` on the previous value before
+/// this function), so this function faithfully does the same: it
+/// never touches the previous `w_alist` pointer at all.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live [`crate::buffer_defs::WinT`].
+pub unsafe fn alist_new() {
+    let mut al = Box::new(AlistT { al_refcount: 1, ..AlistT::default() });
+    // SAFETY: a plain field increment through one exclusive borrow.
+    let new_id = {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.max_alist_id += 1;
+        g.max_alist_id
+    };
+    al.id = new_id;
+    alist_init(&mut al);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*crate::globals::GLOBALS.get_mut().curwin).w_alist = Box::into_raw(al);
     }
 }
 
@@ -288,6 +326,71 @@ mod tests {
         let al_ptr = &mut al as *mut AlistT;
         unsafe { alist_unlink(al_ptr) };
         assert_eq!(al.al_refcount, 1);
+    }
+
+    #[test]
+    fn alist_new_creates_a_fresh_empty_refcounted_arglist_for_curwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = g.curwin;
+        g.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        unsafe { alist_new() };
+
+        // Read the result back through `GLOBALS.curwin`'s OWN stored
+        // pointer, never by touching `win` directly again - a direct
+        // `win.w_alist` read here would freeze the pointer stored in
+        // `GLOBALS.curwin` (a real Tree Borrows violation, confirmed
+        // via `cargo miri test`: a later write through that same
+        // stored pointer - e.g. from a second `alist_new()` call -
+        // would then fail). Matches this crate's established "always
+        // derive via the already-stored global pointer, never
+        // independently from the local a second time" discipline.
+        let al_ptr = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_alist };
+        assert!(!al_ptr.is_null());
+        // SAFETY: `alist_new` just installed a real, `Box`-allocated
+        // `AlistT` here.
+        let al = unsafe { &*al_ptr };
+        assert_eq!(al.al_refcount, 1);
+        assert!(al.al_ga.is_empty());
+        assert_eq!(al.al_ga.ga_itemsize, std::mem::size_of::<AentryT>() as i32);
+        assert!(al.id > 0);
+
+        // Clean up: free the allocated `AlistT` (this test's own
+        // responsibility, matching `alist_unlink`'s "must have been
+        // `Box::into_raw`-allocated" contract) and restore `curwin`.
+        drop(unsafe { Box::from_raw(al_ptr) });
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn alist_new_assigns_a_fresh_monotonically_increasing_id_each_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curwin = g.curwin;
+        g.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        unsafe { alist_new() };
+        // Always read through `GLOBALS.curwin`'s own stored pointer
+        // (never `win.w_alist` directly) - see the sibling test above
+        // for why a direct field read here would freeze the stored
+        // pointer and break the SECOND `alist_new()` call's own
+        // internal write below (confirmed via a real `cargo miri
+        // test` failure before this fix).
+        let first_al_ptr = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_alist };
+        let first_id = unsafe { (*first_al_ptr).id };
+
+        unsafe { alist_new() };
+        let second_al_ptr = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_alist };
+        let second_id = unsafe { (*second_al_ptr).id };
+
+        assert!(second_id > first_id);
+
+        drop(unsafe { Box::from_raw(first_al_ptr) });
+        drop(unsafe { Box::from_raw(second_al_ptr) });
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
     }
 
     #[test]
