@@ -48,9 +48,19 @@
 //! Translated ahead of its own real callers (`spellfile.c`'s spell-file
 //! naming, needing `vim_snprintf`/file-templating, not translated).
 //!
+//! Also translated: [`nofold_len`] (case-folding may change byte
+//! length; given `N` characters in a case-folded word's own byte-length
+//! prefix, find the equivalent byte length of the same `N` characters
+//! in the original, un-folded word) - a genuinely safe `fn` (unlike
+//! this file's other `unsafe fn`s), since `crate::mbyte::utfc_ptr2len`
+//! never reads out of bounds for any byte content.
+//!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
-//! `spell_casefold`/`check_need_cap`/`expand_spelling`, all needing
+//! `spell_casefold`/`check_need_cap`/`expand_spelling`/`onecap_copy`/
+//! `allcap_copy`/`make_case_word` (the last 3 need `MAXWLEN`-bounded
+//! fixed-buffer semantics not yet designed here - a candidate for a
+//! future pass, not rushed alongside `nofold_len`), all needing
 //! `slang_T`'s own spell-file-loaded state or the buffer/window
 //! spell-option plumbing.
 
@@ -325,6 +335,47 @@ pub fn spell_enc() -> Vec<u8> {
     } else {
         b"latin1".to_vec()
     }
+}
+
+/// Case-folding may change the number of bytes: count the number of
+/// characters in `fword[..flen]` and return the byte length of that
+/// many characters in `word` (`nofold_len`).
+///
+/// Deviates from the original's raw pointer-difference return (always
+/// non-negative here, since `word` is only ever walked forward from
+/// its own start) by returning a `usize` byte offset directly, matching
+/// this crate's established "index instead of pointer" convention.
+///
+/// This is a genuinely safe `fn` (unlike its sibling `unsafe fn`s in
+/// this file): `crate::mbyte::utfc_ptr2len` itself never reads out of
+/// bounds for ANY byte content (it bounds its own scan to the slice's
+/// own length, verified directly in its own implementation), so no
+/// caller-side safety precondition is needed here, matching
+/// `crate::spellfile::valid_spell_word`'s own established precedent
+/// for this exact situation.
+#[must_use]
+pub fn nofold_len(fword: &[u8], flen: usize, word: &[u8]) -> usize {
+    let mut n = 0usize;
+    let mut p = 0usize;
+    while p < flen {
+        // SAFETY: `utfc_ptr2len` never reads out of bounds for any
+        // byte content - see this function's own doc comment.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&fword[p..]) }).unwrap_or(0);
+        // .min(...) is a defensive net against a caller-supplied
+        // `flen` exceeding `fword.len()` (a contract violation the
+        // original C also implicitly assumes never happens) - never
+        // changes behavior for well-formed input.
+        p += adv.max(1).min(fword.len().saturating_sub(p));
+        n += 1;
+    }
+    let mut q = 0usize;
+    while n > 0 {
+        // SAFETY: forwarded from this function's own doc comment.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&word[q..]) }).unwrap_or(0);
+        q += adv.max(1).min(word.len().saturating_sub(q));
+        n -= 1;
+    }
+    q
 }
 
 /// Whether byte value `n` appears anywhere in `s` (`byte_in_str`).
@@ -705,6 +756,41 @@ mod tests {
         let result = spell_enc();
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
         assert_eq!(result, enc);
+    }
+
+    // --- nofold_len ---
+
+    #[test]
+    fn nofold_len_all_ascii_matches_byte_for_byte() {
+        // "abc" folded to "abc" (no change): 3 chars in fword[0..3]
+        // maps to byte offset 3 in word.
+        assert_eq!(nofold_len(b"abc", 3, b"ABC"), 3);
+    }
+
+    #[test]
+    fn nofold_len_zero_flen_is_zero_chars_is_zero_bytes() {
+        assert_eq!(nofold_len(b"abc", 0, b"ABC"), 0);
+    }
+
+    #[test]
+    fn nofold_len_multibyte_word_folds_to_fewer_bytes() {
+        // word = "日bc" (3 chars: U+65E5 is 3 bytes, 'b'/'c' 1 byte
+        // each = 5 bytes total). Artificially treat it as if it folds
+        // to fword = "xbc" (3 chars, 3 bytes - a single ASCII stand-in
+        // for whatever U+65E5 folds to, independent of real Unicode
+        // folding rules, to isolate the char-count-vs-byte-length
+        // algorithm itself). flen=2 selects "xb" (2 chars) from fword;
+        // the same 2 characters in word are "日b" = 3+1 = 4 bytes.
+        let word = "日bc".as_bytes();
+        assert_eq!(nofold_len(b"xbc", 2, word), 4);
+    }
+
+    #[test]
+    fn nofold_len_entire_fword_consumed() {
+        // flen covers the whole 3-char fword; word's own first 3
+        // chars are "日bc" in full (3+1+1 = 5 bytes).
+        let word = "日bc".as_bytes();
+        assert_eq!(nofold_len(b"xbc", 3, word), word.len());
     }
 
     // --- valid_spelllang ---
