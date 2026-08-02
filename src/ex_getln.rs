@@ -38,6 +38,12 @@
 //! always `0` today, since nothing in this crate can start a real
 //! `'inccommand'` command preview yet (`cmdpreview_open_buf`, their
 //! only real writer, is not translated).
+//!
+//! Also translated: [`is_in_cmdwin`] - whether the current buffer is
+//! the special `cmdwin` scratch buffer with no other command line
+//! simultaneously active; its own second real condition always holds
+//! today (see its own doc comment), so it simplifies to
+//! `buffer::bt_cmdwin(curbuf)`.
 
 /// What [`vim_strsave_fnameescape`] is escaping for (`VSE_NONE`/
 /// `VSE_SHELL`/`VSE_BUFFER`, `ex_getln.h`).
@@ -347,6 +353,29 @@ pub fn cmdpreview_get_ns() -> i32 {
     unsafe { *CMDPREVIEW_NS.get_mut() }
 }
 
+/// Whether the current buffer is the special `cmdwin` scratch buffer
+/// AND no other command line is simultaneously active
+/// (`is_in_cmdwin`).
+///
+/// The original's own second condition, `get_cmdline_type() == NUL`,
+/// is always true today: `get_cmdline_type()`'s own real early return
+/// (`get_ccline_ptr() == NULL`) is always taken, exactly matching
+/// `cmdline_is_active`'s own established "always false" reasoning
+/// in this same file (both ultimately check the same `MODE_CMDLINE`
+/// bit) - so this simplifies to just `bt_cmdwin(curbuf)`, not a
+/// hardcoded shortcut.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.curbuf` - forwarded from
+/// `crate::buffer::bt_cmdwin`'s own safety doc.
+#[must_use]
+pub unsafe fn is_in_cmdwin() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::buffer::bt_cmdwin(Some(curbuf)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +476,40 @@ mod tests {
     fn cmdpreview_get_ns_is_zero_by_default() {
         let _guard = crate::globals::global_state_test_lock();
         assert_eq!(cmdpreview_get_ns(), 0);
+    }
+
+    #[test]
+    fn is_in_cmdwin_true_when_curbuf_is_the_cmdwin_buf() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        let prev_cmdwin_buf = globals.cmdwin_buf;
+        globals.curbuf = &mut buf as *mut _;
+        globals.cmdwin_buf = &mut buf as *mut _;
+
+        assert!(unsafe { is_in_cmdwin() });
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_curbuf;
+        globals.cmdwin_buf = prev_cmdwin_buf;
+    }
+
+    #[test]
+    fn is_in_cmdwin_false_when_curbuf_is_not_the_cmdwin_buf() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = globals.curbuf;
+        let prev_cmdwin_buf = globals.cmdwin_buf;
+        globals.curbuf = &mut buf as *mut _;
+        globals.cmdwin_buf = std::ptr::null_mut();
+
+        assert!(!unsafe { is_in_cmdwin() });
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_curbuf;
+        globals.cmdwin_buf = prev_cmdwin_buf;
     }
 
     #[test]
