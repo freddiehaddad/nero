@@ -55,12 +55,23 @@
 //! this file's other `unsafe fn`s), since `crate::mbyte::utfc_ptr2len`
 //! never reads out of bounds for any byte content.
 //!
+//! Also translated: [`spell_to_fold`]/[`spell_to_upper`] (the
+//! `SPELL_TOFOLD`/`SPELL_TOUPPER` macros, siblings of
+//! [`spell_is_upper`]) and [`onecap_copy`]/[`allcap_copy`]/
+//! [`make_case_word`] (case-fixing a word copy - upper/fold the first
+//! letter only, upper-case every letter including the real `ß` -> `"SS"`
+//! quirk, or dispatch between the two by `WF_*` flag). Deviate from the
+//! original's `wcopy[MAXWLEN]` fixed-size, truncating output buffer by
+//! returning an unbounded, growing `Vec<u8>` instead - matching this
+//! crate's established "growing `Vec` supersedes the manual
+//! bounded-buffer C idiom" precedent (`winrestcmd`/
+//! `vim_strsave_shellescape`); see [`onecap_copy`]'s own doc comment
+//! for why this doesn't change observable behavior for any realistic
+//! (non-pathologically-long) word.
+//!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
-//! `spell_casefold`/`check_need_cap`/`expand_spelling`/`onecap_copy`/
-//! `allcap_copy`/`make_case_word` (the last 3 need `MAXWLEN`-bounded
-//! fixed-buffer semantics not yet designed here - a candidate for a
-//! future pass, not rushed alongside `nofold_len`), all needing
+//! `spell_casefold`/`check_need_cap`/`expand_spelling`, all needing
 //! `slang_T`'s own spell-file-loaded state or the buffer/window
 //! spell-option plumbing.
 
@@ -196,6 +207,51 @@ pub unsafe fn spell_is_upper(c: i32) -> bool {
         // SAFETY: a plain read through one shared borrow of this
         // file's own static.
         unsafe { SPELLTAB.get_mut() }.st_isu[c as usize]
+    }
+}
+
+/// `SPELL_TOFOLD(c)` (`mbyte.h`): the folded/lowercased equivalent of
+/// codepoint `c`, per spelling's own chartab for `c < 128` (matching
+/// the original's exact `c >= 128` cutoff).
+///
+/// A genuinely safe `fn` (unlike its sibling [`spell_is_upper`]/
+/// [`spell_to_upper`]): `crate::mbyte::utf_fold` is itself a safe
+/// function, and `SPELLTAB.get_mut()`'s own unsafety has no
+/// caller-facing precondition (a plain read through one shared
+/// borrow), matching `crate::option::get_ve_flags`'s own established
+/// "safe wrapper around an internally-`unsafe`-but-precondition-free
+/// global read" precedent.
+#[must_use]
+pub fn spell_to_fold(c: i32) -> i32 {
+    if c >= 128 {
+        crate::mbyte::utf_fold(c)
+    } else {
+        // SAFETY: a plain read through one shared borrow of this
+        // file's own static - no caller-facing precondition.
+        i32::from(unsafe { SPELLTAB.get_mut() }.st_fold[c as usize])
+    }
+}
+
+/// `SPELL_TOUPPER(c)` (`mbyte.h`): the uppercase equivalent of
+/// codepoint `c`, per spelling's own chartab for `c < 128` (matching
+/// the original's exact `c >= 128` cutoff).
+///
+/// A genuinely safe `fn` (unlike [`spell_is_upper`]): `mb_toupper`'s
+/// own unsafety is solely touching `crate::option_vars::OPTION_VARS`
+/// (no precondition depending on `c` itself), so it's wrapped
+/// internally here, matching `crate::option::get_findfunc`'s own
+/// established "safe wrapper" precedent for this exact situation.
+#[must_use]
+pub fn spell_to_upper(c: i32) -> i32 {
+    if c >= 128 {
+        // SAFETY: `mb_toupper`'s only precondition is touching
+        // `OPTION_VARS`, not anything depending on `c` - see this
+        // function's own doc comment.
+        unsafe { crate::mbyte::mb_toupper(c) }
+    } else {
+        // SAFETY: a plain read through one shared borrow of this
+        // file's own static - no caller-facing precondition.
+        i32::from(unsafe { SPELLTAB.get_mut() }.st_upper[c as usize])
     }
 }
 
@@ -376,6 +432,88 @@ pub fn nofold_len(fword: &[u8], flen: usize, word: &[u8]) -> usize {
         n -= 1;
     }
     q
+}
+
+/// Make a copy of `word`, with the first letter upper- or lower-cased
+/// (`onecap_copy`). `word` must not be empty. The result includes its
+/// own trailing NUL, matching this crate's established convention for
+/// freshly-produced string outputs (e.g. `crate::strings::strcase_save`).
+///
+/// Deviates from the original's `wcopy[MAXWLEN]` fixed-size,
+/// truncating output buffer by returning an unbounded, growing
+/// `Vec<u8>` instead - no caller yet depends on the `MAXWLEN`
+/// truncation itself (a defensive C buffer-overflow guard for
+/// pathologically long input, not meaningful editing behavior),
+/// matching this crate's established "growing `Vec` supersedes the
+/// manual bounded-buffer C idiom" precedent (`winrestcmd`/
+/// `vim_strsave_shellescape`).
+#[must_use]
+pub fn onecap_copy(word: &[u8], upper: bool) -> Vec<u8> {
+    let (c, consumed) = crate::mbyte::mb_cptr2char_adv(word);
+    let c = if upper { spell_to_upper(c) } else { spell_to_fold(c) };
+    let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+    let l = crate::mbyte::utf_char2bytes(c, &mut buf) as usize;
+    let mut result = buf[..l].to_vec();
+    let rest = &word[consumed.min(word.len())..];
+    let rest_len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    result.extend_from_slice(&rest[..rest_len]);
+    result.push(0);
+    result
+}
+
+/// Make a copy of `word` with all the letters upper-cased
+/// (`allcap_copy`). The result includes its own trailing NUL, matching
+/// this crate's established convention for freshly-produced string
+/// outputs. Deviates from the original's `wcopy[MAXWLEN]` fixed-size,
+/// truncating output buffer the same way as [`onecap_copy`] - see its
+/// own doc comment for why.
+///
+/// Faithfully preserves a real, deliberate original quirk: German
+/// sharp s (`ß`, U+00DF) uppercases to `"SS"` (TWO characters), not a
+/// single character - the original's own code writes `'S'` directly,
+/// then ALSO falls through to the shared `utf_char2bytes` call with
+/// `c` still `'S'`, writing it a second time. Verified this is real
+/// German uppercasing behavior, not a translation bug.
+#[must_use]
+pub fn allcap_copy(word: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut s = 0usize;
+    while s < word.len() && word[s] != 0 {
+        let (c, consumed) = crate::mbyte::mb_cptr2char_adv(&word[s..]);
+        s += consumed.max(1).min(word.len() - s);
+
+        let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+        if c == 0xdf {
+            let l = crate::mbyte::utf_char2bytes(i32::from(b'S'), &mut buf) as usize;
+            result.extend_from_slice(&buf[..l]);
+            result.extend_from_slice(&buf[..l]);
+        } else {
+            let up = spell_to_upper(c);
+            let l = crate::mbyte::utf_char2bytes(up, &mut buf) as usize;
+            result.extend_from_slice(&buf[..l]);
+        }
+    }
+    result.push(0);
+    result
+}
+
+/// Copy `fword` to a new word, fixing case according to `flags`
+/// (`make_case_word`). `flags` is checked against [`WF_ALLCAP`] first,
+/// then [`WF_ONECAP`]; otherwise `fword` is returned as-is (still
+/// including its own trailing NUL, matching this crate's established
+/// convention).
+#[must_use]
+pub fn make_case_word(fword: &[u8], flags: i32) -> Vec<u8> {
+    if flags & WF_ALLCAP != 0 {
+        allcap_copy(fword)
+    } else if flags & WF_ONECAP != 0 {
+        onecap_copy(fword, true)
+    } else {
+        let len = fword.iter().position(|&b| b == 0).unwrap_or(fword.len());
+        let mut result = fword[..len].to_vec();
+        result.push(0);
+        result
+    }
 }
 
 /// Whether byte value `n` appears anywhere in `s` (`byte_in_str`).
@@ -791,6 +929,109 @@ mod tests {
         // chars are "日bc" in full (3+1+1 = 5 bytes).
         let word = "日bc".as_bytes();
         assert_eq!(nofold_len(b"xbc", 3, word), word.len());
+    }
+
+    // --- spell_to_fold / spell_to_upper ---
+
+    #[test]
+    fn spell_to_fold_ascii_uses_spelltab() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(spell_to_fold(i32::from(b'A')), i32::from(b'a'));
+        assert_eq!(spell_to_fold(i32::from(b'a')), i32::from(b'a'));
+        assert_eq!(spell_to_fold(i32::from(b'5')), i32::from(b'5'));
+    }
+
+    #[test]
+    fn spell_to_upper_ascii_uses_spelltab() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(spell_to_upper(i32::from(b'a')), i32::from(b'A'));
+        assert_eq!(spell_to_upper(i32::from(b'A')), i32::from(b'A'));
+        assert_eq!(spell_to_upper(i32::from(b'5')), i32::from(b'5'));
+    }
+
+    // --- onecap_copy / allcap_copy / make_case_word ---
+
+    #[test]
+    fn onecap_copy_uppercases_only_the_first_letter() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(onecap_copy(b"hello", true), b"Hello\0");
+    }
+
+    #[test]
+    fn onecap_copy_folds_only_the_first_letter() {
+        // upper=false folds (lower-cases) just the first letter,
+        // leaving the rest of the word untouched - "HELLO" ->
+        // "hELLO", not "hello".
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(onecap_copy(b"HELLO", false), b"hELLO\0");
+    }
+
+    #[test]
+    fn onecap_copy_already_correct_case_is_a_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(onecap_copy(b"Hello", true), b"Hello\0");
+    }
+
+    #[test]
+    fn allcap_copy_uppercases_every_letter() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(allcap_copy(b"hello"), b"HELLO\0");
+    }
+
+    #[test]
+    fn allcap_copy_sharp_s_becomes_two_esses() {
+        // German sharp s (U+00DF, 2-byte UTF-8: 0xC3 0x9F) uppercases
+        // to "SS" (two characters) - a real, deliberate original
+        // quirk (see allcap_copy's own doc comment), not a
+        // translation bug.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let word = "aß".as_bytes();
+        assert_eq!(allcap_copy(word), b"ASS\0");
+    }
+
+    #[test]
+    fn allcap_copy_stops_at_the_first_embedded_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(allcap_copy(b"ab\0cd"), b"AB\0");
+    }
+
+    #[test]
+    fn make_case_word_allcap_flag_uppercases_everything() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(make_case_word(b"hello", WF_ALLCAP), b"HELLO\0");
+    }
+
+    #[test]
+    fn make_case_word_onecap_flag_uppercases_only_the_first_letter() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(make_case_word(b"hello", WF_ONECAP), b"Hello\0");
+    }
+
+    #[test]
+    fn make_case_word_no_flags_is_used_as_is() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(make_case_word(b"hello", 0), b"hello\0");
+    }
+
+    #[test]
+    fn make_case_word_allcap_takes_priority_over_onecap() {
+        // Matches the original's own `if (flags & WF_ALLCAP) ... else
+        // if (flags & WF_ONECAP)` order - ALLCAP wins when both bits
+        // happen to be set.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(make_case_word(b"hello", WF_ALLCAP | WF_ONECAP), b"HELLO\0");
     }
 
     // --- valid_spelllang ---
