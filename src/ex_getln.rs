@@ -31,6 +31,13 @@
 //! for `cmdline_at_end`, `false` for `cmdline_overstrike`), since
 //! nothing in this crate can start real command-line editing yet -
 //! not a hardcoded shortcut.
+//!
+//! Also translated: [`cmdpreview_get_bufnr`]/[`cmdpreview_get_ns`] -
+//! trivial accessors over the original's own file-static
+//! `cmdpreview_bufnr`/`cmdpreview_ns`, modeled the same way. Both
+//! always `0` today, since nothing in this crate can start a real
+//! `'inccommand'` command preview yet (`cmdpreview_open_buf`, their
+//! only real writer, is not translated).
 
 /// What [`vim_strsave_fnameescape`] is escaping for (`VSE_NONE`/
 /// `VSE_SHELL`/`VSE_BUFFER`, `ex_getln.h`).
@@ -306,6 +313,40 @@ pub fn f_wildtrigger(
     unimplemented!("wildtrigger(): needs a real, live command-line-editing state")
 }
 
+/// `cmdpreview_bufnr` - the buffer handle of the current `'inccommand'`
+/// preview buffer, or `0` when no preview is active, read via
+/// [`cmdpreview_get_bufnr`]. Modeled as its own file-static, matching
+/// [`CMDLINE_FIRSTC`]'s own established precedent. Always `0` today,
+/// since nothing in this crate can start a real command preview yet
+/// (`cmdpreview_open_buf`, its only real writer, is not translated).
+static CMDPREVIEW_BUFNR: crate::globals::GlobalCell<crate::api::private::defs::Buffer> =
+    crate::globals::GlobalCell::new(0);
+
+/// Returns the buffer handle of the current `'inccommand'` preview
+/// buffer, or `0` when none is active (`cmdpreview_get_bufnr`). Always
+/// `0` today - see `CMDPREVIEW_BUFNR`'s own doc comment.
+#[must_use]
+pub fn cmdpreview_get_bufnr() -> crate::api::private::defs::Buffer {
+    // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
+    unsafe { *CMDPREVIEW_BUFNR.get_mut() }
+}
+
+/// `cmdpreview_ns` - the namespace ID used for `'inccommand'` preview
+/// highlights, or `0` when no preview is active, read via
+/// [`cmdpreview_get_ns`]. Modeled as its own file-static, matching
+/// [`CMDPREVIEW_BUFNR`]'s own precedent just above. Always `0` today,
+/// for the same reason.
+static CMDPREVIEW_NS: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Returns the namespace ID used for `'inccommand'` preview
+/// highlights, or `0` when none is active (`cmdpreview_get_ns`).
+/// Always `0` today - see `CMDPREVIEW_NS`'s own doc comment.
+#[must_use]
+pub fn cmdpreview_get_ns() -> i32 {
+    // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
+    unsafe { *CMDPREVIEW_NS.get_mut() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +435,18 @@ mod tests {
         // Both CMDLINE_CMDPOS and CMDLINE_CMDLEN default to 0, and
         // 0 >= 0 is true.
         assert!(cmdline_at_end());
+    }
+
+    #[test]
+    fn cmdpreview_get_bufnr_is_zero_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(cmdpreview_get_bufnr(), 0);
+    }
+
+    #[test]
+    fn cmdpreview_get_ns_is_zero_by_default() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(cmdpreview_get_ns(), 0);
     }
 
     #[test]
