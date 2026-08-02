@@ -69,11 +69,23 @@
 //! for why this doesn't change observable behavior for any realistic
 //! (non-pathologically-long) word.
 //!
+//! Also translated: [`spell_iswordp`] (the "midword character" variant
+//! of [`spell_iswordp_nmw`] - a `'` mid-word, followed by another word
+//! character, is itself considered a word character, e.g. "they're";
+//! panics for `c > 255` for the same `mb_get_class`/`utf_class`
+//! reason as `spell_iswordp_nmw`) and [`spell_casefold`] (case-folds a
+//! whole word, including the real Greek-sigma `Σ`-at-word-end-vs-
+//! -mid-word special case - `Σ` folds to the medial `σ` unless it's
+//! the LAST character of a word, in which case it folds to the final
+//! `ς`; deviates from the original's `buf[buflen]` fixed-size,
+//! truncating output buffer/OK-FAIL return the same way as
+//! [`onecap_copy`]/[`allcap_copy`] above, since a growing `Vec` has no
+//! caller-buffer-capacity concept to fail against).
+//!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
-//! `spell_casefold`/`check_need_cap`/`expand_spelling`, all needing
-//! `slang_T`'s own spell-file-loaded state or the buffer/window
-//! spell-option plumbing.
+//! `check_need_cap`/`expand_spelling`, all needing `slang_T`'s own
+//! spell-file-loaded state or the buffer/window spell-option plumbing.
 
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
@@ -282,6 +294,104 @@ pub unsafe fn spell_iswordp_nmw(p: &[u8]) -> bool {
     // SAFETY: a plain read through one shared borrow of this file's
     // own static.
     unsafe { SPELLTAB.get_mut() }.st_isw[c as usize]
+}
+
+/// Returns `true` if `p` points to a word character. As a special
+/// case, "midword" characters are seen as word characters when
+/// followed by a word character - this finds "they're" but not
+/// "they there". Thus this only works properly when past the first
+/// character of the word (`spell_iswordp`).
+///
+/// # Safety
+/// `p` must be non-empty and point to a valid, well-formed UTF-8 byte
+/// sequence. `wp.w_s` must be a valid, non-null pointer to a live
+/// `crate::buffer_defs::SynblockT` (same as [`spell_check_window`]).
+///
+/// The `c > 255` branch is `unimplemented!()` - see
+/// [`spell_iswordp_nmw`]'s own doc comment for exactly why (the same
+/// `mb_get_class`/`utf_class` -> `curbuf.b_chartab` blocker).
+#[must_use]
+pub unsafe fn spell_iswordp(p: &[u8], wp: &crate::buffer_defs::WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(p) }).unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let syn = unsafe { &*wp.w_s };
+    let s_off = if l == 1 {
+        // be quick for ASCII
+        usize::from(syn.b_spell_ismw[p[0] as usize])
+    } else {
+        let c = crate::mbyte::utf_ptr2char(p);
+        let is_midword = if c < 256 {
+            syn.b_spell_ismw[c as usize]
+        } else {
+            syn.b_spell_ismw_mb
+                .as_deref()
+                .is_some_and(|mb| crate::strings::vim_strchr(mb, c).is_some())
+        };
+        if is_midword { l } else { 0 }
+    }
+    .min(p.len());
+
+    // Reading past `p`'s own content mirrors the original's own
+    // NUL-terminated-C-string semantics (a NUL byte always decodes to
+    // codepoint 0, which is never a word character) - avoids an
+    // out-of-bounds `utf_ptr2char` call when `s_off == p.len()`.
+    let c = if s_off >= p.len() { 0 } else { crate::mbyte::utf_ptr2char(&p[s_off..]) };
+    if c > 255 {
+        unimplemented!(
+            "spell_iswordp: c > 255 needs mb_get_class/utf_class -> curbuf.b_chartab, not translated"
+        );
+    }
+    // SAFETY: a plain read through one shared borrow of this file's
+    // own static.
+    unsafe { SPELLTAB.get_mut() }.st_isw[c as usize]
+}
+
+/// Case-fold `s` (`spell_casefold`). Uses the character definitions
+/// from the `.spl` file.
+///
+/// Deviates from the original's `buf[buflen]` fixed-size, truncating
+/// output buffer (and its own OK/FAIL "did it fit" return) by
+/// returning an unbounded, growing `Vec<u8>` unconditionally - no
+/// caller-buffer-capacity concept exists for a growing `Vec`, matching
+/// this crate's established "growing `Vec` supersedes the manual
+/// bounded-buffer C idiom" precedent ([`onecap_copy`]/[`allcap_copy`]).
+/// The result includes its own trailing NUL, matching this crate's
+/// established convention for freshly-produced string outputs.
+///
+/// # Safety
+/// Forwards [`spell_iswordp`]'s own safety doc (`wp.w_s` must be
+/// valid) - called for the Greek-sigma special case whenever it is
+/// reached, which panics via `unimplemented!()` if the FOLLOWING
+/// character happens to be non-Latin-1 (`c > 255`), the same narrow,
+/// documented gap as [`spell_iswordp`] itself.
+pub unsafe fn spell_casefold(wp: &crate::buffer_defs::WinT, s: &[u8]) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut p = 0usize;
+    while p < s.len() {
+        let (mut c, consumed) = crate::mbyte::mb_cptr2char_adv(&s[p..]);
+        p += consumed.max(1).min(s.len() - p);
+
+        // Exception: greek capital sigma 0x03A3 folds to 0x03C3,
+        // except when it is the last character in a word, then it
+        // folds to 0x03C2.
+        if c == 0x03a3 || c == 0x03c2 {
+            // SAFETY: forwarded from this function's own safety doc.
+            c = if p == s.len() || !unsafe { spell_iswordp(&s[p..], wp) } {
+                0x03c2
+            } else {
+                0x03c3
+            };
+        } else {
+            c = spell_to_fold(c);
+        }
+
+        let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+        let l = crate::mbyte::utf_char2bytes(c, &mut buf) as usize;
+        result.extend_from_slice(&buf[..l]);
+    }
+    result.push(0);
+    result
 }
 
 /// Returns the case type of `word[..end]` (or, if `end` is `None`,
@@ -762,6 +872,155 @@ mod tests {
         assert!(unsafe { spell_iswordp_nmw(b"a") });
         assert!(unsafe { spell_iswordp_nmw(b"5") });
         assert!(!unsafe { spell_iswordp_nmw(b" ") });
+    }
+
+    // --- spell_iswordp ---
+
+    #[test]
+    fn spell_iswordp_ascii_non_midword_matches_iswordp_nmw() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(unsafe { spell_iswordp(b"a", &win) });
+        assert!(!unsafe { spell_iswordp(b" ", &win) });
+    }
+
+    #[test]
+    fn spell_iswordp_finds_theyre_via_a_midword_apostrophe() {
+        // "they're" - the apostrophe, configured as a midword
+        // character, is itself considered a word character when
+        // followed by another word character ('s' after it).
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        syn.b_spell_ismw[b'\'' as usize] = true;
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(unsafe { spell_iswordp(b"'s", &win) });
+    }
+
+    #[test]
+    fn spell_iswordp_not_theythere_via_a_midword_apostrophe_before_a_space() {
+        // "they there" - the same midword apostrophe, when followed
+        // by a space (not a word character), is NOT itself
+        // considered a word character.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        syn.b_spell_ismw[b'\'' as usize] = true;
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(!unsafe { spell_iswordp(b"' ", &win) });
+    }
+
+    #[test]
+    fn spell_iswordp_midword_char_at_the_very_end_falls_back_to_nul() {
+        // The midword apostrophe has nothing after it at all - reads
+        // past its own content like the original's own NUL-terminated
+        // C-string semantics, treated as codepoint 0 (never a word
+        // character).
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        syn.b_spell_ismw[b'\'' as usize] = true;
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(!unsafe { spell_iswordp(b"'", &win) });
+    }
+
+    #[test]
+    fn spell_iswordp_apostrophe_not_configured_as_midword_is_not_a_word_char() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(!unsafe { spell_iswordp(b"'", &win) });
+    }
+
+    #[test]
+    #[should_panic(expected = "spell_iswordp: c > 255")]
+    fn spell_iswordp_multibyte_non_latin1_panics() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let word = "日a".as_bytes();
+        let _ = unsafe { spell_iswordp(word, &win) };
+    }
+
+    // --- spell_casefold ---
+
+    #[test]
+    fn spell_casefold_ascii_lowercases_and_terminates() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert_eq!(unsafe { spell_casefold(&win, b"HELLO") }, b"hello\0");
+    }
+
+    #[test]
+    fn spell_casefold_empty_input_is_just_a_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert_eq!(unsafe { spell_casefold(&win, b"") }, b"\0");
+    }
+
+    #[test]
+    fn spell_casefold_greek_sigma_at_word_end_folds_to_final_form() {
+        // U+03A3 (greek capital sigma) at the very end of the input
+        // folds to U+03C2 (final lowercase sigma, "ς"), not the
+        // medial U+03C3 ("σ").
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let word = "\u{03A3}".as_bytes(); // Σ
+        let mut expected = "\u{03C2}".as_bytes().to_vec(); // ς
+        expected.push(0);
+        assert_eq!(unsafe { spell_casefold(&win, word) }, expected);
+    }
+
+    #[test]
+    fn spell_casefold_greek_sigma_followed_by_a_letter_folds_to_medial_form() {
+        // U+03A3 followed by an ASCII letter (a word character) folds
+        // to the medial U+03C3 ("σ"), not the final U+03C2 ("ς").
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let word = "\u{03A3}a".as_bytes(); // Σa
+        let mut expected = "\u{03C3}".as_bytes().to_vec(); // σ
+        expected.push(b'a');
+        expected.push(0);
+        assert_eq!(unsafe { spell_casefold(&win, word) }, expected);
+    }
+
+    #[test]
+    fn spell_casefold_greek_sigma_followed_by_punctuation_folds_to_final_form() {
+        // U+03A3 followed by punctuation (not a word character) also
+        // folds to the final U+03C2 ("ς"), matching a real word
+        // boundary.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        let word = "\u{03A3}.".as_bytes(); // Σ.
+        let mut expected = "\u{03C2}".as_bytes().to_vec(); // ς
+        expected.push(b'.');
+        expected.push(0);
+        assert_eq!(unsafe { spell_casefold(&win, word) }, expected);
     }
 
     #[test]
