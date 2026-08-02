@@ -22,24 +22,31 @@
 //! real `emsg` display is skipped, matching this crate's established
 //! policy).
 //!
-//! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
-//! `can_compound`/`match_compoundrule`/`valid_word_prefix`/`captype`/
-//! `spell_iswordp*`/`spell_casefold`/`check_need_cap`/`expand_spelling`,
-//! all needing `slang_T`'s own spell-file-loaded state or the
-//! buffer/window spell-option plumbing.
-//!
 //! Also translated: [`SpelltabT`]/[`clear_spell_chartab`]/
 //! [`init_spell_chartab`] (from `spell_defs.h`/`spell.c` - no
 //! dedicated `spell_defs.rs` module exists yet, matching
 //! `charset.h`'s own "embedded directly, documented" precedent for a
 //! header with no other translated members). Needed only already-real
-//! `mbyte.c`'s `utf_fold`/`mb_toupper`/`mb_isupper`/`mb_islower` -
-//! translated ahead of their own real caller (`spell_iswordp`/
-//! `spell_iswordp_nmw`, needing `mb_get_class`/`utf_class`'s own real
-//! `curbuf->b_chartab`, still not translated - the SAME `g_chartab`
-//! blocker documented throughout this crate's `charset.rs`), matching
-//! this crate's established "small, self-contained, no design freedom
-//! to get wrong" precedent.
+//! `mbyte.c`'s `utf_fold`/`mb_toupper`/`mb_isupper`/`mb_islower`.
+//!
+//! Also translated: [`spell_is_upper`] (the `SPELL_ISUPPER` macro) and
+//! [`spell_iswordp_nmw`] (the ASCII/Latin-1 `c <= 255` fast path via
+//! `SPELLTAB`; panics for `c > 255`, which needs `mb_get_class`/
+//! `utf_class`'s own real `curbuf->b_chartab`, still not translated -
+//! the SAME `g_chartab` blocker documented throughout this crate's
+//! `charset.rs`) and [`captype`] (the full two-phase
+//! allcap/firstcap/past_second state machine, needing only
+//! `spell_iswordp_nmw` and already-real `mbyte.c` primitives) - all
+//! translated ahead of their own real caller (`find_word`/
+//! `spell_check`, needing `slang_T`, not translated), matching this
+//! crate's established "small, self-contained, no design freedom to
+//! get wrong" precedent.
+//!
+//! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
+//! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
+//! `spell_casefold`/`check_need_cap`/`expand_spelling`, all needing
+//! `slang_T`'s own spell-file-loaded state or the buffer/window
+//! spell-option plumbing.
 
 /// word has one capital (or all capitals) (`WF_ONECAP`).
 pub const WF_ONECAP: i32 = 0x02;
@@ -153,6 +160,137 @@ pub unsafe fn init_spell_chartab() {
         sp.st_fold[i as usize] = if f < 256 { f as u8 } else { i as u8 };
         sp.st_upper[i as usize] = if u < 256 { u as u8 } else { i as u8 };
     }
+}
+
+/// `SPELL_ISUPPER(c)` (`mbyte.h`): whether codepoint `c` is uppercase,
+/// per spelling's own chartab for `c < 128` (matching the original's
+/// exact `c >= 128` cutoff - NOT 256, so bytes 128..255 always go
+/// through the real `mb_isupper` even though [`SpelltabT`] itself
+/// covers the full 0..256 range).
+///
+/// # Safety
+/// If `c >= 128`, forwards `crate::mbyte::mb_isupper`'s own safety
+/// doc (touches `crate::option_vars::OPTION_VARS`).
+#[must_use]
+pub unsafe fn spell_is_upper(c: i32) -> bool {
+    if c >= 128 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::mbyte::mb_isupper(c) }
+    } else {
+        // SAFETY: a plain read through one shared borrow of this
+        // file's own static.
+        unsafe { SPELLTAB.get_mut() }.st_isu[c as usize]
+    }
+}
+
+/// Returns `true` if `p` points to a word character. Unlike
+/// `spell_iswordp`, this doesn't check for "midword" characters
+/// (`spell_iswordp_nmw`).
+///
+/// # Safety
+/// `p` must be non-empty and point to a valid, well-formed UTF-8 byte
+/// sequence (forwarded from `crate::mbyte::utf_ptr2char`'s own safety
+/// contract).
+///
+/// The `c > 255` branch is `unimplemented!()` - it needs
+/// `mb_get_class`/`utf_class`, which need the REAL, populated
+/// `curbuf->b_chartab` (the same `g_chartab` blocker documented
+/// throughout `charset.rs` - needs `buf_T` plus real option parsing,
+/// not translated). No current caller in this crate can pass
+/// genuinely non-Latin-1 input yet (this function itself has no real
+/// translated caller today either - see `captype`'s own doc comment).
+#[must_use]
+pub unsafe fn spell_iswordp_nmw(p: &[u8]) -> bool {
+    let c = crate::mbyte::utf_ptr2char(p);
+    if c > 255 {
+        unimplemented!(
+            "spell_iswordp_nmw: c > 255 needs mb_get_class/utf_class -> curbuf.b_chartab, not translated"
+        );
+    }
+    // SAFETY: a plain read through one shared borrow of this file's
+    // own static.
+    unsafe { SPELLTAB.get_mut() }.st_isw[c as usize]
+}
+
+/// Returns the case type of `word[..end]` (or, if `end` is `None`,
+/// `word` up to its own trailing NUL) - one of [`WF_ALLCAP`]/
+/// [`WF_ONECAP`]/[`WF_KEEPCAP`]/`0` (plain) (`captype`).
+///
+/// # Safety
+/// `word` must be non-empty and, if `end.is_none()`, NUL-terminated
+/// (this crate's own established line-buffer convention) - forwarded
+/// from [`spell_iswordp_nmw`]'s own safety doc, which this function
+/// calls throughout.
+///
+/// Panics (via [`spell_iswordp_nmw`]) if `word` contains a genuinely
+/// non-Latin-1 (`c > 255`) character before `end` - see that
+/// function's own doc comment. Has no real translated caller itself
+/// yet either (`find_word`, needing `slang_T`'s own spell-file-loaded
+/// state, not translated) - translated ahead of it anyway, matching
+/// this crate's established "small, self-contained, no design freedom
+/// to get wrong" precedent, since the algorithm itself has none.
+#[must_use]
+pub unsafe fn captype(word: &[u8], end: Option<usize>) -> i32 {
+    let reached_end = |pos: usize| match end {
+        None => pos >= word.len() || word[pos] == 0,
+        Some(e) => pos >= e,
+    };
+
+    // Find the first word character.
+    let mut pos = 0usize;
+    loop {
+        // SAFETY: forwarded from this function's own safety doc -
+        // `pos < word.len()` is an invariant of this loop (see below).
+        if unsafe { spell_iswordp_nmw(&word[pos..]) } {
+            break;
+        }
+        if reached_end(pos) {
+            return 0; // only non-word characters, illegal word
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&word[pos..]) }).unwrap_or(0);
+        pos += adv.max(1).min(word.len() - pos);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (mut c, consumed) = unsafe { crate::mbyte::mb_ptr2char_adv(&word[pos..]) };
+    pos += consumed.max(1).min(word.len() - pos);
+    // SAFETY: forwarded from this function's own safety doc.
+    let firstcap = unsafe { spell_is_upper(c) };
+    let mut allcap = firstcap;
+    let mut past_second = false;
+
+    // Need to check all letters to find a word with mixed upper/
+    // lower. But a word with an upper char only at start is a ONECAP.
+    while !reached_end(pos) {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { spell_iswordp_nmw(&word[pos..]) } {
+            c = crate::mbyte::utf_ptr2char(&word[pos..]);
+            // SAFETY: forwarded from this function's own safety doc.
+            if !unsafe { spell_is_upper(c) } {
+                // UUl -> KEEPCAP
+                if past_second && allcap {
+                    return WF_KEEPCAP;
+                }
+                allcap = false;
+            } else if !allcap {
+                // UlU -> KEEPCAP
+                return WF_KEEPCAP;
+            }
+            past_second = true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(&word[pos..]) }).unwrap_or(0);
+        pos += adv.max(1).min(word.len() - pos);
+    }
+
+    if allcap {
+        return WF_ALLCAP;
+    }
+    if firstcap {
+        return WF_ONECAP;
+    }
+    0
 }
 
 /// Whether byte value `n` appears anywhere in `s` (`byte_in_str`).
@@ -371,6 +509,107 @@ mod tests {
         clear_spell_chartab(&mut expected);
         assert_eq!(&sp.st_isw[0..128], &expected.st_isw[0..128]);
         assert_eq!(&sp.st_fold[0..128], &expected.st_fold[0..128]);
+    }
+
+    // --- spell_is_upper / spell_iswordp_nmw / captype ---
+
+    /// Resets the shared `SPELLTAB` to its deterministic ASCII
+    /// baseline (via `clear_spell_chartab` alone, NOT the full
+    /// `init_spell_chartab` - avoiding that function's own Miri-FFI-
+    /// incompatible bytes-128..256 loop, unneeded for these
+    /// ASCII-only test scenarios). Caller must hold
+    /// `global_state_test_lock()`.
+    fn reset_spelltab_ascii() {
+        clear_spell_chartab(unsafe { SPELLTAB.get_mut() });
+    }
+
+    #[test]
+    fn spell_is_upper_ascii_uses_spelltab() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert!(unsafe { spell_is_upper(i32::from(b'A')) });
+        assert!(!unsafe { spell_is_upper(i32::from(b'a')) });
+        assert!(!unsafe { spell_is_upper(i32::from(b'5')) });
+    }
+
+    #[test]
+    fn spell_iswordp_nmw_letters_and_digits_are_word_chars() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert!(unsafe { spell_iswordp_nmw(b"a") });
+        assert!(unsafe { spell_iswordp_nmw(b"5") });
+        assert!(!unsafe { spell_iswordp_nmw(b" ") });
+    }
+
+    #[test]
+    fn captype_all_lowercase_is_plain() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"hello\0", None) }, 0);
+    }
+
+    #[test]
+    fn captype_all_uppercase_is_allcap() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"HELLO\0", None) }, WF_ALLCAP);
+    }
+
+    #[test]
+    fn captype_leading_capital_only_is_onecap() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"Hello\0", None) }, WF_ONECAP);
+    }
+
+    #[test]
+    fn captype_uul_pattern_is_keepcap() {
+        // "HEllo": two leading capitals then lowercase - hand-traced
+        // against the original's own "UUl -> KEEPCAP" comment: after
+        // 'H' (pos=0, firstcap=allcap=true) and 'E' (still allcap,
+        // past_second becomes true), 'l' triggers
+        // `past_second && allcap` -> KEEPCAP.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"HEllo\0", None) }, WF_KEEPCAP);
+    }
+
+    #[test]
+    fn captype_ulu_pattern_is_keepcap() {
+        // "HeLLo": capital, then lowercase, then capital again -
+        // hand-traced against the original's own "UlU -> KEEPCAP"
+        // comment: after 'H' (firstcap=allcap=true) and 'e' (allcap
+        // becomes false, past_second becomes true), 'L' triggers the
+        // `else if (!allcap)` branch -> KEEPCAP.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"HeLLo\0", None) }, WF_KEEPCAP);
+    }
+
+    #[test]
+    fn captype_only_non_word_characters_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"   \0", None) }, 0);
+    }
+
+    #[test]
+    fn captype_respects_an_explicit_end_offset() {
+        // "HELLOworld" with end=5 only looks at "HELLO" - still
+        // WF_ALLCAP, ignoring the lowercase "world" that follows.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"HELLOworld", Some(5)) }, WF_ALLCAP);
+    }
+
+    #[test]
+    fn captype_leading_punctuation_is_skipped() {
+        // A leading non-word character is skipped when finding the
+        // first word character - the case-type is based on "Hello"
+        // itself, not the punctuation before it.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        assert_eq!(unsafe { captype(b"'Hello\0", None) }, WF_ONECAP);
     }
 
     // --- valid_spelllang ---
