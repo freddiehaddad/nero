@@ -42,6 +42,12 @@
 //! crate's established "small, self-contained, no design freedom to
 //! get wrong" precedent.
 //!
+//! Also translated: [`spell_enc`] (the effective spell-checking
+//! encoding, `'encoding'` mapped to `"latin1"` for `"iso-8859-15"`) -
+//! needed only already-real `option_vars.rs`'s `p_enc` field.
+//! Translated ahead of its own real callers (`spellfile.c`'s spell-file
+//! naming, needing `vim_snprintf`/file-templating, not translated).
+//!
 //! Deferred: everything else - `get_char_type`/`match_checkcompoundpattern`/
 //! `can_compound`/`match_compoundrule`/`valid_word_prefix`/
 //! `spell_casefold`/`check_need_cap`/`expand_spelling`, all needing
@@ -291,6 +297,34 @@ pub unsafe fn captype(word: &[u8], end: Option<usize>) -> i32 {
         return WF_ONECAP;
     }
     0
+}
+
+/// Return the encoding used for spell checking: `'encoding'`, except
+/// that `"latin1"` is used for `"iso-8859-15"`, and limited to 60
+/// characters (just in case) (`spell_enc`).
+///
+/// Returns an owned `Vec<u8>` instead of the original's `char *`
+/// (aliasing `p_enc` directly, or a static `"latin1"` string literal) -
+/// no lifetime hazard to work around in Rust. Matches
+/// `fileio.rs`'s own `get_fio_flags` precedent for reading this exact
+/// field: `p_enc == None` (this crate's own `Default` mirrors raw C
+/// zero-init, not the real, always-populated `ENC_DFLT` value a
+/// genuine running session has) falls back to an empty `Vec<u8>` via
+/// `unwrap_or_default()`, not `ENC_DFLT` itself - a real running
+/// session's `p_enc` is never actually unset.
+#[must_use]
+pub fn spell_enc() -> Vec<u8> {
+    // SAFETY: only reads a plain `Option<Vec<u8>>` field, no raw
+    // pointers/aliasing involved.
+    let p_enc = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_enc
+        .clone()
+        .unwrap_or_default();
+    if p_enc.len() < 60 && p_enc != b"iso-8859-15" {
+        p_enc
+    } else {
+        b"latin1".to_vec()
+    }
 }
 
 /// Whether byte value `n` appears anywhere in `s` (`byte_in_str`).
@@ -610,6 +644,67 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
         assert_eq!(unsafe { captype(b"'Hello\0", None) }, WF_ONECAP);
+    }
+
+    // --- spell_enc ---
+
+    #[test]
+    fn spell_enc_none_falls_back_to_empty_not_enc_dflt() {
+        // p_enc == None (this crate's own raw zero-init default, never
+        // actually seen in a real running session) falls back to an
+        // empty Vec<u8>, matching fileio.rs's own get_fio_flags
+        // precedent for this exact field - NOT crate::option_vars::
+        // ENC_DFLT ("utf-8"), even though that's the real compiled
+        // default a genuine session always has.
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = None;
+        let result = spell_enc();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
+        assert_eq!(result, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn spell_enc_returns_p_enc_when_short_and_not_iso_8859_15() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = Some(b"utf-8".to_vec());
+        let result = spell_enc();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
+        assert_eq!(result, b"utf-8");
+    }
+
+    #[test]
+    fn spell_enc_iso_8859_15_maps_to_latin1() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = Some(b"iso-8859-15".to_vec());
+        let result = spell_enc();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
+        assert_eq!(result, b"latin1");
+    }
+
+    #[test]
+    fn spell_enc_60_or_more_bytes_maps_to_latin1() {
+        // strlen(p_enc) < 60 is a strict less-than: exactly 60 bytes
+        // already falls through to "latin1".
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = Some(vec![b'x'; 60]);
+        let result = spell_enc();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
+        assert_eq!(result, b"latin1");
+    }
+
+    #[test]
+    fn spell_enc_59_bytes_is_returned_as_is() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc.clone();
+        let enc = vec![b'x'; 59];
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = Some(enc.clone());
+        let result = spell_enc();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
+        assert_eq!(result, enc);
     }
 
     // --- valid_spelllang ---
