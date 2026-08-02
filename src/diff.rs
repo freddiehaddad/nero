@@ -64,6 +64,14 @@
 //! provably unreachable today (same `diff_buf_idx` reasoning as
 //! everything else in this file) and is not translated at all.
 //!
+//! Also translated: [`diff_equal_char`] (compares 2 characters,
+//! honoring `'diffopt'`'s `icase` flag - a genuinely self-contained
+//! leaf function, needing only already-real `crate::mbyte::
+//! utfc_ptr2len`/`utf_fold`/`utf_ptr2char` and `crate::macros_defs::
+//! tolower_loc`) - translated ahead of its own real caller
+//! (`diff_equal_entry`, needing `curtab.tp_diffbuf`/`ml_get_buf`/
+//! `diff_check_sanity`, not translated).
+//!
 //! Deferred: everything else in the file - real diff computation/
 //! display/navigation, needing the internal xdiff algorithm or
 //! external `diff` process invocation, neither translated.
@@ -149,6 +157,49 @@ pub fn diffopt_horizontal() -> bool {
 #[must_use]
 pub fn diffopt_hiddenoff() -> bool {
     (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::HIDDEN_OFF != 0
+}
+
+/// Compare the characters at `p1` and `p2`. If they are equal
+/// (possibly ignoring case, per `'diffopt'`'s `icase` flag), returns
+/// the number of bytes they occupy; otherwise `None`
+/// (`diff_equal_char`).
+///
+/// Deviates from the original's `int *const len` out-parameter
+/// (always uninitialized on a `false`/non-match return) by folding
+/// the byte length into the `Some`/`None` result directly.
+///
+/// # Safety
+/// `p1`/`p2` must be non-empty and point to valid, well-formed UTF-8
+/// byte sequences (forwarded from `crate::mbyte::utfc_ptr2len`'s own
+/// safety contract).
+#[must_use]
+pub unsafe fn diff_equal_char(p1: &[u8], p2: &[u8]) -> Option<usize> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(p1) }).unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    if l != usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(p2) }).unwrap_or(0) {
+        return None;
+    }
+    let icase = (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::ICASE != 0;
+    if l > 1 {
+        if p1[..l] != p2[..l]
+            && (!icase
+                || crate::mbyte::utf_fold(crate::mbyte::utf_ptr2char(p1))
+                    != crate::mbyte::utf_fold(crate::mbyte::utf_ptr2char(p2)))
+        {
+            return None;
+        }
+        Some(l)
+    } else {
+        if p1[0] != p2[0]
+            && (!icase
+                || crate::macros_defs::tolower_loc(i32::from(p1[0]))
+                    != crate::macros_defs::tolower_loc(i32::from(p2[0])))
+        {
+            return None;
+        }
+        Some(1)
+    }
 }
 
 /// Return the diff status of `lnum` in window `wp`'s buffer,
@@ -587,6 +638,55 @@ mod tests {
         unsafe { *DIFF_FLAGS.get_mut() |= diff_flag::HIDDEN_OFF };
         assert!(diffopt_hiddenoff());
         unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    // --- diff_equal_char ---
+
+    #[test]
+    fn diff_equal_char_matching_ascii_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { diff_equal_char(b"a\0", b"a\0") }, Some(1));
+    }
+
+    #[test]
+    fn diff_equal_char_mismatched_ascii_bytes_case_sensitive_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { diff_equal_char(b"A\0", b"a\0") }, None);
+    }
+
+    #[test]
+    fn diff_equal_char_mismatched_case_matches_when_icase_flag_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *DIFF_FLAGS.get_mut() };
+        unsafe { *DIFF_FLAGS.get_mut() |= diff_flag::ICASE };
+        let result = unsafe { diff_equal_char(b"A\0", b"a\0") };
+        unsafe { *DIFF_FLAGS.get_mut() = prev };
+        assert_eq!(result, Some(1));
+    }
+
+    #[test]
+    fn diff_equal_char_different_byte_lengths_never_match() {
+        // A 3-byte CJK character vs. a 1-byte ASCII character - the
+        // utfc_ptr2len mismatch itself short-circuits before any
+        // byte/char comparison.
+        let _lock = crate::globals::global_state_test_lock();
+        let word = "日\0".as_bytes();
+        assert_eq!(unsafe { diff_equal_char(word, b"a\0") }, None);
+    }
+
+    #[test]
+    fn diff_equal_char_matching_multibyte_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let word = "日\0".as_bytes();
+        assert_eq!(unsafe { diff_equal_char(word, word) }, Some(3));
+    }
+
+    #[test]
+    fn diff_equal_char_different_multibyte_characters_same_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        let a = "日\0".as_bytes();
+        let b = "本\0".as_bytes();
+        assert_eq!(unsafe { diff_equal_char(a, b) }, None);
     }
 
     /// Points `GLOBALS.curtab` at `tp` for the guard's lifetime,
