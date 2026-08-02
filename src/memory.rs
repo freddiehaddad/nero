@@ -219,6 +219,17 @@ pub fn xmemrchr(src: &[u8], c: u8) -> Option<usize> {
     src.iter().rposition(|&b| b == c)
 }
 
+/// Returns the index of the first occurrence of `c` in `str`, or
+/// `str.len()` if not found (`xstrchrnul`) - never "not found" in the
+/// `Option` sense, matching the original's own `FUNC_ATTR_NONNULL_RET`
+/// contract (a pointer to the NUL terminator, never `NULL`, if `c`
+/// isn't present).
+#[inline]
+#[must_use]
+pub fn xstrchrnul(str: &[u8], c: u8) -> usize {
+    str.iter().position(|&b| b == c).unwrap_or(str.len())
+}
+
 /// `strdup()` wrapper (`xstrdup`).
 #[inline]
 pub fn xstrdup(s: &[u8]) -> Vec<u8> {
@@ -387,6 +398,22 @@ mod tests {
     fn xmemrchr_finds_from_end() {
         assert_eq!(xmemrchr(b"abcabc", b'a'), Some(3));
         assert_eq!(xmemrchr(b"abcabc", b'z'), None);
+    }
+
+    #[test]
+    fn xstrchrnul_finds_first_occurrence() {
+        assert_eq!(xstrchrnul(b"hello,world,!", b','), 5);
+    }
+
+    #[test]
+    fn xstrchrnul_not_found_returns_the_length() {
+        assert_eq!(xstrchrnul(b"hello", b','), 5);
+        assert_eq!(xstrchrnul(b"", b','), 0);
+    }
+
+    #[test]
+    fn xstrchrnul_matches_the_first_of_several_occurrences() {
+        assert_eq!(xstrchrnul(b"a,b,c", b','), 1);
     }
 
     #[test]
