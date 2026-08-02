@@ -137,10 +137,15 @@
 //! real translated caller yet (`shada.c`) - harvested anyway, matching
 //! the established ahead-of-caller precedent.
 //!
+//! Also translated: `mark_set_global`/`mark_set_local` - re-examined
+//! after being wrongly attributed below to `api/extmark.c` (they are
+//! actually real, genuinely self-contained functions in `mark.c`
+//! itself, only CALLED by `shada.c`, not translated). Needed only
+//! already-real `mark_global_index`/[`NAMEDFM`]/`free_xfmark` (global)
+//! or `BufT.b_namedm`/`b_last_cursor`/`b_last_insert`/`b_prompt_start`/
+//! `b_last_change`/`free_fmark` (local).
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
-//!   `nvim_del_mark`'s own API-layer helpers (`api/extmark.c`, not
-//!   `mark.c`) - not investigated this session, a different file.
 //! - `switch_to_mark_buf`/`mark_move_to`: need window switching
 //!   (`ctx_switch`, not the bypass-only `ctx_restore`) or `findsent`
 //!   (`search.c`/`textobject.c`, for their own `(`/`)` sentence-motion
@@ -221,6 +226,58 @@ pub fn clear_fmark(fm: &mut FmarkT, timestamp: Timestamp) {
         timestamp,
         ..FmarkT::default()
     };
+}
+
+/// Set a global (file) mark (`mark_set_global`). Returns `false` when
+/// `name` isn't a valid global-mark name, or when `update` is set and
+/// `fm`'s own timestamp isn't newer than the existing mark's.
+///
+/// # Safety
+/// Touches [`NAMEDFM`] - same requirement as every other function
+/// that does so.
+pub unsafe fn mark_set_global(name: u8, fm: XfmarkT, update: bool) -> bool {
+    let idx = mark_global_index(name);
+    if idx == -1 {
+        return false;
+    }
+    let idx = idx as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    if update && fm.fmark.timestamp <= namedfm[idx].fmark.timestamp {
+        return false;
+    }
+    if namedfm[idx].fmark.mark.lnum != 0 {
+        free_xfmark(std::mem::take(&mut namedfm[idx]));
+    }
+    namedfm[idx] = fm;
+    true
+}
+
+/// Set a local (buffer) mark (`mark_set_local`). Returns `false` when
+/// `name` isn't a valid local-mark name, or when `update` is set and
+/// `fm`'s own timestamp isn't newer than the existing mark's.
+pub fn mark_set_local(name: u8, buf: &mut crate::buffer_defs::BufT, fm: FmarkT, update: bool) -> bool {
+    let fm_tgt = if crate::macros_defs::ascii_islower(i32::from(name)) {
+        &mut buf.b_namedm[usize::from(name - b'a')]
+    } else if name == b'"' {
+        &mut buf.b_last_cursor
+    } else if name == b'^' {
+        &mut buf.b_last_insert
+    } else if name == b':' {
+        &mut buf.b_prompt_start
+    } else if name == b'.' {
+        &mut buf.b_last_change
+    } else {
+        return false;
+    };
+    if update && fm.timestamp <= fm_tgt.timestamp {
+        return false;
+    }
+    if fm_tgt.mark.lnum != 0 {
+        free_fmark(std::mem::take(fm_tgt));
+    }
+    *fm_tgt = fm;
+    true
 }
 
 /// Remove every jump list entry referring to a given buffer. This
@@ -2529,6 +2586,127 @@ mod tests {
         clear_fmark(&mut fm, 12345);
         assert_eq!(fm.fnum, 0);
         assert_eq!(fm.timestamp, 12345);
+    }
+
+    #[test]
+    fn mark_set_global_invalid_name_returns_false() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let fm = XfmarkT::default();
+        assert!(!unsafe { mark_set_global(b'@', fm, false) });
+    }
+
+    #[test]
+    fn mark_set_global_sets_a_fresh_mark() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let fm = XfmarkT {
+            fmark: FmarkT {
+                mark: PosT { lnum: 5, col: 0, coladd: 0 },
+                fnum: 7,
+                ..FmarkT::default()
+            },
+            ..XfmarkT::default()
+        };
+        assert!(unsafe { mark_set_global(b'A', fm, false) });
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.mark.lnum, 5);
+        assert_eq!(namedfm[0].fmark.fnum, 7);
+    }
+
+    #[test]
+    fn mark_set_global_update_rejects_an_older_timestamp() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0].fmark.timestamp = 100;
+        namedfm[0].fmark.mark.lnum = 1;
+
+        let older = XfmarkT {
+            fmark: FmarkT {
+                mark: PosT { lnum: 2, col: 0, coladd: 0 },
+                timestamp: 50,
+                ..FmarkT::default()
+            },
+            ..XfmarkT::default()
+        };
+
+        assert!(!unsafe { mark_set_global(b'A', older, true) });
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.mark.lnum, 1); // untouched
+    }
+
+    #[test]
+    fn mark_set_global_update_accepts_a_newer_timestamp() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[0].fmark.timestamp = 50;
+        namedfm[0].fmark.mark.lnum = 1;
+
+        let newer = XfmarkT {
+            fmark: FmarkT {
+                mark: PosT { lnum: 2, col: 0, coladd: 0 },
+                timestamp: 100,
+                ..FmarkT::default()
+            },
+            ..XfmarkT::default()
+        };
+
+        assert!(unsafe { mark_set_global(b'A', newer, true) });
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        assert_eq!(namedfm[0].fmark.mark.lnum, 2);
+    }
+
+    #[test]
+    fn mark_set_local_invalid_name_returns_false() {
+        let mut buf = BufT::default();
+        let fm = FmarkT::default();
+        assert!(!mark_set_local(b'X', &mut buf, fm, false));
+    }
+
+    #[test]
+    fn mark_set_local_lowercase_letter_targets_b_namedm() {
+        let mut buf = BufT::default();
+        let fm = FmarkT { mark: PosT { lnum: 5, col: 0, coladd: 0 }, ..FmarkT::default() };
+        assert!(mark_set_local(b'a', &mut buf, fm, false));
+        assert_eq!(buf.b_namedm[0].mark.lnum, 5);
+    }
+
+    #[test]
+    fn mark_set_local_special_names_target_their_own_field() {
+        let mut buf = BufT::default();
+        let cursor_fm = FmarkT { mark: PosT { lnum: 1, col: 0, coladd: 0 }, ..FmarkT::default() };
+        assert!(mark_set_local(b'"', &mut buf, cursor_fm, false));
+        assert_eq!(buf.b_last_cursor.mark.lnum, 1);
+
+        let insert_fm = FmarkT { mark: PosT { lnum: 2, col: 0, coladd: 0 }, ..FmarkT::default() };
+        assert!(mark_set_local(b'^', &mut buf, insert_fm, false));
+        assert_eq!(buf.b_last_insert.mark.lnum, 2);
+
+        let prompt_fm = FmarkT { mark: PosT { lnum: 3, col: 0, coladd: 0 }, ..FmarkT::default() };
+        assert!(mark_set_local(b':', &mut buf, prompt_fm, false));
+        assert_eq!(buf.b_prompt_start.mark.lnum, 3);
+
+        let change_fm = FmarkT { mark: PosT { lnum: 4, col: 0, coladd: 0 }, ..FmarkT::default() };
+        assert!(mark_set_local(b'.', &mut buf, change_fm, false));
+        assert_eq!(buf.b_last_change.mark.lnum, 4);
+    }
+
+    #[test]
+    fn mark_set_local_update_rejects_an_older_timestamp() {
+        let mut buf = BufT::default();
+        buf.b_namedm[0].timestamp = 100;
+        buf.b_namedm[0].mark.lnum = 1;
+
+        let older = FmarkT {
+            mark: PosT { lnum: 2, col: 0, coladd: 0 },
+            timestamp: 50,
+            ..FmarkT::default()
+        };
+
+        assert!(!mark_set_local(b'a', &mut buf, older, true));
+        assert_eq!(buf.b_namedm[0].mark.lnum, 1); // untouched
     }
 
     #[test]
