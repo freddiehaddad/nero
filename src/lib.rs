@@ -105,6 +105,7 @@ pub mod menu_defs;
 pub mod message;
 #[path = "move.rs"]
 pub mod r#move;
+pub mod normal;
 pub mod normal_defs;
 pub mod option;
 pub mod optionstr;
