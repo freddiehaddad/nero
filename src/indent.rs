@@ -5,25 +5,31 @@
 //! (`ml_replace`/`changed_bytes`) plus the C-indent (`indent_c.c`) and
 //! Lisp-indent engines.
 //!
-//! Translated: `tabstop_padding`/`tabstop_at`/`tabstop_start`/
-//! `tabstop_fromto`, `indent_size_no_ts`/`indent_size_ts` (needed by
-//! `plines.c`'s tab-width calculations and by `get_breakindent_win`
-//! below); `get_breakindent_win` (needed `buffer.c`'s
-//! `buf_get_changedtick`, now tractable since `eval/typval_defs.rs`'s
-//! `TypvalT` is real - see that function's own doc comment for its one
-//! deliberate gap, `'breakindentopt'="list"`, which needs the real
-//! regex engine); `get_indent`/`get_indent_lnum`/`get_indent_buf`
-//! (thin wrappers around `indent_size_ts` - needed only `cursor.rs`'s
-//! `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/`ml_get_buf`, all
-//! already real); `get_sw_value`/`get_sw_value_col`/`get_sw_value_pos`/
-//! `get_sw_value_indent`/`get_sts_value` (the effective
-//! `'shiftwidth'`/`'softtabstop'` values, needed by `eval/funcs.c`'s
-//! `shiftwidth()` and, ahead of their own real callers - `insert.c`'s
-//! Insert-mode key handling and `ops.c`'s `shift_block`, neither
-//! translated - by the tab-stop-family functions above); `inindent`/
-//! `may_do_si` (small self-contained predicates, translated ahead of
-//! their own real callers - `insert.c`/`ops.c`/`textobject.c`/
-//! `insexpand.c`, none translated - matching the same precedent).
+//! Translated: `tabstop_set`/`tabstop_padding`/`tabstop_at`/
+//! `tabstop_start`/`tabstop_fromto`, `indent_size_no_ts`/
+//! `indent_size_ts` (needed by `plines.c`'s tab-width calculations and
+//! by `get_breakindent_win` below); `get_breakindent_win` (needed
+//! `buffer.c`'s `buf_get_changedtick`, now tractable since
+//! `eval/typval_defs.rs`'s `TypvalT` is real - see that function's own
+//! doc comment for its one deliberate gap, `'breakindentopt'="list"`,
+//! which needs the real regex engine); `get_indent`/`get_indent_lnum`/
+//! `get_indent_buf` (thin wrappers around `indent_size_ts` - needed
+//! only `cursor.rs`'s `get_cursor_line_ptr`/`memline.rs`'s `ml_get`/
+//! `ml_get_buf`, all already real); `get_sw_value`/`get_sw_value_col`/
+//! `get_sw_value_pos`/`get_sw_value_indent`/`get_sts_value` (the
+//! effective `'shiftwidth'`/`'softtabstop'` values, needed by
+//! `eval/funcs.c`'s `shiftwidth()` and, ahead of their own real
+//! callers - `insert.c`'s Insert-mode key handling and `ops.c`'s
+//! `shift_block`, neither translated - by the tab-stop-family
+//! functions above); `inindent`/`may_do_si` (small self-contained
+//! predicates, translated ahead of their own real callers -
+//! `insert.c`/`ops.c`/`textobject.c`/`insexpand.c`, none translated -
+//! matching the same precedent). `tabstop_set` (the `'vartabstop'`/
+//! `'varsofttabstop'` string parser) is likewise translated ahead of
+//! its own real callers (`option.c`/`optionstr.c`'s option-setting
+//! callbacks, `indent.c`'s own `ex_retab` - none translated) -
+//! returns `Result<Option<Vec<ColnrT>>, ()>` instead of a `bool` return
+//! plus a `colnr_T **` out-parameter.
 //!
 //! `tabstop_eq`/`tabstop_copy`/`tabstop_count`/`tabstop_first` need NO
 //! Rust equivalent at all: given this crate's own `Option<&[ColnrT]>`/
@@ -103,6 +109,85 @@ struct BreakindentCache {
 static BREAKINDENT_CACHE: std::sync::LazyLock<GlobalCell<BreakindentCache>> =
     std::sync::LazyLock::new(|| GlobalCell::new(BreakindentCache::default()));
 
+/// Set the integer values corresponding to the string setting of
+/// `'vartabstop'`/`'varsofttabstop'` (`tabstop_set`).
+///
+/// Returns `Ok(None)` for an empty (or literal `"0"`) `var` (matching
+/// the "not set" sentinel these option values use), `Ok(Some(widths))`
+/// on a successfully-parsed comma-separated list of positive
+/// integers, or `Err(())` on invalid syntax/an out-of-range value -
+/// the original's own `emsg`/`semsg` message display is skipped
+/// (`message.c`'s display pipeline is not tractable), matching this
+/// crate's established policy elsewhere; only the success/failure
+/// OUTCOME is preserved. Callers pass `Option<Vec<u8>>` option fields
+/// via `.as_deref().unwrap_or(&[])` (this crate's own established
+/// "no trailing NUL for option string values" convention, `option.rs`'s
+/// module doc), matching `var[0] == NUL` for both an absent and an
+/// empty value.
+// The `Err` case genuinely has no payload to carry (message display
+// is skipped, matching this crate's own established policy) and the
+// 3-way "unset"/"set"/"invalid" distinction (mirroring the original's
+// `bool` return + `colnr_T **` out-param exactly) doesn't collapse
+// cleanly into a plain `Option<Vec<ColnrT>>` the way `Option<Callback>`
+// could for `callback_from_typval` (which had only 2 real outcomes) -
+// a dedicated marker error type would carry no more information than
+// `()` already does.
+#[allow(clippy::result_unit_err)]
+pub fn tabstop_set(var: &[u8]) -> Result<Option<Vec<ColnrT>>, ()> {
+    if var.is_empty() || var == b"0" {
+        return Ok(None);
+    }
+
+    // First pass: validate syntax (digits and properly-placed commas
+    // only), counting how many comma-separated values there are.
+    let mut valcount = 1usize;
+    for i in 0..var.len() {
+        if i == 0 || var[i - 1] == b',' {
+            // Use def=1 so overflow/too-large values pass this check
+            // and are instead rejected by the "n > TABSTOP_MAX" check
+            // in the second pass below.
+            let (value, _) = crate::charset::getdigits(&var[i..], false, 1);
+            if value <= 0 {
+                return Err(());
+            }
+        }
+
+        if crate::ascii_defs::ascii_isdigit(i32::from(var[i])) {
+            continue;
+        }
+        if var[i] == b',' && i > 0 && var[i - 1] != b',' && i + 1 < var.len() {
+            valcount += 1;
+            continue;
+        }
+        return Err(());
+    }
+
+    // Second pass: actually parse each comma-separated value. Every
+    // "start of number" position was already validated above (only
+    // digits, no sign), so `getdigits` here can only ever produce a
+    // genuine non-negative value or (for an astronomically long
+    // digit run) a graceful `def=0` fallback - never the original's
+    // own `atoi`-on-overflow undefined behavior.
+    let mut array = vec![0 as ColnrT; valcount];
+    let mut t = 0usize;
+    let mut cp = 0usize;
+    while cp < var.len() {
+        let (n, _) = crate::charset::getdigits(&var[cp..], false, 0);
+        if n <= 0 || n > i64::from(crate::option_vars::TABSTOP_MAX) {
+            return Err(());
+        }
+        array[t] = n as ColnrT;
+        t += 1;
+        while cp < var.len() && var[cp] != b',' {
+            cp += 1;
+        }
+        if cp < var.len() {
+            cp += 1;
+        }
+    }
+
+    Ok(Some(array))
+}
 
 /// Calculate the number of screen spaces a tab will occupy. If `vts`
 /// is set then the tab widths are taken from that slice, otherwise
@@ -860,6 +945,69 @@ mod tests {
         win.w_briopt_list = 1;
         let line = b"1. text\0";
         let _ = unsafe { get_breakindent_win(&mut win, line) };
+    }
+
+    #[test]
+    fn tabstop_set_empty_string_is_none() {
+        assert_eq!(tabstop_set(b""), Ok(None));
+    }
+
+    #[test]
+    fn tabstop_set_literal_zero_is_none() {
+        assert_eq!(tabstop_set(b"0"), Ok(None));
+    }
+
+    #[test]
+    fn tabstop_set_single_value() {
+        assert_eq!(tabstop_set(b"4"), Ok(Some(vec![4])));
+    }
+
+    #[test]
+    fn tabstop_set_multiple_values() {
+        assert_eq!(tabstop_set(b"4,8"), Ok(Some(vec![4, 8])));
+        assert_eq!(tabstop_set(b"4,8,12"), Ok(Some(vec![4, 8, 12])));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_negative_value() {
+        assert_eq!(tabstop_set(b"-4"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_trailing_comma_with_nothing_after() {
+        assert_eq!(tabstop_set(b"4,"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_leading_comma() {
+        assert_eq!(tabstop_set(b",4"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_doubled_comma() {
+        assert_eq!(tabstop_set(b"4,,8"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_zero_within_a_list() {
+        // The "0 means unset" special case only applies to the WHOLE
+        // string being exactly "0", not to an individual list entry.
+        assert_eq!(tabstop_set(b"4,0"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_non_digit_character() {
+        assert_eq!(tabstop_set(b"4,a,8"), Err(()));
+    }
+
+    #[test]
+    fn tabstop_set_accepts_the_maximum_value() {
+        assert_eq!(tabstop_set(b"9999"), Ok(Some(vec![9999])));
+    }
+
+    #[test]
+    fn tabstop_set_rejects_a_value_past_the_maximum() {
+        assert_eq!(tabstop_set(b"10000"), Err(()));
     }
 
     #[test]
