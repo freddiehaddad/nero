@@ -20,7 +20,10 @@
 //! `'shiftwidth'`/`'softtabstop'` values, needed by `eval/funcs.c`'s
 //! `shiftwidth()` and, ahead of their own real callers - `insert.c`'s
 //! Insert-mode key handling and `ops.c`'s `shift_block`, neither
-//! translated - by the tab-stop-family functions above).
+//! translated - by the tab-stop-family functions above); `inindent`/
+//! `may_do_si` (small self-contained predicates, translated ahead of
+//! their own real callers - `insert.c`/`ops.c`/`textobject.c`/
+//! `insexpand.c`, none translated - matching the same precedent).
 //!
 //! `tabstop_eq`/`tabstop_copy`/`tabstop_count`/`tabstop_first` need NO
 //! Rust equivalent at all: given this crate's own `Option<&[ColnrT]>`/
@@ -29,6 +32,10 @@
 //! `.map_or(8, |v| v[0])` already do exactly what each one does by
 //! hand - the same reasoning already established for `optval_free`/
 //! `optval_copy`/`optval_equal` (`option.rs`).
+//!
+//! `preprocs_left` remains deferred - needs `indent_c.c`'s
+//! `in_cinkeys` (real `'cinkeys'`/`'cinwords'` matching, not just a
+//! fixed-default-rule shortcut).
 //!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
@@ -377,6 +384,54 @@ pub unsafe fn get_sts_value() -> i32 {
     } else {
         curbuf.b_p_sts as i32
     }
+}
+
+/// Return `true` if the cursor is before (or, with `extra == 0`, on)
+/// the first non-blank in the current line (`inindent`).
+///
+/// Translated ahead of its own real callers (`insert.c`/`ops.c`/
+/// `textobject.c`/`insexpand.c`, none translated), matching this
+/// crate's established "small, self-contained, no design freedom to
+/// get wrong" precedent.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin`/`curbuf` must be valid, non-null
+/// pointers to live `WinT`/`BufT` (forwarded from
+/// `crate::cursor::get_cursor_line_ptr`'s own safety doc).
+#[must_use]
+pub unsafe fn inindent(extra: ColnrT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    let mut col: ColnrT = 0;
+    for &c in &line {
+        if !crate::ascii_defs::ascii_iswhite(i32::from(c)) {
+            break;
+        }
+        col += 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor_col = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col };
+    col >= cursor_col + extra
+}
+
+/// Return `true` if the conditions are OK for smart indenting
+/// (`may_do_si`).
+///
+/// Translated ahead of its own real callers (`insert.c`/`ops.c`,
+/// neither translated) - same precedent as [`inindent`] above.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn may_do_si() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    curbuf.b_p_si != 0
+        && curbuf.b_p_cin == 0
+        && curbuf.b_p_inde.as_deref().is_none_or(<[u8]>::is_empty)
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste == 0
 }
 
 /// Compute the size of the indent (in window cells) in `ptr`, without
@@ -1365,6 +1420,116 @@ mod tests {
         let mut buf = BufT { b_p_sts: -1, b_p_sw: 0, b_p_ts: 4, ..Default::default() };
         let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
         assert_eq!(unsafe { get_sts_value() }, 4);
+    }
+
+    #[test]
+    fn inindent_cursor_before_first_non_blank_is_true() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col = 2 };
+
+        assert!(unsafe { inindent(0) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn inindent_cursor_exactly_on_first_non_blank_extra_zero_is_true() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col = 4 };
+
+        assert!(unsafe { inindent(0) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn inindent_cursor_exactly_on_first_non_blank_extra_one_is_false() {
+        // With extra=1, the cursor must be STRICTLY before the first
+        // non-blank, not on it.
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col = 4 };
+
+        assert!(!unsafe { inindent(1) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn inindent_cursor_past_first_non_blank_is_false() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"    text\0");
+        unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col = 5 };
+
+        assert!(!unsafe { inindent(0) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn inindent_empty_line_cursor_at_zero_is_true() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"\0");
+
+        assert!(unsafe { inindent(0) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn may_do_si_true_when_every_condition_holds() {
+        let mut buf =
+            BufT { b_p_si: 1, b_p_cin: 0, b_p_inde: None, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(unsafe { may_do_si() });
+    }
+
+    #[test]
+    fn may_do_si_false_when_smartindent_is_off() {
+        let mut buf = BufT { b_p_si: 0, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(!unsafe { may_do_si() });
+    }
+
+    #[test]
+    fn may_do_si_false_when_cindent_is_on() {
+        let mut buf = BufT { b_p_si: 1, b_p_cin: 1, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(!unsafe { may_do_si() });
+    }
+
+    #[test]
+    fn may_do_si_false_when_indentexpr_is_set() {
+        let mut buf = BufT {
+            b_p_si: 1,
+            b_p_cin: 0,
+            b_p_inde: Some(b"MyIndent()".to_vec()),
+            ..Default::default()
+        };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(!unsafe { may_do_si() });
+    }
+
+    #[test]
+    fn may_do_si_false_when_paste_is_on() {
+        let mut buf = BufT { b_p_si: 1, b_p_cin: 0, b_p_inde: None, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste = 1;
+        let result = unsafe { may_do_si() };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste = 0;
+        assert!(!result);
     }
 
     #[test]
