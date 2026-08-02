@@ -126,13 +126,21 @@
 //! `del_bytes`/`ins_char`/etc., same as `mark_col_adjust`) - harvested
 //! ahead of one, matching the established precedent.
 //!
+//! Also translated: `mark_jumplist_iter`/`mark_global_iter` -
+//! re-examined after being stale-grouped below with functions needing
+//! `shada.c` (their own only real CALLER, not a dependency) - both are
+//! actually genuinely self-contained already, needing only already-
+//! real `w_jumplist`/`w_jumplistlen` and [`NAMEDFM`] respectively.
+//! Replace the original's own `const void *iter` opaque pointer-based
+//! continuation token with a plain `Option<usize>` index, matching
+//! this crate's established "index instead of pointer" convention. No
+//! real translated caller yet (`shada.c`) - harvested anyway, matching
+//! the established ahead-of-caller precedent.
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `mark_set_global`/`mark_set_local`: these are `nvim_buf_set_mark`/
 //!   `nvim_del_mark`'s own API-layer helpers (`api/extmark.c`, not
 //!   `mark.c`) - not investigated this session, a different file.
-//! - `mark_jumplist_iter`/`mark_global_iter`: only consumed by
-//!   `shada.c` (not yet translated); their C-style "raw pointer as an
-//!   opaque continuation token" API doesn't have an urgent caller yet.
 //! - `switch_to_mark_buf`/`mark_move_to`: need window switching
 //!   (`ctx_switch`, not the bypass-only `ctx_restore`) or `findsent`
 //!   (`search.c`/`textobject.c`, for their own `(`/`)` sentence-motion
@@ -451,6 +459,80 @@ pub fn free_jumplist(wp: &mut crate::buffer_defs::WinT) {
         free_xfmark(std::mem::take(&mut wp.w_jumplist[i]));
     }
     wp.w_jumplistlen = 0;
+}
+
+/// Iterate over jumplist items (`mark_jumplist_iter`).
+///
+/// # Warning
+/// No jumplist-editing functions must be called while iteration is in
+/// progress (forwarded from the original's own documented warning).
+///
+/// Deviates from the original's `const void *iter`/`const void
+/// *return-value` opaque pointer-based iterator state by using a
+/// plain `Option<usize>` index instead, matching this crate's
+/// established "index instead of pointer" convention. Pass `None` to
+/// start iteration; returns `(next_iter, fm)`, where `next_iter` is
+/// what to pass to the next call (`None` means iteration is over) and
+/// `fm` is always populated (the original's own `INIT_XFMARK`
+/// sentinel when `win`'s jumplist is genuinely empty, otherwise a
+/// real entry - even on the FINAL call, matching the original's own
+/// "still write `*fm` before returning NULL" behavior for a
+/// non-empty jumplist).
+#[must_use]
+pub fn mark_jumplist_iter(
+    iter: Option<usize>,
+    win: &crate::buffer_defs::WinT,
+) -> (Option<usize>, XfmarkT) {
+    if iter.is_none() && win.w_jumplistlen == 0 {
+        return (None, XfmarkT::default());
+    }
+    let idx = iter.unwrap_or(0);
+    let fm = win.w_jumplist[idx].clone();
+    if idx + 1 == win.w_jumplistlen as usize {
+        (None, fm)
+    } else {
+        (Some(idx + 1), fm)
+    }
+}
+
+/// Iterate over global marks (`mark_global_iter`).
+///
+/// # Warning
+/// No mark-editing functions must be called while iteration is in
+/// progress (forwarded from the original's own documented warning).
+///
+/// Deviates from the original's `const void *iter`/`char *name`/
+/// `xfmark_T *fm` pointer-based iterator + 2 out-parameters by
+/// returning `Option<(name, fm, next_iter)>` instead - `None` means
+/// iteration is over (matching the original's own behavior of never
+/// writing `*fm` in that case), `Some((name, fm, next_iter))`
+/// otherwise, where `next_iter` is what to pass to the next call
+/// (`None` means this was the last entry).
+///
+/// # Safety
+/// Touches [`NAMEDFM`] - same requirement as every other function
+/// that does so.
+#[must_use]
+pub unsafe fn mark_global_iter(iter: Option<usize>) -> Option<(u8, XfmarkT, Option<usize>)> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let namedfm = unsafe { NAMEDFM.get_mut() };
+    let mut i = iter.unwrap_or(0);
+    while i < namedfm.len() && namedfm[i].fmark.mark.lnum == 0 {
+        i += 1;
+    }
+    if i == namedfm.len() || namedfm[i].fmark.mark.lnum == 0 {
+        return None;
+    }
+    let name = if (i as i32) < NMARKS { b'A' + i as u8 } else { b'0' + (i as i32 - NMARKS) as u8 };
+    let fm = namedfm[i].clone();
+    let mut j = i + 1;
+    while j < namedfm.len() {
+        if namedfm[j].fmark.mark.lnum != 0 {
+            return Some((name, fm, Some(j)));
+        }
+        j += 1;
+    }
+    Some((name, fm, None))
 }
 
 /// Resolve a global mark's file name to a real buffer number
@@ -2547,6 +2629,98 @@ mod tests {
         };
         free_jumplist(&mut wp);
         assert_eq!(wp.w_jumplistlen, 0);
+    }
+
+    #[test]
+    fn mark_jumplist_iter_empty_jumplist_returns_none_and_default_fm() {
+        let win = WinT::default();
+        let (next, fm) = mark_jumplist_iter(None, &win);
+        assert!(next.is_none());
+        assert_eq!(fm.fmark.mark.lnum, XfmarkT::default().fmark.mark.lnum);
+    }
+
+    #[test]
+    fn mark_jumplist_iter_single_entry_returns_none_on_first_call() {
+        let mut win = WinT { w_jumplistlen: 1, ..Default::default() };
+        win.w_jumplist[0].fmark.fnum = 42;
+        let (next, fm) = mark_jumplist_iter(None, &win);
+        assert!(next.is_none());
+        assert_eq!(fm.fmark.fnum, 42);
+    }
+
+    #[test]
+    fn mark_jumplist_iter_walks_every_entry_in_order() {
+        let mut win = WinT { w_jumplistlen: 3, ..Default::default() };
+        win.w_jumplist[0].fmark.fnum = 1;
+        win.w_jumplist[1].fmark.fnum = 2;
+        win.w_jumplist[2].fmark.fnum = 3;
+
+        let (next1, fm1) = mark_jumplist_iter(None, &win);
+        assert_eq!(fm1.fmark.fnum, 1);
+        assert_eq!(next1, Some(1));
+
+        let (next2, fm2) = mark_jumplist_iter(next1, &win);
+        assert_eq!(fm2.fmark.fnum, 2);
+        assert_eq!(next2, Some(2));
+
+        let (next3, fm3) = mark_jumplist_iter(next2, &win);
+        assert_eq!(fm3.fmark.fnum, 3);
+        assert!(next3.is_none());
+    }
+
+    #[test]
+    fn mark_global_iter_no_marks_set_returns_none() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        *unsafe { NAMEDFM.get_mut() } = std::array::from_fn(|_| XfmarkT::default());
+        assert!(unsafe { mark_global_iter(None) }.is_none());
+    }
+
+    #[test]
+    fn mark_global_iter_finds_a_single_mark_by_letter() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        *unsafe { NAMEDFM.get_mut() } = std::array::from_fn(|_| XfmarkT::default());
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[2].fmark.mark.lnum = 5; // index 2 -> 'C'
+        let result = unsafe { mark_global_iter(None) };
+        let (name, fm, next) = result.expect("expected a mark to be found");
+        assert_eq!(name, b'C');
+        assert_eq!(fm.fmark.mark.lnum, 5);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn mark_global_iter_walks_multiple_marks_in_index_order() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        *unsafe { NAMEDFM.get_mut() } = std::array::from_fn(|_| XfmarkT::default());
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        namedfm[2].fmark.mark.lnum = 5; // 'C'
+        namedfm[5].fmark.mark.lnum = 7; // 'F'
+
+        let (name1, fm1, next1) = unsafe { mark_global_iter(None) }.expect("first mark");
+        assert_eq!(name1, b'C');
+        assert_eq!(fm1.fmark.mark.lnum, 5);
+        assert_eq!(next1, Some(5));
+
+        let (name2, fm2, next2) = unsafe { mark_global_iter(next1) }.expect("second mark");
+        assert_eq!(name2, b'F');
+        assert_eq!(fm2.fmark.mark.lnum, 7);
+        assert!(next2.is_none());
+    }
+
+    #[test]
+    fn mark_global_iter_numbered_marks_use_digit_names() {
+        let _lock = globals_test_lock();
+        let _guard = NamedfmGuard::acquire();
+        *unsafe { NAMEDFM.get_mut() } = std::array::from_fn(|_| XfmarkT::default());
+        let namedfm = unsafe { NAMEDFM.get_mut() };
+        // Index NMARKS (26) is mark '0', the first numbered mark.
+        namedfm[NMARKS as usize].fmark.mark.lnum = 9;
+        let (name, _fm, next) = unsafe { mark_global_iter(None) }.expect("numbered mark");
+        assert_eq!(name, b'0');
+        assert!(next.is_none());
     }
 
     #[test]
