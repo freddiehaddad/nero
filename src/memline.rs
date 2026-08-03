@@ -2329,6 +2329,24 @@ pub unsafe fn ml_get_pos_len(pos: &crate::pos_defs::PosT) -> crate::pos_defs::Co
     unsafe { ml_get_len(pos.lnum) - pos.col }
 }
 
+/// @return codepoint at `pos` (`gchar_pos`). `pos` must be either
+/// valid or have `col` set to `MAXCOL` (matching the original's own
+/// documented contract) - when searching, columns are sometimes put
+/// at the end of a line.
+///
+/// # Safety
+/// Same as [`ml_get`].
+#[must_use]
+pub unsafe fn gchar_pos(pos: &crate::pos_defs::PosT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if pos.col == crate::pos_defs::MAXCOL || pos.col > unsafe { ml_get_len(pos.lnum) } {
+        return 0; // NUL
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { ml_get_pos(pos) };
+    crate::mbyte::utf_ptr2char(&line)
+}
+
 /// Increment the line pointer `lp` crossing line boundaries as
 /// necessary (`inc`).
 ///
@@ -3187,6 +3205,64 @@ mod tests {
             let pos = crate::pos_defs::PosT { lnum: 2, col: 2, coladd: 0 };
             assert_eq!(ml_get_pos_len(&pos), 3); // "world"[2..] = "rld"
             assert_eq!(ml_get_pos(&pos), b"rld\0".to_vec());
+        }
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn gchar_pos_returns_the_codepoint_at_a_position() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        unsafe {
+            // "world", col 0 = 'w'.
+            let pos = crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 };
+            assert_eq!(gchar_pos(&pos), i32::from(b'w'));
+
+            // "world", col 4 = 'd' (the last real character).
+            let pos = crate::pos_defs::PosT { lnum: 2, col: 4, coladd: 0 };
+            assert_eq!(gchar_pos(&pos), i32::from(b'd'));
+        }
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn gchar_pos_returns_nul_past_the_end_of_the_line() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        unsafe {
+            // "world" has length 5, so col 5 is the trailing NUL.
+            let pos = crate::pos_defs::PosT { lnum: 2, col: 5, coladd: 0 };
+            assert_eq!(gchar_pos(&pos), 0);
+
+            // Genuinely past the end of the line.
+            let pos = crate::pos_defs::PosT { lnum: 2, col: 6, coladd: 0 };
+            assert_eq!(gchar_pos(&pos), 0);
+        }
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn gchar_pos_returns_nul_when_col_is_maxcol() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = build_three_line_two_block_memline();
+        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
+        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+
+        unsafe {
+            let pos = crate::pos_defs::PosT { lnum: 2, col: crate::pos_defs::MAXCOL, coladd: 0 };
+            assert_eq!(gchar_pos(&pos), 0);
         }
 
         unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;

@@ -61,11 +61,12 @@
 //! `Some(...)`); `mark_get_local`/`mark_get_global`/`mark_get` (now
 //! tractable given `pos_to_mark`/`mark_get_visual`/`bt_prompt`/
 //! `fname2fnum` all exist - `mark_get_local`'s own final `else`
-//! branch, `mark_get_motion`, is now real for `{`/`}` (paragraph/
-//! section) via `textobject.c`'s `findpar`; `(`/`)` (sentence motion)
-//! still `unimplemented!()`s, needing `findsent` - a genuinely
-//! different, substantially more involved algorithm, deliberately not
-//! attempted alongside `findpar`); `get_jumplist`
+//! branch, `mark_get_motion`, is now real for BOTH `{`/`}`
+//! (paragraph/section, via `textobject.c`'s `findpar`) AND `(`/`)`
+//! (sentence motion, via `textobject.c`'s `findsent`) - the latter a
+//! genuinely different, substantially more involved algorithm,
+//! deliberately translated in its own dedicated pass rather than
+//! alongside `findpar`); `get_jumplist`
 //! (the real `` <C-O> ``/`` <C-I> `` jumplist-navigation entry point,
 //! distinct from `f_getjumplist`/`getjumplist()`, already translated
 //! in `eval/funcs.rs` - now tractable given `cleanup_jumplist`/
@@ -1649,7 +1650,14 @@ unsafe fn mark_get_motion(buf: &BufT, win: *mut WinT, name: i32) -> *mut FmarkT 
         }
     } else if name == i32::from(b'(') || name == i32::from(b')') {
         // to previous/next sentence
-        unimplemented!("mark::mark_get_motion: findsent (textobject.c) is not yet translated");
+        let dir = if name == i32::from(b')') { Direction::Forward } else { Direction::Backward };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::textobject::findsent(dir, 1) } {
+            // SAFETY: forwarded from this function's own safety doc.
+            let win_cursor = unsafe { (*win).w_cursor };
+            // SAFETY: forwarded from this function's own safety doc.
+            mark = unsafe { pos_to_mark(buf, None, win_cursor) };
+        }
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -4424,13 +4432,71 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "findsent (textobject.c) is not yet translated")]
-    fn mark_get_local_open_paren_still_panics_needing_findsent() {
-        let mut curbuf_dummy = BufT::default();
+    fn mark_get_local_open_paren_moves_backward_to_the_previous_sentence() {
         let mut buf = BufT::default();
-        let mut win = WinT::default();
-        let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut curbuf_dummy as *mut BufT);
-        unsafe { mark_get_local(&mut buf, &mut win, i32::from(b'(')) };
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_cursor: PosT { lnum: 1, col: 13, coladd: 0 }, // start of "Foo bar."
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        // Constructed *before* `ml_open` runs, matching
+        // `mark_get_local_close_brace_finds_the_next_blank_line_via_findpar`'s
+        // own established pattern.
+        let guard = MarkTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(unsafe { crate::memline::ml_open(&mut *buf_ptr) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut *buf_ptr, 1, b"Hello world. Foo bar.\0") },
+            crate::vim_defs::OK
+        );
+
+        // SAFETY: win_ptr and GLOBALS.curwin are the same window here,
+        // matching mark_get_motion's own documented design assumption.
+        let mark = unsafe { mark_get_local(&mut *buf_ptr, win_ptr, i32::from(b'(')) };
+        assert!(!mark.is_null());
+        assert_eq!(unsafe { (*mark).mark }, PosT { lnum: 1, col: 0, coladd: 0 }); // "Hello..."
+        assert_eq!(unsafe { (*mark).fnum }, unsafe { (*buf_ptr).handle });
+        // The real cursor is restored to where it started, matching
+        // `mark_get_motion`'s own `curwin->w_cursor = pos;` tail.
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 13);
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn mark_get_local_close_paren_moves_forward_to_the_next_sentence() {
+        let mut buf = BufT::default();
+        let buf_ptr = &mut buf as *mut BufT;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let guard = MarkTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(unsafe { crate::memline::ml_open(&mut *buf_ptr) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut *buf_ptr, 1, b"Hello world. Foo bar.\0") },
+            crate::vim_defs::OK
+        );
+
+        let mark = unsafe { mark_get_local(&mut *buf_ptr, win_ptr, i32::from(b')')) };
+        assert!(!mark.is_null());
+        assert_eq!(unsafe { (*mark).mark }, PosT { lnum: 1, col: 13, coladd: 0 }); // "Foo bar."
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0); // restored
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 
     #[test]

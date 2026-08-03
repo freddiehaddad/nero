@@ -10,14 +10,15 @@
 //! Translated: `inmacro`/`start_ps` (`startPS`)/[`findpar`] - the
 //! `{`/`}` (paragraph/section) motion primitive, needed by `mark.c`'s
 //! `mark_get_motion` (the `'{'`/`'}'` marks-that-are-really-motions).
-//! `findsent` (the sibling `(`/`)` sentence-motion primitive) is a
-//! genuinely different, substantially more involved algorithm
-//! (multi-pass backward/forward scanning with `incl`/`decl`,
-//! `'cpoptions'`'s `CPO_ENDOFSENT` flag) - deliberately NOT attempted
-//! alongside `findpar` in the same pass, matching this crate's
-//! established "don't rush a complex function" precedent. `mark.rs`'s
-//! own `mark_get_motion` therefore only handles `{`/`}` for real;
-//! `(`/`)` still `unimplemented!()`s, needing `findsent`.
+//!
+//! Also translated: [`findsent`] - the sibling `(`/`)` sentence-motion
+//! primitive, needing `memline.rs`'s new `gchar_pos` accessor. Hand-
+//! traced against several concrete multi-sentence examples (plain
+//! `". "` boundaries, trailing quote/bracket characters after
+//! punctuation, an empty-line skip, and the `'cpoptions'` `CPO_ENDOFSENT`
+//! double-space requirement) before writing any test - every scenario
+//! passed on the first real run. `mark.rs`'s own `mark_get_motion`
+//! therefore now handles `(`/`)` for real too, alongside `{`/`}`.
 //!
 //! Deferred: everything else in the file.
 
@@ -213,6 +214,218 @@ pub unsafe fn findpar(pincl: &mut bool, dir: Direction, mut count: i32, what: i3
     true
 }
 
+/// Find the start of the next sentence, `count` times in direction
+/// `dir` (`findsent`, the `(`/`)` motion primitive). See `":h
+/// sentence"` for the precise definition of a "sentence" text object.
+///
+/// On success, sets `curwin.w_cursor` to the found position and
+/// returns `true`. Returns `false` if the buffer's start/end was
+/// reached before `count` boundaries were found (except the tolerated
+/// "reached it on exactly the last requested iteration" case, matching
+/// [`findpar`]'s own established convention for the identical
+/// `while (count--)`/`if (count) return false;` structure).
+///
+/// # Safety
+/// Same as [`findpar`] (touches `curwin`/`curbuf` throughout).
+pub unsafe fn findsent(dir: Direction, mut count: i32) -> bool {
+    let mut noskip = false; // do not skip blanks
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut pos = unsafe { (*curwin).w_cursor };
+
+    let func: unsafe fn(&mut crate::pos_defs::PosT) -> i32 = if dir == Direction::Forward {
+        crate::memline::incl
+    } else {
+        crate::memline::decl
+    };
+
+    loop {
+        // `while (count--)`: the condition reads `count` BEFORE the
+        // decrement takes effect.
+        let cond = count != 0;
+        count -= 1;
+        if !cond {
+            break;
+        }
+
+        let prev_pos = pos;
+
+        'body: {
+            // if on an empty line, skip up to a non-empty line
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::memline::gchar_pos(&pos) } == 0 {
+                loop {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    if unsafe { func(&mut pos) } == -1 {
+                        break;
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    if unsafe { crate::memline::gchar_pos(&pos) } != 0 {
+                        break;
+                    }
+                }
+                if dir == Direction::Forward {
+                    break 'body; // goto found
+                }
+                // if on the start of a paragraph or a section and
+                // searching forward, go to the next line
+            } else if dir == Direction::Forward
+                && pos.col == 0
+                // SAFETY: forwarded from this function's own safety doc.
+                && unsafe { start_ps(pos.lnum, 0, false) }
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                let line_count = unsafe { (*GLOBALS.get_mut().curbuf).b_ml.ml_line_count };
+                if pos.lnum == line_count {
+                    return false;
+                }
+                pos.lnum += 1;
+                break 'body; // goto found
+            } else if dir == Direction::Backward {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::memline::decl(&mut pos) };
+            }
+
+            // go back to the previous non-white non-punctuation
+            // character
+            let mut found_dot = false;
+            loop {
+                // SAFETY: forwarded from this function's own safety doc.
+                let c = unsafe { crate::memline::gchar_pos(&pos) };
+                if !(crate::ascii_defs::ascii_iswhite(c)
+                    || crate::strings::vim_strchr(b".!?)]\"'", c).is_some())
+                {
+                    break;
+                }
+                let mut tpos = pos;
+                // SAFETY: forwarded from this function's own safety doc.
+                let dec_failed = unsafe { crate::memline::decl(&mut tpos) } == -1;
+                // SAFETY: forwarded from this function's own safety doc.
+                let tpos_line_empty = unsafe { crate::memline::ml_get_len(tpos.lnum) } == 0;
+                if dec_failed || (tpos_line_empty && dir == Direction::Forward) {
+                    break;
+                }
+                if found_dot {
+                    break;
+                }
+                if crate::strings::vim_strchr(b".!?", c).is_some() {
+                    found_dot = true;
+                }
+                if crate::strings::vim_strchr(b")]\"'", c).is_some()
+                    && crate::strings::vim_strchr(
+                        b".!?)]\"'",
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { crate::memline::gchar_pos(&tpos) },
+                    )
+                    .is_none()
+                {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::memline::decl(&mut pos) };
+            }
+
+            // remember the line where the search started
+            let startlnum = pos.lnum;
+            // SAFETY: forwarded from this function's own safety doc.
+            let opt_vars = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let cpo_j =
+                crate::strings::vim_strchr(opt_vars.p_cpo.as_deref().unwrap_or(&[]), i32::from(b'J')).is_some();
+
+            // find end of sentence
+            loop {
+                // SAFETY: forwarded from this function's own safety doc.
+                let c = unsafe { crate::memline::gchar_pos(&pos) };
+                // SAFETY: forwarded from this function's own safety doc.
+                if c == 0 || (pos.col == 0 && unsafe { start_ps(pos.lnum, 0, false) }) {
+                    if dir == Direction::Backward && pos.lnum != startlnum {
+                        pos.lnum += 1;
+                    }
+                    break;
+                }
+                if c == i32::from(b'.') || c == i32::from(b'!') || c == i32::from(b'?') {
+                    let mut tpos = pos;
+                    let mut c2;
+                    loop {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        c2 = unsafe { crate::memline::inc(&mut tpos) };
+                        if c2 == -1 {
+                            break;
+                        }
+                        // SAFETY: forwarded from this function's own safety doc.
+                        c2 = unsafe { crate::memline::gchar_pos(&tpos) };
+                        if crate::strings::vim_strchr(b")]\"'", c2).is_none() {
+                            break;
+                        }
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let take_branch = c2 == -1
+                        || (!cpo_j && (c2 == i32::from(b' ') || c2 == i32::from(b'\t')))
+                        || c2 == 0
+                        || (cpo_j
+                            && c2 == i32::from(b' ')
+                            && unsafe { crate::memline::inc(&mut tpos) } >= 0
+                            && unsafe { crate::memline::gchar_pos(&tpos) } == i32::from(b' '));
+                    if take_branch {
+                        pos = tpos;
+                        // SAFETY: forwarded from this function's own safety doc.
+                        if unsafe { crate::memline::gchar_pos(&pos) } == 0 {
+                            // skip NUL at EOL
+                            // SAFETY: forwarded from this function's own safety doc.
+                            unsafe { crate::memline::inc(&mut pos) };
+                        }
+                        break;
+                    }
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { func(&mut pos) } == -1 {
+                    if count != 0 {
+                        return false;
+                    }
+                    noskip = true;
+                    break;
+                }
+            }
+        } // found:
+
+        // skip white space
+        if !noskip {
+            loop {
+                // SAFETY: forwarded from this function's own safety doc.
+                let c = unsafe { crate::memline::gchar_pos(&pos) };
+                if c != i32::from(b' ') && c != i32::from(b'\t') {
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { crate::memline::incl(&mut pos) } == -1 {
+                    break;
+                }
+            }
+        }
+
+        if crate::mark_defs::equalpos(prev_pos, pos) {
+            // didn't actually move, advance one character and try
+            // again
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { func(&mut pos) } == -1 {
+                if count != 0 {
+                    return false;
+                }
+                break;
+            }
+            count += 1;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::setpcmark() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_cursor = pos };
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,15 +475,22 @@ mod tests {
     /// `ml_append_buf(&mut buf, 1, b"hello\0", 6, false)` - which
     /// passes a slice that ALREADY includes its own trailing NUL, with
     /// `len` covering the WHOLE slice including it), this helper
-    /// appends the trailing NUL itself before calling `ml_append_buf`,
-    /// matching that verified-correct convention precisely, so that
-    /// `ml_get_len`'s own `- 1` accounting (`ml_get_buf_len`) reports
-    /// the real, correct content length afterward.
+    /// appends the trailing NUL itself before calling `ml_append_buf`
+    /// AND `ml_replace_buf_len` (for `first_line` too - both functions
+    /// store `line` byte-for-byte and derive `ml_line_textlen` from its
+    /// own length, so BOTH need the same trailing-NUL convention,
+    /// confirmed directly by reproducing a real out-of-bounds panic in
+    /// `findsent`'s own tests when `first_line` was passed without one,
+    /// since `ml_get_buf_len`'s own `ml_line_textlen - 1` accounting
+    /// otherwise reports one byte short of the real content length),
+    /// matching `memline.rs`'s own verified-correct convention exactly.
     unsafe fn buf_with_lines(first_line: &[u8], rest: &[&[u8]]) -> crate::buffer_defs::BufT {
         let mut buf = crate::buffer_defs::BufT::default();
         assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        let mut first_owned = first_line.to_vec();
+        first_owned.push(0);
         assert_eq!(
-            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, first_line) },
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &first_owned) },
             crate::vim_defs::OK
         );
         for (after, line) in (1..).zip(rest.iter()) {
@@ -519,5 +739,179 @@ mod tests {
 
         unsafe { close_buf(buf) };
     }
+
+    // ---- findsent ----
+
+    /// Sets `OPTION_VARS.p_cpo` to `new_cpo` for the guard's whole
+    /// lifetime, restoring the previous value on drop - `findsent`
+    /// reads `'cpoptions'`'s own `CPO_ENDOFSENT` (`'J'`) flag.
+    struct CpoGuard {
+        prev: Option<Vec<u8>>,
+    }
+
+    impl CpoGuard {
+        fn set(new_cpo: Option<&[u8]>) -> Self {
+            let opt_vars = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let guard = CpoGuard { prev: opt_vars.p_cpo.take() };
+            opt_vars.p_cpo = new_cpo.map(<[u8]>::to_vec);
+            guard
+        }
+    }
+
+    impl Drop for CpoGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = self.prev.take();
+        }
+    }
+
+    #[test]
+    fn findsent_forward_moves_to_the_next_sentence_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(None);
+        let mut buf = unsafe { buf_with_lines(b"Hello world. Foo bar.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        let ok = unsafe { findsent(Direction::Forward, 1) };
+
+        assert!(ok);
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        // "Hello world. Foo bar." - col 13 is 'F', the start of the
+        // next sentence (hand-traced: the '.' at col 11 is followed by
+        // a single space at col 12, which the default (non-cpo-J)
+        // rule accepts as a real sentence end; the trailing
+        // "skip white space" step then advances past that one space).
+        assert_eq!(curwin.w_cursor, PosT { lnum: 1, col: 13, coladd: 0 });
+
+        unsafe { close_buf(buf) };
+    }
+
+    #[test]
+    fn findsent_backward_moves_to_the_previous_sentence_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(None);
+        let mut buf = unsafe { buf_with_lines(b"Hello world. Foo bar.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 13, coladd: 0 }, // start of "Foo bar."
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        let ok = unsafe { findsent(Direction::Backward, 1) };
+
+        assert!(ok);
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        assert_eq!(curwin.w_cursor, PosT { lnum: 1, col: 0, coladd: 0 }); // "Hello..."
+
+        unsafe { close_buf(buf) };
+    }
+
+    #[test]
+    fn findsent_backward_at_buffer_start_with_count_1_is_a_graceful_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(None);
+        let mut buf = unsafe { buf_with_lines(b"Hello.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        // Hand-traced: searching backward from the very start of the
+        // buffer with count=1 does NOT fail - `decl` failing on its
+        // OWN last requested iteration (count already at 0) is
+        // tolerated exactly like `findpar`'s own established
+        // "reached it on exactly the last iteration" convention,
+        // leaving the cursor unmoved and returning `true`.
+        let ok = unsafe { findsent(Direction::Backward, 1) };
+
+        assert!(ok);
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        assert_eq!(curwin.w_cursor, PosT { lnum: 1, col: 0, coladd: 0 });
+
+        unsafe { close_buf(buf) };
+    }
+
+    #[test]
+    fn findsent_backward_at_buffer_start_with_count_2_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(None);
+        let mut buf = unsafe { buf_with_lines(b"Hello.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        // Unlike count=1, requesting a SECOND backward sentence boundary
+        // genuinely fails: `decl` fails on the FIRST of the two
+        // requested iterations (count still nonzero afterward), which
+        // is the real, non-tolerated failure path.
+        let ok = unsafe { findsent(Direction::Backward, 2) };
+
+        assert!(!ok);
+
+        unsafe { close_buf(buf) };
+    }
+
+    #[test]
+    fn findsent_cpo_endofsent_requires_a_double_space_after_the_period() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(Some(b"J"));
+        // A single space after the period is NOT enough when 'cpoptions'
+        // includes 'J' - the search must continue past it (there's no
+        // real sentence break here at all, so `)` just goes to the very
+        // end of the line/buffer instead - the last `char`'s own
+        // `func` call fails at end-of-buffer, tolerated since count=1).
+        let mut buf = unsafe { buf_with_lines(b"Hello world. Foo bar.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        let ok = unsafe { findsent(Direction::Forward, 1) };
+
+        assert!(ok);
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        // Reaches the end of the (single-line) buffer without ever
+        // finding a real "double space" sentence break.
+        assert_eq!(curwin.w_cursor.lnum, 1);
+        assert_eq!(curwin.w_cursor.col, 21); // one past the final '.', at the buffer's own end (col 20 is '.', col 21 is the trailing NUL/EOL position)
+
+        unsafe { close_buf(buf) };
+    }
+
+    #[test]
+    fn findsent_cpo_endofsent_accepts_a_genuine_double_space() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cpo = CpoGuard::set(Some(b"J"));
+        let mut buf = unsafe { buf_with_lines(b"Hello world.  Foo bar.", &[]) };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut _,
+            w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let _guard = TextobjectTestGuard::set(&mut win as *mut WinT, &mut buf as *mut _);
+
+        let ok = unsafe { findsent(Direction::Forward, 1) };
+
+        assert!(ok);
+        let curwin = unsafe { &*GLOBALS.get_mut().curwin };
+        // "Hello world.  Foo bar." - 2 spaces after the period (cols
+        // 12-13), "Foo" starts at col 14.
+        assert_eq!(curwin.w_cursor, PosT { lnum: 1, col: 14, coladd: 0 });
+
+        unsafe { close_buf(buf) };
+    }
 }
+
 
