@@ -6,15 +6,19 @@
 //! (`get_special_key_name`/`find_special_key_in_table`, a large
 //! generated table not transcribed here).
 //!
-//! Translated: [`name_to_mod_mask`], [`handle_x_keys`], and
+//! Translated: [`name_to_mod_mask`], [`handle_x_keys`],
 //! [`simplify_key`] - all pure, self-contained lookups needing only
 //! [`crate::keycodes_defs`]'s own (partial) constant/table
-//! translations.
+//! translations - and [`vim_unescape_ks`], a self-contained in-place
+//! unescape needing only [`crate::keycodes_defs::K_SPECIAL`]/
+//! [`crate::keycodes_defs::KS_SPECIAL`]/[`crate::keycodes_defs::KE_FILLER`].
 //!
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
 //! `find_special_key_in_table`/`find_special_key`/`replace_termcodes`/
 //! `trans_special`/`special_to_buf` (need the full generated key-name
-//! table), `get_mouse_button` (needs `mouse.c`).
+//! table), `get_mouse_button` (needs `mouse.c`), `add_char2buf`/
+//! `vim_strsave_escape_ks` (the escaping counterpart of
+//! `vim_unescape_ks` - needs `utf_ptr2len`, verify separately).
 
 use crate::ascii_defs::TAB;
 use crate::keycodes_defs::{
@@ -97,6 +101,38 @@ pub fn simplify_key(key: i32, modifiers: &mut i32) -> i32 {
         }
     }
     key
+}
+
+/// Remove escaping from `K_SPECIAL` characters - the reverse of
+/// `vim_strsave_escape_ks` (not yet translated - needs `add_char2buf`/
+/// `utf_ptr2len`). Works in place, returning the number of bytes in
+/// the unescaped result (`vim_unescape_ks`).
+///
+/// Modeled as `p: &mut [u8]` (in place, like the original's own
+/// `char *p` in/out buffer) rather than returning a fresh `Vec<u8>`:
+/// every real caller (`mapping.c`, `lua/executor.c`, `register.c`)
+/// already owns a mutable buffer it wants shrunk in place, matching
+/// this crate's established convention for genuinely in-place C
+/// buffer algorithms (e.g. `charset::rl_mirror_ascii`).
+#[must_use]
+pub fn vim_unescape_ks(p: &mut [u8]) -> usize {
+    let mut s = 0usize;
+    let mut d = 0usize;
+    while s < p.len() && p[s] != 0 {
+        if p[s] == crate::keycodes_defs::K_SPECIAL
+            && p.get(s + 1).copied() == Some(crate::keycodes_defs::KS_SPECIAL)
+            && p.get(s + 2).copied() == Some(crate::keycodes_defs::KE_FILLER)
+        {
+            p[d] = crate::keycodes_defs::K_SPECIAL;
+            d += 1;
+            s += 3;
+        } else {
+            p[d] = p[s];
+            d += 1;
+            s += 1;
+        }
+    }
+    d
 }
 
 #[cfg(test)]
@@ -212,5 +248,65 @@ mod tests {
         let mut modifiers = i32::from(MOD_MASK_CTRL);
         assert_eq!(simplify_key(K_F1, &mut modifiers), K_F1);
         assert_eq!(modifiers, i32::from(MOD_MASK_CTRL));
+    }
+
+    // --- vim_unescape_ks ---
+
+    fn ks() -> (u8, u8, u8) {
+        (crate::keycodes_defs::K_SPECIAL, crate::keycodes_defs::KS_SPECIAL, crate::keycodes_defs::KE_FILLER)
+    }
+
+    #[test]
+    fn vim_unescape_ks_unescapes_a_single_sequence() {
+        let (k, ks, ke) = ks();
+        let mut buf = [k, ks, ke, b'a', b'b'];
+        let new_len = vim_unescape_ks(&mut buf);
+        assert_eq!(new_len, 3);
+        assert_eq!(&buf[..new_len], &[k, b'a', b'b']);
+    }
+
+    #[test]
+    fn vim_unescape_ks_no_escape_sequences_is_unchanged() {
+        let mut buf = *b"hi\0\0\0";
+        let new_len = vim_unescape_ks(&mut buf);
+        assert_eq!(new_len, 2);
+        assert_eq!(&buf[..new_len], b"hi");
+    }
+
+    #[test]
+    fn vim_unescape_ks_bare_escape_sequence_becomes_one_byte() {
+        let (k, ks, ke) = ks();
+        let mut buf = [k, ks, ke];
+        let new_len = vim_unescape_ks(&mut buf);
+        assert_eq!(new_len, 1);
+        assert_eq!(buf[0], k);
+    }
+
+    #[test]
+    fn vim_unescape_ks_k_special_not_followed_by_the_full_pattern_is_left_alone() {
+        // K_SPECIAL followed by bytes that don't match KS_SPECIAL/
+        // KE_FILLER exactly - not a real escape sequence, copied
+        // through unchanged (matching the original's own exact-match
+        // requirement on all 3 bytes).
+        let (k, _, _) = ks();
+        let mut buf = [k, b'x', b'y', 0];
+        let new_len = vim_unescape_ks(&mut buf);
+        assert_eq!(new_len, 3);
+        assert_eq!(&buf[..new_len], &[k, b'x', b'y']);
+    }
+
+    #[test]
+    fn vim_unescape_ks_multiple_sequences_in_one_buffer() {
+        let (k, ks, ke) = ks();
+        let mut buf = [k, ks, ke, b'-', k, ks, ke, 0];
+        let new_len = vim_unescape_ks(&mut buf);
+        assert_eq!(new_len, 3);
+        assert_eq!(&buf[..new_len], &[k, b'-', k]);
+    }
+
+    #[test]
+    fn vim_unescape_ks_empty_string_stays_empty() {
+        let mut buf = [0u8];
+        assert_eq!(vim_unescape_ks(&mut buf), 0);
     }
 }
