@@ -408,6 +408,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"strcharlen"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strcharlen });
         m.insert(&b"strchars"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strchars });
         m.insert(&b"strwidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_strwidth });
+        m.insert(&b"charclass"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_charclass });
         m.insert(&b"strdisplaywidth"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strdisplaywidth });
         m.insert(&b"strutf16len"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_strutf16len });
         m.insert(&b"stridx"[..], EvalFuncDefT { min_argc: 2, max_argc: 3, base_arg: 1, func: f_stridx });
@@ -4414,6 +4415,32 @@ unsafe fn f_strwidth(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(unsafe { crate::mbyte::mb_string2cells(&s) } as i64);
 }
 
+/// `charclass({string})` - the character class of the first character
+/// in `{string}` (`f_charclass`, `mbyte.c`), via the already-real
+/// [`crate::mbyte::mb_get_class`]: `0` blank, `1` punctuation, `2`
+/// word character (depends on `'iskeyword'`), `3` emoji, or higher for
+/// a specific Unicode class.
+///
+/// `rettv` is left untouched (matching the original's own bare
+/// `return;`, before ever assigning anything into it) when `{string}`
+/// isn't a `String`, or is a null `String` (`argvars[0].vval.v_string
+/// == NULL`, matching `TypvalValue::String(None)` here) - the same
+/// "leaves rettv untouched" contract already established for other
+/// argument-type-check failures in this module (e.g. `f_getreg`'s own
+/// type-error path).
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::mb_get_class`]'s own safety doc.
+unsafe fn f_charclass(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_string_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let TypvalValue::String(s) = &argvars[0].value else { unreachable!() };
+    let Some(s) = s else { return };
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::Number(i64::from(unsafe { crate::mbyte::mb_get_class(s) }));
+}
+
 /// `strdisplaywidth({string} [, {col}])` - the number of display cells
 /// `{string}` would occupy if displayed starting at screen column
 /// `{col}` (default `0`), accounting for `'tabstop'` (`f_strdisplaywidth`,
@@ -8242,6 +8269,7 @@ mod tests {
             "strcharlen",
             "strchars",
             "strwidth",
+            "charclass",
             "strdisplaywidth",
             "strutf16len",
             "stridx",
@@ -12707,6 +12735,44 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_strwidth(&[string("一".as_bytes())], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(2));
+    }
+
+    #[test]
+    fn charclass_classifies_blank_punctuation_and_word() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_charclass(&[string(b"a")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(2));
+
+        unsafe { f_charclass(&[string(b" ")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        unsafe { f_charclass(&[string(b"!")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        unsafe { f_charclass(&[string("中".as_bytes())], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0x4e00));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+    }
+
+    #[test]
+    fn charclass_non_string_argument_leaves_rettv_untouched() {
+        let mut rettv = TypvalT::default();
+        unsafe { f_charclass(&[num(5)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::default());
+    }
+
+    #[test]
+    fn charclass_null_string_argument_leaves_rettv_untouched() {
+        let mut rettv = TypvalT::default();
+        let null_string = TypvalT { value: TypvalValue::String(None), ..Default::default() };
+        unsafe { f_charclass(&[null_string], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::default());
     }
 
     #[test]
