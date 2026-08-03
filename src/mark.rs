@@ -147,11 +147,13 @@
 //! `b_last_change`/`free_fmark` (local).
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `switch_to_mark_buf`/`mark_move_to`: need window switching
-//!   (`ctx_switch`, not the bypass-only `ctx_restore`) or `findsent`
-//!   (`search.c`/`textobject.c`, for their own `(`/`)` sentence-motion
-//!   support - `mark_get_motion`'s own `{`/`}` branch is translated,
-//!   see above).
+//! - `switch_to_mark_buf`/`mark_move_to`: re-verified directly against
+//!   the real source (an earlier note here citing `findsent` was
+//!   stale/inaccurate - neither function actually calls it) - the
+//!   real, precise blocker is `buffer.c`'s `buflist_getfile`, needing
+//!   `text_or_buf_locked`/`swbuf_goto_win_with_buf`/`win_split`/
+//!   `tabpage_new`/`getfile` (real window-splitting, buffer-switching,
+//!   and file-loading machinery), none translated.
 //! - `ex_marks`: the real, current upstream source is just a thin
 //!   `nlua_call_excmd(...)` wrapper delegating to a Lua implementation
 //!   (`vim._core.marks`) - needs the Lua host (`lua/executor.c`, phase
