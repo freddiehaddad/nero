@@ -7,7 +7,14 @@
 //! its own sub-paths are narrower than the original - see below),
 //! `ml_new_ptr`, `ml_new_data`, `set_b0_fname` (only the
 //! `buf.b_ffname.is_none()` fast path - see the note below),
-//! `add_b0_fenc`, `long_to_char`/`char_to_long`, `ml_add_stack`,
+//! `add_b0_fenc`, `ml_setflags` (writes the is-changed/`'fileformat'`/
+//! `'fileencoding'` bits into block 0 and marks it dirty - reads the
+//! current `b0_fname` sub-range out of the raw block-0 byte buffer
+//! into a scratch `ZeroBlock` rather than casting a live `ZeroBlock *`
+//! pointer through it like the original does, since this crate's
+//! block-0 bytes are the *packed* representation, not a live struct
+//! instance - see `ml_setflags`'s own doc comment), `long_to_char`/
+//! `char_to_long`, `ml_add_stack`,
 //! `ml_lineadd`, `ml_add_deleted_len`/`ml_add_deleted_len_buf` (the
 //! common, non-`update_need_codepoints` path), `ml_updatechunk` (a
 //! no-op stub - see below), **`ml_find_line`** (the real B-tree
@@ -187,8 +194,8 @@
 use crate::buffer_defs::BufT;
 use crate::ex_cmds_defs::cmod;
 use crate::globals::{GlobalCell, GLOBALS};
-use crate::memfile::{mf_free, mf_get, mf_new, mf_open, mf_put, mf_sync, mf_trans_del};
-use crate::memfile_defs::{BhdrT, BlocknrT, MemfileT};
+use crate::memfile::{mf_free, mf_get, mf_new, mf_open, mf_put, mf_sync, mf_trans_del, mfs_flag};
+use crate::memfile_defs::{BhdrT, BlocknrT, MemfileT, BH_DIRTY};
 use crate::memline_defs::{
     InfoptrT, ML_ALLOCATED, ML_CHNK_ADDLINE, ML_CHNK_DELLINE, ML_CHNK_UPDLINE, ML_EMPTY,
     ML_LINE_DIRTY, ML_LOCKED_DIRTY, ML_LOCKED_POS,
@@ -272,6 +279,9 @@ const ZERO_BLOCK_SIZE: usize = ZB_OFF_MAGIC_CHAR + 1;
 // Values for the b0_dirty/b0_flags "aliased into the tail of b0_fname"
 // trick (`#define b0_dirty b0_fname[B0_FNAME_SIZE_ORG - 1]` etc.).
 const B0_DIRTY: u8 = 0x55;
+/// Mask for the `'fileformat'` bits within `b0_flags` (`B0_FF_MASK`,
+/// used by [`ml_setflags`]).
+const B0_FF_MASK: u8 = 3;
 const B0_HAS_FENC: u8 = 8;
 
 const B0_MAGIC_LONG: i64 = 0x3031_3233;
@@ -629,6 +639,58 @@ fn add_b0_fenc(b0: &mut ZeroBlock, buf: &BufT) {
         b0.b0_fname[dst_start - 1] = 0;
         b0.set_b0_flags(b0.b0_flags() | B0_HAS_FENC);
     }
+}
+
+/// Writes information into memline for closing the file and setting
+/// the flags for recovery: is-changed, fileformat, `'fileencoding'`
+/// (`ml_setflags`). Called when starting to edit a buffer for a
+/// swapfile, or when the buffer changes.
+///
+/// Deviates from the original's own `ZeroBlock *b0p = hp->bh_data;`
+/// direct-pointer-cast-then-mutate-through-it idiom: this crate's
+/// block-0 bytes are the raw *packed* byte buffer (see the module doc
+/// comment on why `ZeroBlock` isn't a `#[repr(C)]` reinterpretation),
+/// not a live `ZeroBlock` struct instance, so there is nothing to
+/// mutate "in place" directly. Instead, recovers the current
+/// `b0_fname` sub-range (which is the ONLY part of block 0 this
+/// function - via `set_b0_dirty`/`set_b0_flags`/`add_b0_fenc`, none of
+/// which touch any other `ZeroBlock` field - ever touches) into a
+/// scratch `ZeroBlock` (every other scratch field stays at its zeroed
+/// [`ZeroBlock::new`] default, which is safe precisely because those
+/// other fields are never read/written here), mutates it through the
+/// same real functions `ml_open` itself uses, then writes only that
+/// `b0_fname` sub-range back - never the whole scratch `ZeroBlock`,
+/// which would otherwise stomp over the real, already-written
+/// `b0_page_size`/`b0_mtime`/`b0_ino`/`b0_pid`/`b0_uname`/`b0_hname`
+/// bytes elsewhere in the buffer.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT`.
+pub unsafe fn ml_setflags(buf: &mut BufT) {
+    if buf.b_ml.ml_mfp.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mfp = unsafe { &mut *buf.b_ml.ml_mfp };
+    let Some(&hp) = mfp.mf_hash.get(&0) else {
+        return;
+    };
+    // SAFETY: `hp` came from `mfp`'s own `mf_hash`, a valid, currently
+    // in-use block header (forwarded from this function's own safety
+    // doc).
+    let data = unsafe { (*hp).bh_data.as_data_mut() };
+    let mut scratch = ZeroBlock::new(0);
+    scratch.b0_fname.copy_from_slice(&data[ZB_OFF_FNAME..ZB_OFF_FNAME + B0_FNAME_SIZE_ORG]);
+    scratch.set_b0_dirty(if buf.b_changed != 0 { B0_DIRTY } else { 0 });
+    scratch.set_b0_flags((scratch.b0_flags() & !B0_FF_MASK) | (get_fileformat(buf) + 1) as u8);
+    add_b0_fenc(&mut scratch, buf);
+    data[ZB_OFF_FNAME..ZB_OFF_FNAME + B0_FNAME_SIZE_ORG].copy_from_slice(&scratch.b0_fname);
+    // SAFETY: `hp` is the same valid pointer as above.
+    unsafe { (*hp).bh_flags |= BH_DIRTY };
+    // SAFETY: `mfp` is a valid, currently-open `MemfileT` (forwarded
+    // from this function's own safety doc).
+    unsafe { mf_sync(mfp, mfs_flag::ZERO) };
 }
 
 /// Open a new memline for `buf` (`ml_open`).
@@ -2679,6 +2741,161 @@ mod tests {
             let data = (*hp).bh_data.as_data();
             assert_eq!(data[ZB_OFF_ID], BLOCK0_ID0);
             assert_eq!(data[ZB_OFF_ID + 1], BLOCK0_ID1);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    /// Recovers block 0's current `b0_fname` sub-range (the only part
+    /// [`ml_setflags`] ever mutates) into a fresh scratch [`ZeroBlock`]
+    /// so its `b0_dirty()`/`b0_flags()` accessors can be used to
+    /// inspect it, mirroring `ml_setflags`'s own internal technique.
+    unsafe fn read_block0_fname(buf: &mut BufT) -> ZeroBlock {
+        let mfp = &mut *buf.b_ml.ml_mfp;
+        let hp = mfp.mf_hash.get(&0).copied().expect("block 0 should be cached");
+        let data = (*hp).bh_data.as_data();
+        let mut zb = ZeroBlock::new(0);
+        zb.b0_fname.copy_from_slice(&data[ZB_OFF_FNAME..ZB_OFF_FNAME + B0_FNAME_SIZE_ORG]);
+        zb
+    }
+
+    #[test]
+    fn ml_setflags_is_a_noop_when_ml_mfp_is_null() {
+        // BufT::default() leaves b_ml.ml_mfp null - must not panic.
+        let mut buf = test_buf();
+        unsafe { ml_setflags(&mut buf) };
+    }
+
+    #[test]
+    fn ml_setflags_sets_dirty_flag_when_buffer_changed() {
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_changed = 1;
+            ml_setflags(&mut buf);
+            assert_eq!(read_block0_fname(&mut buf).b0_dirty(), B0_DIRTY);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    #[test]
+    fn ml_setflags_clears_dirty_flag_when_buffer_unchanged() {
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_changed = 1;
+            ml_setflags(&mut buf);
+            assert_eq!(read_block0_fname(&mut buf).b0_dirty(), B0_DIRTY);
+
+            // Now mark it unchanged and re-run: the dirty byte should
+            // flip back to 0.
+            buf.b_changed = 0;
+            ml_setflags(&mut buf);
+            assert_eq!(read_block0_fname(&mut buf).b0_dirty(), 0);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    #[test]
+    fn ml_setflags_updates_the_fileformat_bits_without_touching_has_fenc() {
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_p_fenc = Some(b"utf-8".to_vec());
+            buf.b_p_ff = Some(b"unix".to_vec());
+            ml_setflags(&mut buf);
+            let zb = read_block0_fname(&mut buf);
+            assert_eq!(zb.b0_flags() & B0_FF_MASK, (get_fileformat(&buf) + 1) as u8);
+            // 'fileencoding' is non-empty and fits, so B0_HAS_FENC must
+            // stay set - the fileformat-bits update must not disturb it
+            // (it lives in the SAME byte, via the `& !B0_FF_MASK`
+            // preserve-other-bits mask).
+            assert_ne!(zb.b0_flags() & B0_HAS_FENC, 0);
+
+            // Now switch to "dos" and verify the ff bits actually
+            // changed to match.
+            buf.b_p_ff = Some(b"dos".to_vec());
+            ml_setflags(&mut buf);
+            let zb2 = read_block0_fname(&mut buf);
+            assert_eq!(zb2.b0_flags() & B0_FF_MASK, (get_fileformat(&buf) + 1) as u8);
+            assert_ne!(zb.b0_flags() & B0_FF_MASK, zb2.b0_flags() & B0_FF_MASK);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    #[test]
+    fn ml_setflags_sets_has_fenc_even_for_an_empty_fenc_that_still_fits() {
+        // Real, verified-against-source upstream quirk: `add_b0_fenc`
+        // only clears B0_HAS_FENC when the (possibly-empty) fenc
+        // string, plus a NUL, would NOT fit in the remaining
+        // `b0_fname` space - an EMPTY fenc always fits (0 bytes), so
+        // B0_HAS_FENC is set unconditionally in that case too, not
+        // cleared. Translated faithfully rather than "fixed".
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_p_fenc = Some(Vec::new());
+            ml_setflags(&mut buf);
+            assert_ne!(read_block0_fname(&mut buf).b0_flags() & B0_HAS_FENC, 0);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    #[test]
+    fn ml_setflags_clears_has_fenc_when_fileencoding_does_not_fit() {
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_p_fenc = Some(b"utf-8".to_vec());
+            ml_setflags(&mut buf);
+            assert_ne!(read_block0_fname(&mut buf).b0_flags() & B0_HAS_FENC, 0);
+
+            // A 'fileencoding' value too long to fit in the remaining
+            // b0_fname space (B0_FNAME_SIZE_NOCRYPT == 898 bytes)
+            // clears B0_HAS_FENC instead.
+            buf.b_p_fenc = Some(vec![b'x'; 1000]);
+            ml_setflags(&mut buf);
+            assert_eq!(read_block0_fname(&mut buf).b0_flags() & B0_HAS_FENC, 0);
+
+            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp_owned, false);
+        }
+    }
+
+    #[test]
+    fn ml_setflags_marks_the_block_header_dirty() {
+        let mut buf = test_buf();
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            // Explicitly clear the dirty bit first (rather than
+            // assuming ml_open leaves it clean - it may not, e.g.
+            // when the memfile has no real backing file for
+            // mf_sync's own write to actually succeed against), so
+            // this test genuinely exercises ml_setflags's own
+            // `bh_flags |= BH_DIRTY` line rather than coincidentally
+            // observing a leftover flag from ml_open itself.
+            let mfp = &mut *buf.b_ml.ml_mfp;
+            let hp = mfp.mf_hash.get(&0).copied().unwrap();
+            (*hp).bh_flags &= !BH_DIRTY;
+            assert_eq!((*hp).bh_flags & BH_DIRTY, 0, "precondition: block 0 starts clean");
+
+            ml_setflags(&mut buf);
+            assert_ne!((*hp).bh_flags & BH_DIRTY, 0);
 
             let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp_owned, false);
