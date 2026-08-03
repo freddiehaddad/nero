@@ -26,6 +26,13 @@
 //! so this is a provably observably-identical simplification, not a
 //! behavior change.
 //!
+//! Also translated: `bytes2offset` - the exact inverse of
+//! `crate::spellfile::offset2bytes` (already real), a pure,
+//! self-contained byte-decoding algorithm with no dependency on the
+//! `slang_T` machinery at all. No real caller yet either (deep inside
+//! the same untranslated spell-suggestion engine) - harvested ahead of
+//! it for the same reason as `spell_check_sps` above.
+//!
 //! Deferred: everything else in the file.
 
 use crate::ascii_defs::ascii_isdigit;
@@ -135,6 +142,52 @@ pub unsafe fn spell_check_sps() -> i32 {
         *SPS_LIMIT.get_mut() = new_limit;
     }
     OK
+}
+
+/// Decode a byte-offset value encoded by
+/// [`crate::spellfile::offset2bytes`] (`bytes2offset`), the opposite
+/// of that function. Returns the decoded offset and the number of
+/// bytes consumed (`(nr, consumed)`), in place of the original's own
+/// `char **pp` advancing-pointer out-parameter, matching this crate's
+/// established C-out-parameter-to-owned-return convention.
+///
+/// No real caller is translated yet (its own real caller, deep inside
+/// `spellsuggest.c`'s substantial, untranslated real spell-suggestion
+/// engine, needs `slang_T` spell-language data) - harvested ahead of
+/// it, matching this crate's established precedent for a small,
+/// self-contained function with no design freedom of its own.
+#[must_use]
+pub fn bytes2offset(p: &[u8]) -> (i32, usize) {
+    let mut i = 0usize;
+    let c = i32::from(p[i]);
+    i += 1;
+    let mut nr;
+    if c & 0x80 == 0x00 {
+        // 1 byte
+        nr = c - 1;
+    } else if c & 0xc0 == 0x80 {
+        // 2 bytes
+        nr = (c & 0x3f) - 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+    } else if c & 0xe0 == 0xc0 {
+        // 3 bytes
+        nr = (c & 0x1f) - 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+    } else {
+        // 4 bytes
+        nr = (c & 0x0f) - 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+        nr = nr * 255 + (i32::from(p[i]) - 1);
+        i += 1;
+    }
+    (nr, i)
 }
 
 #[cfg(test)]
@@ -272,5 +325,66 @@ mod tests {
         assert_eq!(unsafe { spell_check_sps() }, FAIL);
         assert_eq!(unsafe { sps_limit() }, 9999);
         assert_eq!(unsafe { sps_flags() }, SPS_BEST);
+    }
+
+    // --- bytes2offset ---
+
+    #[test]
+    fn bytes2offset_decodes_a_1_byte_value() {
+        // offset2bytes(0) == [1] (hand-verified in spellfile.rs's own
+        // tests).
+        assert_eq!(bytes2offset(&[1]), (0, 1));
+    }
+
+    #[test]
+    fn bytes2offset_decodes_a_2_byte_value() {
+        // offset2bytes(127) is 2 bytes (spellfile.rs's own
+        // `offset2bytes_crosses_into_the_2_byte_encoding` test):
+        // b1 = 127 % 255 + 1 = 128 > 0x7f, so nr=127 needs 2 bytes.
+        // b1 = 128, rem = 0, b2 = 0 % 255 + 1 = 1.
+        // Encoded as [0x80 + 1, 128] = [0x81, 0x80].
+        let (nr, consumed) = bytes2offset(&[0x81, 0x80]);
+        assert_eq!(nr, 127);
+        assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn bytes2offset_only_consumes_its_own_bytes_leaving_the_rest() {
+        // A 1-byte value followed by unrelated trailing data - only
+        // the first byte should be consumed.
+        let (nr, consumed) = bytes2offset(&[1, 0xff, 0xff]);
+        assert_eq!(nr, 0);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn bytes2offset_round_trips_with_offset2bytes_across_every_encoding_width() {
+        // The single strongest correctness check available: for a
+        // wide spread of values (one hand-picked from each of
+        // offset2bytes's own 1/2/3/4-byte branches, per its real
+        // b1/b2/b3/b4 arithmetic), decoding what it encoded must
+        // recover the exact original value and consume every byte it
+        // produced.
+        for nr in [
+            0,          // 1 byte (see offset2bytes(0) == [1] above)
+            100,        // 1 byte
+            126,        // 1 byte (offset2bytes's own upper-bound test)
+            127,        // 2 bytes (offset2bytes's own crossing-point test)
+            254,
+            255,
+            1_000,
+            65_535,     // crosses into the 3-byte range
+            1_000_000,  // crosses into the 4-byte range
+            100_000_000,
+        ] {
+            let encoded = crate::spellfile::offset2bytes(nr);
+            let (decoded, consumed) = bytes2offset(&encoded);
+            assert_eq!(decoded, nr, "round-trip mismatch for nr={nr}, encoded={encoded:?}");
+            assert_eq!(
+                consumed,
+                encoded.len(),
+                "bytes2offset should consume every byte offset2bytes produced for nr={nr}"
+            );
+        }
     }
 }
