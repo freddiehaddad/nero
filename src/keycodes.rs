@@ -39,6 +39,12 @@
 //! single-pass `Vec` replacing the original's 2-pass C string
 //! building).
 //!
+//! Also translated: [`extract_modifiers`] - folds Ctrl/Shift modifiers
+//! into a single-byte key where possible (e.g. `"Shift-a"` -> `'A'`,
+//! `"Ctrl-@"` -> [`crate::keycodes_defs::K_ZERO`]), needing only
+//! already-real [`crate::macros_defs::ascii_isalpha`]/
+//! [`crate::macros_defs::toupper_asc`]/[`crate::ascii_defs::ctrl_chr`].
+//!
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
 //! `find_special_key`/`replace_termcodes`/`trans_special`/
 //! `special_to_buf` (need substantially more parsing logic beyond the
@@ -432,6 +438,60 @@ pub fn get_special_key_code(name: &[u8]) -> i32 {
     }
     0
 }
+
+/// Try to include modifiers (except alt/meta) in the key. Changes
+/// `"Shift-a"` to `'A'`, `"Ctrl-@"` to `<Nul>`, etc. (`extract_modifiers`).
+///
+/// `simplify`: if `false`, don't do Ctrl. `did_simplify`: set to `true`
+/// when it is `Some` and `simplify` is `true` and Ctrl is removed from
+/// `modifiers`.
+///
+/// No real caller is translated yet (`find_special_key`, needing
+/// substantially more parsing logic beyond what's translated so far -
+/// see this module's own doc comment) - harvested ahead of it,
+/// matching this crate's established precedent for a small,
+/// self-contained function with no design freedom of its own.
+#[must_use]
+#[allow(dead_code)] // no real translated caller yet - see this function's own doc comment
+pub fn extract_modifiers(key: i32, modifiers: &mut i32, simplify: bool, did_simplify: Option<&mut bool>) -> i32 {
+    let mut key = key;
+
+    if *modifiers & i32::from(crate::keycodes_defs::MOD_MASK_SHIFT) != 0
+        && crate::macros_defs::ascii_isalpha(key)
+    {
+        key = crate::macros_defs::toupper_asc(key);
+        // With <C-S-a> we keep the shift modifier.
+        // With <S-a>, <A-S-a> and <S-A> we don't keep the shift modifier.
+        if *modifiers & i32::from(crate::keycodes_defs::MOD_MASK_CTRL) == 0 {
+            *modifiers &= !i32::from(crate::keycodes_defs::MOD_MASK_SHIFT);
+        }
+    }
+
+    // <C-H> and <C-h> mean the same thing, always use "H"
+    if *modifiers & i32::from(crate::keycodes_defs::MOD_MASK_CTRL) != 0
+        && crate::macros_defs::ascii_isalpha(key)
+    {
+        key = crate::macros_defs::toupper_asc(key);
+    }
+
+    if simplify
+        && *modifiers & i32::from(crate::keycodes_defs::MOD_MASK_CTRL) != 0
+        && ((key >= i32::from(b'?') && key <= i32::from(b'_')) || crate::macros_defs::ascii_isalpha(key))
+    {
+        key = crate::ascii_defs::ctrl_chr(key);
+        *modifiers &= !i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        if key == 0 {
+            // <C-@> is <Nul>
+            key = K_ZERO;
+        }
+        if let Some(did_simplify) = did_simplify {
+            *did_simplify = true;
+        }
+    }
+
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +756,85 @@ mod tests {
         // instead (and "t_a" itself isn't a real key name, so this
         // resolves to 0).
         assert_eq!(get_special_key_code(b"t_a"), 0);
+    }
+
+    // --- extract_modifiers ---
+
+    #[test]
+    fn extract_modifiers_shift_alone_uppercases_and_clears_shift() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_SHIFT);
+        let key = extract_modifiers(i32::from(b'a'), &mut modifiers, true, None);
+        assert_eq!(key, i32::from(b'A'));
+        assert_eq!(modifiers, 0);
+    }
+
+    #[test]
+    fn extract_modifiers_ctrl_shift_together_keeps_shift_and_simplifies_to_ctrl_a() {
+        let mut modifiers =
+            i32::from(crate::keycodes_defs::MOD_MASK_SHIFT) | i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let mut did_simplify = false;
+        let key = extract_modifiers(i32::from(b'a'), &mut modifiers, true, Some(&mut did_simplify));
+        // Ctrl-A is 0x01.
+        assert_eq!(key, 0x01);
+        // Shift is retained (only Ctrl was consumed).
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_SHIFT));
+        assert!(did_simplify);
+    }
+
+    #[test]
+    fn extract_modifiers_ctrl_h_simplifies_to_backspace() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let key = extract_modifiers(i32::from(b'h'), &mut modifiers, true, None);
+        assert_eq!(key, i32::from(crate::ascii_defs::BS));
+        assert_eq!(modifiers, 0);
+    }
+
+    #[test]
+    fn extract_modifiers_ctrl_at_becomes_k_zero() {
+        // <C-@> is <Nul> - ctrl_chr('@') computes to 0, which is
+        // special-cased to K_ZERO instead of a bare 0.
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let mut did_simplify = false;
+        let key = extract_modifiers(i32::from(b'@'), &mut modifiers, true, Some(&mut did_simplify));
+        assert_eq!(key, crate::keycodes_defs::K_ZERO);
+        assert_eq!(modifiers, 0);
+        assert!(did_simplify);
+    }
+
+    #[test]
+    fn extract_modifiers_simplify_false_leaves_ctrl_modifier_untouched() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let key = extract_modifiers(i32::from(b'h'), &mut modifiers, false, None);
+        // Still uppercased (that part isn't gated on `simplify`), but
+        // the Ctrl bit itself is NOT folded into the key.
+        assert_eq!(key, i32::from(b'H'));
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_CTRL));
+    }
+
+    #[test]
+    fn extract_modifiers_ctrl_on_a_digit_outside_the_special_range_is_unaffected() {
+        // '5' is neither alphabetic nor in the '?'..='_' range, so Ctrl
+        // is never folded into it.
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let key = extract_modifiers(i32::from(b'5'), &mut modifiers, true, None);
+        assert_eq!(key, i32::from(b'5'));
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_CTRL));
+    }
+
+    #[test]
+    fn extract_modifiers_no_relevant_modifiers_leaves_key_and_modifiers_unchanged() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_ALT);
+        let key = extract_modifiers(i32::from(b'a'), &mut modifiers, true, None);
+        assert_eq!(key, i32::from(b'a'));
+        assert_eq!(modifiers, i32::from(crate::keycodes_defs::MOD_MASK_ALT));
+    }
+
+    #[test]
+    fn extract_modifiers_did_simplify_none_does_not_panic_when_simplification_happens() {
+        let mut modifiers = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        // Should not panic even though the Ctrl-simplification branch
+        // is genuinely taken here.
+        let key = extract_modifiers(i32::from(b'h'), &mut modifiers, true, None);
+        assert_eq!(key, i32::from(crate::ascii_defs::BS));
     }
 }
