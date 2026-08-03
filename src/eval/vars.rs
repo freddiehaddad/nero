@@ -2413,6 +2413,97 @@ pub unsafe fn restore_vimvar(idx: VimVarIndex, save_tv: TypvalT) {
     }
 }
 
+/// Set `v:cmdarg` (`set_cmdarg`).
+///
+/// If `eap` is `Some`, builds `v:cmdarg`'s new value from `eap`'s own
+/// `++bin`/`++nobin`/`++edit`/`++ff=`/`++enc=`/`++bad=`/`++p` fields
+/// and returns the OLD value (for the caller to save and pass back in
+/// a later, paired restore call). If `eap` is `None`, this is that
+/// later restore call: the CURRENT value is discarded (matching the
+/// original's own `xfree(oldval)` - here, simply dropped, since
+/// `Option<Vec<u8>>` owns its own bytes) and replaced with `oldarg`,
+/// always returning `None`. Must always be called in pairs, exactly
+/// like the original.
+///
+/// No real caller is translated yet (every real call site wraps a
+/// `:read`/`:write`/`:edit`-family Ex command's own execution, none
+/// of which exist here) - harvested ahead of them, matching this
+/// crate's established precedent for a small, self-contained function
+/// with no design freedom of its own.
+///
+/// # Safety
+/// Same as [`get_vim_var_tv`].
+pub unsafe fn set_cmdarg(eap: Option<&crate::ex_cmds_defs::ExargT>, oldarg: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let tv = unsafe { &mut *get_vim_var_tv(VimVarIndex::Cmdarg) };
+    let TypvalValue::String(oldval_slot) = &mut tv.value else {
+        unreachable!("set_cmdarg: v:cmdarg is always String-typed (see VIMVARS's own VV_CMDARG entry)")
+    };
+    let oldval = std::mem::take(oldval_slot);
+
+    let Some(eap) = eap else {
+        tv.value = TypvalValue::String(oldarg);
+        return None;
+    };
+
+    let mut newval = Vec::new();
+    if eap.force_bin == crate::ex_cmds_defs::FORCE_BIN {
+        newval.extend_from_slice(b" ++bin");
+    } else if eap.force_bin == crate::ex_cmds_defs::FORCE_NOBIN {
+        newval.extend_from_slice(b" ++nobin");
+    }
+
+    if eap.read_edit {
+        newval.extend_from_slice(b" ++edit");
+    }
+
+    if eap.force_ff != 0 {
+        let ff_name: &[u8] = match eap.force_ff {
+            b'u' => b"unix",
+            b'd' => b"dos",
+            _ => b"mac",
+        };
+        newval.extend_from_slice(b" ++ff=");
+        newval.extend_from_slice(ff_name);
+    }
+    if eap.force_enc != 0 {
+        newval.extend_from_slice(b" ++enc=");
+        if let Some(cmd) = &eap.cmd {
+            let start = eap.force_enc as usize;
+            if start < cmd.len() {
+                // eap->cmd + eap->force_enc is a NUL-terminated C
+                // string - stop at the first embedded NUL (or the
+                // buffer's own end if none), matching this crate's
+                // established "embedded NUL ends a C-string-modeled
+                // scan" idiom. Real callers (ex_docmd.c's ++enc=
+                // argument parser) insert that embedded NUL right
+                // after the encoding value itself, before any
+                // trailing command text (e.g. a following filename),
+                // so this always lands exactly on the encoding name.
+                let rest = &cmd[start..];
+                let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+                newval.extend_from_slice(&rest[..end]);
+            }
+        }
+    }
+
+    if eap.bad_char == crate::ex_cmds_defs::BAD_KEEP {
+        newval.extend_from_slice(b" ++bad=keep");
+    } else if eap.bad_char == crate::ex_cmds_defs::BAD_DROP {
+        newval.extend_from_slice(b" ++bad=drop");
+    } else if eap.bad_char != 0 {
+        newval.extend_from_slice(b" ++bad=");
+        newval.push(eap.bad_char as u8);
+    }
+
+    if eap.mkdir_p {
+        newval.extend_from_slice(b" ++p");
+    }
+
+    tv.value = TypvalValue::String(Some(newval));
+    oldval
+}
+
 /// Set `v:count`/`v:count1`, and (if `set_prevcount`) `v:prevcount`
 /// from the current `v:count` (`set_vcount`).
 ///
@@ -3183,6 +3274,169 @@ mod tests {
         unsafe {
             set_reg_var(i32::from(b'a'));
             assert_eq!(get_vim_var_str(VimVarIndex::Reg), b"a");
+        }
+    }
+
+    // --- set_cmdarg ---
+
+    #[test]
+    fn set_cmdarg_none_eap_restores_oldarg_and_returns_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert_eq!(set_cmdarg(None, Some(b"restored".to_vec())), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b"restored");
+            // Clean up back to the documented "unset" default.
+            assert_eq!(set_cmdarg(None, None), None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_all_flags_unset_produces_an_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT::default();
+            let old = set_cmdarg(Some(&eap), None);
+            assert_eq!(old, None, "v:cmdarg started unset");
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b"");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_force_bin_and_nobin() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT { force_bin: crate::ex_cmds_defs::FORCE_BIN, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++bin");
+            set_cmdarg(None, None);
+
+            let eap =
+                crate::ex_cmds_defs::ExargT { force_bin: crate::ex_cmds_defs::FORCE_NOBIN, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++nobin");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_read_edit() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT { read_edit: true, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++edit");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_force_ff_unix_dos_mac() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            for (byte, expected) in [(b'u', &b" ++ff=unix"[..]), (b'd', b" ++ff=dos"), (b'x', b" ++ff=mac")] {
+                let eap = crate::ex_cmds_defs::ExargT { force_ff: byte, ..Default::default() };
+                set_cmdarg(Some(&eap), None);
+                assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), expected);
+                set_cmdarg(None, None);
+            }
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_force_enc_reads_from_cmd_at_the_given_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            // Real callers (ex_docmd.c's ++enc= argument parser, not
+            // yet translated) insert an embedded NUL right after the
+            // encoding value itself before storing force_enc, so that
+            // "cmd + force_enc" ends exactly at the encoding text with
+            // no trailing command content - modeled here the same way.
+            let eap = crate::ex_cmds_defs::ExargT {
+                force_enc: 6,
+                cmd: Some(b"++enc=utf-8\0 file.txt".to_vec()),
+                ..Default::default()
+            };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++enc=utf-8");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_bad_char_keep_drop_and_literal() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT { bad_char: crate::ex_cmds_defs::BAD_KEEP, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++bad=keep");
+            set_cmdarg(None, None);
+
+            let eap = crate::ex_cmds_defs::ExargT { bad_char: crate::ex_cmds_defs::BAD_DROP, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++bad=drop");
+            set_cmdarg(None, None);
+
+            let eap = crate::ex_cmds_defs::ExargT { bad_char: i32::from(b'?'), ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++bad=?");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_mkdir_p() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT { mkdir_p: true, ..Default::default() };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++p");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_combines_every_flag_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap = crate::ex_cmds_defs::ExargT {
+                force_bin: crate::ex_cmds_defs::FORCE_BIN,
+                read_edit: true,
+                force_ff: b'u',
+                force_enc: 0,
+                bad_char: crate::ex_cmds_defs::BAD_KEEP,
+                mkdir_p: true,
+                ..Default::default()
+            };
+            set_cmdarg(Some(&eap), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++bin ++edit ++ff=unix ++bad=keep ++p");
+            set_cmdarg(None, None);
+        }
+    }
+
+    #[test]
+    fn set_cmdarg_returns_the_old_value_for_a_later_restore() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let eap1 = crate::ex_cmds_defs::ExargT { read_edit: true, ..Default::default() };
+            let old1 = set_cmdarg(Some(&eap1), None);
+            assert_eq!(old1, None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++edit");
+
+            // A nested call (e.g. a command run from within another
+            // command's own body) saves+overwrites, then must restore
+            // the outer value exactly, matching the "always called in
+            // pairs" contract.
+            let eap2 = crate::ex_cmds_defs::ExargT { mkdir_p: true, ..Default::default() };
+            let old2 = set_cmdarg(Some(&eap2), None);
+            assert_eq!(old2, Some(b" ++edit".to_vec()));
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++p");
+
+            assert_eq!(set_cmdarg(None, old2), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b" ++edit");
+
+            assert_eq!(set_cmdarg(None, old1), None);
+            assert_eq!(get_vim_var_str(VimVarIndex::Cmdarg), b"");
         }
     }
 
