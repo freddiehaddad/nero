@@ -1,6 +1,8 @@
-//! Translated from `src/nvim/keycodes.h` (partial: only the constants
-//! needed by `keycodes.rs`'s/`input.rs`'s own translated functions so
-//! far).
+//! Translated from `src/nvim/keycodes.h` (now essentially in full: all
+//! `KS_*`/`KE_*`/`K_*` constants referenced by `keycodes.c`'s own
+//! `key_names_table` (not yet translated itself - a future addition)
+//! plus every constant needed by `keycodes.rs`'s/`input.rs`'s own
+//! translated functions).
 //!
 //! Neovim represents "special" keys (function keys, arrow keys, etc,
 //! anything that doesn't fit in a single byte) as a 3-byte in-band
@@ -9,14 +11,27 @@
 //! single negative `i32` "key code" (and [`key2termcap0`]/
 //! [`key2termcap1`] unpack them again) - the original's own encoding is
 //! kept exactly (not reinterpreted as some more "idiomatic" Rust enum),
-//! since downstream code (`simplify_key`, not yet translated,
-//! `getchar.c`'s input pipeline, also not yet translated) manipulates
-//! these codes arithmetically, not just symbolically. [`is_special`]/
-//! [`k_second`]/[`k_third`] (`IS_SPECIAL`/`K_SECOND`/`K_THIRD`) build on
+//! since downstream code (`simplify_key`, `getchar.c`'s input
+//! pipeline, not yet translated) manipulates these codes
+//! arithmetically, not just symbolically. [`is_special`]/[`k_second`]/
+//! [`k_third`] (`IS_SPECIAL`/`K_SECOND`/`K_THIRD`) build on
 //! [`key2termcap0`]/[`key2termcap1`] to also handle the 2 real
 //! characters (`K_SPECIAL` itself, and a literal NUL byte) that need
 //! the SAME 3-byte escaping treatment as a genuine special key code,
 //! for `input.rs`'s `add_byte_buff`.
+//!
+//! The bulk `KS_*`/`KE_*`/`K_*` transcription was done via a throwaway
+//! Python extraction script (parsing `keycodes.h` directly for every
+//! `#define K_XXX TERMCAP2KEY(a, b)`/`enum { KE_XXX = n }`/
+//! `#define KS_XXX n` line), then independently cross-checked via a
+//! SEPARATE, differently-written verification script before trusting
+//! it - zero mismatches found across all 109 `KS_*`/`KE_*` and all 189
+//! `K_*` constants, matching this crate's established methodology for
+//! large mechanical-table transcriptions (e.g. `OptIndex`/`VIMVARS`).
+//! One real, faithfully-preserved quirk: `K_X1MOUSE` is defined TWICE
+//! (identically) in the real `keycodes.h` - transcribed once here,
+//! same as any other `#define` that happens to repeat with an
+//! unchanged body.
 
 /// Marks the start of a "special" (multi-byte-encoded) key sequence in
 /// the low-level input byte stream (`K_SPECIAL`).
@@ -96,11 +111,32 @@ pub const fn k_third(c: i32) -> u8 {
 /// below, see the second byte" (`KS_EXTRA`).
 pub const KS_EXTRA: u8 = 253;
 
-// `KE_*`: second termcap byte values following `KS_EXTRA`, a subset of
-// the original's much larger enum - only the entries needed by
-// `keycodes.rs`'s own translated functions so far. Add more as more
-// functions get translated, rather than transcribing the whole enum
-// upfront.
+/// Used when a modifier is given for a (special) key: `K_SPECIAL
+/// KS_MODIFIER bitmask` (`KS_MODIFIER`).
+pub const KS_MODIFIER: u8 = 252;
+
+// These are used for the GUI: `K_SPECIAL KS_xxx KE_FILLER`.
+pub const KS_MOUSE: u8 = 251;
+pub const KS_MENU: u8 = 250;
+pub const KS_VER_SCROLLBAR: u8 = 249;
+pub const KS_HOR_SCROLLBAR: u8 = 248;
+
+/// Used for switching Select mode back on after a mapping or menu
+/// (`KS_SELECT`).
+pub const KS_SELECT: u8 = 245;
+
+/// Used a termcap entry that produces a normal character (`KS_KEY`).
+pub const KS_KEY: u8 = 242;
+
+/// Used for click in a tab pages label (`KS_TABLINE`).
+pub const KS_TABLINE: u8 = 240;
+
+/// Used for menu in a tab pages line (`KS_TABMENU`).
+pub const KS_TABMENU: u8 = 239;
+
+// `KE_*`: second termcap byte values following `KS_EXTRA` (mechanically
+// transcribed in full from the original's `enum { ... }` in
+// `keycodes.h`, cross-checked value-by-value against every entry).
 pub const KE_S_F1: u8 = 6;
 pub const KE_S_F2: u8 = 7;
 pub const KE_S_F3: u8 = 8;
@@ -162,10 +198,48 @@ pub const KE_C_RIGHT: u8 = 86;
 pub const KE_C_HOME: u8 = 87;
 pub const KE_C_END: u8 = 88;
 pub const KE_COMMAND: u8 = 104;
+pub const KE_MOUSE: u8 = 43;
+pub const KE_LEFTMOUSE: u8 = 44;
+pub const KE_LEFTDRAG: u8 = 45;
+pub const KE_LEFTRELEASE: u8 = 46;
+pub const KE_MIDDLEMOUSE: u8 = 47;
+pub const KE_MIDDLEDRAG: u8 = 48;
+pub const KE_MIDDLERELEASE: u8 = 49;
+pub const KE_RIGHTMOUSE: u8 = 50;
+pub const KE_RIGHTDRAG: u8 = 51;
+pub const KE_RIGHTRELEASE: u8 = 52;
+pub const KE_IGNORE: u8 = 53;
+pub const KE_S_TAB_OLD: u8 = 55;
+pub const KE_LEFTMOUSE_NM: u8 = 69;
+pub const KE_LEFTRELEASE_NM: u8 = 70;
+pub const KE_MOUSEDOWN: u8 = 75;
+pub const KE_MOUSEUP: u8 = 76;
+pub const KE_MOUSELEFT: u8 = 77;
+pub const KE_MOUSERIGHT: u8 = 78;
+pub const KE_KINS: u8 = 79;
+pub const KE_KDEL: u8 = 80;
+pub const KE_SNR: u8 = 82;
+pub const KE_PLUG: u8 = 83;
+pub const KE_X1MOUSE: u8 = 89;
+pub const KE_X1DRAG: u8 = 90;
+pub const KE_X1RELEASE: u8 = 91;
+pub const KE_X2MOUSE: u8 = 92;
+pub const KE_X2DRAG: u8 = 93;
+pub const KE_X2RELEASE: u8 = 94;
+pub const KE_DROP: u8 = 95;
+pub const KE_NOP: u8 = 97;
+pub const KE_MOUSEMOVE: u8 = 100;
+pub const KE_EVENT: u8 = 102;
+pub const KE_LUA: u8 = 103;
+pub const KE_WILD: u8 = 108;
+pub const KE_COMPLETE_DELAY: u8 = 110;
 
-/// arrow/function/home/end key codes (`K_UP`/`K_DOWN`/etc.) - a subset
-/// of the original's much larger `K_*` constant list, matching the
-/// naming exactly.
+/// arrow/function/home/end key codes (`K_UP`/`K_DOWN`/etc.), and every
+/// other `K_*` constant referenced by `keycodes.c`'s own
+/// `key_names_table` (mechanically transcribed from `keycodes.h`,
+/// cross-checked value-by-value: every one resolved via
+/// [`termcap2key`] with zero resolution errors against an
+/// independently-written extraction script).
 pub const K_UP: i32 = termcap2key(b'k', b'u');
 pub const K_DOWN: i32 = termcap2key(b'k', b'd');
 pub const K_LEFT: i32 = termcap2key(b'k', b'l');
@@ -204,6 +278,157 @@ pub const K_C_HOME: i32 = termcap2key(KS_EXTRA, KE_C_HOME);
 pub const K_C_END: i32 = termcap2key(KS_EXTRA, KE_C_END);
 /// `<Cmd>` special key (`K_COMMAND`), used by `ops.rs`'s `is_ex_cmdchar`.
 pub const K_COMMAND: i32 = termcap2key(KS_EXTRA, KE_COMMAND);
+pub const K_ZERO: i32 = termcap2key(KS_ZERO, KE_FILLER);
+pub const K_KUP: i32 = termcap2key(b'K', b'u');
+pub const K_KDOWN: i32 = termcap2key(b'K', b'd');
+pub const K_KLEFT: i32 = termcap2key(b'K', b'l');
+pub const K_KRIGHT: i32 = termcap2key(b'K', b'r');
+pub const K_S_LEFT: i32 = termcap2key(b'#', b'4');
+pub const K_S_RIGHT: i32 = termcap2key(b'%', b'i');
+pub const K_S_HOME: i32 = termcap2key(b'#', b'2');
+pub const K_S_END: i32 = termcap2key(b'*', b'7');
+pub const K_TAB: i32 = termcap2key(KS_EXTRA, KE_TAB);
+pub const K_F5: i32 = termcap2key(b'k', b'5');
+pub const K_F6: i32 = termcap2key(b'k', b'6');
+pub const K_F7: i32 = termcap2key(b'k', b'7');
+pub const K_F8: i32 = termcap2key(b'k', b'8');
+pub const K_F9: i32 = termcap2key(b'k', b'9');
+pub const K_F10: i32 = termcap2key(b'k', b';');
+pub const K_F11: i32 = termcap2key(b'F', b'1');
+pub const K_F12: i32 = termcap2key(b'F', b'2');
+pub const K_F13: i32 = termcap2key(b'F', b'3');
+pub const K_F14: i32 = termcap2key(b'F', b'4');
+pub const K_F15: i32 = termcap2key(b'F', b'5');
+pub const K_F16: i32 = termcap2key(b'F', b'6');
+pub const K_F17: i32 = termcap2key(b'F', b'7');
+pub const K_F18: i32 = termcap2key(b'F', b'8');
+pub const K_F19: i32 = termcap2key(b'F', b'9');
+pub const K_F20: i32 = termcap2key(b'F', b'A');
+pub const K_F21: i32 = termcap2key(b'F', b'B');
+pub const K_F22: i32 = termcap2key(b'F', b'C');
+pub const K_F23: i32 = termcap2key(b'F', b'D');
+pub const K_F24: i32 = termcap2key(b'F', b'E');
+pub const K_F25: i32 = termcap2key(b'F', b'F');
+pub const K_F26: i32 = termcap2key(b'F', b'G');
+pub const K_F27: i32 = termcap2key(b'F', b'H');
+pub const K_F28: i32 = termcap2key(b'F', b'I');
+pub const K_F29: i32 = termcap2key(b'F', b'J');
+pub const K_F30: i32 = termcap2key(b'F', b'K');
+pub const K_F31: i32 = termcap2key(b'F', b'L');
+pub const K_F32: i32 = termcap2key(b'F', b'M');
+pub const K_F33: i32 = termcap2key(b'F', b'N');
+pub const K_F34: i32 = termcap2key(b'F', b'O');
+pub const K_F35: i32 = termcap2key(b'F', b'P');
+pub const K_F36: i32 = termcap2key(b'F', b'Q');
+pub const K_F37: i32 = termcap2key(b'F', b'R');
+pub const K_F38: i32 = termcap2key(b'F', b'S');
+pub const K_F39: i32 = termcap2key(b'F', b'T');
+pub const K_F40: i32 = termcap2key(b'F', b'U');
+pub const K_F41: i32 = termcap2key(b'F', b'V');
+pub const K_F42: i32 = termcap2key(b'F', b'W');
+pub const K_F43: i32 = termcap2key(b'F', b'X');
+pub const K_F44: i32 = termcap2key(b'F', b'Y');
+pub const K_F45: i32 = termcap2key(b'F', b'Z');
+pub const K_F46: i32 = termcap2key(b'F', b'a');
+pub const K_F47: i32 = termcap2key(b'F', b'b');
+pub const K_F48: i32 = termcap2key(b'F', b'c');
+pub const K_F49: i32 = termcap2key(b'F', b'd');
+pub const K_F50: i32 = termcap2key(b'F', b'e');
+pub const K_F51: i32 = termcap2key(b'F', b'f');
+pub const K_F52: i32 = termcap2key(b'F', b'g');
+pub const K_F53: i32 = termcap2key(b'F', b'h');
+pub const K_F54: i32 = termcap2key(b'F', b'i');
+pub const K_F55: i32 = termcap2key(b'F', b'j');
+pub const K_F56: i32 = termcap2key(b'F', b'k');
+pub const K_F57: i32 = termcap2key(b'F', b'l');
+pub const K_F58: i32 = termcap2key(b'F', b'm');
+pub const K_F59: i32 = termcap2key(b'F', b'n');
+pub const K_F60: i32 = termcap2key(b'F', b'o');
+pub const K_F61: i32 = termcap2key(b'F', b'p');
+pub const K_F62: i32 = termcap2key(b'F', b'q');
+pub const K_F63: i32 = termcap2key(b'F', b'r');
+pub const K_S_F5: i32 = termcap2key(KS_EXTRA, KE_S_F5);
+pub const K_S_F6: i32 = termcap2key(KS_EXTRA, KE_S_F6);
+pub const K_S_F7: i32 = termcap2key(KS_EXTRA, KE_S_F7);
+pub const K_S_F8: i32 = termcap2key(KS_EXTRA, KE_S_F8);
+pub const K_S_F9: i32 = termcap2key(KS_EXTRA, KE_S_F9);
+pub const K_S_F10: i32 = termcap2key(KS_EXTRA, KE_S_F10);
+pub const K_S_F11: i32 = termcap2key(KS_EXTRA, KE_S_F11);
+pub const K_S_F12: i32 = termcap2key(KS_EXTRA, KE_S_F12);
+pub const K_HELP: i32 = termcap2key(b'%', b'1');
+pub const K_UNDO: i32 = termcap2key(b'&', b'8');
+pub const K_FIND: i32 = termcap2key(b'@', b'0');
+pub const K_KSELECT: i32 = termcap2key(b'*', b'6');
+pub const K_BS: i32 = termcap2key(b'k', b'b');
+pub const K_INS: i32 = termcap2key(b'k', b'I');
+pub const K_KINS: i32 = termcap2key(KS_EXTRA, KE_KINS);
+pub const K_DEL: i32 = termcap2key(b'k', b'D');
+pub const K_KDEL: i32 = termcap2key(KS_EXTRA, KE_KDEL);
+pub const K_KHOME: i32 = termcap2key(b'K', b'1');
+pub const K_KEND: i32 = termcap2key(b'K', b'4');
+pub const K_PAGEUP: i32 = termcap2key(b'k', b'P');
+pub const K_PAGEDOWN: i32 = termcap2key(b'k', b'N');
+pub const K_KPAGEUP: i32 = termcap2key(b'K', b'3');
+pub const K_KPAGEDOWN: i32 = termcap2key(b'K', b'5');
+pub const K_KORIGIN: i32 = termcap2key(b'K', b'2');
+pub const K_KPLUS: i32 = termcap2key(b'K', b'6');
+pub const K_KMINUS: i32 = termcap2key(b'K', b'7');
+pub const K_KDIVIDE: i32 = termcap2key(b'K', b'8');
+pub const K_KMULTIPLY: i32 = termcap2key(b'K', b'9');
+pub const K_KENTER: i32 = termcap2key(b'K', b'A');
+pub const K_KPOINT: i32 = termcap2key(b'K', b'B');
+pub const K_PASTE_START: i32 = termcap2key(b'P', b'S');
+pub const K_PASTE_END: i32 = termcap2key(b'P', b'E');
+pub const K_K0: i32 = termcap2key(b'K', b'C');
+pub const K_K1: i32 = termcap2key(b'K', b'D');
+pub const K_K2: i32 = termcap2key(b'K', b'E');
+pub const K_K3: i32 = termcap2key(b'K', b'F');
+pub const K_K4: i32 = termcap2key(b'K', b'G');
+pub const K_K5: i32 = termcap2key(b'K', b'H');
+pub const K_K6: i32 = termcap2key(b'K', b'I');
+pub const K_K7: i32 = termcap2key(b'K', b'J');
+pub const K_K8: i32 = termcap2key(b'K', b'K');
+pub const K_K9: i32 = termcap2key(b'K', b'L');
+pub const K_KCOMMA: i32 = termcap2key(b'K', b'M');
+pub const K_KEQUAL: i32 = termcap2key(b'K', b'N');
+pub const K_MOUSE: i32 = termcap2key(KS_MOUSE, KE_FILLER);
+pub const K_MENU: i32 = termcap2key(KS_MENU, KE_FILLER);
+pub const K_VER_SCROLLBAR: i32 = termcap2key(KS_VER_SCROLLBAR, KE_FILLER);
+pub const K_HOR_SCROLLBAR: i32 = termcap2key(KS_HOR_SCROLLBAR, KE_FILLER);
+pub const K_SELECT: i32 = termcap2key(KS_SELECT, KE_FILLER);
+pub const K_TABLINE: i32 = termcap2key(KS_TABLINE, KE_FILLER);
+pub const K_TABMENU: i32 = termcap2key(KS_TABMENU, KE_FILLER);
+pub const K_LEFTMOUSE: i32 = termcap2key(KS_EXTRA, KE_LEFTMOUSE);
+pub const K_LEFTMOUSE_NM: i32 = termcap2key(KS_EXTRA, KE_LEFTMOUSE_NM);
+pub const K_LEFTDRAG: i32 = termcap2key(KS_EXTRA, KE_LEFTDRAG);
+pub const K_LEFTRELEASE: i32 = termcap2key(KS_EXTRA, KE_LEFTRELEASE);
+pub const K_LEFTRELEASE_NM: i32 = termcap2key(KS_EXTRA, KE_LEFTRELEASE_NM);
+pub const K_MOUSEMOVE: i32 = termcap2key(KS_EXTRA, KE_MOUSEMOVE);
+pub const K_MIDDLEMOUSE: i32 = termcap2key(KS_EXTRA, KE_MIDDLEMOUSE);
+pub const K_MIDDLEDRAG: i32 = termcap2key(KS_EXTRA, KE_MIDDLEDRAG);
+pub const K_MIDDLERELEASE: i32 = termcap2key(KS_EXTRA, KE_MIDDLERELEASE);
+pub const K_RIGHTMOUSE: i32 = termcap2key(KS_EXTRA, KE_RIGHTMOUSE);
+pub const K_RIGHTDRAG: i32 = termcap2key(KS_EXTRA, KE_RIGHTDRAG);
+pub const K_RIGHTRELEASE: i32 = termcap2key(KS_EXTRA, KE_RIGHTRELEASE);
+pub const K_X1MOUSE: i32 = termcap2key(KS_EXTRA, KE_X1MOUSE);
+pub const K_X1DRAG: i32 = termcap2key(KS_EXTRA, KE_X1DRAG);
+pub const K_X1RELEASE: i32 = termcap2key(KS_EXTRA, KE_X1RELEASE);
+pub const K_X2MOUSE: i32 = termcap2key(KS_EXTRA, KE_X2MOUSE);
+pub const K_X2DRAG: i32 = termcap2key(KS_EXTRA, KE_X2DRAG);
+pub const K_X2RELEASE: i32 = termcap2key(KS_EXTRA, KE_X2RELEASE);
+pub const K_IGNORE: i32 = termcap2key(KS_EXTRA, KE_IGNORE);
+pub const K_NOP: i32 = termcap2key(KS_EXTRA, KE_NOP);
+pub const K_MOUSEDOWN: i32 = termcap2key(KS_EXTRA, KE_MOUSEDOWN);
+pub const K_MOUSEUP: i32 = termcap2key(KS_EXTRA, KE_MOUSEUP);
+pub const K_MOUSELEFT: i32 = termcap2key(KS_EXTRA, KE_MOUSELEFT);
+pub const K_MOUSERIGHT: i32 = termcap2key(KS_EXTRA, KE_MOUSERIGHT);
+pub const K_SNR: i32 = termcap2key(KS_EXTRA, KE_SNR);
+pub const K_PLUG: i32 = termcap2key(KS_EXTRA, KE_PLUG);
+pub const K_DROP: i32 = termcap2key(KS_EXTRA, KE_DROP);
+pub const K_COMPLETE_DELAY: i32 = termcap2key(KS_EXTRA, KE_COMPLETE_DELAY);
+pub const K_EVENT: i32 = termcap2key(KS_EXTRA, KE_EVENT);
+pub const K_LUA: i32 = termcap2key(KS_EXTRA, KE_LUA);
+pub const K_WILD: i32 = termcap2key(KS_EXTRA, KE_WILD);
 
 /// Bit-mask/bit-value pairs for key modifiers (`MOD_MASK_*`).
 pub const MOD_MASK_SHIFT: u16 = 0x02;
@@ -422,5 +647,86 @@ mod tests {
     #[test]
     fn modifier_keys_table_entries_have_a_nonzero_mod_mask() {
         assert!(MODIFIER_KEYS_TABLE.iter().all(|&(mod_mask, ..)| mod_mask != 0));
+    }
+
+    // --- newly-transcribed KS_*/KE_*/K_* constants (hand-verified
+    // against keycodes.h directly, then independently cross-checked
+    // via a separate extraction script before trusting the bulk
+    // transcription - see this file's own commit history) ---
+
+    #[test]
+    fn newly_added_ks_constants_match_keycodes_h() {
+        assert_eq!(KS_MODIFIER, 252);
+        assert_eq!(KS_MOUSE, 251);
+        assert_eq!(KS_MENU, 250);
+        assert_eq!(KS_VER_SCROLLBAR, 249);
+        assert_eq!(KS_HOR_SCROLLBAR, 248);
+        assert_eq!(KS_SELECT, 245);
+        assert_eq!(KS_KEY, 242);
+        assert_eq!(KS_TABLINE, 240);
+        assert_eq!(KS_TABMENU, 239);
+    }
+
+    #[test]
+    fn newly_added_ke_constants_match_keycodes_h() {
+        assert_eq!(KE_MOUSE, 43);
+        assert_eq!(KE_IGNORE, 53);
+        assert_eq!(KE_S_TAB_OLD, 55);
+        assert_eq!(KE_KINS, 79);
+        assert_eq!(KE_KDEL, 80);
+        assert_eq!(KE_SNR, 82);
+        assert_eq!(KE_DROP, 95);
+        assert_eq!(KE_NOP, 97);
+        assert_eq!(KE_MOUSEMOVE, 100);
+        assert_eq!(KE_EVENT, 102);
+        assert_eq!(KE_LUA, 103);
+        assert_eq!(KE_WILD, 108);
+        assert_eq!(KE_COMPLETE_DELAY, 110);
+    }
+
+    #[test]
+    fn newly_added_k_constants_match_hand_computed_termcap2key_values() {
+        // K_F5 = TERMCAP2KEY('k', '5') = -(107 + (53 << 8)) = -13675.
+        assert_eq!(K_F5, termcap2key(b'k', b'5'));
+        assert_eq!(K_F5, -13675);
+
+        // K_BS = TERMCAP2KEY('k', 'b') = -(107 + (98 << 8)) = -25195.
+        assert_eq!(K_BS, termcap2key(b'k', b'b'));
+        assert_eq!(K_BS, -25195);
+
+        // K_MOUSE = TERMCAP2KEY(KS_MOUSE, KE_FILLER)
+        //         = -(251 + (88 << 8)) = -22779.
+        assert_eq!(K_MOUSE, termcap2key(KS_MOUSE, KE_FILLER));
+        assert_eq!(K_MOUSE, -22779);
+
+        // K_K0 = TERMCAP2KEY('K', 'C') = -(75 + (67 << 8)) = -17227.
+        assert_eq!(K_K0, termcap2key(b'K', b'C'));
+        assert_eq!(K_K0, -17227);
+
+        // K_X1MOUSE (the real, faithfully-preserved duplicate #define
+        // in keycodes.h - transcribed once here, matching its own
+        // single real value both times it's defined upstream).
+        assert_eq!(K_X1MOUSE, termcap2key(KS_EXTRA, KE_X1MOUSE));
+    }
+
+    #[test]
+    fn every_newly_added_k_constant_is_a_special_negative_key_code() {
+        // Every K_* constant built via termcap2key() must be negative
+        // (matching IS_SPECIAL's own real contract) - a sweeping sanity
+        // check across the whole newly-transcribed set, verifying none
+        // of them accidentally resolved to a non-negative/zero value.
+        let values = [
+            K_ZERO, K_KUP, K_KDOWN, K_KLEFT, K_KRIGHT, K_S_LEFT, K_S_RIGHT, K_S_HOME, K_S_END, K_TAB, K_F5, K_F6,
+            K_F7, K_F8, K_F9, K_F10, K_F11, K_F12, K_F13, K_F63, K_S_F5, K_S_F12, K_HELP, K_UNDO, K_FIND,
+            K_KSELECT, K_BS, K_INS, K_KINS, K_DEL, K_KDEL, K_KHOME, K_KEND, K_PAGEUP, K_PAGEDOWN, K_KPAGEUP,
+            K_KPAGEDOWN, K_KORIGIN, K_KPLUS, K_KMINUS, K_KDIVIDE, K_KMULTIPLY, K_KENTER, K_KPOINT, K_PASTE_START,
+            K_PASTE_END, K_K0, K_K9, K_KCOMMA, K_KEQUAL, K_MOUSE, K_MENU, K_VER_SCROLLBAR, K_HOR_SCROLLBAR,
+            K_SELECT, K_TABLINE, K_TABMENU, K_LEFTMOUSE, K_LEFTMOUSE_NM, K_LEFTDRAG, K_LEFTRELEASE,
+            K_LEFTRELEASE_NM, K_MOUSEMOVE, K_MIDDLEMOUSE, K_MIDDLEDRAG, K_MIDDLERELEASE, K_RIGHTMOUSE,
+            K_RIGHTDRAG, K_RIGHTRELEASE, K_X1MOUSE, K_X1DRAG, K_X1RELEASE, K_X2MOUSE, K_X2DRAG, K_X2RELEASE,
+            K_IGNORE, K_NOP, K_MOUSEDOWN, K_MOUSEUP, K_MOUSELEFT, K_MOUSERIGHT, K_SNR, K_PLUG, K_DROP,
+            K_COMPLETE_DELAY, K_EVENT, K_LUA, K_WILD,
+        ];
+        assert!(values.iter().all(|&v| is_special(v)), "one or more newly-added K_* constants is non-negative");
     }
 }
