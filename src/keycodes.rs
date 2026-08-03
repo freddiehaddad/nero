@@ -1,32 +1,69 @@
 //! Translated from `src/nvim/keycodes.c` (tractable core only).
 //!
 //! `keycodes.c` (~830 lines) is neovim's special-key name/termcap-code
-//! lookup and conversion file - many of its functions need `mouse.c`'s
-//! mouse-event table (not translated) or the full key-name table
-//! (`get_special_key_name`/`find_special_key_in_table`, a large
-//! generated table not transcribed here).
+//! lookup and conversion file - many of its remaining functions need
+//! `mouse.c`'s mouse-event table (not translated) or
+//! `replace_termcodes`/`trans_special`'s own substantial parsing
+//! logic.
 //!
 //! Translated: [`name_to_mod_mask`], [`handle_x_keys`],
 //! [`simplify_key`] - all pure, self-contained lookups needing only
-//! [`crate::keycodes_defs`]'s own (partial) constant/table
-//! translations - and [`vim_unescape_ks`], a self-contained in-place
-//! unescape needing only [`crate::keycodes_defs::K_SPECIAL`]/
+//! [`crate::keycodes_defs`]'s own constant/table translations - and
+//! [`vim_unescape_ks`], a self-contained in-place unescape needing
+//! only [`crate::keycodes_defs::K_SPECIAL`]/
 //! [`crate::keycodes_defs::KS_SPECIAL`]/[`crate::keycodes_defs::KE_FILLER`].
 //!
+//! Also translated: [`KEY_NAMES_TABLE`] (`key_names_table`) - the
+//! original's own key-name-to-code lookup table, mechanically
+//! transcribed from a pre-built copy of `keycode_names.generated.h`
+//! (187 entries) via a throwaway Python extraction script, with every
+//! entry's `key`/`is_alt`/`name` fields cross-checked (length
+//! assertions on every transcribed name, a second pass verifying no
+//! unresolved bare identifier slipped into the generated Rust source)
+//! before trusting it - plus [`find_special_key_in_table`] and
+//! [`get_special_key_code`], the table's own 2 real consumer
+//! functions with no OTHER dependency.
+//!
+//! [`get_special_key_code`] deliberately does NOT replicate the
+//! original's own `get_special_key_code_hash` - a machine-generated
+//! PERFECT HASH function (via `src/gen/gen_keycodes.lua`'s
+//! `hashy.hashy_hash`, the same code-generation family that produces
+//! `option.c`'s own `find_option`-adjacent perfect hash) - since that
+//! hash is purely a performance optimization over the SAME table, with
+//! no behavioral difference from a plain, case-insensitive linear
+//! scan (verified directly: `gen_keycodes.lua` passes `icase = true`
+//! to `hashy_hash`, confirming the real lookup IS case-insensitive,
+//! e.g. `"f1"` and `"F1"` both resolve to `K_F1`) - matching this
+//! crate's established "translate the observable behavior, not the
+//! exact optimization mechanism" precedent (e.g. `winrestcmd`'s own
+//! single-pass `Vec` replacing the original's 2-pass C string
+//! building).
+//!
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
-//! `find_special_key_in_table`/`find_special_key`/`replace_termcodes`/
-//! `trans_special`/`special_to_buf` (need the full generated key-name
-//! table), `get_mouse_button` (needs `mouse.c`), `add_char2buf`/
+//! `find_special_key`/`replace_termcodes`/`trans_special`/
+//! `special_to_buf` (need substantially more parsing logic beyond the
+//! table itself), `get_mouse_button` (needs `mouse.c`), `add_char2buf`/
 //! `vim_strsave_escape_ks` (the escaping counterpart of
 //! `vim_unescape_ks` - needs `utf_ptr2len`, verify separately).
 
 use crate::ascii_defs::TAB;
-use crate::keycodes_defs::{
-    key2termcap0, key2termcap1, termcap2key, MODIFIER_KEYS_TABLE, MOD_MASK_CTRL, MOD_MASK_SHIFT,
-    MOD_MASK_TABLE, K_DOWN, K_END, K_F1, K_F2, K_F3, K_F4, K_HOME, K_LEFT, K_RIGHT, K_S_F1,
-    K_S_F2, K_S_F3, K_S_F4, K_S_TAB, K_S_XF1, K_S_XF2, K_S_XF3, K_S_XF4, K_UP, K_XDOWN, K_XEND,
-    K_XF1, K_XF2, K_XF3, K_XF4, K_XHOME, K_XLEFT, K_XRIGHT, K_XUP, K_ZEND, K_ZHOME,
-};
+use crate::keycodes_defs::{key2termcap0, key2termcap1, termcap2key, MODIFIER_KEYS_TABLE, 
+    MOD_MASK_CTRL, MOD_MASK_SHIFT, MOD_MASK_TABLE, K_BS, K_COMMAND, K_DEL, K_DOWN, K_DROP, 
+    K_END, K_F1, K_F10, K_F11, K_F12, K_F13, K_F14, K_F15, K_F16, K_F17, K_F18, K_F19, K_F2, 
+    K_F20, K_F21, K_F22, K_F23, K_F24, K_F25, K_F26, K_F27, K_F28, K_F29, K_F3, K_F30, K_F31, 
+    K_F32, K_F33, K_F34, K_F35, K_F36, K_F37, K_F38, K_F39, K_F4, K_F40, K_F41, K_F42, K_F43, 
+    K_F44, K_F45, K_F46, K_F47, K_F48, K_F49, K_F5, K_F50, K_F51, K_F52, K_F53, K_F54, K_F55, 
+    K_F56, K_F57, K_F58, K_F59, K_F6, K_F60, K_F61, K_F62, K_F63, K_F7, K_F8, K_F9, K_FIND, 
+    K_HELP, K_HOME, K_IGNORE, K_INS, K_K0, K_K1, K_K2, K_K3, K_K4, K_K5, K_K6, K_K7, K_K8, 
+    K_K9, K_KCOMMA, K_KDEL, K_KDIVIDE, K_KDOWN, K_KEND, K_KENTER, K_KEQUAL, K_KHOME, K_KINS, 
+    K_KLEFT, K_KMINUS, K_KMULTIPLY, K_KORIGIN, K_KPAGEDOWN, K_KPAGEUP, K_KPLUS, K_KPOINT, 
+    K_KRIGHT, K_KSELECT, K_KUP, K_LEFT, K_LEFTDRAG, K_LEFTMOUSE, K_LEFTMOUSE_NM, K_LEFTRELEASE, 
+    K_LEFTRELEASE_NM, K_MIDDLEDRAG, K_MIDDLEMOUSE, K_MIDDLERELEASE, K_MOUSE, K_MOUSEDOWN, 
+    K_MOUSELEFT, K_MOUSEMOVE, K_MOUSERIGHT, K_MOUSEUP, K_PAGEDOWN, K_PAGEUP, K_PLUG, K_RIGHT, 
+    K_RIGHTDRAG, K_RIGHTMOUSE, K_RIGHTRELEASE, K_SNR, K_S_F1, K_S_F2, K_S_F3, K_S_F4, K_S_TAB, 
+    K_S_XF1, K_S_XF2, K_S_XF3, K_S_XF4, K_TAB, K_UNDO, K_UP, K_X1DRAG, K_X1MOUSE, K_X1RELEASE, 
+    K_X2DRAG, K_X2MOUSE, K_X2RELEASE, K_XDOWN, K_XEND, K_XF1, K_XF2, K_XF3, K_XF4, K_XHOME, 
+    K_XLEFT, K_XRIGHT, K_XUP, K_ZEND, K_ZERO, K_ZHOME};
 
 /// Returns the [`crate::keycodes_defs::MOD_MASK_TABLE`] modifier-mask
 /// bit corresponding to modifier letter `c` (e.g. `'S'` for shift, `'C'`
@@ -135,6 +172,266 @@ pub fn vim_unescape_ks(p: &mut [u8]) -> usize {
     d
 }
 
+/// One entry of `KEY_NAMES_TABLE` (`struct key_name_entry`).
+pub struct KeyNameEntry {
+    /// Special key code or ASCII value (`key`).
+    pub key: i32,
+    /// Is an alternative name (`is_alt`).
+    pub is_alt: bool,
+    /// Name of key (`name`).
+    pub name: &'static str,
+}
+
+/// `key_names_table` - the special-key name/code lookup table
+/// (mechanically transcribed - see this module's own doc comment for
+/// the full methodology). Every entry is in the ORIGINAL's own
+/// natural declaration order (NOT the hash-bucket order the real
+/// generated header happens to store it in) - order doesn't matter
+/// here, since both `find_special_key_in_table`/
+/// `get_special_key_code` use a plain linear scan, not the
+/// original's own perfect hash.
+pub static KEY_NAMES_TABLE: &[KeyNameEntry] = &[
+    KeyNameEntry { key: K_K0, is_alt: false, name: "k0" },
+    KeyNameEntry { key: K_F1, is_alt: false, name: "F1" },
+    KeyNameEntry { key: K_K1, is_alt: false, name: "k1" },
+    KeyNameEntry { key: K_F2, is_alt: false, name: "F2" },
+    KeyNameEntry { key: K_K2, is_alt: false, name: "k2" },
+    KeyNameEntry { key: K_F3, is_alt: false, name: "F3" },
+    KeyNameEntry { key: K_K3, is_alt: false, name: "k3" },
+    KeyNameEntry { key: K_F4, is_alt: false, name: "F4" },
+    KeyNameEntry { key: K_K4, is_alt: false, name: "k4" },
+    KeyNameEntry { key: K_F5, is_alt: false, name: "F5" },
+    KeyNameEntry { key: K_K5, is_alt: false, name: "k5" },
+    KeyNameEntry { key: K_F6, is_alt: false, name: "F6" },
+    KeyNameEntry { key: K_K6, is_alt: false, name: "k6" },
+    KeyNameEntry { key: K_F7, is_alt: false, name: "F7" },
+    KeyNameEntry { key: K_K7, is_alt: false, name: "k7" },
+    KeyNameEntry { key: K_F8, is_alt: false, name: "F8" },
+    KeyNameEntry { key: K_K8, is_alt: false, name: "k8" },
+    KeyNameEntry { key: K_F9, is_alt: false, name: "F9" },
+    KeyNameEntry { key: K_K9, is_alt: false, name: "k9" },
+    KeyNameEntry { key: (crate::ascii_defs::NL as i32), is_alt: true, name: "LF" },
+    KeyNameEntry { key: (crate::ascii_defs::NL as i32), is_alt: false, name: "NL" },
+    KeyNameEntry { key: K_UP, is_alt: false, name: "Up" },
+    KeyNameEntry { key: (crate::ascii_defs::CAR as i32), is_alt: false, name: "CR" },
+    KeyNameEntry { key: K_BS, is_alt: false, name: "BS" },
+    KeyNameEntry { key: (b'<' as i32), is_alt: false, name: "lt" },
+    KeyNameEntry { key: K_F10, is_alt: false, name: "F10" },
+    KeyNameEntry { key: K_F20, is_alt: false, name: "F20" },
+    KeyNameEntry { key: K_F30, is_alt: false, name: "F30" },
+    KeyNameEntry { key: K_F40, is_alt: false, name: "F40" },
+    KeyNameEntry { key: K_F50, is_alt: false, name: "F50" },
+    KeyNameEntry { key: K_F60, is_alt: false, name: "F60" },
+    KeyNameEntry { key: K_KINS, is_alt: true, name: "KP0" },
+    KeyNameEntry { key: K_F11, is_alt: false, name: "F11" },
+    KeyNameEntry { key: K_F21, is_alt: false, name: "F21" },
+    KeyNameEntry { key: K_F31, is_alt: false, name: "F31" },
+    KeyNameEntry { key: K_F41, is_alt: false, name: "F41" },
+    KeyNameEntry { key: K_F51, is_alt: false, name: "F51" },
+    KeyNameEntry { key: K_F61, is_alt: false, name: "F61" },
+    KeyNameEntry { key: K_KEND, is_alt: true, name: "KP1" },
+    KeyNameEntry { key: K_XF1, is_alt: false, name: "xF1" },
+    KeyNameEntry { key: K_F12, is_alt: false, name: "F12" },
+    KeyNameEntry { key: K_F22, is_alt: false, name: "F22" },
+    KeyNameEntry { key: K_F32, is_alt: false, name: "F32" },
+    KeyNameEntry { key: K_F42, is_alt: false, name: "F42" },
+    KeyNameEntry { key: K_F52, is_alt: false, name: "F52" },
+    KeyNameEntry { key: K_F62, is_alt: false, name: "F62" },
+    KeyNameEntry { key: K_KDOWN, is_alt: true, name: "KP2" },
+    KeyNameEntry { key: K_XF2, is_alt: false, name: "xF2" },
+    KeyNameEntry { key: K_F13, is_alt: false, name: "F13" },
+    KeyNameEntry { key: K_F23, is_alt: false, name: "F23" },
+    KeyNameEntry { key: K_F33, is_alt: false, name: "F33" },
+    KeyNameEntry { key: K_F43, is_alt: false, name: "F43" },
+    KeyNameEntry { key: K_F53, is_alt: false, name: "F53" },
+    KeyNameEntry { key: K_F63, is_alt: false, name: "F63" },
+    KeyNameEntry { key: K_KPAGEDOWN, is_alt: true, name: "KP3" },
+    KeyNameEntry { key: K_XF3, is_alt: false, name: "xF3" },
+    KeyNameEntry { key: K_F14, is_alt: false, name: "F14" },
+    KeyNameEntry { key: K_F24, is_alt: false, name: "F24" },
+    KeyNameEntry { key: K_F34, is_alt: false, name: "F34" },
+    KeyNameEntry { key: K_F44, is_alt: false, name: "F44" },
+    KeyNameEntry { key: K_F54, is_alt: false, name: "F54" },
+    KeyNameEntry { key: K_KLEFT, is_alt: true, name: "KP4" },
+    KeyNameEntry { key: K_XF4, is_alt: false, name: "xF4" },
+    KeyNameEntry { key: K_F15, is_alt: false, name: "F15" },
+    KeyNameEntry { key: K_F25, is_alt: false, name: "F25" },
+    KeyNameEntry { key: K_F35, is_alt: false, name: "F35" },
+    KeyNameEntry { key: K_F45, is_alt: false, name: "F45" },
+    KeyNameEntry { key: K_F55, is_alt: false, name: "F55" },
+    KeyNameEntry { key: K_KORIGIN, is_alt: true, name: "KP5" },
+    KeyNameEntry { key: K_F16, is_alt: false, name: "F16" },
+    KeyNameEntry { key: K_F26, is_alt: false, name: "F26" },
+    KeyNameEntry { key: K_F36, is_alt: false, name: "F36" },
+    KeyNameEntry { key: K_F46, is_alt: false, name: "F46" },
+    KeyNameEntry { key: K_F56, is_alt: false, name: "F56" },
+    KeyNameEntry { key: K_KRIGHT, is_alt: true, name: "KP6" },
+    KeyNameEntry { key: K_F17, is_alt: false, name: "F17" },
+    KeyNameEntry { key: K_F27, is_alt: false, name: "F27" },
+    KeyNameEntry { key: K_F37, is_alt: false, name: "F37" },
+    KeyNameEntry { key: K_F47, is_alt: false, name: "F47" },
+    KeyNameEntry { key: K_F57, is_alt: false, name: "F57" },
+    KeyNameEntry { key: K_KHOME, is_alt: true, name: "KP7" },
+    KeyNameEntry { key: K_F18, is_alt: false, name: "F18" },
+    KeyNameEntry { key: K_F28, is_alt: false, name: "F28" },
+    KeyNameEntry { key: K_F38, is_alt: false, name: "F38" },
+    KeyNameEntry { key: K_F48, is_alt: false, name: "F48" },
+    KeyNameEntry { key: K_F58, is_alt: false, name: "F58" },
+    KeyNameEntry { key: K_KUP, is_alt: true, name: "KP8" },
+    KeyNameEntry { key: K_F19, is_alt: false, name: "F19" },
+    KeyNameEntry { key: K_F29, is_alt: false, name: "F29" },
+    KeyNameEntry { key: K_F39, is_alt: false, name: "F39" },
+    KeyNameEntry { key: K_F49, is_alt: false, name: "F49" },
+    KeyNameEntry { key: K_F59, is_alt: false, name: "F59" },
+    KeyNameEntry { key: K_KPAGEUP, is_alt: true, name: "KP9" },
+    KeyNameEntry { key: (crate::ascii_defs::TAB as i32), is_alt: false, name: "Tab" },
+    KeyNameEntry { key: K_TAB, is_alt: false, name: "Tab" },
+    KeyNameEntry { key: (crate::ascii_defs::ESC as i32), is_alt: false, name: "Esc" },
+    KeyNameEntry { key: K_COMMAND, is_alt: false, name: "Cmd" },
+    KeyNameEntry { key: K_END, is_alt: false, name: "End" },
+    KeyNameEntry { key: (crate::ascii_defs::CSI as i32), is_alt: false, name: "CSI" },
+    KeyNameEntry { key: K_DEL, is_alt: false, name: "Del" },
+    KeyNameEntry { key: K_ZERO, is_alt: false, name: "Nul" },
+    KeyNameEntry { key: K_KUP, is_alt: false, name: "kUp" },
+    KeyNameEntry { key: K_XUP, is_alt: false, name: "xUp" },
+    KeyNameEntry { key: (b'|' as i32), is_alt: false, name: "Bar" },
+    KeyNameEntry { key: K_SNR, is_alt: false, name: "SNR" },
+    KeyNameEntry { key: K_INS, is_alt: true, name: "Ins" },
+    KeyNameEntry { key: K_DOWN, is_alt: false, name: "Down" },
+    KeyNameEntry { key: K_DROP, is_alt: false, name: "Drop" },
+    KeyNameEntry { key: K_FIND, is_alt: false, name: "Find" },
+    KeyNameEntry { key: K_HELP, is_alt: false, name: "Help" },
+    KeyNameEntry { key: K_HOME, is_alt: false, name: "Home" },
+    KeyNameEntry { key: K_KDEL, is_alt: false, name: "kDel" },
+    KeyNameEntry { key: K_KEND, is_alt: false, name: "kEnd" },
+    KeyNameEntry { key: K_LEFT, is_alt: false, name: "Left" },
+    KeyNameEntry { key: K_PLUG, is_alt: false, name: "Plug" },
+    KeyNameEntry { key: K_UNDO, is_alt: false, name: "Undo" },
+    KeyNameEntry { key: K_XEND, is_alt: false, name: "xEnd" },
+    KeyNameEntry { key: K_ZEND, is_alt: false, name: "zEnd" },
+    KeyNameEntry { key: K_KDOWN, is_alt: false, name: "kDown" },
+    KeyNameEntry { key: K_XDOWN, is_alt: false, name: "xDown" },
+    KeyNameEntry { key: K_KHOME, is_alt: false, name: "kHome" },
+    KeyNameEntry { key: K_XHOME, is_alt: false, name: "xHome" },
+    KeyNameEntry { key: K_ZHOME, is_alt: false, name: "zHome" },
+    KeyNameEntry { key: K_RIGHT, is_alt: false, name: "Right" },
+    KeyNameEntry { key: K_KLEFT, is_alt: false, name: "kLeft" },
+    KeyNameEntry { key: K_XLEFT, is_alt: false, name: "xLeft" },
+    KeyNameEntry { key: (crate::ascii_defs::CAR as i32), is_alt: true, name: "Enter" },
+    KeyNameEntry { key: K_MOUSE, is_alt: false, name: "Mouse" },
+    KeyNameEntry { key: K_KDIVIDE, is_alt: true, name: "KPDiv" },
+    KeyNameEntry { key: K_KPLUS, is_alt: false, name: "kPlus" },
+    KeyNameEntry { key: (b' ' as i32), is_alt: false, name: "Space" },
+    KeyNameEntry { key: (crate::ascii_defs::ESC as i32), is_alt: true, name: "Escape" },
+    KeyNameEntry { key: K_X1DRAG, is_alt: false, name: "X1Drag" },
+    KeyNameEntry { key: K_X2DRAG, is_alt: false, name: "X2Drag" },
+    KeyNameEntry { key: K_PAGEUP, is_alt: false, name: "PageUp" },
+    KeyNameEntry { key: K_KMINUS, is_alt: false, name: "kMinus" },
+    KeyNameEntry { key: K_KRIGHT, is_alt: false, name: "kRight" },
+    KeyNameEntry { key: K_XRIGHT, is_alt: false, name: "xRight" },
+    KeyNameEntry { key: (b'\\' as i32), is_alt: false, name: "Bslash" },
+    KeyNameEntry { key: K_DEL, is_alt: true, name: "Delete" },
+    KeyNameEntry { key: K_KSELECT, is_alt: false, name: "Select" },
+    KeyNameEntry { key: K_KMULTIPLY, is_alt: true, name: "KPMult" },
+    KeyNameEntry { key: K_IGNORE, is_alt: false, name: "Ignore" },
+    KeyNameEntry { key: K_KENTER, is_alt: false, name: "kEnter" },
+    KeyNameEntry { key: K_KCOMMA, is_alt: false, name: "kComma" },
+    KeyNameEntry { key: K_KPOINT, is_alt: false, name: "kPoint" },
+    KeyNameEntry { key: K_KPLUS, is_alt: true, name: "KPPlus" },
+    KeyNameEntry { key: K_KEQUAL, is_alt: false, name: "kEqual" },
+    KeyNameEntry { key: K_INS, is_alt: false, name: "Insert" },
+    KeyNameEntry { key: (crate::ascii_defs::CAR as i32), is_alt: true, name: "Return" },
+    KeyNameEntry { key: K_KPAGEUP, is_alt: false, name: "kPageUp" },
+    KeyNameEntry { key: K_KCOMMA, is_alt: true, name: "KPComma" },
+    KeyNameEntry { key: K_KENTER, is_alt: true, name: "KPEnter" },
+    KeyNameEntry { key: K_KDIVIDE, is_alt: false, name: "kDivide" },
+    KeyNameEntry { key: K_KMINUS, is_alt: true, name: "KPMinus" },
+    KeyNameEntry { key: K_X1MOUSE, is_alt: false, name: "X1Mouse" },
+    KeyNameEntry { key: K_X2MOUSE, is_alt: false, name: "X2Mouse" },
+    KeyNameEntry { key: K_KINS, is_alt: false, name: "kInsert" },
+    KeyNameEntry { key: K_KORIGIN, is_alt: false, name: "kOrigin" },
+    KeyNameEntry { key: K_MOUSEUP, is_alt: true, name: "MouseUp" },
+    KeyNameEntry { key: (crate::ascii_defs::NL as i32), is_alt: true, name: "NewLine" },
+    KeyNameEntry { key: K_KEQUAL, is_alt: true, name: "KPEquals" },
+    KeyNameEntry { key: K_LEFTDRAG, is_alt: false, name: "LeftDrag" },
+    KeyNameEntry { key: K_PAGEDOWN, is_alt: false, name: "PageDown" },
+    KeyNameEntry { key: (crate::ascii_defs::NL as i32), is_alt: true, name: "LineFeed" },
+    KeyNameEntry { key: K_KDEL, is_alt: true, name: "KPPeriod" },
+    KeyNameEntry { key: K_BS, is_alt: true, name: "BackSpace" },
+    KeyNameEntry { key: K_KMULTIPLY, is_alt: false, name: "kMultiply" },
+    KeyNameEntry { key: K_KPAGEDOWN, is_alt: false, name: "kPageDown" },
+    KeyNameEntry { key: K_LEFTMOUSE, is_alt: false, name: "LeftMouse" },
+    KeyNameEntry { key: K_MOUSEDOWN, is_alt: true, name: "MouseDown" },
+    KeyNameEntry { key: K_MOUSEMOVE, is_alt: false, name: "MouseMove" },
+    KeyNameEntry { key: K_RIGHTDRAG, is_alt: false, name: "RightDrag" },
+    KeyNameEntry { key: K_X1RELEASE, is_alt: false, name: "X1Release" },
+    KeyNameEntry { key: K_X2RELEASE, is_alt: false, name: "X2Release" },
+    KeyNameEntry { key: K_MIDDLEDRAG, is_alt: false, name: "MiddleDrag" },
+    KeyNameEntry { key: K_RIGHTMOUSE, is_alt: false, name: "RightMouse" },
+    KeyNameEntry { key: K_MIDDLEMOUSE, is_alt: false, name: "MiddleMouse" },
+    KeyNameEntry { key: K_LEFTMOUSE_NM, is_alt: false, name: "LeftMouseNM" },
+    KeyNameEntry { key: K_LEFTRELEASE, is_alt: false, name: "LeftRelease" },
+    KeyNameEntry { key: K_RIGHTRELEASE, is_alt: false, name: "RightRelease" },
+    KeyNameEntry { key: K_LEFTRELEASE_NM, is_alt: false, name: "LeftReleaseNM" },
+    KeyNameEntry { key: K_MIDDLERELEASE, is_alt: false, name: "MiddleRelease" },
+    KeyNameEntry { key: K_MOUSEDOWN, is_alt: false, name: "ScrollWheelUp" },
+    KeyNameEntry { key: K_MOUSEUP, is_alt: false, name: "ScrollWheelDown" },
+    KeyNameEntry { key: K_MOUSERIGHT, is_alt: false, name: "ScrollWheelLeft" },
+    KeyNameEntry { key: K_MOUSELEFT, is_alt: false, name: "ScrollWheelRight" },
+];
+
+/// Find a table index for special key `c` in `KEY_NAMES_TABLE`,
+/// skipping alternate-name (`is_alt`) entries - used to look up a
+/// key's own CANONICAL display name (`find_special_key_in_table`).
+/// Returns `-1` if `c` isn't a recognized special key.
+#[must_use]
+pub fn find_special_key_in_table(c: i32) -> i32 {
+    for (i, entry) in KEY_NAMES_TABLE.iter().enumerate() {
+        if c == entry.key && !entry.is_alt {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+/// Find the special key with the given name (`get_special_key_code`).
+///
+/// `name` does not have to end with a NUL byte - matching stops
+/// before the first non-identifier byte (` . `/` _ `/
+/// alphanumeric, via [`crate::ascii_defs::ascii_isident`]). If
+/// `name` starts with `"t_"` the next two bytes are interpreted as
+/// a termcap name directly, bypassing the table entirely.
+///
+/// The real lookup against [`KEY_NAMES_TABLE`] is
+/// **case-insensitive** (matching the original's own generated perfect
+/// hash, built with `icase = true` - see this module's own doc
+/// comment) - translated here as a plain linear scan comparing
+/// lowercased bytes, rather than replicating the hash itself.
+///
+/// Returns the key code, or `0` if not found.
+#[must_use]
+pub fn get_special_key_code(name: &[u8]) -> i32 {
+    if name.first().copied() == Some(b't')
+        && name.get(1).copied() == Some(b'_')
+        && name.get(2).is_some_and(|&c| c != 0)
+        && name.get(3).is_some_and(|&c| c != 0)
+    {
+        return termcap2key(name[2], name[3]);
+    }
+
+    let mut end = 0;
+    while name.get(end).is_some_and(|&c| crate::ascii_defs::ascii_isident(i32::from(c))) {
+        end += 1;
+    }
+    let candidate = &name[..end];
+
+    for entry in KEY_NAMES_TABLE {
+        if candidate.eq_ignore_ascii_case(entry.name.as_bytes()) {
+            return entry.key;
+        }
+    }
+    0
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +605,96 @@ mod tests {
     fn vim_unescape_ks_empty_string_stays_empty() {
         let mut buf = [0u8];
         assert_eq!(vim_unescape_ks(&mut buf), 0);
+    }
+
+    // --- KEY_NAMES_TABLE / find_special_key_in_table / get_special_key_code ---
+
+    #[test]
+    fn key_names_table_has_the_expected_entry_count() {
+        // Mechanically transcribed from a 187-entry pre-built copy of
+        // keycode_names.generated.h - hand-counted via the same
+        // extraction script used to generate the table itself.
+        assert_eq!(KEY_NAMES_TABLE.len(), 187);
+    }
+
+    #[test]
+    fn find_special_key_in_table_finds_the_canonical_non_alt_entry() {
+        let idx = find_special_key_in_table(K_UP);
+        assert!(idx >= 0);
+        assert_eq!(KEY_NAMES_TABLE[idx as usize].name, "Up");
+        assert!(!KEY_NAMES_TABLE[idx as usize].is_alt);
+    }
+
+    #[test]
+    fn find_special_key_in_table_skips_an_alt_only_match_to_find_the_canonical_one() {
+        // K_KUP has TWO table entries: an alt "KP8" and the canonical,
+        // non-alt "kUp" - the function must return the LATTER.
+        let idx = find_special_key_in_table(K_KUP);
+        assert!(idx >= 0);
+        assert_eq!(KEY_NAMES_TABLE[idx as usize].name, "kUp");
+        assert!(!KEY_NAMES_TABLE[idx as usize].is_alt);
+    }
+
+    #[test]
+    fn find_special_key_in_table_returns_minus_1_for_an_unrecognized_key() {
+        assert_eq!(find_special_key_in_table(999_999), -1);
+    }
+
+    #[test]
+    fn get_special_key_code_finds_a_plain_name() {
+        assert_eq!(get_special_key_code(b"Up"), K_UP);
+        assert_eq!(get_special_key_code(b"F1"), K_F1);
+    }
+
+    #[test]
+    fn get_special_key_code_is_case_insensitive() {
+        assert_eq!(get_special_key_code(b"up"), K_UP);
+        assert_eq!(get_special_key_code(b"UP"), K_UP);
+        assert_eq!(get_special_key_code(b"uP"), K_UP);
+        assert_eq!(get_special_key_code(b"f1"), K_F1);
+    }
+
+    #[test]
+    fn get_special_key_code_finds_an_alt_name_too() {
+        // "KP8" is K_KUP's own alt-only name - unlike
+        // find_special_key_in_table, name-based lookup must still find
+        // it (a real key notation like "<KP8>" must resolve).
+        assert_eq!(get_special_key_code(b"KP8"), K_KUP);
+    }
+
+    #[test]
+    fn get_special_key_code_stops_at_the_first_non_identifier_byte() {
+        // Trailing, unrelated bytes after the name itself (e.g. a
+        // closing '>' from "<Up>" notation, already stripped by a real
+        // caller, or just garbage) don't prevent a match.
+        assert_eq!(get_special_key_code(b"Up>"), K_UP);
+        assert_eq!(get_special_key_code(b"Up rest"), K_UP);
+    }
+
+    #[test]
+    fn get_special_key_code_unrecognized_name_is_zero() {
+        assert_eq!(get_special_key_code(b"NotARealKeyName"), 0);
+    }
+
+    #[test]
+    fn get_special_key_code_empty_name_is_zero() {
+        assert_eq!(get_special_key_code(b""), 0);
+    }
+
+    #[test]
+    fn get_special_key_code_termcap_form() {
+        // "t_ab" bypasses the table entirely: TERMCAP2KEY('a', 'b').
+        assert_eq!(get_special_key_code(b"t_ab"), termcap2key(b'a', b'b'));
+        // Extra trailing bytes past the 2 termcap bytes are ignored.
+        assert_eq!(get_special_key_code(b"t_abXYZ"), termcap2key(b'a', b'b'));
+    }
+
+    #[test]
+    fn get_special_key_code_termcap_form_needs_at_least_2_bytes_after_t_underscore() {
+        // "t_a" has a 3rd byte but no 4th - not a valid termcap form,
+        // falls through to the ordinary identifier-bounded table scan
+        // instead (and "t_a" itself isn't a real key name, so this
+        // resolves to 0).
+        assert_eq!(get_special_key_code(b"t_a"), 0);
     }
 }
