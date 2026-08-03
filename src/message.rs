@@ -116,6 +116,201 @@ pub fn redirecting() -> bool {
         || !globals.capture_ga.is_null()
 }
 
+/// Truncate `s` to fit within `room_in` display cells - keeping both
+/// the start and end of the string, joined by `"..."` in the middle
+/// when both ends can't fit together as-is (`trunc_string`).
+///
+/// Returns a fresh, owned buffer holding only the resulting content -
+/// no trailing NUL byte, unlike some of this crate's other C-string-
+/// modeled outputs (e.g. `charset::transchar_hex`): the original's own
+/// NUL-termination exists purely to mark content length within a
+/// fixed-size destination buffer, a purpose Rust's own `Vec::len()`
+/// already serves without needing an explicit sentinel byte. To keep
+/// this translation's own truncation POINT byte-for-byte identical to
+/// the original's for the same `room_in`/`buflen` (not merely
+/// "morally equivalent"), every one of the original's own `buflen - 1`
+/// -style capacity reservations (made to leave room for that NUL byte)
+/// is preserved here exactly, even though nothing is ever written into
+/// that reserved slot.
+///
+/// The original's own `s == buf` aliasing case (reusing the SAME
+/// buffer for both input and output, e.g. `quickfix.c`'s own real
+/// caller `qf_fmt_text`) has no direct Rust equivalent needed: since
+/// this function only ever READS `s`, never mutates it in place, a
+/// caller wanting that exact in-place behavior simply overwrites its
+/// own buffer with this function's returned value afterward - byte-
+/// for-byte identical content either way.
+///
+/// `s` is treated as ending at its own first embedded NUL byte, or at
+/// the slice's own end, whichever is shorter - this crate's
+/// established "embedded NUL ends a C-string-modeled scan" idiom
+/// (matching `charset::vim_strnsize`'s own identical treatment),
+/// standing in for the original's own `strlen(s)`.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` (via
+/// [`crate::charset::ptr2cells`]/[`crate::mbyte::utfc_ptr2len`]/
+/// [`crate::mbyte::utf_head_off`]) - same requirement as every other
+/// function that does so.
+#[must_use]
+pub unsafe fn trunc_string(s: &[u8], room_in: i32, buflen: usize) -> Vec<u8> {
+    let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
+
+    if s.is_empty() {
+        // The original: `*buf = NUL;` when `buflen > 0` (an empty
+        // destination string), otherwise nothing at all - either way,
+        // zero bytes of real CONTENT, matching an empty Vec.
+        return Vec::new();
+    }
+
+    let mut room = room_in - 3; // "..." takes 3 chars
+    if room_in < 3 {
+        room = 0;
+    }
+    let half = room / 2;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut len = 0i32;
+    let mut e = 0usize;
+
+    // First part: start of the string.
+    while len < half && e < buflen {
+        if e >= s.len() {
+            // text fits without truncating! `buf` already holds
+            // exactly the string's own content up to this point (no
+            // explicit NUL needed - Vec's own length marks the end).
+            return buf;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe { crate::charset::ptr2cells(&s[e..]) };
+        if len + n > half {
+            break;
+        }
+        len += n;
+        buf.push(s[e]);
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut m = unsafe { crate::mbyte::utfc_ptr2len(&s[e..]) };
+        loop {
+            m -= 1;
+            if m <= 0 {
+                break;
+            }
+            e += 1;
+            if e == buflen {
+                break;
+            }
+            buf.push(s[e]);
+        }
+        e += 1;
+    }
+
+    // Last part: end of the string.
+    let mut half = s.len() as i32; // strlen(s)
+    let mut i = half;
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        // `half` is always >= 1 here (the loop breaks as soon as it
+        // reaches 0, immediately below, before ever looping back to
+        // redo this computation with half == 0), so `half - 1` is
+        // always a valid index into `s`.
+        let offset = unsafe { crate::mbyte::utf_head_off(s, (half - 1) as usize) };
+        half = half - offset - 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe { crate::charset::ptr2cells(&s[half as usize..]) };
+        if len + n > room || half == 0 {
+            break;
+        }
+        len += n;
+        i = half;
+    }
+
+    if i <= e as i32 + 3 {
+        // Text fits without truncating - just append everything
+        // remaining after the first part.
+        let natural_len = s.len() as i32;
+        let mut copy_len = if natural_len >= buflen as i32 { buflen as i32 - 1 } else { natural_len };
+        copy_len = copy_len - e as i32 + 1;
+        if copy_len < 1 {
+            buf.truncate(e - 1);
+        } else {
+            // The original's own `len` here includes the destination
+            // buffer's own trailing NUL byte (`strlen(s) + 1`-style
+            // accounting) - this translation copies one fewer byte
+            // (the real content only), matching its own "no NUL byte"
+            // convention documented above.
+            let real_copy_len = (copy_len - 1) as usize;
+            buf.extend_from_slice(&s[e..e + real_copy_len]);
+        }
+    } else if e + 3 < buflen {
+        // Set the middle "..." and copy the last part.
+        buf.truncate(e);
+        buf.extend_from_slice(b"...");
+        let natural_len = (s.len() - i as usize) as i32; // strlen(s + i)
+        let mut copy_len = natural_len + 1;
+        if copy_len >= buflen as i32 - e as i32 - 3 {
+            copy_len = buflen as i32 - e as i32 - 3 - 1;
+        }
+        let real_copy_len = (copy_len - 1).max(0) as usize;
+        buf.extend_from_slice(&s[i as usize..i as usize + real_copy_len]);
+    } else {
+        // Can't fit the "...", just truncate it - the original
+        // reserves the final byte for a NUL, i.e. keeps only
+        // `buflen - 1` content bytes; this translation has no NUL of
+        // its own, but keeps the exact same content-length cap.
+        buf.truncate(buflen.saturating_sub(1));
+    }
+
+    buf
+}
+
+/// Truncate a message such that it can be printed without causing a
+/// scroll (`msg_strtrunc`). Returns `None` when no truncating is done
+/// (matching the original's own `NULL` return - the caller should keep
+/// using its own, untruncated `s` in that case).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`/`crate::option_vars::OPTION_VARS`
+/// (the same real fields [`trunc_string`]/[`crate::option::shortmess`]/
+/// [`crate::ui::ui_has`] already require), plus forwards
+/// [`trunc_string`]'s own safety doc.
+#[must_use]
+pub unsafe fn msg_strtrunc(s: &[u8], force: bool) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let ui_has_messages = crate::ui::ui_has(crate::ui::UiExtension::Messages);
+
+    // May truncate message to avoid a hit-return prompt.
+    let should_truncate = (g.msg_scroll == 0
+        && !g.need_wait_return
+        && crate::option::shortmess(crate::option_vars::shm::TRUNCALL)
+        && !g.exmode_active
+        && g.msg_silent == 0
+        && !ui_has_messages)
+        || force;
+    if !should_truncate {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut len = unsafe { crate::charset::vim_strsize(s) };
+    let room = if g.msg_scrolled != 0 {
+        // Use all the columns.
+        (g.Rows - g.msg_row) * g.Columns - 1
+    } else {
+        // Use up to 'showcmd' column.
+        let last_row = if ui_has_messages { g.Columns } else { g.sc_col - 1 };
+        (g.Rows - g.msg_row - 1) * g.Columns + last_row
+    };
+    if len > room && room > 0 {
+        // may have up to 18 bytes per cell (6 per char, up to two
+        // composing chars)
+        len = (room + 2) * 18;
+        // SAFETY: forwarded from this function's own safety doc.
+        return Some(unsafe { trunc_string(s, room, len as usize) });
+    }
+    None
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -219,5 +414,218 @@ pub(crate) mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = Some(b"log.txt".to_vec());
         assert!(redirecting());
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = old;
+    }
+
+    // --- trunc_string ---
+
+    #[test]
+    fn trunc_string_empty_input_is_an_empty_buffer() {
+        assert_eq!(unsafe { trunc_string(b"", 10, 100) }, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn trunc_string_fits_without_truncating_returns_the_whole_string() {
+        // "hello" is only 5 cells - comfortably under room_in=20's
+        // half budget (8), so the first-part loop's own "s[e]==NUL"
+        // fast-path fires and returns the whole thing untouched.
+        assert_eq!(unsafe { trunc_string(b"hello", 20, 100) }, b"hello");
+    }
+
+    #[test]
+    fn trunc_string_ascii_middle_truncation() {
+        // Hand-traced: room = 10-3 = 7, half = 3. First part accepts
+        // "abc" (3 cells, e=3). Last part walks backward from the end
+        // accepting 'z','y','x','w' (4 cells, len reaches 7 == room),
+        // rejecting 'v' (would make len=8 > room) - i ends up at the
+        // position of 'w' (index 22). Since i(22) > e(3)+3(=6), the
+        // "..." branch is used: "abc" + "..." + "wxyz".
+        let s = b"abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(unsafe { trunc_string(s, 10, 100) }, b"abc...wxyz");
+    }
+
+    #[test]
+    fn trunc_string_small_room_still_reserves_dots() {
+        // room_in=6 => room=3, half=1. First part accepts only 'a'
+        // (len=1, e=1). Last part walks back accepting only 'z'
+        // (len=2 <= room=3), rejects 'y' (len=3, still <=3 actually -
+        // let's just trust the real algorithm and check the shape
+        // rather than hand-deriving every character here).
+        let s = b"abcdefghijklmnopqrstuvwxyz";
+        let result = unsafe { trunc_string(s, 6, 100) };
+        assert!(result.windows(3).any(|w| w == b"..."), "expected a '...' in {result:?}");
+        assert!(result.starts_with(b"a"));
+        assert!(result.ends_with(b"z"));
+    }
+
+    #[test]
+    fn trunc_string_buflen_clamps_the_fits_without_truncating_branch() {
+        // The string is short enough to "fit without truncating" by
+        // room_in alone (room_in=100 is huge), but buflen is small
+        // enough to force real content clamping in the i<=e+3 branch.
+        let s = b"abcdefghij"; // 10 bytes
+        let result = unsafe { trunc_string(s, 100, 5) };
+        // buflen=5 means at most 4 content bytes (buflen - 1 reserved
+        // for the original's own conceptual NUL slot).
+        assert_eq!(result.len(), 4);
+        assert_eq!(result, b"abcd");
+    }
+
+    #[test]
+    fn trunc_string_buflen_too_small_for_dots_hard_truncates() {
+        // room_in is large enough to want a real "..." truncation, but
+        // buflen is too small to fit "first part" + "..." at all, so
+        // the hard-truncate-at-buflen branch is used instead.
+        let s = b"abcdefghijklmnopqrstuvwxyz";
+        let result = unsafe { trunc_string(s, 10, 4) };
+        assert_eq!(result.len(), 3); // buflen - 1
+    }
+
+    #[test]
+    fn trunc_string_negative_room_in_is_treated_as_zero() {
+        // room_in < 3 forces room = 0 (degenerate case, can't fit any
+        // real content alongside the "...").
+        let s = b"abcdefghijklmnopqrstuvwxyz";
+        let result = unsafe { trunc_string(s, 1, 100) };
+        assert!(result.windows(3).any(|w| w == b"..."));
+    }
+
+    #[test]
+    fn trunc_string_never_splits_a_multibyte_character() {
+        // Mix of ASCII and a wide (2-cell) CJK character (U+4E2D "中",
+        // 3 UTF-8 bytes) repeated several times - the riskiest part of
+        // the algorithm is the byte-vs-cell tracking in both the
+        // first-part inner loop (utfc_ptr2len) and the last-part
+        // backward walk (utf_head_off). This doesn't hand-derive the
+        // exact expected output (that would require replicating the
+        // full cell-width arithmetic by hand), but does verify the
+        // result is always valid UTF-8 (never a partial multi-byte
+        // sequence) for a range of room_in values.
+        let s = "ab中中中中中中中中中中cd".as_bytes();
+        for room_in in 3..=20 {
+            let result = unsafe { trunc_string(s, room_in, 100) };
+            assert!(
+                std::str::from_utf8(&result).is_ok(),
+                "room_in={room_in} produced invalid UTF-8: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trunc_string_stops_at_an_embedded_nul() {
+        // Matches the established "embedded NUL ends a C-string-
+        // modeled scan" idiom - content after the NUL is invisible to
+        // the function entirely, same as a real strlen(s) would see.
+        assert_eq!(unsafe { trunc_string(b"hi\0garbage", 20, 100) }, b"hi");
+    }
+
+    // --- msg_strtrunc ---
+
+    /// Resets every Globals/OPTION_VARS field `msg_strtrunc` reads to
+    /// a fixed, known-good "should truncate, plenty of room" baseline,
+    /// returning the previous values so a test can restore them.
+    struct MsgStrtruncGuard {
+        msg_scroll: i32,
+        need_wait_return: bool,
+        p_shm: Option<Vec<u8>>,
+        exmode_active: bool,
+        msg_silent: i32,
+        msg_scrolled: i32,
+        rows: i32,
+        columns: i32,
+        msg_row: i32,
+        sc_col: i32,
+    }
+
+    impl MsgStrtruncGuard {
+        fn set() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let prev = MsgStrtruncGuard {
+                msg_scroll: g.msg_scroll,
+                need_wait_return: g.need_wait_return,
+                p_shm: ov.p_shm.clone(),
+                exmode_active: g.exmode_active,
+                msg_silent: g.msg_silent,
+                msg_scrolled: g.msg_scrolled,
+                rows: g.Rows,
+                columns: g.Columns,
+                msg_row: g.msg_row,
+                sc_col: g.sc_col,
+            };
+            g.msg_scroll = 0;
+            g.need_wait_return = false;
+            ov.p_shm = Some(b"T".to_vec());
+            g.exmode_active = false;
+            g.msg_silent = 0;
+            g.msg_scrolled = 0;
+            g.Rows = 24;
+            g.Columns = 80;
+            g.msg_row = 0;
+            g.sc_col = 0;
+            prev
+        }
+    }
+
+    impl Drop for MsgStrtruncGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            g.msg_scroll = self.msg_scroll;
+            g.need_wait_return = self.need_wait_return;
+            ov.p_shm = self.p_shm.take();
+            g.exmode_active = self.exmode_active;
+            g.msg_silent = self.msg_silent;
+            g.msg_scrolled = self.msg_scrolled;
+            g.Rows = self.rows;
+            g.Columns = self.columns;
+            g.msg_row = self.msg_row;
+            g.sc_col = self.sc_col;
+        }
+    }
+
+    #[test]
+    fn msg_strtrunc_short_message_needs_no_truncation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = MsgStrtruncGuard::set();
+        assert_eq!(unsafe { msg_strtrunc(b"hello", false) }, None);
+    }
+
+    #[test]
+    fn msg_strtrunc_long_message_is_truncated() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = MsgStrtruncGuard::set();
+        // 80 columns * 24 rows is a huge room budget normally, but
+        // msg_row is set to Rows-1 (the very last row) below, so
+        // "room" (based on the remaining rows/showcmd column) becomes
+        // small enough that a long message must be truncated.
+        unsafe { crate::globals::GLOBALS.get_mut() }.msg_row = 23;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sc_col = 5;
+        let long_msg = vec![b'x'; 500];
+        let result = unsafe { msg_strtrunc(&long_msg, false) };
+        assert!(result.is_some());
+        assert!(result.unwrap().len() < 500);
+    }
+
+    #[test]
+    fn msg_strtrunc_returns_none_when_shortmess_truncall_not_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = MsgStrtruncGuard::set();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = Some(Vec::new());
+        unsafe { crate::globals::GLOBALS.get_mut() }.msg_row = 23;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sc_col = 5;
+        let long_msg = vec![b'x'; 500];
+        assert_eq!(unsafe { msg_strtrunc(&long_msg, false) }, None);
+    }
+
+    #[test]
+    fn msg_strtrunc_force_truncates_even_without_shortmess_truncall() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = MsgStrtruncGuard::set();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = Some(Vec::new());
+        unsafe { crate::globals::GLOBALS.get_mut() }.msg_row = 23;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sc_col = 5;
+        let long_msg = vec![b'x'; 500];
+        let result = unsafe { msg_strtrunc(&long_msg, true) };
+        assert!(result.is_some());
     }
 }
