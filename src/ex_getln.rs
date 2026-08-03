@@ -319,6 +319,77 @@ pub fn f_wildtrigger(
     unimplemented!("wildtrigger(): needs a real, live command-line-editing state")
 }
 
+/// Set the command line contents to `str`, with the cursor at byte
+/// position `pos` (`< 0` meaning "at the end") (`set_cmdline_str`,
+/// `ex_getln.c`). Returns `1` (fail) unless a command line is
+/// currently active - the original's own `get_ccline_ptr() == NULL`
+/// check is exactly `!cmdline_is_active()`, always true today, making
+/// this an always-taken early return (not a hardcoded shortcut - see
+/// `cmdline_is_active`'s own doc comment for the same established
+/// pattern).
+fn set_cmdline_str(_str: &[u8], _pos: i32) -> i32 {
+    if !cmdline_is_active() {
+        return 1;
+    }
+    unimplemented!("set_cmdline_str(): needs a real, live command-line-editing state")
+}
+
+/// `setcmdline({str} [, {pos}])` - set the command-line contents
+/// (`f_setcmdline`, `ex_getln.c`).
+pub fn f_setcmdline(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    if crate::eval::typval::tv_check_for_string_arg(argvars, 0) == crate::vim_defs::FAIL
+        || (argvars.len() > 1
+            && crate::eval::typval::tv_check_for_opt_number_arg(argvars, 1) == crate::vim_defs::FAIL)
+    {
+        return;
+    }
+
+    let mut pos: i32 = -1;
+    if argvars.len() > 1 {
+        let mut error = false;
+        pos = (crate::eval::typval::tv_get_number_chk(&argvars[1], Some(&mut error)) - 1) as i32;
+        if error {
+            return;
+        }
+        if pos < 0 {
+            // Real `emsg(_(e_positive))` display skipped - message
+            // display not tractable, matching this crate's established
+            // policy - the identical early-return state is kept.
+            return;
+        }
+    }
+
+    let n = set_cmdline_str(&crate::eval::typval::tv_get_string(&argvars[0]), pos);
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
+}
+
+/// Set the command line's cursor byte position to `pos` (zero-based)
+/// (`set_cmdline_pos`, `ex_getln.c`). Returns `1` (fail) unless a
+/// command line is currently active - see [`set_cmdline_str`]'s own
+/// doc comment for why this is always the case today.
+fn set_cmdline_pos(_pos: i32) -> i32 {
+    if !cmdline_is_active() {
+        return 1;
+    }
+    unimplemented!("set_cmdline_pos(): needs a real, live command-line-editing state")
+}
+
+/// `setcmdpos({pos})` - set the command-line cursor position
+/// (`f_setcmdpos`, `ex_getln.c`).
+pub fn f_setcmdpos(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    let pos = (crate::eval::typval::tv_get_number(&argvars[0]) - 1) as i32;
+    if pos >= 0 {
+        rettv.value =
+            crate::eval::typval_defs::TypvalValue::Number(i64::from(set_cmdline_pos(pos)));
+    }
+}
+
 /// `cmdpreview_bufnr` - the buffer handle of the current `'inccommand'`
 /// preview buffer, or `0` when no preview is active, read via
 /// [`cmdpreview_get_bufnr`]. Modeled as its own file-static, matching
@@ -633,5 +704,128 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    // --- set_cmdline_str / f_setcmdline / set_cmdline_pos / f_setcmdpos ---
+
+    #[test]
+    fn set_cmdline_str_returns_1_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(set_cmdline_str(b"foo", -1), 1);
+    }
+
+    #[test]
+    fn set_cmdline_pos_returns_1_when_no_command_line_is_active() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(set_cmdline_pos(0), 1);
+    }
+
+    #[test]
+    fn setcmdline_leaves_rettv_untouched_when_first_arg_is_not_a_string() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let args = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(5),
+            ..Default::default()
+        }];
+        f_setcmdline(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn setcmdline_leaves_rettv_untouched_when_second_arg_is_not_a_number() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"foo".to_vec())),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"bar".to_vec())),
+                ..Default::default()
+            },
+        ];
+        f_setcmdline(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn setcmdline_leaves_rettv_untouched_when_pos_is_negative() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        // {pos} is 1-based; passing 0 makes the internal, 0-based
+        // `pos` computation land at -1, which is the real, reachable
+        // "positive number required" early return (independent of
+        // `cmdline_is_active()`'s own always-false state today).
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"foo".to_vec())),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(0),
+                ..Default::default()
+            },
+        ];
+        f_setcmdline(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn setcmdline_returns_1_when_pos_argument_is_omitted() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let args = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::String(Some(b"foo".to_vec())),
+            ..Default::default()
+        }];
+        f_setcmdline(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn setcmdline_returns_1_when_pos_is_a_valid_positive_number() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let args = [
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::String(Some(b"foo".to_vec())),
+                ..Default::default()
+            },
+            crate::eval::typval_defs::TypvalT {
+                value: crate::eval::typval_defs::TypvalValue::Number(1),
+                ..Default::default()
+            },
+        ];
+        f_setcmdline(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn setcmdpos_leaves_rettv_untouched_when_pos_is_negative() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        // {pos} is 1-based; passing 0 makes the internal, 0-based
+        // `pos` computation land at -1, so `f_setcmdpos` never even
+        // calls `set_cmdline_pos` and never assigns `rettv`.
+        let args = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(0),
+            ..Default::default()
+        }];
+        f_setcmdpos(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn setcmdpos_returns_1_when_pos_is_a_valid_positive_number() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        let args = [crate::eval::typval_defs::TypvalT {
+            value: crate::eval::typval_defs::TypvalValue::Number(1),
+            ..Default::default()
+        }];
+        f_setcmdpos(&args, &mut rettv);
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(1));
     }
 }

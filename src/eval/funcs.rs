@@ -527,6 +527,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcmdscreenpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::ex_getln::f_getcmdscreenpos });
         m.insert(&b"getcmdtype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::ex_getln::f_getcmdtype });
         m.insert(&b"wildtrigger"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::ex_getln::f_wildtrigger });
+        m.insert(&b"setcmdline"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::ex_getln::f_setcmdline });
+        m.insert(&b"setcmdpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::ex_getln::f_setcmdpos });
         m.insert(&b"getcmdwintype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcmdwintype });
         m.insert(&b"getpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getpos });
         m.insert(&b"getcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getcharpos });
@@ -8235,6 +8237,8 @@ mod tests {
             "getcmdscreenpos",
             "getcmdtype",
             "wildtrigger",
+            "setcmdline",
+            "setcmdpos",
             "getpos",
             "getcharpos",
             "getcurpos",
