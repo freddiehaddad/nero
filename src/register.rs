@@ -32,6 +32,16 @@
 //! behavior for a session in which nothing has ever yanked, deleted,
 //! put, or run an Ex command yet.
 //!
+//! [`get_reg_contents`]'s `kGRegList` flag (return a `List`, one item
+//! per register line, rather than a joined string) is now real too,
+//! used by both the `getreg()`/`getreginfo()` builtins
+//! (`eval/funcs.rs`). [`get_register_name`]/[`get_unname_register`]
+//! (the small `register.h` inverse of [`op_reg_index`], and the index
+//! of the register `""` currently points to) are also translated -
+//! `get_unname_register` always returns `-1` today (`Y_PREVIOUS` is
+//! always `None`, see its own doc comment), matching a real session
+//! in which nothing has ever performed a genuine yank.
+//!
 //! Deferred:
 //! - `@.` (last inserted text) needs a `last_insert` `String`
 //!   file-static (`insert.c`) populated only by real insert-mode text
@@ -47,10 +57,6 @@
 //!   `file_name_at_cursor`/`find_ident_under_cursor`/`ml_get_buf`
 //!   (`errmsg = true` is unreachable from any real caller in this
 //!   crate today).
-//! - `kGRegList` (`get_reg_contents` returning a `List` rather than a
-//!   joined string, used by the `getreg()` builtin, not `@r` in
-//!   expressions) - `unimplemented!()`s if ever requested; `eval7`'s
-//!   own real call never sets it.
 //! - Everything else: `yank_register_mline`, `get_default_register_name`
 //!   (`'clipboard'`-driven default-register selection), `op_reg_iter`
 //!   (ShaDa register enumeration), and the entire real
@@ -81,6 +87,43 @@ pub fn op_reg_index(regname: i32) -> Option<usize> {
         Some(PLUS_REGISTER)
     } else {
         None
+    }
+}
+
+/// The character name of the register with the given `Y_REGS` index
+/// (`get_register_name`), the inverse of [`op_reg_index`] -
+/// `-1` maps to `'"'` (the unnamed register), matching the original's
+/// own special case for [`get_unname_register`]'s `-1` "no previous
+/// register" sentinel.
+#[must_use]
+pub fn get_register_name(num: i32) -> i32 {
+    if num == -1 {
+        i32::from(b'"')
+    } else if num < 10 {
+        num + i32::from(b'0')
+    } else if num == crate::register_defs::DELETION_REGISTER as i32 {
+        i32::from(b'-')
+    } else if num == STAR_REGISTER as i32 {
+        i32::from(b'*')
+    } else if num == PLUS_REGISTER as i32 {
+        i32::from(b'+')
+    } else {
+        num + i32::from(b'a') - 10
+    }
+}
+
+/// The index of the register `""` (unnamed) currently points to
+/// (`get_unname_register`) - always `-1` today, matching `Y_PREVIOUS`
+/// always being `None` (nothing performs a real yank yet).
+///
+/// # Safety
+/// Touches `Y_PREVIOUS` (a `GlobalCell`) - no overlapping live access.
+#[must_use]
+pub unsafe fn get_unname_register() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { *Y_PREVIOUS.get_mut() } {
+        Some(idx) => idx as i32,
+        None => -1,
     }
 }
 
@@ -529,6 +572,42 @@ mod tests {
         assert_eq!(op_reg_index(i32::from(b'"')), None);
         assert_eq!(op_reg_index(0), None);
         assert_eq!(op_reg_index(i32::from(b'!')), None);
+    }
+
+    #[test]
+    fn get_register_name_is_the_inverse_of_op_reg_index() {
+        for regname in b'0'..=b'9' {
+            let idx = op_reg_index(i32::from(regname)).unwrap();
+            assert_eq!(get_register_name(idx as i32), i32::from(regname));
+        }
+        for regname in b'a'..=b'z' {
+            let idx = op_reg_index(i32::from(regname)).unwrap();
+            assert_eq!(get_register_name(idx as i32), i32::from(regname));
+        }
+        assert_eq!(get_register_name(crate::register_defs::DELETION_REGISTER as i32), i32::from(b'-'));
+        assert_eq!(get_register_name(STAR_REGISTER as i32), i32::from(b'*'));
+        assert_eq!(get_register_name(PLUS_REGISTER as i32), i32::from(b'+'));
+    }
+
+    #[test]
+    fn get_register_name_of_minus_one_is_the_unnamed_register() {
+        assert_eq!(get_register_name(-1), i32::from(b'"'));
+    }
+
+    #[test]
+    fn get_unname_register_is_minus_one_when_y_previous_is_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, None);
+        assert_eq!(unsafe { get_unname_register() }, -1);
+    }
+
+    #[test]
+    fn get_unname_register_matches_y_previous_when_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = unsafe { *Y_PREVIOUS.get_mut() };
+        unsafe { *Y_PREVIOUS.get_mut() = Some(5) };
+        assert_eq!(unsafe { get_unname_register() }, 5);
+        unsafe { *Y_PREVIOUS.get_mut() = saved };
     }
 
     #[test]

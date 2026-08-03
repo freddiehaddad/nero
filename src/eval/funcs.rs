@@ -473,6 +473,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"windowsversion"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_windowsversion });
         m.insert(&b"getreg"[..], EvalFuncDefT { min_argc: 0, max_argc: 3, base_arg: 1, func: f_getreg });
         m.insert(&b"getregtype"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getregtype });
+        m.insert(&b"getreginfo"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getreginfo });
         m.insert(&b"changenr"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_changenr });
         m.insert(&b"interrupt"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_interrupt });
         m.insert(&b"invert"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_invert });
@@ -5972,6 +5973,90 @@ unsafe fn f_getregtype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(Some(crate::register::format_reg_type(reg_type, reg_width)));
 }
 
+/// `getreginfo([{regname}])` - a `Dict` describing register
+/// `{regname}` (default `v:register`): `regcontents` (a `List`, one
+/// item per register line), `regtype` (`"v"`/`"V"`/`"<CTRL-V>N"`),
+/// and either `points_to` (only for the unnamed register `'"'`) or
+/// `isunnamed` (a `Bool`) (`f_getreginfo`, `funcs.c`), via the
+/// already-real [`crate::register::get_reg_contents`]/`get_reg_type`/
+/// `format_reg_type`/[`crate::register::get_register_name`]/
+/// [`crate::register::get_unname_register`].
+///
+/// If the register is unset, `rettv` is left as an empty `Dict` (no
+/// `regcontents`/`regtype`/`points_to`/`isunnamed` key at all),
+/// matching the original's own early `return;` right after
+/// `list == NULL`.
+///
+/// # Safety
+/// Forwarded from [`getreg_get_regname`]/
+/// [`crate::register::get_reg_contents`]/`get_reg_type`/
+/// [`crate::register::get_unname_register`]'s own safety docs.
+unsafe fn f_getreginfo(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut regname = unsafe { getreg_get_regname(argvars) };
+    if regname == 0 {
+        return;
+    }
+    if regname == i32::from(b'@') {
+        regname = i32::from(b'"');
+    }
+
+    // SAFETY: `d` is a fresh allocation not shared with anything else
+    // yet.
+    let d = unsafe { crate::eval::typval::tv_dict_alloc_ret(rettv) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let dict = unsafe { &mut *d };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let contents = unsafe {
+        crate::register::get_reg_contents(
+            regname,
+            crate::register_defs::greg_flags::EXPR_SRC | crate::register_defs::greg_flags::LIST,
+        )
+    };
+    let list = match contents {
+        Some(crate::register_defs::RegContents::List(l)) => l,
+        Some(crate::register_defs::RegContents::Str(_)) => {
+            unreachable!("get_reg_contents always returns a List when greg_flags::LIST is set")
+        }
+        None => return,
+    };
+    // SAFETY: `list` is a freshly-built, exclusively-owned list;
+    // `tv_dict_add_list` bumps its refcount on success.
+    unsafe { crate::eval::typval::tv_dict_add_list(dict, b"regcontents", list) };
+
+    let mut reg_width: crate::pos_defs::ColnrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg_type = unsafe { crate::register::get_reg_type(regname, Some(&mut reg_width)) };
+    // get_reg_contents (above) and get_reg_type both gate on the same
+    // underlying register state (a special register's own early
+    // match, or `y_array.is_some()` for a plain yank register) - since
+    // get_reg_contents just succeeded for this exact regname,
+    // get_reg_type returning None here would mean the two functions
+    // have become inconsistent, matching the original's own
+    // `case kMTUnknown: abort();` treatment of this as unreachable.
+    debug_assert!(reg_type.is_some(), "get_reg_type disagreed with get_reg_contents for the same register");
+    crate::eval::typval::tv_dict_add_str(
+        dict,
+        b"regtype",
+        Some(&crate::register::format_reg_type(reg_type, reg_width)),
+    );
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let points_to_name = unsafe { crate::register::get_register_name(crate::register::get_unname_register()) };
+    if regname == i32::from(b'"') {
+        let buf = [points_to_name as u8];
+        crate::eval::typval::tv_dict_add_str(dict, b"points_to", Some(&buf));
+    } else {
+        let is_unnamed = if regname == points_to_name {
+            crate::eval::typval_defs::BoolVarValue::True
+        } else {
+            crate::eval::typval_defs::BoolVarValue::False
+        };
+        crate::eval::typval::tv_dict_add_bool(dict, b"isunnamed", is_unnamed);
+    }
+}
+
 /// `eval({string})` - evaluate `{string}` and return the result
 /// (`f_eval`, `eval.c`), via the already-existing
 /// [`crate::eval::eval::eval1`].
@@ -8212,6 +8297,7 @@ mod tests {
             "windowsversion",
             "getreg",
             "getregtype",
+            "getreginfo",
             "changenr",
             "interrupt",
             "invert",
@@ -14797,6 +14883,126 @@ mod tests {
         // touches rettv at all), a real, faithfully-preserved
         // difference between the two functions' own real structure.
         assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    // --- f_getreginfo ---
+
+    #[test]
+    fn getreginfo_type_error_leaves_rettv_untouched() {
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreginfo(&[list_tv], &mut rettv) };
+        // f_getreginfo never assigns to rettv at all before parsing
+        // its regname argument (unlike f_getregtype), matching the
+        // original's own structure exactly.
+        assert_eq!(rettv.value, TypvalValue::default());
+    }
+
+    #[test]
+    fn getreginfo_unset_register_is_an_empty_dict() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"a")], &mut rettv) };
+        match rettv.value {
+            TypvalValue::Dict(d) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_dict_len(d.as_ref()) }, 0);
+                unsafe { crate::eval::typval::tv_dict_unref(d) };
+            }
+            other => panic!("expected an empty Dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getreginfo_expression_register_reports_regcontents_and_regtype() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::register::set_expr_line(Some(b"1 + 1".to_vec()));
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"=")], &mut rettv) };
+        match rettv.value {
+            TypvalValue::Dict(d) => {
+                let dict = unsafe { &mut *d };
+                let contents_di = crate::eval::typval::tv_dict_find(Some(dict), b"regcontents")
+                    .expect("regcontents key must be present");
+                match unsafe { &(*contents_di).di_tv }.value {
+                    TypvalValue::List(l) => assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1),
+                    ref other => panic!("expected regcontents to be a List, got {other:?}"),
+                }
+                let regtype_di =
+                    crate::eval::typval::tv_dict_find(Some(dict), b"regtype").expect("regtype key must be present");
+                assert_eq!(unsafe { &(*regtype_di).di_tv }.value, TypvalValue::String(Some(b"v".to_vec())));
+                // '=' isn't the unnamed register, so `isunnamed` (not
+                // `points_to`) is the key added - and since Y_PREVIOUS
+                // is always None today, get_unname_register() always
+                // resolves to '"', which never equals '=', so
+                // `isunnamed` is always false.
+                let isunnamed_di = crate::eval::typval::tv_dict_find(Some(dict), b"isunnamed")
+                    .expect("isunnamed key must be present");
+                assert_eq!(
+                    unsafe { &(*isunnamed_di).di_tv }.value,
+                    TypvalValue::Bool(crate::eval::typval_defs::BoolVarValue::False)
+                );
+                assert!(crate::eval::typval::tv_dict_find(Some(dict), b"points_to").is_none());
+                unsafe { crate::eval::typval::tv_dict_unref(d) };
+            }
+            other => panic!("expected a Dict, got {other:?}"),
+        }
+        crate::register::set_expr_line(None);
+    }
+
+    #[test]
+    fn getreginfo_unnamed_register_reports_points_to_not_isunnamed() {
+        let _guard = crate::globals::global_state_test_lock();
+        // '"' (unnamed) resolves to Y_REGS[0] today (op_reg_index('"')
+        // is None, so it falls back to register 0; Y_PREVIOUS is
+        // always None, so the "paste from previously used register"
+        // branch never fires either) - populate it via Paste mode,
+        // which (unlike Yank mode) never touches Y_PREVIOUS itself.
+        unsafe {
+            let reg = &mut *crate::register::get_yank_register(i32::from(b'0'), crate::register_defs::YregModeT::Paste);
+            reg.y_array = Some(vec![b"hello".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::CharWise;
+        }
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"\"")], &mut rettv) };
+        match rettv.value {
+            TypvalValue::Dict(d) => {
+                let dict = unsafe { &mut *d };
+                let points_to_di = crate::eval::typval::tv_dict_find(Some(dict), b"points_to")
+                    .expect("points_to key must be present");
+                // get_register_name(get_unname_register()) is always
+                // '"' today (Y_PREVIOUS is always None).
+                assert_eq!(unsafe { &(*points_to_di).di_tv }.value, TypvalValue::String(Some(b"\"".to_vec())));
+                assert!(crate::eval::typval::tv_dict_find(Some(dict), b"isunnamed").is_none());
+                unsafe { crate::eval::typval::tv_dict_unref(d) };
+            }
+            other => panic!("expected a Dict, got {other:?}"),
+        }
+
+        unsafe {
+            let reg = &mut *crate::register::get_yank_register(i32::from(b'0'), crate::register_defs::YregModeT::Paste);
+            *reg = crate::register_defs::YankregT::default();
+        }
+    }
+
+    #[test]
+    fn getreginfo_at_is_an_alias_for_the_unnamed_register() {
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv_at = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"@")], &mut rettv_at) };
+        let mut rettv_quote = TypvalT::default();
+        unsafe { f_getreginfo(&[string(b"\"")], &mut rettv_quote) };
+        match (rettv_at.value, rettv_quote.value) {
+            (TypvalValue::Dict(d1), TypvalValue::Dict(d2)) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_dict_len(d1.as_ref()) }, 0);
+                assert_eq!(unsafe { crate::eval::typval::tv_dict_len(d2.as_ref()) }, 0);
+                unsafe {
+                    crate::eval::typval::tv_dict_unref(d1);
+                    crate::eval::typval::tv_dict_unref(d2);
+                }
+            }
+            other => panic!("expected 2 Dicts, got {other:?}"),
+        }
     }
 
     // --- f_eval ---
