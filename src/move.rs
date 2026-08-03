@@ -24,17 +24,8 @@
 //! `decoration.c`'s `conceal_cursor_line`/`decor_conceal_line`, neither
 //! translated yet.
 //!
-//! `validate_botline_win` (which would otherwise be a trivial one-line
-//! wrapper) was investigated and NOT translated: its real work,
-//! `comp_botline`, needs `redraw_for_cursorline`/`set_empty_rows`/
-//! `win_check_anchored_floats` (redraw + floating-window machinery) -
-//! genuinely substantial, not a quick win, even now that
-//! `plines_correct_topline` (`comp_botline`'s own inner per-line call)
-//! exists.
-//!
 //! Also translated: `validate_cheight` (via `plines.c`'s already-real
-//! `plines_win_full`) - unlike `validate_botline_win` above, its own
-//! real work needs no not-yet-translated subsystem.
+//! `plines_win_full`).
 //!
 //! Also translated: `set_topline` (now that `fold.c`'s `has_folding`
 //! exists) - unblocked `mark.c`'s `mark_view_restore`. Omits the
@@ -136,9 +127,25 @@
 //! translated window-scrolling machinery), matching this crate's
 //! established "translate ahead of a real caller" precedent.
 //!
-//! Deferred: everything else (window-scrolling/`w_topline`/`w_botline`
-//! maintenance, `curs_columns`'s full screen-row/column computation,
-//! `validate_cursor`/`curs_rows`/`validate_botline_win`, all needing
+//! Also translated: **`comp_botline`/`validate_botline_win`**
+//! (re-investigated after being deferred for many sessions citing
+//! `redraw_for_cursorline`/`set_empty_rows`/
+//! `win_check_anchored_floats` as blockers - direct re-reading found
+//! `redraw_for_cursorline`'s ENTIRE job is deciding whether to call
+//! `redraw_later` (a pure redraw-scheduling side effect, omitted
+//! entirely, matching this file's own established precedent) and
+//! `win_check_anchored_floats` was already real (`check_topfill`'s own
+//! dependency) - only `set_empty_rows` itself was genuinely missing,
+//! and is now translated too). `comp_botline` walks forward from
+//! `w_topline` (or `w_cursor.lnum`/`w_cline_row` if `VALID_CROW` is
+//! already set) via `plines_correct_topline`, filling in
+//! `w_cline_row`/`w_cline_height`/`w_cline_folded` when the walk
+//! passes the cursor's own line, until adding one more line's height
+//! would exceed `w_view_height`.
+//!
+//! Deferred: everything else (window-scrolling/`w_topline`
+//! maintenance beyond `set_topline`, `curs_columns`'s full screen-row/
+//! column computation, `validate_cursor`/`curs_rows`, all needing
 //! `fold.c`'s real fold-tree search and/or the redraw pipeline).
 //! `validate_cheight` (mentioned above) is NOT among these - fixed a
 //! stale duplicate reference here that still listed it as deferred
@@ -818,6 +825,88 @@ pub unsafe fn changed_line_abv_curs() {
     unsafe { changed_line_abv_curs_win(curwin) };
 }
 
+/// Compute `wp.w_botline` and the other line-and-height-related
+/// `w_valid` bits, from `wp.w_topline` (or `wp.w_cursor.lnum` if
+/// `VALID_CROW` is already set) forward (`comp_botline`).
+///
+/// Omits the original's `redraw_for_cursorline(wp)` call: that
+/// function's ENTIRE job is to conditionally call `redraw_later` (a
+/// pure redraw-scheduling side effect) - it never touches any value
+/// this crate currently computes - so the whole call is omitted,
+/// matching this crate's established `redraw_later`-omission
+/// precedent (e.g. `set_topline`/`set_valid_virtcol`) rather than
+/// needing `win_cursorline_standout`/`'cursorline'` to exist first.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Forwarded from
+/// [`check_cursor_moved`]'s/[`plines_correct_topline`]'s/
+/// [`set_empty_rows`]'s/[`crate::winfloat::win_check_anchored_floats`]'s
+/// own safety docs.
+unsafe fn comp_botline(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_cursor_moved(wp) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let (mut lnum, mut done) = if w.w_valid & i32::from(w_valid::VALID_CROW) != 0 {
+        (w.w_cursor.lnum, w.w_cline_row)
+    } else {
+        (w.w_topline, 0)
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*w.w_buffer }.b_ml.ml_line_count;
+    while lnum <= line_count {
+        let mut last = lnum;
+        let mut folded = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe {
+            plines_correct_topline(wp, lnum, Some(&mut last), true, Some(&mut folded))
+        };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &mut *wp };
+        if lnum <= w.w_cursor.lnum && last >= w.w_cursor.lnum {
+            w.w_cline_row = done;
+            w.w_cline_height = n;
+            w.w_cline_folded = folded;
+            w.w_valid |= i32::from(w_valid::VALID_CROW) | i32::from(w_valid::VALID_CHEIGHT);
+        }
+        if done + n > w.w_view_height {
+            break;
+        }
+        done += n;
+        lnum = last;
+        lnum += 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    // wp->w_botline is the line that is just below the window
+    w.w_botline = lnum;
+    w.w_valid |= i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP);
+    w.w_viewport_invalid = true;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_empty_rows(wp, done) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::winfloat::win_check_anchored_floats(wp) };
+}
+
+/// Update `wp.w_botline` if it is not valid (`validate_botline_win`).
+///
+/// # Safety
+/// Same as `comp_botline`.
+pub unsafe fn validate_botline_win(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*wp }.w_valid & i32::from(w_valid::VALID_BOTLINE) == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { comp_botline(wp) };
+    }
+}
+
 /// Mark `wp.w_botline` as invalid, because of some change in the
 /// buffer (`invalidate_botline_win`).
 ///
@@ -914,6 +1003,40 @@ pub unsafe fn check_topfill(wp: *mut WinT, down: bool) {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::winfloat::win_check_anchored_floats(wp) };
+}
+
+/// Compute `wp.w_empty_rows`/`w_filler_rows` from `used` (the number
+/// of buffer-content window rows already occupied) (`set_empty_rows`).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is also valid. Forwarded from
+/// [`crate::plines::win_get_fill`]'s own safety doc.
+pub unsafe fn set_empty_rows(wp: *mut WinT, used: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    w.w_filler_rows = 0;
+    if used == 0 {
+        w.w_empty_rows = 0; // single line that doesn't fit
+    } else {
+        w.w_empty_rows = w.w_view_height - used;
+        let botline = w.w_botline;
+        // SAFETY: forwarded from this function's own safety doc.
+        let line_count = unsafe { &*w.w_buffer }.b_ml.ml_line_count;
+        if botline <= line_count {
+            // SAFETY: forwarded from this function's own safety doc.
+            let filler_rows = unsafe { crate::plines::win_get_fill(&*wp, botline) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            w.w_filler_rows = filler_rows;
+            if w.w_empty_rows > w.w_filler_rows {
+                w.w_empty_rows -= w.w_filler_rows;
+            } else {
+                w.w_filler_rows = w.w_empty_rows;
+                w.w_empty_rows = 0;
+            }
+        }
+    }
 }
 
 /// Call this whenever a window-local setting changes that could
@@ -1680,6 +1803,82 @@ mod tests {
         );
     }
 
+    // --- set_empty_rows ---
+
+    #[test]
+    fn set_empty_rows_used_zero_resets_both_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_filler_rows = 99;
+        win.w_empty_rows = 99;
+
+        unsafe { set_empty_rows(&mut win as *mut WinT, 0) };
+
+        assert_eq!(win.w_filler_rows, 0);
+        assert_eq!(win.w_empty_rows, 0);
+    }
+
+    #[test]
+    fn set_empty_rows_botline_past_the_end_skips_the_filler_lookup() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_height = 10;
+        win.w_botline = 5; // > ml_line_count(3): inner block is skipped
+
+        unsafe { set_empty_rows(&mut win as *mut WinT, 6) };
+
+        assert_eq!(win.w_empty_rows, 4); // 10 - 6
+        assert_eq!(win.w_filler_rows, 0); // never touched past the reset
+    }
+
+    #[test]
+    fn set_empty_rows_valid_botline_with_no_filler_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_height = 10;
+        win.w_botline = 3; // <= ml_line_count(5): inner block runs
+
+        unsafe { set_empty_rows(&mut win as *mut WinT, 6) };
+
+        // win_get_fill returns 0 today (nothing can create diff/
+        // virtual-line filler content), so this is observably
+        // identical to the "skipped" case above.
+        assert_eq!(win.w_empty_rows, 4); // 10 - 6
+        assert_eq!(win.w_filler_rows, 0);
+    }
+
+    #[test]
+    fn set_empty_rows_used_equals_view_height_takes_the_else_branch() {
+        // w_empty_rows computes to exactly 0, so the "w_empty_rows >
+        // w_filler_rows" check (0 > 0) is false - the else branch
+        // runs instead, but produces the same final values since
+        // win_get_fill is 0 today either way.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_view_height = 10;
+        win.w_botline = 3;
+
+        unsafe { set_empty_rows(&mut win as *mut WinT, 10) };
+
+        assert_eq!(win.w_empty_rows, 0);
+        assert_eq!(win.w_filler_rows, 0);
+    }
+
     #[test]
     fn plines_correct_topline_limit_winheight_clamps_result() {
         // At the topline with w_topfill=10 (added as filler on top of
@@ -2095,6 +2294,150 @@ mod tests {
         assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    // --- validate_botline_win / comp_botline ---
+
+    #[test]
+    fn validate_botline_win_skips_recompute_when_already_valid() {
+        // No GLOBALS/lock needed: comp_botline is never reached.
+        let mut buf = BufT::default();
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_valid = i32::from(w_valid::VALID_BOTLINE);
+        win.w_botline = 42; // sentinel: must stay untouched
+
+        unsafe { validate_botline_win(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_botline, 42);
+        assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
+    }
+
+    #[test]
+    fn validate_botline_win_small_buffer_fits_entirely_in_the_window() {
+        // 3 lines, each contributing n=1 (wo_wrap=0's fast path -
+        // real line content is never needed), all fit within a
+        // 10-row window starting at the topline.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 10;
+
+        unsafe { validate_botline_win(&mut win as *mut WinT) };
+
+        // lnum runs 1, 2, 3 (each n=1, done=1,2,3), then 4 > line
+        // count(3) stops the loop - w_botline is the line "just below
+        // the window".
+        assert_eq!(win.w_botline, 4);
+        assert_eq!(
+            win.w_valid & (i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP)),
+            i32::from(w_valid::VALID_BOTLINE) | i32::from(w_valid::VALID_BOTLINE_AP)
+        );
+        assert!(win.w_viewport_invalid);
+        // set_empty_rows(wp, 3): botline(4) > line_count(3), so the
+        // filler-lookup block is skipped - matches
+        // set_empty_rows_botline_past_the_end_skips_the_filler_lookup's
+        // own established shape.
+        assert_eq!(win.w_empty_rows, 7); // 10 - 3
+        assert_eq!(win.w_filler_rows, 0);
+    }
+
+    #[test]
+    fn validate_botline_win_large_buffer_stops_the_loop_early() {
+        // A tiny 2-row window against a 5-line buffer: only 2 lines
+        // fit, the 3rd would overflow and is never counted.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 2;
+
+        unsafe { validate_botline_win(&mut win as *mut WinT) };
+
+        // lnum=1: done 0+1=1<=2, advance to 2. lnum=2: done 1+1=2<=2,
+        // advance to 3. lnum=3: done 2+1=3>2 -> break with lnum still
+        // at 3 (never advanced to `last`).
+        assert_eq!(win.w_botline, 3);
+        // set_empty_rows(wp, 2): botline(3) <= line_count(5), so
+        // win_get_fill(3) runs (needs CurtabGuard) - always 0 today.
+        assert_eq!(win.w_empty_rows, 0); // 2 - 2, then the "else" branch keeps it 0
+        assert_eq!(win.w_filler_rows, 0);
+    }
+
+    #[test]
+    fn comp_botline_starts_from_the_cursor_line_when_valid_crow_already_set() {
+        // VALID_CROW pre-set with w_cursor == w_valid_cursor (and
+        // every other check_cursor_moved-compared field matching)
+        // means check_cursor_moved is a total no-op here, so the
+        // "start from the cursor line" branch (not "start from
+        // w_topline") is the one actually exercised.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1; // != 2/3, so win_get_fill's path is used for both
+        win.w_view_width = 20;
+        win.w_view_height = 10;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 };
+        win.w_valid_cursor = win.w_cursor;
+        win.w_valid = i32::from(w_valid::VALID_CROW);
+        win.w_cline_row = 5; // arbitrary starting "done" value
+
+        unsafe { comp_botline(&mut win as *mut WinT) };
+
+        // lnum starts at w_cursor.lnum(2), done starts at
+        // w_cline_row(5): lnum=2 (== cursor.lnum) -> w_cline_row=5,
+        // w_cline_height=1, done=5+1=6, advance to 3; lnum=3 (>
+        // cursor.lnum, no cline_row update) -> done=6+1=7, advance to
+        // 4; lnum=4 > line_count(3) stops.
+        assert_eq!(win.w_botline, 4);
+        assert_eq!(win.w_cline_row, 5);
+        assert_eq!(win.w_cline_height, 1);
+        assert!(!win.w_cline_folded);
+        assert_eq!(win.w_empty_rows, 3); // 10 - 7
+    }
+
+    #[test]
+    fn comp_botline_never_updates_cline_row_when_the_loop_breaks_before_the_cursor_line() {
+        // Cursor sits past where the (tiny) window's own loop breaks -
+        // w_cline_row/w_cline_height must stay at their sentinel
+        // values, never touched.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 5;
+        let mut win = win_with_buf(&mut buf as *mut BufT);
+        win.w_topline = 1;
+        win.w_view_width = 20;
+        win.w_view_height = 2;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 4, col: 0, coladd: 0 };
+        win.w_valid_cursor = win.w_cursor; // matches: check_cursor_moved is a no-op
+        win.w_cline_row = 99;
+        win.w_cline_height = 99;
+
+        unsafe { comp_botline(&mut win as *mut WinT) };
+
+        // Loop only ever reaches lnum 1, 2, 3 (breaking at 3) - cursor
+        // line 4 is never visited, so the cline_row-update branch
+        // never fires.
+        assert_eq!(win.w_botline, 3);
+        assert_eq!(win.w_cline_row, 99);
+        assert_eq!(win.w_cline_height, 99);
+        assert_eq!(
+            win.w_valid & (i32::from(w_valid::VALID_CROW) | i32::from(w_valid::VALID_CHEIGHT)),
+            0
+        );
     }
 
     #[test]

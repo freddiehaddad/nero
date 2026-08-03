@@ -4860,12 +4860,12 @@ pub unsafe fn buf_charidx_to_byteidx(
 ///
 /// Supports the `[lnum, col, coladd]` `List` form and the `.`
 /// (cursor)/`v` (Visual start)/`$` (last line or column, depending on
-/// `dollar_lnum`) special strings. The `'x` mark form needs
-/// `mark_get` (`mark.c`, not yet translated) and the `w0`/`w$`
-/// (first/last visible line) forms need `update_topline`/
-/// `validate_botline_win` (the redraw pipeline, not yet translated) -
-/// both `unimplemented!()` if actually reached (neither is reachable
-/// from any currently-translated caller).
+/// `dollar_lnum`)/`w$` (last VISIBLE line, via `move.c`'s now-real
+/// `validate_botline_win`) special strings. The `'x` mark form needs
+/// `mark_get` (`mark.c`, not yet translated) and `w0` (first visible
+/// line) needs `update_topline` (`move.c`'s own window-scrolling
+/// machinery, not yet translated) - both `unimplemented!()` if
+/// actually reached.
 ///
 /// # Safety
 /// `wp` must point to a valid, live `WinT` whose `w_buffer` is also
@@ -4967,10 +4967,30 @@ pub unsafe fn var2fpos(
     pos.coladd = 0;
 
     if name.first() == Some(&b'w') && dollar_lnum {
-        unimplemented!(
-            "var2fpos: \"w0\"/\"w$\" need update_topline/validate_botline_win (the redraw \
-             pipeline), not yet translated"
-        );
+        // The `w_valid` flags are not reset when moving the cursor,
+        // but they do matter for `update_topline`/`validate_botline_win`.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::check_cursor_moved(wp) };
+
+        pos.col = 0;
+        if name.get(1) == Some(&b'0') {
+            // "w0": first visible line - needs `update_topline`
+            // (`move.c`'s own window-scrolling machinery, not yet
+            // translated).
+            unimplemented!(
+                "var2fpos: \"w0\" needs update_topline (the redraw pipeline), not yet \
+                 translated"
+            );
+        } else if name.get(1) == Some(&b'$') {
+            // "w$": last visible line.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::validate_botline_win(wp) };
+            // In silent Ex mode botline is zero, return zero then.
+            // SAFETY: forwarded from this function's own safety doc.
+            let botline = unsafe { &*wp }.w_botline;
+            pos.lnum = if botline > 0 { botline - 1 } else { 0 };
+            return Some(pos);
+        }
     } else if name.first() == Some(&b'$') {
         // last column or line
         if dollar_lnum {
@@ -10734,6 +10754,78 @@ mod tests {
     #[test]
     fn e2e_interpolated_string_single_quoted_with_embedded_expression() {
         assert_eq!(eval_str(b"$'val={40 + 2}'").1.value, TypvalValue::String(Some(b"val=42".to_vec())));
+    }
+
+    // --- var2fpos ---
+
+    #[test]
+    fn var2fpos_w_dollar_returns_the_last_visible_line_when_the_whole_buffer_fits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        unsafe { assert_eq!(crate::memline::ml_open(&mut buf), OK) };
+        unsafe {
+            assert_eq!(crate::memline::ml_replace_buf_len(&mut buf, 1, b"a\0"), OK);
+            assert_eq!(crate::memline::ml_append_buf(&mut buf, 1, b"b\0", 2, false), OK);
+            assert_eq!(crate::memline::ml_append_buf(&mut buf, 2, b"c\0", 2, false), OK);
+        }
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_view_width: 20,
+            w_view_height: 10,
+            ..Default::default()
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curtab = globals.curtab;
+        globals.curtab = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        let tv = TypvalT { value: TypvalValue::String(Some(b"w$".to_vec())), ..Default::default() };
+        let pos = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_curtab;
+
+        // All 3 lines fit within the 10-row window (each contributes
+        // n=1 via `wo_wrap=0`'s fast path) - "w$" resolves to the
+        // buffer's own actual last line, matching
+        // `validate_botline_win`'s own real w_botline computation
+        // (w_botline=4, so pos.lnum = 4 - 1 = 3).
+        assert_eq!(pos, Some(crate::pos_defs::PosT { lnum: 3, col: 0, coladd: 0 }));
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "update_topline")]
+    fn var2fpos_w_zero_needs_update_topline() {
+        // check_cursor_moved (called unconditionally for both "w0"
+        // and "w$") never touches w_buffer, so a bare BufT::default()
+        // (no real ml_open) is fine here - the panic fires before
+        // validate_botline_win/win_get_fill would ever need curtab.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
+        let tv = TypvalT { value: TypvalValue::String(Some(b"w0".to_vec())), ..Default::default() };
+        let _ = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+    }
+
+    #[test]
+    fn var2fpos_w_followed_by_neither_zero_nor_dollar_returns_none() {
+        // Matches the original's own exact structure: having already
+        // committed to the `name[0] == 'w' && dollar_lnum` branch,
+        // neither inner `if`/`else if` matching falls all the way
+        // through to the function's own final `return NULL;` (this
+        // crate's `None`), not to the sibling `name[0] == '$'` branch.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..Default::default() };
+        let tv = TypvalT { value: TypvalValue::String(Some(b"wx".to_vec())), ..Default::default() };
+        let pos = unsafe { var2fpos(&tv, true, false, &mut win as *mut crate::buffer_defs::WinT) };
+        assert_eq!(pos, None);
     }
 
     // --- list2fpos ---

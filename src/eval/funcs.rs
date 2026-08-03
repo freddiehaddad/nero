@@ -15292,6 +15292,29 @@ mod tests {
     }
 
     #[test]
+    fn line_w_dollar_returns_the_last_visible_line_when_the_whole_buffer_fits() {
+        // End-to-end proof (through the real f_line/var2fpos/
+        // validate_botline_win chain, not just var2fpos directly)
+        // that "w$" now resolves for real.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"a", b"b", b"c"]);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_view_width: 20,
+            w_view_height: 10,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b"w$")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
     fn line_with_a_winid_argument_is_unimplemented() {
         let mut rettv = TypvalT::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
