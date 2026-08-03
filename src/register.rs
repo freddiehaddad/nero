@@ -655,9 +655,17 @@ mod tests {
     #[test]
     fn get_yank_register_unrecognized_name_falls_back_to_register_0() {
         let _lock = crate::globals::global_state_test_lock();
+        // get_yank_register(0, Yank) below sets Y_PREVIOUS as a side
+        // effect (matching the original's own real behavior) - reset
+        // both before and after, matching every other Yank-mode test
+        // in this file, so it doesn't leak into an unrelated test
+        // asserting Y_PREVIOUS starts None (e.g.
+        // get_unname_register_is_minus_one_when_y_previous_is_none).
+        unsafe { *Y_PREVIOUS.get_mut() = None };
         let reg_invalid = unsafe { get_yank_register(i32::from(b'!'), YregModeT::Put) };
         let reg_zero = unsafe { get_yank_register(0, YregModeT::Yank) };
         assert_eq!(reg_invalid, reg_zero, "an unrecognized name uses register 0, matching the original");
+        unsafe { *Y_PREVIOUS.get_mut() = None };
     }
 
     #[test]

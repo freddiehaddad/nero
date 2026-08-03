@@ -4759,6 +4759,27 @@ pub unsafe fn set_var_const(name: &[u8], tv: &mut TypvalT, copy: bool, is_const:
     }
 }
 
+/// Set an internal variable to a string value, creating it if it
+/// doesn't already exist (`set_internal_string_var`). `value` models
+/// the original's own real (if unusually not `FUNC_ATTR_NONNULL`-
+/// asserted for this parameter) nullable `char *value` - several real
+/// callers (`ex_cmds2.c`'s `:compiler`, `syntax.c`'s `'syntax'`
+/// bookkeeping) can genuinely pass a `NULL` "no previous value" case.
+///
+/// None of this function's real callers (`ex_cmds2.c`, `quickfix.c`,
+/// `statusline.c`, `syntax.c`) are translated yet - harvested ahead of
+/// them, matching this crate's established precedent for a small,
+/// self-contained function with no design freedom of its own (a thin
+/// `TypvalT` + [`set_var`] wrapper).
+///
+/// # Safety
+/// Forwarded from [`set_var`]'s own safety doc.
+pub unsafe fn set_internal_string_var(name: &[u8], value: Option<&[u8]>) {
+    let mut tv = TypvalT { value: TypvalValue::String(value.map(<[u8]>::to_vec)), ..Default::default() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_var(name, &mut tv, true) };
+}
+
 /// `"setwinvar()"`/`"settabwinvar()"` functions (`setwinvar`).
 ///
 /// `off == 1` selects `settabwinvar()`'s extra leading `{tabnr}`
@@ -5509,6 +5530,54 @@ mod set_var_tests {
             ..TypvalT::default()
         };
         unsafe { set_var(b"g:myvar", &mut tv, true) };
+    }
+
+    // ---- set_internal_string_var ----
+
+    #[test]
+    fn set_internal_string_var_creates_a_new_string_variable() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+
+        unsafe { set_internal_string_var(b"g:current_compiler", Some(b"rustc")) };
+
+        let mut rettv = TypvalT::default();
+        assert_eq!(unsafe { eval_variable(b"g:current_compiler", Some(&mut rettv), true, false) }, crate::vim_defs::OK);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"rustc".to_vec())));
+
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_internal_string_var_none_value_stores_a_null_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        // b: scope resolution dereferences GLOBALS.curbuf directly -
+        // needs a real fixture, not just reset_shared_state().
+        let _fx = TestFixture::new();
+
+        // Models a real call shape (e.g. syntax.c's "no previous
+        // 'syntax' value" case) - the original's own char *value can
+        // genuinely be NULL here, not just for name.
+        unsafe { set_internal_string_var(b"b:current_syntax", None) };
+
+        let mut rettv = TypvalT::default();
+        assert_eq!(unsafe { eval_variable(b"b:current_syntax", Some(&mut rettv), true, false) }, crate::vim_defs::OK);
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn set_internal_string_var_overwrites_an_existing_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        // w: scope resolution dereferences GLOBALS.curwin directly -
+        // needs a real fixture, not just reset_shared_state().
+        let _fx = TestFixture::new();
+
+        unsafe { set_internal_string_var(b"w:quickfix_title", Some(b"first")) };
+        unsafe { set_internal_string_var(b"w:quickfix_title", Some(b"second")) };
+
+        let mut rettv = TypvalT::default();
+        assert_eq!(unsafe { eval_variable(b"w:quickfix_title", Some(&mut rettv), true, false) }, crate::vim_defs::OK);
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"second".to_vec())));
     }
 
     // ---- setwinvar/settabwinvar/setbufvar (the real "f_*" entry
