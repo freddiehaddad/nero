@@ -28,12 +28,20 @@
 //! `v:versionlong` startup values need exactly `min_vim_version`/
 //! `highest_patch` and nothing else.
 //!
+//! Also translated: [`may_show_intro`] - a pure boolean CHECK deciding
+//! whether the intro screen should currently be shown (`drawscreen.c`'s
+//! own real caller then decides separately whether to actually render
+//! it) - re-investigated after an earlier, over-broad module-doc note
+//! had conflated this check with the intro screen's own real
+//! rendering (a genuine, still-deferred, rendering-pipeline concern);
+//! `may_show_intro` itself has no rendering dependency at all.
+//!
 //! Deferred: `has_vim_patch` (needs the FULL `included_patchsets`
 //! table, not just its own leading value, to check whether a
 //! SPECIFIC patch number is included for a given Vim version - no
 //! real caller yet, `has('patch-N')` isn't itself translated), the
-//! version/build-info string constants, `may_show_intro`/intro-screen
-//! display (needs the rendering pipeline).
+//! version/build-info string constants, and the intro screen's own
+//! real rendering (needs the drawing/screen-grid pipeline).
 
 /// Current Nvim major version (`NVIM_VERSION_MAJOR`), matching this
 /// checkout's own `CMakeLists.txt` (`set(NVIM_VERSION_MAJOR 0)`) - a
@@ -124,9 +132,205 @@ pub fn highest_patch() -> i32 {
     HIGHEST_PATCH
 }
 
+/// Whether the intro message should currently be shown
+/// (`may_show_intro`) - `true` exactly when: `curbuf` is empty and
+/// unnamed, `curbuf`/`curwin` are the very first buffer/window ever
+/// created, `curwin` is the only (non-floating) window in its tab,
+/// and `'shortmess'` doesn't include the `I` flag.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT`s. `curbuf.b_ml.ml_mfp`, if non-null,
+/// must be a valid pointer to a live `MemfileT` (touched transitively
+/// via `crate::buffer::buf_is_empty`). `GLOBALS.firstwin`'s own
+/// `w_next` chain must consist of valid, live `WinT` pointers (touched
+/// transitively via `crate::window::one_window`).
+#[must_use]
+pub unsafe fn may_show_intro() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *g.curbuf };
+    crate::buffer::buf_is_empty(curbuf)
+        && curbuf.b_fname.is_none()
+        && curbuf.handle == 1
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { &*g.curwin }.handle == crate::window::LOWEST_WIN_ID
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { crate::window::one_window(g.curwin, std::ptr::null()) }
+        && crate::strings::vim_strchr(
+            // SAFETY: momentary read, cloned out immediately.
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm.as_deref().unwrap_or(b""),
+            i32::from(crate::option_vars::shm::INTRO),
+        )
+        .is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RAII guard saving/restoring `GLOBALS.curbuf`/`curwin`/
+    /// `firstwin` together (all 3 touched by `may_show_intro`).
+    /// Callers must hold `crate::globals::global_state_test_lock()`
+    /// for the guard's whole lifetime (matching this crate's
+    /// established "compose with an externally-held lock" pattern).
+    struct MayShowIntroGuard {
+        prev_curbuf: *mut crate::buffer_defs::BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl MayShowIntroGuard {
+        fn set(
+            buf: *mut crate::buffer_defs::BufT,
+            win: *mut crate::buffer_defs::WinT,
+        ) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_curbuf = g.curbuf;
+            let prev_curwin = g.curwin;
+            let prev_firstwin = g.firstwin;
+            g.curbuf = buf;
+            g.curwin = win;
+            g.firstwin = win;
+            MayShowIntroGuard { prev_curbuf, prev_curwin, prev_firstwin }
+        }
+    }
+
+    impl Drop for MayShowIntroGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curbuf = self.prev_curbuf;
+            g.curwin = self.prev_curwin;
+            g.firstwin = self.prev_firstwin;
+        }
+    }
+
+    fn reset_p_shm() {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = None;
+    }
+
+    #[test]
+    fn may_show_intro_true_for_a_fresh_empty_unnamed_buffer_alone_in_its_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_p_shm();
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        unsafe { assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK) };
+        let mut win = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID,
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = MayShowIntroGuard::set(buf_ptr, win_ptr);
+
+        assert!(unsafe { may_show_intro() });
+
+        drop(_guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn may_show_intro_false_when_buffer_has_a_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_p_shm();
+        let mut buf = crate::buffer_defs::BufT {
+            handle: 1,
+            b_fname: Some(b"foo.txt".to_vec()),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID,
+            ..Default::default()
+        };
+        let _guard = MayShowIntroGuard::set(
+            &mut buf as *mut crate::buffer_defs::BufT,
+            &mut win as *mut crate::buffer_defs::WinT,
+        );
+
+        // buf.b_ml.ml_line_count defaults to 0 (not 1), so buf_is_empty
+        // short-circuits to false without ever touching the (null)
+        // ml_mfp - no ml_open needed for this branch.
+        assert!(!unsafe { may_show_intro() });
+    }
+
+    #[test]
+    fn may_show_intro_false_when_buffer_handle_is_not_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_p_shm();
+        let mut buf = crate::buffer_defs::BufT { handle: 2, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID,
+            ..Default::default()
+        };
+        let _guard = MayShowIntroGuard::set(
+            &mut buf as *mut crate::buffer_defs::BufT,
+            &mut win as *mut crate::buffer_defs::WinT,
+        );
+        assert!(!unsafe { may_show_intro() });
+    }
+
+    #[test]
+    fn may_show_intro_false_when_window_handle_is_not_lowest() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_p_shm();
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID + 1,
+            ..Default::default()
+        };
+        let _guard = MayShowIntroGuard::set(
+            &mut buf as *mut crate::buffer_defs::BufT,
+            &mut win as *mut crate::buffer_defs::WinT,
+        );
+        assert!(!unsafe { may_show_intro() });
+    }
+
+    #[test]
+    fn may_show_intro_false_when_not_the_only_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_p_shm();
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        let mut win2 = crate::buffer_defs::WinT { handle: 2, ..Default::default() };
+        let win2_ptr = &mut win2 as *mut crate::buffer_defs::WinT;
+        let mut win1 = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID,
+            w_next: win2_ptr,
+            ..Default::default()
+        };
+        let _guard = MayShowIntroGuard::set(
+            &mut buf as *mut crate::buffer_defs::BufT,
+            &mut win1 as *mut crate::buffer_defs::WinT,
+        );
+        assert!(!unsafe { may_show_intro() });
+    }
+
+    #[test]
+    fn may_show_intro_false_when_shortmess_includes_intro_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_shm = Some(b"I".to_vec());
+        let mut buf = crate::buffer_defs::BufT { handle: 1, ..Default::default() };
+        unsafe { assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK) };
+        let mut win = crate::buffer_defs::WinT {
+            handle: crate::window::LOWEST_WIN_ID,
+            ..Default::default()
+        };
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let _guard = MayShowIntroGuard::set(buf_ptr, win_ptr);
+
+        assert!(!unsafe { may_show_intro() });
+
+        drop(_guard);
+        reset_p_shm();
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
 
     #[test]
     fn has_nvim_version_older_major_is_true() {

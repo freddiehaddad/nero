@@ -1318,6 +1318,31 @@ pub fn u_checkpoint(buf: &mut BufT) -> UndoCheckpoint {
     uc
 }
 
+/// Compute a SHA-256 hash of the whole buffer's contents, used to
+/// verify an undofile still matches the buffer it was written for
+/// (`u_compute_hash`). Returns the hash by value instead of writing
+/// into a caller-provided `hash: *mut u8` out-parameter.
+///
+/// `ml_get_buf`'s own return convention (each line's bytes include
+/// their own trailing NUL) already matches the original's
+/// `strlen(p) + 1`-byte hash-input length exactly, with no extra
+/// arithmetic needed.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT` (touched transitively via `ml_get_buf`).
+#[must_use]
+pub unsafe fn u_compute_hash(buf: &mut BufT) -> [u8; crate::sha256::SHA256_SUM_SIZE] {
+    let mut ctx = crate::sha256::ContextSha256T::default();
+    crate::sha256::sha256_start(&mut ctx);
+    for lnum in 1..=buf.b_ml.ml_line_count {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+        crate::sha256::sha256_update(&mut ctx, &p);
+    }
+    crate::sha256::sha256_finish(&mut ctx)
+}
+
 /// Return an allocated string of the full path of the target undofile
 /// (`u_get_undo_file_name`), searching `'undodir'`'s comma-separated
 /// entries in order.
@@ -3147,6 +3172,65 @@ mod tests {
         // SAFETY: `d` is still exclusively owned; nothing else
         // references it.
         unsafe { crate::eval::typval::tv_dict_free(d) };
+    }
+
+    // --- u_compute_hash ---
+
+    #[test]
+    fn u_compute_hash_matches_an_independently_computed_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf, 1, b"ab\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"xyz\0", 4, false),
+                crate::vim_defs::OK
+            );
+        }
+        assert_eq!(buf.b_ml.ml_line_count, 2);
+
+        // Reference: sha256(b"ab\x00" + b"xyz\x00"), independently
+        // computed via Python's hashlib before writing this test.
+        let expected: [u8; 32] = [
+            0x88, 0xdb, 0x66, 0xbc, 0xcf, 0x14, 0x6a, 0x32, 0xa5, 0x8b, 0xf5, 0xdf, 0xf9, 0x87,
+            0x32, 0x7a, 0xcd, 0x4a, 0xf9, 0x35, 0x9f, 0xf2, 0xec, 0xa2, 0x1f, 0x27, 0x34, 0x2a,
+            0x47, 0x9a, 0xe4, 0x63,
+        ];
+        assert_eq!(unsafe { u_compute_hash(&mut buf) }, expected);
+
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn u_compute_hash_differs_when_a_line_changes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf_a = BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf_a), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf_a, 1, b"hello\0"),
+                crate::vim_defs::OK
+            );
+        }
+        let hash_a = unsafe { u_compute_hash(&mut buf_a) };
+        close_buf_with_memline(buf_a);
+
+        let mut buf_b = BufT::default();
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf_b), crate::vim_defs::OK);
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf_b, 1, b"world\0"),
+                crate::vim_defs::OK
+            );
+        }
+        let hash_b = unsafe { u_compute_hash(&mut buf_b) };
+        close_buf_with_memline(buf_b);
+
+        assert_ne!(hash_a, hash_b);
     }
 
     // --- u_get_undo_file_name / f_undofile ---
