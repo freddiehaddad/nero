@@ -10,13 +10,22 @@
 //! splitting, with no dependency on the command registry itself - plus
 //! [`parse_addr_type_arg`], a small lookup table (`ADDR_TYPE_COMPLETE`,
 //! 8 entries) needing only the already-translated
-//! [`crate::ex_cmds_defs::CmdAddrT`] enum.
+//! [`crate::ex_cmds_defs::CmdAddrT`] enum. Also translated:
+//! [`cmdcomplete_type_to_str`]/[`cmdcomplete_str_to_type`]/
+//! [`parse_compl_arg`], via a new `COMMAND_COMPLETE` lookup table (46
+//! entries, mechanically transcribed + individually cross-checked
+//! against the original's own `command_complete[]` sparse designated-
+//! initializer array) - the original module doc's own claim that this
+//! needed "a much larger ~70-entry table - a separate, dedicated
+//! undertaking" was stale (that number was
+//! [`crate::cmdexpand_defs::ExpandContext`]'s own total variant count,
+//! not `command_complete[]`'s real, much smaller populated size) -
+//! re-verified directly against the real C source, not assumed.
 //!
 //! Deferred: everything else - `uc_add_command`/`ex_command`/
-//! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`, and
-//! `cmdcomplete_str_to_type`/`parse_compl_arg` (both need
-//! `command_complete[]`'s much larger ~70-entry `EXPAND_*`-indexed
-//! table - a separate, dedicated undertaking).
+//! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`/`uc_scan_attr`
+//! (the real user-command registry and its `:command`-parsing
+//! caller).
 
 use crate::ascii_defs::ascii_iswhite;
 
@@ -144,6 +153,197 @@ pub fn parse_addr_type_arg(value: &[u8]) -> Option<crate::ex_cmds_defs::CmdAddrT
         .map(|&(addr, _, _)| addr)
 }
 
+/// Names of every `-complete=` completion type that has one
+/// (`command_complete[]`) - a sparse C designated-initializer array
+/// (indexed by [`crate::cmdexpand_defs::ExpandContext`] discriminant,
+/// with most of that enum's ~70 variants NOT present at all) kept
+/// here as a flat list of (variant, name) pairs instead, avoiding any
+/// numeric discriminant round-tripping. Mechanically transcribed from
+/// the original in its own exact declaration order and individually
+/// cross-checked, entry by entry, against both the original array and
+/// `ExpandContext`'s own already-verified discriminant values.
+const COMMAND_COMPLETE: &[(crate::cmdexpand_defs::ExpandContext, &str)] = {
+    use crate::cmdexpand_defs::ExpandContext as Ec;
+    &[
+        (Ec::Arglist, "arglist"),
+        (Ec::Augroup, "augroup"),
+        (Ec::Buffers, "buffer"),
+        (Ec::Checkhealth, "checkhealth"),
+        (Ec::Colors, "color"),
+        (Ec::Commands, "command"),
+        (Ec::Compiler, "compiler"),
+        (Ec::UserDefined, "custom"),
+        (Ec::UserList, "customlist"),
+        (Ec::UserLua, "<Lua function>"),
+        (Ec::DiffBuffers, "diff_buffer"),
+        (Ec::Directories, "dir"),
+        (Ec::EnvVars, "environment"),
+        (Ec::Events, "event"),
+        (Ec::Expression, "expression"),
+        (Ec::Files, "file"),
+        (Ec::FilesInPath, "file_in_path"),
+        (Ec::Filetype, "filetype"),
+        (Ec::Filetypecmd, "filetypecmd"),
+        (Ec::Functions, "function"),
+        (Ec::Help, "help"),
+        (Ec::Highlight, "highlight"),
+        (Ec::History, "history"),
+        (Ec::Keymap, "keymap"),
+        (Ec::Locales, "locale"),
+        (Ec::Lua, "lua"),
+        (Ec::Mapclear, "mapclear"),
+        (Ec::Mappings, "mapping"),
+        (Ec::Menus, "menu"),
+        (Ec::Messages, "messages"),
+        (Ec::Ownsyntax, "syntax"),
+        (Ec::Syntime, "syntime"),
+        (Ec::Settings, "option"),
+        (Ec::Packadd, "packadd"),
+        (Ec::Retab, "retab"),
+        (Ec::Runtime, "runtime"),
+        (Ec::Shellcmd, "shellcmd"),
+        (Ec::Shellcmdline, "shellcmdline"),
+        (Ec::Sign, "sign"),
+        (Ec::Tags, "tag"),
+        (Ec::TagsListfiles, "tag_listfiles"),
+        (Ec::User, "user"),
+        (Ec::UserVars, "var"),
+        (Ec::Breakpoint, "breakpoint"),
+        (Ec::Scriptnames, "scriptnames"),
+        (Ec::DirsInCdpath, "dir_in_path"),
+    ]
+};
+
+/// Look up the `-complete=` name for a given `xp_context` value, as a
+/// raw `i32` (`get_command_complete`). Returns `None` for any `arg`
+/// absent from [`COMMAND_COMPLETE`] - covering, in one check, both the
+/// original's own explicit bounds check (`arg < 0 || arg >=
+/// ARRAY_SIZE(command_complete)`) and its sparse array's implicit
+/// `NULL` for an in-bounds-but-unpopulated index; every `ExpandContext`
+/// variant not listed in `COMMAND_COMPLETE` falls into exactly one of
+/// those two original cases.
+#[must_use]
+fn get_command_complete(arg: i32) -> Option<&'static str> {
+    COMMAND_COMPLETE.iter().find(|(ec, _)| *ec as i32 == arg).map(|&(_, name)| name)
+}
+
+/// Get the name of completion type `expand` as an owned byte string,
+/// or `None` if no completion is available (`cmdcomplete_type_to_str`).
+/// `compl_arg` is the function name for the `"custom"`/`"customlist"`
+/// types.
+///
+/// `expand` stays a raw `i32` (matching the original's own `int
+/// expand` parameter) rather than
+/// [`crate::cmdexpand_defs::ExpandContext`] directly, since real
+/// callers (`cmdexpand.c`'s `f_getcompletion`/`ex_getln.c`'s
+/// `set_context_by_ecmd_flag`-adjacent completion state) pass an
+/// already-live `xp_context` value that may not correspond to any
+/// declared variant name (never itself asserted valid before this
+/// call in the original either).
+#[must_use]
+pub fn cmdcomplete_type_to_str(expand: i32, compl_arg: &[u8]) -> Option<Vec<u8>> {
+    let cmd_compl = get_command_complete(expand)?;
+    if expand == crate::cmdexpand_defs::ExpandContext::UserLua as i32 {
+        return None;
+    }
+
+    if expand == crate::cmdexpand_defs::ExpandContext::UserList as i32
+        || expand == crate::cmdexpand_defs::ExpandContext::UserDefined as i32
+    {
+        let mut buffer = Vec::with_capacity(cmd_compl.len() + compl_arg.len() + 1);
+        buffer.extend_from_slice(cmd_compl.as_bytes());
+        buffer.push(b',');
+        buffer.extend_from_slice(compl_arg);
+        return Some(buffer);
+    }
+
+    Some(cmd_compl.as_bytes().to_vec())
+}
+
+/// Parse a `-complete=` argument's own type name back into its
+/// `xp_context` value (`cmdcomplete_str_to_type`) - the inverse of
+/// [`cmdcomplete_type_to_str`]. Returns
+/// [`crate::cmdexpand_defs::ExpandContext::Nothing`] if `complete_str`
+/// doesn't match any known completion type name, matching the
+/// original's own `return EXPAND_NOTHING;` fallback.
+#[must_use]
+pub fn cmdcomplete_str_to_type(complete_str: &[u8]) -> crate::cmdexpand_defs::ExpandContext {
+    if complete_str.starts_with(b"custom,") {
+        return crate::cmdexpand_defs::ExpandContext::UserDefined;
+    }
+    if complete_str.starts_with(b"customlist,") {
+        return crate::cmdexpand_defs::ExpandContext::UserList;
+    }
+
+    COMMAND_COMPLETE
+        .iter()
+        .find(|(_, name)| name.as_bytes() == complete_str)
+        .map_or(crate::cmdexpand_defs::ExpandContext::Nothing, |&(ec, _)| ec)
+}
+
+/// Parse a completion argument `value` (`parse_compl_arg`). The
+/// detected completion type is written into `*complp`; `EX_BUFNAME`/
+/// `EX_XFILE` are OR'd into `*argt` for the completion types that need
+/// them; any argument part after a `,` (used by the `"custom"`/
+/// `"customlist"` types, e.g. `-complete=custom,MyFunc`) is copied
+/// into `*compl_arg`.
+///
+/// Omits the original's own `semsg`/`emsg` error-message display on
+/// both failure paths, matching this crate's established "skip the
+/// deferred message-display side effect, keep the exact same return
+/// value" policy (e.g. `window::check_split_disallowed_err`).
+///
+/// No real caller is translated yet (`uc_scan_attr`, the `:command`
+/// attribute parser) - harvested ahead of it, matching this crate's
+/// established precedent for a small, self-contained function with no
+/// design freedom of its own.
+pub fn parse_compl_arg(
+    value: &[u8],
+    complp: &mut crate::cmdexpand_defs::ExpandContext,
+    argt: &mut u32,
+    compl_arg: &mut Option<Vec<u8>>,
+) -> i32 {
+    // Look for any argument part - the part after any ','.
+    let mut arg: Option<&[u8]> = None;
+    let mut valend = value.len();
+    if let Some(comma) = value.iter().position(|&b| b == b',') {
+        arg = Some(&value[comma + 1..]);
+        valend = comma;
+    }
+
+    let value_prefix = &value[..valend];
+    let Some(&(ec, _)) = COMMAND_COMPLETE.iter().find(|(_, name)| name.as_bytes() == value_prefix) else {
+        return crate::vim_defs::FAIL;
+    };
+    *complp = ec;
+    if ec == crate::cmdexpand_defs::ExpandContext::Buffers {
+        *argt |= crate::ex_cmds_defs::ex_flags::BUFNAME;
+    } else if matches!(
+        ec,
+        crate::cmdexpand_defs::ExpandContext::Directories
+            | crate::cmdexpand_defs::ExpandContext::Files
+            | crate::cmdexpand_defs::ExpandContext::Shellcmdline
+    ) {
+        *argt |= crate::ex_cmds_defs::ex_flags::XFILE;
+    }
+
+    let is_user_custom = matches!(
+        *complp,
+        crate::cmdexpand_defs::ExpandContext::UserDefined | crate::cmdexpand_defs::ExpandContext::UserList
+    );
+    if !is_user_custom && arg.is_some() {
+        return crate::vim_defs::FAIL;
+    }
+    if is_user_custom && arg.is_none() {
+        return crate::vim_defs::FAIL;
+    }
+
+    if let Some(a) = arg {
+        *compl_arg = Some(a.to_vec());
+    }
+    crate::vim_defs::OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +451,180 @@ mod tests {
     fn parse_addr_type_arg_unknown_name_is_none() {
         assert_eq!(parse_addr_type_arg(b"nonexistent"), None);
         assert_eq!(parse_addr_type_arg(b""), None);
+    }
+
+    // --- get_command_complete / cmdcomplete_type_to_str / cmdcomplete_str_to_type ---
+
+    #[test]
+    fn get_command_complete_finds_every_entry_by_its_own_discriminant() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        for &(ec, name) in COMMAND_COMPLETE {
+            assert_eq!(get_command_complete(ec as i32), Some(name), "mismatch for {ec:?}");
+        }
+        // A representative negative value and a value known to be
+        // absent from the sparse array (e.g. Nothing == 0, never
+        // itself a completion type name).
+        assert_eq!(get_command_complete(Ec::Unsuccessful as i32), None);
+        assert_eq!(get_command_complete(Ec::Nothing as i32), None);
+        assert_eq!(get_command_complete(9999), None);
+    }
+
+    #[test]
+    fn cmdcomplete_type_to_str_plain_type_returns_its_own_name() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        assert_eq!(cmdcomplete_type_to_str(Ec::Buffers as i32, b""), Some(b"buffer".to_vec()));
+        assert_eq!(cmdcomplete_type_to_str(Ec::Files as i32, b""), Some(b"file".to_vec()));
+    }
+
+    #[test]
+    fn cmdcomplete_type_to_str_user_lua_is_always_none() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        // UserLua IS present in COMMAND_COMPLETE (as "<Lua function>")
+        // but is specifically excluded by its own real caller-visible
+        // check, matching the original's own `expand == EXPAND_USER_LUA`
+        // special case.
+        assert_eq!(cmdcomplete_type_to_str(Ec::UserLua as i32, b""), None);
+    }
+
+    #[test]
+    fn cmdcomplete_type_to_str_user_defined_and_list_append_the_compl_arg() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        assert_eq!(
+            cmdcomplete_type_to_str(Ec::UserDefined as i32, b"MyFunc"),
+            Some(b"custom,MyFunc".to_vec())
+        );
+        assert_eq!(
+            cmdcomplete_type_to_str(Ec::UserList as i32, b"MyFunc"),
+            Some(b"customlist,MyFunc".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmdcomplete_type_to_str_unknown_type_is_none() {
+        assert_eq!(cmdcomplete_type_to_str(9999, b""), None);
+    }
+
+    #[test]
+    fn cmdcomplete_str_to_type_recognizes_custom_and_customlist_prefixes() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        assert_eq!(cmdcomplete_str_to_type(b"custom,MyFunc"), Ec::UserDefined);
+        assert_eq!(cmdcomplete_str_to_type(b"customlist,MyFunc"), Ec::UserList);
+    }
+
+    #[test]
+    fn cmdcomplete_str_to_type_is_the_inverse_of_get_command_complete() {
+        for &(ec, name) in COMMAND_COMPLETE {
+            // "custom"/"customlist" are handled by their own dedicated
+            // prefix check first in the real function (never reached
+            // via a bare, comma-less name for those two specifically),
+            // so they're excluded from this generic round-trip check.
+            if name == "custom" || name == "customlist" {
+                continue;
+            }
+            assert_eq!(cmdcomplete_str_to_type(name.as_bytes()), ec, "mismatch for {name:?}");
+        }
+    }
+
+    #[test]
+    fn cmdcomplete_str_to_type_unrecognized_name_is_nothing() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        assert_eq!(cmdcomplete_str_to_type(b"not-a-real-type"), Ec::Nothing);
+        assert_eq!(cmdcomplete_str_to_type(b""), Ec::Nothing);
+    }
+
+    // --- parse_compl_arg ---
+
+    #[test]
+    fn parse_compl_arg_plain_type_succeeds_with_no_argument() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"command", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(complp, Ec::Commands);
+        assert_eq!(argt, 0);
+        assert_eq!(compl_arg, None);
+    }
+
+    #[test]
+    fn parse_compl_arg_buffer_type_sets_ex_bufname() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"buffer", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(complp, Ec::Buffers);
+        assert_eq!(argt, crate::ex_cmds_defs::ex_flags::BUFNAME);
+    }
+
+    #[test]
+    fn parse_compl_arg_file_like_types_set_ex_xfile() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        for name in [&b"dir"[..], b"file", b"shellcmdline"] {
+            let mut complp = Ec::Nothing;
+            let mut argt = 0u32;
+            let mut compl_arg = None;
+            let rc = parse_compl_arg(name, &mut complp, &mut argt, &mut compl_arg);
+            assert_eq!(rc, crate::vim_defs::OK);
+            assert_eq!(argt, crate::ex_cmds_defs::ex_flags::XFILE, "mismatch for {name:?}");
+        }
+    }
+
+    #[test]
+    fn parse_compl_arg_custom_with_a_function_argument_succeeds() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"custom,MyFunc", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(complp, Ec::UserDefined);
+        assert_eq!(compl_arg, Some(b"MyFunc".to_vec()));
+    }
+
+    #[test]
+    fn parse_compl_arg_customlist_with_a_function_argument_succeeds() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"customlist,MyFunc", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::OK);
+        assert_eq!(complp, Ec::UserList);
+        assert_eq!(compl_arg, Some(b"MyFunc".to_vec()));
+    }
+
+    #[test]
+    fn parse_compl_arg_custom_without_a_function_argument_fails() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"custom", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn parse_compl_arg_non_custom_type_with_an_argument_fails() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        // "buffer" never takes a function argument (only "custom"/
+        // "customlist" do), so a trailing ",whatever" is rejected.
+        let rc = parse_compl_arg(b"buffer,whatever", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn parse_compl_arg_unknown_type_fails() {
+        use crate::cmdexpand_defs::ExpandContext as Ec;
+        let mut complp = Ec::Nothing;
+        let mut argt = 0u32;
+        let mut compl_arg = None;
+        let rc = parse_compl_arg(b"not-a-real-type", &mut complp, &mut argt, &mut compl_arg);
+        assert_eq!(rc, crate::vim_defs::FAIL);
     }
 }
