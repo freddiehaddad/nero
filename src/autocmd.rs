@@ -459,6 +459,37 @@ pub fn event_nr2name(event: EventT) -> String {
     format!("{event:?}")
 }
 
+/// Defer sending the `OptionSet` autocommand for `buf`'s own
+/// "modified" option changing until back at the main loop
+/// (`aucmd_defer_modified`).
+///
+/// Since `has_event(EVENT_OPTIONSET)` is always `false` today (nothing
+/// in this crate can register a real autocommand yet - see this
+/// module's own doc comment), this function's real body is ALWAYS a
+/// no-op via its own first, short-circuiting `||` disjunct - the real,
+/// always-taken early-return condition is translated directly here,
+/// not a hardcoded shortcut, matching this crate's own established
+/// "no autocmds registered" bypass-path precedent
+/// (`apply_autocmds_group`'s own doc comment). If
+/// `has_event(EVENT_OPTIONSET)` were ever real (a future session
+/// adding `:autocmd` registration), reaching past it needs
+/// `bt_nofile`/`get_vim_var_str`/the deferred-events multiqueue - none
+/// of which are wired up here yet, so that path `unimplemented!()`s,
+/// unreachable today.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+pub unsafe fn aucmd_defer_modified(buf: *mut BufT, _new_val: bool) {
+    if !has_event(EventT::OptionSet) {
+        return;
+    }
+    let _ = buf;
+    unimplemented!(
+        "aucmd_defer_modified: needs bt_nofile/get_vim_var_str/the deferred-events \
+         multiqueue - unreachable while has_event(EVENT_OPTIONSET) is always false"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,4 +804,67 @@ mod tests {
             assert!(!name.contains("::"));
         }
     }
+
+    #[test]
+    fn aucmd_defer_modified_is_a_noop_when_no_optionset_autocmd_is_registered() {
+        // AUTOCMDS is shared - hold the lock even though this test
+        // only reads through has_event's own no-op fast path (a
+        // sibling test elsewhere in this module populates
+        // AUTOCMDS[BufEnter] under this same lock).
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        // Must not panic - has_event(EVENT_OPTIONSET) is always false
+        // today, so the real body's own first `||` disjunct always
+        // short-circuits the whole condition to true and returns
+        // immediately, never reaching the unimplemented!() tail.
+        unsafe { aucmd_defer_modified(&mut buf as *mut BufT, true) };
+        unsafe { aucmd_defer_modified(&mut buf as *mut BufT, false) };
+    }
+
+    #[test]
+    fn aucmd_defer_modified_panics_if_an_optionset_autocmd_is_ever_registered() {
+        // A hypothetical future state (never reachable today, since
+        // nothing can populate AUTOCMDS[OptionSet] yet) - proves the
+        // real early-return condition is genuinely checked, not
+        // hardcoded, and that the (today unreachable) tail correctly
+        // signals its own remaining blocker rather than silently
+        // doing the wrong thing. Checks the panic message manually
+        // (not via #[should_panic]) since a manual catch_unwind is
+        // needed to safely clean up AUTOCMDS even if the call panics -
+        // combining both mechanisms causes #[should_panic] to observe
+        // the wrong (re-thrown/unwrap) panic message instead of the
+        // real one.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        {
+            let autocmds = unsafe { AUTOCMDS.get_mut() };
+            assert!(autocmds[EventT::OptionSet as usize].is_empty());
+            autocmds[EventT::OptionSet as usize].push(crate::autocmd_defs::AutoCmd {
+                pat: std::ptr::null_mut(),
+                id: 1,
+                desc: None,
+                handler_cmd: None,
+                handler_fn: crate::eval::typval_defs::Callback::default(),
+                script_ctx: crate::eval::typval_defs::SctxT::default(),
+                once: false,
+                nested: false,
+            });
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            aucmd_defer_modified(&mut buf as *mut BufT, true);
+        }));
+        // Clean up so other tests sharing this GlobalCell see an empty
+        // state again, regardless of whether the call above panicked.
+        (unsafe { AUTOCMDS.get_mut() })[EventT::OptionSet as usize].clear();
+
+        let err = result.expect_err("aucmd_defer_modified should have panicked");
+        // unimplemented!() with a plain string literal (no format
+        // interpolation) panics with a `&'static str` payload, not a
+        // `String`.
+        let msg = err.downcast_ref::<&str>().copied().unwrap_or("<non-string panic>");
+        assert!(msg.contains("aucmd_defer_modified"), "unexpected panic message: {msg}");
+    }
 }
+
+
+

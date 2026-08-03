@@ -77,6 +77,85 @@ use crate::buffer_defs::{b_flags, BufT};
 use crate::option::copy_option_part;
 use crate::strings::vim_strchr;
 
+/// Internal part of `changed()`, no user interaction (`changed_internal`).
+/// Also used for recovery.
+///
+/// Every dependency this function needs (`ml_setflags`,
+/// `redraw_buf_status_later`, `GLOBALS.redraw_tabline`/
+/// `need_maketitle`, `aucmd_defer_modified` - always a no-op today,
+/// see its own doc comment) is now real, unlike its own caller
+/// `changed()` (still needs `ml_open_file`/the message-display
+/// pipeline for its OWN body, so `changed()` itself remains deferred -
+/// see this module's own doc comment).
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`.
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT` (touched transitively via `ml_setflags`).
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid, live
+/// `WinT` pointers (touched transitively via `redraw_buf_status_later`).
+pub unsafe fn changed_internal(buf: *mut BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let was_changed = unsafe { (*buf).b_changed } != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).b_changed = 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::ml_setflags(&mut *buf) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::redraw_buf_status_later(buf) };
+    unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = true;
+    unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = true;
+    if !was_changed {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::autocmd::aucmd_defer_modified(buf, true) };
+    }
+}
+
+/// Called when the changed flag must be reset for buffer `buf`
+/// (`unchanged`). When `ff` is true also reset `'fileformat'`. When
+/// `always_inc_changedtick` is true, `b:changedtick` is incremented
+/// even when the changed flag was off.
+///
+/// The original's own `file_ff_differs(buf, false)` call always
+/// passes `false` for its own `ignore_empty` parameter - meaning this
+/// function never needs a real, `ml_open`'d memline to have been
+/// opened first (`file_ff_differs`'s only branch that would touch
+/// `ml_get_buf` is unconditionally skipped whenever `ignore_empty` is
+/// `false`).
+///
+/// # Safety
+/// Same as [`changed_internal`].
+pub unsafe fn unchanged(buf: *mut BufT, ff: bool, always_inc_changedtick: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_changed = unsafe { (*buf).b_changed } != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let ff_differs = ff && unsafe { file_ff_differs(&mut *buf, false) };
+    if is_changed || ff_differs {
+        let was_changed = is_changed;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*buf).b_changed = 0 };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::memline::ml_setflags(&mut *buf) };
+        if ff {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { save_file_ff(&mut *buf) };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::redraw_buf_status_later(buf) };
+        unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = true;
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+        if was_changed {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::autocmd::aucmd_defer_modified(buf, false) };
+        }
+    } else if always_inc_changedtick {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+    }
+}
+
 /// Remember the current values of `'fileformat'`/`'fileencoding'`/
 /// `'endofline'`/`'bomb'`, so a later call to [`file_ff_differs`] can
 /// detect if they changed (`save_file_ff`).
@@ -664,6 +743,7 @@ pub unsafe fn get_last_leader_offset(line: &[u8], mut flags: Option<&mut usize>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::buf_get_changedtick;
 
     #[test]
     fn file_ff_differs_false_for_never_loaded_buffer() {
@@ -770,6 +850,120 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { file_ff_differs(&mut buf, false) });
+    }
+
+    #[test]
+    fn changed_internal_sets_b_changed_and_redraw_bookkeeping() {
+        // Touches shared GLOBALS.redraw_tabline/need_maketitle.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = false;
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = false;
+
+        unsafe { changed_internal(&mut buf as *mut BufT) };
+
+        assert_eq!(buf.b_changed, 1);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+    }
+
+    #[test]
+    fn changed_internal_does_not_panic_when_already_changed() {
+        // was_changed == true skips the aucmd_defer_modified call
+        // entirely - verify calling it again on an already-changed
+        // buffer is still a clean no-op (AUTOCMDS[OptionSet] is empty
+        // either way, but the was_changed branch itself must not
+        // panic or misbehave).
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 1, ..Default::default() };
+        unsafe { changed_internal(&mut buf as *mut BufT) };
+        assert_eq!(buf.b_changed, 1);
+    }
+
+    #[test]
+    fn unchanged_resets_changed_flag_and_saves_fileformat_when_ff_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_changed: 1,
+            b_p_ff: Some(b"dos".to_vec()),
+            b_start_ffc: i32::from(b'x'), // stale, must be refreshed
+            ..Default::default()
+        };
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { unchanged(&mut buf as *mut BufT, true, false) };
+
+        assert_eq!(buf.b_changed, 0);
+        // save_file_ff was called for real: b_start_ffc now matches
+        // 'fileformat's own first byte.
+        assert_eq!(buf.b_start_ffc, i32::from(b'd'));
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
+    }
+
+    #[test]
+    fn unchanged_does_not_save_fileformat_when_ff_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_changed: 1,
+            b_p_ff: Some(b"dos".to_vec()),
+            b_start_ffc: i32::from(b'x'),
+            ..Default::default()
+        };
+
+        unsafe { unchanged(&mut buf as *mut BufT, false, false) };
+
+        assert_eq!(buf.b_changed, 0);
+        // save_file_ff was NOT called: the stale b_start_ffc survives.
+        assert_eq!(buf.b_start_ffc, i32::from(b'x'));
+    }
+
+    #[test]
+    fn unchanged_triggers_via_file_ff_differs_even_when_not_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        // b_changed starts false, but 'fileformat' genuinely differs
+        // from what was saved when editing started - ff_differs alone
+        // must be enough to enter the real branch.
+        let mut buf = BufT {
+            b_changed: 0,
+            b_p_ff: Some(b"dos".to_vec()),
+            b_start_ffc: i32::from(b'u'),
+            ..Default::default()
+        };
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { unchanged(&mut buf as *mut BufT, true, false) };
+
+        assert_eq!(buf.b_start_ffc, i32::from(b'd'));
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
+    }
+
+    #[test]
+    fn unchanged_increments_changedtick_via_always_inc_changedtick_only() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = false;
+        let before_tick = buf_get_changedtick(&buf);
+
+        // ff == false, so ff_differs is false too - the `else if`
+        // branch is the only one that can fire here.
+        unsafe { unchanged(&mut buf as *mut BufT, false, true) };
+
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
+        // The main branch's own bookkeeping must NOT have run.
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline);
+    }
+
+    #[test]
+    fn unchanged_is_a_complete_noop_when_nothing_triggers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline = false;
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { unchanged(&mut buf as *mut BufT, false, false) };
+
+        assert_eq!(buf_get_changedtick(&buf), before_tick);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.redraw_tabline);
     }
 
     #[test]
