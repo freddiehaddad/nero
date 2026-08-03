@@ -42,7 +42,16 @@
 //! anymore), keeping the underlying `b:changedtick` value itself fully
 //! correct for every other C-level accessor in this crate. `set_buflisted`
 //! (now tractable now that `autocmd.c`'s `apply_autocmds` is real - see
-//! `crate::autocmd`'s own module doc).
+//! `crate::autocmd`'s own module doc). `buf_clear_file` (now tractable
+//! now that `change.c`'s `unchanged` is real - see `crate::change`'s
+//! own module doc); translated ahead of its own real callers
+//! (`close_buffer`/`ex_cmds.c`'s `:enew`, neither translated), matching
+//! this crate's established "small, simple, no design freedom" ahead-
+//! of-caller precedent. Deliberately does NOT close/free
+//! `buf.b_ml.ml_mfp` itself - exactly like the original, which relies
+//! on its own caller having already done so beforehand (via
+//! `buf_freeall`) - documented explicitly on `buf_clear_file`'s own doc
+//! comment so a future caller doesn't assume this function frees it.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `bt_nofileread` (`static`): its only caller, `open_buffer`, is
@@ -583,6 +592,36 @@ pub unsafe fn buflist_name_nr(fnum: i32) -> Option<(Vec<u8>, crate::pos_defs::Li
     // SAFETY: forwarded from this function's own safety doc.
     let lnum = unsafe { buflist_findlnum(buf) };
     Some((fname, lnum))
+}
+
+/// Make `buf` not contain a file (`buf_clear_file`).
+///
+/// The original neither closes nor frees `buf.b_ml.ml_mfp` itself
+/// here - by the time its own real caller (`close_buffer`, via
+/// `buf_freeall`) reaches this function, the memfile has already been
+/// closed elsewhere; this just clears the (by then dangling) pointer,
+/// exactly like the original does. Any future caller of this function
+/// must ensure `buf.b_ml.ml_mfp` (if non-null) has already been
+/// closed/freed BEFORE calling this, or it will leak.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp`, if non-null, must be a valid pointer to a live
+/// `MemfileT` (touched transitively via `unchanged`'s own
+/// `ml_setflags` call). `GLOBALS.firstwin`'s own `w_next` chain must
+/// consist of valid, live `WinT` pointers (touched transitively via
+/// `unchanged`'s own `redraw_buf_status_later` call).
+pub unsafe fn buf_clear_file(buf: &mut BufT) {
+    buf.b_ml.ml_line_count = 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::change::unchanged(buf as *mut BufT, true, true) };
+    buf.b_p_eof = 0;
+    buf.b_start_eof = 0;
+    buf.b_p_eol = 1;
+    buf.b_start_eol = 1;
+    buf.b_p_bomb = 0;
+    buf.b_start_bomb = 0;
+    buf.b_ml.ml_mfp = std::ptr::null_mut();
+    buf.b_ml.ml_flags = crate::memline_defs::ML_EMPTY;
 }
 
 /// Get `b:changedtick` value. Faster than querying `b:`
@@ -1184,6 +1223,28 @@ mod tests {
         }
     }
 
+    /// Points `GLOBALS.firstwin` at `firstwin` for the guard's
+    /// lifetime, restoring the previous value on drop. Callers must
+    /// hold `global_state_test_lock()` for the guard's whole lifetime
+    /// (matching this file's own `CurbufGuard`/`CurwinGuard`).
+    struct FirstwinGuard {
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl FirstwinGuard {
+        fn set(new_firstwin: *mut crate::buffer_defs::WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = new_firstwin;
+            FirstwinGuard { previous }
+        }
+    }
+
+    impl Drop for FirstwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = self.previous;
+        }
+    }
+
     /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
     /// restoring the previous value on drop. Callers must hold
     /// `global_state_test_lock()` for the guard's whole lifetime
@@ -1319,5 +1380,56 @@ mod tests {
         unsafe {
             drop(Box::from_raw(wi));
         }
+    }
+
+    #[test]
+    fn buf_clear_file_resets_every_tracked_field() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _firstwin_guard = FirstwinGuard::set(std::ptr::null_mut());
+        let _curwin_guard = CurwinGuard::set(std::ptr::null_mut());
+
+        let mut buf = BufT {
+            b_p_eof: 1,
+            b_start_eof: 1,
+            b_p_eol: 0,
+            b_start_eol: 0,
+            b_p_bomb: 1,
+            b_start_bomb: 1,
+            ..Default::default()
+        };
+        buf.b_ml.ml_line_count = 42;
+        buf.b_ml.ml_flags = 0;
+        // ml_mfp stays null (BufT::default()) - unchanged/ml_setflags
+        // both gracefully no-op on a null memfile, avoiding the
+        // ml_open-transitive Miri/FFI hazard documented elsewhere.
+
+        unsafe { buf_clear_file(&mut buf) };
+
+        assert_eq!(buf.b_ml.ml_line_count, 1);
+        assert_eq!(buf.b_p_eof, 0);
+        assert_eq!(buf.b_start_eof, 0);
+        assert_eq!(buf.b_p_eol, 1);
+        assert_eq!(buf.b_start_eol, 1);
+        assert_eq!(buf.b_p_bomb, 0);
+        assert_eq!(buf.b_start_bomb, 0);
+        assert!(buf.b_ml.ml_mfp.is_null());
+        assert_eq!(buf.b_ml.ml_flags, crate::memline_defs::ML_EMPTY);
+    }
+
+    #[test]
+    fn buf_clear_file_marks_the_buffer_unchanged_via_the_real_unchanged_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _firstwin_guard = FirstwinGuard::set(std::ptr::null_mut());
+        let _curwin_guard = CurwinGuard::set(std::ptr::null_mut());
+
+        let mut buf = BufT { b_changed: 1, ..Default::default() };
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { buf_clear_file(&mut buf) };
+
+        // unchanged(buf, true, true) was really called: b_changed
+        // resets to 0 and b:changedtick was bumped.
+        assert_eq!(buf.b_changed, 0);
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
     }
 }
