@@ -128,6 +128,8 @@
 //! [`mb_get_class_tab`]/[`mb_get_class`] (their own real callers,
 //! placed here next to `utf_class_tab` rather than matching the
 //! original's own much-earlier declaration order, for readability).
+//! Also [`utf_ambiguous_width`] - needs only the already-real
+//! [`utf_ptr2char_info`]/`prop_is_emojilike`.
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -1428,6 +1430,41 @@ pub fn utf_ptr2char_info(p: &[u8]) -> crate::mbyte_defs::CharInfo {
     crate::mbyte_defs::CharInfo { value: code_point, len }
 }
 
+/// Whether the character at `p` has ambiguous East Asian Width (so
+/// `'ambiwidth'` decides its real display width), or turns into an
+/// emoji when immediately followed by `U+FE0F` VARIATION SELECTOR-16
+/// (`utf_ambiguous_width`).
+///
+/// No real caller is translated yet (`api/ui.c`'s `nvim_ui_attach`/
+/// `tui/tui.c`'s terminal-capability probing) - harvested ahead of
+/// them, matching this crate's established precedent for a small,
+/// self-contained function with no design freedom of its own.
+#[must_use]
+pub fn utf_ambiguous_width(p: &[u8]) -> bool {
+    // be quick if there is nothing to print or ASCII-only
+    if p.first().copied().unwrap_or(0) == 0 || p.get(1).copied().unwrap_or(0) == 0 {
+        return false;
+    }
+
+    let info = utf_ptr2char_info(p);
+    if info.value >= 0x80 {
+        // SAFETY: utf8proc_get_property never returns null (documented
+        // utf8proc contract - it always returns a valid "default entry"
+        // even for out-of-range/invalid codepoints).
+        let prop = unsafe { &*utf8proc_sys::utf8proc_get_property(info.value) };
+        if prop.ambiguous_width() != 0 || prop_is_emojilike(prop) {
+            return true;
+        }
+    }
+
+    // check if second sequence is 0xFE0F VS-16 which can turn things
+    // into emoji, safe with no second sequence (fewer than 3 bytes
+    // remain after `info.len`, matching the original's own NUL-safe
+    // `memcmp` - a genuine mismatch, not a bounds error, when the
+    // buffer simply doesn't extend that far).
+    p.get(info.len..info.len + 3) == Some(&[0xef, 0xb8, 0x8f][..])
+}
+
 /// Return information about the first character of `line` as a
 /// [`crate::mbyte_defs::StrCharInfo`] positioned at offset 0
 /// (`utf_ptr2StrCharInfo`, an inline function in the original's own
@@ -2311,6 +2348,50 @@ mod tests {
         assert_eq!(ci.pos, 0);
         assert_eq!(ci.chr.value, i32::from(b'a'));
         assert_eq!(ci.chr.len, 1);
+    }
+
+    // --- utf_ambiguous_width ---
+
+    #[test]
+    fn utf_ambiguous_width_empty_or_single_byte_is_false() {
+        assert!(!utf_ambiguous_width(b""));
+        assert!(!utf_ambiguous_width(b"a"));
+        assert!(!utf_ambiguous_width(b"a\0"));
+    }
+
+    #[test]
+    fn utf_ambiguous_width_plain_ascii_is_false() {
+        assert!(!utf_ambiguous_width(b"ab"));
+    }
+
+    #[test]
+    fn utf_ambiguous_width_true_for_an_ambiguous_width_character() {
+        // U+00A1 (INVERTED EXCLAMATION MARK) has East Asian Width
+        // "Ambiguous" - already relied upon by the existing
+        // utf_char2cells_ambiguous_width_follows_ambiwidth_option test.
+        let mut s = "¡".as_bytes().to_vec();
+        s.push(b'x');
+        assert!(utf_ambiguous_width(&s));
+    }
+
+    #[test]
+    fn utf_ambiguous_width_true_when_followed_by_variation_selector_16() {
+        // A plain ASCII base character (itself neither ambiguous-width
+        // nor emoji-like) immediately followed by U+FE0F (VS-16, UTF-8
+        // bytes EF B8 8F) - turns into an emoji presentation, matching
+        // the original's own dedicated memcmp check.
+        let mut s = vec![b'a'];
+        s.extend_from_slice(&[0xef, 0xb8, 0x8f]);
+        assert!(utf_ambiguous_width(&s));
+    }
+
+    #[test]
+    fn utf_ambiguous_width_false_for_an_unambiguous_character_without_vs16() {
+        // U+4E2D ('中', CJK) is unconditionally double-width (not
+        // "Ambiguous"), not emoji-like, and not followed by VS-16.
+        let mut s = "中".as_bytes().to_vec();
+        s.push(b'x');
+        assert!(!utf_ambiguous_width(&s));
     }
 
     #[test]
