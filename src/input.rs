@@ -32,13 +32,14 @@
 //!   `vgetc()` call cannot be remapped. `KEY_NOREMAP` starts at `0`
 //!   and is only ever changed inside `vgetc()` itself (not
 //!   translated), so this is always `false` today.
-//! - [`typebuf_typed`]/[`typebuf_maplen`] - whether there are (and how
-//!   many) untyped (mapped, or from `:normal`) characters in the
-//!   typeahead buffer. The new `TYPEBUF: GlobalCell<
-//!   crate::input_defs::TypebufT>` instance's own `tb_maplen` starts
-//!   at `0` and is only ever changed inside `ins_typebuf` (not yet
-//!   translated), so `typebuf_typed()` is always `true` and
-//!   `typebuf_maplen()` always `0` today.
+//! - [`typebuf_typed`]/[`typebuf_maplen`]/[`typebuf_len`] - whether
+//!   there are (and how many) untyped (mapped, or from `:normal`)
+//!   characters in the typeahead buffer, and how many valid bytes it
+//!   currently holds. The new `TYPEBUF: GlobalCell<
+//!   crate::input_defs::TypebufT>` instance's own `tb_maplen`/`tb_len`
+//!   both start at `0` and are only ever changed inside `ins_typebuf`
+//!   (not yet translated), so `typebuf_typed()` is always `true` and
+//!   `typebuf_maplen()`/`typebuf_len()` always `0` today.
 //! - [`typebuf_changed`] - whether the typeahead buffer changed since
 //!   a given `tb_change_cnt` snapshot (e.g. from a client message or
 //!   `feedkeys()`). A real, generically-callable predicate (depends on
@@ -163,6 +164,16 @@ pub fn typebuf_typed() -> bool {
 pub fn typebuf_maplen() -> i32 {
     // SAFETY: momentary read.
     unsafe { TYPEBUF.get_mut() }.tb_maplen
+}
+
+/// The number of valid bytes currently in the typeahead buffer
+/// (`typebuf.tb_len`, read directly in the original - not a named
+/// function there, but exposed as one here since `TYPEBUF` itself is
+/// private to this module, matching `typebuf_maplen`'s own shape).
+#[must_use]
+pub fn typebuf_len() -> i32 {
+    // SAFETY: momentary read.
+    unsafe { TYPEBUF.get_mut() }.tb_len
 }
 
 /// Whether the typeahead buffer was changed (while waiting for a
@@ -367,6 +378,16 @@ mod tests {
         reset_buffers();
         assert!(typebuf_typed());
         assert_eq!(typebuf_maplen(), 0);
+        assert_eq!(typebuf_len(), 0);
+    }
+
+    #[test]
+    fn typebuf_len_reflects_tb_len() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_len = 5;
+        assert_eq!(typebuf_len(), 5);
+        reset_buffers();
     }
 
     #[test]

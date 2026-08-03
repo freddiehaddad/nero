@@ -12,16 +12,23 @@
 //! needed `option.c`'s `get_ve_flags`, already translated),
 //! `get_real_state` (resolves `MODE_NORMAL`'s "real" sub-state -
 //! Visual/Select/op-pending - all fields already existed via
-//! `globals.rs`/`normal_defs.rs`), and `get_mode` (the `mode()`
+//! `globals.rs`/`normal_defs.rs`), `get_mode` (the `mode()`
 //! builtin's own state-to-string formatter - re-investigated and found
 //! to be a pure state reader with NO event-loop interaction of its
 //! own, unlike `state_enter` itself; see `get_mode`'s own doc comment
 //! for exactly which of its many branches are decidable today vs.
-//! genuinely unreachable). These are simple, self-contained
-//! global-state readers with no design freedom of their own - the
-//! usual "harvest the tractable core" pattern, even without a real
-//! caller yet among currently-translated code (matching the
-//! established precedent, e.g. `cursor.c`'s batch last session).
+//! genuinely unreachable), and `is_safe_now`/`may_trigger_safestate`/
+//! `state_no_longer_safe`/`get_was_safe_state` (the `SafeState`
+//! autocommand-triggering family - `is_safe_now` needed only
+//! `input.c`'s `stuff_empty`/`typebuf_len`/`using_script` - all real,
+//! see `input.rs` - plus `GLOBALS.global_busy`/`debug_mode`;
+//! `may_trigger_safestate` calls the now-real `apply_autocmds` for
+//! real, omitting only the original's own pure-diagnostic `DLOG(...)`
+//! calls). These are simple, self-contained global-state readers with
+//! no design freedom of their own - the usual "harvest the tractable
+//! core" pattern, even without a real caller yet among currently-
+//! translated code (matching the established precedent, e.g.
+//! `cursor.c`'s batch last session).
 //!
 //! Everything else - `state_enter`, `check_pending`, `may_sync_undo`,
 //! `restart_edit`-related helpers, `os_breakcheck`/`line_breakcheck`
@@ -189,6 +196,74 @@ pub unsafe fn get_mode() -> Vec<u8> {
     }
 
     buf
+}
+
+/// When true in a safe state when starting to wait for a character
+/// (`was_safe`, `static` in the original).
+static WAS_SAFE: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Return whether currently it is safe, assuming it was safe before
+/// (high level state didn't change) (`is_safe_now`, `static` in the
+/// original).
+///
+/// Every dependency is real: `stuff_empty`/`typebuf_len`/
+/// `using_script` (`input.c`, all always report their own "nothing has
+/// happened yet" default today, exactly like a genuinely fresh,
+/// interactive session), and `GLOBALS.global_busy`/`debug_mode`.
+fn is_safe_now() -> bool {
+    crate::input::stuff_empty()
+        && crate::input::typebuf_len() == 0
+        && !crate::input::using_script()
+        // SAFETY: momentary reads of plain scalar globals.
+        && unsafe { crate::globals::GLOBALS.get_mut() }.global_busy == 0
+        && !unsafe { crate::globals::GLOBALS.get_mut() }.debug_mode
+}
+
+/// Trigger `SafeState` if currently in a safe state, that is `safe` is
+/// true and there is no typeahead (`may_trigger_safestate`).
+///
+/// The original's own `DLOG(...)` debug-logging calls (only reached
+/// when `was_safe` actually changes) are omitted entirely - pure
+/// diagnostic logging with no observable state effect, matching this
+/// crate's established "message/log display omitted, state kept"
+/// policy. `apply_autocmds(EVENT_SAFESTATE, ...)` is called for real.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (touched transitively via `apply_autocmds`,
+/// reached only when `is_safe` is true).
+pub unsafe fn may_trigger_safestate(safe: bool) {
+    let is_safe = safe && is_safe_now();
+    if is_safe {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+        let _ = crate::autocmd::apply_autocmds(
+            crate::autocmd_defs::EventT::SafeState,
+            None,
+            None,
+            false,
+            Some(curbuf),
+        );
+    }
+    unsafe { *WAS_SAFE.get_mut() = is_safe };
+}
+
+/// Something changed which causes the state possibly to be unsafe,
+/// e.g. a character was typed. It will remain unsafe until the next
+/// call to [`may_trigger_safestate`] (`state_no_longer_safe`).
+///
+/// The original's own `reason` parameter and its `DLOG(...)` call are
+/// omitted entirely: `reason` only ever feeds that one omitted debug
+/// log line, never any other observable behavior.
+pub fn state_no_longer_safe() {
+    unsafe { *WAS_SAFE.get_mut() = false };
+}
+
+/// Whether it was safe last time [`may_trigger_safestate`] ran
+/// (`get_was_safe_state`).
+#[must_use]
+pub fn get_was_safe_state() -> bool {
+    unsafe { *WAS_SAFE.get_mut() }
 }
 
 #[cfg(test)]
@@ -538,5 +613,97 @@ mod tests {
         let result = unsafe { get_mode() };
         reset_mode_globals();
         assert_eq!(result, b"!".to_vec());
+    }
+
+    /// Resets `GLOBALS.global_busy`/`debug_mode` to their real
+    /// defaults - both start "off" in a fresh session.
+    fn reset_safestate_globals() {
+        let g = unsafe { GLOBALS.get_mut() };
+        g.global_busy = 0;
+        g.debug_mode = false;
+    }
+
+    #[test]
+    fn is_safe_now_true_by_default() {
+        let _lock = global_state_test_lock();
+        reset_safestate_globals();
+        assert!(is_safe_now());
+        reset_safestate_globals();
+    }
+
+    #[test]
+    fn is_safe_now_false_when_global_busy() {
+        let _lock = global_state_test_lock();
+        reset_safestate_globals();
+        unsafe { GLOBALS.get_mut() }.global_busy = 1;
+        assert!(!is_safe_now());
+        reset_safestate_globals();
+    }
+
+    #[test]
+    fn is_safe_now_false_when_debug_mode() {
+        let _lock = global_state_test_lock();
+        reset_safestate_globals();
+        unsafe { GLOBALS.get_mut() }.debug_mode = true;
+        assert!(!is_safe_now());
+        reset_safestate_globals();
+    }
+
+    #[test]
+    fn may_trigger_safestate_sets_was_safe_true_when_state_is_safe() {
+        // CurbufGuard is self-locking - do not also acquire an
+        // explicit global_state_test_lock() here (deadlock).
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        reset_safestate_globals();
+
+        unsafe { may_trigger_safestate(true) };
+        assert!(get_was_safe_state());
+
+        reset_safestate_globals();
+        state_no_longer_safe();
+    }
+
+    #[test]
+    fn may_trigger_safestate_false_when_safe_argument_is_false() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        reset_safestate_globals();
+
+        // Underlying state is otherwise safe, but the caller itself
+        // reports "not safe" (e.g. mid-command) - was_safe must stay
+        // false.
+        unsafe { may_trigger_safestate(false) };
+        assert!(!get_was_safe_state());
+
+        reset_safestate_globals();
+    }
+
+    #[test]
+    fn may_trigger_safestate_false_when_global_busy() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        reset_safestate_globals();
+        unsafe { GLOBALS.get_mut() }.global_busy = 1;
+
+        unsafe { may_trigger_safestate(true) };
+        assert!(!get_was_safe_state());
+
+        reset_safestate_globals();
+    }
+
+    #[test]
+    fn state_no_longer_safe_resets_was_safe_to_false() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        reset_safestate_globals();
+
+        unsafe { may_trigger_safestate(true) };
+        assert!(get_was_safe_state());
+
+        state_no_longer_safe();
+        assert!(!get_was_safe_state());
+
+        reset_safestate_globals();
     }
 }
