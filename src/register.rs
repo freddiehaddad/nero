@@ -58,7 +58,7 @@
 //!   `op_delete`, `shada.c`'s register entries) - no real caller
 //!   exists for any of these yet.
 
-use crate::register_defs::{greg_flags, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
+use crate::register_defs::{greg_flags, RegContents, YankregT, YregModeT, NUM_REGISTERS, PLUS_REGISTER, STAR_REGISTER};
 
 /// Convert a register name character to its `Y_REGS` index
 /// (`op_reg_index`). Returns `None` for a name with no direct slot
@@ -346,32 +346,49 @@ unsafe fn get_spec_reg(regname: i32, errmsg: bool) -> Option<(Option<Vec<u8>>, b
     }
 }
 
+/// Wrap `s` for `get_reg_contents`'s own return value
+/// (`get_reg_wrap_one_line`): a plain string when `flags` doesn't
+/// include `greg_flags::LIST`, or a freshly-allocated 1-element `List`
+/// containing `s` when it does. Returns `None` when `s` itself is
+/// `None` (matching the original's own `retval == NULL` early return,
+/// checked by every real caller BEFORE calling the original
+/// `get_reg_wrap_one_line` at all - folded into this one helper here
+/// since Rust's `?` operator makes that trivial).
+fn get_reg_wrap_one_line(s: Option<Vec<u8>>, flags: u32) -> Option<RegContents> {
+    let s = s?;
+    if flags & greg_flags::LIST == 0 {
+        return Some(RegContents::Str(s));
+    }
+    let list = crate::eval::typval::tv_list_alloc(1);
+    // SAFETY: `list` was just allocated above, a valid, exclusively-
+    // owned pointer.
+    unsafe { crate::eval::typval::tv_list_append_string(list, Some(&s)) };
+    Some(RegContents::List(list))
+}
+
 /// Gets the contents of a register (`get_reg_contents`).
-/// @remark Used for `@r` in expressions (only `flags ==
-/// kGRegExprSrc`, `eval7`'s own real call).
+/// @remark Used for `@r` in expressions and for `getreg()`.
 ///
 /// Returns `None` for an invalid register name or an unset/empty
-/// register, matching the original's own `NULL`.
-///
-/// # Deferred
-/// `flags & kGRegList` (return a `List` rather than a joined string,
-/// needed only by the `getreg()` builtin, not `@r`) -
-/// `unimplemented!()`s if ever requested.
+/// register, matching the original's own `NULL`. Returns
+/// [`RegContents::List`] when `flags` includes `greg_flags::LIST`
+/// (needed by the `getreg()` builtin, not `@r`'s own real call, which
+/// always passes `flags == greg_flags::EXPR_SRC`).
 ///
 /// # Safety
 /// Forwarded from `get_spec_reg`'s own safety doc.
 #[must_use]
-pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<Vec<u8>> {
+pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<RegContents> {
     // Don't allow using an expression register inside an expression.
     let regname = if regname == i32::from(b'=') {
         if flags & greg_flags::NO_EXPR != 0 {
             return None;
         }
         return if flags & greg_flags::EXPR_SRC != 0 {
-            get_expr_line_src()
+            get_reg_wrap_one_line(get_expr_line_src(), flags)
         } else {
             // SAFETY: forwarded from this function's own safety doc.
-            unsafe { get_expr_line() }
+            get_reg_wrap_one_line(unsafe { get_expr_line() }, flags)
         };
     } else if regname == i32::from(b'@') {
         // "@@" is used for the unnamed register.
@@ -387,16 +404,22 @@ pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<Vec<u8>> {
 
     // SAFETY: forwarded from this function's own safety doc.
     if let Some((retval, _allocated)) = unsafe { get_spec_reg(regname, false) } {
-        return retval;
-    }
-
-    if flags & greg_flags::LIST != 0 {
-        unimplemented!("get_reg_contents: kGRegList is only needed by getreg(), not eval7's own @r");
+        return get_reg_wrap_one_line(retval, flags);
     }
 
     // SAFETY: forwarded from this function's own safety doc.
     let reg = unsafe { &*get_yank_register(regname, YregModeT::Put) };
     let y_array = reg.y_array.as_ref()?;
+
+    if flags & greg_flags::LIST != 0 {
+        let list = crate::eval::typval::tv_list_alloc(y_array.len() as isize);
+        for line in y_array {
+            // SAFETY: `list` was just allocated above, a valid,
+            // exclusively-owned pointer.
+            unsafe { crate::eval::typval::tv_list_append_string(list, Some(line)) };
+        }
+        return Some(RegContents::List(list));
+    }
 
     // Join the lines of the yank register into one string, inserting a
     // newline between lines and after the last line if y_type is
@@ -408,7 +431,7 @@ pub unsafe fn get_reg_contents(regname: i32, flags: u32) -> Option<Vec<u8>> {
             retval.push(b'\n');
         }
     }
-    Some(retval)
+    Some(RegContents::Str(retval))
 }
 
 /// Get the type of register `regname` (`get_reg_type`).
@@ -776,7 +799,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         set_expr_line(Some(b"1 + 1".to_vec()));
         let result = unsafe { get_reg_contents(i32::from(b'='), greg_flags::EXPR_SRC) };
-        assert_eq!(result, Some(b"1 + 1".to_vec()));
+        assert_eq!(result, Some(RegContents::Str(b"1 + 1".to_vec())));
         set_expr_line(None);
     }
 
@@ -785,7 +808,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         set_expr_line(Some(b"1 + 1".to_vec()));
         let result = unsafe { get_reg_contents(i32::from(b'='), 0) };
-        assert_eq!(result, Some(b"2".to_vec()));
+        assert_eq!(result, Some(RegContents::Str(b"2".to_vec())));
         set_expr_line(None);
     }
 
@@ -817,14 +840,52 @@ mod tests {
     #[test]
     fn get_reg_contents_black_hole_is_an_empty_string_not_none() {
         let result = unsafe { get_reg_contents(i32::from(b'_'), greg_flags::EXPR_SRC) };
-        assert_eq!(result, Some(Vec::new()));
+        assert_eq!(result, Some(RegContents::Str(Vec::new())));
     }
 
     #[test]
-    fn get_reg_contents_klist_flag_is_unimplemented() {
-        let result = std::panic::catch_unwind(|| unsafe { get_reg_contents(i32::from(b'a'), greg_flags::LIST) });
-        assert!(result.is_err(), "expected a panic (kGRegList not yet translated)");
+    fn get_reg_contents_list_flag_wraps_a_special_register_in_a_one_element_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        set_expr_line(Some(b"1 + 1".to_vec()));
+        let result = unsafe { get_reg_contents(i32::from(b'='), greg_flags::EXPR_SRC | greg_flags::LIST) };
+        match result {
+            Some(RegContents::List(l)) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+                unsafe { crate::eval::typval::tv_list_free(l) };
+            }
+            other => panic!("expected a 1-element List, got {other:?}"),
+        }
+        set_expr_line(None);
     }
+
+    #[test]
+    fn get_reg_contents_list_flag_returns_one_item_per_yank_register_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'f')).unwrap();
+        unsafe {
+            let reg = &mut Y_REGS.get_mut()[idx];
+            reg.y_array = Some(vec![b"line one".to_vec(), b"line two".to_vec()]);
+            reg.y_type = crate::normal_defs::MotionType::LineWise;
+        }
+
+        let result = unsafe { get_reg_contents(i32::from(b'f'), greg_flags::LIST) };
+        match result {
+            Some(RegContents::List(l)) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 2);
+                unsafe { crate::eval::typval::tv_list_free(l) };
+            }
+            other => panic!("expected a 2-element List, got {other:?}"),
+        }
+
+        unsafe { Y_REGS.get_mut()[idx] = YankregT::default() };
+    }
+
+    #[test]
+    fn get_reg_contents_list_flag_is_none_for_an_unset_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_reg_contents(i32::from(b'g'), greg_flags::LIST) }, None);
+    }
+
 
     // --- get_reg_type / format_reg_type ---
 

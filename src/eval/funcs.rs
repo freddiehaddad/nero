@@ -5884,12 +5884,13 @@ unsafe fn getreg_get_regname(argvars: &[TypvalT]) -> i32 {
 }
 
 /// `getreg([{regname} [, {expr} [, {list}]]])` - the contents of
-/// register `{regname}` (default `v:register`) as a `String`
-/// (`f_getreg`, `funcs.c`), via the already-existing
-/// [`crate::register::get_reg_contents`]. The `{list}`-truthy path
-/// (return a `List` instead) is not yet supported - it panics via
-/// `unimplemented!()` inside `get_reg_contents` itself, matching that
-/// function's own already-documented deferral (`kGRegList`).
+/// register `{regname}` (default `v:register`) as a `String`, or (when
+/// `{list}` is truthy) as a `List` (one item per register line, or a
+/// one-element list for a special/expression register) (`f_getreg`,
+/// `funcs.c`), via the already-existing
+/// [`crate::register::get_reg_contents`]'s real `kGRegList` support -
+/// falling back to a fresh empty `List` when the register is unset,
+/// matching the original's own `retval == NULL` fallback exactly.
 ///
 /// # Safety
 /// Forwarded from [`getreg_get_regname`]/
@@ -5916,13 +5917,32 @@ unsafe fn f_getreg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
     let flags = if arg2 { crate::register_defs::greg_flags::EXPR_SRC } else { 0 };
     if return_list {
-        // SAFETY: forwarded from this function's own safety doc. Always
-        // panics today (kGRegList not yet supported by get_reg_contents).
-        let _ = unsafe { crate::register::get_reg_contents(regname, flags | crate::register_defs::greg_flags::LIST) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let contents =
+            unsafe { crate::register::get_reg_contents(regname, flags | crate::register_defs::greg_flags::LIST) };
+        let list = match contents {
+            Some(crate::register_defs::RegContents::List(l)) => l,
+            Some(crate::register_defs::RegContents::Str(_)) => {
+                unreachable!("get_reg_contents always returns a List when greg_flags::LIST is set")
+            }
+            None => crate::eval::typval::tv_list_alloc(0),
+        };
+        // SAFETY: `list` is either a freshly-allocated list (refcount
+        // 0) or one returned by `get_reg_contents` (also refcount 0) -
+        // either way, a valid, exclusively-owned pointer this function
+        // is the first to reference.
+        unsafe { crate::eval::typval::tv_list_ref(list) };
+        rettv.value = TypvalValue::List(list);
     } else {
         // SAFETY: forwarded from this function's own safety doc.
         let contents = unsafe { crate::register::get_reg_contents(regname, flags) };
-        rettv.value = TypvalValue::String(contents);
+        rettv.value = match contents {
+            Some(crate::register_defs::RegContents::Str(s)) => TypvalValue::String(Some(s)),
+            Some(crate::register_defs::RegContents::List(_)) => {
+                unreachable!("get_reg_contents never returns a List without greg_flags::LIST, never passed here")
+            }
+            None => TypvalValue::String(None),
+        };
     }
 }
 
@@ -14694,16 +14714,41 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "kGRegList")]
-    fn getreg_list_true_is_unimplemented() {
+    fn getreg_list_true_returns_an_empty_list_for_an_unset_register() {
         let _guard = crate::globals::global_state_test_lock();
-        // Uses an ordinary named register ('a'), not the black hole
-        // ('_') or another special register - those are resolved by
-        // get_spec_reg BEFORE get_reg_contents ever reaches its own
-        // kGRegList check, so they never trigger this panic (caught
-        // via a real test failure, not assumed).
+        // An ordinary named register nothing has ever yanked into -
+        // get_reg_contents returns None, so f_getreg falls back to a
+        // fresh, empty list (tv_list_alloc(0)) rather than a null
+        // rettv, matching the original's own retval == NULL fallback.
         let mut rettv = TypvalT::default();
         unsafe { f_getreg(&[string(b"a"), num(0), num(1)], &mut rettv) };
+        match rettv.value {
+            TypvalValue::List(l) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+                // tv_list_ref must have bumped the refcount to 1, so
+                // rettv genuinely owns its own reference.
+                assert_eq!(unsafe { (*l).lv_refcount }, 1);
+                unsafe { crate::eval::typval::tv_list_unref(l) };
+            }
+            other => panic!("expected an empty List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn getreg_list_true_returns_a_one_element_list_for_the_expression_register() {
+        let _guard = crate::globals::global_state_test_lock();
+        crate::register::set_expr_line(Some(b"1 + 1".to_vec()));
+        let mut rettv = TypvalT::default();
+        unsafe { f_getreg(&[string(b"="), num(1), num(1)], &mut rettv) };
+        match rettv.value {
+            TypvalValue::List(l) => {
+                assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 1);
+                assert_eq!(unsafe { (*l).lv_refcount }, 1);
+                unsafe { crate::eval::typval::tv_list_unref(l) };
+            }
+            other => panic!("expected a 1-element List, got {other:?}"),
+        }
+        crate::register::set_expr_line(None);
     }
 
     // --- f_getregtype ---

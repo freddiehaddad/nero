@@ -50,6 +50,24 @@ pub mod greg_flags {
     pub const LIST: u32 = 4;
 }
 
+/// The result of `get_reg_contents` - either a joined string, or (when
+/// `greg_flags::LIST` is set) a `List` of individual lines. Models the
+/// original's own dual-purpose `void*` return (either a `char*` or a
+/// `list_T*`, distinguished only by the caller's own `flags`) as a
+/// safe Rust enum instead, matching this crate's established "C
+/// void*/union becomes a safe tagged enum" precedent (e.g.
+/// `Callback`, `TypvalValue`, `BhData`).
+#[derive(Debug, PartialEq)]
+pub enum RegContents {
+    /// A joined string (`char*` in the original).
+    Str(Vec<u8>),
+    /// A `List` of individual lines, heap-allocated via `tv_list_alloc`
+    /// (`list_T*` in the original, refcount `0`) - the caller takes
+    /// ownership and must eventually store it into a `rettv` (bumping
+    /// its refcount) or `tv_list_free`/`tv_list_unref` it directly.
+    List(*mut crate::eval::typval_defs::ListT),
+}
+
 /// Definition of one register (`yankreg_T`).
 ///
 /// `y_array`/`y_size` (a nullable array pointer plus its own separate

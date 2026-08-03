@@ -3831,7 +3831,13 @@ pub unsafe fn eval7(
                 // SAFETY: forwarded from this function's own safety doc.
                 let contents =
                     unsafe { crate::register::get_reg_contents(regname, crate::register_defs::greg_flags::EXPR_SRC) };
-                rettv.value = TypvalValue::String(contents);
+                rettv.value = match contents {
+                    Some(crate::register_defs::RegContents::Str(s)) => TypvalValue::String(Some(s)),
+                    Some(crate::register_defs::RegContents::List(_)) => unreachable!(
+                        "get_reg_contents never returns a List without greg_flags::LIST, never passed here"
+                    ),
+                    None => TypvalValue::String(None),
+                };
             }
             if arg.get(pos).is_some() {
                 pos += 1;
