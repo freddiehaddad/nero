@@ -45,12 +45,24 @@
 //! already-real [`crate::macros_defs::ascii_isalpha`]/
 //! [`crate::macros_defs::toupper_asc`]/[`crate::ascii_defs::ctrl_chr`].
 //!
+//! Also translated: [`add_char2buf`] (escapes `K_SPECIAL` while
+//! copying a single character, needing only already-real
+//! [`crate::mbyte::utf_char2bytes`]) and, now that it exists,
+//! [`vim_strsave_escape_ks`] (the escaping counterpart of
+//! [`vim_unescape_ks`], needing [`crate::mbyte::utf_ptr2char`]/
+//! [`crate::mbyte::utf_ptr2len`], both already real). Neither has a
+//! real translated caller yet (`api/vim.c`'s `nvim_replace_termcodes`,
+//! `eval/funcs.c`'s `keytrans()` - which ALSO needs
+//! `find_special_key`, still deferred below - `mapping.c`, and
+//! `register.c`'s typeahead-buffer insertion are all real callers in
+//! the original, none translated) - translated ahead of one anyway,
+//! matching this crate's established "small, simple, mechanically
+//! correct piece ahead of its real caller" precedent.
+//!
 //! Deferred: everything else - `get_special_key`/`get_special_key_name`/
 //! `find_special_key`/`replace_termcodes`/`trans_special`/
 //! `special_to_buf` (need substantially more parsing logic beyond the
-//! table itself), `get_mouse_button` (needs `mouse.c`), `add_char2buf`/
-//! `vim_strsave_escape_ks` (the escaping counterpart of
-//! `vim_unescape_ks` - needs `utf_ptr2len`, verify separately).
+//! table itself), `get_mouse_button` (needs `mouse.c`).
 
 use crate::ascii_defs::TAB;
 use crate::keycodes_defs::{key2termcap0, key2termcap1, termcap2key, MODIFIER_KEYS_TABLE, 
@@ -147,9 +159,8 @@ pub fn simplify_key(key: i32, modifiers: &mut i32) -> i32 {
 }
 
 /// Remove escaping from `K_SPECIAL` characters - the reverse of
-/// `vim_strsave_escape_ks` (not yet translated - needs `add_char2buf`/
-/// `utf_ptr2len`). Works in place, returning the number of bytes in
-/// the unescaped result (`vim_unescape_ks`).
+/// [`vim_strsave_escape_ks`]. Works in place, returning the number of
+/// bytes in the unescaped result (`vim_unescape_ks`).
 ///
 /// Modeled as `p: &mut [u8]` (in place, like the original's own
 /// `char *p` in/out buffer) rather than returning a fresh `Vec<u8>`:
@@ -176,6 +187,86 @@ pub fn vim_unescape_ks(p: &mut [u8]) -> usize {
         }
     }
     d
+}
+
+/// Add character `c` to buffer `s`, escaping the special meaning of
+/// `K_SPECIAL` and handling multi-byte characters (`add_char2buf`).
+///
+/// Writes starting at `s[0]` and returns the number of bytes written -
+/// replacing the original's own "return a pointer to just after the
+/// added bytes" convention (the caller advances its own write position
+/// by that count instead, matching this crate's established
+/// bytes-written idiom for buffer-cursor C functions). The caller's
+/// own buffer must have room for at least `MB_MAXBYTES + 1` bytes from
+/// `s[0]`, matching the original's own documented contract (up to 6
+/// UTF-8 bytes, each possibly expanding to 3 bytes if it equals
+/// `K_SPECIAL`, comfortably fits within `MB_MAXBYTES + 1 = 22`).
+///
+/// # Panics
+/// If `s` has fewer than 3 times [`crate::mbyte::utf_char2len`]`(c)`
+/// bytes of room (matching [`crate::mbyte::utf_char2bytes`]'s own
+/// panic contract, propagated here).
+#[must_use]
+pub fn add_char2buf(c: i32, s: &mut [u8]) -> usize {
+    let mut temp = [0u8; crate::mbyte_defs::MB_MAXBYTES + 1];
+    let len = crate::mbyte::utf_char2bytes(c, &mut temp) as usize;
+    let mut written = 0;
+    for &byte in &temp[..len] {
+        // Need to escape K_SPECIAL like in the typeahead buffer.
+        if byte == crate::keycodes_defs::K_SPECIAL {
+            s[written] = crate::keycodes_defs::K_SPECIAL;
+            s[written + 1] = crate::keycodes_defs::KS_SPECIAL;
+            s[written + 2] = crate::keycodes_defs::KE_FILLER;
+            written += 3;
+        } else {
+            s[written] = byte;
+            written += 1;
+        }
+    }
+    written
+}
+
+/// Copy `p` to a freshly-allocated buffer, escaping `K_SPECIAL` so the
+/// result can be put in the typeahead buffer (`vim_strsave_escape_ks`).
+///
+/// `p` is scanned up to (not including) its first NUL byte or the end
+/// of the slice, whichever comes first - matching the original's own
+/// NUL-terminated-`char *` convention. The returned `Vec<u8>` carries
+/// NO trailing NUL of its own, matching this crate's established
+/// "`.len()` is authoritative" convention for a freshly-produced byte
+/// buffer that isn't line/memline-shaped storage.
+#[must_use]
+pub fn vim_strsave_escape_ks(p: &[u8]) -> Vec<u8> {
+    let p = match p.iter().position(|&b| b == 0) {
+        Some(nul_at) => &p[..nul_at],
+        None => p,
+    };
+    // Need a buffer to hold up to three times as much (K_SPECIAL
+    // escaping). Four in case of an illegal UTF-8 byte: 0xc0 -> 0xc3
+    // K_SPECIAL KS_SPECIAL KE_FILLER.
+    let mut res = Vec::with_capacity(p.len() * 4);
+    let mut s = 0usize;
+    while s < p.len() {
+        if p[s] == crate::keycodes_defs::K_SPECIAL && p.get(s + 1).is_some() && p.get(s + 2).is_some() {
+            // Copy special key unmodified. p was already truncated at
+            // its first NUL above, so "p[s+1]/p[s+2] exist" here is
+            // exactly the original's own "s[1] != NUL && s[2] != NUL".
+            res.push(p[s]);
+            res.push(p[s + 1]);
+            res.push(p[s + 2]);
+            s += 3;
+        } else {
+            // Add character, possibly multi-byte, to destination,
+            // escaping K_SPECIAL. Be careful, it can be an illegal
+            // byte!
+            let c = crate::mbyte::utf_ptr2char(&p[s..]);
+            let mut buf = [0u8; crate::mbyte_defs::MB_MAXBYTES + 1];
+            let written = add_char2buf(c, &mut buf);
+            res.extend_from_slice(&buf[..written]);
+            s += crate::mbyte::utf_ptr2len(&p[s..]) as usize;
+        }
+    }
+    res
 }
 
 /// One entry of `KEY_NAMES_TABLE` (`struct key_name_entry`).
@@ -665,6 +756,77 @@ mod tests {
     fn vim_unescape_ks_empty_string_stays_empty() {
         let mut buf = [0u8];
         assert_eq!(vim_unescape_ks(&mut buf), 0);
+    }
+
+    // --- add_char2buf ---
+
+    #[test]
+    fn add_char2buf_ascii_character_writes_one_byte_unescaped() {
+        let mut buf = [0u8; 8];
+        let written = add_char2buf('A' as i32, &mut buf);
+        assert_eq!(written, 1);
+        assert_eq!(&buf[..written], &[0x41]);
+    }
+
+    #[test]
+    fn add_char2buf_two_byte_character_with_no_k_special_byte() {
+        // 'e' with acute accent (U+00E9) -> UTF-8 [0xC3, 0xA9], neither
+        // byte equals K_SPECIAL (0x80), so no escaping happens.
+        let mut buf = [0u8; 8];
+        let written = add_char2buf(0xE9, &mut buf);
+        assert_eq!(written, 2);
+        assert_eq!(&buf[..written], &[0xC3, 0xA9]);
+    }
+
+    #[test]
+    fn add_char2buf_escapes_a_k_special_byte_within_the_encoding() {
+        // U+0080 -> UTF-8 [0xC2, 0x80]. The second byte (0x80) equals
+        // K_SPECIAL, so it expands into the 3-byte escape sequence;
+        // the first byte (0xC2) passes through unescaped.
+        let (k, ks, ke) = ks();
+        let mut buf = [0u8; 8];
+        let written = add_char2buf(0x80, &mut buf);
+        assert_eq!(written, 4);
+        assert_eq!(&buf[..written], &[0xC2, k, ks, ke]);
+    }
+
+    // --- vim_strsave_escape_ks ---
+
+    #[test]
+    fn vim_strsave_escape_ks_plain_ascii_is_unchanged() {
+        assert_eq!(vim_strsave_escape_ks(b"abc"), b"abc".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escape_ks_copies_an_existing_escaped_sequence_unmodified() {
+        let (k, ks, ke) = ks();
+        let input = [k, ks, ke, b'a'];
+        assert_eq!(vim_strsave_escape_ks(&input), vec![k, ks, ke, b'a']);
+    }
+
+    #[test]
+    fn vim_strsave_escape_ks_encodes_a_lone_trailing_k_special_byte_via_roundtrip() {
+        // A trailing, ISOLATED 0x80 byte (fewer than 2 bytes follow,
+        // so the "already escaped" check fails) falls through to
+        // utf_ptr2char's own "illegal byte returns itself" fallback
+        // (128), which add_char2buf then re-encodes as valid UTF-8
+        // (U+0080 -> [0xC2, 0x80]) and escapes the resulting
+        // K_SPECIAL byte - matching the original's own real, if
+        // unusual, "be careful, it can be an illegal byte!" behavior.
+        let (k, ks, ke) = ks();
+        let input = [b'a', k];
+        assert_eq!(vim_strsave_escape_ks(&input), vec![b'a', 0xC2, k, ks, ke]);
+    }
+
+    #[test]
+    fn vim_strsave_escape_ks_truncates_at_the_first_embedded_nul() {
+        let input = *b"ab\0cd";
+        assert_eq!(vim_strsave_escape_ks(&input), b"ab".to_vec());
+    }
+
+    #[test]
+    fn vim_strsave_escape_ks_empty_input_returns_empty() {
+        assert_eq!(vim_strsave_escape_ks(b""), Vec::<u8>::new());
     }
 
     // --- KEY_NAMES_TABLE / find_special_key_in_table / get_special_key_code ---
