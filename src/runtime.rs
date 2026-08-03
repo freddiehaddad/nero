@@ -295,6 +295,22 @@ pub unsafe fn f_getstacktrace(
     unsafe { stacktrace_create(rettv) };
 }
 
+/// Whether there is a currently-active execution-stack frame to report
+/// source-location information about (`HAVE_SOURCING_INFO`, a macro
+/// in the original: `exestack.ga_data != NULL && exestack.ga_len > 0`).
+///
+/// Always `false` today, matching `EXESTACK`'s own doc comment (see
+/// above) - `message.rs`'s own `other_sourcing_name`/`get_emsg_source`
+/// are this accessor's own real, current callers.
+#[must_use]
+pub fn have_sourcing_info() -> bool {
+    // SAFETY: the `&Vec` this briefly, implicitly creates (to call
+    // `.is_empty()`) is used and discarded immediately, matching this
+    // module's own `stacktrace_create`'s identical `EXESTACK.as_ptr()`
+    // precedent.
+    !unsafe { (*EXESTACK.as_ptr()).is_empty() }
+}
+
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
 /// each test (in this module, or `eval::vars`'s own tests exercising
 /// [`new_script_item`]/`new_script_vars` together) starts from a clean

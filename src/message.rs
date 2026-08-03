@@ -6,9 +6,11 @@
 //! `msg_scroll_*`/`msg_ext_*`), none of which is translated.
 //!
 //! Translated: [`msg_id_exists`], [`msg_use_grid`], [`msg_do_throttle`],
-//! [`msg_scrollsize`], [`redirecting`] - small, pure predicates/
-//! computations needing only a couple of small pieces of genuinely-new
-//! state (see below), not the actual message pipeline.
+//! [`msg_scrollsize`], [`redirecting`], [`trunc_string`],
+//! [`msg_strtrunc`], `other_sourcing_name`, `get_emsg_source` -
+//! small, pure predicates/computations needing only a couple of small
+//! pieces of genuinely-new state (see below), not the actual message
+//! pipeline.
 //!
 //! `DEFAULT_GRID` is harvested here ahead of its real owning file,
 //! `grid.c` (not translated) - it is the original's own file-static
@@ -21,11 +23,28 @@
 //! (`keycodes_defs.rs`, ahead of `keycodes.c`) and `shape_table`
 //! (`cursor_shape.rs`, ahead of the rest of `cursor_shape.c`).
 //!
+//! `other_sourcing_name`/`get_emsg_source` both correctly, always
+//! take their own early-return path today
+//! (`crate::runtime::have_sourcing_info()` is always `false` -
+//! `runtime.rs`'s own `EXESTACK` is always empty, matching its own
+//! documented `AUTOCMDS`-style "genuinely, provably always-empty
+//! registry" precedent) - their own remaining bodies (needing
+//! `estack_sfile`-adjacent `SOURCING_NAME` access, not yet translated)
+//! are `unimplemented!()`, unreachable in practice today given the
+//! above. `get_emsg_lnum`/`msg_source` are NOT translated: unlike
+//! these two, both directly evaluate `SOURCING_NAME` WITHOUT first
+//! checking `HAVE_SOURCING_INFO` (relying on real neovim's own
+//! invariant that `exestack` is never actually empty in a live
+//! session, since something always pushes an initial frame at
+//! startup) - translating them here would mean indexing this crate's
+//! own always-empty `EXESTACK` directly, a genuine panic risk with no
+//! real guard, unlike every other "always-empty registry" case in
+//! this crate.
+//!
 //! Deferred: everything else - the entire `msg_puts`/`msg_grid_*`/
 //! `msg_scroll_*`/`msg_ext_*` output and routing pipeline,
 //! `message_filtered` (needs `vim_regexec`, the regex engine, not
-//! translated), `msg_strtrunc`/`trunc_string`/`other_sourcing_name`/
-//! `get_emsg_source`/`get_emsg_lnum` (candidates for a future commit),
+//! translated), `get_emsg_lnum`/`msg_source` (see above),
 //! `messaging`/`msg_use_printf` (need `char_avail`/`ui_active`,
 //! neither translated).
 
@@ -307,6 +326,59 @@ pub unsafe fn msg_strtrunc(s: &[u8], force: bool) -> Option<Vec<u8>> {
         len = (room + 2) * 18;
         // SAFETY: forwarded from this function's own safety doc.
         return Some(unsafe { trunc_string(s, room, len as usize) });
+    }
+    None
+}
+
+/// Whether the current execution stack's own source name differs from
+/// the last one displayed (`other_sourcing_name`).
+///
+/// Always `false` today - see this module's own doc comment.
+///
+/// `#[allow(dead_code)]`: no real translated caller yet (`get_emsg_lnum`/
+/// `msg_source`, neither translated - see this module's own doc
+/// comment) - tested directly, matching this crate's established
+/// convention for private helpers harvested ahead of their real
+/// caller.
+#[allow(dead_code)]
+#[must_use]
+fn other_sourcing_name() -> bool {
+    if crate::runtime::have_sourcing_info() {
+        // SOURCING_NAME != NULL && (compare against the last-displayed
+        // source name) - needs SOURCING_NAME access (estack_sfile-
+        // adjacent), not yet translated.
+        unimplemented!(
+            "message::other_sourcing_name: needs SOURCING_NAME access (estack_sfile-adjacent), \
+             not yet translated - unreachable in practice today since \
+             crate::runtime::have_sourcing_info() is always false, see this module's own doc \
+             comment"
+        );
+    }
+    false
+}
+
+/// Get the message about the source, as used for an error message
+/// (`get_emsg_source`). Returns `None` when no message is to be given.
+///
+/// Always `None` today - see this module's own doc comment.
+///
+/// `#[allow(dead_code)]`: no real translated caller yet (`msg_source`,
+/// not translated - see this module's own doc comment) - tested
+/// directly, matching this crate's established convention for private
+/// helpers harvested ahead of their real caller.
+#[allow(dead_code)]
+#[must_use]
+fn get_emsg_source() -> Option<Vec<u8>> {
+    if crate::runtime::have_sourcing_info() {
+        // SOURCING_NAME != NULL && other_sourcing_name() - needs
+        // SOURCING_NAME access (estack_sfile-adjacent), not yet
+        // translated.
+        unimplemented!(
+            "message::get_emsg_source: needs SOURCING_NAME access (estack_sfile-adjacent), not \
+             yet translated - unreachable in practice today since \
+             crate::runtime::have_sourcing_info() is always false, see this module's own doc \
+             comment"
+        );
     }
     None
 }
@@ -627,5 +699,24 @@ pub(crate) mod tests {
         let long_msg = vec![b'x'; 500];
         let result = unsafe { msg_strtrunc(&long_msg, true) };
         assert!(result.is_some());
+    }
+
+    // --- other_sourcing_name / get_emsg_source ---
+
+    #[test]
+    fn other_sourcing_name_is_false_when_there_is_no_sourcing_info() {
+        let _lock = crate::globals::global_state_test_lock();
+        // EXESTACK is always empty in this crate today, so
+        // have_sourcing_info() is always false - a real, always-taken
+        // early return, not a hardcoded stub.
+        assert!(!crate::runtime::have_sourcing_info());
+        assert!(!other_sourcing_name());
+    }
+
+    #[test]
+    fn get_emsg_source_is_none_when_there_is_no_sourcing_info() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!crate::runtime::have_sourcing_info());
+        assert_eq!(get_emsg_source(), None);
     }
 }
