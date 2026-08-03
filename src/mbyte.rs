@@ -118,6 +118,16 @@
 //! comment for why). This directly unblocks `bufwrite.c`'s
 //! `get_fio_flags`/`make_bom` as a follow-up, once `FIO_*`/
 //! `ucs2bytes` also exist.
+//!
+//! Also translated: [`utf_class_tab`]/[`utf_class`] (Unicode character
+//! classification via `UTF_CLASS_TABLE`, a 71-entry sorted-interval
+//! table mechanically extracted from the real source, plus the
+//! already-real `prop_is_emojilike`/`crate::charset::vim_iswordc_tab`
+//! for its own Latin1/emoji fast paths - mutually recursive with
+//! `vim_iswordc_tab`, see that function's own doc comment) and
+//! [`mb_get_class_tab`]/[`mb_get_class`] (their own real callers,
+//! placed here next to `utf_class_tab` rather than matching the
+//! original's own much-earlier declaration order, for readability).
 
 /// To speed up `BYTELEN()`; a lookup table to quickly get the length
 /// in bytes of a UTF-8 character from the first byte of a UTF-8
@@ -1053,6 +1063,194 @@ pub unsafe fn utf_char2cells(c: i32) -> i32 {
     }
 
     1
+}
+
+/// Sorted list of non-overlapping `(first, last, class)` intervals
+/// used by [`utf_class_tab`] to classify characters `>= 0x100`
+/// (`classes[]`, a `static struct clinterval[]` in the original).
+///
+/// Mechanically extracted from the real `mbyte.c` source via a
+/// throwaway PowerShell regex script (not hand-transcribed) - all 71
+/// entries, verified to match the original 1:1 in count and value.
+#[rustfmt::skip]
+const UTF_CLASS_TABLE: &[(u32, u32, u32)] = &[
+    (0x037e, 0x037e, 1),
+    (0x0387, 0x0387, 1),
+    (0x055a, 0x055f, 1),
+    (0x0589, 0x0589, 1),
+    (0x05be, 0x05be, 1),
+    (0x05c0, 0x05c0, 1),
+    (0x05c3, 0x05c3, 1),
+    (0x05f3, 0x05f4, 1),
+    (0x060c, 0x060c, 1),
+    (0x061b, 0x061b, 1),
+    (0x061f, 0x061f, 1),
+    (0x066a, 0x066d, 1),
+    (0x06d4, 0x06d4, 1),
+    (0x0700, 0x070d, 1),
+    (0x0964, 0x0965, 1),
+    (0x0970, 0x0970, 1),
+    (0x0df4, 0x0df4, 1),
+    (0x0e4f, 0x0e4f, 1),
+    (0x0e5a, 0x0e5b, 1),
+    (0x0f04, 0x0f12, 1),
+    (0x0f3a, 0x0f3d, 1),
+    (0x0f85, 0x0f85, 1),
+    (0x104a, 0x104f, 1),
+    (0x10fb, 0x10fb, 1),
+    (0x1361, 0x1368, 1),
+    (0x166d, 0x166e, 1),
+    (0x1680, 0x1680, 0),
+    (0x169b, 0x169c, 1),
+    (0x16eb, 0x16ed, 1),
+    (0x1735, 0x1736, 1),
+    (0x17d4, 0x17dc, 1),
+    (0x1800, 0x180a, 1),
+    (0x2000, 0x200b, 0),
+    (0x200c, 0x2027, 1),
+    (0x2028, 0x2029, 0),
+    (0x202a, 0x202e, 1),
+    (0x202f, 0x202f, 0),
+    (0x2030, 0x205e, 1),
+    (0x205f, 0x205f, 0),
+    (0x2060, 0x206f, 1),
+    (0x2070, 0x207f, 0x2070),
+    (0x2080, 0x2094, 0x2080),
+    (0x20a0, 0x27ff, 1),
+    (0x2800, 0x28ff, 0x2800),
+    (0x2900, 0x2998, 1),
+    (0x29d8, 0x29db, 1),
+    (0x29fc, 0x29fd, 1),
+    (0x2e00, 0x2e7f, 1),
+    (0x3000, 0x3000, 0),
+    (0x3001, 0x3020, 1),
+    (0x3030, 0x3030, 1),
+    (0x303d, 0x303d, 1),
+    (0x3040, 0x309f, 0x3040),
+    (0x30a0, 0x30ff, 0x30a0),
+    (0x3300, 0x9fff, 0x4e00),
+    (0xac00, 0xd7a3, 0xac00),
+    (0xf900, 0xfaff, 0x4e00),
+    (0xfd3e, 0xfd3f, 1),
+    (0xfe30, 0xfe6b, 1),
+    (0xff00, 0xff0f, 1),
+    (0xff1a, 0xff20, 1),
+    (0xff3b, 0xff40, 1),
+    (0xff5b, 0xff65, 1),
+    (0x1d000, 0x1d24f, 1),
+    (0x1d400, 0x1d7ff, 1),
+    (0x1f000, 0x1f2ff, 1),
+    (0x1f300, 0x1f9ff, 1),
+    (0x20000, 0x2a6df, 0x4e00),
+    (0x2a700, 0x2b73f, 0x4e00),
+    (0x2b740, 0x2b81f, 0x4e00),
+    (0x2f800, 0x2fa1f, 0x4e00),
+];
+
+/// Get class of a Unicode character `c` given an explicit `chartab`
+/// (`utf_class_tab`): `0` for white space, `1` for punctuation, `2` or
+/// bigger for some class of word character (bigger classes, e.g.
+/// Hiragana/Katakana/CJK/Hangul/braille/super-and-subscript, are
+/// distinguished from plain "class 2" so that adjacent runs of
+/// different exotic scripts don't get merged into a single "word" by
+/// the `w`/`b`/`e` word-motion commands).
+///
+/// For `c < 0x100`, uses `'iskeyword'`'s own default value the same
+/// way [`crate::charset::vim_iswordc_tab`] does (see that function's
+/// own doc comment for why this is a genuinely faithful, not merely
+/// approximate, translation in this crate today) - dispatched through
+/// `vim_iswordc_tab` itself since the two functions are mutually
+/// recursive in the original (this one delegates to it for `c <
+/// 0x100`; it delegates back here for `c >= 0x100`).
+#[must_use]
+pub fn utf_class_tab(c: i32, chartab: &[u64; 4]) -> i32 {
+    if c < 0x100 {
+        if c == i32::from(b' ') || c == i32::from(crate::ascii_defs::TAB) || c == 0 || c == 0xa0 {
+            return 0; // blank
+        }
+        if crate::charset::vim_iswordc_tab(c, chartab) {
+            return 2; // word character
+        }
+        return 1; // punctuation
+    }
+
+    // SAFETY: utf8proc_get_property never returns null (documented
+    // utf8proc contract - it always returns a valid "default entry"
+    // even for out-of-range/invalid codepoints).
+    let prop = unsafe { &*utf8proc_sys::utf8proc_get_property(c) };
+    // emoji
+    if prop_is_emojilike(prop) {
+        return 3;
+    }
+
+    // binary search in table
+    let c = c as u32;
+    let mut bot = 0i64;
+    let mut top = UTF_CLASS_TABLE.len() as i64 - 1;
+    while top >= bot {
+        let mid = ((bot + top) / 2) as usize;
+        let (first, last, cls) = UTF_CLASS_TABLE[mid];
+        if last < c {
+            bot = mid as i64 + 1;
+        } else if first > c {
+            top = mid as i64 - 1;
+        } else {
+            return cls as i32;
+        }
+    }
+
+    // most other characters are "word" characters
+    2
+}
+
+/// Get class of a Unicode character `c` in the current buffer
+/// (`utf_class`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn utf_class(c: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let chartab = unsafe { &(*crate::globals::GLOBALS.get_mut().curbuf).b_chartab };
+    utf_class_tab(c, chartab)
+}
+
+/// Get class of the character at pointer `p`, given an explicit
+/// `chartab` (`mb_get_class_tab`): `0` for blank or NUL, `1` for
+/// punctuation, `2` for an alphanumeric word character, `>2` for other
+/// word characters (including CJK and emoji) - placed here next to
+/// [`utf_class_tab`] (its own real dependency) rather than matching
+/// the original's own much-earlier declaration order in `mbyte.c`,
+/// for readability.
+#[must_use]
+pub fn mb_get_class_tab(p: &[u8], chartab: &[u64; 4]) -> i32 {
+    let Some(&b0) = p.first() else {
+        return 0;
+    };
+    if UTF8LEN_TAB[b0 as usize] == 1 {
+        if b0 == 0 || crate::ascii_defs::ascii_iswhite(i32::from(b0)) {
+            return 0;
+        }
+        if crate::charset::vim_iswordc_tab(i32::from(b0), chartab) {
+            return 2;
+        }
+        return 1;
+    }
+    utf_class_tab(utf_ptr2char(p), chartab)
+}
+
+/// Get class of the character at pointer `p` in the current buffer
+/// (`mb_get_class`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn mb_get_class(p: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let chartab = unsafe { &(*crate::globals::GLOBALS.get_mut().curbuf).b_chartab };
+    mb_get_class_tab(p, chartab)
 }
 
 /// Return the number of display cells the character at `p` occupies.
@@ -2483,6 +2681,117 @@ mod tests {
         let _guard = option_vars_test_lock();
         let cjk = "一".as_bytes(); // U+4E00
         assert_eq!(unsafe { utf_ptr2cells(cjk) }, unsafe { utf_char2cells(0x4e00) });
+    }
+
+    // --- utf_class_tab / utf_class / mb_get_class_tab / mb_get_class ---
+
+    #[test]
+    fn utf_class_tab_ascii_blank_punctuation_and_word() {
+        let chartab = [0u64; 4];
+        assert_eq!(utf_class_tab(i32::from(b' '), &chartab), 0);
+        assert_eq!(utf_class_tab(i32::from(crate::ascii_defs::TAB), &chartab), 0);
+        assert_eq!(utf_class_tab(0, &chartab), 0);
+        assert_eq!(utf_class_tab(0xa0, &chartab), 0); // nbsp
+        assert_eq!(utf_class_tab(i32::from(b'!'), &chartab), 1);
+        assert_eq!(utf_class_tab(i32::from(b'a'), &chartab), 2);
+    }
+
+    #[test]
+    fn utf_class_tab_table_lookups() {
+        let chartab = [0u64; 4];
+        // Exact single-value interval, class 1 (punctuation).
+        assert_eq!(utf_class_tab(0x0387, &chartab), 1);
+        // Blank interval.
+        assert_eq!(utf_class_tab(0x1680, &chartab), 0);
+        // Superscript interval, its own distinct class (0x2070).
+        assert_eq!(utf_class_tab(0x2070, &chartab), 0x2070);
+        // CJK interval, its own distinct class (0x4e00) - '中' itself.
+        assert_eq!(utf_class_tab(0x4e2d, &chartab), 0x4e00);
+        // Hangul interval, its own distinct class (0xac00).
+        assert_eq!(utf_class_tab(0xac00, &chartab), 0xac00);
+        // The table's own first entry (binary-search edge) and its own
+        // last entry, (0x2f800, 0x2fa1f, 0x4e00) - also CJK, not
+        // punctuation.
+        assert_eq!(utf_class_tab(0x037e, &chartab), 1);
+        assert_eq!(utf_class_tab(0x2fa1f, &chartab), 0x4e00);
+    }
+
+    #[test]
+    fn utf_class_tab_absent_from_table_defaults_to_word_character() {
+        let chartab = [0u64; 4];
+        // Cyrillic 'А' (U+0410) isn't in UTF_CLASS_TABLE at all, and
+        // isn't emoji-like - falls through to the default "most other
+        // characters are word characters" rule.
+        assert_eq!(utf_class_tab(0x0410, &chartab), 2);
+        // A codepoint immediately after a single-value interval
+        // (0x0387 + 1) that itself isn't in any interval.
+        assert_eq!(utf_class_tab(0x0388, &chartab), 2);
+    }
+
+    #[test]
+    fn utf_class_tab_emoji_beats_the_table_entry() {
+        let chartab = [0u64; 4];
+        // U+1F600 (😀) is within the table's own (0x1f300, 0x1f9ff, 1)
+        // interval, but prop_is_emojilike is checked FIRST - class 3
+        // wins over the table's own class 1.
+        assert_eq!(utf_class_tab(0x1f600, &chartab), 3);
+    }
+
+    /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
+    /// restoring the previous pointer on drop. Holds
+    /// `global_state_test_lock` for its entire lifetime, matching
+    /// `charset.rs`'s own identical `CurbufGuard` precedent.
+    struct CurbufGuard {
+        previous: *mut crate::buffer_defs::BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CurbufGuard {
+        fn set(new_curbuf: *mut crate::buffer_defs::BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = new_curbuf;
+            CurbufGuard { previous, _lock }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.previous;
+        }
+    }
+
+    #[test]
+    fn utf_class_uses_the_current_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { utf_class(i32::from(b'a')) }, 2);
+        assert_eq!(unsafe { utf_class(i32::from(b' ')) }, 0);
+    }
+
+    #[test]
+    fn mb_get_class_tab_blank_punctuation_and_word() {
+        let chartab = [0u64; 4];
+        assert_eq!(mb_get_class_tab(b"", &chartab), 0);
+        assert_eq!(mb_get_class_tab(b"\0", &chartab), 0);
+        assert_eq!(mb_get_class_tab(b" ", &chartab), 0);
+        assert_eq!(mb_get_class_tab(b"!", &chartab), 1);
+        assert_eq!(mb_get_class_tab(b"a", &chartab), 2);
+    }
+
+    #[test]
+    fn mb_get_class_tab_multibyte_delegates_to_utf_class_tab() {
+        let chartab = [0u64; 4];
+        assert_eq!(mb_get_class_tab("中".as_bytes(), &chartab), 0x4e00);
+    }
+
+    #[test]
+    fn mb_get_class_uses_the_current_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert_eq!(unsafe { mb_get_class(b"a") }, 2);
+        assert_eq!(unsafe { mb_get_class(b" ") }, 0);
+        assert_eq!(unsafe { mb_get_class("中".as_bytes()) }, 0x4e00);
     }
 
     #[test]

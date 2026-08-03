@@ -51,11 +51,17 @@
 //!   `crate::path::path_has_wildcard` too) are now translated alongside
 //!   it. [`getwhitecols_curline`] (a thin wrapper over [`getwhitecols`]
 //!   and `crate::cursor::get_cursor_line_ptr`) is translated too.
-//! - `vim_iswordc`/`vim_iswordp` families: still need the real
-//!   `g_chartab` (built by `buf_init_chartab` above) - these depend on
-//!   `'iskeyword'`, whose own default (or per-buffer/filetype
-//!   customization) this crate has not separately re-verified as
-//!   similarly shortcut-able yet.
+//! - `vim_iswordc`/`vim_iswordp` families ([`vim_iswordc_tab`]/
+//!   [`vim_iswordc_buf`]/[`vim_iswordc`]/[`vim_iswordp_buf`]/
+//!   [`vim_iswordp`]) are now ALSO translated: re-examination (this
+//!   pass) found `'iskeyword'`'s own default is the EXACT SAME string
+//!   as `'isident'`'s (directly verified against `options.lua`), so
+//!   this reuses `default_is_id_char` for `c < 0x100` outright;
+//!   characters `0x100` and above use the real
+//!   `crate::mbyte::utf_class_tab` (mutually
+//!   recursive with it, matching the original's own cross-file mutual
+//!   reference). The earlier note here was an honest "not yet
+//!   checked", not a false claim - this pass did the checking.
 //! - `transchar`/`transchar_buf`/`transchar_byte`/`transchar_byte_buf`/
 //!   `transchar_nonprint` are now translated too (this pass), returning
 //!   an owned `Vec<u8>` (including trailing NUL) instead of a pointer
@@ -670,6 +676,89 @@ fn default_is_id_char(c: u8) -> bool {
 #[must_use]
 pub fn vim_isidc(c: i32) -> bool {
     c > 0 && c < 0x100 && default_is_id_char(c as u8)
+}
+
+/// Check that `c` is a keyword character (`vim_iswordc_tab`): letters
+/// from `'iskeyword'`'s own DEFAULT (non-customized) value, digits,
+/// underscore, and above `0xFF`, any character in
+/// [`crate::mbyte::utf_class_tab`]'s own "word" classes (`>= 2`).
+///
+/// `'iskeyword'` defaults to the EXACT SAME string as `'isident'`
+/// (`"@,48-57,_,192-255"` on non-Windows / `"@,48-57,_,128-167,
+/// 224-235"` on Windows - both directly verified against
+/// `options.lua`), so this reuses `default_is_id_char` outright for
+/// `c < 0x100` rather than duplicating an identical rule - a real
+/// consequence of the shared default string, not a coincidence papered
+/// over. Unlike `vim_isIDc`, `'iskeyword'`'s own description also
+/// extends above `0xFF`: "check the 'word' character class (any
+/// character that is categorized as a letter, number or emoji
+/// according to the Unicode general category)" - exactly
+/// `utf_class_tab(c, chartab) >= 2`.
+///
+/// `chartab` is accepted for signature fidelity with the original
+/// (which takes a buffer-specific `b_chartab`, since `'iskeyword'` -
+/// unlike `'isident'`/`'isfname'` - is buffer-scoped) but not read
+/// directly in the `c < 0x100` branch: nothing in this crate can
+/// currently set `'iskeyword'` to anything other than its compiled-in
+/// default (`do_set`/`:set`/filetype-plugin-driven
+/// `did_set_iskeyword`/`:syn-iskeyword`, none translated), so every
+/// buffer this crate can currently construct always has exactly the
+/// default value - the default-rule shortcut is the exact answer, not
+/// an approximation, for every real buffer today (same reasoning
+/// already established for [`vim_isidc`]/`vim_isfilec`).
+///
+/// Mutually recursive with [`crate::mbyte::utf_class_tab`] (this
+/// function calls it for `c >= 0x100`; it calls this function back for
+/// `c < 0x100`) - safe in Rust with no forward-declaration needed,
+/// unlike the original's own C translation unit.
+#[must_use]
+pub fn vim_iswordc_tab(c: i32, chartab: &[u64; 4]) -> bool {
+    if c >= 0x100 {
+        crate::mbyte::utf_class_tab(c, chartab) >= 2
+    } else {
+        c > 0 && default_is_id_char(c as u8)
+    }
+}
+
+/// Check that `c` is a keyword character, using buffer `buf`'s own
+/// `'iskeyword'` (`vim_iswordc_buf`).
+#[must_use]
+pub fn vim_iswordc_buf(c: i32, buf: &crate::buffer_defs::BufT) -> bool {
+    vim_iswordc_tab(c, &buf.b_chartab)
+}
+
+/// Check that `c` is a keyword character, using the current buffer's
+/// own `'iskeyword'` (`vim_iswordc`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn vim_iswordc(c: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    vim_iswordc_buf(c, unsafe { &*crate::globals::GLOBALS.get_mut().curbuf })
+}
+
+/// Like [`vim_iswordc_buf`] but decodes the (possibly multi-byte)
+/// character at pointer `p` first (`vim_iswordp_buf`).
+#[must_use]
+pub fn vim_iswordp_buf(p: &[u8], buf: &crate::buffer_defs::BufT) -> bool {
+    let Some(&b0) = p.first() else {
+        return false;
+    };
+    let c = if crate::mbyte::UTF8LEN_TAB[b0 as usize] > 1 { crate::mbyte::utf_ptr2char(p) } else { i32::from(b0) };
+    vim_iswordc_buf(c, buf)
+}
+
+/// Like [`vim_iswordc`] but decodes the (possibly multi-byte)
+/// character at pointer `p` first (`vim_iswordp`).
+///
+/// # Safety
+/// Same as [`vim_iswordc`].
+#[must_use]
+pub unsafe fn vim_iswordp(p: &[u8]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    vim_iswordp_buf(p, unsafe { &*crate::globals::GLOBALS.get_mut().curbuf })
 }
 
 /// Whether byte `c` is a file-name character under `'isfname'`'s own
@@ -1645,6 +1734,70 @@ mod tests {
             assert!(vim_isidc(255)); // end of the Unix range
             assert!(!vim_isidc(191)); // just below the Unix range
         }
+    }
+
+    // --- vim_iswordc_tab / vim_iswordc_buf / vim_iswordc / vim_iswordp* ---
+
+    #[test]
+    fn vim_iswordc_tab_ascii_matches_default_iskeyword() {
+        let chartab = [0u64; 4];
+        assert!(vim_iswordc_tab(i32::from(b'a'), &chartab));
+        assert!(vim_iswordc_tab(i32::from(b'Z'), &chartab));
+        assert!(vim_iswordc_tab(i32::from(b'5'), &chartab));
+        assert!(vim_iswordc_tab(i32::from(b'_'), &chartab));
+        assert!(!vim_iswordc_tab(i32::from(b' '), &chartab));
+        assert!(!vim_iswordc_tab(i32::from(b'!'), &chartab));
+        assert!(!vim_iswordc_tab(0, &chartab));
+    }
+
+    #[test]
+    fn vim_iswordc_tab_above_0xff_delegates_to_utf_class_tab() {
+        let chartab = [0u64; 4];
+        // U+0387 (Greek ano teleia) is punctuation (class 1) per
+        // UTF_CLASS_TABLE - not a word character.
+        assert!(!vim_iswordc_tab(0x0387, &chartab));
+        // U+4E2D ('中', CJK) falls in the (0x3300, 0x9fff, 0x4e00)
+        // table entry - class 0x4e00 (19968) is >= 2, a word character.
+        assert!(vim_iswordc_tab(0x4e2d, &chartab));
+        // U+1680 (Ogham space mark) is blank (class 0) - not a word
+        // character.
+        assert!(!vim_iswordc_tab(0x1680, &chartab));
+        // A codepoint absent from the table entirely (and not emoji)
+        // falls through to the default "most other characters are
+        // word characters" rule (class 2).
+        assert!(vim_iswordc_tab(0x0410, &chartab)); // Cyrillic 'А'
+    }
+
+    #[test]
+    fn vim_iswordc_buf_uses_the_given_buffers_chartab() {
+        let buf = crate::buffer_defs::BufT::default();
+        assert!(vim_iswordc_buf(i32::from(b'a'), &buf));
+        assert!(!vim_iswordc_buf(i32::from(b' '), &buf));
+    }
+
+    #[test]
+    fn vim_iswordp_buf_decodes_a_multibyte_character_first() {
+        let buf = crate::buffer_defs::BufT::default();
+        assert!(vim_iswordp_buf("中".as_bytes(), &buf));
+        assert!(vim_iswordp_buf(b"a", &buf));
+        assert!(!vim_iswordp_buf(b" ", &buf));
+        assert!(!vim_iswordp_buf(b"", &buf));
+    }
+
+    #[test]
+    fn vim_iswordc_uses_the_current_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert!(unsafe { vim_iswordc(i32::from(b'a')) });
+        assert!(!unsafe { vim_iswordc(i32::from(b' ')) });
+    }
+
+    #[test]
+    fn vim_iswordp_uses_the_current_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut buf as *mut crate::buffer_defs::BufT);
+        assert!(unsafe { vim_iswordp(b"a") });
+        assert!(!unsafe { vim_iswordp(b" ") });
     }
 
     #[test]
