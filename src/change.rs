@@ -17,7 +17,13 @@
 //! `diff_update_line` (`diff.c`), and `buf_inc_changedtick` (the real
 //! `b:` dict watcher machinery, eval engine/phase 5).
 //!
-//! Translated here: `file_ff_differs` (needed by `undo.c`'s
+//! Translated here: `save_file_ff` (snapshots `'fileformat'`/
+//! `'fileencoding'`/`'endofline'`/`'bomb'` so a later `file_ff_differs`
+//! call can detect a change - always assigns a fresh `b_start_fenc`
+//! clone rather than replicating the original's own "only alloc when
+//! the value differs" `xfree`/`strcmp`/`xstrdup` micro-optimization,
+//! since Rust's `Option<Vec<u8>>` ownership makes the two observably
+//! identical), `file_ff_differs` (needed by `undo.c`'s
 //! `bufIsChanged`) and `change_warning` (needed a real `apply_autocmds`
 //! plus `autocmd_busy`, both now available). `change_warning`'s own
 //! real message display (`msg_start`/`msg_source`/`msg_puts_hl`/
@@ -70,6 +76,26 @@ use crate::ascii_defs::ascii_iswhite;
 use crate::buffer_defs::{b_flags, BufT};
 use crate::option::copy_option_part;
 use crate::strings::vim_strchr;
+
+/// Remember the current values of `'fileformat'`/`'fileencoding'`/
+/// `'endofline'`/`'bomb'`, so a later call to [`file_ff_differs`] can
+/// detect if they changed (`save_file_ff`).
+///
+/// Deviates from the original's own "only alloc when the value
+/// actually differs" `xfree`/`strcmp`/`xstrdup` dance for
+/// `b_start_fenc` by always assigning a fresh clone directly - Rust's
+/// own `Option<Vec<u8>>` ownership already makes this observably
+/// identical (no caller can detect whether the allocation was reused
+/// or fresh), matching this crate's established "idiomatic Rust
+/// supersedes a manual C micro-optimization" precedent.
+pub fn save_file_ff(buf: &mut BufT) {
+    buf.b_start_ffc =
+        i32::from(buf.b_p_ff.as_deref().and_then(<[u8]>::first).copied().unwrap_or(0));
+    buf.b_start_eof = buf.b_p_eof;
+    buf.b_start_eol = buf.b_p_eol;
+    buf.b_start_bomb = buf.b_p_bomb;
+    buf.b_start_fenc = buf.b_p_fenc.clone();
+}
 
 /// Return true if `'fileformat'` and/or `'fileencoding'` has a
 /// different value from when editing started (`save_file_ff()`
@@ -744,6 +770,76 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { file_ff_differs(&mut buf, false) });
+    }
+
+    #[test]
+    fn save_file_ff_snapshots_every_tracked_option() {
+        let mut buf = BufT {
+            b_p_ff: Some(b"dos".to_vec()),
+            b_p_eof: 1,
+            b_p_eol: 0,
+            b_p_bomb: 1,
+            b_p_fenc: Some(b"latin1".to_vec()),
+            ..Default::default()
+        };
+        save_file_ff(&mut buf);
+        assert_eq!(buf.b_start_ffc, i32::from(b'd'));
+        assert_eq!(buf.b_start_eof, 1);
+        assert_eq!(buf.b_start_eol, 0);
+        assert_eq!(buf.b_start_bomb, 1);
+        assert_eq!(buf.b_start_fenc, Some(b"latin1".to_vec()));
+    }
+
+    #[test]
+    fn save_file_ff_with_none_fileformat_and_fileencoding_defaults_to_zero_and_none() {
+        let mut buf = BufT {
+            b_p_ff: None,
+            b_p_fenc: None,
+            b_start_ffc: i32::from(b'x'),
+            b_start_fenc: Some(b"stale".to_vec()),
+            ..Default::default()
+        };
+        save_file_ff(&mut buf);
+        assert_eq!(buf.b_start_ffc, 0);
+        assert_eq!(buf.b_start_fenc, None);
+    }
+
+    #[test]
+    fn save_file_ff_then_file_ff_differs_reports_no_difference() {
+        let mut buf = BufT {
+            b_p_ff: Some(b"unix".to_vec()),
+            b_p_eof: 1,
+            b_p_eol: 0,
+            b_p_bomb: 0,
+            b_p_fenc: Some(b"utf-8".to_vec()),
+            ..Default::default()
+        };
+        save_file_ff(&mut buf);
+        assert!(!unsafe { file_ff_differs(&mut buf, false) });
+    }
+
+    #[test]
+    fn save_file_ff_then_file_ff_differs_reports_difference_after_fenc_change() {
+        let mut buf = BufT {
+            b_p_ff: Some(b"unix".to_vec()),
+            b_p_fenc: Some(b"utf-8".to_vec()),
+            ..Default::default()
+        };
+        save_file_ff(&mut buf);
+        // Simulate the user changing 'fileencoding' after editing
+        // started.
+        buf.b_p_fenc = Some(b"latin1".to_vec());
+        assert!(unsafe { file_ff_differs(&mut buf, false) });
+    }
+
+    #[test]
+    fn save_file_ff_then_file_ff_differs_reports_difference_after_fileformat_change() {
+        let mut buf = BufT { b_p_ff: Some(b"unix".to_vec()), ..Default::default() };
+        save_file_ff(&mut buf);
+        // Simulate the user changing 'fileformat' after editing
+        // started.
+        buf.b_p_ff = Some(b"dos".to_vec());
+        assert!(unsafe { file_ff_differs(&mut buf, false) });
     }
 
     /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
