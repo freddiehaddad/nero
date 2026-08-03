@@ -22,12 +22,20 @@
 //! not `command_complete[]`'s real, much smaller populated size) -
 //! re-verified directly against the real C source, not assumed.
 //!
+//! Also translated: [`uc_validate_name`] - a tiny, self-contained
+//! "does this look like a valid command name, and where does it end"
+//! scan, via already-real [`crate::ex_docmd::ends_excmd`] and
+//! [`crate::ascii_defs::ascii_iswhite`]/`crate::macros_defs::
+//! ascii_isalpha`/`crate::macros_defs::ascii_isalnum`.
+//!
 //! Deferred: everything else - `uc_add_command`/`ex_command`/
 //! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`/`uc_scan_attr`
 //! (the real user-command registry and its `:command`-parsing
 //! caller).
 
 use crate::ascii_defs::ascii_iswhite;
+use crate::ex_docmd::ends_excmd;
+use crate::macros_defs::{ascii_isalnum, ascii_isalpha};
 
 /// Splits a byte string by unescaped whitespace (space & tab), used for
 /// `<f-args>` on Lua command callbacks. Similar to the original's
@@ -344,6 +352,40 @@ pub fn parse_compl_arg(
     crate::vim_defs::OK
 }
 
+/// Return the byte offset within `name` right after a valid command
+/// name (an alphabetic character followed by zero or more alphanumeric
+/// characters), or `None` if `name` doesn't start with a valid command
+/// name (`uc_validate_name`).
+///
+/// Matches the original's own subtlety: if `name`'s first byte isn't
+/// alphabetic, NO characters are consumed at all (the alphanumeric-run
+/// scan is only entered when the very first byte is alphabetic) - so a
+/// `name` that immediately ends the command (e.g. is empty, or starts
+/// with whitespace/`|`/`"`) still succeeds with an offset of `0`, not a
+/// `None` failure. Running off the end of `name` during the
+/// alphanumeric scan is treated the same as hitting a real NUL
+/// terminator would in the original (matching [`ends_excmd`]'s own
+/// `c == 0` "ran off the end" convention).
+///
+/// No real caller is translated yet (`ex_command`, the `:command`
+/// command's own handler) - harvested ahead of it, matching this
+/// crate's established precedent for a small, self-contained function
+/// with no design freedom of its own.
+#[must_use]
+pub fn uc_validate_name(name: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    if name.first().is_some_and(|&c| ascii_isalpha(i32::from(c))) {
+        while name.get(i).is_some_and(|&c| ascii_isalnum(i32::from(c))) {
+            i += 1;
+        }
+    }
+    let c = name.get(i).copied().unwrap_or(0);
+    if !ends_excmd(c) && !ascii_iswhite(i32::from(c)) {
+        return None;
+    }
+    Some(i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +668,61 @@ mod tests {
         let mut compl_arg = None;
         let rc = parse_compl_arg(b"not-a-real-type", &mut complp, &mut argt, &mut compl_arg);
         assert_eq!(rc, crate::vim_defs::FAIL);
+    }
+
+    // --- uc_validate_name ---
+
+    #[test]
+    fn uc_validate_name_all_alnum_runs_to_the_end_of_the_slice() {
+        // "MyCmd" is entirely alphanumeric with nothing after it -
+        // running off the end is treated like a NUL terminator,
+        // which counts as ending the command.
+        assert_eq!(uc_validate_name(b"MyCmd"), Some(5));
+    }
+
+    #[test]
+    fn uc_validate_name_stops_at_whitespace() {
+        assert_eq!(uc_validate_name(b"MyCmd arg"), Some(5));
+    }
+
+    #[test]
+    fn uc_validate_name_stops_at_a_pipe() {
+        assert_eq!(uc_validate_name(b"MyCmd|"), Some(5));
+    }
+
+    #[test]
+    fn uc_validate_name_stops_at_a_comment_quote() {
+        assert_eq!(uc_validate_name(b"MyCmd\"comment"), Some(5));
+    }
+
+    #[test]
+    fn uc_validate_name_rejects_a_non_name_character_right_after_the_alnum_run() {
+        // "-" is neither alphanumeric (so it stops the scan) nor an
+        // end-of-command/whitespace character - real command names
+        // can't contain it.
+        assert_eq!(uc_validate_name(b"My-Cmd"), None);
+    }
+
+    #[test]
+    fn uc_validate_name_empty_slice_succeeds_with_offset_zero() {
+        // No characters at all to scan; running straight off the end
+        // is itself an "ends the command" position.
+        assert_eq!(uc_validate_name(b""), Some(0));
+    }
+
+    #[test]
+    fn uc_validate_name_leading_whitespace_succeeds_with_offset_zero() {
+        // The first byte isn't alphabetic, so no scan is entered at
+        // all - the check falls straight through to "is position 0
+        // itself an end/whitespace byte", which it is here.
+        assert_eq!(uc_validate_name(b" foo"), Some(0));
+    }
+
+    #[test]
+    fn uc_validate_name_rejects_a_name_starting_with_a_digit() {
+        // The first byte isn't alphabetic (a digit doesn't count), so
+        // no scan is entered - position 0 itself ('1') is neither an
+        // end-of-command nor whitespace byte, so this fails.
+        assert_eq!(uc_validate_name(b"123abc"), None);
     }
 }
