@@ -52,6 +52,13 @@
 //! crate's established precedent (e.g. `ops.rs`'s `clear_oparg`/
 //! `reset_lbr`/`restore_lbr`).
 //!
+//! Also translated: [`get_map_mode`] - the exact inverse of
+//! [`map_mode_to_chars`], decoding a `:map`-family command name's own
+//! leading mode-character(s) back into mode bits. Also has no real
+//! translated caller yet (every real caller is one of `mapping.c`'s
+//! own not-yet-translated command handlers) - harvested ahead of them
+//! for the same reason as `map_mode_to_chars`.
+//!
 //! Deferred: everything else - the whole `:map`/`:unmap`/`:abbreviate`
 //! command family and mapping-table storage/lookup (needs
 //! `MapblockT`'s real fields), `ExpandMappings` (needs the regex
@@ -153,6 +160,63 @@ pub fn map_mode_to_chars(m: i32) -> Vec<u8> {
     }
 
     buf
+}
+
+/// Determine the mapping mode bits from a `:map`-family command
+/// name's own leading mode-character(s) (`get_map_mode`). Returns
+/// `(mode_bits, bytes_consumed)` in place of the original's own
+/// `char **cmdp` advancing-pointer out-parameter, matching this
+/// crate's established C-out-parameter-to-owned-return convention.
+///
+/// `bytes_consumed` is `1` when a recognized single-letter mode prefix
+/// (`i`/`l`/`c`/`n`/`v`/`x`/`s`/`o`/`t`) was found, or `0` when none
+/// was (the "plain `:map`" default case) - matching the original's own
+/// `p++`-then-conditional-`p--` structure exactly. The `'n'` check
+/// specifically also looks at the SECOND byte (`cmd[1]`) to avoid
+/// misreading a raw, un-prefix-stripped `"noremap"` command name as
+/// the `:nmap`-specific prefix (real neovim's own `// avoid :noremap`
+/// comment) - only `'n'` NOT immediately followed by `'o'` counts as
+/// the `:nmap` prefix.
+///
+/// This is the exact inverse of [`map_mode_to_chars`] (which encodes
+/// mode bits back INTO a prefix string) - see that function's own doc
+/// comment for the full mode-bit vocabulary.
+///
+/// No real caller is translated yet (`do_mapclear`/`do_map`/`showmap`/
+/// `ex_map_check_prefix`, none of `mapping.c`'s own command handlers),
+/// so this is harvested ahead of them, matching this crate's
+/// established precedent for a small, self-contained function with no
+/// design freedom of its own.
+#[must_use]
+#[allow(dead_code)] // no real translated caller yet - see this function's own doc comment
+pub fn get_map_mode(cmd: &[u8], forceit: bool) -> (i32, usize) {
+    let modec = cmd.first().copied().unwrap_or(0);
+    if modec == b'i' {
+        (mode::INSERT as i32, 1) // :imap
+    } else if modec == b'l' {
+        (mode::LANGMAP as i32, 1) // :lmap
+    } else if modec == b'c' {
+        (mode::CMDLINE as i32, 1) // :cmap
+    } else if modec == b'n' && cmd.get(1).copied() != Some(b'o') {
+        (mode::NORMAL as i32, 1) // :nmap (but not :noremap)
+    } else if modec == b'v' {
+        (mode::VISUAL as i32 | mode::SELECT as i32, 1) // :vmap
+    } else if modec == b'x' {
+        (mode::VISUAL as i32, 1) // :xmap
+    } else if modec == b's' {
+        (mode::SELECT as i32, 1) // :smap
+    } else if modec == b'o' {
+        (mode::OP_PENDING as i32, 1) // :omap
+    } else if modec == b't' {
+        (mode::TERMINAL as i32, 1) // :tmap
+    } else if forceit {
+        (mode::INSERT as i32 | mode::CMDLINE as i32, 0) // :map !
+    } else {
+        (
+            mode::VISUAL as i32 | mode::SELECT as i32 | mode::NORMAL as i32 | mode::OP_PENDING as i32,
+            0,
+        ) // :map
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +385,114 @@ mod tests {
     #[test]
     fn map_mode_to_chars_zero_is_empty() {
         assert_eq!(map_mode_to_chars(0), b"");
+    }
+
+    // --- get_map_mode (pure, no shared state) ---
+
+    #[test]
+    fn get_map_mode_insert() {
+        assert_eq!(get_map_mode(b"imap", false), (mode::INSERT as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_langmap() {
+        assert_eq!(get_map_mode(b"lmap", false), (mode::LANGMAP as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_cmdline() {
+        assert_eq!(get_map_mode(b"cmap", false), (mode::CMDLINE as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_normal() {
+        assert_eq!(get_map_mode(b"nmap", false), (mode::NORMAL as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_noremap_is_not_normal_specific() {
+        // "noremap" starts with 'n' followed by 'o' - this must NOT be
+        // read as the :nmap prefix (real neovim's own "avoid :noremap"
+        // comment); it falls through to the plain ":map" default.
+        assert_eq!(
+            get_map_mode(b"noremap", false),
+            (mode::VISUAL as i32 | mode::SELECT as i32 | mode::NORMAL as i32 | mode::OP_PENDING as i32, 0)
+        );
+    }
+
+    #[test]
+    fn get_map_mode_visual_and_select() {
+        assert_eq!(get_map_mode(b"vmap", false), (mode::VISUAL as i32 | mode::SELECT as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_visual_only() {
+        assert_eq!(get_map_mode(b"xmap", false), (mode::VISUAL as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_select() {
+        assert_eq!(get_map_mode(b"smap", false), (mode::SELECT as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_op_pending() {
+        assert_eq!(get_map_mode(b"omap", false), (mode::OP_PENDING as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_terminal() {
+        assert_eq!(get_map_mode(b"tmap", false), (mode::TERMINAL as i32, 1));
+    }
+
+    #[test]
+    fn get_map_mode_plain_map_without_forceit() {
+        assert_eq!(
+            get_map_mode(b"map", false),
+            (mode::VISUAL as i32 | mode::SELECT as i32 | mode::NORMAL as i32 | mode::OP_PENDING as i32, 0)
+        );
+    }
+
+    #[test]
+    fn get_map_mode_plain_map_with_forceit() {
+        // ":map!" - forceit is set by the caller (having already
+        // recognized the trailing "!"), not derived from `cmd` itself.
+        assert_eq!(get_map_mode(b"map", true), (mode::INSERT as i32 | mode::CMDLINE as i32, 0));
+    }
+
+    #[test]
+    fn get_map_mode_empty_slice_behaves_like_an_unrecognized_prefix() {
+        assert_eq!(
+            get_map_mode(b"", false),
+            (mode::VISUAL as i32 | mode::SELECT as i32 | mode::NORMAL as i32 | mode::OP_PENDING as i32, 0)
+        );
+        assert_eq!(get_map_mode(b"", true), (mode::INSERT as i32 | mode::CMDLINE as i32, 0));
+    }
+
+    #[test]
+    fn get_map_mode_round_trips_through_map_mode_to_chars() {
+        // get_map_mode is the exact inverse of map_mode_to_chars -
+        // verify a representative sample encodes to a prefix that,
+        // reparsed (with a trailing "map" appended, mimicking a real
+        // command name), recovers the SAME mode bits.
+        for (name, expected_mode) in [
+            (&b"imap"[..], mode::INSERT as i32),
+            (b"lmap", mode::LANGMAP as i32),
+            (b"cmap", mode::CMDLINE as i32),
+            (b"nmap", mode::NORMAL as i32),
+            (b"vmap", mode::VISUAL as i32 | mode::SELECT as i32),
+            (b"xmap", mode::VISUAL as i32),
+            (b"smap", mode::SELECT as i32),
+            (b"omap", mode::OP_PENDING as i32),
+            (b"tmap", mode::TERMINAL as i32),
+        ] {
+            let (decoded_mode, _consumed) = get_map_mode(name, false);
+            assert_eq!(decoded_mode, expected_mode, "get_map_mode({name:?})");
+            let mut encoded = map_mode_to_chars(decoded_mode);
+            encoded.extend_from_slice(b"map");
+            let (re_decoded_mode, _) = get_map_mode(&encoded, false);
+            assert_eq!(re_decoded_mode, expected_mode, "round trip for {name:?} via {encoded:?}");
+        }
     }
 }
 
