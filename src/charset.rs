@@ -908,6 +908,23 @@ pub fn transchar_hex(c: i32) -> Vec<u8> {
     buf
 }
 
+/// Mirror (reverse in place) text for right-left ("'rightleft'")
+/// displaying - only works for single-byte characters, e.g. numbers
+/// (`rl_mirror_ascii`, `drawline.c`'s own real caller - the screen-
+/// rendering pipeline - is not yet translated; harvested ahead of it,
+/// matching this crate's established precedent for a small,
+/// self-contained function with no design freedom of its own).
+///
+/// `end` is the original's own optional explicit end pointer (e.g.
+/// from `skiptowhite`) as a byte offset into `buf`; `None` reverses
+/// the whole NUL-terminated string, matching this crate's established
+/// "embedded NUL ends a C-string-modeled scan" idiom (stopping at the
+/// first embedded NUL, or the buffer's own length if none).
+pub fn rl_mirror_ascii(buf: &mut [u8], end: Option<usize>) {
+    let end = end.unwrap_or_else(|| buf.iter().position(|&b| b == 0).unwrap_or(buf.len()));
+    buf[..end].reverse();
+}
+
 /// Convert a non-printable character to 2-4 printable ones
 /// (`transchar_nonprint`). Doesn't work for multi-byte characters -
 /// `c` must be `<= 0xFF`.
@@ -1906,6 +1923,36 @@ mod tests {
     #[test]
     fn transchar_hex_zero_is_two_digits() {
         assert_eq!(transchar_hex(0), b"<00>\0");
+    }
+
+    #[test]
+    fn rl_mirror_ascii_reverses_a_whole_nul_terminated_string() {
+        let mut buf = b"<12>\0\0\0".to_vec();
+        rl_mirror_ascii(&mut buf, None);
+        assert_eq!(&buf[..4], b">21<");
+    }
+
+    #[test]
+    fn rl_mirror_ascii_reverses_only_up_to_an_explicit_end_offset() {
+        // Mirrors skiptowhite(num)'s own real call shape: reverse just
+        // the digit run, leaving whatever follows untouched.
+        let mut buf = b"123 rest".to_vec();
+        rl_mirror_ascii(&mut buf, Some(3));
+        assert_eq!(&buf, b"321 rest");
+    }
+
+    #[test]
+    fn rl_mirror_ascii_no_nul_reverses_the_whole_buffer() {
+        let mut buf = b"abcd".to_vec();
+        rl_mirror_ascii(&mut buf, None);
+        assert_eq!(&buf, b"dcba");
+    }
+
+    #[test]
+    fn rl_mirror_ascii_empty_range_is_a_no_op() {
+        let mut buf = b"\0abc".to_vec();
+        rl_mirror_ascii(&mut buf, None);
+        assert_eq!(&buf, b"\0abc");
     }
 
     #[test]
