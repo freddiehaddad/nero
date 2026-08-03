@@ -2,20 +2,11 @@
 //!
 //! `change.c` (~2200 lines) is the buffer-modification/change-tracking
 //! core (`changed`/`changed_bytes`/`changed_lines`, insert-mode byte
-//! insertion, indent-preservation helpers, etc.). Re-examined after
-//! `memline.c`'s write side (`ml_replace`/`ml_append`/`ml_delete`) and
-//! `autocmd.c`'s `apply_autocmds` (real, faithful "no autocmds
-//! registered" bypass path) were both completed - `change_warning` is
-//! now tractable too, since `autocmd_busy` is a real, always-`false`
-//! global (see `crate::autocmd::AUTOCMD_BUSY`'s own doc comment) and
-//! `apply_autocmds` itself is real. `changed`/`changed_internal`/
-//! `changed_common`/`changed_lines_invalidate_win` (etc.) still need a
-//! wide spread of OTHER not-yet-translated subsystems though:
-//! `ml_open_file` (swap-file creation), window/fold display
-//! bookkeeping (`redraw_buf_status_later`, `find_wl_entry`,
-//! `invalidate_botline_win`, `buf_meta_total`), `diff_internal`/
-//! `diff_update_line` (`diff.c`), and `buf_inc_changedtick` (the real
-//! `b:` dict watcher machinery, eval engine/phase 5).
+//! insertion, indent-preservation helpers, etc.). `changed_common`/
+//! `changed_lines_invalidate_win`/`changed_lines`/`changed_bytes` (etc.)
+//! still need a wide spread of OTHER not-yet-translated subsystems:
+//! window/fold display bookkeeping (`find_wl_entry`,
+//! `invalidate_botline_win`, `buf_meta_total`), and more.
 //!
 //! Translated here: `save_file_ff` (snapshots `'fileformat'`/
 //! `'fileencoding'`/`'endofline'`/`'bomb'` so a later `file_ff_differs`
@@ -67,26 +58,78 @@
 //! infrastructure. This directly unblocks `ops.c`'s own `skip_comment`
 //! (see `ops.rs`).
 //!
+//! Also translated: [`changed`] itself - re-examined and found
+//! tractable now that `changed_internal`/`buf_inc_changedtick` are
+//! both real: its own real "create a swap file" branch is gated behind
+//! `BufT.b_may_swap`, which `ml_open` only ever sets `true` when
+//! `OPTION_VARS.p_uc != 0` - always `false` today, since nothing
+//! bootstraps real option defaults for `'updatecount'` yet (matching
+//! this crate's own established "`OPTION_VARS` defaults to raw C
+//! zero-init, not the real post-startup value" convention) - the real,
+//! always-false-today check is kept (not hardcoded away), with its own
+//! body `unimplemented!()`ing if ever genuinely reached (needing
+//! `ml_open_file`, real swap-file creation, plus the message-display
+//! pipeline).
+//!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display
-//! pipeline, the fold/diff subsystems, the eval engine's `b:` dict
-//! watchers, etc. - see above).
+//! pipeline, the fold/diff subsystems, etc. - see above).
 
 use crate::ascii_defs::ascii_iswhite;
 use crate::buffer_defs::{b_flags, BufT};
 use crate::option::copy_option_part;
 use crate::strings::vim_strchr;
 
+/// Call this function when something in a buffer is changed (`changed`).
+/// Most often called through `changed_bytes()`/`changed_lines()` (both
+/// still deferred - they also mark the display area to redraw), which
+/// also mark the area of the display to be redrawn.
+///
+/// Careful: may trigger autocommands that reload the buffer (via
+/// [`change_warning`]).
+///
+/// # Safety
+/// Same as [`change_warning`]/[`changed_internal`].
+pub unsafe fn changed(buf: *mut BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*buf).b_changed } == 0 {
+        // Give a warning about changing a read-only file. This may
+        // also check-out the file, thus change "curbuf"!
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { change_warning(buf, 0) };
+
+        // Create a swap file if that is wanted (not for "nofile"/
+        // "nowrite" buffer types). `buf.b_may_swap` is always false
+        // today - nothing bootstraps real option defaults for
+        // `'updatecount'`/`'swapfile'` yet (matching this crate's own
+        // established "`OPTION_VARS` defaults to raw C zero-init, not
+        // the real post-startup value" convention - see `ml_open`'s
+        // own `b_may_swap` assignment, which needs `p_uc != 0`).
+        // This real, always-false-today check is kept (not hardcoded
+        // away): its own body `unimplemented!()`s if ever genuinely
+        // reached, needing `ml_open_file` (real swap-file creation)
+        // plus the message-display pipeline, neither translated.
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*buf).b_may_swap } && !crate::buffer::bt_dontwrite(unsafe { Some(&*buf) }) {
+            unimplemented!(
+                "change::changed: creating a swap file needs ml_open_file \
+                 (real file I/O) plus the message-display pipeline, neither \
+                 translated - unreachable today since BufT.b_may_swap is \
+                 always false, see this function's own doc comment"
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { changed_internal(buf) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::buffer::buf_inc_changedtick(&mut *buf) };
+
+    // If a pattern is highlighted, the position may now be invalid.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Search.hl_match = false;
+}
+
 /// Internal part of `changed()`, no user interaction (`changed_internal`).
 /// Also used for recovery.
-///
-/// Every dependency this function needs (`ml_setflags`,
-/// `redraw_buf_status_later`, `GLOBALS.redraw_tabline`/
-/// `need_maketitle`, `aucmd_defer_modified` - always a no-op today,
-/// see its own doc comment) is now real, unlike its own caller
-/// `changed()` (still needs `ml_open_file`/the message-display
-/// pipeline for its OWN body, so `changed()` itself remains deferred -
-/// see this module's own doc comment).
 ///
 /// # Safety
 /// `buf` must be a valid, non-null pointer to a live `BufT`.
@@ -1166,7 +1209,70 @@ mod tests {
         );
     }
 
-    // ---- get_leader_len ----
+    // ---- changed ----
+
+    #[test]
+    fn changed_marks_the_buffer_as_changed_and_increments_changedtick() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let _guard = CurbufGuard::set(buf_ptr);
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { changed(buf_ptr) };
+
+        assert_eq!(buf.b_changed, 1);
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
+    }
+
+    #[test]
+    fn changed_still_increments_changedtick_when_already_changed() {
+        // buf_inc_changedtick() runs unconditionally, outside the
+        // `if !b_changed` block - a second `changed()` call still
+        // bumps the tick even though change_warning/changed_internal
+        // are both skipped.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 1, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let _guard = CurbufGuard::set(buf_ptr);
+        let before_tick = buf_get_changedtick(&buf);
+
+        unsafe { changed(buf_ptr) };
+
+        assert_eq!(buf.b_changed, 1);
+        assert_eq!(buf_get_changedtick(&buf), before_tick + 1);
+    }
+
+    #[test]
+    fn changed_resets_search_hl_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let _guard = CurbufGuard::set(buf_ptr);
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.hl_match = true;
+
+        unsafe { changed(buf_ptr) };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Search.hl_match);
+    }
+
+    #[test]
+    #[should_panic(expected = "change::changed: creating a swap file needs ml_open_file")]
+    fn changed_panics_if_b_may_swap_is_ever_genuinely_true() {
+        // Not achievable via any real translated function yet (nothing
+        // can set OPTION_VARS.p_uc != 0 / BufT.b_may_swap true) - pokes
+        // it directly to prove the real, always-false-today check is
+        // faithfully translated, independent of how b_may_swap
+        // eventually gets set for real.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_changed: 0, b_may_swap: true, ..Default::default() };
+        let buf_ptr = &mut buf as *mut BufT;
+        let _guard = CurbufGuard::set(buf_ptr);
+
+        unsafe { changed(buf_ptr) };
+    }
+
+
 
     fn buf_with_com(com: &[u8]) -> BufT {
         BufT { b_p_com: Some(com.to_vec()), ..Default::default() }
