@@ -43,6 +43,14 @@
 //! `in_cinkeys` (real `'cinkeys'`/`'cinwords'` matching, not just a
 //! fixed-default-rule shortcut).
 //!
+//! Also translated: `briopt_check` - parses `'breakindentopt'`'s value
+//! (`shift:`/`min:`/`sbr`/`list:`/`column:`, comma-separated) into a
+//! window's own `w_briopt_*` fields, needed only the already-real
+//! `charset.rs`'s `getdigits`/`getdigits_int`. No real caller is
+//! translated yet (`did_set_breakindentopt`, the option's own
+//! callback) - harvested ahead of it, matching this crate's
+//! established precedent for a small, self-contained function.
+//!
 //! `tabstop_padding`'s `vts` parameter deviates from the original's raw
 //! `colnr_T *vts` (a C array whose own `vts[0]` holds the element
 //! count, `vts[1..=count]` the actual tab-stop widths - a classic C
@@ -517,6 +525,105 @@ pub unsafe fn may_do_si() -> bool {
         && curbuf.b_p_inde.as_deref().is_none_or(<[u8]>::is_empty)
         // SAFETY: forwarded from this function's own safety doc.
         && unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste == 0
+}
+
+/// Parse `'breakindentopt'`'s value (`shift:`/`min:`/`sbr`/`list:`/
+/// `column:`, comma-separated) into `wp`'s own `w_briopt_*` fields
+/// (`briopt_check`).
+///
+/// `briopt`, when `Some`, overrides reading `wp`'s own
+/// `w_onebuf_opt.wo_briopt` value directly - matching the original's
+/// own "use `briopt` if given, else fall back to `wp->w_p_briopt`,
+/// else the empty string" 3-way fallback (used by
+/// `did_set_breakindentopt`, not translated, to validate a CANDIDATE
+/// value before it is actually stored).
+///
+/// Returns `false` if the value contains an unrecognized entry (a
+/// real parse failure) - `wp`'s own fields are only updated on
+/// success, and only when `wp` is `Some`.
+///
+/// No real caller is translated yet (`did_set_breakindentopt`, the
+/// `'breakindentopt'` option's own callback, not translated) -
+/// harvested ahead of it, matching this crate's established
+/// precedent for a small, self-contained function with no design
+/// freedom of its own.
+#[must_use]
+pub fn briopt_check(briopt: Option<&[u8]>, wp: Option<&mut WinT>) -> bool {
+    let mut bri_shift = 0i32;
+    let mut bri_min = 20i32;
+    let mut bri_sbr = false;
+    let mut bri_list = 0i32;
+    let mut bri_vcol = 0i32;
+
+    let owned;
+    let p: &[u8] = match briopt {
+        Some(b) => b,
+        None => match wp.as_deref() {
+            Some(w) => {
+                owned = w.w_onebuf_opt.wo_briopt.clone().unwrap_or_default();
+                &owned
+            }
+            None => crate::option_vars::EMPTY_STRING_OPTION,
+        },
+    };
+
+    let mut pos = 0usize;
+    loop {
+        if p.get(pos).copied().unwrap_or(0) == 0 {
+            break;
+        }
+        let rest = &p[pos..];
+        if rest.starts_with(b"shift:")
+            && ((rest.get(6).copied() == Some(b'-')
+                && rest.get(7).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))))
+                || rest.get(6).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))))
+        {
+            pos += 6;
+            let (value, consumed) = crate::charset::getdigits_int(&p[pos..], true, 0);
+            bri_shift = value;
+            pos += consumed;
+        } else if rest.starts_with(b"min:")
+            && rest.get(4).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c)))
+        {
+            pos += 4;
+            let (value, consumed) = crate::charset::getdigits_int(&p[pos..], true, 0);
+            bri_min = value;
+            pos += consumed;
+        } else if rest.starts_with(b"sbr") {
+            pos += 3;
+            bri_sbr = true;
+        } else if rest.starts_with(b"list:") {
+            pos += 5;
+            let (value, consumed) = crate::charset::getdigits(&p[pos..], false, 0);
+            bri_list = value as i32;
+            pos += consumed;
+        } else if rest.starts_with(b"column:") {
+            pos += 7;
+            let (value, consumed) = crate::charset::getdigits(&p[pos..], false, 0);
+            bri_vcol = value as i32;
+            pos += consumed;
+        }
+
+        let c = p.get(pos).copied().unwrap_or(0);
+        if c != b',' && c != 0 {
+            return false;
+        }
+        if c == b',' {
+            pos += 1;
+        }
+    }
+
+    let Some(wp) = wp else {
+        return true;
+    };
+
+    wp.w_briopt_shift = bri_shift;
+    wp.w_briopt_min = bri_min;
+    wp.w_briopt_sbr = bri_sbr;
+    wp.w_briopt_list = bri_list;
+    wp.w_briopt_vcol = bri_vcol;
+
+    true
 }
 
 /// Compute the size of the indent (in window cells) in `ptr`, without
@@ -1678,6 +1785,110 @@ mod tests {
         let result = unsafe { may_do_si() };
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_paste = 0;
         assert!(!result);
+    }
+
+    // --- briopt_check ---
+
+    #[test]
+    fn briopt_check_empty_string_succeeds_with_defaults() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b""), Some(&mut win)));
+        assert_eq!(win.w_briopt_shift, 0);
+        assert_eq!(win.w_briopt_min, 20);
+        assert!(!win.w_briopt_sbr);
+        assert_eq!(win.w_briopt_list, 0);
+        assert_eq!(win.w_briopt_vcol, 0);
+    }
+
+    #[test]
+    fn briopt_check_shift_positive() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"shift:5"), Some(&mut win)));
+        assert_eq!(win.w_briopt_shift, 5);
+    }
+
+    #[test]
+    fn briopt_check_shift_negative() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"shift:-3"), Some(&mut win)));
+        assert_eq!(win.w_briopt_shift, -3);
+    }
+
+    #[test]
+    fn briopt_check_min() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"min:10"), Some(&mut win)));
+        assert_eq!(win.w_briopt_min, 10);
+    }
+
+    #[test]
+    fn briopt_check_sbr() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"sbr"), Some(&mut win)));
+        assert!(win.w_briopt_sbr);
+    }
+
+    #[test]
+    fn briopt_check_list() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"list:2"), Some(&mut win)));
+        assert_eq!(win.w_briopt_list, 2);
+    }
+
+    #[test]
+    fn briopt_check_column() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"column:15"), Some(&mut win)));
+        assert_eq!(win.w_briopt_vcol, 15);
+    }
+
+    #[test]
+    fn briopt_check_multiple_comma_separated_entries() {
+        let mut win = WinT::default();
+        assert!(briopt_check(Some(b"shift:5,min:10,sbr"), Some(&mut win)));
+        assert_eq!(win.w_briopt_shift, 5);
+        assert_eq!(win.w_briopt_min, 10);
+        assert!(win.w_briopt_sbr);
+        // Unset entries keep their own defaults.
+        assert_eq!(win.w_briopt_list, 0);
+        assert_eq!(win.w_briopt_vcol, 0);
+    }
+
+    #[test]
+    fn briopt_check_unrecognized_entry_fails_and_does_not_touch_wp() {
+        let mut win = WinT { w_briopt_shift: 99, ..Default::default() };
+        assert!(!briopt_check(Some(b"bogus"), Some(&mut win)));
+        // A failed parse never writes anything back into wp.
+        assert_eq!(win.w_briopt_shift, 99);
+    }
+
+    #[test]
+    fn briopt_check_shift_prefix_without_a_valid_digit_is_unrecognized() {
+        // "shift:x" textually starts with the "shift:" keyword, but
+        // the original's own guard requires a real digit (or "-"
+        // followed by a digit) right after it - "x" doesn't qualify,
+        // so the whole entry is treated as wholly unrecognized (not
+        // partially consumed).
+        let mut win = WinT::default();
+        assert!(!briopt_check(Some(b"shift:x"), Some(&mut win)));
+    }
+
+    #[test]
+    fn briopt_check_wp_none_only_validates_without_needing_a_window() {
+        assert!(briopt_check(Some(b"shift:5,sbr"), None));
+        assert!(!briopt_check(Some(b"bogus"), None));
+    }
+
+    #[test]
+    fn briopt_check_falls_back_to_wp_own_option_value_when_briopt_is_none() {
+        let mut win = WinT { w_onebuf_opt: crate::buffer_defs::WinoptT { wo_briopt: Some(b"shift:7".to_vec()), ..Default::default() }, ..Default::default() };
+        assert!(briopt_check(None, Some(&mut win)));
+        assert_eq!(win.w_briopt_shift, 7);
+    }
+
+    #[test]
+    fn briopt_check_no_briopt_and_no_wp_uses_the_empty_string() {
+        assert!(briopt_check(None, None));
     }
 
     #[test]
