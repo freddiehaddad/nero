@@ -7,10 +7,10 @@
 //!
 //! Translated: [`msg_id_exists`], [`msg_use_grid`], [`msg_do_throttle`],
 //! [`msg_scrollsize`], [`redirecting`], [`trunc_string`],
-//! [`msg_strtrunc`], `other_sourcing_name`, `get_emsg_source` -
-//! small, pure predicates/computations needing only a couple of small
-//! pieces of genuinely-new state (see below), not the actual message
-//! pipeline.
+//! [`msg_strtrunc`], `other_sourcing_name`, `get_emsg_source`,
+//! `emsg_not_now` - small, pure predicates/computations needing only a
+//! couple of small pieces of genuinely-new state (see below), not the
+//! actual message pipeline.
 //!
 //! `DEFAULT_GRID` is harvested here ahead of its real owning file,
 //! `grid.c` (not translated) - it is the original's own file-static
@@ -383,6 +383,26 @@ fn get_emsg_source() -> Option<Vec<u8>> {
     None
 }
 
+/// Whether error messages are currently suppressed and should not be
+/// given at all (`emsg_not_now`) - checked by `emsg`/`semsg`/`iemsg`/
+/// `siemsg` (none translated) before doing any real work.
+///
+/// `#[allow(dead_code)]`: no real translated caller yet - harvested
+/// ahead of them, matching this crate's established precedent for a
+/// small, self-contained function with no design freedom of its own.
+#[allow(dead_code)]
+#[must_use]
+pub fn emsg_not_now() -> bool {
+    // SAFETY: plain reads through their own exclusive borrows.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let option_vars = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let p_debug = option_vars.p_debug.as_deref().unwrap_or(b"");
+    (globals.emsg_off > 0
+        && crate::strings::vim_strchr(p_debug, i32::from(b'm')).is_none()
+        && crate::strings::vim_strchr(p_debug, i32::from(b't')).is_none())
+        || globals.emsg_skip > 0
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -486,6 +506,68 @@ pub(crate) mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = Some(b"log.txt".to_vec());
         assert!(redirecting());
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = old;
+    }
+
+    // --- emsg_not_now ---
+
+    /// Sets `GLOBALS.emsg_off`/`emsg_skip` and `OPTION_VARS.p_debug` for
+    /// the duration of `f`, restoring all 3 afterward (even if `f`
+    /// panics, via a manual `catch_unwind`, matching this crate's own
+    /// established pattern for RAII-guard-free multi-field test setup).
+    fn with_emsg_state<R>(emsg_off: i32, emsg_skip: i32, p_debug: Option<&[u8]>, f: impl FnOnce() -> R + std::panic::UnwindSafe) -> R {
+        let old_off = unsafe { crate::globals::GLOBALS.get_mut() }.emsg_off;
+        let old_skip = unsafe { crate::globals::GLOBALS.get_mut() }.emsg_skip;
+        let old_debug = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_debug.take();
+        unsafe { crate::globals::GLOBALS.get_mut() }.emsg_off = emsg_off;
+        unsafe { crate::globals::GLOBALS.get_mut() }.emsg_skip = emsg_skip;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_debug = p_debug.map(<[u8]>::to_vec);
+        let result = std::panic::catch_unwind(f);
+        unsafe { crate::globals::GLOBALS.get_mut() }.emsg_off = old_off;
+        unsafe { crate::globals::GLOBALS.get_mut() }.emsg_skip = old_skip;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_debug = old_debug;
+        result.unwrap()
+    }
+
+    #[test]
+    fn emsg_not_now_default_state_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(0, 0, None, || assert!(!emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_true_when_emsg_off_and_debug_is_plain() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(1, 0, None, || assert!(emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_false_when_emsg_off_but_debug_contains_m() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(1, 0, Some(b"m"), || assert!(!emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_false_when_emsg_off_but_debug_contains_t() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(1, 0, Some(b"t"), || assert!(!emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_false_when_emsg_off_but_debug_contains_both() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(1, 0, Some(b"mt"), || assert!(!emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_true_when_emsg_skip_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(0, 1, None, || assert!(emsg_not_now()));
+    }
+
+    #[test]
+    fn emsg_not_now_true_when_both_emsg_off_and_emsg_skip() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_emsg_state(1, 1, None, || assert!(emsg_not_now()));
     }
 
     // --- trunc_string ---
