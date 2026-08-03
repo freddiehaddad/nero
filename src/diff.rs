@@ -287,6 +287,41 @@ fn diff_buf_idx(buf: *mut crate::buffer_defs::BufT, tp: *mut crate::buffer_defs:
         .unwrap_or(crate::buffer_defs::DB_COUNT)
 }
 
+/// Return `true` if `diff` appears in the current tab page's list of
+/// diff blocks (`valid_diff`). Its only real caller (deep inside the
+/// substantial, untranslated `ex_diffupdate`/fold-update machinery)
+/// isn't translated yet - harvested ahead of it, matching this
+/// crate's established precedent for a small, self-contained function
+/// with no design freedom of its own.
+///
+/// `GLOBALS.curtab.tp_first_diff` is always null today (nothing in
+/// this crate can currently create a diff block, see this module's
+/// own doc comment), so this always returns `false` in practice - a
+/// genuinely correct, total answer for every `diff` pointer (no diff
+/// blocks exist, so no pointer is ever a member of that empty list),
+/// unlike e.g. `normal.rs`'s `op_pending` (where an empty/uninitialized
+/// registry does NOT mean the same thing as "genuinely not pending").
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curtab` must be a valid, non-null pointer
+/// to a live [`crate::buffer_defs::TabpageT`], and every diff block
+/// transitively reachable through `df_next` from its `tp_first_diff`
+/// must likewise be valid.
+#[must_use]
+pub unsafe fn valid_diff(diff: *const crate::buffer_defs::DiffT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { &*crate::globals::GLOBALS.get_mut().curtab };
+    let mut dp = curtab.tp_first_diff;
+    while !dp.is_null() {
+        if std::ptr::eq(dp, diff) {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        dp = unsafe { &*dp }.df_next;
+    }
+    false
+}
+
 /// Return `true` if `buf` is being diffed in any tab page
 /// (`diff_mode_buf`).
 ///
@@ -794,6 +829,48 @@ mod tests {
             diff_buf_idx(&mut buf as *mut BufT, &mut tp as *mut crate::buffer_defs::TabpageT),
             crate::buffer_defs::DB_COUNT
         );
+    }
+
+    #[test]
+    fn valid_diff_false_when_tp_first_diff_is_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let some_diff = std::ptr::null::<crate::buffer_defs::DiffT>().wrapping_add(1);
+        assert!(!unsafe { valid_diff(some_diff) });
+    }
+
+    #[test]
+    fn valid_diff_true_when_the_pointer_is_the_only_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut d1 = crate::buffer_defs::DiffT::default();
+        let d1_ptr = &mut d1 as *mut crate::buffer_defs::DiffT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_first_diff: d1_ptr, ..Default::default() };
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        assert!(unsafe { valid_diff(d1_ptr) });
+    }
+
+    #[test]
+    fn valid_diff_true_when_found_later_in_the_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut d2 = crate::buffer_defs::DiffT::default();
+        let d2_ptr = &mut d2 as *mut crate::buffer_defs::DiffT;
+        let mut d1 = crate::buffer_defs::DiffT { df_next: d2_ptr, ..Default::default() };
+        let d1_ptr = &mut d1 as *mut crate::buffer_defs::DiffT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_first_diff: d1_ptr, ..Default::default() };
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        assert!(unsafe { valid_diff(d2_ptr) });
+    }
+
+    #[test]
+    fn valid_diff_false_when_not_present_in_a_nonempty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut d1 = crate::buffer_defs::DiffT::default();
+        let d1_ptr = &mut d1 as *mut crate::buffer_defs::DiffT;
+        let mut tp = crate::buffer_defs::TabpageT { tp_first_diff: d1_ptr, ..Default::default() };
+        let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        let mut other = crate::buffer_defs::DiffT::default();
+        assert!(!unsafe { valid_diff(&mut other as *mut crate::buffer_defs::DiffT) });
     }
 
     /// Points `GLOBALS.first_tabpage` at `head` for the guard's

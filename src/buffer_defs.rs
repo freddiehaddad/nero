@@ -778,6 +778,7 @@ pub const DB_COUNT: usize = 8;
 /// differences is expected to be reasonably small. The list is sorted on
 /// lnum. Each diffblock also contains a cached list of inline diff of
 /// changes within the block, used for highlighting.
+#[derive(Debug, Clone, Default)]
 pub struct DiffT {
     pub df_next: *mut DiffT,
     /// line number in buffer
