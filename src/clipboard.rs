@@ -2,23 +2,37 @@
 //!
 //! `clipboard.c` implements the `'clipboard'`-option-driven system
 //! clipboard integration (`"*"`/`"+"` registers), routed through a
-//! Lua `g:clipboard` provider. Almost every function
-//! (`adjust_clipboard_name`/`get_clipboard`/`set_clipboard`) needs
-//! both the real yank-register storage (`register.c`'s `yankreg_T`,
-//! only partially translated) and the Lua-callback provider machinery
-//! (`eval_has_provider`/calling into `vim.g.clipboard`), neither of
-//! which exists yet.
+//! Lua `g:clipboard` provider. Most of the file
+//! (`get_clipboard`/`set_clipboard`) needs both the real yank-register
+//! storage (`register.c`'s `yankreg_T`, only partially translated) and
+//! the Lua-callback provider machinery (`eval_has_provider`/calling
+//! into `vim.g.clipboard`), neither of which exists yet.
 //!
 //! Translated: `start_batch_changes`/`end_batch_changes` (the
 //! recursion-depth-counted "pause clipboard updates during a
 //! `:while`/`:for` loop" pair). `end_batch_changes`'s own real
 //! "flush a pending update" branch (`set_clipboard(NUL,
 //! get_y_previous())`) is never reached today: `clipboard_needs_update`
-//! is only ever set `true` inside `adjust_clipboard_name`, not yet
-//! translated, so it stays `false` forever in this crate today -
-//! exactly matching `autocmd.rs`'s own `AU_NEED_CLEAN`/
-//! `TERMRESPONSE_CHANGED` "provably always false today, not a
-//! hardcoded stub" precedent.
+//! is only ever set `true` inside `adjust_clipboard_name`, so it stays
+//! `false` forever in this crate today - exactly matching
+//! `autocmd.rs`'s own `AU_NEED_CLEAN`/`TERMRESPONSE_CHANGED` "provably
+//! always false today, not a hardcoded stub" precedent.
+//!
+//! Also translated: [`adjust_clipboard_name`] - its own real, FIRST
+//! condition (`!explicit_cb_reg && !implicit_cb_reg`) is always true
+//! today: `explicit_cb_reg` only holds for an explicit `'*'`/`'+'`
+//! name (no real caller passes one yet), and `implicit_cb_reg` needs
+//! `OPTION_VARS.cb_flags` to have its `UNNAMED`/`UNNAMEDPLUS` bits
+//! set, which can never happen in this crate today, since
+//! `'clipboard'` defaults to empty and nothing can write a NEW
+//! option value yet (`do_set`/`set_option_value`, the option-write
+//! pipeline, isn't translated). Everything past that first check,
+//! needing `eval_has_provider`/`get_y_register` (neither translated),
+//! `unimplemented!()`s, provably unreachable today. This directly
+//! unblocks [`get_default_register_name`] (`register.c`), whose own
+//! only real callers (`main.c`/`normal.c`) aren't translated yet,
+//! translated ahead of them anyway since it's small and mechanically
+//! correct, matching this crate's established precedent.
 //!
 //! Deferred: everything else in the file.
 
@@ -88,6 +102,56 @@ pub fn end_batch_changes() {
              CLIPBOARD_NEEDS_UPDATE true yet"
         );
     }
+}
+
+/// Determine if register `*name` should be used as a clipboard
+/// (`adjust_clipboard_name`). Returns `Some(target)` (the clipboard
+/// register that should be used) when `*name` is a clipboard register
+/// AND a provider is available, else `None` - possibly having updated
+/// `*name` along the way. See this module's own doc comment for why
+/// the real, always-taken early-return condition makes this always
+/// `None` (with `*name` left completely unchanged) today.
+///
+/// # Safety
+/// Touches `OPTION_VARS`.
+pub unsafe fn adjust_clipboard_name(
+    name: &mut i32,
+    _quiet: bool,
+    _writing: bool,
+) -> Option<*mut crate::register_defs::YankregT> {
+    let explicit_cb_reg = *name == i32::from(b'*') || *name == i32::from(b'+');
+    // SAFETY: forwarded from this function's own safety doc.
+    let cb_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+    let implicit_cb_reg = *name == 0
+        && (cb_flags & (crate::option_vars::opt_cb_flag::UNNAMED | crate::option_vars::opt_cb_flag::UNNAMEDPLUS))
+            != 0;
+    if !explicit_cb_reg && !implicit_cb_reg {
+        return None;
+    }
+
+    unimplemented!(
+        "adjust_clipboard_name: the real \"use a clipboard register\" \
+         branches need eval_has_provider (the Lua g:clipboard provider \
+         machinery) and get_y_register (register.c's real yank-register \
+         storage), neither translated - unreachable today since \
+         OPTION_VARS.cb_flags can never be nonzero (the option-write \
+         pipeline, do_set/set_option_value, isn't translated) and no real \
+         caller passes an explicit '*'/'+' name yet"
+    );
+}
+
+/// Whether the default register (used for an unnamed paste) should be
+/// a clipboard register (`get_default_register_name`). Always `0`
+/// (`NUL`) today - see [`adjust_clipboard_name`]'s own doc comment.
+///
+/// # Safety
+/// Touches `OPTION_VARS` (via [`adjust_clipboard_name`]).
+#[must_use]
+pub unsafe fn get_default_register_name() -> i32 {
+    let mut name = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { adjust_clipboard_name(&mut name, true, false) };
+    name
 }
 
 #[cfg(test)]
@@ -165,8 +229,11 @@ mod tests {
         let _lock = global_state_test_lock();
         reset();
         start_batch_changes();
-        // Simulates what adjust_clipboard_name would have done, since
-        // it isn't translated yet.
+        // Simulates the "unnamed register, deferred write" branch
+        // `adjust_clipboard_name` would take if it ever reached its
+        // own genuinely-unreachable-today body (see this module's own
+        // doc comment) - directly exercised here since no currently
+        // possible call sequence can reach it for real.
         unsafe { *CLIPBOARD_NEEDS_UPDATE.get_mut() = true };
         let result = std::panic::catch_unwind(end_batch_changes);
         reset();
@@ -180,5 +247,83 @@ mod tests {
             msg.contains("flushing a deferred clipboard update"),
             "unexpected panic message: {msg}"
         );
+    }
+
+    // --- adjust_clipboard_name / get_default_register_name ---
+
+    #[test]
+    fn adjust_clipboard_name_is_none_for_an_ordinary_register_with_cb_flags_unset() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = 0;
+
+        let mut name = i32::from(b'a');
+        assert!(unsafe { adjust_clipboard_name(&mut name, true, false) }.is_none());
+        assert_eq!(name, i32::from(b'a'));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
+    }
+
+    #[test]
+    fn adjust_clipboard_name_is_none_for_an_unnamed_register_with_cb_flags_unset() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = 0;
+
+        let mut name = 0;
+        assert!(unsafe { adjust_clipboard_name(&mut name, true, false) }.is_none());
+        assert_eq!(name, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
+    }
+
+    #[test]
+    #[should_panic(expected = "adjust_clipboard_name")]
+    fn adjust_clipboard_name_panics_for_an_explicit_star_register() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = 0;
+
+        let mut name = i32::from(b'*');
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            adjust_clipboard_name(&mut name, true, false)
+        }));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "adjust_clipboard_name")]
+    fn adjust_clipboard_name_panics_for_an_unnamed_register_when_cb_flags_unnamed_is_set() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        // This can never actually happen in a real session today (the
+        // option-write pipeline isn't translated) - set directly here
+        // purely to exercise `implicit_cb_reg`'s own real logic.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = crate::option_vars::opt_cb_flag::UNNAMED;
+
+        let mut name = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            adjust_clipboard_name(&mut name, true, false)
+        }));
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn get_default_register_name_is_nul_by_default() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = 0;
+
+        assert_eq!(unsafe { get_default_register_name() }, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cb_flags = prev;
     }
 }
