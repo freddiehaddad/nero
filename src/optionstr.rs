@@ -247,6 +247,11 @@
 //! `std::ptr::eq` against the window's own `wo_briopt` address. Its
 //! `redraw_all_later` call is omitted - pure redraw scheduling.
 //!
+//! Also [`did_set_colorcolumn`] - exactly the same shape, delegating
+//! to `window.rs`'s already-real `check_colorcolumn` and reproducing
+//! the original's own `varp == &win->w_p_cc ? win : NULL` comparison
+//! the same `std::ptr::eq` way.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1824,6 +1829,47 @@ pub unsafe fn did_set_breakindentopt(args: &mut crate::option_defs::OptsetT) -> 
         crate::indent::briopt_check(val.as_deref(), Some(unsafe { &mut *win_ptr }))
     } else {
         crate::indent::briopt_check(val.as_deref(), None)
+    };
+
+    if !ok {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    None
+}
+
+/// The `'colorcolumn'` option is changed (`did_set_colorcolumn`).
+///
+/// Exactly the same shape as [`did_set_breakindentopt`]: delegates to
+/// `window.rs`'s already-real `check_colorcolumn`, passing the window
+/// only when the value being set IS the window-local `'colorcolumn'`
+/// storage (so the parsed columns are actually stored), matching the
+/// original's own `varp == &win->w_p_cc ? win : NULL` pointer
+/// comparison via a real `std::ptr::eq`.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// whose own `w_buffer` is either null or a valid, live `BufT`
+/// pointer (forwarded to `check_colorcolumn`'s own safety doc).
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_colorcolumn(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    let varp = args.os_varp as *const Option<Vec<u8>>;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_window_local =
+        std::ptr::eq(varp, unsafe { std::ptr::addr_of!((*win_ptr).w_onebuf_opt.wo_cc) });
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let val: Option<Vec<u8>> = unsafe { &*varp }.clone();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ok = unsafe {
+        if is_window_local {
+            crate::window::check_colorcolumn(val.as_deref(), Some(&mut *win_ptr))
+        } else {
+            crate::window::check_colorcolumn(val.as_deref(), None)
+        }
     };
 
     if !ok {
@@ -4429,6 +4475,94 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- did_set_colorcolumn ----
+
+    fn cc_args(
+        win: &mut crate::buffer_defs::WinT,
+        window_local: bool,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        let varp = if window_local {
+            std::ptr::addr_of_mut!(win.w_onebuf_opt.wo_cc) as *mut c_void
+        } else {
+            val as *mut Option<Vec<u8>> as *mut c_void
+        };
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: varp,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_colorcolumn_empty_is_valid() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = cc_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_colorcolumn_accepts_absolute_and_relative_columns() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"+1,-1,80".to_vec());
+        let mut args = cc_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_colorcolumn_rejects_a_non_numeric_value() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = cc_args(&mut win, false, &mut val);
+        assert_eq!(
+            unsafe { did_set_colorcolumn(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_colorcolumn_window_local_value_is_stored_into_the_window() {
+        // The ptr::eq branch: os_varp IS the window's own wo_cc
+        // storage, so check_colorcolumn gets Some(wp) and fills
+        // w_p_cc_cols. A real (non-null) w_buffer is required - a null
+        // one makes check_colorcolumn return early with "buffer was
+        // closed", storing nothing.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            ..Default::default()
+        };
+        win.w_onebuf_opt.wo_cc = Some(b"80".to_vec());
+        let mut unused: Option<Vec<u8>> = None;
+        let mut args = cc_args(&mut win, true, &mut unused);
+        assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
+        // Stored 0-based, so column 80 becomes 79.
+        assert_eq!(win.w_p_cc_cols, Some(vec![79]));
+    }
+
+    #[test]
+    fn did_set_colorcolumn_window_local_null_buffer_is_treated_as_closed() {
+        // A null w_buffer short-circuits check_colorcolumn to success
+        // without storing anything - matching the original's own
+        // "buffer was closed" early return.
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_cc = Some(b"80".to_vec());
+        let mut unused: Option<Vec<u8>> = None;
+        let mut args = cc_args(&mut win, true, &mut unused);
+        assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
+        assert!(win.w_p_cc_cols.is_none());
+    }
+
+    #[test]
+    fn did_set_colorcolumn_non_window_local_value_leaves_the_window_alone() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"80".to_vec());
+        let mut args = cc_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
+        assert!(win.w_p_cc_cols.is_none());
     }
 
     // ---- did_set_mousescroll ----
