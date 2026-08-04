@@ -9,12 +9,10 @@
 //! Translated: `spell_check_sps` (parse the `'spellsuggest'` option
 //! string into the `sps_flags`/`sps_limit` file-statics), via
 //! `option.c`'s already-real `copy_option_part` and `charset.c`'s
-//! already-real `getdigits_int`/`ascii_isdigit`. No real caller yet
-//! (`spell_suggest`, the only reader of `sps_flags`/`sps_limit`, and
-//! `did_set_spellsuggest`, its only OTHER real caller, are both not
-//! translated) - translated ahead of them anyway, matching this
-//! crate's established "translate a small, simple, mechanically-
-//! correct piece ahead of the surrounding engine" precedent.
+//! already-real `getdigits_int`/`ascii_isdigit`. `did_set_spellsuggest`
+//! (`optionstr.rs`) is now this function's real caller. `spell_suggest`
+//! itself (the only reader of `sps_flags`/`sps_limit`) remains not
+//! translated.
 //!
 //! Deliberately restructured to compute into LOCAL `new_flags`/
 //! `new_limit` values, only committing them to the shared

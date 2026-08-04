@@ -69,7 +69,16 @@
 //! (delegates entirely to `did_set_str_generic`, its own pure
 //! redraw-scheduling call omitted) and [`did_set_sessionoptions`]
 //! (rejects `"sesdir"`+`"curdir"` together, restoring the OLD
-//! `ssop_flags` on that specific failure).
+//! `ssop_flags` on that specific failure). Also [`did_set_keymodel`]
+//! (sets `GLOBALS.km_stopsel`/`km_startsel` from `'keymodel'`'s own
+//! character content), [`did_set_showcmdloc`] (delegates then calls
+//! the already-real `comp_col`), [`did_set_splitkeep`] (snapshots
+//! every window's own height across every tabpage into
+//! `w_prev_height`, using `tabpage_win_valid`'s own already-
+//! established `curtab`-vs-`tp_firstwin` window-list-walk
+//! convention), and [`did_set_spellsuggest`] (re-scanned once
+//! `spellsuggest.rs`'s own `spell_check_sps` landed in an earlier
+//! commit this segment - its only remaining real blocker).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -614,6 +623,94 @@ pub unsafe fn did_set_sessionoptions(args: &mut crate::option_defs::OptsetT) -> 
         return Some(crate::errors::e_invarg.as_bytes());
     }
     None
+}
+
+/// The `'keymodel'` option is changed (`did_set_keymodel`).
+///
+/// # Safety
+/// Same as [`did_set_str_generic`]. Also touches `GLOBALS`
+/// (`km_stopsel`/`km_startsel`).
+pub unsafe fn did_set_keymodel(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe { did_set_str_generic(args) };
+    if errmsg.is_some() {
+        return errmsg;
+    }
+    // SAFETY: a plain, momentary read - no aliasing hazard.
+    let p_km = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_km.clone();
+    let val: &[u8] = p_km.as_deref().unwrap_or(&[]);
+    let stopsel = crate::strings::vim_strchr(val, i32::from(b'o')).is_some();
+    let startsel = crate::strings::vim_strchr(val, i32::from(b'a')).is_some();
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.km_stopsel = stopsel;
+    globals.km_startsel = startsel;
+    None
+}
+
+/// The `'showcmdloc'` option is changed (`did_set_showcmdloc`).
+///
+/// # Safety
+/// Same as [`did_set_str_generic`]. Also touches `GLOBALS`/
+/// `OPTION_VARS` (via `comp_col`).
+pub unsafe fn did_set_showcmdloc(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe { did_set_str_generic(args) };
+    if errmsg.is_none() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::comp_col() };
+    }
+    errmsg
+}
+
+/// The `'splitkeep'` option is changed (`did_set_splitkeep`).
+///
+/// Snapshots every window's own current height into `w_prev_height`,
+/// across every tabpage - matching the original's own
+/// `FOR_ALL_TAB_WINDOWS` walk (the current tab's own windows are
+/// reached via `GLOBALS.firstwin`, matching `tabpage_win_valid`'s own
+/// already-established convention for this exact distinction).
+///
+/// # Safety
+/// Same as [`did_set_str_generic`]. Also touches `GLOBALS`'s
+/// `first_tabpage`/`firstwin` window-list pointers, which must all be
+/// valid, live pointers for the whole call.
+pub unsafe fn did_set_splitkeep(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let win = unsafe { &mut *wp };
+            win.w_prev_height = win.w_height;
+            wp = win.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_str_generic(args) }
+}
+
+/// The `'spellsuggest'` option is changed (`did_set_spellsuggest`).
+///
+/// # Safety
+/// Touches `OPTION_VARS`, matching `spell_check_sps`'s own safety doc.
+pub unsafe fn did_set_spellsuggest() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::spellsuggest::spell_check_sps() } == crate::vim_defs::OK {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -1487,5 +1584,169 @@ mod tests {
         let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
         let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Sessionoptions, os_varp: varp, ..Default::default() };
         assert_eq!(unsafe { did_set_sessionoptions(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_keymodel ----
+
+    #[test]
+    fn did_set_keymodel_sets_stopsel_and_startsel_from_o_and_a() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The original reads the GLOBAL `p_km` directly (not
+        // `args->os_varp`) - matching a real invocation, where
+        // `os_varp` points at this SAME global storage for a
+        // global-only option, `OPTION_VARS.p_km` is set to the new
+        // value directly here, and `os_varp` points at it too.
+        // Derived via `as_ptr()` (not `get_mut()`) so this pointer
+        // survives `did_set_keymodel`'s OWN internal `get_mut()`
+        // call without being invalidated under Tree Borrows.
+        let ov_ptr = crate::option_vars::OPTION_VARS.as_ptr();
+        let km_ptr = unsafe { std::ptr::addr_of_mut!((*ov_ptr).p_km) };
+        let prev = unsafe { (*km_ptr).clone() };
+        unsafe { *km_ptr = Some(b"stopsel,startsel".to_vec()) };
+        let varp = km_ptr as *mut c_void;
+
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Keymodel, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_keymodel(&mut args) }, None);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(globals.km_stopsel);
+        assert!(globals.km_startsel);
+
+        unsafe { *km_ptr = prev };
+    }
+
+    #[test]
+    fn did_set_keymodel_empty_clears_both_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.km_stopsel = true;
+        globals.km_startsel = true;
+
+        let ov_ptr = crate::option_vars::OPTION_VARS.as_ptr();
+        let km_ptr = unsafe { std::ptr::addr_of_mut!((*ov_ptr).p_km) };
+        let prev = unsafe { (*km_ptr).clone() };
+        unsafe { *km_ptr = Some(Vec::new()) };
+        let varp = km_ptr as *mut c_void;
+
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Keymodel, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_keymodel(&mut args) }, None);
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(!globals.km_stopsel);
+        assert!(!globals.km_startsel);
+
+        unsafe { *km_ptr = prev };
+    }
+
+    // ---- did_set_showcmdloc ----
+
+    #[test]
+    fn did_set_showcmdloc_valid_value_recomputes_comp_col() {
+        let mut val: Option<Vec<u8>> = Some(b"last".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Showcmdloc, os_varp: varp, ..Default::default() };
+        // comp_col() itself is exercised extensively in drawscreen.rs's
+        // own tests - this only verifies did_set_showcmdloc reaches
+        // and calls it without panicking, on a valid value.
+        assert_eq!(unsafe { did_set_showcmdloc(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_showcmdloc_invalid_value_fails_without_calling_comp_col() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Showcmdloc, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_showcmdloc(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_splitkeep ----
+
+    #[test]
+    fn did_set_splitkeep_snapshots_curtab_window_heights_via_firstwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        let prev_curtab = globals.curtab;
+        let prev_firstwin = globals.firstwin;
+
+        let mut win = crate::buffer_defs::WinT { w_height: 12, w_prev_height: 0, w_next: std::ptr::null_mut(), ..Default::default() };
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = tp_ptr;
+        globals.curtab = tp_ptr;
+        globals.firstwin = win_ptr;
+
+        let mut val: Option<Vec<u8>> = Some(b"cursor".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Splitkeep, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_splitkeep(&mut args) }, None);
+        assert_eq!(unsafe { &*win_ptr }.w_prev_height, 12);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = prev_first_tabpage;
+        globals.curtab = prev_curtab;
+        globals.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn did_set_splitkeep_snapshots_a_non_current_tabpage_via_its_own_tp_firstwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first_tabpage = globals.first_tabpage;
+        let prev_curtab = globals.curtab;
+
+        let mut other_win =
+            crate::buffer_defs::WinT { w_height: 33, w_prev_height: 0, w_next: std::ptr::null_mut(), ..Default::default() };
+        let other_win_ptr = &mut other_win as *mut crate::buffer_defs::WinT;
+        let mut other_tp = crate::buffer_defs::TabpageT { tp_firstwin: other_win_ptr, tp_next: std::ptr::null_mut(), ..Default::default() };
+        let other_tp_ptr = &mut other_tp as *mut crate::buffer_defs::TabpageT;
+
+        // A separate "current" tabpage with no windows of its own -
+        // just needs to be a distinct, valid tabpage so `other_tp` is
+        // NOT `curtab` (exercising the `tp_firstwin` branch, not the
+        // `GLOBALS.firstwin` one).
+        let mut curtab = crate::buffer_defs::TabpageT { tp_firstwin: std::ptr::null_mut(), tp_next: other_tp_ptr, ..Default::default() };
+        let curtab_ptr = &mut curtab as *mut crate::buffer_defs::TabpageT;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = curtab_ptr;
+        globals.curtab = curtab_ptr;
+        globals.firstwin = std::ptr::null_mut();
+
+        let mut val: Option<Vec<u8>> = Some(b"screen".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Splitkeep, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_splitkeep(&mut args) }, None);
+        assert_eq!(unsafe { &*other_win_ptr }.w_prev_height, 33);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.first_tabpage = prev_first_tabpage;
+        globals.curtab = prev_curtab;
+    }
+
+    // ---- did_set_spellsuggest ----
+
+    fn set_p_sps(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_sps.clone();
+        opts.p_sps = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_spellsuggest_valid_value_is_ok() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_sps(Some(b"best,10"));
+        assert_eq!(unsafe { did_set_spellsuggest() }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = prev;
+    }
+
+    #[test]
+    fn did_set_spellsuggest_invalid_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_sps(Some(b"bogus"));
+        assert_eq!(unsafe { did_set_spellsuggest() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = prev;
     }
 }
