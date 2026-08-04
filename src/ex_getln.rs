@@ -44,6 +44,13 @@
 //! simultaneously active; its own second real condition always holds
 //! today (see its own doc comment), so it simplifies to
 //! `buffer::bt_cmdwin(curbuf)`.
+//!
+//! Also translated: [`check_opt_wim`] - parses `'wildmode'` into
+//! `GLOBALS.wim_flags`, hand-traced against a concrete
+//! `"longest:full,list,full"` example (a `:`-joined group combines
+//! flags into the SAME slot; a `,`-joined group starts a new one)
+//! before translating. `optionstr.rs`'s `did_set_wildmode` is its
+//! real caller.
 
 /// What [`vim_strsave_fnameescape`] is escaping for (`VSE_NONE`/
 /// `VSE_SHELL`/`VSE_BUFFER`, `ex_getln.h`).
@@ -447,6 +454,91 @@ pub unsafe fn is_in_cmdwin() -> bool {
     unsafe { crate::buffer::bt_cmdwin(Some(curbuf)) }
 }
 
+/// Read the `'wildmode'` option, filling
+/// `crate::globals::Globals::wim_flags` (`check_opt_wim`).
+///
+/// `'wildmode'` is a comma-separated list of up to 4 "stages"; each
+/// stage is one or more `:`-joined mode names (e.g.
+/// `"longest:full,list,full"` - the FIRST stage combines
+/// `longest`+`full`, matching the original's exact bit-OR-into-the-
+/// same-slot behavior for a `:`-joined group, hand-traced against
+/// this concrete example before translating). Fewer than 4
+/// comma-separated stages get the LAST given stage's own flags
+/// repeated for the remaining slots (matching the original's own
+/// "fill remaining entries with last flag" tail exactly).
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` and
+/// `crate::globals::GLOBALS`.
+pub unsafe fn check_opt_wim() -> i32 {
+    use crate::option_vars::opt_wim_flag;
+    use crate::vim_defs::{FAIL, OK};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_wim = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim.clone();
+    let s: &[u8] = p_wim.as_deref().unwrap_or(&[]);
+
+    let mut new_wim_flags = [0u8; 4];
+    let mut idx = 0usize;
+    let mut pos = 0usize;
+
+    while pos < s.len() {
+        // Count consecutive alpha characters starting at `pos`.
+        let mut i = 0usize;
+        while pos + i < s.len() && crate::macros_defs::ascii_isalpha(i32::from(s[pos + i])) {
+            i += 1;
+        }
+        let next = s.get(pos + i).copied();
+        if next.is_some() && next != Some(b',') && next != Some(b':') {
+            return FAIL;
+        }
+
+        let word = &s[pos..pos + i];
+        let flag = if i == 7 && word == b"longest" {
+            opt_wim_flag::LONGEST
+        } else if i == 4 && word == b"full" {
+            opt_wim_flag::FULL
+        } else if i == 4 && word == b"list" {
+            opt_wim_flag::LIST
+        } else if i == 8 && word == b"lastused" {
+            opt_wim_flag::LASTUSED
+        } else if i == 8 && word == b"noselect" {
+            opt_wim_flag::NOSELECT
+        } else if i == 8 && word == b"noinsert" {
+            opt_wim_flag::NOINSERT
+        } else {
+            return FAIL;
+        };
+        new_wim_flags[idx] |= flag as u8;
+
+        pos += i;
+        match s.get(pos) {
+            None => break,
+            Some(&b',') => {
+                if idx == 3 {
+                    return FAIL;
+                }
+                idx += 1;
+            }
+            Some(_) => {} // ':' - combine into the same slot.
+        }
+        // The original for-loop's own increment - consumes the
+        // comma/colon we just examined.
+        pos += 1;
+    }
+
+    // Fill remaining entries with the last flag.
+    while idx < 3 {
+        new_wim_flags[idx + 1] = new_wim_flags[idx];
+        idx += 1;
+    }
+
+    // Only when there are no errors, wim_flags[] is changed.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = new_wim_flags;
+    OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +919,104 @@ mod tests {
         }];
         f_setcmdpos(&args, &mut rettv);
         assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(1));
+    }
+
+    // ---- check_opt_wim ----
+
+    fn set_p_wim(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_wim.clone();
+        opts.p_wim = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    fn reset_wim_flags() -> [u8; 4] {
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags;
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = [0; 4];
+        prev
+    }
+
+    #[test]
+    fn check_opt_wim_the_real_default_value_repeats_full_in_every_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wim = set_p_wim(Some(b"full"));
+        let prev_flags = reset_wim_flags();
+
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags,
+            [crate::option_vars::opt_wim_flag::FULL as u8; 4]
+        );
+
+        set_p_wim(prev_wim.as_deref());
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = prev_flags;
+    }
+
+    #[test]
+    fn check_opt_wim_colon_combines_flags_into_the_same_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "longest:full,list,full" - hand-traced: slot 0 = LONGEST|FULL
+        // (":"-joined), slot 1 = LIST, slot 2 = FULL, slot 3 repeats
+        // slot 2's own FULL (fewer than 4 comma-separated stages).
+        let prev_wim = set_p_wim(Some(b"longest:full,list,full"));
+        let prev_flags = reset_wim_flags();
+
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::OK);
+        use crate::option_vars::opt_wim_flag;
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags,
+            [
+                (opt_wim_flag::LONGEST | opt_wim_flag::FULL) as u8,
+                opt_wim_flag::LIST as u8,
+                opt_wim_flag::FULL as u8,
+                opt_wim_flag::FULL as u8,
+            ]
+        );
+
+        set_p_wim(prev_wim.as_deref());
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = prev_flags;
+    }
+
+    #[test]
+    fn check_opt_wim_empty_value_is_ok_with_all_zero_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wim = set_p_wim(Some(b""));
+        let prev_flags = reset_wim_flags();
+
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags, [0; 4]);
+
+        set_p_wim(prev_wim.as_deref());
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = prev_flags;
+    }
+
+    #[test]
+    fn check_opt_wim_unknown_word_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wim = set_p_wim(Some(b"bogus"));
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::FAIL);
+        set_p_wim(prev_wim.as_deref());
+    }
+
+    #[test]
+    fn check_opt_wim_more_than_4_stages_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wim = set_p_wim(Some(b"full,full,full,full,full"));
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::FAIL);
+        set_p_wim(prev_wim.as_deref());
+    }
+
+    #[test]
+    fn check_opt_wim_failure_leaves_wim_flags_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wim = set_p_wim(Some(b"bogus"));
+        let prev_flags = reset_wim_flags();
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = [7, 7, 7, 7];
+
+        assert_eq!(unsafe { check_opt_wim() }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags, [7, 7, 7, 7]);
+
+        set_p_wim(prev_wim.as_deref());
+        unsafe { crate::globals::GLOBALS.get_mut() }.wim_flags = prev_flags;
     }
 }

@@ -87,9 +87,10 @@
 //! "display text differs, boolean outcome identical" policy),
 //! [`did_set_mousescroll`] (parses a comma-separated
 //! `"ver:N"`/`"hor:M"` list into `OPTION_VARS.p_mousescroll_vert`/
-//! `p_mousescroll_hor`), and [`did_set_showbreak`] (every character
+//! `p_mousescroll_hor`), [`did_set_showbreak`] (every character
 //! must occupy exactly 1 screen cell, via the already-real
-//! `ptr2cells`/`utfc_ptr2len`).
+//! `ptr2cells`/`utfc_ptr2len`), and [`did_set_wildmode`] (built on a
+//! new `ex_getln.rs::check_opt_wim`).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -867,6 +868,20 @@ pub unsafe fn did_set_showbreak(args: &mut crate::option_defs::OptsetT) -> Optio
         pos += unsafe { crate::mbyte::utfc_ptr2len(&val[pos..]) }.max(1) as usize;
     }
     None
+}
+
+/// The `'wildmode'` option is changed (`did_set_wildmode`).
+///
+/// # Safety
+/// Touches `OPTION_VARS`/`GLOBALS`, matching `check_opt_wim`'s own
+/// safety doc.
+pub unsafe fn did_set_wildmode() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_getln::check_opt_wim() } == crate::vim_defs::OK {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -2135,5 +2150,30 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"ok\x01".to_vec());
         let mut args = showbreak_args(&mut val);
         assert!(unsafe { did_set_showbreak(&mut args) }.is_some());
+    }
+
+    // ---- did_set_wildmode ----
+
+    fn set_p_wim(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_wim.clone();
+        opts.p_wim = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_wildmode_valid_value_is_ok() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_wim(Some(b"full"));
+        assert_eq!(unsafe { did_set_wildmode() }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim = prev;
+    }
+
+    #[test]
+    fn did_set_wildmode_invalid_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_wim(Some(b"bogus"));
+        assert_eq!(unsafe { did_set_wildmode() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim = prev;
     }
 }
