@@ -260,6 +260,13 @@
 //! script identifier via `userfunc.rs`'s already-real
 //! `get_scriptlocal_funcname`. Never fails.
 //!
+//! Also [`did_set_shellpipe_redir`] (`'shellpipe'`/`'shellredir'`) -
+//! a shell command template in which `%s` marks the file-name
+//! substitution point. At most ONE `%s` is allowed, `%%` is a
+//! literal-percent escape, and any other `%`-sequence (or a trailing
+//! bare `%`) is rejected. Reads `args.os_newval` rather than
+//! `args.os_varp`, matching the original exactly.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1913,6 +1920,52 @@ pub unsafe fn did_set_optexpr(args: &mut crate::option_defs::OptsetT) -> Option<
     if let Some(name) = unsafe { crate::eval::userfunc::get_scriptlocal_funcname(&val) } {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *varp = Some(name) };
+    }
+
+    None
+}
+
+/// Validate `'shellpipe'`/`'shellredir'` (`did_set_shellpipe_redir`).
+///
+/// The value is a shell command template in which `%s` marks where
+/// the real file name is substituted. At most ONE `%s` is allowed;
+/// `%%` is a literal-percent escape; any other `%`-sequence (or a
+/// trailing bare `%`) is rejected.
+///
+/// Reads `args.os_newval` rather than `args.os_varp`, matching the
+/// original exactly.
+pub fn did_set_shellpipe_redir(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let val: &[u8] = match &args.os_newval {
+        crate::option_defs::OptVal::String(s) => s,
+        _ => &[],
+    };
+
+    let mut seen = false;
+    let mut p = 0usize;
+    while p < val.len() {
+        if val[p] != b'%' {
+            p += 1;
+            continue;
+        }
+        // A bare trailing '%' with nothing after it. The original
+        // reads `p[1]` and finds its own NUL terminator; here that is
+        // an explicit "is '%' the last byte" bounds check.
+        if p + 1 >= val.len() {
+            return Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes());
+        }
+        if val[p + 1] == b'%' {
+            p += 2; // skip second %, plus the loop's own increment
+            continue;
+        }
+        if val[p + 1] == b's' {
+            if seen {
+                return Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes());
+            }
+            seen = true;
+            p += 2; // consume 's', plus the loop's own increment
+            continue;
+        }
+        return Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes());
     }
 
     None
@@ -4663,6 +4716,65 @@ mod tests {
         let mut args = listflag_args(&mut val);
         assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
         assert_eq!(val, Some(b"s:MyFunc".to_vec()));
+    }
+
+    // ---- did_set_shellpipe_redir ----
+
+    fn shellpipe_result(value: &[u8]) -> Option<&'static [u8]> {
+        let mut args = crate::option_defs::OptsetT {
+            os_newval: crate::option_defs::OptVal::String(value.to_vec()),
+            ..Default::default()
+        };
+        did_set_shellpipe_redir(&mut args)
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_accepts_a_single_placeholder() {
+        assert_eq!(shellpipe_result(b"2>&1| tee %s"), None);
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_accepts_a_value_with_no_percent_at_all() {
+        assert_eq!(shellpipe_result(b">"), None);
+        assert_eq!(shellpipe_result(b""), None);
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_accepts_a_doubled_percent_escape() {
+        assert_eq!(shellpipe_result(b"100%% done"), None);
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_accepts_an_escape_next_to_a_placeholder() {
+        // "%%" consumes both bytes, so the following "%s" is still the
+        // FIRST real placeholder, not a second one.
+        assert_eq!(shellpipe_result(b"%%%s"), None);
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_rejects_two_placeholders() {
+        assert_eq!(
+            shellpipe_result(b"%s %s"),
+            Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_rejects_a_trailing_bare_percent() {
+        // The original reads p[1] and finds its own NUL terminator;
+        // here that is an explicit bounds check.
+        assert_eq!(
+            shellpipe_result(b"tee %"),
+            Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_shellpipe_redir_rejects_an_unknown_percent_sequence() {
+        assert_eq!(
+            shellpipe_result(b"%d"),
+            Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes())
+        );
     }
 
     // ---- did_set_mousescroll ----
