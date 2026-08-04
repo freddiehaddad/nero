@@ -57,6 +57,11 @@
 //! on the same line have been matched (so `"else { foo();"` is not
 //! terminated but `"else { foo(); }"` is).
 //!
+//! Also [`cin_is_cpp_namespace`] (with its optional `"inline"`/
+//! `"export"` prefixes and C++17 nested `a::b` names) and
+//! [`after_label`], which returns `Option<usize>` in place of the
+//! original's nullable `const char *`.
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
 //! `find_line_comment` (need `ml_get` and the cursor) and the rest of
 //! the real indent-computation algorithm.
@@ -810,6 +815,109 @@ pub unsafe fn cin_isterminated(
     found_start
 }
 
+/// Recognize a `"namespace"` scope declaration
+/// (`cin_is_cpp_namespace`).
+///
+/// Accepts an optional `"inline"`/`"export"` prefix in any order, an
+/// optional namespace name, and C++17 nested namespace names joined
+/// by `"::"`.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_is_cpp_namespace(line: &[u8], s: usize) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc - the
+    // same `curbuf` read `vim_iswordc` performs.
+    let isword = |c: u8| unsafe { crate::charset::vim_iswordc(i32::from(c)) };
+    let starts = |i: usize, w: &[u8]| line.get(i..).is_some_and(|t| t.starts_with(w));
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut s = unsafe { cin_skipcomment(line, s) };
+
+    // skip over "inline" and "export" in any order
+    while (starts(s, b"inline") || starts(s, b"export")) && (at(s + 6) == 0 || !isword(at(s + 6)))
+    {
+        let after = s + 6;
+        let w = after + crate::charset::skipwhite(line.get(after..).unwrap_or(&[]));
+        // SAFETY: forwarded from this function's own safety doc.
+        s = unsafe { cin_skipcomment(line, w) };
+    }
+
+    if !(starts(s, b"namespace") && (at(s + 9) == 0 || !isword(at(s + 9)))) {
+        return false;
+    }
+
+    let after = s + 9;
+    let w = after + crate::charset::skipwhite(line.get(after..).unwrap_or(&[]));
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut p = unsafe { cin_skipcomment(line, w) };
+
+    let mut has_name = false;
+    let mut has_name_start = false;
+    while at(p) != 0 {
+        if crate::ascii_defs::ascii_iswhite(i32::from(at(p))) {
+            has_name = true; // found end of a name
+            let w = p + crate::charset::skipwhite(line.get(p..).unwrap_or(&[]));
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skipcomment(line, w) };
+        } else if at(p) == b'{' {
+            break;
+        } else if isword(at(p)) {
+            has_name_start = true;
+            if has_name {
+                return false; // word character after skipping past name
+            }
+            p += 1;
+        } else if at(p) == b':' && at(p + 1) == b':' && isword(at(p + 2)) {
+            if !has_name_start || has_name {
+                return false;
+            }
+            // C++ 17 nested namespace
+            p += 3;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// The index of the first non-empty non-comment character after a
+/// `':'` (`after_label`), or `None` when there is none.
+///
+/// For `"case 234:    a = b;"` this points at the `a`.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn after_label(line: &[u8], l: usize) -> Option<usize> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut l = l;
+
+    while at(l) != 0 {
+        if at(l) == b':' {
+            if at(l + 1) == b':' {
+                // skip over "::" for C++
+                l += 1;
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                if !unsafe { cin_iscase(line, l + 1, false) } {
+                    break;
+                }
+            }
+        } else if at(l) == b'\'' && at(l + 1) != 0 && at(l + 2) == b'\'' {
+            l += 2; // skip over 'x'
+        }
+        l += 1;
+    }
+    if at(l) == 0 {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let l = unsafe { cin_skipcomment(line, l + 1) };
+    if at(l) == 0 { None } else { Some(l) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +1010,106 @@ mod tests {
     // ---- cin_is_cpp_extern_c ----
 
     // ---- cin_isterminated ----
+
+    // ---- cin_is_cpp_namespace / after_label ----
+
+    #[test]
+    fn cin_is_cpp_namespace_accepts_named_and_anonymous_forms() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace", 0) });
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace foo", 0) });
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace foo {", 0) });
+            // Anonymous namespace.
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace {", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_namespace_accepts_inline_and_export_prefixes() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_cpp_namespace(b"inline namespace foo", 0) });
+            assert!(unsafe { cin_is_cpp_namespace(b"export namespace foo", 0) });
+            // Both, in either order.
+            assert!(unsafe { cin_is_cpp_namespace(b"inline export namespace foo", 0) });
+            assert!(unsafe { cin_is_cpp_namespace(b"export inline namespace foo", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_namespace_accepts_a_cpp17_nested_name() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace a::b", 0) });
+            assert!(unsafe { cin_is_cpp_namespace(b"namespace a::b::c {", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_namespace_rejects_a_second_name_after_the_first() {
+        with_hash_comment(0, || {
+            // Once a name has ended, another word character is not
+            // allowed - this is not a namespace declaration.
+            assert!(!unsafe { cin_is_cpp_namespace(b"namespace foo bar", 0) });
+            // A "::" after the name has already ended is rejected too.
+            assert!(!unsafe { cin_is_cpp_namespace(b"namespace foo ::b", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_namespace_rejects_non_namespaces() {
+        with_hash_comment(0, || {
+            assert!(!unsafe { cin_is_cpp_namespace(b"", 0) });
+            assert!(!unsafe { cin_is_cpp_namespace(b"struct foo {", 0) });
+            // "namespaces" is not the keyword.
+            assert!(!unsafe { cin_is_cpp_namespace(b"namespaces foo", 0) });
+            // Unexpected punctuation in the name position.
+            assert!(!unsafe { cin_is_cpp_namespace(b"namespace foo;", 0) });
+        });
+    }
+
+    #[test]
+    fn after_label_points_past_a_label_colon() {
+        with_hash_comment(0, || {
+            // "case 234:    a = b;" - the `a` is at index 13.
+            let line = b"case 234:    a = b;";
+            assert_eq!(unsafe { after_label(line, 0) }, Some(13));
+            // A plain label works the same way.
+            let line = b"done: x";
+            assert_eq!(unsafe { after_label(line, 0) }, Some(6));
+        });
+    }
+
+    #[test]
+    fn after_label_skips_a_comment_after_the_colon() {
+        with_hash_comment(0, || {
+            let line = b"done:/* c */x";
+            assert_eq!(unsafe { after_label(line, 0) }, Some(12));
+        });
+    }
+
+    #[test]
+    fn after_label_is_none_without_a_label_or_trailing_code() {
+        with_hash_comment(0, || {
+            // No colon at all.
+            assert_eq!(unsafe { after_label(b"x = 1;", 0) }, None);
+            assert_eq!(unsafe { after_label(b"", 0) }, None);
+            // A colon with nothing after it.
+            assert_eq!(unsafe { after_label(b"done:", 0) }, None);
+            // Only a comment after it.
+            assert_eq!(unsafe { after_label(b"done:/* c */", 0) }, None);
+        });
+    }
+
+    #[test]
+    fn after_label_skips_cpp_scope_resolution_and_char_constants() {
+        with_hash_comment(0, || {
+            // "::" is stepped over, so the real label colon is found.
+            let line = b"std::foo: x";
+            assert_eq!(unsafe { after_label(line, 0) }, Some(10));
+            // A quoted colon is skipped as a char constant.
+            let line = b"x = ':'; done: y";
+            assert_eq!(unsafe { after_label(line, 0) }, Some(15));
+        });
+    }
 
     #[test]
     fn cin_isterminated_reports_the_terminating_character() {
