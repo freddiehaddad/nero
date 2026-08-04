@@ -138,6 +138,16 @@
 //! appends the separator via adjacent string-literal concatenation
 //! for this one call).
 //!
+//! Also [`did_set_virtualedit`] - resolves `ve`/`flags` from either
+//! `win.w_onebuf_opt.wo_ve`/`wo_ve_flags` (`OPT_LOCAL`) or
+//! `OPTION_VARS.p_ve`/`ve_flags` (otherwise) as an owned copy (Rust
+//! can't alias 2 different `&mut` targets behind one binding the way
+//! the original's own pointer-aliasing trick does), then writes
+//! `opt_strings_flags`'s own already-real, brand-new-flags-value
+//! return back to whichever target was selected. On a genuine value
+//! change, calls the already-real `move::validate_virtcol`/
+//! `cursor::coladvance` to recompute the cursor position.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1239,6 +1249,69 @@ pub unsafe fn did_set_vartabstop(args: &mut crate::option_defs::OptsetT) -> Opti
         }
         Err(()) => Some(crate::errors::e_invarg.as_bytes()),
     }
+}
+
+/// The `'virtualedit'` option is changed (`did_set_virtualedit`).
+///
+/// Resolves `ve`/`flags` from either `win.w_onebuf_opt.wo_ve`/
+/// `wo_ve_flags` (`OPT_LOCAL`) or `OPTION_VARS.p_ve`/`ve_flags`
+/// (otherwise) - an owned copy rather than the original's own
+/// pointer-aliasing trick, since Rust can't alias 2 different `&mut`
+/// targets behind one binding. `opt_strings_flags` already returns a
+/// brand-new flags value here (not a mutable out-param, matching this
+/// crate's own established simplification), so the "recompute" path
+/// just writes the result back to whichever target `use_local`
+/// selected.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` is NOT read (unlike most
+/// `did_set_*` callbacks, this one only ever reads through
+/// `args.os_win`/`OPTION_VARS`, matching the original's own body,
+/// which never touches `args->os_varp` either).
+pub unsafe fn did_set_virtualedit(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    let use_local = args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_LOCAL != 0;
+
+    let ve: Vec<u8> = if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*win_ptr }.w_onebuf_opt.wo_ve.clone().unwrap_or_default()
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve.clone().unwrap_or_default()
+    };
+
+    if use_local && ve.is_empty() {
+        // make the local value empty: use the global value
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win_ptr }.w_onebuf_opt.wo_ve_flags = 0;
+        return None;
+    }
+
+    let Some(new_flags) = opt_strings_flags(&ve, crate::option_vars::OPT_VE_VALUES, true) else {
+        return Some(crate::errors::e_invarg.as_bytes());
+    };
+
+    if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *win_ptr }.w_onebuf_opt.wo_ve_flags = new_flags;
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = new_flags;
+    }
+
+    let old_matches =
+        matches!(&args.os_oldval, crate::option_defs::OptVal::String(old) if *old == ve);
+    if !old_matches {
+        // Recompute cursor position in case the new 've' setting
+        // changes something.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::validate_virtcol(win_ptr) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let virtcol = unsafe { &*win_ptr }.w_virtcol;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(win_ptr, virtcol) };
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -2384,6 +2457,180 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"bz".to_vec());
         let mut args = whichwrap_args(&mut val);
         assert_eq!(unsafe { did_set_whichwrap(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_virtualedit ----
+
+    /// Builds an `OptsetT` with `os_oldval` pre-set to match `ve`
+    /// exactly, so `did_set_virtualedit`'s own "value genuinely
+    /// changed" recompute path (`validate_virtcol`/`coladvance`,
+    /// which need a real memline) is never reached - used by every
+    /// test below that isn't specifically exercising that path.
+    fn virtualedit_args_no_recompute(
+        win: &mut crate::buffer_defs::WinT,
+        flags: u32,
+        ve: &[u8],
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_flags: flags as i32,
+            os_oldval: crate::option_defs::OptVal::String(ve.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_virtualedit_global_valid_value_sets_ve_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags;
+        let prev_p_ve = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = Some(b"all".to_vec());
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = virtualedit_args_no_recompute(&mut win, 0, b"all");
+        assert_eq!(unsafe { did_set_virtualedit(&mut args) }, None);
+        assert_eq!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags,
+            crate::option_vars::opt_ve_flag::ALL
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = prev_p_ve;
+    }
+
+    #[test]
+    fn did_set_virtualedit_global_invalid_value_fails_and_leaves_flags_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags;
+        let prev_p_ve = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = 0xDEAD;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = Some(b"bogus".to_vec());
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = virtualedit_args_no_recompute(&mut win, 0, b"bogus");
+        assert_eq!(
+            unsafe { did_set_virtualedit(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags, 0xDEAD);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = prev_p_ve;
+    }
+
+    #[test]
+    fn did_set_virtualedit_local_empty_resets_to_global() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_ve = Some(Vec::new());
+        win.w_onebuf_opt.wo_ve_flags = crate::option_vars::opt_ve_flag::ALL;
+        let mut args = virtualedit_args_no_recompute(
+            &mut win,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+            b"",
+        );
+        assert_eq!(unsafe { did_set_virtualedit(&mut args) }, None);
+        assert_eq!(win.w_onebuf_opt.wo_ve_flags, 0);
+    }
+
+    #[test]
+    fn did_set_virtualedit_local_valid_value_sets_wo_ve_flags() {
+        // Uses "all" (index 2 in OPT_VE_VALUES) since its own
+        // opt_ve_flag::ALL constant (0x04) genuinely matches
+        // opt_strings_flags's own `1 << index` scheme; "block"/
+        // "insert" (indices 0/1) do NOT - their opt_ve_flag constants
+        // (0x05/0x06) are dead, unreferenced-anywhere-in-the-real-
+        // source generator artifacts, confirmed by grepping the whole
+        // original codebase, not values opt_strings_flags itself ever
+        // actually produces.
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_ve = Some(b"all".to_vec());
+        let mut args = virtualedit_args_no_recompute(
+            &mut win,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+            b"all",
+        );
+        assert_eq!(unsafe { did_set_virtualedit(&mut args) }, None);
+        assert_eq!(win.w_onebuf_opt.wo_ve_flags, crate::option_vars::opt_ve_flag::ALL);
+    }
+
+    #[test]
+    fn did_set_virtualedit_local_invalid_value_fails() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_ve = Some(b"bogus".to_vec());
+        let mut args = virtualedit_args_no_recompute(
+            &mut win,
+            crate::option_defs::opt_set_flags::OPT_LOCAL,
+            b"bogus",
+        );
+        assert_eq!(
+            unsafe { did_set_virtualedit(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_virtualedit_recomputes_cursor_position_when_value_genuinely_changes() {
+        // Uses the same real-memline test-fixture pattern established
+        // in cursor.rs's own test module (`CursorTestGuard`/
+        // `open_and_set_test_buf`) since the recompute path
+        // (validate_virtcol/coladvance) needs a real w_buffer.
+        struct VirtualeditTestGuard {
+            prev_curwin: *mut crate::buffer_defs::WinT,
+            prev_curbuf: *mut crate::buffer_defs::BufT,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl VirtualeditTestGuard {
+            fn set(win: *mut crate::buffer_defs::WinT, buf: *mut crate::buffer_defs::BufT) -> Self {
+                let _lock = crate::globals::global_state_test_lock();
+                let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+                let guard = VirtualeditTestGuard {
+                    prev_curwin: globals.curwin,
+                    prev_curbuf: globals.curbuf,
+                    _lock,
+                };
+                globals.curwin = win;
+                globals.curbuf = buf;
+                guard
+            }
+        }
+        impl Drop for VirtualeditTestGuard {
+            fn drop(&mut self) {
+                let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+                globals.curwin = self.prev_curwin;
+                globals.curbuf = self.prev_curbuf;
+            }
+        }
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let guard = VirtualeditTestGuard::set(&mut win as *mut _, &mut buf as *mut _);
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        win.w_buffer = &mut buf as *mut crate::buffer_defs::BufT;
+
+        let prev_p_ve = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve.clone();
+        let prev_ve_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = Some(b"all".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_flags: 0,
+            // A genuinely different old value forces the recompute path.
+            os_oldval: crate::option_defs::OptVal::String(b"".to_vec()),
+            ..Default::default()
+        };
+
+        // Must not panic - validate_virtcol/coladvance both run
+        // through their own real, working logic here.
+        assert_eq!(unsafe { did_set_virtualedit(&mut args) }, None);
+        assert!(win.w_valid & i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL) != 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ve = prev_p_ve;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ve_flags = prev_ve_flags;
+
+        drop(guard);
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 
     // ---- did_set_mousescroll ----
