@@ -3691,6 +3691,25 @@ static EVAL7_RECURSE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCe
 /// smaller-stack concern, so only that branch is modeled).
 const EVAL7_MAX_RECURSE: i32 = 1000;
 
+/// Recursion-depth counter for `callback_call` (not yet translated -
+/// needs the full user-function/callback-invocation machinery) -
+/// `callback_depth` in the original. Always `0` today: nothing in
+/// this crate can currently invoke a real Vimscript callback.
+static CALLBACK_DEPTH: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Return the current recursion depth of nested callback invocations
+/// (`get_callback_depth`). Always `0` today - see `CALLBACK_DEPTH`'s
+/// own doc comment. Translated ahead of `callback_call` itself,
+/// matching this crate's established "small, simple, mechanically
+/// correct piece ahead of its real caller" precedent - its own real
+/// caller, `eval/funcs.c`'s `f_state()`, remains separately blocked
+/// (needs `move.c`'s `op_pending()`, confirmed NOT a legitimate
+/// "always false" shortcut).
+#[must_use]
+pub fn get_callback_depth() -> i32 {
+    unsafe { *CALLBACK_DEPTH.get_mut() }
+}
+
 /// Handle sixth level expression: number/blob/single-quoted-string
 /// literals and parenthesized sub-expressions, plus leading
 /// `!`/`-`/`+` and trailing subscript chaining (`eval7`).
@@ -5806,6 +5825,27 @@ unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: 
 mod tests {
     use super::*;
     use crate::eval::typval_defs::VarLockStatus;
+
+    // --- get_callback_depth ---
+
+    #[test]
+    fn get_callback_depth_defaults_to_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(get_callback_depth(), 0);
+    }
+
+    #[test]
+    fn get_callback_depth_reflects_callback_depth() {
+        // Directly manipulate the file-static (something no real,
+        // translated caller can currently do, since nothing can
+        // invoke a real Vimscript callback yet) to prove
+        // get_callback_depth reads the REAL value, not a hardcoded 0.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *CALLBACK_DEPTH.get_mut() = 3 };
+        assert_eq!(get_callback_depth(), 3);
+        unsafe { *CALLBACK_DEPTH.get_mut() = 0 };
+        assert_eq!(get_callback_depth(), 0);
+    }
 
     #[test]
     fn num_divide_ordinary_case() {
