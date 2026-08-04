@@ -15,10 +15,18 @@
 //! `charset.rs`, so the note was stale. It needs only `skipwhite`,
 //! `copy_option_part` and the buffer's own `'cinwords'`.
 //!
+//! Also [`skip_string`] and [`is_pos_in_string`] - both pure, needing
+//! only `ascii_isdigit` and `vim_strchr`. Two real quirks in the
+//! original are preserved and pinned by tests: an UNTERMINATED string
+//! does not leave the index "unmodified" as the header comment
+//! suggests (the opening quote has already advanced it), and the
+//! octal char-constant path is unreachable because its own digit loop
+//! overshoots by one.
+//!
 //! Deferred: everything else - `check_linecomment` (needs
-//! `is_pos_in_string`/`skip_string`), `cin_ends_in`/
-//! `cin_is_cpp_extern_c` (need `cin_skipcomment`/`cin_nocode`), and
-//! the rest of the real indent-computation algorithm.
+//! `cin_skipcomment`), `cin_ends_in`/`cin_is_cpp_extern_c` (need
+//! `cin_skipcomment`/`cin_nocode`), and the rest of the real
+//! indent-computation algorithm.
 
 use crate::charset::vim_isidc;
 
@@ -101,6 +109,114 @@ pub unsafe fn cin_is_cinword(line: &[u8]) -> bool {
     false
 }
 
+/// Skip to the end of a `"string"` or a `'c'` character constant
+/// (`skip_string`). If there is no string or character at `p`, `p` is
+/// returned unmodified.
+///
+/// The original takes and returns a `const char *`; here `p` is a byte
+/// INDEX into `line`, matching this crate's established
+/// index-instead-of-pointer convention.
+///
+/// Note the original's trailing `if (!*p) p--;` "backup from NUL":
+/// when the scan runs off the end of the line it steps back one byte
+/// so the caller's own `p++` lands exactly on the terminator rather
+/// than past it. That is reproduced here as a saturating decrement
+/// when the index reaches the line's length, and is load-bearing for
+/// [`is_pos_in_string`]'s own loop termination.
+#[must_use]
+pub fn skip_string(line: &[u8], p: usize) -> usize {
+    let mut p = p;
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+
+    // We loop, because strings may be concatenated: "date""time".
+    loop {
+        if at(p) == b'\'' {
+            // 'c' or '\n' or '\000'
+            if at(p + 1) == 0 {
+                // ' at end of line
+                break;
+            }
+            let mut i = 2usize;
+            if at(p + 1) == b'\\' && at(p + 2) != 0 {
+                // '\n' or '\000'
+                i += 1;
+                while crate::ascii_defs::ascii_isdigit(i32::from(at(p + i - 1))) {
+                    i += 1;
+                }
+            }
+            if at(p + i - 1) != 0 && at(p + i) == b'\'' {
+                // check for trailing '
+                p += i;
+                p += 1;
+                continue;
+            }
+        } else if at(p) == b'"' {
+            // start of string
+            p += 1;
+            while at(p) != 0 {
+                if at(p) == b'\\' && at(p + 1) != 0 {
+                    p += 1;
+                } else if at(p) == b'"' {
+                    // end of string
+                    break;
+                }
+                p += 1;
+            }
+            if at(p) == b'"' {
+                p += 1;
+                continue; // continue for another string
+            }
+        } else if at(p) == b'R' && at(p + 1) == b'"' {
+            // Raw string: R"[delim](...)[delim]"
+            let delim = p + 2;
+            if let Some(rel) = crate::strings::vim_strchr(
+                line.get(delim.min(line.len())..).unwrap_or(&[]),
+                i32::from(b'('),
+            ) {
+                let delim_len = rel;
+                p += 3;
+                while at(p) != 0 {
+                    if at(p) == b')'
+                        && line
+                            .get(p + 1..(p + 1 + delim_len).min(line.len()))
+                            .is_some_and(|s| {
+                                s.len() == delim_len
+                                    && s == &line[delim..delim + delim_len]
+                            })
+                        && at(p + delim_len + 1) == b'"'
+                    {
+                        p += delim_len + 1;
+                        break;
+                    }
+                    p += 1;
+                }
+                if at(p) == b'"' {
+                    p += 1;
+                    continue; // continue for another string
+                }
+            }
+        }
+        break; // no string found
+    }
+
+    if at(p) == 0 {
+        // backup from NUL
+        p = p.saturating_sub(1);
+    }
+    p
+}
+
+/// Whether `line[col]` is inside a C string (`is_pos_in_string`).
+#[must_use]
+pub fn is_pos_in_string(line: &[u8], col: usize) -> bool {
+    let mut p = 0usize;
+    while line.get(p).is_some_and(|&c| c != 0) && p < col {
+        p = skip_string(line, p);
+        p += 1;
+    }
+    p > col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +270,97 @@ mod tests {
 
     /// The real default `'cinwords'`, read off a live nvim binary.
     const DEFAULT_CINW: &[u8] = b"if,else,while,do,for,switch";
+
+    // ---- skip_string / is_pos_in_string ----
+
+    #[test]
+    fn skip_string_leaves_a_non_string_position_alone() {
+        // Nothing string-like at `p`, so the index comes back unchanged.
+        assert_eq!(skip_string(b"abc", 0), 0);
+        assert_eq!(skip_string(b"abc", 1), 1);
+    }
+
+    #[test]
+    fn skip_string_skips_a_double_quoted_string() {
+        // `"abc"` - lands on the CLOSING quote, not past it, because
+        // of the original's own "backup from NUL" step.
+        assert_eq!(skip_string(b"\"abc\"", 0), 4);
+    }
+
+    #[test]
+    fn skip_string_advances_through_an_unterminated_string() {
+        // The header comment says an absent string returns the
+        // argument unmodified, but that is only true when `p` does
+        // not START a string. Once the opening quote is seen the
+        // original has already advanced `p`, and an unterminated
+        // string runs to the end of the line - then the "backup from
+        // NUL" step leaves it on the last byte. Quirk preserved.
+        assert_eq!(skip_string(b"\"abc", 0), 3);
+    }
+
+    #[test]
+    fn skip_string_skips_concatenated_strings_as_one_run() {
+        // "date""time" - the loop continues across the join.
+        let line = b"\"date\"\"time\"";
+        assert_eq!(skip_string(line, 0), line.len() - 1);
+    }
+
+    #[test]
+    fn skip_string_skips_a_char_constant_and_its_escapes() {
+        assert_eq!(skip_string(b"'a'", 0), 2);
+        // '\n' - the backslash form.
+        assert_eq!(skip_string(b"'\\n'", 0), 3);
+        // A lone quote at end of line is not a char constant.
+        assert_eq!(skip_string(b"'", 0), 0);
+    }
+
+    #[test]
+    fn skip_string_does_not_recognize_an_octal_char_constant() {
+        // The original's own digit loop overshoots: it advances `i`
+        // while `p[i - 1]` is a digit, so it stops with `p[i - 1]`
+        // ON the closing quote and `p[i]` one PAST it. The trailing
+        // check then tests the wrong byte and fails, leaving `'\000'`
+        // unrecognized despite the comment naming it. Faithfully
+        // preserved rather than "fixed" - the non-octal `'\n'` form
+        // above shows the same code path working as intended.
+        assert_eq!(skip_string(b"'\\000'", 0), 0);
+        assert_eq!(skip_string(b"'\\0'", 0), 0);
+    }
+
+    #[test]
+    fn skip_string_handles_an_escaped_quote_inside_a_string() {
+        // "a\"b" - the escaped quote must not end the string.
+        let line = b"\"a\\\"b\"";
+        assert_eq!(skip_string(line, 0), line.len() - 1);
+    }
+
+    #[test]
+    fn skip_string_skips_a_cpp_raw_string() {
+        // R"x(hi)x" - the delimiter is `x`, so only `)x"` ends it.
+        let line = b"R\"x(hi)x\"";
+        assert_eq!(skip_string(line, 0), line.len() - 1);
+        // With no `(` there is no delimiter, so it is not a raw string.
+        assert_eq!(skip_string(b"R\"xy", 0), 0);
+    }
+
+    #[test]
+    fn is_pos_in_string_detects_a_position_inside_a_string() {
+        // `"abc"` - index 2 is the `b`, inside the string.
+        assert!(is_pos_in_string(b"\"abc\"", 2));
+        // `x"y"` - index 2 is the `y`, inside the string.
+        assert!(is_pos_in_string(b"x\"y\"", 2));
+    }
+
+    #[test]
+    fn is_pos_in_string_is_false_outside_a_string() {
+        // Plain text is never inside a string.
+        assert!(!is_pos_in_string(b"abc", 1));
+        // The OPENING quote itself is not "inside" - the loop's own
+        // `(p - line) < col` bound exits before scanning it.
+        assert!(!is_pos_in_string(b"\"abc\"", 0));
+        // Text before a string starts.
+        assert!(!is_pos_in_string(b"x\"y\"", 0));
+    }
 
     #[test]
     fn cin_is_cinword_matches_a_keyword_followed_by_a_non_word_char() {
