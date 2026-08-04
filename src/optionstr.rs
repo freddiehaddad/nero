@@ -65,7 +65,11 @@
 //! validator, hand-traced against the original's own for-loop -
 //! whose OWN increment clause consumes the comma between pairs, on
 //! top of the manual per-character advancement the loop body already
-//! does - see its own doc comment).
+//! does - see its own doc comment). Also [`did_set_selection`]
+//! (delegates entirely to `did_set_str_generic`, its own pure
+//! redraw-scheduling call omitted) and [`did_set_sessionoptions`]
+//! (rejects `"sesdir"`+`"curdir"` together, restoring the OLD
+//! `ssop_flags` on that specific failure).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -561,6 +565,53 @@ pub unsafe fn did_set_matchpairs(args: &mut crate::option_defs::OptsetT) -> Opti
         }
         // The original for-loop's own increment - consumes the comma.
         i += 1;
+    }
+    None
+}
+
+/// The `'selection'` option is changed (`did_set_selection`).
+///
+/// Omits the original's own pure redraw-scheduling call
+/// (`redraw_curbuf_later`, reached when `GLOBALS.Visual.active`) -
+/// matching this crate's established policy - while keeping the
+/// underlying [`did_set_str_generic`] check.
+///
+/// # Safety
+/// Same as [`did_set_str_generic`].
+pub unsafe fn did_set_selection(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_str_generic(args) }
+}
+
+/// The `'sessionoptions'` option is changed (`did_set_sessionoptions`).
+///
+/// After the generic comma-list check, rejects the combination of
+/// both `"sesdir"` and `"curdir"` - restoring `ssop_flags` back to
+/// whatever the OLD value implies (matching the original's own
+/// re-parse-the-old-value call exactly, since `did_set_str_generic`'s
+/// own `check_str_opt` has already written the NEW, rejected flags
+/// into `ssop_flags` by this point).
+///
+/// # Safety
+/// Same as [`did_set_str_generic`].
+pub unsafe fn did_set_sessionoptions(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe { did_set_str_generic(args) };
+    if errmsg.is_some() {
+        return errmsg;
+    }
+    // SAFETY: a plain, momentary read - no aliasing hazard.
+    let ssop_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags;
+    if (ssop_flags & crate::option_vars::opt_ssop_flag::CURDIR != 0)
+        && (ssop_flags & crate::option_vars::opt_ssop_flag::SESDIR != 0)
+    {
+        if let crate::option_defs::OptVal::String(ref old) = args.os_oldval
+            && let Some(restored_flags) = opt_strings_flags(old, crate::option_vars::OPT_SSOP_VALUES, true)
+        {
+            // SAFETY: a plain, momentary write - no aliasing hazard.
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags = restored_flags;
+        }
+        return Some(crate::errors::e_invarg.as_bytes());
     }
     None
 }
@@ -1374,5 +1425,67 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"(:),,{:}".to_vec());
         let mut args = set_varp_args(&mut val);
         assert_eq!(unsafe { did_set_matchpairs(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_selection ----
+
+    #[test]
+    fn did_set_selection_accepts_every_real_value() {
+        for val in crate::option_vars::OPT_SEL_VALUES {
+            let mut val_opt: Option<Vec<u8>> = Some(val.as_bytes().to_vec());
+            let varp = &mut val_opt as *mut Option<Vec<u8>> as *mut c_void;
+            let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Selection, os_varp: varp, ..Default::default() };
+            assert_eq!(unsafe { did_set_selection(&mut args) }, None, "value {val:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn did_set_selection_rejects_an_unknown_value() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Selection, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_selection(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_sessionoptions ----
+
+    #[test]
+    fn did_set_sessionoptions_accepts_a_valid_combination() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut val: Option<Vec<u8>> = Some(b"blank,help".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Sessionoptions,
+            os_varp: varp,
+            os_oldval: crate::option_defs::OptVal::String(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_sessionoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_sessionoptions_rejects_sesdir_and_curdir_together_and_restores_old_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut val: Option<Vec<u8>> = Some(b"sesdir,curdir".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: OptIndex::Sessionoptions,
+            os_varp: varp,
+            os_oldval: crate::option_defs::OptVal::String(b"blank".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_sessionoptions(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+
+        // ssop_flags is restored to whatever "blank" (the old value)
+        // implies - "blank" is index 7 in OPT_SSOP_VALUES.
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags, 1 << 7);
+    }
+
+    #[test]
+    fn did_set_sessionoptions_invalid_value_fails_before_the_sesdir_curdir_check() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Sessionoptions, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_sessionoptions(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 }
