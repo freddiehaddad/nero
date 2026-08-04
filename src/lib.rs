@@ -103,6 +103,7 @@ pub mod memory_defs;
 pub mod menu;
 pub mod menu_defs;
 pub mod message;
+pub mod mouse;
 #[path = "move.rs"]
 pub mod r#move;
 pub mod normal;
