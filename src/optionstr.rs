@@ -132,6 +132,12 @@
 //! `fold.rs`'s own real fold-tree search/update machinery isn't
 //! translated yet.
 //!
+//! Also [`did_set_whichwrap`] - a thin `did_set_option_listflag`
+//! wrapper over `option_vars::WW_ALL` (plus a trailing `,`, since
+//! `'whichwrap'` is itself a comma-separated flag list - the original
+//! appends the separator via adjacent string-literal concatenation
+//! for this one call).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -801,6 +807,26 @@ pub unsafe fn did_set_mouse(args: &mut crate::option_defs::OptsetT) -> Option<&'
     let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
     let val: &[u8] = varp.as_deref().unwrap_or(&[]);
     did_set_option_listflag(val, crate::option_vars::MOUSE_ALL.as_bytes())
+}
+
+/// The `'whichwrap'` option is changed (`did_set_whichwrap`).
+///
+/// `'whichwrap'` is itself a comma-separated flag list, so the
+/// original appends a `,` to `WW_ALL` (adjacent string-literal
+/// concatenation, `WW_ALL ","`) for this one call, making the comma
+/// separator itself pass as a valid character.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_whichwrap(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    let mut flags = crate::option_vars::WW_ALL.as_bytes().to_vec();
+    flags.push(b',');
+    did_set_option_listflag(val, &flags)
 }
 
 /// The `'mousescroll'` option is changed (`did_set_mousescroll`).
@@ -2321,6 +2347,43 @@ mod tests {
         let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
         let mut args = crate::option_defs::OptsetT { os_varp: varp, ..Default::default() };
         assert_eq!(unsafe { did_set_mouse(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_whichwrap ----
+
+    fn whichwrap_args(val: &mut Option<Vec<u8>>) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT { os_varp: val as *mut Option<Vec<u8>> as *mut c_void, ..Default::default() }
+    }
+
+    #[test]
+    fn did_set_whichwrap_accepts_every_real_flag_character() {
+        // WW_ALL == "bshl<>[]~" - every one of its own characters is
+        // individually valid.
+        let mut val: Option<Vec<u8>> = Some(b"bshl<>[]~".to_vec());
+        let mut args = whichwrap_args(&mut val);
+        assert_eq!(unsafe { did_set_whichwrap(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_whichwrap_accepts_a_comma_separated_list() {
+        // The real default value: a comma-separated list of flags.
+        let mut val: Option<Vec<u8>> = Some(b"b,s".to_vec());
+        let mut args = whichwrap_args(&mut val);
+        assert_eq!(unsafe { did_set_whichwrap(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_whichwrap_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = whichwrap_args(&mut val);
+        assert_eq!(unsafe { did_set_whichwrap(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_whichwrap_rejects_an_unknown_flag_character() {
+        let mut val: Option<Vec<u8>> = Some(b"bz".to_vec());
+        let mut args = whichwrap_args(&mut val);
+        assert_eq!(unsafe { did_set_whichwrap(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 
     // ---- did_set_mousescroll ----
