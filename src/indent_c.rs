@@ -69,6 +69,10 @@
 //! is missed while the same text indented is found - preserved and
 //! pinned by its own test rather than "fixed".
 //!
+//! Also [`check_linecomment`] - the column of a line comment's start,
+//! or `MAXCOL` for none. Handles both the C `//` form and, for a
+//! `'lisp'` buffer, the `;` form with its own string tracking.
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
 //! `find_line_comment`/`cin_iswhileofdo_end` (need `ml_get`, the
 //! cursor and `find_match_paren`) and the rest of the real
@@ -983,6 +987,92 @@ pub fn cin_is_if_for_while_before_offset(line: &[u8], offset: usize) -> Option<u
     }
 }
 
+/// The column of a line comment's start, or `MAXCOL` when there is
+/// none (`check_linecomment`).
+///
+/// The line is scanned once (skipping strings), so this stays linear
+/// even on lines with many slashes.
+///
+/// For a `'lisp'` buffer this looks for a `';'` comment instead,
+/// tracking string state as it goes.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`, matching [`cindent_on`]'s own safety doc.
+#[must_use]
+pub unsafe fn check_linecomment(line: &[u8]) -> i32 {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let lisp = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }.b_p_lisp != 0;
+
+    let mut found: Option<usize> = None;
+
+    if lisp {
+        // skip Lispish one-line comments
+        if crate::strings::vim_strchr(line, i32::from(b';')).is_some() {
+            // there may be comments
+            let mut in_str = false; // inside of string
+            let mut p = 0usize;
+            while let Some(rel) = line
+                .get(p..)
+                .and_then(|t| t.iter().position(|&c| c == b'"' || c == b';'))
+            {
+                p += rel;
+                if at(p) == b'"' {
+                    if in_str {
+                        if at(p.wrapping_sub(1)) != b'\\' {
+                            // skip escaped quote
+                            in_str = false;
+                        }
+                    } else if p == 0
+                        || (p >= 2
+                            // skip #\" form
+                            && at(p - 1) != b'\\'
+                            && at(p - 2) != b'#')
+                    {
+                        in_str = true;
+                    }
+                } else if !in_str
+                    && (p < 2 || (at(p - 1) != b'\\' && at(p - 2) != b'#'))
+                    && !is_pos_in_string(line, p)
+                {
+                    found = Some(p); // found!
+                    break;
+                }
+                p += 1;
+            }
+        }
+    } else {
+        // Scan the line once, skipping over strings, char constants
+        // and raw strings, instead of testing each '/' with
+        // is_pos_in_string() (which rescans from the start, making
+        // this quadratic on lines with many slashes).
+        let mut p = 0usize;
+        while at(p) != 0 {
+            p = skip_string(line, p);
+            if at(p) == 0 {
+                break;
+            }
+            // Accept a double /, unless it's preceded with * and
+            // followed by *, because * / / * is an end and start of a
+            // C comment.
+            if at(p) == b'/'
+                && at(p + 1) == b'/'
+                && (p == 0 || at(p - 1) != b'*' || at(p + 2) != b'*')
+            {
+                found = Some(p);
+                break;
+            }
+            p += 1;
+        }
+    }
+
+    match found {
+        None => crate::pos_defs::MAXCOL,
+        Some(p) => i32::try_from(p).unwrap_or(crate::pos_defs::MAXCOL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1169,93 @@ mod tests {
     // ---- cin_is_cpp_namespace / after_label ----
 
     // ---- cin_is_if_for_while_before_offset ----
+
+    // ---- check_linecomment ----
+
+    /// Runs `f` with a buffer whose `'lisp'` option is `lisp`.
+    fn with_lisp<R>(lisp: i32, f: impl FnOnce() -> R) -> R {
+        let mut buf = BufT {
+            b_p_lisp: lisp,
+            ..Default::default()
+        };
+        let _guard = CurbufGuard::set(&mut buf);
+        f()
+    }
+
+    #[test]
+    fn check_linecomment_finds_a_slash_slash_comment() {
+        with_lisp(0, || {
+            assert_eq!(unsafe { check_linecomment(b"// c") }, 0);
+            assert_eq!(unsafe { check_linecomment(b"x = 1; // c") }, 7);
+        });
+    }
+
+    #[test]
+    fn check_linecomment_is_maxcol_when_there_is_no_comment() {
+        with_lisp(0, || {
+            assert_eq!(
+                unsafe { check_linecomment(b"x = 1;") },
+                crate::pos_defs::MAXCOL
+            );
+            assert_eq!(unsafe { check_linecomment(b"") }, crate::pos_defs::MAXCOL);
+            // A single slash is division, not a comment.
+            assert_eq!(
+                unsafe { check_linecomment(b"a / b") },
+                crate::pos_defs::MAXCOL
+            );
+        });
+    }
+
+    #[test]
+    fn check_linecomment_ignores_slashes_inside_a_string() {
+        with_lisp(0, || {
+            // The `//` inside the literal must not count...
+            assert_eq!(
+                unsafe { check_linecomment(b"x = \"http://a\";") },
+                crate::pos_defs::MAXCOL
+            );
+            // ...but a real one after it does.
+            assert_eq!(unsafe { check_linecomment(b"x = \"a\"; // c") }, 9);
+        });
+    }
+
+    #[test]
+    fn check_linecomment_rejects_the_star_slash_slash_star_sequence() {
+        with_lisp(0, || {
+            // `*//*` is the end of one C comment and the start of the
+            // next, not a line comment, so it is skipped.
+            assert_eq!(
+                unsafe { check_linecomment(b"a*//*b") },
+                crate::pos_defs::MAXCOL
+            );
+        });
+    }
+
+    #[test]
+    fn check_linecomment_finds_a_semicolon_comment_in_lisp_mode() {
+        with_lisp(1, || {
+            assert_eq!(unsafe { check_linecomment(b"; c") }, 0);
+            assert_eq!(unsafe { check_linecomment(b"(foo) ; c") }, 6);
+            // No semicolon at all.
+            assert_eq!(
+                unsafe { check_linecomment(b"(foo)") },
+                crate::pos_defs::MAXCOL
+            );
+        });
+    }
+
+    #[test]
+    fn check_linecomment_lisp_mode_ignores_a_semicolon_inside_a_string() {
+        with_lisp(1, || {
+            // The `;` inside the literal must not count...
+            assert_eq!(
+                unsafe { check_linecomment(b"(foo \";\")") },
+                crate::pos_defs::MAXCOL
+            );
+            // ...but a real one after it does.
+            assert_eq!(unsafe { check_linecomment(b"(foo \"a\") ; c") }, 10);
+        });
+    }
 
     #[test]
     fn cin_is_if_for_while_before_offset_finds_an_indented_keyword() {
