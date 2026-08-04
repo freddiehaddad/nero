@@ -36,6 +36,10 @@
 //! the switch-label and `'cinscopedecls'` recognizers, all resting on
 //! `cin_skipcomment`.
 //!
+//! Also [`cin_skip_comment_and_string`] and [`cin_is_compound_init`]
+//! (structure/compound-literal initialization: `=|return
+//! [&][(typecast)] [{]`).
+//!
 //! Deferred: everything else - `cin_islinecomment`/`find_line_comment`
 //! (need `ml_get` and the cursor), `cin_ends_in`/`cin_is_cpp_extern_c`
 //! and the rest of the real indent-computation algorithm.
@@ -464,6 +468,106 @@ pub unsafe fn cin_isscopedecl(line: &[u8], p: usize) -> bool {
     false
 }
 
+/// Skip comments and strings repeatedly until neither applies
+/// (`cin_skip_comment_and_string`).
+///
+/// The original loops until the position stops moving, because
+/// skipping a comment can expose a string and vice versa.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_skip_comment_and_string(line: &[u8], s: usize) -> usize {
+    let mut p = s;
+    loop {
+        let r = p;
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p) };
+        if line.get(p).copied().unwrap_or(0) != 0 {
+            p = skip_string(line, p);
+        }
+        if p == r {
+            return p;
+        }
+    }
+}
+
+/// Recognize structure or compound literal initialization
+/// (`cin_is_compound_init`): `=|return [&][(typecast)] [{]`, with an
+/// arbitrary number of opening braces.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_is_compound_init(line: &[u8], s: usize) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut p = s;
+    let mut r: Option<usize> = None;
+
+    while at(p) != 0 {
+        if at(p) == b'=' {
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skipcomment(line, p + 1) };
+            r = Some(p);
+        } else if line.get(p..).is_some_and(|t| t.starts_with(b"return"))
+            && !crate::charset::vim_isidc(i32::from(at(p + 6)))
+            && (p == s || !crate::charset::vim_isidc(i32::from(at(p - 1))))
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skipcomment(line, p + 6) };
+            r = Some(p);
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skip_comment_and_string(line, p + 1) };
+        }
+    }
+
+    // p points now after '=' or "return"
+    let Some(mut p) = r else {
+        return false;
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { cin_nocode(line, p) } {
+        return true;
+    }
+
+    if at(p) == b'&' {
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p + 1) };
+    }
+
+    if at(p) == b'(' {
+        // skip a typecast
+        let mut open_count: i32 = 1;
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skip_comment_and_string(line, p + 1) };
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { cin_nocode(line, p) } {
+                return true;
+            }
+            open_count += i32::from(at(p) == b'(') - i32::from(at(p) == b')');
+            if open_count == 0 {
+                break;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p + 1) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { cin_nocode(line, p) } {
+            return true;
+        }
+    }
+
+    while at(p) == b'{' {
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p + 1) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { cin_nocode(line, p) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +652,83 @@ mod tests {
 
     /// The real default `'cinscopedecls'`, read off a live nvim binary.
     const DEFAULT_CINSD: &[u8] = b"public,protected,private";
+
+    // ---- cin_skip_comment_and_string / cin_is_compound_init ----
+
+    #[test]
+    fn cin_skip_comment_and_string_loops_until_nothing_moves() {
+        with_hash_comment(0, || {
+            // A comment followed by a string: one pass would leave
+            // the string, so the loop must run twice.
+            let line = b"/* c */\"str\"x";
+            assert_eq!(
+                unsafe { cin_skip_comment_and_string(line, 0) },
+                line.len() - 1
+            );
+            // Nothing to skip leaves the index alone.
+            assert_eq!(unsafe { cin_skip_comment_and_string(b"x", 0) }, 0);
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_accepts_an_assignment_opening_a_brace() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_compound_init(b"int x = {", 0) });
+            // Several opening braces are allowed.
+            assert!(unsafe { cin_is_compound_init(b"int x = {{", 0) });
+            // A bare `=` at end of line also counts.
+            assert!(unsafe { cin_is_compound_init(b"int x =", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_accepts_return_forms() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_compound_init(b"return {", 0) });
+            assert!(unsafe { cin_is_compound_init(b"return", 0) });
+            // `return &{` - the address-of form.
+            assert!(unsafe { cin_is_compound_init(b"return &{", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_skips_a_typecast() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_compound_init(b"x = (struct foo){", 0) });
+            assert!(unsafe { cin_is_compound_init(b"return (T){", 0) });
+            // Nested parens in the cast are balanced correctly.
+            assert!(unsafe { cin_is_compound_init(b"x = (a(b)){", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_rejects_lines_without_an_assignment_or_return() {
+        with_hash_comment(0, || {
+            assert!(!unsafe { cin_is_compound_init(b"int x;", 0) });
+            assert!(!unsafe { cin_is_compound_init(b"", 0) });
+            assert!(!unsafe { cin_is_compound_init(b"{", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_rejects_trailing_code_after_the_brace() {
+        with_hash_comment(0, || {
+            // Real code after the brace means this is not just an
+            // opening of a compound initializer.
+            assert!(!unsafe { cin_is_compound_init(b"x = { 1", 0) });
+            assert!(!unsafe { cin_is_compound_init(b"x = y;", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_compound_init_requires_return_to_be_its_own_word() {
+        with_hash_comment(0, || {
+            // "returns" and "myreturn" are not the `return` keyword,
+            // so neither line has an assignment or return at all.
+            assert!(!unsafe { cin_is_compound_init(b"returns {", 0) });
+            assert!(!unsafe { cin_is_compound_init(b"myreturn {", 0) });
+        });
+    }
 
     #[test]
     fn cin_isdefault_recognizes_a_default_label() {
