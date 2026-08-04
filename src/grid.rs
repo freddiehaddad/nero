@@ -24,10 +24,13 @@
 //! (`hl_combine_attr`), and `decor`'s own providers, none translated.
 //! `schar_cache_clear` likewise needs `decor_check_invalid_glyphs`.
 //!
-//! `line_do_arabic_shape` needs `arabic.c`'s own `arabic_shape`, not
-//! translated; its two private helpers (`schar_in_arabic_block`,
-//! `schar_get_first_two_codepoints`) have no other caller and are held
-//! back with it rather than landed as dead code.
+//! `line_do_arabic_shape` and its two private helpers landed once
+//! `arabic.rs`'s own `arabic_shape` did. Note the argument order at
+//! its `arabic_shape` call: the NEXT character is passed as that
+//! function's `prev_c`, and the PREVIOUS one as its `next_c`. That is
+//! not a mistake - the glyph buffer is in VISUAL order while
+//! `arabic_shape` reasons in LOGICAL order, and Arabic runs
+//! right-to-left, so the two are mirrored.
 //!
 //! `schar_get_adv` is deliberately NOT translated: the original's
 //! `schar_get`/`schar_get_adv` split exists purely so a caller can
@@ -240,6 +243,139 @@ pub fn schar_get(sc: ScharT) -> Vec<u8> {
     }
 }
 
+/// The first raw UTF-8 byte of `sc` (`schar_get_first_byte`).
+fn schar_get_first_byte(sc: ScharT) -> u8 {
+    if schar_high(sc) {
+        // SAFETY: a plain global-cell borrow, no aliasing hazard.
+        let cache = unsafe { GLYPH_CACHE.get_mut() };
+        let idx = schar_idx(sc) as usize;
+        debug_assert!(idx < cache.len());
+        cache.keys().get(idx).and_then(|k| k.first()).copied().unwrap_or(0)
+    } else {
+        sc.to_ne_bytes()[0]
+    }
+}
+
+/// Whether `sc` starts in the Arabic Unicode block
+/// (`schar_in_arabic_block`).
+///
+/// Tests only the FIRST UTF-8 byte: `0xD8`/`0xD9` are the two lead
+/// bytes covering U+0600..U+07FF, so masking off the low bit of the
+/// lead byte identifies both at once. This is a cheap pre-filter, not
+/// an exact test - `line_do_arabic_shape` re-checks with
+/// `ARABIC_CHAR` before shaping anything.
+fn schar_in_arabic_block(sc: ScharT) -> bool {
+    (schar_get_first_byte(sc) & 0xFE) == 0xD8
+}
+
+/// `ARABIC_CHAR(ch)` (`arabic.h`) - whether `ch` is in U+0600..U+06FF.
+const fn arabic_char(ch: i32) -> bool {
+    (ch & 0xFF00) == 0x0600
+}
+
+/// The first two codepoints of `sc`, or `0` when not available
+/// (`schar_get_first_two_codepoints`).
+fn schar_get_first_two_codepoints(sc: ScharT) -> (i32, i32) {
+    let buf = schar_get_nul_terminated(sc);
+    let c0 = crate::mbyte::utf_ptr2char(&buf);
+    if c0 == 0 {
+        return (0, 0);
+    }
+    let len = usize::try_from(crate::mbyte::utf_ptr2len(&buf)).unwrap_or(0);
+    let c1 = if len < buf.len() {
+        crate::mbyte::utf_ptr2char(&buf[len..])
+    } else {
+        0
+    };
+    (c0, c1)
+}
+
+/// Apply Arabic shaping to a whole line of glyphs in place
+/// (`line_do_arabic_shape`).
+///
+/// The original takes a `schar_T *buf` plus a separate `cols` count; a
+/// slice carries both, so a caller wanting to shape only part of a
+/// line passes `&mut buf[..cols]`.
+///
+/// Note the argument order at the `arabic_shape` call: the NEXT
+/// character is passed as that function's `prev_c`/`prev_c1`, and the
+/// PREVIOUS one as its `next_c`. That is not a mistake - the glyph
+/// buffer is in VISUAL order while `arabic_shape` reasons in LOGICAL
+/// order, and Arabic runs right-to-left, so the two are mirrored.
+/// Preserved exactly as the original has it.
+///
+/// # Safety
+/// Forwarded from [`crate::arabic::arabic_shape`]'s own safety doc.
+pub unsafe fn line_do_arabic_shape(buf: &mut [ScharT]) {
+    let cols = buf.len();
+
+    // quickly skip over non-arabic text
+    let Some(start) = buf.iter().position(|&sc| schar_in_arabic_block(sc)) else {
+        return;
+    };
+
+    let mut c0prev = 0i32;
+    let (mut c0, mut c1) = schar_get_first_two_codepoints(buf[start]);
+
+    for i in start..cols {
+        let (c0next, c1next) = schar_get_first_two_codepoints(if i + 1 < cols {
+            buf[i + 1]
+        } else {
+            0
+        });
+
+        if arabic_char(c0) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (c0new, c1new) = unsafe {
+                // Visual order vs logical order - see this function's
+                // own doc comment.
+                crate::arabic::arabic_shape(c0, c1, c0next, c1next, c0prev)
+            };
+
+            if c0new != c0 || c1new != c1 {
+                let sc_bytes = schar_get(buf[i]);
+                let mut scbuf_new = [0u8; MAX_SCHAR_SIZE];
+                let mut len = usize::try_from(crate::mbyte::utf_char2bytes(c0new, &mut scbuf_new))
+                    .unwrap_or(0);
+                if c1new != 0 {
+                    len += usize::try_from(crate::mbyte::utf_char2bytes(
+                        c1new,
+                        &mut scbuf_new[len..],
+                    ))
+                    .unwrap_or(0);
+                }
+
+                let off = usize::try_from(
+                    crate::mbyte::utf_char2len(c0)
+                        + if c1 != 0 {
+                            crate::mbyte::utf_char2len(c1)
+                        } else {
+                            0
+                        },
+                )
+                .unwrap_or(0);
+                let mut rest = sc_bytes.len().saturating_sub(off);
+
+                if rest > 0 && rest + len + 1 > MAX_SCHAR_SIZE {
+                    // Too bigly, discard one code-point. This is
+                    // enough because c0 cannot grow by more than two
+                    // bytes (base arabic to extended arabic).
+                    let tail = &sc_bytes[off..off + rest];
+                    let b = crate::mbyte::utf_cp_bounds(tail, rest - 1);
+                    rest -= usize::try_from(b.begin_off).unwrap_or(0) + 1;
+                }
+
+                scbuf_new[len..len + rest].copy_from_slice(&sc_bytes[off..off + rest]);
+                buf[i] = schar_from_buf(&scbuf_new[..len + rest]);
+            }
+        }
+
+        c0prev = c0;
+        c0 = c0next;
+        c1 = c1next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +512,113 @@ mod tests {
         assert_eq!(schar_get_first_codepoint(0), 0);
         assert_eq!(schar_get_ascii(0), 0);
         assert_eq!(schar_cells(0), 1);
+    }
+
+    #[test]
+    fn line_do_arabic_shape_leaves_a_non_arabic_line_alone() {
+        let _l = lock();
+        let mut buf: Vec<ScharT> = "hello"
+            .chars()
+            .map(|c| schar_from_char(c as i32))
+            .collect();
+        let before = buf.clone();
+        unsafe { line_do_arabic_shape(&mut buf) };
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn line_do_arabic_shape_leaves_an_empty_line_alone() {
+        let _l = lock();
+        let mut buf: Vec<ScharT> = Vec::new();
+        unsafe { line_do_arabic_shape(&mut buf) };
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn schar_in_arabic_block_matches_only_the_arabic_lead_bytes() {
+        let _l = lock();
+        // U+0600..U+07FF encode with a 0xD8 or 0xD9 lead byte.
+        assert!(schar_in_arabic_block(schar_from_char(0x0644))); // LAM
+        assert!(schar_in_arabic_block(schar_from_char(0x0627))); // ALEF
+        // Latin, and a box-drawing char (0xE2 lead), are not.
+        assert!(!schar_in_arabic_block(schar_from_ascii(b'a')));
+        assert!(!schar_in_arabic_block(schar_from_char(0x2500)));
+    }
+
+    #[test]
+    fn schar_get_first_two_codepoints_splits_a_base_and_its_composing_char() {
+        let _l = lock();
+        // A bare character has no second codepoint.
+        assert_eq!(
+            schar_get_first_two_codepoints(schar_from_char(0x0644)),
+            (0x0644, 0)
+        );
+        // A base plus one composing char reports both.
+        let sc = schar_from_buf("\u{0644}\u{0627}".as_bytes());
+        assert_eq!(schar_get_first_two_codepoints(sc), (0x0644, 0x0627));
+        // The empty glyph reports nothing at all.
+        assert_eq!(schar_get_first_two_codepoints(0), (0, 0));
+    }
+
+    #[test]
+    fn line_do_arabic_shape_joins_a_run_of_lam() {
+        let _l = lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_arshape, prev_tbidi) = (opts.p_arshape, opts.p_tbidi);
+        opts.p_arshape = 1;
+        opts.p_tbidi = 0;
+
+        // Three LAMs in a row. Hand-traced against a_LAM's own ACHARS
+        // row (isolated fedd, initial fedf, medial fee0, final fede)
+        // and this function's visual-vs-logical argument mirroring:
+        // the FIRST glyph has no visual predecessor but does have a
+        // successor, which `arabic_shape` sees as its `prev_c`, so it
+        // shapes as a FINAL form; the middle one joins both ways and
+        // is MEDIAL; the last has only a visual predecessor, seen as
+        // `next_c`, so it is INITIAL.
+        let lam = schar_from_char(0x0644);
+        let mut buf = vec![lam; 3];
+        unsafe { line_do_arabic_shape(&mut buf) };
+
+        assert_eq!(schar_get_first_two_codepoints(buf[0]).0, 0xfede);
+        assert_eq!(schar_get_first_two_codepoints(buf[1]).0, 0xfee0);
+        assert_eq!(schar_get_first_two_codepoints(buf[2]).0, 0xfedf);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_arshape = prev_arshape;
+        opts.p_tbidi = prev_tbidi;
+    }
+
+    #[test]
+    fn line_do_arabic_shape_gates_only_the_ligature_on_arabicshape() {
+        let _l = lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_arshape, prev_tbidi) = (opts.p_arshape, opts.p_tbidi);
+
+        // A LAM carrying a composing ALEF. With 'arabicshape' ON the
+        // pair collapses into the LAM-ALEF ligature and the composing
+        // char is consumed.
+        let lam_alef = schar_from_buf("\u{0644}\u{0627}".as_bytes());
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_arshape = 1;
+        opts.p_tbidi = 0;
+        let mut buf = vec![lam_alef];
+        unsafe { line_do_arabic_shape(&mut buf) };
+        assert_eq!(schar_get_first_two_codepoints(buf[0]), (0xfefb, 0));
+
+        // With it OFF the ligature does not form - but the ordinary
+        // joining forms still apply, so the LAM becomes its ISOLATED
+        // presentation form and keeps its composing char. Only
+        // `arabic_combine` consults 'arabicshape'.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_arshape = 0;
+        let mut buf = vec![lam_alef];
+        unsafe { line_do_arabic_shape(&mut buf) };
+        assert_eq!(schar_get_first_two_codepoints(buf[0]), (0xfedd, 0x0627));
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_arshape = prev_arshape;
+        opts.p_tbidi = prev_tbidi;
     }
 
     #[test]
