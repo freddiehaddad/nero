@@ -354,6 +354,32 @@
 //! and is instead rejected by the "corner char between edge chars"
 //! rule.
 //!
+//! Also `set_chars_option` and its `get_encoded_char_adv`/
+//! `field_value_err` helpers, plus the `LCS_TAB`/`FCS_TAB` field
+//! tables - the `'listchars'`/`'fillchars'` parser. The original's
+//! `struct chars_tab` holds a raw `schar_T *cp` into the file-static
+//! `lcs_chars`/`fcs_chars` and then compares that POINTER against
+//! specific field addresses to recognise the multi-character
+//! `tab`/`leadtab` entries; that becomes a `CharsField` selector here,
+//! whose equality test is exactly the original's pointer equality
+//! without needing raw pointers into a mutable static. The two scratch
+//! structs likewise become plain locals - they are fully
+//! re-initialised at the top of the storing round and only read at the
+//! very end, so nothing observable depends on their being statics.
+//!
+//! Cross-checked field-by-field against a real `nvim` binary, which
+//! pinned several things worth stating: the `'fillchars'` field is
+//! spelled `foldclose` even though the struct member is `foldclosed`
+//! (`foldclosed:+` is E474); invalid OR truncated hex escapes
+//! (`\xZZ`, `\x`) report E1512 "wrong character width" rather than a
+//! parse error, because `get_encoded_char_adv` funnels both into the
+//! same `0` sentinel; and a double-width escape (`\U0001F600`) lands
+//! on that same path. Note `field_value_err` returns a non-NULL EMPTY
+//! string when given no error buffer, so a per-field error is still
+//! reported but carries no message - `check_chars_options` depends on
+//! exactly that, and it is pinned by its own test rather than papered
+//! over.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1705,6 +1731,32 @@ pub unsafe fn did_set_completeslash(args: &mut crate::option_defs::OptsetT) -> O
 #[allow(non_upper_case_globals)]
 const e_comma_required: &str = crate::gettext_defs::gettext_noop("E536: Comma required");
 
+/// Error message for a `'listchars'`/`'fillchars'` field given the
+/// wrong number of characters (`e_wrong_number_of_characters_for_field_str`,
+/// a file-local `static const char[]` in the original - kept
+/// file-local here too, same precedent as `e_comma_required`).
+///
+/// The original formats the offending field's own name into the `%s`
+/// via `field_value_err`/`vim_vsnprintf`; per this module's own
+/// established policy for dynamically-formatted messages, the
+/// placeholder is left unformatted here. The message is still worth
+/// reproducing as its own constant because it is genuinely
+/// distinguishable from `e_invarg`, so tests can tell the two
+/// failure paths apart.
+#[allow(non_upper_case_globals)]
+const e_wrong_number_of_characters_for_field_str: &str =
+    crate::gettext_defs::gettext_noop("E1511: Wrong number of characters for field \"%s\"");
+
+/// Error message for a `'listchars'`/`'fillchars'` field whose
+/// character is the wrong width - i.e. double-width, which the
+/// original notes is forbidden, apparently a TUI limitation
+/// (`e_wrong_character_width_for_field_str`). Same file-local scoping
+/// and same unformatted-`%s` treatment as
+/// `e_wrong_number_of_characters_for_field_str` above.
+#[allow(non_upper_case_globals)]
+const e_wrong_character_width_for_field_str: &str =
+    crate::gettext_defs::gettext_noop("E1512: Wrong character width for field \"%s\"");
+
 /// All `'shortmess'` flag characters (`SHM_ALL`, a file-local
 /// `static char[]` in the original - kept file-local here too,
 /// matching the original's own scoping, following this module's own
@@ -2940,6 +2992,539 @@ pub unsafe fn did_set_foldmarker(args: &mut crate::option_defs::OptsetT) -> Opti
     }
 
     None
+}
+
+/// Read one `'listchars'`/`'fillchars'` field character from `p`,
+/// advancing past it (`get_encoded_char_adv`).
+///
+/// Calls the equivalent of `mb_cptr2char_adv(p)` and returns the
+/// character. If `p` starts with `\x`, `\u` or `\U` the hex or
+/// unicode value is used instead.
+///
+/// Returns `(schar, consumed)`. A `schar` of `0` means invalid hex or
+/// an invalid UTF-8 byte, matching the original's own sentinel; note
+/// a double-width character also yields `0`, since the original notes
+/// two-column characters are forbidden here.
+///
+/// The original takes `const char **p` and advances it in place;
+/// returning the byte count consumed says the same thing without a
+/// pointer-to-pointer. Note the original advances `*p` even on the
+/// hex path's own failure returns, so the consumed count is reported
+/// on every path rather than only on success.
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::utfc_ptr2schar`]'s own safety doc.
+unsafe fn get_encoded_char_adv(p: &[u8]) -> (crate::types_defs::ScharT, usize) {
+    if p.len() >= 2 && p[0] == b'\\' && matches!(p[1], b'x' | b'u' | b'U') {
+        let mut num: i64 = 0;
+        let bytes = match p[1] {
+            b'x' => 1,
+            b'u' => 2,
+            _ => 4,
+        };
+        let mut off = 0usize;
+        for _ in 0..bytes {
+            off += 2;
+            let n = if off < p.len() {
+                crate::charset::hexhex2nr(&p[off..])
+            } else {
+                -1
+            };
+            if n < 0 {
+                return (0, off);
+            }
+            num = num * 256 + i64::from(n);
+        }
+        off += 2;
+        let num = i32::try_from(num).unwrap_or(0xFFFD);
+        // SAFETY: a plain width lookup on a codepoint value.
+        let too_wide = unsafe { crate::charset::char2cells(num) } > 1;
+        return (
+            if too_wide {
+                0
+            } else {
+                crate::grid::schar_from_char(num)
+            },
+            off,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let clen = usize::try_from(unsafe { crate::mbyte::utfc_ptr2len(p) }).unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let (c, firstc) = unsafe { crate::mbyte::utfc_ptr2schar(p) };
+    // SAFETY: a plain width lookup on a codepoint value.
+    let too_wide = unsafe { crate::charset::char2cells(firstc) } > 1;
+    // Invalid UTF-8 byte or doublewidth not allowed
+    let sc = if (clen == 1 && firstc > 127) || too_wide {
+        0
+    } else {
+        c
+    };
+    (sc, clen)
+}
+
+/// Which `'listchars'`/`'fillchars'` option a `set_chars_option` call
+/// is handling (`CharsOption`, `optionstr.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharsOption {
+    Fillchars,
+    Listchars,
+}
+
+/// Which field of `LcsCharsT`/`FcsCharsT` one `chars_tab` entry
+/// writes to.
+///
+/// The original stores a raw `schar_T *cp` pointing straight into the
+/// file-static `lcs_chars`/`fcs_chars`, and then compares that pointer
+/// against specific field addresses (`tab[i].cp == &lcs_chars.tab2`)
+/// to recognise the multi-character `tab`/`leadtab` entries. A field
+/// selector is the direct translation of "which field does this entry
+/// write", and selector equality is exactly the same test as the
+/// original's pointer equality - without needing raw pointers into a
+/// mutable static. `None` models the original's own `NULL` `cp`, used
+/// by the `multispace`/`leadmultispace` entries that are handled
+/// entirely by special cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharsField {
+    None,
+    LcsEol,
+    LcsExt,
+    LcsNbsp,
+    LcsPrec,
+    LcsSpace,
+    LcsTab2,
+    LcsLeadtab2,
+    LcsLead,
+    LcsTrail,
+    LcsConceal,
+    FcsStl,
+    FcsStlnc,
+    FcsWbr,
+    FcsHoriz,
+    FcsHorizup,
+    FcsHorizdown,
+    FcsVert,
+    FcsVertleft,
+    FcsVertright,
+    FcsVerthoriz,
+    FcsFold,
+    FcsFoldopen,
+    FcsFoldclosed,
+    FcsFoldsep,
+    FcsFoldinner,
+    FcsDiff,
+    FcsMsgsep,
+    FcsEob,
+    FcsLastline,
+    FcsTrunc,
+    FcsTruncrl,
+}
+
+/// One row of `lcs_tab`/`fcs_tab` (`struct chars_tab`).
+struct CharsTab {
+    /// which field this entry writes (`schar_T *cp`)
+    cp: CharsField,
+    /// char id (`String name`)
+    name: &'static str,
+    /// default value
+    def: Option<&'static str>,
+    /// default value when `def` isn't single-width
+    fallback: Option<&'static str>,
+}
+
+/// Shorthand mirroring the original's own `CHARSTAB_ENTRY` macro.
+const fn charstab_entry(
+    cp: CharsField,
+    name: &'static str,
+    def: Option<&'static str>,
+    fallback: Option<&'static str>,
+) -> CharsTab {
+    CharsTab {
+        cp,
+        name,
+        def,
+        fallback,
+    }
+}
+
+/// `fcs_tab` - the `'fillchars'` field table.
+const FCS_TAB: [CharsTab; 21] = [
+    charstab_entry(CharsField::FcsStl, "stl", Some(" "), None),
+    charstab_entry(CharsField::FcsStlnc, "stlnc", Some(" "), None),
+    charstab_entry(CharsField::FcsWbr, "wbr", Some(" "), None),
+    charstab_entry(CharsField::FcsHoriz, "horiz", Some("─"), Some("-")),
+    charstab_entry(CharsField::FcsHorizup, "horizup", Some("┴"), Some("-")),
+    charstab_entry(CharsField::FcsHorizdown, "horizdown", Some("┬"), Some("-")),
+    charstab_entry(CharsField::FcsVert, "vert", Some("│"), Some("|")),
+    charstab_entry(CharsField::FcsVertleft, "vertleft", Some("┤"), Some("|")),
+    charstab_entry(CharsField::FcsVertright, "vertright", Some("├"), Some("|")),
+    charstab_entry(CharsField::FcsVerthoriz, "verthoriz", Some("┼"), Some("+")),
+    charstab_entry(CharsField::FcsFold, "fold", Some("·"), Some("-")),
+    charstab_entry(CharsField::FcsFoldopen, "foldopen", Some("-"), None),
+    // NB: the field is `foldclosed` but the option name is `foldclose`.
+    charstab_entry(CharsField::FcsFoldclosed, "foldclose", Some("+"), None),
+    charstab_entry(CharsField::FcsFoldsep, "foldsep", Some("│"), Some("|")),
+    charstab_entry(CharsField::FcsFoldinner, "foldinner", None, None),
+    charstab_entry(CharsField::FcsDiff, "diff", Some("-"), None),
+    charstab_entry(CharsField::FcsMsgsep, "msgsep", Some(" "), None),
+    charstab_entry(CharsField::FcsEob, "eob", Some("~"), None),
+    charstab_entry(CharsField::FcsLastline, "lastline", Some("@"), None),
+    charstab_entry(CharsField::FcsTrunc, "trunc", Some(">"), None),
+    charstab_entry(CharsField::FcsTruncrl, "truncrl", Some("<"), None),
+];
+
+/// `lcs_tab` - the `'listchars'` field table.
+const LCS_TAB: [CharsTab; 12] = [
+    charstab_entry(CharsField::LcsEol, "eol", None, None),
+    charstab_entry(CharsField::LcsExt, "extends", None, None),
+    charstab_entry(CharsField::LcsNbsp, "nbsp", None, None),
+    charstab_entry(CharsField::LcsPrec, "precedes", None, None),
+    charstab_entry(CharsField::LcsSpace, "space", None, None),
+    charstab_entry(CharsField::LcsTab2, "tab", None, None),
+    charstab_entry(CharsField::LcsLeadtab2, "leadtab", None, None),
+    charstab_entry(CharsField::LcsLead, "lead", None, None),
+    charstab_entry(CharsField::LcsTrail, "trail", None, None),
+    charstab_entry(CharsField::LcsConceal, "conceal", None, None),
+    charstab_entry(CharsField::None, "multispace", None, None),
+    charstab_entry(CharsField::None, "leadmultispace", None, None),
+];
+
+/// Store `v` into whichever `LcsCharsT`/`FcsCharsT` field `f` names.
+///
+/// A no-op for [`CharsField::None`], matching the original's own
+/// `if (tab[i].cp != NULL)` guard.
+fn store_chars_field(
+    lcs: &mut crate::buffer_defs::LcsCharsT,
+    fcs: &mut crate::buffer_defs::FcsCharsT,
+    f: CharsField,
+    v: crate::types_defs::ScharT,
+) {
+    use CharsField as F;
+    match f {
+        F::None => {}
+        F::LcsEol => lcs.eol = v,
+        F::LcsExt => lcs.ext = v,
+        F::LcsNbsp => lcs.nbsp = v,
+        F::LcsPrec => lcs.prec = v,
+        F::LcsSpace => lcs.space = v,
+        F::LcsTab2 => lcs.tab2 = v,
+        F::LcsLeadtab2 => lcs.leadtab2 = v,
+        F::LcsLead => lcs.lead = v,
+        F::LcsTrail => lcs.trail = v,
+        F::LcsConceal => lcs.conceal = v,
+        F::FcsStl => fcs.stl = v,
+        F::FcsStlnc => fcs.stlnc = v,
+        F::FcsWbr => fcs.wbr = v,
+        F::FcsHoriz => fcs.horiz = v,
+        F::FcsHorizup => fcs.horizup = v,
+        F::FcsHorizdown => fcs.horizdown = v,
+        F::FcsVert => fcs.vert = v,
+        F::FcsVertleft => fcs.vertleft = v,
+        F::FcsVertright => fcs.vertright = v,
+        F::FcsVerthoriz => fcs.verthoriz = v,
+        F::FcsFold => fcs.fold = v,
+        F::FcsFoldopen => fcs.foldopen = v,
+        F::FcsFoldclosed => fcs.foldclosed = v,
+        F::FcsFoldsep => fcs.foldsep = v,
+        F::FcsFoldinner => fcs.foldinner = v,
+        F::FcsDiff => fcs.diff = v,
+        F::FcsMsgsep => fcs.msgsep = v,
+        F::FcsEob => fcs.eob = v,
+        F::FcsLastline => fcs.lastline = v,
+        F::FcsTrunc => fcs.trunc = v,
+        F::FcsTruncrl => fcs.truncrl = v,
+    }
+}
+
+/// `field_value_err` - report a bad `'listchars'`/`'fillchars'` field.
+///
+/// The original formats the offending field's own name into `fmt`'s
+/// `%s` and returns `errbuf`; when `errbuf` is NULL it returns `""`
+/// instead. That empty string still compares non-NULL at every call
+/// site, so the field error is still reported as an error, just
+/// without a message - `check_chars_options` relies on exactly this.
+/// Reproduced faithfully here, including the empty-message case.
+fn field_value_err(errbuf: Option<&mut Vec<u8>>, fmt: &'static str) -> &'static [u8] {
+    match errbuf {
+        None => b"",
+        Some(buf) => {
+            buf.clear();
+            buf.extend_from_slice(fmt.as_bytes());
+            fmt.as_bytes()
+        }
+    }
+}
+
+/// Handle setting `'listchars'` or `'fillchars'`
+/// (`set_chars_option`). Assumes monocell characters.
+///
+/// `value` is either the global or the window-local value; `what`
+/// selects which option; `apply` false means check for errors only,
+/// without storing anything.
+///
+/// Returns an error message, or `None` if the value is OK.
+///
+/// The original keeps its two scratch structs (`lcs_chars`/
+/// `fcs_chars`) as file statics, but they are pure scratch: every
+/// field is re-initialised at the top of the storing round and they
+/// are only read at the very end, so they are ordinary locals here.
+/// That removes two mutable statics without changing any observable
+/// behaviour.
+///
+/// # Safety
+/// Forwarded from `get_encoded_char_adv`'s own safety doc. Must not
+/// run concurrently with any other access to `OPTION_VARS`.
+pub unsafe fn set_chars_option(
+    wp: &mut crate::buffer_defs::WinT,
+    value: &[u8],
+    what: CharsOption,
+    apply: bool,
+    mut errbuf: Option<&mut Vec<u8>>,
+) -> Option<&'static [u8]> {
+    // Last occurrence of "multispace:" / "leadmultispace:"
+    let mut last_multispace: Option<usize> = None;
+    let mut last_lmultispace: Option<usize> = None;
+    let mut multispace_len = 0usize;
+    let mut lead_multispace_len = 0usize;
+
+    let tab: &[CharsTab] = match what {
+        CharsOption::Listchars => &LCS_TAB,
+        CharsOption::Fillchars => &FCS_TAB,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    // A local value of "" means "use the global value".
+    let value: Vec<u8> = match what {
+        CharsOption::Listchars => {
+            if wp.w_onebuf_opt.wo_lcs.as_deref().unwrap_or(b"").is_empty() {
+                opts.p_lcs.clone().unwrap_or_default()
+            } else {
+                value.to_vec()
+            }
+        }
+        CharsOption::Fillchars => {
+            if wp.w_onebuf_opt.wo_fcs.as_deref().unwrap_or(b"").is_empty() {
+                opts.p_fcs.clone().unwrap_or_default()
+            } else {
+                value.to_vec()
+            }
+        }
+    };
+
+    let mut lcs = crate::buffer_defs::LcsCharsT::default();
+    let mut fcs = crate::buffer_defs::FcsCharsT::default();
+
+    // first round: check for valid value, second round: assign values
+    let last_round = i32::from(apply);
+    for round in 0..=last_round {
+        let mut has_tab = false;
+        let mut has_leadtab = false;
+
+        if round > 0 {
+            // After checking that the value is valid: set defaults
+            for e in tab {
+                // XXX (from the original): characters taking 2 columns
+                // are forbidden (TUI limitation?). Set old defaults in
+                // that case.
+                // SAFETY: a plain width lookup on the table's own text.
+                let use_def = e
+                    .def
+                    .is_some_and(|d| unsafe { crate::charset::ptr2cells(d.as_bytes()) } == 1);
+                let src = if use_def { e.def } else { e.fallback };
+                store_chars_field(
+                    &mut lcs,
+                    &mut fcs,
+                    e.cp,
+                    crate::grid::schar_from_str(src.map(str::as_bytes)),
+                );
+            }
+
+            if what == CharsOption::Listchars {
+                lcs.tab1 = 0;
+                lcs.tab3 = 0;
+                lcs.leadtab1 = 0;
+                lcs.leadtab3 = 0;
+                lcs.multispace = (multispace_len > 0).then(|| vec![0; multispace_len]);
+                lcs.leadmultispace = (lead_multispace_len > 0).then(|| vec![0; lead_multispace_len]);
+            }
+        }
+
+        let mut p = 0usize;
+        while p < value.len() && value[p] != 0 {
+            let mut matched = false;
+            for e in tab {
+                let n = e.name.len();
+                if !(value[p..].starts_with(e.name.as_bytes())
+                    && value.get(p + n) == Some(&b':'))
+                {
+                    continue;
+                }
+                matched = true;
+                let mut s = p + n + 1;
+
+                let is_multi = what == CharsOption::Listchars
+                    && (e.name == "multispace" || e.name == "leadmultispace");
+                if is_multi {
+                    let lead = e.name == "leadmultispace";
+                    if round == 0 {
+                        let mut count = 0usize;
+                        while s < value.len() && value[s] != 0 && value[s] != b',' {
+                            // SAFETY: forwarded from this fn's safety doc.
+                            let (c1, adv) = unsafe { get_encoded_char_adv(&value[s..]) };
+                            s += adv;
+                            if c1 == 0 {
+                                return Some(field_value_err(
+                                    errbuf.as_deref_mut(),
+                                    e_wrong_character_width_for_field_str,
+                                ));
+                            }
+                            count += 1;
+                        }
+                        if count == 0 {
+                            // cannot be an empty string
+                            return Some(field_value_err(
+                                errbuf.as_deref_mut(),
+                                e_wrong_number_of_characters_for_field_str,
+                            ));
+                        }
+                        if lead {
+                            last_lmultispace = Some(p);
+                            lead_multispace_len = count;
+                        } else {
+                            last_multispace = Some(p);
+                            multispace_len = count;
+                        }
+                    } else {
+                        let mut pos = 0usize;
+                        let is_last = if lead {
+                            last_lmultispace == Some(p)
+                        } else {
+                            last_multispace == Some(p)
+                        };
+                        while s < value.len() && value[s] != 0 && value[s] != b',' {
+                            // SAFETY: forwarded from this fn's safety doc.
+                            let (c1, adv) = unsafe { get_encoded_char_adv(&value[s..]) };
+                            s += adv;
+                            if is_last {
+                                let dst = if lead {
+                                    lcs.leadmultispace.as_mut()
+                                } else {
+                                    lcs.multispace.as_mut()
+                                };
+                                if let Some(v) = dst
+                                    && pos < v.len()
+                                {
+                                    v[pos] = c1;
+                                }
+                                pos += 1;
+                            }
+                        }
+                    }
+                    p = s;
+                    break;
+                }
+
+                if s >= value.len() || value[s] == 0 {
+                    return Some(field_value_err(
+                        errbuf.as_deref_mut(),
+                        e_wrong_number_of_characters_for_field_str,
+                    ));
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                let (c1, adv) = unsafe { get_encoded_char_adv(&value[s..]) };
+                s += adv;
+                if c1 == 0 {
+                    return Some(field_value_err(
+                        errbuf.as_deref_mut(),
+                        e_wrong_character_width_for_field_str,
+                    ));
+                }
+                let mut c2 = 0;
+                let mut c3 = 0;
+                if e.cp == CharsField::LcsTab2 || e.cp == CharsField::LcsLeadtab2 {
+                    if s >= value.len() || value[s] == 0 {
+                        return Some(field_value_err(
+                            errbuf.as_deref_mut(),
+                            e_wrong_number_of_characters_for_field_str,
+                        ));
+                    }
+                    // SAFETY: forwarded from this fn's safety doc.
+                    let (v, adv) = unsafe { get_encoded_char_adv(&value[s..]) };
+                    c2 = v;
+                    s += adv;
+                    if c2 == 0 {
+                        return Some(field_value_err(
+                            errbuf.as_deref_mut(),
+                            e_wrong_character_width_for_field_str,
+                        ));
+                    }
+                    let at_end = s >= value.len() || value[s] == 0 || value[s] == b',';
+                    if !at_end {
+                        // SAFETY: forwarded from this fn's safety doc.
+                        let (v, adv) = unsafe { get_encoded_char_adv(&value[s..]) };
+                        c3 = v;
+                        s += adv;
+                        if c3 == 0 {
+                            return Some(field_value_err(
+                                errbuf.as_deref_mut(),
+                                e_wrong_character_width_for_field_str,
+                            ));
+                        }
+                    }
+                    if e.cp == CharsField::LcsTab2 {
+                        has_tab = true;
+                    } else {
+                        has_leadtab = true;
+                    }
+                }
+
+                if s >= value.len() || value[s] == 0 || value[s] == b',' {
+                    if round > 0 {
+                        if e.cp == CharsField::LcsTab2 {
+                            lcs.tab1 = c1;
+                            lcs.tab2 = c2;
+                            lcs.tab3 = c3;
+                        } else if e.cp == CharsField::LcsLeadtab2 {
+                            lcs.leadtab1 = c1;
+                            lcs.leadtab2 = c2;
+                            lcs.leadtab3 = c3;
+                        } else {
+                            store_chars_field(&mut lcs, &mut fcs, e.cp, c1);
+                        }
+                    }
+                    p = s;
+                    break;
+                }
+                return Some(field_value_err(
+                    errbuf.as_deref_mut(),
+                    e_wrong_number_of_characters_for_field_str,
+                ));
+            }
+
+            if !matched {
+                return Some(crate::errors::e_invarg.as_bytes());
+            }
+
+            if p < value.len() && value[p] == b',' {
+                p += 1;
+            }
+        }
+
+        if what == CharsOption::Listchars && has_leadtab && !has_tab {
+            return Some(crate::errors::e_leadtab_requires_tab.as_bytes());
+        }
+    }
+
+    if apply {
+        if what == CharsOption::Listchars {
+            wp.w_p_lcs_chars = lcs;
+        } else {
+            wp.w_p_fcs_chars = fcs;
+        }
+    }
+
+    None // no error
 }
 
 #[cfg(test)]
@@ -5351,6 +5936,231 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- set_chars_option ----
+
+    /// Runs `f` with both global chars options saved/restored, taking
+    /// the shared test lock exactly once for the whole body.
+    fn with_chars<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (plcs, pfcs) = (opts.p_lcs.clone(), opts.p_fcs.clone());
+        let result = f();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_lcs = plcs;
+        opts.p_fcs = pfcs;
+        result
+    }
+
+    /// Check `value` against `what`, with a non-empty window-local
+    /// value so the global fallback is not taken.
+    fn chars_check(what: CharsOption, value: &[u8]) -> Option<&'static [u8]> {
+        let mut win = crate::buffer_defs::WinT::default();
+        match what {
+            CharsOption::Listchars => win.w_onebuf_opt.wo_lcs = Some(value.to_vec()),
+            CharsOption::Fillchars => win.w_onebuf_opt.wo_fcs = Some(value.to_vec()),
+        }
+        unsafe { set_chars_option(&mut win, value, what, false, None) }
+    }
+
+    #[test]
+    fn set_chars_option_accepts_the_forms_real_nvim_accepts() {
+        // Every case cross-checked against a real nvim binary.
+        with_chars(|| {
+            use CharsOption::{Fillchars, Listchars};
+            for (what, v) in [
+                (Listchars, &b"eol:$"[..]),
+                (Listchars, b"tab:>-"),
+                (Listchars, b"tab:>-."),
+                (Listchars, b"tab:>-,leadtab:<-"),
+                (Listchars, b"multispace:."),
+                (Listchars, b"multispace:abc"),
+                (Listchars, b"leadmultispace:xy,tab:>-"),
+                (Listchars, b"eol:\\x41"),
+                (Listchars, b"eol:\\u2500"),
+                (Listchars, b"tab:\\x41\\x42"),
+                (Listchars, b""),
+                (Fillchars, b"vert:|"),
+                (Fillchars, b"foldclose:+"),
+                (Fillchars, b""),
+            ] {
+                assert_eq!(
+                    chars_check(what, v),
+                    None,
+                    "{:?} should be accepted",
+                    std::string::String::from_utf8_lossy(v)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn set_chars_option_rejects_the_forms_real_nvim_rejects() {
+        with_chars(|| {
+            use CharsOption::{Fillchars, Listchars};
+            // Per-field errors go through `field_value_err`, which
+            // returns a non-NULL EMPTY string when no errbuf is
+            // supplied - still an error, just without a message.
+            // `e_invarg`/`e_leadtab_requires_tab` are returned
+            // directly instead, so they carry their text either way.
+            // This split is exactly what `check_chars_options` relies
+            // on, so it is pinned here rather than papered over.
+            let field = &b""[..];
+            let invarg = crate::errors::e_invarg.as_bytes();
+            let leadtab = crate::errors::e_leadtab_requires_tab.as_bytes();
+            for (what, v, want) in [
+                // Wrong number of characters for the field.
+                (Listchars, &b"tab:>"[..], field),
+                (Listchars, b"eol:", field),
+                (Listchars, b"eol:ab", field),
+                (Listchars, b"multispace:", field),
+                // Wrong character width: invalid/truncated hex all
+                // return 0 from get_encoded_char_adv, which the
+                // original reports as a width error rather than a
+                // parse error - confirmed against real nvim.
+                (Listchars, b"eol:\\xZZ", field),
+                (Listchars, b"eol:\\x", field),
+                (Listchars, b"eol:\\U0001F600", field),
+                // Unknown field, or no colon at all.
+                (Listchars, b"eol", invarg),
+                (Listchars, b"bogus:x", invarg),
+                (Fillchars, b"bogus:x", invarg),
+                // `foldclosed` is not a field name; `foldclose` is.
+                (Fillchars, b"foldclosed:+", invarg),
+                // leadtab without tab.
+                (Listchars, b"leadtab:>-", leadtab),
+            ] {
+                assert_eq!(
+                    chars_check(what, v),
+                    Some(want),
+                    "{:?}",
+                    std::string::String::from_utf8_lossy(v)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn set_chars_option_rejects_a_double_width_field_character() {
+        with_chars(|| {
+            // Real nvim reports E1512 here; with no errbuf the
+            // message is empty, as above.
+            assert_eq!(
+                chars_check(CharsOption::Listchars, "nbsp:一".as_bytes()),
+                Some(&b""[..])
+            );
+        });
+    }
+
+    #[test]
+    fn set_chars_option_stores_values_and_defaults_when_applying() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"eol:$,tab:>-.".to_vec());
+            let v = b"eol:$,tab:>-.".to_vec();
+            assert_eq!(
+                unsafe {
+                    set_chars_option(&mut win, &v, CharsOption::Listchars, true, None)
+                },
+                None
+            );
+            let lcs = &win.w_p_lcs_chars;
+            assert_eq!(lcs.eol, crate::grid::schar_from_char(i32::from(b'$')));
+            assert_eq!(lcs.tab1, crate::grid::schar_from_char(i32::from(b'>')));
+            assert_eq!(lcs.tab2, crate::grid::schar_from_char(i32::from(b'-')));
+            assert_eq!(lcs.tab3, crate::grid::schar_from_char(i32::from(b'.')));
+
+            // 'fillchars' picks up its table defaults for untouched
+            // fields; `vert` defaults to the box-drawing char.
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_fcs = Some(b"eob:~".to_vec());
+            let v = b"eob:~".to_vec();
+            assert_eq!(
+                unsafe {
+                    set_chars_option(&mut win, &v, CharsOption::Fillchars, true, None)
+                },
+                None
+            );
+            assert_eq!(
+                win.w_p_fcs_chars.vert,
+                crate::grid::schar_from_str(Some("│".as_bytes()))
+            );
+            assert_eq!(
+                win.w_p_fcs_chars.eob,
+                crate::grid::schar_from_char(i32::from(b'~'))
+            );
+        });
+    }
+
+    #[test]
+    fn set_chars_option_sizes_multispace_from_the_last_occurrence() {
+        with_chars(|| {
+            // Two `multispace:` fields: the original records only the
+            // LAST one's position, so only its characters are stored,
+            // and the array is sized from it too.
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"multispace:ab,multispace:xyz".to_vec());
+            let v = b"multispace:ab,multispace:xyz".to_vec();
+            assert_eq!(
+                unsafe {
+                    set_chars_option(&mut win, &v, CharsOption::Listchars, true, None)
+                },
+                None
+            );
+            let ms = win.w_p_lcs_chars.multispace.as_ref().expect("multispace");
+            assert_eq!(ms.len(), 3);
+            assert_eq!(ms[0], crate::grid::schar_from_char(i32::from(b'x')));
+            assert_eq!(ms[2], crate::grid::schar_from_char(i32::from(b'z')));
+        });
+    }
+
+    #[test]
+    fn set_chars_option_falls_back_to_the_global_value_when_local_is_empty() {
+        with_chars(|| {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lcs =
+                Some(b"bogus:x".to_vec());
+            // The window-local value is empty, so the (invalid)
+            // global value is what actually gets checked.
+            let mut win = crate::buffer_defs::WinT::default();
+            assert_eq!(
+                unsafe { set_chars_option(&mut win, b"", CharsOption::Listchars, false, None) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        });
+    }
+
+    #[test]
+    fn set_chars_option_writes_the_message_into_errbuf_when_given_one() {
+        with_chars(|| {
+            // With no errbuf the original returns a non-NULL EMPTY
+            // string, so the error is still reported but carries no
+            // message - `check_chars_options` relies on exactly this.
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"eol:ab".to_vec());
+            let v = b"eol:ab".to_vec();
+            assert_eq!(
+                unsafe {
+                    set_chars_option(&mut win, &v, CharsOption::Listchars, false, None)
+                },
+                Some(&b""[..])
+            );
+
+            let mut errbuf = Vec::new();
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"eol:ab".to_vec());
+            let got = unsafe {
+                set_chars_option(
+                    &mut win,
+                    &v,
+                    CharsOption::Listchars,
+                    false,
+                    Some(&mut errbuf),
+                )
+            };
+            assert_eq!(got, Some(e_wrong_number_of_characters_for_field_str.as_bytes()));
+            assert_eq!(errbuf, e_wrong_number_of_characters_for_field_str.as_bytes());
+        });
     }
 
     // ---- did_set_winborder / did_set_pumborder ----
