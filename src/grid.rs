@@ -16,13 +16,22 @@
 //! branches rather than collapsing them, so the bit patterns stay
 //! identical on both endiannesses.
 //!
+//! Also `grid_clear_line`, `grid_invalidate` and `grid_getchar` - the
+//! three `ScreenGrid` accessors that need only the grid's own backing
+//! arrays, not the redraw pipeline. `grid_getchar` returns
+//! `(schar, attr)` rather than taking the original's optional `attrp`
+//! out-parameter.
+//!
 //! Deferred (each genuinely blocked, not simply "not gotten to yet"):
 //! everything that actually draws - `grid_line_start`/`grid_line_puts`/
 //! `grid_put_linebuf`/`grid_scroll`/`grid_clear` and the `ScreenGrid`
 //! allocation helpers - needs the UI event pipeline (`ui_line`,
 //! `ui_call_grid_scroll`), the highlight attribute registry
 //! (`hl_combine_attr`), and `decor`'s own providers, none translated.
-//! `schar_cache_clear` likewise needs `decor_check_invalid_glyphs`.
+//! `schar_cache_clear` likewise needs `decor_check_invalid_glyphs`,
+//! and the private `grid_invalid_row` has no caller but
+//! `grid_put_linebuf`, so it is held back rather than landed as dead
+//! code.
 //!
 //! `line_do_arabic_shape` and its two private helpers landed once
 //! `arabic.rs`'s own `arabic_shape` did. Note the argument order at
@@ -376,6 +385,81 @@ pub unsafe fn line_do_arabic_shape(buf: &mut [ScharT]) {
     }
 }
 
+/// Clear a line in the grid starting at `off` until `width`
+/// characters are cleared (`grid_clear_line`).
+///
+/// `valid` false marks the cleared attributes invalid (`-1`), which is
+/// how the redraw code flags a row it must repaint rather than trust.
+///
+/// # Safety
+/// `grid`'s own `chars`/`attrs`/`vcols` must each point to at least
+/// `off + width` live elements.
+pub unsafe fn grid_clear_line(
+    grid: &mut crate::grid_defs::ScreenGrid,
+    off: usize,
+    width: i32,
+    valid: bool,
+) {
+    let width = usize::try_from(width).unwrap_or(0);
+    let fill: crate::types_defs::SattrT = if valid { 0 } else { -1 };
+    for col in 0..width {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            *grid.chars.add(off + col) = schar_from_ascii(b' ');
+            *grid.attrs.add(off + col) = fill;
+            // The original `memset`s -1 across every byte, which for
+            // a two's-complement `colnr_T` is exactly -1.
+            *grid.vcols.add(off + col) = -1;
+        }
+    }
+}
+
+/// Mark every attribute in `grid` invalid, forcing a full repaint
+/// (`grid_invalidate`).
+///
+/// # Safety
+/// `grid.attrs` must point to at least `rows * cols` live elements.
+pub unsafe fn grid_invalidate(grid: &mut crate::grid_defs::ScreenGrid) {
+    let n = usize::try_from(grid.rows).unwrap_or(0) * usize::try_from(grid.cols).unwrap_or(0);
+    for i in 0..n {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            *grid.attrs.add(i) = -1;
+        }
+    }
+}
+
+/// Get a single character directly from `grid.chars`
+/// (`grid_getchar`).
+///
+/// Returns `(schar, attr)`. The original takes `attrp` as an optional
+/// out-parameter; a tuple says the same thing, and a caller that does
+/// not want the attribute simply ignores it.
+///
+/// Returns `(0, 0)` when the position is out of range, matching the
+/// original's own safety check.
+///
+/// # Safety
+/// When `grid.chars` is non-null, `grid`'s own `chars`/`attrs`/
+/// `line_offset` must point to live elements covering `row`/`col`.
+#[must_use]
+pub unsafe fn grid_getchar(
+    grid: &crate::grid_defs::ScreenGrid,
+    row: i32,
+    col: i32,
+) -> (ScharT, i32) {
+    // safety check
+    if grid.chars.is_null() || row >= grid.rows || col >= grid.cols {
+        return (0, 0);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        let off = *grid.line_offset.add(row as usize) + col as usize;
+        (*grid.chars.add(off), *grid.attrs.add(off))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +703,87 @@ mod tests {
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         opts.p_arshape = prev_arshape;
         opts.p_tbidi = prev_tbidi;
+    }
+
+    /// Build a small backing store for a `ScreenGrid` test, returning
+    /// the grid plus the vectors it borrows (which must outlive it).
+    fn test_grid(
+        rows: i32,
+        cols: i32,
+    ) -> (
+        crate::grid_defs::ScreenGrid,
+        Vec<ScharT>,
+        Vec<crate::types_defs::SattrT>,
+        Vec<crate::pos_defs::ColnrT>,
+        Vec<usize>,
+    ) {
+        let n = (rows * cols) as usize;
+        let mut chars: Vec<ScharT> = vec![0; n];
+        let mut attrs: Vec<crate::types_defs::SattrT> = vec![7; n];
+        let mut vcols: Vec<crate::pos_defs::ColnrT> = vec![0; n];
+        let mut line_offset: Vec<usize> =
+            (0..rows as usize).map(|r| r * cols as usize).collect();
+        let grid = crate::grid_defs::ScreenGrid {
+            chars: chars.as_mut_ptr(),
+            attrs: attrs.as_mut_ptr(),
+            vcols: vcols.as_mut_ptr(),
+            line_offset: line_offset.as_mut_ptr(),
+            rows,
+            cols,
+            ..Default::default()
+        };
+        (grid, chars, attrs, vcols, line_offset)
+    }
+
+    #[test]
+    fn grid_clear_line_fills_spaces_and_marks_validity() {
+        let _l = lock();
+        let (mut grid, chars, attrs, vcols, _lo) = test_grid(2, 4);
+
+        // A valid clear leaves attribute 0; an invalid one leaves -1.
+        unsafe { grid_clear_line(&mut grid, 0, 4, true) };
+        unsafe { grid_clear_line(&mut grid, 4, 4, false) };
+
+        let space = schar_from_ascii(b' ');
+        assert!(chars.iter().all(|&c| c == space));
+        assert_eq!(&attrs[..4], &[0, 0, 0, 0]);
+        assert_eq!(&attrs[4..], &[-1, -1, -1, -1]);
+        // vcols is always invalidated, either way.
+        assert!(vcols.iter().all(|&v| v == -1));
+    }
+
+    #[test]
+    fn grid_invalidate_marks_every_attribute_invalid() {
+        let _l = lock();
+        let (mut grid, _c, attrs, _v, _lo) = test_grid(3, 5);
+        assert!(attrs.iter().all(|&a| a == 7)); // the initial fill
+        unsafe { grid_invalidate(&mut grid) };
+        assert_eq!(attrs.len(), 15);
+        assert!(attrs.iter().all(|&a| a == -1));
+    }
+
+    #[test]
+    fn grid_getchar_reads_through_the_line_offset_table() {
+        let _l = lock();
+        let (mut grid, mut chars, mut attrs, _v, _lo) = test_grid(2, 4);
+        // Row 1, column 2 is index 1*4 + 2 == 6.
+        chars[6] = schar_from_ascii(b'z');
+        attrs[6] = 42;
+        let _ = &mut chars;
+        let _ = &mut attrs;
+
+        assert_eq!(
+            unsafe { grid_getchar(&grid, 1, 2) },
+            (schar_from_ascii(b'z'), 42)
+        );
+
+        // Out-of-range row or column returns the NUL character.
+        assert_eq!(unsafe { grid_getchar(&grid, 2, 0) }, (0, 0));
+        assert_eq!(unsafe { grid_getchar(&grid, 0, 4) }, (0, 0));
+
+        // A grid with no backing store is also rejected.
+        grid.chars = std::ptr::null_mut();
+        assert_eq!(unsafe { grid_getchar(&grid, 0, 0) }, (0, 0));
     }
 
     #[test]
