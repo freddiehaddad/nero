@@ -205,6 +205,15 @@
 //! `GLOBALS.cmdpreview`, otherwise delegating to
 //! [`did_set_str_generic`]).
 //!
+//! Also [`did_set_backupcopy`] - the same local-or-global flags
+//! pattern as [`did_set_virtualedit`]/[`did_set_tagcase`], plus a
+//! plain-`:set` branch that also clears the buffer-local flags first
+//! (matching [`did_set_completeopt`]'s own shape) and an
+//! "exactly one of `auto`/`yes`/`no`" constraint. On that specific
+//! failure the original re-derives the flags from `args.os_oldval`
+//! before returning the error - preserved here rather than leaving
+//! the rejected value's own flags in place.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1578,6 +1587,92 @@ pub unsafe fn did_set_inccommand(args: &mut crate::option_defs::OptsetT) -> Opti
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { did_set_str_generic(args) }
+}
+
+/// The `'backupcopy'` option is changed (`did_set_backupcopy`).
+///
+/// Same "resolve from local or global storage as an owned copy"
+/// pattern as [`did_set_virtualedit`]/[`did_set_tagcase`], plus two
+/// extra behaviours the others don't have:
+///
+/// - a plain `:set` (neither `OPT_LOCAL` nor `OPT_GLOBAL`) also
+///   clears the buffer-local flags first, matching
+///   [`did_set_completeopt`]'s own already-established branch shape;
+/// - the resulting flags must contain EXACTLY ONE of `"auto"`,
+///   `"yes"` and `"no"`. On that specific failure the original
+///   re-derives the flags from `args.os_oldval` (restoring the
+///   previous value's own bitmask) before returning the error -
+///   preserved here rather than simply leaving the rejected value's
+///   flags in place.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_backupcopy(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    let opt_flags = args.os_flags as u32;
+    let use_local = opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0;
+
+    let bkc: Vec<u8> = if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*buf_ptr }.b_p_bkc.clone().unwrap_or_default()
+    } else {
+        if opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+            // When using `:set`, clear the local flags.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *buf_ptr }.b_bkc_flags = 0;
+        }
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bkc.clone().unwrap_or_default()
+    };
+
+    if use_local && bkc.is_empty() {
+        // make the local value empty: use the global value
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { bkc_store(buf_ptr, use_local, 0) };
+        return None;
+    }
+
+    let Some(new_flags) = opt_strings_flags(&bkc, crate::option_vars::OPT_BKC_VALUES, true) else {
+        return Some(crate::errors::e_invarg.as_bytes());
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { bkc_store(buf_ptr, use_local, new_flags) };
+
+    let exclusive_count = u32::from(new_flags & crate::option_vars::opt_bkc_flag::AUTO != 0)
+        + u32::from(new_flags & crate::option_vars::opt_bkc_flag::YES != 0)
+        + u32::from(new_flags & crate::option_vars::opt_bkc_flag::NO != 0);
+    if exclusive_count != 1 {
+        // Must have exactly one of "auto", "yes" and "no". Restore the
+        // flags the PREVIOUS value implied, matching the original's
+        // own `opt_strings_flags(oldval, ...)` re-derivation (which
+        // likewise ignores its own return value - a malformed oldval
+        // simply leaves the flags as that partial parse left them).
+        if let crate::option_defs::OptVal::String(oldval) = &args.os_oldval
+            && let Some(old_flags) =
+                opt_strings_flags(oldval, crate::option_vars::OPT_BKC_VALUES, true)
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { bkc_store(buf_ptr, use_local, old_flags) };
+        }
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    None
+}
+
+/// Writes `value` to whichever `'backupcopy'` flags slot
+/// [`did_set_backupcopy`] selected.
+///
+/// # Safety
+/// `buf_ptr` must be a valid, non-null pointer to a live `BufT`
+/// whenever `use_local` is true.
+unsafe fn bkc_store(buf_ptr: *mut crate::buffer_defs::BufT, use_local: bool, value: u32) {
+    if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *buf_ptr }.b_bkc_flags = value;
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags = value;
+    }
 }
 
 /// The `'breakat'` option is changed (`did_set_breakat`).
@@ -3568,6 +3663,165 @@ mod tests {
         );
 
         unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview = prev;
+    }
+
+    // ---- did_set_backupcopy ----
+
+    /// Saves/restores every piece of shared state `did_set_backupcopy`
+    /// can touch, so these tests can't leak into any other test.
+    fn with_backupcopy<R>(global: Option<&[u8]>, f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_bkc = opts.p_bkc.clone();
+        let prev_flags = opts.bkc_flags;
+        opts.p_bkc = global.map(<[u8]>::to_vec);
+
+        let result = f();
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_bkc = prev_bkc;
+        opts.bkc_flags = prev_flags;
+        result
+    }
+
+    fn bkc_args(
+        buf: &mut crate::buffer_defs::BufT,
+        flags: u32,
+        oldval: &[u8],
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_buf: buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: flags as i32,
+            os_oldval: crate::option_defs::OptVal::String(oldval.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_backupcopy_global_auto_is_accepted() {
+        with_backupcopy(Some(b"auto"), || {
+            let mut buf = crate::buffer_defs::BufT::default();
+            let mut args = bkc_args(&mut buf, 0, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            assert_eq!(
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags,
+                crate::option_vars::opt_bkc_flag::AUTO
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_accepts_one_exclusive_value_plus_a_modifier() {
+        with_backupcopy(Some(b"yes,breaksymlink"), || {
+            let mut buf = crate::buffer_defs::BufT::default();
+            let mut args = bkc_args(&mut buf, 0, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            assert_eq!(
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags,
+                crate::option_vars::opt_bkc_flag::YES
+                    | crate::option_vars::opt_bkc_flag::BREAKSYMLINK
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_rejects_two_exclusive_values() {
+        with_backupcopy(Some(b"yes,no"), || {
+            let mut buf = crate::buffer_defs::BufT::default();
+            let mut args = bkc_args(&mut buf, 0, b"auto");
+            assert_eq!(
+                unsafe { did_set_backupcopy(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+            // The original re-derives the flags from oldval ("auto")
+            // on this specific failure, rather than leaving the
+            // rejected value's own yes|no bitmask in place.
+            assert_eq!(
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags,
+                crate::option_vars::opt_bkc_flag::AUTO
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_rejects_zero_exclusive_values() {
+        with_backupcopy(Some(b"breaksymlink"), || {
+            let mut buf = crate::buffer_defs::BufT::default();
+            let mut args = bkc_args(&mut buf, 0, b"yes");
+            assert_eq!(
+                unsafe { did_set_backupcopy(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+            assert_eq!(
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags,
+                crate::option_vars::opt_bkc_flag::YES
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_rejects_an_unknown_value() {
+        with_backupcopy(Some(b"bogus"), || {
+            let mut buf = crate::buffer_defs::BufT::default();
+            let mut args = bkc_args(&mut buf, 0, b"auto");
+            assert_eq!(
+                unsafe { did_set_backupcopy(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_plain_set_clears_the_buffer_local_flags() {
+        with_backupcopy(Some(b"auto"), || {
+            let mut buf = crate::buffer_defs::BufT { b_bkc_flags: 0xDEAD, ..Default::default() };
+            // opt_flags == 0 means a plain `:set` (neither OPT_LOCAL
+            // nor OPT_GLOBAL), which also clears the local flags.
+            let mut args = bkc_args(&mut buf, 0, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            assert_eq!(buf.b_bkc_flags, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_opt_global_leaves_the_buffer_local_flags_alone() {
+        with_backupcopy(Some(b"auto"), || {
+            let mut buf = crate::buffer_defs::BufT { b_bkc_flags: 0xDEAD, ..Default::default() };
+            let mut args =
+                bkc_args(&mut buf, crate::option_defs::opt_set_flags::OPT_GLOBAL, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            // OPT_GLOBAL skips the local-clearing branch entirely.
+            assert_eq!(buf.b_bkc_flags, 0xDEAD);
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_local_empty_resets_to_global() {
+        with_backupcopy(Some(b"auto"), || {
+            let mut buf = crate::buffer_defs::BufT {
+                b_p_bkc: Some(Vec::new()),
+                b_bkc_flags: 0xDEAD,
+                ..Default::default()
+            };
+            let mut args =
+                bkc_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            assert_eq!(buf.b_bkc_flags, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_backupcopy_local_valid_value_sets_the_buffer_local_flags() {
+        with_backupcopy(Some(b"auto"), || {
+            let mut buf =
+                crate::buffer_defs::BufT { b_p_bkc: Some(b"no".to_vec()), ..Default::default() };
+            let mut args =
+                bkc_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL, b"auto");
+            assert_eq!(unsafe { did_set_backupcopy(&mut args) }, None);
+            assert_eq!(buf.b_bkc_flags, crate::option_vars::opt_bkc_flag::NO);
+            // The global flags must be untouched by an OPT_LOCAL call.
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags, 0);
+        });
     }
 
     // ---- did_set_mousescroll ----
