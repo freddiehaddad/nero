@@ -154,6 +154,15 @@
 //! step, and `opt_strings_flags`'s own `list` parameter is `false` -
 //! a single value, not a comma-separated list).
 //!
+//! Also [`did_set_concealcursor`] (a thin `did_set_option_listflag`
+//! wrapper over `option_vars::COCU_ALL` - unlike `'whichwrap'`,
+//! `'concealcursor'` is NOT a comma-separated list, so no separator
+//! character is appended) and `did_set_completeslash` (Windows-only,
+//! matching the original's own `#ifdef BACKSLASH_IN_FILENAME` guard
+//! via `#[cfg(windows)]`; validates BOTH the global and buffer-local
+//! value regardless of which was actually being set, faithfully
+//! matching the original's own two-call `||` condition).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1360,6 +1369,55 @@ pub unsafe fn did_set_tagcase(args: &mut crate::option_defs::OptsetT) -> Option<
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags = new_flags;
     }
 
+    None
+}
+
+/// The `'concealcursor'` option is changed (`did_set_concealcursor`).
+///
+/// A thin `did_set_option_listflag` wrapper over
+/// `option_vars::COCU_ALL` - unlike `'whichwrap'`, `'concealcursor'`
+/// is NOT a comma-separated list, so no separator character is
+/// appended to the valid-character set.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_concealcursor(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    did_set_option_listflag(val, crate::option_vars::COCU_ALL.as_bytes())
+}
+
+/// The `'completeslash'` option is changed (`did_set_completeslash`).
+///
+/// Windows-only, matching the original's own `#ifdef
+/// BACKSLASH_IN_FILENAME` guard around this whole function (the
+/// option itself is likewise `enable_if`-gated to that same platform,
+/// per `option_defs.rs`'s own already-established handling) -
+/// translated as `#[cfg(windows)]`, following `os/os_defs.rs`'s own
+/// `BACKSLASH_IN_FILENAME_BOOL` precedent.
+///
+/// Validates BOTH the global `'completeslash'` and the buffer-local
+/// one, regardless of which was actually being set - faithfully
+/// matching the original's own two-call `||` condition rather than
+/// "fixing" it to check only the one that changed.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+#[cfg(windows)]
+pub unsafe fn did_set_completeslash(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*(args.os_buf as *const crate::buffer_defs::BufT) };
+    let p_csl = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl.clone().unwrap_or_default();
+    let b_p_csl: &[u8] = buf.b_p_csl.as_deref().unwrap_or(&[]);
+
+    if opt_strings_flags(&p_csl, crate::option_vars::OPT_CSL_VALUES, false).is_none()
+        || opt_strings_flags(b_p_csl, crate::option_vars::OPT_CSL_VALUES, false).is_none()
+    {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
     None
 }
 
@@ -2753,6 +2811,114 @@ mod tests {
         let mut buf = crate::buffer_defs::BufT { b_p_tc: Some(b"bogus".to_vec()), ..Default::default() };
         let mut args = tagcase_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL);
         assert_eq!(unsafe { did_set_tagcase(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_concealcursor ----
+
+    fn concealcursor_args(val: &mut Option<Vec<u8>>) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT { os_varp: val as *mut Option<Vec<u8>> as *mut c_void, ..Default::default() }
+    }
+
+    #[test]
+    fn did_set_concealcursor_accepts_every_real_flag_character() {
+        // COCU_ALL == "nvic".
+        let mut val: Option<Vec<u8>> = Some(b"nvic".to_vec());
+        let mut args = concealcursor_args(&mut val);
+        assert_eq!(unsafe { did_set_concealcursor(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_concealcursor_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = concealcursor_args(&mut val);
+        assert_eq!(unsafe { did_set_concealcursor(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_concealcursor_rejects_an_unknown_flag_character() {
+        let mut val: Option<Vec<u8>> = Some(b"nz".to_vec());
+        let mut args = concealcursor_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_concealcursor(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_concealcursor_rejects_a_comma_unlike_whichwrap() {
+        // 'concealcursor' is NOT a comma-separated list, so (unlike
+        // 'whichwrap') a comma is genuinely an invalid character here.
+        let mut val: Option<Vec<u8>> = Some(b"n,v".to_vec());
+        let mut args = concealcursor_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_concealcursor(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    // ---- did_set_completeslash (Windows-only) ----
+
+    #[cfg(windows)]
+    #[test]
+    fn did_set_completeslash_accepts_every_real_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl.clone();
+
+        for value in [&b""[..], b"slash", b"backslash"] {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = Some(value.to_vec());
+            let mut buf =
+                crate::buffer_defs::BufT { b_p_csl: Some(value.to_vec()), ..Default::default() };
+            let mut args = crate::option_defs::OptsetT {
+                os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+                ..Default::default()
+            };
+            assert_eq!(unsafe { did_set_completeslash(&mut args) }, None, "value {value:?}");
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn did_set_completeslash_rejects_a_bad_global_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = Some(b"bogus".to_vec());
+
+        let mut buf = crate::buffer_defs::BufT { b_p_csl: Some(b"slash".to_vec()), ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_completeslash(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = prev;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn did_set_completeslash_rejects_a_bad_buffer_local_value_even_when_global_is_fine() {
+        // Faithfully exercises the original's own two-call `||`
+        // condition: a bad LOCAL value is rejected even though the
+        // global one is perfectly valid.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = Some(b"slash".to_vec());
+
+        let mut buf = crate::buffer_defs::BufT { b_p_csl: Some(b"bogus".to_vec()), ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_completeslash(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = prev;
     }
 
     // ---- did_set_mousescroll ----
