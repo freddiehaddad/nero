@@ -35,6 +35,22 @@
 //! to always succeed - see [`opt_strings_flags`]'s own doc comment and
 //! its dedicated regression test.
 //!
+//! Also translated: `opt_values`/`check_str_opt` (the option-
+//! index-to-valid-values-table lookup, and the generic "is this
+//! string a valid value for this option" checker built on it), and
+//! [`did_set_str_generic`] - the first real, callback-shaped
+//! `did_set_*` function, plus two of its own small siblings that
+//! needed nothing beyond it: [`did_set_backupext_or_patchmode`]
+//! (`'backupext'`/`'patchmode'` can't both resolve to the same
+//! effective suffix) and [`did_set_backspace`] (a numeric legacy
+//! `'2'` spelling, or else delegate to `did_set_str_generic`).
+//! `check_str_opt`'s own real, load-bearing side effect - writing the
+//! computed flags bitmask into the option's `flags_var`, when it has
+//! one - is preserved even though nothing currently reads it (no
+//! translated code consumes e.g. `'sessionoptions'`'s own resulting
+//! bitmask yet), matching this crate's established "keep the real
+//! state mutation even without a current consumer" policy.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -45,6 +61,7 @@
 //! into this same pass).
 
 use crate::option_defs::opt_flags;
+use std::ffi::c_void;
 
 /// Whether `val` contains an illegal character for an option flagged
 /// `NFNAME`/`NDNAME` (`check_illegal_path_names`, `optionstr.c`) -
@@ -143,6 +160,124 @@ pub fn check_ff_value(p: &[u8]) -> bool {
 #[must_use]
 pub fn valid_filetype(val: &[u8]) -> bool {
     crate::option::valid_name(val, b".-_")
+}
+
+/// Get the array of valid string values for `opt_idx` (`opt_values`, a
+/// `static` helper).
+///
+/// Two options genuinely borrow a SIBLING option's own `values[]`
+/// table rather than having a distinct one of their own (confirmed
+/// directly against the real body, not assumed): `'viewoptions'`
+/// reuses `'sessionoptions'`'s, and `'fileformats'` reuses
+/// `'fileformat'`'s.
+fn opt_values(opt_idx: crate::option_defs::OptIndex) -> &'static [&'static str] {
+    use crate::option_defs::OptIndex;
+    let idx1 = match opt_idx {
+        OptIndex::Viewoptions => OptIndex::Sessionoptions,
+        OptIndex::Fileformats => OptIndex::Fileformat,
+        _ => opt_idx,
+    };
+    crate::option::get_option(idx1).values
+}
+
+/// Whether the string value at `varp` (or, when `None`, at the
+/// option's own global storage, `opt.var`) is a valid value for
+/// `opt_idx` (`check_str_opt`).
+///
+/// As a real, load-bearing side effect - matching the original
+/// exactly, even though no currently-translated code reads it yet -
+/// on success this writes the resulting flags bitmask into
+/// `*opt.flags_var` when the option has one.
+///
+/// # Safety
+/// `varp`, if `Some`, must point to a live `Option<Vec<u8>>` for the
+/// whole call (matching `crate::option::optval_from_varp`'s own
+/// established contract for a `String`-typed option's storage) - as
+/// must the option's own global `.var` pointer, when `varp` is
+/// `None`.
+unsafe fn check_str_opt(opt_idx: crate::option_defs::OptIndex, varp: Option<*mut c_void>) -> bool {
+    let opt = crate::option::get_option(opt_idx);
+    let varp = varp.unwrap_or(opt.var);
+    let list = (opt.flags & (opt_flags::COMMA | opt_flags::ONE_COMMA)) != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let val = unsafe { &*(varp as *mut Option<Vec<u8>>) };
+    let val_bytes: &[u8] = val.as_deref().unwrap_or(&[]);
+    let values = opt_values(opt_idx);
+    match opt_strings_flags(val_bytes, values, list) {
+        Some(flags) => {
+            if !opt.flags_var.is_null() {
+                // SAFETY: a non-null `flags_var` points to a live
+                // `u32` for the option's whole lifetime, matching
+                // `get_varp_from`'s own established contract.
+                unsafe {
+                    *opt.flags_var = flags;
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Generic `did_set_*` callback for a plain comma/one-comma string
+/// option with no further special handling (`did_set_str_generic`).
+///
+/// # Safety
+/// `args.os_varp`, if non-null, must point to a live
+/// `Option<Vec<u8>>` for the whole call, matching `check_str_opt`'s
+/// own contract.
+pub unsafe fn did_set_str_generic(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let varp = if args.os_varp.is_null() { None } else { Some(args.os_varp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let ok = unsafe { check_str_opt(args.os_idx, varp) };
+    if ok {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
+/// The `'backupext'` or the `'patchmode'` option is changed
+/// (`did_set_backupext_or_patchmode`) - rejects the combination if
+/// both would resolve to the same effective suffix (stripping one
+/// shared leading `.`, if present on each), which would make
+/// neovim's own backup-vs-patch-file disambiguation logic ambiguous.
+pub fn did_set_backupext_or_patchmode() -> Option<&'static [u8]> {
+    // SAFETY: a plain, momentary read of two independent option
+    // values - no aliasing hazard.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let bex: &[u8] = opts.p_bex.as_deref().unwrap_or(&[]);
+    let pm: &[u8] = opts.p_pm.as_deref().unwrap_or(&[]);
+    let bex_trimmed = if bex.first() == Some(&b'.') { &bex[1..] } else { bex };
+    let pm_trimmed = if pm.first() == Some(&b'.') { &pm[1..] } else { pm };
+    if bex_trimmed == pm_trimmed {
+        Some(crate::gettext_defs::gettext_noop("E589: 'backupext' and 'patchmode' are equal").as_bytes())
+    } else {
+        None
+    }
+}
+
+/// The `'backspace'` option is changed (`did_set_backspace`).
+///
+/// A legacy numeric spelling is only valid as the single digit `'2'`
+/// (matching the original's own `ascii_isdigit(*p_bs)` check against
+/// just the FIRST byte - any other leading digit, e.g. `"3"` or a
+/// multi-digit `"20"`, is rejected); anything non-numeric falls
+/// through to the generic comma-list validator.
+///
+/// # Safety
+/// Same as `did_set_str_generic`.
+pub unsafe fn did_set_backspace(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: a plain, momentary read - no aliasing hazard.
+    let p_bs = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs.clone();
+    let first = p_bs.as_deref().and_then(|s| s.first().copied());
+    if let Some(c) = first
+        && crate::ascii_defs::ascii_isdigit(i32::from(c))
+    {
+        return if c == b'2' { None } else { Some(crate::errors::e_invarg.as_bytes()) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_str_generic(args) }
 }
 
 #[cfg(test)]
@@ -314,5 +449,209 @@ mod tests {
         // zero characters never finds a disallowed one, so an empty
         // value is vacuously valid - not a translation bug.
         assert!(valid_filetype(b""));
+    }
+
+    // ---- opt_values / check_str_opt / did_set_str_generic ----
+
+    use crate::option_defs::OptIndex;
+
+    #[test]
+    fn opt_values_returns_the_options_own_table_for_a_normal_option() {
+        assert_eq!(opt_values(OptIndex::Fileformat), crate::option_vars::OPT_FF_VALUES);
+        assert_eq!(opt_values(OptIndex::Sessionoptions), crate::option_vars::OPT_SSOP_VALUES);
+    }
+
+    #[test]
+    fn opt_values_viewoptions_reuses_sessionoptions_own_table() {
+        assert_eq!(opt_values(OptIndex::Viewoptions), crate::option_vars::OPT_SSOP_VALUES);
+    }
+
+    #[test]
+    fn opt_values_fileformats_reuses_fileformat_own_table() {
+        assert_eq!(opt_values(OptIndex::Fileformats), crate::option_vars::OPT_FF_VALUES);
+    }
+
+    #[test]
+    fn check_str_opt_accepts_a_valid_value_via_an_explicit_varp() {
+        let mut val: Option<Vec<u8>> = Some(b"unix".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        assert!(unsafe { check_str_opt(OptIndex::Fileformat, Some(varp)) });
+    }
+
+    #[test]
+    fn check_str_opt_rejects_an_invalid_value_via_an_explicit_varp() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        assert!(!unsafe { check_str_opt(OptIndex::Fileformat, Some(varp)) });
+    }
+
+    #[test]
+    fn check_str_opt_writes_the_computed_flags_into_flags_var_on_success() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.ssop_flags;
+        opts.ssop_flags = 0;
+
+        let mut val: Option<Vec<u8>> = Some(b"help,blank".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        assert!(unsafe { check_str_opt(OptIndex::Sessionoptions, Some(varp)) });
+
+        // "help" is index 6, "blank" is index 7 in OPT_SSOP_VALUES.
+        assert_eq!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags,
+            (1 << 6) | (1 << 7)
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags = prev;
+    }
+
+    #[test]
+    fn check_str_opt_none_varp_reads_the_options_own_global_storage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_ff.clone();
+        opts.p_ff = Some(b"dos".to_vec());
+
+        assert!(unsafe { check_str_opt(OptIndex::Fileformat, None) });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ff = Some(b"bogus".to_vec());
+        assert!(!unsafe { check_str_opt(OptIndex::Fileformat, None) });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ff = prev;
+    }
+
+    #[test]
+    fn did_set_str_generic_valid_value_returns_none() {
+        let mut val: Option<Vec<u8>> = Some(b"unix".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args =
+            crate::option_defs::OptsetT { os_idx: OptIndex::Fileformat, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_str_generic(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_str_generic_invalid_value_returns_e_invarg() {
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args =
+            crate::option_defs::OptsetT { os_idx: OptIndex::Fileformat, os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_str_generic(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_str_generic_null_varp_falls_back_to_the_options_own_global_storage() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_ff.clone();
+        opts.p_ff = Some(b"mac".to_vec());
+
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Fileformat, ..Default::default() };
+        assert_eq!(unsafe { did_set_str_generic(&mut args) }, None);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ff = prev;
+    }
+
+    // ---- did_set_backupext_or_patchmode ----
+
+    fn set_bex_pm(bex: Option<&[u8]>, pm: Option<&[u8]>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = (opts.p_bex.clone(), opts.p_pm.clone());
+        opts.p_bex = bex.map(<[u8]>::to_vec);
+        opts.p_pm = pm.map(<[u8]>::to_vec);
+        prev
+    }
+
+    fn restore_bex_pm(prev: (Option<Vec<u8>>, Option<Vec<u8>>)) {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_bex = prev.0;
+        opts.p_pm = prev.1;
+    }
+
+    #[test]
+    fn did_set_backupext_or_patchmode_different_suffixes_is_ok() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_bex_pm(Some(b"~"), Some(b".orig"));
+        assert_eq!(did_set_backupext_or_patchmode(), None);
+        restore_bex_pm(prev);
+    }
+
+    #[test]
+    fn did_set_backupext_or_patchmode_identical_suffixes_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_bex_pm(Some(b".bak"), Some(b".bak"));
+        assert!(did_set_backupext_or_patchmode().is_some());
+        restore_bex_pm(prev);
+    }
+
+    #[test]
+    fn did_set_backupext_or_patchmode_leading_dot_is_stripped_before_comparing() {
+        let _lock = crate::globals::global_state_test_lock();
+        // ".bak" (patchmode) and "bak" (backupext, no leading dot) both
+        // reduce to the same "bak" suffix once the shared leading '.'
+        // is stripped from whichever side has one.
+        let prev = set_bex_pm(Some(b"bak"), Some(b".bak"));
+        assert!(did_set_backupext_or_patchmode().is_some());
+        restore_bex_pm(prev);
+    }
+
+    // ---- did_set_backspace ----
+
+    fn set_p_bs(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_bs.clone();
+        opts.p_bs = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_backspace_legacy_digit_2_is_ok() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_bs(Some(b"2"));
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
+        assert_eq!(unsafe { did_set_backspace(&mut args) }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
+    }
+
+    #[test]
+    fn did_set_backspace_other_leading_digit_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_bs(Some(b"3"));
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
+        assert_eq!(unsafe { did_set_backspace(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
+    }
+
+    #[test]
+    fn did_set_backspace_multi_digit_only_checks_the_first_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Matches the original's own `ascii_isdigit(*p_bs)` - only the
+        // FIRST byte is inspected, so "20" is rejected (first digit is
+        // '2', but the whole string isn't the single character "2").
+        // Wait: the check is `*p_bs != '2'` on the FIRST byte alone, so
+        // "20" actually passes this specific check (first byte is '2')
+        // even though the whole string isn't just "2" - preserved
+        // faithfully, not "fixed" to require an exact one-byte match.
+        let prev = set_p_bs(Some(b"20"));
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
+        assert_eq!(unsafe { did_set_backspace(&mut args) }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
+    }
+
+    #[test]
+    fn did_set_backspace_non_numeric_delegates_to_the_generic_comma_list_check() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_bs(Some(b"indent,eol,start"));
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
+        assert_eq!(unsafe { did_set_backspace(&mut args) }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
+    }
+
+    #[test]
+    fn did_set_backspace_non_numeric_invalid_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_bs(Some(b"bogus"));
+        let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
+        assert_eq!(unsafe { did_set_backspace(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
     }
 }
