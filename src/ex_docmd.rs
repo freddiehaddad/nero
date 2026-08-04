@@ -84,6 +84,18 @@
 //! this same file, and `menu.c`'s `ex_emenu`-adjacent code - neither
 //! translated yet), matching this crate's established "small, simple,
 //! mechanically correct piece ahead of its real caller" precedent.
+//!
+//! Also translated: [`set_no_hlsearch`] - toggles the "temporarily
+//! don't highlight search matches" flag and keeps `v:hlsearch` in
+//! sync, needing only the already-real `GLOBALS.Search.no_hlsearch`/
+//! `OPTION_VARS.p_hls`/`eval::vars::set_vim_var_nr`. Also
+//! [`ex_nohlsearch`] (`:nohlsearch`) - a genuine, complete Ex-command
+//! handler (not just a helper ahead of one), matching this crate's
+//! established `mark.rs`'s `ex_clearjumps` precedent for translating a
+//! real `ex_*` handler ahead of the still-unpopulated `cmdnames[]`
+//! dispatch table. Its own `redraw_all_later(UPD_SOME_VALID)` call is
+//! omitted (pure redraw scheduling, matching this crate's established
+//! `redraw_later`-omission precedent).
 
 use crate::buffer_defs::b_flags;
 
@@ -513,6 +525,42 @@ pub unsafe fn restore_current_state(sst: &mut SaveStateT) {
     // for 'indentexpr'). Update the mouse and cursor, they may have
     // changed.
     g.State = sst.save_state;
+}
+
+/// Set (or clear) the "temporarily don't highlight search matches"
+/// flag, and keep `v:hlsearch` in sync with it (`set_no_hlsearch`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::set_vim_var_nr`]'s own safety
+/// doc.
+pub unsafe fn set_no_hlsearch(flag: bool) {
+    // SAFETY: momentary write.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = flag;
+    // SAFETY: momentary read.
+    let no_hlsearch = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch;
+    // SAFETY: momentary read.
+    let p_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::eval::vars::set_vim_var_nr(
+            crate::eval::vars::VimVarIndex::Hlsearch,
+            i64::from(!no_hlsearch && p_hls != 0),
+        )
+    };
+}
+
+/// `:nohlsearch` - temporarily disable search-match highlighting until
+/// the next search (`ex_nohlsearch`).
+///
+/// The original's own `redraw_all_later(UPD_SOME_VALID)` call is
+/// omitted - a pure redraw-scheduling side effect, matching this
+/// crate's established `redraw_later`-omission precedent.
+///
+/// # Safety
+/// Same as [`set_no_hlsearch`].
+pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_no_hlsearch(true) };
 }
 
 #[cfg(test)]
@@ -1064,5 +1112,70 @@ mod tests {
         );
 
         snap.restore();
+    }
+
+    // --- set_no_hlsearch / ex_nohlsearch ---
+
+    fn reset_hlsearch_state() {
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = false;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 1;
+    }
+
+    #[test]
+    fn set_no_hlsearch_true_disables_hlsearch_regardless_of_p_hls() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_hlsearch_state();
+
+        unsafe { set_no_hlsearch(true) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch);
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(crate::eval::vars::VimVarIndex::Hlsearch) },
+            0
+        );
+        reset_hlsearch_state();
+    }
+
+    #[test]
+    fn set_no_hlsearch_false_with_p_hls_set_enables_v_hlsearch() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_hlsearch_state();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 1;
+
+        unsafe { set_no_hlsearch(false) };
+
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch);
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(crate::eval::vars::VimVarIndex::Hlsearch) },
+            1
+        );
+        reset_hlsearch_state();
+    }
+
+    #[test]
+    fn set_no_hlsearch_false_with_p_hls_unset_leaves_v_hlsearch_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_hlsearch_state();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 0;
+
+        unsafe { set_no_hlsearch(false) };
+
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(crate::eval::vars::VimVarIndex::Hlsearch) },
+            0
+        );
+        reset_hlsearch_state();
+    }
+
+    #[test]
+    fn ex_nohlsearch_sets_no_hlsearch_true() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_hlsearch_state();
+        let eap = crate::ex_cmds_defs::ExargT::default();
+
+        unsafe { ex_nohlsearch(&eap) };
+
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch);
+        reset_hlsearch_state();
     }
 }
