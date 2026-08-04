@@ -44,10 +44,14 @@
 //! [`cin_iscomment`], [`cin_islinecomment`], [`cin_isif`],
 //! [`cin_iselse`], [`cin_isdo`], [`cin_isbreak`] and [`cin_ends_in`].
 //!
+//! Also [`cin_is_cpp_extern_c`] (`extern "C"`/`extern "C++"` linkage
+//! specifications). Note its keyword-boundary test uses `vim_iswordc`
+//! rather than the `vim_isIDc` [`cin_starts_with`] uses, so it is
+//! deliberately NOT expressed through that helper.
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
-//! `find_line_comment` (need `ml_get` and the cursor),
-//! `cin_is_cpp_extern_c` and the rest of the real indent-computation
-//! algorithm.
+//! `find_line_comment` (need `ml_get` and the cursor) and the rest of
+//! the real indent-computation algorithm.
 
 use crate::charset::vim_isidc;
 
@@ -663,6 +667,72 @@ pub unsafe fn cin_ends_in(line: &[u8], s: usize, find: &[u8]) -> bool {
     false
 }
 
+/// Recognize an `extern "C"` or `extern "C++"` linkage specification
+/// (`cin_is_cpp_extern_c`).
+///
+/// Requires exactly one string literal: a second one (as in
+/// `extern "C" "C"`) is rejected, as is anything else between the
+/// keyword and an opening brace.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_is_cpp_extern_c(line: &[u8], s: usize) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { cin_skipcomment(line, s) };
+
+    // Note the keyword test here uses `vim_iswordc`, not the
+    // `vim_isIDc` that `cin_starts_with` uses - so this is
+    // deliberately NOT expressed via that helper.
+    if !line.get(s..).is_some_and(|t| t.starts_with(b"extern")) {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc - the
+    // same `curbuf` read.
+    let boundary_ok =
+        at(s + 6) == 0 || !unsafe { crate::charset::vim_iswordc(i32::from(at(s + 6))) };
+    if !boundary_ok {
+        return false;
+    }
+
+    let after = s + 6;
+    let w = after + crate::charset::skipwhite(line.get(after..).unwrap_or(&[]));
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut p = unsafe { cin_skipcomment(line, w) };
+
+    let mut has_string_literal = false;
+    while at(p) != 0 {
+        if crate::ascii_defs::ascii_iswhite(i32::from(at(p))) {
+            let w = p + crate::charset::skipwhite(line.get(p..).unwrap_or(&[]));
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skipcomment(line, w) };
+        } else if at(p) == b'{' {
+            break;
+        } else if at(p) == b'"' && at(p + 1) == b'C' && at(p + 2) == b'"' {
+            if has_string_literal {
+                return false;
+            }
+            has_string_literal = true;
+            p += 3;
+        } else if at(p) == b'"'
+            && at(p + 1) == b'C'
+            && at(p + 2) == b'+'
+            && at(p + 3) == b'+'
+            && at(p + 4) == b'"'
+        {
+            if has_string_literal {
+                return false;
+            }
+            has_string_literal = true;
+            p += 5;
+        } else {
+            return false;
+        }
+    }
+    has_string_literal
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +821,45 @@ mod tests {
     // ---- cin_skip_comment_and_string / cin_is_compound_init ----
 
     // ---- small cin_* predicates ----
+
+    // ---- cin_is_cpp_extern_c ----
+
+    #[test]
+    fn cin_is_cpp_extern_c_accepts_both_linkage_forms() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_is_cpp_extern_c(b"extern \"C\"", 0) });
+            assert!(unsafe { cin_is_cpp_extern_c(b"extern \"C++\"", 0) });
+            // A following brace ends the scan successfully.
+            assert!(unsafe { cin_is_cpp_extern_c(b"extern \"C\" {", 0) });
+            // Comments are skipped before and within.
+            assert!(unsafe { cin_is_cpp_extern_c(b"/* c */extern \"C\"", 0) });
+            assert!(unsafe { cin_is_cpp_extern_c(b"extern /* c */ \"C\"", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_extern_c_requires_exactly_one_string_literal() {
+        with_hash_comment(0, || {
+            // No literal at all.
+            assert!(!unsafe { cin_is_cpp_extern_c(b"extern", 0) });
+            assert!(!unsafe { cin_is_cpp_extern_c(b"extern {", 0) });
+            // Two literals are rejected.
+            assert!(!unsafe { cin_is_cpp_extern_c(b"extern \"C\" \"C\"", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_is_cpp_extern_c_rejects_other_content_and_partial_keywords() {
+        with_hash_comment(0, || {
+            // An ordinary extern declaration is not a linkage spec.
+            assert!(!unsafe { cin_is_cpp_extern_c(b"extern int x;", 0) });
+            // An unrecognized literal.
+            assert!(!unsafe { cin_is_cpp_extern_c(b"extern \"Rust\"", 0) });
+            // "externx" is not the keyword.
+            assert!(!unsafe { cin_is_cpp_extern_c(b"externx \"C\"", 0) });
+            assert!(!unsafe { cin_is_cpp_extern_c(b"", 0) });
+        });
+    }
 
     #[test]
     fn cin_ispreproc_matches_a_hash_after_optional_whitespace() {
