@@ -62,9 +62,17 @@
 //! [`after_label`], which returns `Option<usize>` in place of the
 //! original's nullable `const char *`.
 //!
+//! Also [`cin_is_if_for_while_before_offset`], which returns
+//! `Option<usize>` in place of the original's bool-plus-in/out
+//! `int *poffset`. Its whitespace-skipping loop has a STRICT
+//! `offset > 2` bound, so a keyword at column 0 followed by a space
+//! is missed while the same text indented is found - preserved and
+//! pinned by its own test rather than "fixed".
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
-//! `find_line_comment` (need `ml_get` and the cursor) and the rest of
-//! the real indent-computation algorithm.
+//! `find_line_comment`/`cin_iswhileofdo_end` (need `ml_get`, the
+//! cursor and `find_match_paren`) and the rest of the real
+//! indent-computation algorithm.
 
 use crate::charset::vim_isidc;
 
@@ -918,6 +926,63 @@ pub unsafe fn after_label(line: &[u8], l: usize) -> Option<usize> {
     if at(l) == 0 { None } else { Some(l) }
 }
 
+/// Whether an `"if"`, `"for"` or `"while"` keyword sits just before
+/// `offset` (`cin_is_if_for_while_before_offset`).
+///
+/// The original takes `int *poffset` as an in/out parameter; here
+/// `offset` is passed by value and the updated position is returned
+/// as `Some(new_offset)`, with `None` for "not found".
+///
+/// Note the whitespace-skipping loop's own `offset > 2` bound is
+/// STRICT, so it stops early when the keyword sits at the very start
+/// of the line: `"if ("` (keyword at column 0, one space) is NOT
+/// recognized, while the same text indented (`"  if ("`) is. That
+/// looks like an off-by-one in the original, but it is preserved
+/// rather than "fixed", and pinned by its own test.
+#[must_use]
+pub fn cin_is_if_for_while_before_offset(line: &[u8], offset: usize) -> Option<usize> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+
+    // `if (offset-- < 2)` - compares first, then decrements.
+    if offset < 2 {
+        return None;
+    }
+    let mut offset = offset - 1;
+
+    while offset > 2 && crate::ascii_defs::ascii_iswhite(i32::from(at(offset))) {
+        offset -= 1;
+    }
+
+    let starts = |i: usize, w: &[u8]| line.get(i..).is_some_and(|t| t.starts_with(w));
+
+    offset -= 1;
+    let found = if starts(offset, b"if") {
+        true
+    } else if offset >= 1 {
+        offset -= 1;
+        if starts(offset, b"for") {
+            true
+        } else if offset >= 2 {
+            offset -= 2;
+            starts(offset, b"while")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !found {
+        return None;
+    }
+    // The keyword must not itself be the tail of a longer identifier.
+    if offset == 0 || !crate::charset::vim_isidc(i32::from(at(offset - 1))) {
+        Some(offset)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1077,51 @@ mod tests {
     // ---- cin_isterminated ----
 
     // ---- cin_is_cpp_namespace / after_label ----
+
+    // ---- cin_is_if_for_while_before_offset ----
+
+    #[test]
+    fn cin_is_if_for_while_before_offset_finds_an_indented_keyword() {
+        // "  if (" - the `(` is at index 5, and the keyword starts at
+        // index 2, which is what comes back.
+        assert_eq!(cin_is_if_for_while_before_offset(b"  if (", 5), Some(2));
+        // "  for (" - `(` at 6, keyword at 2.
+        assert_eq!(cin_is_if_for_while_before_offset(b"  for (", 6), Some(2));
+        // "  while (" - `(` at 8, keyword at 2.
+        assert_eq!(cin_is_if_for_while_before_offset(b"  while (", 8), Some(2));
+    }
+
+    #[test]
+    fn cin_is_if_for_while_before_offset_finds_a_keyword_with_no_space() {
+        // At column 0 with NO space the scan still reaches the word.
+        assert_eq!(cin_is_if_for_while_before_offset(b"if(", 2), Some(0));
+    }
+
+    #[test]
+    fn cin_is_if_for_while_before_offset_misses_a_column_zero_keyword_with_a_space() {
+        // The whitespace loop's `offset > 2` bound is STRICT, so it
+        // refuses to step back over the space at index 2 and the
+        // keyword is missed. Preserved from the original rather than
+        // "fixed" - the same text indented is found (see above).
+        assert_eq!(cin_is_if_for_while_before_offset(b"if (", 3), None);
+    }
+
+    #[test]
+    fn cin_is_if_for_while_before_offset_rejects_a_longer_identifier() {
+        // "xif (" - the `if` here is the tail of `xif`, so the
+        // preceding-character check rejects it.
+        assert_eq!(cin_is_if_for_while_before_offset(b" xif (", 6), None);
+    }
+
+    #[test]
+    fn cin_is_if_for_while_before_offset_rejects_short_offsets_and_non_keywords() {
+        // An offset below 2 can never have a keyword before it.
+        assert_eq!(cin_is_if_for_while_before_offset(b"if (", 0), None);
+        assert_eq!(cin_is_if_for_while_before_offset(b"if (", 1), None);
+        // No keyword at all.
+        assert_eq!(cin_is_if_for_while_before_offset(b"  foo (", 6), None);
+        assert_eq!(cin_is_if_for_while_before_offset(b"", 5), None);
+    }
 
     #[test]
     fn cin_is_cpp_namespace_accepts_named_and_anonymous_forms() {
