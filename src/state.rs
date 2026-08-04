@@ -98,20 +98,22 @@ pub fn get_real_state() -> i32 {
 /// mis-classified it as "genuinely event-loop-bound, deferred
 /// alongside `state_enter`" - `get_mode` itself is a pure state-to-
 /// string formatter with no event-loop interaction of its own. Two of
-/// its real predicates, `ins_compl_active()`/
-/// `ctrl_x_mode_not_defined_yet()` (`insexpand.c`, not translated),
-/// are modeled as their real, verified default/idle values
-/// (`compl_started == false`; `ctrl_x_mode == CTRL_X_NORMAL`, NOT
-/// `CTRL_X_NOT_DEFINED_YET`) - nothing in this crate can currently
-/// change either away from that default (no insert-completion
-/// subsystem exists), so "false" is the correct, decidable answer
-/// today, not a guess. The `MODE_CMDLINE`-dependent branches (needing
-/// `ex_getln.c`'s `get_cmdline_info()`/`cmdline_overstrike()`, neither
-/// translated) panic via `unimplemented!()` if ever actually reached -
-/// unlike the two predicates above, nothing in this crate can
-/// currently construct a `State` value with the `MODE_CMDLINE` bit set
-/// at all (no command-line editing subsystem exists), so there is no
-/// real default to fall back on for those specific branches.
+/// its real predicates, `insexpand.c`'s `ins_compl_active()`/
+/// `ctrl_x_mode_not_defined_yet()`, are NOW called for real (both
+/// exist as of this update) - each still always reports its own
+/// real, verified default/idle value today (`compl_started == false`;
+/// `ctrl_x_mode == CTRL_X_NORMAL`, NOT `CTRL_X_NOT_DEFINED_YET`),
+/// since nothing in this crate can currently change either away from
+/// that default (no insert-completion subsystem exists) - but this is
+/// no longer a hardcoded assumption baked into THIS function, it is
+/// the genuine, current answer from `insexpand.rs`'s own real state.
+/// The `MODE_CMDLINE`-dependent branches (needing `ex_getln.c`'s
+/// `get_cmdline_info()`/`cmdline_overstrike()`, neither translated)
+/// panic via `unimplemented!()` if ever actually reached - unlike the
+/// two predicates above, nothing in this crate can currently
+/// construct a `State` value with the `MODE_CMDLINE` bit set at all
+/// (no command-line editing subsystem exists), so there is no real
+/// default to fall back on for those specific branches.
 ///
 /// # Safety
 /// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
@@ -152,9 +154,12 @@ pub unsafe fn get_mode() -> Vec<u8> {
         } else {
             buf.push(b'i');
         }
-        // ins_compl_active()/ctrl_x_mode_not_defined_yet() (insexpand.c)
-        // both real, verified false in their default/idle state - see
-        // this function's own doc comment.
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::insexpand::ins_compl_active() } {
+            buf.push(b'c');
+        } else if unsafe { crate::insexpand::ctrl_x_mode_not_defined_yet() } {
+            buf.push(b'x');
+        }
     } else if g.State & mode::CMDLINE as i32 != 0 || g.exmode_active {
         buf.push(b'c');
         if g.exmode_active {

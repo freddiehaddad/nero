@@ -8,22 +8,26 @@
 //! Translated: the `CTRL_X_*` mode constants and the whole
 //! `ctrl_x_mode_*` predicate family (19 pure, `FUNC_ATTR_PURE`
 //! functions checking the current Ctrl-X completion sub-mode) plus
-//! the `CTRL_X_MODE` file-static itself (`ctrl_x_mode`). All are
-//! small, self-contained, no-design-freedom equality checks -
-//! translated ahead of their real callers (`ins_ctrl_x`/the whole
-//! completion-source dispatch, none translated), matching this
-//! crate's established "translate a small, simple, mechanically-
-//! correct piece ahead of the surrounding engine" precedent.
+//! the `CTRL_X_MODE` file-static itself (`ctrl_x_mode`), and now
+//! [`ins_compl_active`] plus its own backing `COMPL_STARTED`
+//! file-static (`compl_started`). All are small, self-contained,
+//! no-design-freedom equality checks - translated ahead of their real
+//! callers (`ins_ctrl_x`/the whole completion-source dispatch, none
+//! translated), matching this crate's established "translate a small,
+//! simple, mechanically-correct piece ahead of the surrounding engine"
+//! precedent.
 //!
 //! Since `ins_ctrl_x` (the only real mutator of `ctrl_x_mode`) isn't
 //! translated, `CTRL_X_MODE` stays `CTRL_X_NORMAL` (its own real
-//! static initializer value) forever in this crate today - exactly
-//! matching `state.rs`'s own already-documented assumption for
-//! `get_mode`'s `ctrl_x_mode_not_defined_yet()` check (see that
-//! function's own doc comment). `state.rs` could be refined to read
-//! through `CTRL_X_MODE` directly instead of its own hardcoded
-//! assumption as a low-risk future follow-up - not done here, to keep
-//! this change scoped to `insexpand.c` itself.
+//! static initializer value) forever in this crate today, and
+//! `COMPL_STARTED` likewise stays `false` forever (its own only real
+//! mutator is the same not-yet-translated completion engine) -
+//! exactly matching `state.rs`'s own already-documented assumption
+//! for `get_mode`'s `ins_compl_active()`/
+//! `ctrl_x_mode_not_defined_yet()` checks (see that function's own
+//! doc comment) - `state.rs`'s own `get_mode` has now been refined to
+//! call these 2 real predicates directly instead of its own
+//! hardcoded-false assumption, since both now exist for real.
 //!
 //! Also translated: [`set_ref_in_cpt_callbacks`]/
 //! [`set_ref_in_insexpand_funcs`] - mark the global `'completefunc'`/
@@ -106,6 +110,23 @@ pub const CPT_COUNT: i32 = 4;
 /// Which Ctrl-X mode are we in? (`ctrl_x_mode`). Always
 /// [`CTRL_X_NORMAL`] today - see this module's own doc comment.
 static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
+
+/// Whether Insert-mode completion is currently active (`compl_started`).
+/// Always `false` today - nothing in this crate can currently start a
+/// real completion session (the only real mutator, `ins_ctrl_x`/the
+/// completion-source dispatch machinery, isn't translated), matching
+/// [`CTRL_X_MODE`]'s own established treatment exactly.
+static COMPL_STARTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Check that Insert-mode completion is active (`ins_compl_active`).
+///
+/// # Safety
+/// Same as `ctrl_x_mode()`.
+#[must_use]
+pub unsafe fn ins_compl_active() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_STARTED.get_mut() }
+}
 
 /// # Safety
 /// Single-threaded test/editor state, matching every other
@@ -375,6 +396,66 @@ mod tests {
         assert!(unsafe { ctrl_x_mode_normal() });
         assert!(unsafe { ctrl_x_mode_none() }); // CTRL_X_NORMAL == 0
         assert!(!unsafe { ctrl_x_mode_not_default() });
+    }
+
+    #[test]
+    fn ins_compl_active_defaults_to_false() {
+        let _lock = global_state_test_lock();
+        assert!(!unsafe { ins_compl_active() });
+    }
+
+    #[test]
+    fn ins_compl_active_reflects_compl_started() {
+        // Directly manipulate the file-static (something no real,
+        // translated caller can currently do, since nothing starts a
+        // real completion session yet) to prove ins_compl_active
+        // reads the REAL value, not a hardcoded false.
+        let _lock = global_state_test_lock();
+        unsafe { *COMPL_STARTED.get_mut() = true };
+        assert!(unsafe { ins_compl_active() });
+        unsafe { *COMPL_STARTED.get_mut() = false };
+        assert!(!unsafe { ins_compl_active() });
+    }
+
+    #[test]
+    fn get_mode_insert_reports_c_when_completion_is_active() {
+        // Proves state.rs's get_mode() now calls the REAL
+        // ins_compl_active() (wired in this same update), not a
+        // hardcoded false - manipulates COMPL_STARTED directly, only
+        // possible from within this same module (it's a private
+        // static), so this test lives here rather than in state.rs.
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::INSERT as i32;
+        unsafe { *COMPL_STARTED.get_mut() = true };
+
+        let result = unsafe { crate::state::get_mode() };
+
+        unsafe { *COMPL_STARTED.get_mut() = false };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(result, b"ic".to_vec());
+    }
+
+    #[test]
+    fn get_mode_insert_reports_x_when_ctrl_x_mode_not_defined_yet() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_NOT_DEFINED_YET);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = crate::state_defs::mode::INSERT as i32;
+
+        let result = unsafe { crate::state::get_mode() };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+
+        assert_eq!(result, b"ix".to_vec());
     }
 
     #[test]
