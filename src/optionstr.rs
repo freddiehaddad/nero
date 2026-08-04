@@ -98,6 +98,18 @@
 //! bitmask yet), matching this crate's established "keep the real
 //! state mutation even without a current consumer" policy.
 //!
+//! Also [`check_stl_option`] (`'statusline'`/`'winbar'`/`'tabline'`/
+//! `'rulerformat'`/`'statuscolumn'` format-string validation) -
+//! genuinely self-contained (only needs `STL_ALL`, a fixed
+//! character set derived from `statusline_defs.rs`'s own
+//! `stl_flag` module, plus `ascii_isdigit`), even though its own real
+//! caller (`did_set_statustabline_rulerformat`, needing
+//! `win_config_float`/`get_option_default`/`comp_col`) is not yet
+//! translated - matching this crate's established "small, simple,
+//! no design freedom" ahead-of-caller precedent. Every dynamically-
+//! formatted `illegal_char` message is simplified to a static
+//! `e_invarg`, matching this module's own established policy.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -882,6 +894,184 @@ pub unsafe fn did_set_wildmode() -> Option<&'static [u8]> {
     } else {
         Some(crate::errors::e_invarg.as_bytes())
     }
+}
+
+/// All `'statusline'`/`'winbar'`/`'tabline'`/`'rulerformat'`/
+/// `'statuscolumn'` item-flag characters (`STL_ALL`, `option_vars.h`).
+///
+/// Faithfully preserves a real, harmless upstream quirk: `TABPAGENR`/
+/// `TABCLOSENR`/`CLICK_FUNC` are listed TWICE in the original's own
+/// array literal - since this is only ever used for membership
+/// testing (`vim_strchr`/`.contains()`), the duplication changes
+/// nothing observable, but is transcribed exactly rather than
+/// silently de-duplicated.
+const STL_ALL: &[u8] = &[
+    crate::statusline_defs::stl_flag::FILEPATH,
+    crate::statusline_defs::stl_flag::FULLPATH,
+    crate::statusline_defs::stl_flag::FILENAME,
+    crate::statusline_defs::stl_flag::COLUMN,
+    crate::statusline_defs::stl_flag::VIRTCOL,
+    crate::statusline_defs::stl_flag::VIRTCOL_ALT,
+    crate::statusline_defs::stl_flag::LINE,
+    crate::statusline_defs::stl_flag::NUMLINES,
+    crate::statusline_defs::stl_flag::BUFNO,
+    crate::statusline_defs::stl_flag::KEYMAP,
+    crate::statusline_defs::stl_flag::OFFSET,
+    crate::statusline_defs::stl_flag::OFFSET_X,
+    crate::statusline_defs::stl_flag::BYTEVAL,
+    crate::statusline_defs::stl_flag::BYTEVAL_X,
+    crate::statusline_defs::stl_flag::ROFLAG,
+    crate::statusline_defs::stl_flag::ROFLAG_ALT,
+    crate::statusline_defs::stl_flag::HELPFLAG,
+    crate::statusline_defs::stl_flag::HELPFLAG_ALT,
+    crate::statusline_defs::stl_flag::FILETYPE,
+    crate::statusline_defs::stl_flag::FILETYPE_ALT,
+    crate::statusline_defs::stl_flag::PREVIEWFLAG,
+    crate::statusline_defs::stl_flag::PREVIEWFLAG_ALT,
+    crate::statusline_defs::stl_flag::MODIFIED,
+    crate::statusline_defs::stl_flag::MODIFIED_ALT,
+    crate::statusline_defs::stl_flag::QUICKFIX,
+    crate::statusline_defs::stl_flag::PERCENTAGE,
+    crate::statusline_defs::stl_flag::ALTPERCENT,
+    crate::statusline_defs::stl_flag::ARGLISTSTAT,
+    crate::statusline_defs::stl_flag::PAGENUM,
+    crate::statusline_defs::stl_flag::SHOWCMD,
+    crate::statusline_defs::stl_flag::FOLDCOL,
+    crate::statusline_defs::stl_flag::SIGNCOL,
+    crate::statusline_defs::stl_flag::VIM_EXPR,
+    crate::statusline_defs::stl_flag::SEPARATE,
+    crate::statusline_defs::stl_flag::TRUNCMARK,
+    crate::statusline_defs::stl_flag::USER_HL,
+    crate::statusline_defs::stl_flag::HIGHLIGHT,
+    crate::statusline_defs::stl_flag::HIGHLIGHT_COMB,
+    crate::statusline_defs::stl_flag::TABPAGENR,
+    crate::statusline_defs::stl_flag::TABCLOSENR,
+    crate::statusline_defs::stl_flag::CLICK_FUNC,
+    // Real, harmless duplicate from the original's own array literal.
+    crate::statusline_defs::stl_flag::TABPAGENR,
+    crate::statusline_defs::stl_flag::TABCLOSENR,
+    crate::statusline_defs::stl_flag::CLICK_FUNC,
+];
+
+/// Check validity of options with the `'statusline'` format
+/// (`check_stl_option`). Returns an error message, or `None` on
+/// success.
+///
+/// Every dynamically-formatted "illegal character" message the
+/// original builds via `illegal_char` is simplified to a static
+/// [`crate::errors::e_invarg`], matching this file's own established
+/// policy (the DISPLAYED text differs, the valid/invalid boolean
+/// outcome is identical) - see this module's own doc comment.
+///
+/// Operates on byte positions rather than a NUL-terminated pointer
+/// walk; every `*s`-past-the-end read in the original (which relies
+/// on the implicit C-string NUL terminator) is replicated as an
+/// explicit `pos >= s.len()` bounds check instead, EXCEPT at the
+/// `STL_ALL` membership test: the original's own `vim_strchr` has a
+/// real, deliberate `if (c <= 0) return NULL;` guard (`strings.c`),
+/// so running off the end there is a genuine ILLEGAL CHARACTER, not
+/// a graceful "found the terminator" match - confirmed directly
+/// against a real `nvim` binary (a bare trailing `%` with nothing
+/// after it is rejected as `E539: Illegal character <^@>`) before
+/// trusting this, since an earlier draft assumed the opposite.
+#[must_use]
+pub fn check_stl_option(s: &[u8]) -> Option<&'static [u8]> {
+    let len = s.len();
+    let mut pos = 0usize;
+    let mut groupdepth: i32 = 0;
+
+    while pos < len {
+        // Scan forward for the next '%'.
+        while pos < len && s[pos] != b'%' {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+        pos += 1;
+
+        if pos < len
+            && (s[pos] == b'%'
+                || s[pos] == crate::statusline_defs::stl_flag::TRUNCMARK
+                || s[pos] == crate::statusline_defs::stl_flag::SEPARATE)
+        {
+            pos += 1;
+            continue;
+        }
+        if pos < len && s[pos] == b')' {
+            pos += 1;
+            groupdepth -= 1;
+            if groupdepth < 0 {
+                break;
+            }
+            continue;
+        }
+        if pos < len && s[pos] == b'-' {
+            pos += 1;
+        }
+        while pos < len && crate::ascii_defs::ascii_isdigit(i32::from(s[pos])) {
+            pos += 1;
+        }
+        if pos < len && s[pos] == crate::statusline_defs::stl_flag::USER_HL {
+            continue;
+        }
+        if pos < len && s[pos] == b'.' {
+            pos += 1;
+            while pos < len && crate::ascii_defs::ascii_isdigit(i32::from(s[pos])) {
+                pos += 1;
+            }
+        }
+        if pos < len && s[pos] == b'(' {
+            groupdepth += 1;
+            continue;
+        }
+        // The original checks `vim_strchr(STL_ALL, (uint8_t)(*s)) ==
+        // NULL` here - and `vim_strchr` itself has a real, deliberate
+        // `if (c <= 0) return NULL;` guard (`strings.c`), UNLIKE a
+        // raw C-string dereference of `*s` past the string's own end
+        // (which just reads the value 0). This means running off the
+        // end here is genuinely, faithfully an ILLEGAL CHARACTER (a
+        // dangling '%' with nothing after it is INVALID, not silently
+        // accepted) - confirmed directly against a real `nvim` binary
+        // before trusting this (an earlier draft assumed the
+        // opposite, incorrectly treating a bare trailing '%' as
+        // valid).
+        if pos >= len || !STL_ALL.contains(&s[pos]) {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        if s[pos] == crate::statusline_defs::stl_flag::VIM_EXPR {
+            pos += 1; // `*++s`
+            let reevaluate = pos < len && s[pos] == b'%';
+            if reevaluate {
+                pos += 1; // `*++s`
+                if pos < len && s[pos] == b'}' {
+                    // "}" is not allowed immediately after "%{%"
+                    return Some(crate::errors::e_invarg.as_bytes());
+                }
+            }
+            loop {
+                if pos >= len {
+                    break;
+                }
+                let stop = s[pos] == b'}' && (!reevaluate || (pos > 0 && s[pos - 1] == b'%'));
+                if stop {
+                    break;
+                }
+                pos += 1;
+            }
+            if pos >= len || s[pos] != b'}' {
+                return Some(
+                    crate::gettext_defs::gettext_noop("E540: Unclosed expression sequence")
+                        .as_bytes(),
+                );
+            }
+        }
+    }
+
+    if groupdepth != 0 {
+        return Some(crate::gettext_defs::gettext_noop("E542: Unbalanced groups").as_bytes());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2175,5 +2365,112 @@ mod tests {
         let prev = set_p_wim(Some(b"bogus"));
         assert_eq!(unsafe { did_set_wildmode() }, Some(crate::errors::e_invarg.as_bytes()));
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wim = prev;
+    }
+
+    // ---- check_stl_option ----
+
+    #[test]
+    fn check_stl_option_empty_string_is_ok() {
+        assert_eq!(check_stl_option(b""), None);
+    }
+
+    #[test]
+    fn check_stl_option_plain_text_with_no_percent_is_ok() {
+        assert_eq!(check_stl_option(b"just plain text"), None);
+    }
+
+    #[test]
+    fn check_stl_option_a_bare_trailing_percent_is_illegal() {
+        // vim_strchr's own `if (c <= 0) return NULL;` guard means a
+        // dangling '%' with nothing after it is a genuine illegal
+        // character (NUL), NOT a graceful match against STL_ALL's own
+        // trailing sentinel - verified directly against a real `nvim`
+        // binary (`E539: Illegal character <^@>`) before trusting
+        // this.
+        assert_eq!(check_stl_option(b"%"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn check_stl_option_percent_percent_is_a_literal_escape() {
+        assert_eq!(check_stl_option(b"%%"), None);
+    }
+
+    #[test]
+    fn check_stl_option_truncmark_and_separate_are_ok() {
+        assert_eq!(check_stl_option(b"%<"), None);
+        assert_eq!(check_stl_option(b"%="), None);
+    }
+
+    #[test]
+    fn check_stl_option_unrecognized_flag_character_fails() {
+        assert_eq!(check_stl_option(b"%z"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn check_stl_option_a_realistic_default_like_statusline_is_ok() {
+        assert_eq!(check_stl_option(b"%f%m%r%h%w%=%l,%c%V %P"), None);
+    }
+
+    #[test]
+    fn check_stl_option_minwid_and_maxwid_digits_are_ok() {
+        assert_eq!(check_stl_option(b"%3f"), None);
+        assert_eq!(check_stl_option(b"%-3.2f"), None);
+    }
+
+    #[test]
+    fn check_stl_option_user_highlight_digit_flag_is_ok() {
+        assert_eq!(check_stl_option(b"%1*text"), None);
+    }
+
+    #[test]
+    fn check_stl_option_balanced_group_is_ok() {
+        assert_eq!(check_stl_option(b"%(text%)"), None);
+    }
+
+    #[test]
+    fn check_stl_option_a_lone_close_paren_is_unbalanced() {
+        assert_eq!(
+            check_stl_option(b"%)"),
+            Some(crate::gettext_defs::gettext_noop("E542: Unbalanced groups").as_bytes())
+        );
+    }
+
+    #[test]
+    fn check_stl_option_an_unclosed_open_paren_is_unbalanced() {
+        assert_eq!(
+            check_stl_option(b"%(unclosed"),
+            Some(crate::gettext_defs::gettext_noop("E542: Unbalanced groups").as_bytes())
+        );
+    }
+
+    #[test]
+    fn check_stl_option_a_plain_expression_is_ok() {
+        assert_eq!(check_stl_option(b"%{expr}"), None);
+    }
+
+    #[test]
+    fn check_stl_option_a_reevaluating_expression_is_ok() {
+        assert_eq!(check_stl_option(b"%{%1+1%}"), None);
+    }
+
+    #[test]
+    fn check_stl_option_a_reevaluating_expression_immediately_closed_fails() {
+        assert_eq!(check_stl_option(b"%{%}"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn check_stl_option_an_unclosed_expression_fails() {
+        assert_eq!(
+            check_stl_option(b"%{expr"),
+            Some(crate::gettext_defs::gettext_noop("E540: Unclosed expression sequence").as_bytes())
+        );
+    }
+
+    #[test]
+    fn check_stl_option_an_unclosed_reevaluating_expression_fails() {
+        assert_eq!(
+            check_stl_option(b"%{%expr"),
+            Some(crate::gettext_defs::gettext_noop("E540: Unclosed expression sequence").as_bytes())
+        );
     }
 }
