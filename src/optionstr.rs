@@ -319,14 +319,24 @@
 //! redraw condition, which exists only to decide WHICH redraw to
 //! schedule, has no observable effect here and is omitted with them.
 //!
+//! Also [`check_signcolumn`] and [`did_set_signcolumn`] - the
+//! `WinT` field wiring that previously blocked these
+//! (`w_minscwidth`/`w_maxscwidth`/`w_scwidth`, plus `SCL_NO`/
+//! `SCL_NUM`/`OPT_SCL_VALUES`) all landed in the meantime, so the old
+//! "deferred" note below no longer applied. `check_signcolumn`
+//! follows `check_colorcolumn`/`briopt_check`'s established
+//! `Option<&[u8]>`/`Option<&mut WinT>`/plain-`bool` shape. Two real
+//! behaviours are preserved: `"number"` only maps to `SCL_NUM` when
+//! the window actually has `'number'`/`'relativenumber'` set
+//! (otherwise it falls through to the same `min=0, max=1` bare
+//! `"auto"` uses), and the `auto:<MIN>-<MAX>` form is NOT in the
+//! value list so it is shape-checked by hand.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
-//! `OPTIONS` doc comment), `copy_option_part`/`skip_to_option_part`
-//! (already translated in `option.rs`, not here), and
-//! `check_signcolumn`/other `opt_strings_flags` callers (each needs
-//! its own additional `WinT` field wiring, deliberately not bundled
-//! into this same pass).
+//! `OPTIONS` doc comment) and `copy_option_part`/`skip_to_option_part`
+//! (already translated in `option.rs`, not here).
 
 use crate::option_defs::opt_flags;
 use std::ffi::c_void;
@@ -1983,6 +1993,160 @@ pub unsafe fn did_set_complete(args: &mut crate::option_defs::OptsetT) -> Option
         while p < len && (val[p] == b',' || val[p] == b' ') {
             p += 1;
         }
+    }
+
+    None
+}
+
+/// Check `scl` as a `'signcolumn'` value and update `wp`'s own
+/// `w_minscwidth`/`w_maxscwidth`/`w_scwidth` (`check_signcolumn`).
+///
+/// `scl`, when `Some`, overrides reading `wp`'s own
+/// `w_onebuf_opt.wo_scl` directly - matching the original's own "use
+/// `scl` if given, else fall back to `wp->w_p_scl`, else the empty
+/// string" 3-way fallback, the same shape `check_colorcolumn`/
+/// `briopt_check` already established. Returns `false` for an
+/// invalid value (the original's own `FAIL`), matching those two
+/// functions' plain-`bool` precedent for this exact "valid or not"
+/// shape. `wp`'s fields are only touched when `wp` is `Some`.
+///
+/// An empty value is invalid, unlike most options in this file.
+///
+/// Accepts either one of the 22 literal `OPT_SCL_VALUES` entries, or
+/// the separate `auto:<MIN>-<MAX>` form (which that list does NOT
+/// contain, so it is validated by hand - exactly 8 bytes, two single
+/// digits around a `-`, with `1 <= MIN < MAX` and `MAX >= 2`).
+///
+/// Two real behaviours worth noting, both preserved:
+/// - `"number"` only maps to `SCL_NUM` when the window actually has
+///   `'number'` or `'relativenumber'` set; otherwise it falls all the
+///   way through to the same `min=0, max=1` the bare `"auto"` uses.
+/// - `"yes:<N>"`/`"auto:<N>"` read their digit positionally without
+///   re-validating it, which is safe precisely because
+///   `opt_strings_flags` already matched the whole value against the
+///   fixed list.
+#[must_use]
+pub fn check_signcolumn(scl: Option<&[u8]>, wp: Option<&mut crate::buffer_defs::WinT>) -> bool {
+    let owned;
+    let val: &[u8] = if let Some(scl) = scl {
+        scl
+    } else if let Some(ref w) = wp {
+        owned = w.w_onebuf_opt.wo_scl.clone().unwrap_or_default();
+        &owned
+    } else {
+        &[]
+    };
+
+    if val.is_empty() {
+        return false;
+    }
+
+    let listed = opt_strings_flags(val, crate::option_vars::OPT_SCL_VALUES, false).is_some();
+
+    // The `auto:<MIN>-<MAX>` form is not in the value list, so it is
+    // shape-checked by hand. Done BEFORE the `wp` check so an invalid
+    // value is rejected even when only validating.
+    let mut range: Option<(i32, i32)> = None;
+    if !listed {
+        if !(val.starts_with(b"auto:")
+            && val.len() == 8
+            && crate::ascii_defs::ascii_isdigit(i32::from(val[5]))
+            && val[6] == b'-'
+            && crate::ascii_defs::ascii_isdigit(i32::from(val[7])))
+        {
+            return false;
+        }
+        let min = i32::from(val[5] - b'0');
+        let max = i32::from(val[7] - b'0');
+        if min < 1 || max < 2 || min > 8 || min >= max {
+            return false;
+        }
+        range = Some((min, max));
+    }
+
+    let Some(w) = wp else {
+        return true;
+    };
+
+    if let Some((min, max)) = range {
+        w.w_minscwidth = min;
+        w.w_maxscwidth = max;
+    } else if val.starts_with(b"no") {
+        w.w_minscwidth = crate::option_vars::SCL_NO;
+        w.w_maxscwidth = crate::option_vars::SCL_NO;
+    } else if val.starts_with(b"nu")
+        && (w.w_onebuf_opt.wo_nu != 0 || w.w_onebuf_opt.wo_rnu != 0)
+    {
+        w.w_minscwidth = crate::option_vars::SCL_NUM;
+        w.w_maxscwidth = crate::option_vars::SCL_NUM;
+    } else if val.starts_with(b"yes:") {
+        let n = i32::from(val[4] - b'0');
+        w.w_minscwidth = n;
+        w.w_maxscwidth = n;
+    } else if val.first() == Some(&b'y') {
+        w.w_minscwidth = 1;
+        w.w_maxscwidth = 1;
+    } else if val.starts_with(b"auto:") {
+        w.w_minscwidth = 0;
+        w.w_maxscwidth = i32::from(val[5] - b'0');
+    } else {
+        // Bare "auto" - and also "number" on a window with neither
+        // 'number' nor 'relativenumber' set.
+        w.w_minscwidth = 0;
+        w.w_maxscwidth = 1;
+    }
+
+    let scwidth = if w.w_minscwidth <= 0 { 0 } else { w.w_maxscwidth.min(w.w_scwidth) };
+    w.w_scwidth = w.w_minscwidth.max(scwidth);
+    true
+}
+
+/// The `'signcolumn'` option is changed (`did_set_signcolumn`).
+///
+/// Delegates to [`check_signcolumn`], passing the window only when
+/// the value being set IS the window-local `'signcolumn'` storage -
+/// the same `std::ptr::eq` reproduction of the original's own
+/// `varp == &win->w_p_scl ? win : NULL` comparison already used by
+/// [`did_set_breakindentopt`]/[`did_set_colorcolumn`].
+///
+/// Then resets the number column's cached width when switching TO or
+/// FROM `"number"`. Note the "from" half reads `args.os_oldval`'s own
+/// first two bytes, so it also fires for any other old value starting
+/// with `nu` - faithfully preserved.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+pub unsafe fn did_set_signcolumn(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    let varp = args.os_varp as *const Option<Vec<u8>>;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_window_local =
+        std::ptr::eq(varp, unsafe { std::ptr::addr_of!((*win_ptr).w_onebuf_opt.wo_scl) });
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let val: Option<Vec<u8>> = unsafe { &*varp }.clone();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ok = if is_window_local {
+        check_signcolumn(val.as_deref(), Some(unsafe { &mut *win_ptr }))
+    } else {
+        check_signcolumn(val.as_deref(), None)
+    };
+    if !ok {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    let oldval_is_nu = match &args.os_oldval {
+        crate::option_defs::OptVal::String(old) => old.starts_with(b"nu"),
+        _ => false,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *win_ptr };
+    if oldval_is_nu || w.w_minscwidth == crate::option_vars::SCL_NUM {
+        w.w_nrwidth_line_count = 0;
     }
 
     None
@@ -5132,6 +5296,225 @@ mod tests {
             complete_result(&long_k(crate::tag::LSIZE * 2)),
             Some(crate::errors::e_invarg.as_bytes())
         );
+    }
+
+    // ---- check_signcolumn / did_set_signcolumn ----
+
+    fn scl_win() -> crate::buffer_defs::WinT {
+        crate::buffer_defs::WinT::default()
+    }
+
+    #[test]
+    fn check_signcolumn_accepts_every_listed_value_without_a_window() {
+        for v in crate::option_vars::OPT_SCL_VALUES {
+            assert!(check_signcolumn(Some(v.as_bytes()), None), "value {v}");
+        }
+    }
+
+    #[test]
+    fn check_signcolumn_rejects_an_empty_value() {
+        // Unlike most options in this file, empty is invalid here.
+        assert!(!check_signcolumn(Some(b""), None));
+    }
+
+    #[test]
+    fn check_signcolumn_rejects_an_unknown_value() {
+        assert!(!check_signcolumn(Some(b"bogus"), None));
+    }
+
+    #[test]
+    fn check_signcolumn_accepts_a_valid_auto_range() {
+        assert!(check_signcolumn(Some(b"auto:1-3"), None));
+        assert!(check_signcolumn(Some(b"auto:2-9"), None));
+    }
+
+    #[test]
+    fn check_signcolumn_rejects_out_of_bounds_auto_ranges() {
+        // Every one of these was confirmed rejected by a real nvim.
+        for v in [
+            &b"auto:0-3"[..], // min < 1
+            b"auto:3-2",      // min > max
+            b"auto:3-3",      // min == max
+            b"auto:9-9",      // min > 8 and min == max
+            b"auto:1-1",      // max < 2
+            b"auto:1-12",     // wrong length
+        ] {
+            assert!(!check_signcolumn(Some(v), None), "value {v:?}");
+        }
+    }
+
+    #[test]
+    fn check_signcolumn_no_sets_the_scl_no_sentinel() {
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"no"), Some(&mut win)));
+        assert_eq!(win.w_minscwidth, crate::option_vars::SCL_NO);
+        assert_eq!(win.w_maxscwidth, crate::option_vars::SCL_NO);
+    }
+
+    #[test]
+    fn check_signcolumn_number_needs_number_or_relativenumber() {
+        // With 'number' set, "number" maps to the SCL_NUM sentinel.
+        let mut win = scl_win();
+        win.w_onebuf_opt.wo_nu = 1;
+        assert!(check_signcolumn(Some(b"number"), Some(&mut win)));
+        assert_eq!(win.w_minscwidth, crate::option_vars::SCL_NUM);
+
+        // 'relativenumber' alone works too.
+        let mut win = scl_win();
+        win.w_onebuf_opt.wo_rnu = 1;
+        assert!(check_signcolumn(Some(b"number"), Some(&mut win)));
+        assert_eq!(win.w_minscwidth, crate::option_vars::SCL_NUM);
+    }
+
+    #[test]
+    fn check_signcolumn_number_without_nu_falls_through_to_auto() {
+        // The real behaviour: with neither 'number' nor
+        // 'relativenumber', "number" falls all the way through to the
+        // same min=0/max=1 the bare "auto" uses.
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"number"), Some(&mut win)));
+        assert_eq!(win.w_minscwidth, 0);
+        assert_eq!(win.w_maxscwidth, 1);
+    }
+
+    #[test]
+    fn check_signcolumn_yes_and_yes_n_set_both_bounds() {
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"yes"), Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (1, 1));
+
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"yes:3"), Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (3, 3));
+    }
+
+    #[test]
+    fn check_signcolumn_auto_forms_set_min_zero() {
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"auto"), Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (0, 1));
+
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"auto:5"), Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (0, 5));
+
+        let mut win = scl_win();
+        assert!(check_signcolumn(Some(b"auto:2-6"), Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (2, 6));
+    }
+
+    #[test]
+    fn check_signcolumn_falls_back_to_the_windows_own_value() {
+        // scl == None reads wp's own wo_scl instead.
+        let mut win = scl_win();
+        win.w_onebuf_opt.wo_scl = Some(b"yes:4".to_vec());
+        assert!(check_signcolumn(None, Some(&mut win)));
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (4, 4));
+    }
+
+    #[test]
+    fn check_signcolumn_recomputes_scwidth_from_the_new_bounds() {
+        // min > 0 clamps w_scwidth into [min, max].
+        let mut win = scl_win();
+        win.w_scwidth = 9;
+        assert!(check_signcolumn(Some(b"yes:3"), Some(&mut win)));
+        assert_eq!(win.w_scwidth, 3);
+
+        // min <= 0 drives the intermediate to 0, so w_scwidth becomes
+        // max(min, 0) == 0.
+        let mut win = scl_win();
+        win.w_scwidth = 9;
+        assert!(check_signcolumn(Some(b"auto"), Some(&mut win)));
+        assert_eq!(win.w_scwidth, 0);
+    }
+
+    #[test]
+    fn check_signcolumn_leaves_the_window_untouched_on_failure() {
+        let mut win = scl_win();
+        win.w_minscwidth = 7;
+        assert!(!check_signcolumn(Some(b"auto:3-2"), Some(&mut win)));
+        assert_eq!(win.w_minscwidth, 7);
+    }
+
+    fn scl_args(
+        win: &mut crate::buffer_defs::WinT,
+        window_local: bool,
+        val: &mut Option<Vec<u8>>,
+        oldval: &[u8],
+    ) -> crate::option_defs::OptsetT {
+        let varp = if window_local {
+            std::ptr::addr_of_mut!(win.w_onebuf_opt.wo_scl) as *mut c_void
+        } else {
+            val as *mut Option<Vec<u8>> as *mut c_void
+        };
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: varp,
+            os_oldval: crate::option_defs::OptVal::String(oldval.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_signcolumn_accepts_a_valid_value() {
+        let mut win = scl_win();
+        let mut val: Option<Vec<u8>> = Some(b"yes".to_vec());
+        let mut args = scl_args(&mut win, false, &mut val, b"auto");
+        assert_eq!(unsafe { did_set_signcolumn(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_signcolumn_rejects_an_invalid_value() {
+        let mut win = scl_win();
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = scl_args(&mut win, false, &mut val, b"auto");
+        assert_eq!(
+            unsafe { did_set_signcolumn(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_signcolumn_window_local_value_updates_the_window() {
+        let mut win = scl_win();
+        win.w_onebuf_opt.wo_scl = Some(b"yes:2".to_vec());
+        let mut unused: Option<Vec<u8>> = None;
+        let mut args = scl_args(&mut win, true, &mut unused, b"auto");
+        assert_eq!(unsafe { did_set_signcolumn(&mut args) }, None);
+        assert_eq!((win.w_minscwidth, win.w_maxscwidth), (2, 2));
+    }
+
+    #[test]
+    fn did_set_signcolumn_resets_nrwidth_when_switching_away_from_number() {
+        // The "from" half of the check reads os_oldval's first two
+        // bytes.
+        let mut win = crate::buffer_defs::WinT { w_nrwidth_line_count: 42, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"yes".to_vec());
+        let mut args = scl_args(&mut win, false, &mut val, b"number");
+        assert_eq!(unsafe { did_set_signcolumn(&mut args) }, None);
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    #[test]
+    fn did_set_signcolumn_resets_nrwidth_when_switching_to_number() {
+        // The "to" half: w_minscwidth ends up as SCL_NUM.
+        let mut win = crate::buffer_defs::WinT { w_nrwidth_line_count: 42, ..Default::default() };
+        win.w_onebuf_opt.wo_nu = 1;
+        win.w_onebuf_opt.wo_scl = Some(b"number".to_vec());
+        let mut unused: Option<Vec<u8>> = None;
+        let mut args = scl_args(&mut win, true, &mut unused, b"auto");
+        assert_eq!(unsafe { did_set_signcolumn(&mut args) }, None);
+        assert_eq!(win.w_minscwidth, crate::option_vars::SCL_NUM);
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    #[test]
+    fn did_set_signcolumn_leaves_nrwidth_alone_for_an_unrelated_change() {
+        let mut win = crate::buffer_defs::WinT { w_nrwidth_line_count: 42, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"yes".to_vec());
+        let mut args = scl_args(&mut win, false, &mut val, b"auto");
+        assert_eq!(unsafe { did_set_signcolumn(&mut args) }, None);
+        assert_eq!(win.w_nrwidth_line_count, 42);
     }
 
     // ---- did_set_colorcolumn ----
