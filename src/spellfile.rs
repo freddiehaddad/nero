@@ -41,10 +41,56 @@
 //!   writing through a caller-provided buffer pointer and returning
 //!   just the byte count. Used by `sug_write` (the `.sug`
 //!   suggestion-file writer, not yet translated).
+//! - [`spell_check_msm`] - parses `'mkspellmem'` into the 3 file-static
+//!   tree-compression tuning knobs (`compress_start`/`compress_inc`/
+//!   `compress_added`), via `charset.c`'s already-real
+//!   `ascii_isdigit`/`getdigits_int`. `did_set_mkspellmem`
+//!   (`optionstr.rs`) is its real caller; the actual compression
+//!   algorithm reading these 3 knobs back out remains not translated.
 //!
 //! Deferred: everything else - the whole `.spl`/`.sug`/`.aff`/`.dic`
 //! binary/text format read/write machinery, and the word/affix-tree
 //! storage (`spellinfo_T`, `afffile_T`) it all builds on.
+
+use crate::globals::GlobalCell;
+
+/// Size of one memory block used for the word tree (`SBLOCKSIZE`).
+const SBLOCKSIZE: i32 = 16000;
+
+/// Tunable parameter for when the tree is compressed - memory /
+/// [`SBLOCKSIZE`] (`compress_start`).
+static COMPRESS_START: GlobalCell<i32> = GlobalCell::new(30000);
+/// Tunable parameter for when the tree is compressed - memory /
+/// [`SBLOCKSIZE`] (`compress_inc`).
+static COMPRESS_INC: GlobalCell<i32> = GlobalCell::new(100);
+/// Tunable parameter for when the tree is compressed - word count
+/// (`compress_added`).
+static COMPRESS_ADDED: GlobalCell<i32> = GlobalCell::new(500_000);
+
+/// # Safety
+/// Single-threaded test/editor state, matching every other
+/// `GlobalCell`-backed file-static in this crate.
+#[must_use]
+pub unsafe fn compress_start() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPRESS_START.get_mut() }
+}
+
+/// # Safety
+/// Same as [`compress_start`].
+#[must_use]
+pub unsafe fn compress_inc() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPRESS_INC.get_mut() }
+}
+
+/// # Safety
+/// Same as [`compress_start`].
+#[must_use]
+pub unsafe fn compress_added() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPRESS_ADDED.get_mut() }
+}
 
 /// Whether `s1` and `s2` are equal - both being absent (`None`) also
 /// counts as equal (`str_equal`).
@@ -127,6 +173,72 @@ pub fn offset2bytes(nr: i32) -> Vec<u8> {
         // 1 byte
         vec![b1 as u8]
     }
+}
+
+/// Parse the `'mkspellmem'` option value ("start,inc,added", 3 comma-
+/// separated digit runs) into `COMPRESS_START`/`COMPRESS_INC`/
+/// `COMPRESS_ADDED` (`spell_check_msm`). Returns `FAIL` if the value
+/// is malformed or fails a sanity check (any part is zero, or
+/// `incr > start`) - leaving the 3 file-statics untouched in that
+/// case, matching the original's own "only assign on the final,
+/// fully-validated `OK` path" structure exactly.
+///
+/// # Safety
+/// Touches `crate::option_vars::OPTION_VARS` and this module's own
+/// `COMPRESS_START`/`COMPRESS_INC`/`COMPRESS_ADDED` - no overlapping
+/// live access, same as every other function touching either.
+#[must_use]
+pub unsafe fn spell_check_msm() -> i32 {
+    use crate::vim_defs::{FAIL, OK};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_msm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm.clone();
+    let s: &[u8] = p_msm.as_deref().unwrap_or(&[]);
+    let mut pos = 0usize;
+
+    if !s.first().is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))) {
+        return FAIL;
+    }
+    let (val1, consumed) = crate::charset::getdigits_int(&s[pos..], true, 0);
+    pos += consumed;
+    let start = (val1 * 10) / (SBLOCKSIZE / 102);
+    if s.get(pos) != Some(&b',') {
+        return FAIL;
+    }
+    pos += 1;
+
+    if !s.get(pos).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))) {
+        return FAIL;
+    }
+    let (val2, consumed) = crate::charset::getdigits_int(&s[pos..], true, 0);
+    pos += consumed;
+    let incr = (val2 * 102) / (SBLOCKSIZE / 10);
+    if s.get(pos) != Some(&b',') {
+        return FAIL;
+    }
+    pos += 1;
+
+    if !s.get(pos).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))) {
+        return FAIL;
+    }
+    let (val3, consumed) = crate::charset::getdigits_int(&s[pos..], true, 0);
+    pos += consumed;
+    let added = val3 * 1024;
+    if pos != s.len() {
+        return FAIL;
+    }
+
+    if start == 0 || incr == 0 || added == 0 || incr > start {
+        return FAIL;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *COMPRESS_START.get_mut() = start;
+        *COMPRESS_INC.get_mut() = incr;
+        *COMPRESS_ADDED.get_mut() = added;
+    }
+    OK
 }
 
 #[cfg(test)]
@@ -243,5 +355,119 @@ mod tests {
         // 1-byte path's own upper limit is b1 <= 0x7f, i.e. nr <= 126).
         assert_eq!(offset2bytes(126).len(), 1);
         assert_eq!(offset2bytes(127).len(), 2);
+    }
+
+    // --- spell_check_msm ---
+
+    fn set_p_msm(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_msm.clone();
+        opts.p_msm = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    fn reset_compress() -> (i32, i32, i32) {
+        let prev = (
+            unsafe { compress_start() },
+            unsafe { compress_inc() },
+            unsafe { compress_added() },
+        );
+        unsafe {
+            *COMPRESS_START.get_mut() = 30000;
+            *COMPRESS_INC.get_mut() = 100;
+            *COMPRESS_ADDED.get_mut() = 500_000;
+        }
+        prev
+    }
+
+    fn restore_compress(prev: (i32, i32, i32)) {
+        unsafe {
+            *COMPRESS_START.get_mut() = prev.0;
+            *COMPRESS_INC.get_mut() = prev.1;
+            *COMPRESS_ADDED.get_mut() = prev.2;
+        }
+    }
+
+    #[test]
+    fn spell_check_msm_the_real_default_value_is_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"460000,2000,500"));
+        let prev_compress = reset_compress();
+
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::OK);
+        // Hand-traced: start = (460000*10)/(16000/102) = 4600000/156 =
+        // 29487; incr = (2000*102)/(16000/10) = 204000/1600 = 127;
+        // added = 500*1024 = 512000.
+        assert_eq!(unsafe { compress_start() }, 29487);
+        assert_eq!(unsafe { compress_inc() }, 127);
+        assert_eq!(unsafe { compress_added() }, 512_000);
+
+        set_p_msm(prev_msm.as_deref());
+        restore_compress(prev_compress);
+    }
+
+    #[test]
+    fn spell_check_msm_missing_comma_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"460000"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_non_digit_start_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"-1,2,3"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_zero_start_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"0,1,1"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_incr_greater_than_start_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        // start = (2000*10)/156 = 128; incr = (2100*102)/1600 = 133;
+        // 133 > 128, so this must fail.
+        let prev_msm = set_p_msm(Some(b"2000,2100,500"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_missing_third_number_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"1,2,"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_trailing_garbage_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"460000,2000,500x"));
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        set_p_msm(prev_msm.as_deref());
+    }
+
+    #[test]
+    fn spell_check_msm_failure_leaves_compress_values_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_msm = set_p_msm(Some(b"bogus"));
+        let prev_compress = reset_compress();
+
+        assert_eq!(unsafe { spell_check_msm() }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { compress_start() }, 30000);
+        assert_eq!(unsafe { compress_inc() }, 100);
+        assert_eq!(unsafe { compress_added() }, 500_000);
+
+        set_p_msm(prev_msm.as_deref());
+        restore_compress(prev_compress);
     }
 }

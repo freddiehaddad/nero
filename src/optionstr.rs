@@ -76,9 +76,11 @@
 //! every window's own height across every tabpage into
 //! `w_prev_height`, using `tabpage_win_valid`'s own already-
 //! established `curtab`-vs-`tp_firstwin` window-list-walk
-//! convention), and [`did_set_spellsuggest`] (re-scanned once
+//! convention), [`did_set_spellsuggest`] (re-scanned once
 //! `spellsuggest.rs`'s own `spell_check_sps` landed in an earlier
-//! commit this segment - its only remaining real blocker).
+//! commit this segment - its only remaining real blocker), and
+//! [`did_set_mkspellmem`] (same shape, now that `spellfile.rs`'s own
+//! new `spell_check_msm` exists).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -707,6 +709,19 @@ pub unsafe fn did_set_splitkeep(args: &mut crate::option_defs::OptsetT) -> Optio
 pub unsafe fn did_set_spellsuggest() -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { crate::spellsuggest::spell_check_sps() } == crate::vim_defs::OK {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
+/// The `'mkspellmem'` option is changed (`did_set_mkspellmem`).
+///
+/// # Safety
+/// Touches `OPTION_VARS`, matching `spell_check_msm`'s own safety doc.
+pub unsafe fn did_set_mkspellmem() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::spellfile::spell_check_msm() } == crate::vim_defs::OK {
         None
     } else {
         Some(crate::errors::e_invarg.as_bytes())
@@ -1748,5 +1763,30 @@ mod tests {
         let prev = set_p_sps(Some(b"bogus"));
         assert_eq!(unsafe { did_set_spellsuggest() }, Some(crate::errors::e_invarg.as_bytes()));
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = prev;
+    }
+
+    // ---- did_set_mkspellmem ----
+
+    fn set_p_msm(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_msm.clone();
+        opts.p_msm = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_mkspellmem_valid_value_is_ok() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_msm(Some(b"460000,2000,500"));
+        assert_eq!(unsafe { did_set_mkspellmem() }, None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm = prev;
+    }
+
+    #[test]
+    fn did_set_mkspellmem_invalid_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_msm(Some(b"bogus"));
+        assert_eq!(unsafe { did_set_mkspellmem() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm = prev;
     }
 }
