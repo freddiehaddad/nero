@@ -84,10 +84,12 @@
 //! new `did_set_option_listflag` helper - its own dynamically-
 //! formatted `"E539: Illegal character <c>"` message is simplified
 //! to a static `e_invarg`, matching this whole module's established
-//! "display text differs, boolean outcome identical" policy), and
+//! "display text differs, boolean outcome identical" policy),
 //! [`did_set_mousescroll`] (parses a comma-separated
 //! `"ver:N"`/`"hor:M"` list into `OPTION_VARS.p_mousescroll_vert`/
-//! `p_mousescroll_hor`).
+//! `p_mousescroll_hor`), and [`did_set_showbreak`] (every character
+//! must occupy exactly 1 screen cell, via the already-real
+//! `ptr2cells`/`utfc_ptr2len`).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -835,6 +837,35 @@ pub unsafe fn did_set_mousescroll() -> Option<&'static [u8]> {
     opts.p_mousescroll_vert = if vertical == -1 { MOUSESCROLL_VERT_DFLT } else { vertical };
     opts.p_mousescroll_hor = if horizontal == -1 { MOUSESCROLL_HOR_DFLT } else { horizontal };
 
+    None
+}
+
+/// The `'showbreak'` option is changed (`did_set_showbreak`).
+///
+/// Every character in the value must occupy exactly 1 screen cell -
+/// no unprintable or double-wide characters allowed.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call. Touches `OPTION_VARS` (via `ptr2cells`/`utfc_ptr2len`).
+pub unsafe fn did_set_showbreak(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    let mut pos = 0usize;
+    while pos < val.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::charset::ptr2cells(&val[pos..]) } != 1 {
+            return Some(
+                crate::gettext_defs::gettext_noop(
+                    "E595: 'showbreak' contains unprintable or wide character",
+                )
+                .as_bytes(),
+            );
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        pos += unsafe { crate::mbyte::utfc_ptr2len(&val[pos..]) }.max(1) as usize;
+    }
     None
 }
 
@@ -2045,5 +2076,64 @@ mod tests {
         assert_eq!(opts.p_mousescroll_vert, 0);
         assert_eq!(opts.p_mousescroll_hor, 0);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    // ---- did_set_showbreak ----
+
+    fn showbreak_args(val: &mut Option<Vec<u8>>) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT { os_varp: val as *mut Option<Vec<u8>> as *mut c_void, ..Default::default() }
+    }
+
+    #[test]
+    fn did_set_showbreak_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = showbreak_args(&mut val);
+        assert_eq!(unsafe { did_set_showbreak(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_showbreak_plain_ascii_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(b"->".to_vec());
+        let mut args = showbreak_args(&mut val);
+        assert_eq!(unsafe { did_set_showbreak(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_showbreak_control_character_is_invalid() {
+        let mut val: Option<Vec<u8>> = Some(vec![0x01]);
+        let mut args = showbreak_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_showbreak(&mut args) },
+            Some(
+                crate::gettext_defs::gettext_noop(
+                    "E595: 'showbreak' contains unprintable or wide character"
+                )
+                .as_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn did_set_showbreak_double_wide_character_is_invalid() {
+        // U+65E5 ("日") is a double-wide CJK character (2 screen
+        // cells), confirmed via ptr2cells in an earlier session.
+        let mut val: Option<Vec<u8>> = Some("日".as_bytes().to_vec());
+        let mut args = showbreak_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_showbreak(&mut args) },
+            Some(
+                crate::gettext_defs::gettext_noop(
+                    "E595: 'showbreak' contains unprintable or wide character"
+                )
+                .as_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn did_set_showbreak_rejects_the_first_bad_character_even_after_good_ones() {
+        let mut val: Option<Vec<u8>> = Some(b"ok\x01".to_vec());
+        let mut args = showbreak_args(&mut val);
+        assert!(unsafe { did_set_showbreak(&mut args) }.is_some());
     }
 }
