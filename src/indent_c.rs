@@ -78,9 +78,14 @@
 //! is the first function here to need a real memline, so its tests
 //! follow `cursor.rs`'s own `open_and_set_test_buf` precedent.
 //!
-//! Deferred: everything else - `cin_ispreproc_cont`/
-//! `find_line_comment`/`cin_iswhileofdo_end` (need `ml_get`, the
-//! cursor and `find_match_paren`) and the rest of the real
+//! Also [`find_line_comment`] and [`cin_ispreproc_cont`]. The former
+//! returns an owned `PosT` instead of a pointer into a shared
+//! `static pos_T`; the latter returns a `(bool, lnum, amount)` tuple
+//! in place of the original's three in/out parameters.
+//!
+//! Deferred: everything else - `cin_iswhileofdo_end`/
+//! `cin_is_cpp_baseclass`/`cin_isfuncdecl` (need `find_match_paren`
+//! and multi-line backtracking) and the rest of the real
 //! indent-computation algorithm.
 
 use crate::charset::vim_isidc;
@@ -1149,6 +1154,103 @@ pub unsafe fn cin_first_id_amount() -> i32 {
     col
 }
 
+/// Check previous lines for a `"//"` line comment, skipping over
+/// blank lines (`find_line_comment`).
+///
+/// Returns the position of the comment, or `None` when a non-blank
+/// line without one is reached first. The original returns a pointer
+/// into a `static pos_T`; returning the value avoids that shared
+/// mutable static entirely.
+///
+/// # Safety
+/// `crate::globals::GLOBALS`' own `curwin` must be a valid, non-null
+/// pointer to a live `WinT`, and every line above the cursor must be
+/// readable via `ml_get`.
+#[must_use]
+pub unsafe fn find_line_comment() -> Option<crate::pos_defs::PosT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut pos = unsafe { &*curwin }.w_cursor;
+
+    while pos.lnum > 1 {
+        pos.lnum -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get(pos.lnum) };
+        let p = crate::charset::skipwhite(&line);
+        if cin_islinecomment(&line, p) {
+            pos.col = i32::try_from(p).unwrap_or(0);
+            return Some(pos);
+        }
+        if line.get(p).copied().unwrap_or(0) != 0 {
+            break;
+        }
+    }
+    None
+}
+
+/// Whether the line at `lnum` is a preprocessor statement, or a
+/// continuation line of one (`cin_ispreproc_cont`).
+///
+/// Returns `(is_preproc, lnum, amount)`: the original takes all three
+/// as in/out parameters (`const char **pp`, `linenr_T *lnump`,
+/// `int *amount`) and returns a bool. The line itself is dropped from
+/// the result - every caller re-fetches it from the returned `lnum`
+/// anyway, and returning it would mean handing back a buffer the
+/// caller must keep in sync.
+///
+/// `amount` is only updated when the answer is true, matching the
+/// original's own `if (retval) *amount = candidate_amount;`.
+///
+/// # Safety
+/// Every line from `lnum` down to 1 must be readable via `ml_get`,
+/// and `get_indent_lnum`'s own safety requirements must hold.
+#[must_use]
+pub unsafe fn cin_ispreproc_cont(
+    line: &[u8],
+    lnum: crate::pos_defs::LinenrT,
+    amount: i32,
+) -> (bool, crate::pos_defs::LinenrT, i32) {
+    // The original tests `line[strlen(line) - 1]`, i.e. the last byte
+    // BEFORE the NUL terminator - so the scan must stop at a NUL
+    // rather than using the raw last byte of the buffer.
+    let ends_in_backslash = |l: &[u8]| {
+        let end = l.iter().position(|&c| c == 0).unwrap_or(l.len());
+        end > 0 && l[end - 1] == b'\\'
+    };
+    let is_empty_line = |l: &[u8]| l.first().copied().unwrap_or(0) == 0;
+
+    let mut cur: Vec<u8> = line.to_vec();
+    let mut lnum = lnum;
+    let mut retval = false;
+    let mut candidate_amount = amount;
+    let mut out_lnum = lnum;
+
+    if !is_empty_line(&cur) && ends_in_backslash(&cur) {
+        // SAFETY: forwarded from this function's own safety doc.
+        candidate_amount = unsafe { crate::indent::get_indent_lnum(lnum) };
+    }
+
+    loop {
+        if cin_ispreproc(&cur, 0) {
+            retval = true;
+            out_lnum = lnum;
+            break;
+        }
+        if lnum == 1 {
+            break;
+        }
+        lnum -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        cur = unsafe { crate::memline::ml_get(lnum) };
+        if is_empty_line(&cur) || !ends_in_backslash(&cur) {
+            break;
+        }
+    }
+
+    (retval, out_lnum, if retval { candidate_amount } else { amount })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,6 +1421,115 @@ mod tests {
         drop(guard);
         close_test_buf(buf);
         result
+    }
+
+    // ---- find_line_comment / cin_ispreproc_cont ----
+
+    /// Installs a buffer whose memline holds `lines`, with the cursor
+    /// on `lnum`, then runs `f`.
+    fn with_lines<R>(
+        lines: &[&[u8]],
+        lnum: crate::pos_defs::LinenrT,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let mut buf = BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let guard = CurbufGuard::set_win_and_buf(&mut win, &mut buf);
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        // ml_open leaves a single empty line; replace it, then append.
+        let mut first = lines[0].to_vec();
+        first.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &first) },
+            crate::vim_defs::OK
+        );
+        for (i, l) in lines.iter().enumerate().skip(1) {
+            let mut text = (*l).to_vec();
+            text.push(0);
+            assert_eq!(
+                unsafe {
+                    crate::memline::ml_append_buf(
+                        &mut buf,
+                        i as crate::pos_defs::LinenrT,
+                        &text,
+                        0,
+                        false,
+                    )
+                },
+                crate::vim_defs::OK
+            );
+        }
+        win.w_cursor.lnum = lnum;
+
+        let result = f();
+
+        drop(guard);
+        close_test_buf(buf);
+        result
+    }
+
+    #[test]
+    fn find_line_comment_finds_a_comment_above_skipping_blank_lines() {
+        // Line 1 is the comment, line 2 blank, cursor on line 3.
+        let pos = with_lines(&[b"  // c", b"", b"x = 1;"], 3, || unsafe {
+            find_line_comment()
+        });
+        let pos = pos.expect("comment found");
+        assert_eq!(pos.lnum, 1);
+        assert_eq!(pos.col, 2); // past the leading whitespace
+    }
+
+    #[test]
+    fn find_line_comment_stops_at_the_first_non_blank_line() {
+        // Line 2 is real code, so the comment on line 1 is never
+        // reached.
+        let pos = with_lines(&[b"// c", b"y = 2;", b"x = 1;"], 3, || unsafe {
+            find_line_comment()
+        });
+        assert!(pos.is_none());
+    }
+
+    #[test]
+    fn find_line_comment_is_none_at_the_top_of_the_buffer() {
+        let pos = with_lines(&[b"x = 1;"], 1, || unsafe { find_line_comment() });
+        assert!(pos.is_none());
+    }
+
+    #[test]
+    fn cin_ispreproc_cont_recognizes_a_direct_preprocessor_line() {
+        with_lines(&[b"#define X 1"], 1, || {
+            let (found, lnum, amount) = unsafe { cin_ispreproc_cont(b"#define X 1", 1, 7) };
+            assert!(found);
+            assert_eq!(lnum, 1);
+            // No trailing backslash, so the amount is unchanged.
+            assert_eq!(amount, 7);
+        });
+    }
+
+    #[test]
+    fn cin_ispreproc_cont_walks_back_over_continuation_lines() {
+        // Line 1 starts the directive, lines 1-2 end in backslashes.
+        let lines: &[&[u8]] = &[b"#define X \\", b"    1 + \\", b"    2"];
+        with_lines(lines, 3, || {
+            let (found, lnum, _amount) = unsafe { cin_ispreproc_cont(b"    2", 3, 0) };
+            assert!(found);
+            // Walked back to the directive's own first line.
+            assert_eq!(lnum, 1);
+        });
+    }
+
+    #[test]
+    fn cin_ispreproc_cont_is_false_for_ordinary_code() {
+        with_lines(&[b"x = 1;", b"y = 2;"], 2, || {
+            let (found, lnum, amount) = unsafe { cin_ispreproc_cont(b"y = 2;", 2, 4) };
+            assert!(!found);
+            // The line number and amount come back untouched.
+            assert_eq!(lnum, 2);
+            assert_eq!(amount, 4);
+        });
     }
 
     #[test]
