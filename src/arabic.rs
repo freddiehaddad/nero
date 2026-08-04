@@ -27,9 +27,19 @@
 //! established repeatedly elsewhere in this crate (e.g. `sign.rs`'s
 //! `sign_cmd_idx`, `menu.rs`'s `menu_is_hidden`).
 //!
-//! Deferred: `arabic_shape` itself (the actual letter-joining state
-//! machine that consumes `can_join`/`A_is_valid`) - substantially
-//! larger and more specialized, no current caller.
+//! Also `arabic_shape` itself, plus its two private `chg_c_laa2i`/
+//! `chg_c_laa2f` LAM-ALEF ligature helpers. It returns `(shaped, c1)`
+//! rather than taking the original's in/out `int *c1p`, which makes it
+//! impossible for a caller to forget that a LAM-ALEF pair CONSUMES the
+//! composing character.
+//!
+//! One deliberate divergence: `A_is_ok` also accepts the byte order
+//! mark, which has no `ACHARS` entry, so the original's own
+//! `find_achar(c)` can return NULL and then be dereferenced. This
+//! translation returns the character unchanged there instead - exactly
+//! what the original's own "missing from the table means using
+//! original character" fallback would have produced anyway, so the UB
+//! is avoided without any behavioural difference.
 
 use crate::option_vars::OPTION_VARS;
 
@@ -42,6 +52,18 @@ mod codepoint {
     pub const ALEF: i32 = 0x0627;
     /// `a_LAM`, relevant to [`super::arabic_combine`].
     pub const LAM: i32 = 0x0644;
+
+    /// LAM-ALEF ligature presentation forms, used by
+    /// [`super::chg_c_laa2i`] (isolated) and [`super::chg_c_laa2f`]
+    /// (final). Each ALEF-family letter has its own pair.
+    pub const S_LAM_ALEF_MADDA_ABOVE: i32 = 0xfef5;
+    pub const F_LAM_ALEF_MADDA_ABOVE: i32 = 0xfef6;
+    pub const S_LAM_ALEF_HAMZA_ABOVE: i32 = 0xfef7;
+    pub const F_LAM_ALEF_HAMZA_ABOVE: i32 = 0xfef8;
+    pub const S_LAM_ALEF_HAMZA_BELOW: i32 = 0xfef9;
+    pub const F_LAM_ALEF_HAMZA_BELOW: i32 = 0xfefa;
+    pub const S_LAM_ALEF: i32 = 0xfefb;
+    pub const F_LAM_ALEF: i32 = 0xfefc;
 }
 
 /// Check whether we are dealing with a character that could be
@@ -224,6 +246,109 @@ pub fn can_join(c1: i32, c2: i32) -> bool {
     (a1.initial != 0 || a1.medial != 0) && (a2.final_ != 0 || a2.medial != 0)
 }
 
+/// Change shape - from Combination-Isolated to Isolated
+/// (`chg_c_laa2i`).
+///
+/// Maps the composing ALEF-family character of a LAM-ALEF pair to its
+/// isolated ligature form; `0` when `hid_c` is not one of the four.
+fn chg_c_laa2i(hid_c: i32) -> i32 {
+    match hid_c {
+        codepoint::ALEF_MADDA => codepoint::S_LAM_ALEF_MADDA_ABOVE,
+        codepoint::ALEF_HAMZA_ABOVE => codepoint::S_LAM_ALEF_HAMZA_ABOVE,
+        codepoint::ALEF_HAMZA_BELOW => codepoint::S_LAM_ALEF_HAMZA_BELOW,
+        codepoint::ALEF => codepoint::S_LAM_ALEF,
+        _ => 0,
+    }
+}
+
+/// Change shape - from Combination-Isolated to Final (`chg_c_laa2f`).
+///
+/// As [`chg_c_laa2i`], but selecting the final ligature form.
+fn chg_c_laa2f(hid_c: i32) -> i32 {
+    match hid_c {
+        codepoint::ALEF_MADDA => codepoint::F_LAM_ALEF_MADDA_ABOVE,
+        codepoint::ALEF_HAMZA_ABOVE => codepoint::F_LAM_ALEF_HAMZA_ABOVE,
+        codepoint::ALEF_HAMZA_BELOW => codepoint::F_LAM_ALEF_HAMZA_BELOW,
+        codepoint::ALEF => codepoint::F_LAM_ALEF,
+        _ => 0,
+    }
+}
+
+/// Do Arabic shaping on character `c` (`arabic_shape`).
+///
+/// Returns `(shaped, c1)`: the shaped character, and the (possibly
+/// updated) first composing character. The original passes `c1` as an
+/// in/out `int *c1p`; returning it says the same thing without the
+/// pointer, and makes it impossible for a caller to forget that a
+/// LAM-ALEF pair CONSUMES the composing character (the original sets
+/// `*c1p = 0` in that branch).
+///
+/// `prev_c`/`prev_c1` are the previous character and its own first
+/// composing character, `next_c` the next character - all unshaped.
+///
+/// Non-Arabic characters, and Arabic ones missing from the shaping
+/// table, are passed back unchanged.
+///
+/// # Safety
+/// Forwarded from [`arabic_combine`]'s own safety doc.
+#[must_use]
+pub unsafe fn arabic_shape(
+    c: i32,
+    c1: i32,
+    prev_c: i32,
+    prev_c1: i32,
+    next_c: i32,
+) -> (i32, i32) {
+    // Deal only with Arabic character, pass back all others
+    if !a_is_ok(c) {
+        return (c, c1);
+    }
+
+    let mut c1_out = c1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curr_laa = unsafe { arabic_combine(c, c1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let prev_laa = unsafe { arabic_combine(prev_c, prev_c1) };
+
+    let mut curr_c = if curr_laa {
+        let shaped = if a_is_valid(prev_c) && can_join(prev_c, codepoint::LAM) && !prev_laa {
+            chg_c_laa2f(c1)
+        } else {
+            chg_c_laa2i(c1)
+        };
+        // Remove the composing character
+        c1_out = 0;
+        shaped
+    } else {
+        // NOT guaranteed to succeed: `a_is_ok` also accepts the byte
+        // order mark, which has no `ACHARS` entry. The original
+        // dereferences the resulting NULL here; returning the
+        // character unchanged is what its own "missing from the table
+        // means using original character" fallback would have
+        // produced anyway, so this avoids the UB without diverging.
+        let Some(curr_a) = find_achar(c) else {
+            return (c, c1);
+        };
+        let backward_combine = !prev_laa && can_join(prev_c, c);
+        let forward_combine = can_join(c, next_c);
+
+        let form = match (backward_combine, forward_combine) {
+            (true, true) => curr_a.medial,
+            (true, false) => curr_a.final_,
+            (false, true) => curr_a.initial,
+            (false, false) => curr_a.isolated,
+        };
+        i32::try_from(form).unwrap_or(0)
+    };
+
+    // Character missing from the table means using original character.
+    if curr_c == 0 {
+        curr_c = c;
+    }
+
+    (curr_c, c1_out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +411,125 @@ mod tests {
         let opts = unsafe { OPTION_VARS.get_mut() };
         opts.p_arshape = prev_arshape;
         opts.p_tbidi = prev_tbidi;
+    }
+
+    /// Runs `f` with shaping enabled and termbidi off - the exact
+    /// condition `arabic_combine` requires - restoring both after.
+    fn with_shaping<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = option_vars_test_lock();
+        let opts = unsafe { OPTION_VARS.get_mut() };
+        let (prev_arshape, prev_tbidi) = (opts.p_arshape, opts.p_tbidi);
+        opts.p_arshape = 1;
+        opts.p_tbidi = 0;
+
+        let result = f();
+
+        let opts = unsafe { OPTION_VARS.get_mut() };
+        opts.p_arshape = prev_arshape;
+        opts.p_tbidi = prev_tbidi;
+        result
+    }
+
+    // Codepoints and their own table forms, read straight off ACHARS.
+    const LAM: i32 = 0x0644;
+    const ALEF: i32 = 0x0627;
+    const BEH: i32 = 0x0628;
+
+    #[test]
+    fn arabic_shape_selects_the_joining_form_from_the_neighbours() {
+        with_shaping(|| {
+            // (prev, next, expected LAM form) - hand-traced against
+            // ACHARS' own a_LAM row: isolated fedd, initial fedf,
+            // medial fee0, final fede.
+            for (prev, next, want) in [
+                (0, 0, 0xfedd),       // neither side joins -> isolated
+                (0, LAM, 0xfedf),     // only forward joins  -> initial
+                (LAM, LAM, 0xfee0),   // both sides join     -> medial
+                (LAM, 0, 0xfede),     // only backward joins -> final
+            ] {
+                assert_eq!(
+                    unsafe { arabic_shape(LAM, 0, prev, 0, next) },
+                    (want, 0),
+                    "prev={prev:#x} next={next:#x}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn arabic_shape_ligates_lam_alef_and_consumes_the_composing_char() {
+        with_shaping(|| {
+            // No joinable previous letter -> the ISOLATED ligature,
+            // and the composing ALEF is consumed (c1 comes back 0).
+            assert_eq!(
+                unsafe { arabic_shape(LAM, ALEF, 0, 0, 0) },
+                (0xfefb, 0)
+            );
+            // A previous letter that can join to LAM selects the
+            // FINAL ligature instead.
+            assert_eq!(
+                unsafe { arabic_shape(LAM, ALEF, BEH, 0, 0) },
+                (0xfefc, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn arabic_shape_without_shaping_enabled_does_not_ligate() {
+        let _lock = option_vars_test_lock();
+        let opts = unsafe { OPTION_VARS.get_mut() };
+        let (prev_arshape, prev_tbidi) = (opts.p_arshape, opts.p_tbidi);
+        opts.p_arshape = 0;
+
+        // `arabic_combine` is gated on 'arabicshape', so LAM+ALEF
+        // takes the ordinary joining path instead of the ligature
+        // one, and the composing char is NOT consumed.
+        assert_eq!(unsafe { arabic_shape(LAM, ALEF, 0, 0, 0) }, (0xfedd, ALEF));
+
+        let opts = unsafe { OPTION_VARS.get_mut() };
+        opts.p_arshape = prev_arshape;
+        opts.p_tbidi = prev_tbidi;
+    }
+
+    #[test]
+    fn arabic_shape_passes_back_non_arabic_characters_unchanged() {
+        with_shaping(|| {
+            for c in [i32::from(b'a'), i32::from(b' '), 0, 0x2500, -5] {
+                assert_eq!(unsafe { arabic_shape(c, 0, 0, 0, 0) }, (c, 0));
+            }
+        });
+    }
+
+    #[test]
+    fn arabic_shape_falls_back_to_the_original_char_when_a_form_is_missing() {
+        with_shaping(|| {
+            // a_HAMZA_ABOVE is in the table but has NO presentation
+            // forms at all, so the selected form is 0 and the
+            // original substitutes the input character rather than
+            // emitting NUL.
+            assert_eq!(unsafe { arabic_shape(0x0654, 0, 0, 0, 0) }, (0x0654, 0));
+        });
+    }
+
+    #[test]
+    fn arabic_shape_alef_cannot_start_a_join() {
+        with_shaping(|| {
+            // ALEF has no initial or medial form, so `can_join` fails
+            // with ALEF on the LEFT - a following letter never makes
+            // it join forward, and it stays isolated.
+            assert_eq!(unsafe { arabic_shape(ALEF, 0, 0, 0, LAM) }, (0xfe8d, 0));
+            // It can still END a join, which selects its final form.
+            assert_eq!(unsafe { arabic_shape(ALEF, 0, BEH, 0, 0) }, (0xfe8e, 0));
+        });
+    }
+
+    #[test]
+    fn arabic_shape_returns_the_byte_order_mark_unchanged() {
+        with_shaping(|| {
+            // The BOM passes `a_is_ok` but has no `ACHARS` entry; the
+            // original would dereference NULL here.
+            assert_eq!(unsafe { arabic_shape(0xfeff, 0, 0, 0, 0) }, (0xfeff, 0));
+        });
     }
 
     #[test]
