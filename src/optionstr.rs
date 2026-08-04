@@ -148,6 +148,12 @@
 //! change, calls the already-real `move::validate_virtcol`/
 //! `cursor::coladvance` to recompute the cursor position.
 //!
+//! Also [`did_set_tagcase`] - the exact same "resolve from local or
+//! global storage as an owned copy" pattern as
+//! [`did_set_virtualedit`], but simpler (no cursor-position recompute
+//! step, and `opt_strings_flags`'s own `list` parameter is `false` -
+//! a single value, not a comma-separated list).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1309,6 +1315,49 @@ pub unsafe fn did_set_virtualedit(args: &mut crate::option_defs::OptsetT) -> Opt
         let virtcol = unsafe { &*win_ptr }.w_virtcol;
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { crate::cursor::coladvance(win_ptr, virtcol) };
+    }
+
+    None
+}
+
+/// The `'tagcase'` option is changed (`did_set_tagcase`).
+///
+/// Same "resolve from local or global storage as an owned copy"
+/// pattern already established by [`did_set_virtualedit`], but
+/// simpler - no cursor-position recompute step at all, and
+/// `opt_strings_flags`'s own `list` parameter is `false` (a single
+/// value, not a comma-separated list, unlike `'virtualedit'`).
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_tagcase(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    let use_local = args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_LOCAL != 0;
+
+    let p: Vec<u8> = if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*buf_ptr }.b_p_tc.clone().unwrap_or_default()
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc.clone().unwrap_or_default()
+    };
+
+    if use_local && p.is_empty() {
+        // make the local value empty: use the global value
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *buf_ptr }.b_tc_flags = 0;
+        return None;
+    }
+
+    let Some(new_flags) = opt_strings_flags(&p, crate::option_vars::OPT_TC_VALUES, false) else {
+        return Some(crate::errors::e_invarg.as_bytes());
+    };
+
+    if use_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *buf_ptr }.b_tc_flags = new_flags;
+    } else {
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags = new_flags;
     }
 
     None
@@ -2631,6 +2680,79 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    // ---- did_set_tagcase ----
+
+    fn tagcase_args(buf: &mut crate::buffer_defs::BufT, flags: u32) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_buf: buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: flags as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_tagcase_global_valid_value_sets_tc_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags;
+        let prev_p_tc = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc = Some(b"ignore".to_vec());
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut args = tagcase_args(&mut buf, 0);
+        assert_eq!(unsafe { did_set_tagcase(&mut args) }, None);
+        // "ignore" is index 1 in OPT_TC_VALUES, matching
+        // opt_strings_flags's own `1 << index` scheme exactly.
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags, 0x02);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc = prev_p_tc;
+    }
+
+    #[test]
+    fn did_set_tagcase_global_invalid_value_fails_and_leaves_flags_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags;
+        let prev_p_tc = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags = 0xDEAD;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc = Some(b"bogus".to_vec());
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut args = tagcase_args(&mut buf, 0);
+        assert_eq!(unsafe { did_set_tagcase(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags, 0xDEAD);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tc_flags = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tc = prev_p_tc;
+    }
+
+    #[test]
+    fn did_set_tagcase_local_empty_resets_to_global() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_tc: Some(Vec::new()),
+            b_tc_flags: 0x02,
+            ..Default::default()
+        };
+        let mut args = tagcase_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL);
+        assert_eq!(unsafe { did_set_tagcase(&mut args) }, None);
+        assert_eq!(buf.b_tc_flags, 0);
+    }
+
+    #[test]
+    fn did_set_tagcase_local_valid_value_sets_b_tc_flags() {
+        let mut buf = crate::buffer_defs::BufT { b_p_tc: Some(b"smart".to_vec()), ..Default::default() };
+        let mut args = tagcase_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL);
+        assert_eq!(unsafe { did_set_tagcase(&mut args) }, None);
+        // "smart" is index 4 in OPT_TC_VALUES.
+        assert_eq!(buf.b_tc_flags, 0x10);
+    }
+
+    #[test]
+    fn did_set_tagcase_local_invalid_value_fails() {
+        let mut buf = crate::buffer_defs::BufT { b_p_tc: Some(b"bogus".to_vec()), ..Default::default() };
+        let mut args = tagcase_args(&mut buf, crate::option_defs::opt_set_flags::OPT_LOCAL);
+        assert_eq!(unsafe { did_set_tagcase(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 
     // ---- did_set_mousescroll ----
