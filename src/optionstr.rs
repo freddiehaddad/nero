@@ -119,6 +119,19 @@
 //! `starting != NO_SCREEN`, and `starting` is only ever assigned by
 //! `main.c`'s not-yet-translated startup sequence).
 //!
+//! Also [`did_set_varsofttabstop`]/[`did_set_vartabstop`] - both
+//! built directly on `indent.rs`'s own already-real `tabstop_set`
+//! (translated ahead of its real caller in an earlier pass). Rust's
+//! own assignment automatically frees the previous
+//! `b_p_vsts_array`/`b_p_vts_array`, matching the original's manual
+//! `xfree(oldarray)`. `did_set_vartabstop`'s own extra
+//! `foldmethodIsIndent`-gated `foldUpdateAll` call panics - a
+//! genuinely REACHABLE gap (`'foldmethod'` is an ordinary string
+//! option that can legitimately be `"indent"` in a real session,
+//! unlike e.g. `AUTOCMDS`'s always-empty-registry precedent) -
+//! `fold.rs`'s own real fold-tree search/update machinery isn't
+//! translated yet.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1133,6 +1146,73 @@ pub unsafe fn did_set_iconstring(args: &mut crate::option_defs::OptsetT) -> Opti
 pub unsafe fn did_set_titlestring(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { did_set_titleiconstring(args, crate::globals::STL_IN_TITLE) }
+}
+
+/// The `'varsofttabstop'` option is changed (`did_set_varsofttabstop`).
+///
+/// Parses the comma-separated tab-width list via the already-real
+/// `crate::indent::tabstop_set`, which already returns an
+/// `Option<Vec<ColnrT>>` matching `BufT.b_p_vsts_array`'s own
+/// representation directly - Rust's own assignment automatically
+/// drops (frees) the previous array, matching the original's manual
+/// `xfree(oldarray)` step.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+pub unsafe fn did_set_varsofttabstop(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(args.os_buf as *mut crate::buffer_defs::BufT) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    match crate::indent::tabstop_set(val) {
+        Ok(array) => {
+            buf.b_p_vsts_array = array;
+            None
+        }
+        Err(()) => Some(crate::errors::e_invarg.as_bytes()),
+    }
+}
+
+/// The `'vartabstop'` option is changed (`did_set_vartabstop`).
+///
+/// Same shape as [`did_set_varsofttabstop`], targeting
+/// `BufT.b_p_vts_array` instead, plus a real `'foldmethod'=="indent"`
+/// check (`foldmethodIsIndent`, already real) whose own real
+/// `foldUpdateAll` call panics - a genuinely REACHABLE gap (unlike
+/// e.g. `AUTOCMDS`'s always-empty-registry precedent, `'foldmethod'`
+/// is an ordinary string option that CAN legitimately be `"indent"`
+/// in a real session) - `fold.rs`'s own real fold-tree
+/// search/update machinery isn't translated yet.
+///
+/// # Safety
+/// `args.os_buf`/`args.os_win` must be valid, non-null pointers to a
+/// live `BufT`/`WinT` respectively, for the whole call. `args.os_varp`
+/// must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_vartabstop(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(args.os_buf as *mut crate::buffer_defs::BufT) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*(args.os_win as *const crate::buffer_defs::WinT) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    match crate::indent::tabstop_set(val) {
+        Ok(array) => {
+            buf.b_p_vts_array = array;
+            if crate::fold::foldmethod_is_indent(win) {
+                unimplemented!(
+                    "did_set_vartabstop: foldUpdateAll - real fold-tree update machinery, not translated"
+                );
+            }
+            None
+        }
+        Err(()) => Some(crate::errors::e_invarg.as_bytes()),
+    }
 }
 
 #[cfg(test)]
@@ -2606,5 +2686,94 @@ mod tests {
         let stl_syntax = unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax;
         unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax = prev;
         assert_eq!(stl_syntax, crate::globals::STL_IN_ICON);
+    }
+
+    // ---- did_set_varsofttabstop / did_set_vartabstop ----
+
+    fn vartabstop_args(
+        buf: &mut crate::buffer_defs::BufT,
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_buf: buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_varsofttabstop_empty_clears_the_array() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_vsts_array: Some(vec![4, 8]),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        assert_eq!(unsafe { did_set_varsofttabstop(&mut args) }, None);
+        assert_eq!(buf.b_p_vsts_array, None);
+    }
+
+    #[test]
+    fn did_set_varsofttabstop_valid_list_sets_the_array() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"4,8,12".to_vec());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        assert_eq!(unsafe { did_set_varsofttabstop(&mut args) }, None);
+        assert_eq!(buf.b_p_vsts_array, Some(vec![4, 8, 12]));
+    }
+
+    #[test]
+    fn did_set_varsofttabstop_invalid_value_fails_and_leaves_the_array_untouched() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_vsts_array: Some(vec![4]),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"4,bogus".to_vec());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_varsofttabstop(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        // Matches the original: a failed tabstop_set call never
+        // touches the buffer's own array at all.
+        assert_eq!(buf.b_p_vsts_array, Some(vec![4]));
+    }
+
+    #[test]
+    fn did_set_vartabstop_valid_list_sets_the_array_without_fold_update() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        // Default 'foldmethod' ("manual") means foldmethod_is_indent
+        // is false, so the unimplemented!() fold-update branch is
+        // never reached.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"4,8".to_vec());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        assert_eq!(unsafe { did_set_vartabstop(&mut args) }, None);
+        assert_eq!(buf.b_p_vts_array, Some(vec![4, 8]));
+    }
+
+    #[test]
+    fn did_set_vartabstop_invalid_value_fails() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"0,1".to_vec());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        assert_eq!(unsafe { did_set_vartabstop(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdateAll")]
+    fn did_set_vartabstop_panics_when_foldmethod_is_indent() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        let mut val: Option<Vec<u8>> = Some(b"4,8".to_vec());
+        let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
+        let _ = unsafe { did_set_vartabstop(&mut args) };
     }
 }

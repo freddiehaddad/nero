@@ -25,10 +25,10 @@
 //! predicates, translated ahead of their own real callers -
 //! `insert.c`/`ops.c`/`textobject.c`/`insexpand.c`, none translated -
 //! matching the same precedent). `tabstop_set` (the `'vartabstop'`/
-//! `'varsofttabstop'` string parser) is likewise translated ahead of
-//! its own real callers (`option.c`/`optionstr.c`'s option-setting
-//! callbacks, `indent.c`'s own `ex_retab` - none translated) -
-//! returns `Result<Option<Vec<ColnrT>>, ()>` instead of a `bool` return
+//! `'varsofttabstop'` string parser) has 2 real callers now
+//! (`optionstr.rs`'s `did_set_varsofttabstop`/`did_set_vartabstop`) -
+//! `indent.c`'s own `ex_retab` is still not translated - returns
+//! `Result<Option<Vec<ColnrT>>, ()>` instead of a `bool` return
 //! plus a `colnr_T **` out-parameter.
 //!
 //! `tabstop_eq`/`tabstop_copy`/`tabstop_count`/`tabstop_first` need NO
