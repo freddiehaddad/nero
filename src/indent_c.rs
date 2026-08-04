@@ -27,6 +27,11 @@
 //! comment skipper the rest of the indent engine is built on. Needs
 //! only `skipwhite` and the buffer's own `b_ind_hash_comment`.
 //!
+//! Also [`cin_islabel_skip`] and [`cin_has_js_key`], both unlocked by
+//! `cin_skipcomment`. `cin_islabel_skip` returns `Option<usize>`
+//! rather than the original's bool-plus-in-place-advance `const char
+//! **s`.
+//!
 //! Deferred: everything else - `cin_islinecomment`/`find_line_comment`
 //! (need `ml_get` and the cursor), `cin_ends_in`/`cin_is_cpp_extern_c`
 //! and the rest of the real indent-computation algorithm.
@@ -284,6 +289,83 @@ pub unsafe fn cin_nocode(line: &[u8], s: usize) -> bool {
     line.get(end).copied().unwrap_or(0) == 0
 }
 
+/// Whether `line[s..]` matches `"label:"`, returning the index just
+/// past the `':'` when it does (`cin_islabel_skip`).
+///
+/// The original takes `const char **s` and advances it in place,
+/// returning a bool; returning `Option<usize>` says the same thing
+/// without the pointer-to-pointer - `None` is the original's `false`
+/// (with `*s` left wherever it stopped, which no caller reads on that
+/// path).
+///
+/// `"::"` is C++ scope resolution, not a label, so it is rejected.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_islabel_skip(line: &[u8], s: usize) -> Option<usize> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut s = s;
+
+    // need at least one ID character
+    if !crate::charset::vim_isidc(i32::from(at(s))) {
+        return None;
+    }
+    while crate::charset::vim_isidc(i32::from(at(s))) {
+        // SAFETY: `utfc_ptr2len` only reads the slice it is given.
+        let adv = unsafe { crate::mbyte::utfc_ptr2len(line.get(s..).unwrap_or(&[])) };
+        s += usize::try_from(adv).unwrap_or(1).max(1);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    s = unsafe { cin_skipcomment(line, s) };
+
+    // "::" is not a label, it's C++
+    if at(s) == b':' && at(s + 1) != b':' {
+        Some(s + 1)
+    } else {
+        None
+    }
+}
+
+/// Whether `line` starts with `"key:"` (`cin_has_js_key`) - the
+/// JavaScript object-literal key form, optionally quoted as `'key':`
+/// or `"key":`.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_has_js_key(line: &[u8]) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut s = crate::charset::skipwhite(line);
+
+    let mut quote = 0u8;
+    if at(s) == b'\'' || at(s) == b'"' {
+        // can be 'key': or "key":
+        quote = at(s);
+        s += 1;
+    }
+    // need at least one ID character
+    if !crate::charset::vim_isidc(i32::from(at(s))) {
+        return false;
+    }
+    while crate::charset::vim_isidc(i32::from(at(s))) {
+        s += 1;
+    }
+    // Note the original's own `*s && *s == quote` - when no quote was
+    // seen `quote` is NUL, and the leading `*s` test is what stops a
+    // line ending here from matching it.
+    if at(s) != 0 && at(s) == quote {
+        s += 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    s = unsafe { cin_skipcomment(line, s) };
+
+    // "::" is not a label, it's C++
+    at(s) == b':' && at(s + 1) != b':'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +432,85 @@ mod tests {
         };
         let _guard = CurbufGuard::set(&mut buf);
         f()
+    }
+
+    // ---- cin_islabel_skip / cin_has_js_key ----
+
+    #[test]
+    fn cin_islabel_skip_accepts_a_plain_label() {
+        with_hash_comment(0, || {
+            // "done:" - returns the index just past the ':'.
+            assert_eq!(unsafe { cin_islabel_skip(b"done:", 0) }, Some(5));
+            // Trailing code after the colon does not matter.
+            assert_eq!(unsafe { cin_islabel_skip(b"lab: x = 1;", 0) }, Some(4));
+        });
+    }
+
+    #[test]
+    fn cin_islabel_skip_rejects_cpp_scope_resolution() {
+        with_hash_comment(0, || {
+            // "std::" is C++ scope resolution, not a label.
+            assert_eq!(unsafe { cin_islabel_skip(b"std::cout", 0) }, None);
+        });
+    }
+
+    #[test]
+    fn cin_islabel_skip_requires_an_id_char_and_a_colon() {
+        with_hash_comment(0, || {
+            // No identifier at all.
+            assert_eq!(unsafe { cin_islabel_skip(b":x", 0) }, None);
+            assert_eq!(unsafe { cin_islabel_skip(b"", 0) }, None);
+            // An identifier with no colon after it.
+            assert_eq!(unsafe { cin_islabel_skip(b"done", 0) }, None);
+            assert_eq!(unsafe { cin_islabel_skip(b"done = 1", 0) }, None);
+        });
+    }
+
+    #[test]
+    fn cin_islabel_skip_allows_a_comment_before_the_colon() {
+        with_hash_comment(0, || {
+            // The comment skipper runs between the identifier and the
+            // colon, so this still reads as a label.
+            let line = b"done/* c */:";
+            assert_eq!(
+                unsafe { cin_islabel_skip(line, 0) },
+                Some(line.len())
+            );
+        });
+    }
+
+    #[test]
+    fn cin_has_js_key_accepts_bare_and_quoted_keys() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_has_js_key(b"key: 1") });
+            assert!(unsafe { cin_has_js_key(b"'key': 1") });
+            assert!(unsafe { cin_has_js_key(b"\"key\": 1") });
+            // Leading whitespace is skipped first.
+            assert!(unsafe { cin_has_js_key(b"   key: 1") });
+        });
+    }
+
+    #[test]
+    fn cin_has_js_key_rejects_non_keys() {
+        with_hash_comment(0, || {
+            // No colon.
+            assert!(!unsafe { cin_has_js_key(b"key = 1") });
+            // No identifier.
+            assert!(!unsafe { cin_has_js_key(b": 1") });
+            assert!(!unsafe { cin_has_js_key(b"") });
+            // C++ scope resolution again.
+            assert!(!unsafe { cin_has_js_key(b"std::cout") });
+        });
+    }
+
+    #[test]
+    fn cin_has_js_key_only_consumes_a_matching_closing_quote() {
+        with_hash_comment(0, || {
+            // Mismatched quotes: the `"` does not match the opening
+            // `'`, so it is not consumed and the colon is never
+            // reached.
+            assert!(!unsafe { cin_has_js_key(b"'key\": 1") });
+        });
     }
 
     #[test]
