@@ -80,11 +80,14 @@
 //! `spellsuggest.rs`'s own `spell_check_sps` landed in an earlier
 //! commit this segment - its only remaining real blocker),
 //! [`did_set_mkspellmem`] (same shape, now that `spellfile.rs`'s own
-//! new `spell_check_msm` exists), and [`did_set_mouse`] (built on a
+//! new `spell_check_msm` exists), [`did_set_mouse`] (built on a
 //! new `did_set_option_listflag` helper - its own dynamically-
 //! formatted `"E539: Illegal character <c>"` message is simplified
 //! to a static `e_invarg`, matching this whole module's established
-//! "display text differs, boolean outcome identical" policy).
+//! "display text differs, boolean outcome identical" policy), and
+//! [`did_set_mousescroll`] (parses a comma-separated
+//! `"ver:N"`/`"hor:M"` list into `OPTION_VARS.p_mousescroll_vert`/
+//! `p_mousescroll_hor`).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -761,6 +764,78 @@ pub unsafe fn did_set_mouse(args: &mut crate::option_defs::OptsetT) -> Option<&'
     let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
     let val: &[u8] = varp.as_deref().unwrap_or(&[]);
     did_set_option_listflag(val, crate::option_vars::MOUSE_ALL.as_bytes())
+}
+
+/// The `'mousescroll'` option is changed (`did_set_mousescroll`).
+///
+/// Parses a comma-separated `"ver:N"`/`"hor:M"` list (each direction
+/// at most once), applying the real default for whichever direction
+/// wasn't given.
+///
+/// # Safety
+/// Touches `OPTION_VARS`.
+pub unsafe fn did_set_mousescroll() -> Option<&'static [u8]> {
+    use crate::option_vars::{MOUSESCROLL_HOR_DFLT, MOUSESCROLL_VERT_DFLT};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_ms = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll.clone();
+    let string: &[u8] = p_ms.as_deref().unwrap_or(&[]);
+
+    let mut vertical: crate::types_defs::OptInt = -1;
+    let mut horizontal: crate::types_defs::OptInt = -1;
+    let mut pos = 0usize;
+
+    loop {
+        let remaining = &string[pos..];
+        let end = crate::strings::vim_strchr(remaining, i32::from(b','));
+        let length = end.unwrap_or(remaining.len());
+
+        // Both "ver:" and "hor:" are 4 bytes long, followed by at
+        // least one digit.
+        if length <= 4 {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+
+        let is_vert = &remaining[..4] == b"ver:";
+        let is_hor = &remaining[..4] == b"hor:";
+        if !is_vert && !is_hor {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        let target = if is_vert { &mut vertical } else { &mut horizontal };
+        if *target != -1 {
+            // Direction already set - this is a duplicate.
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+
+        // Verify that only digits follow the colon.
+        for &b in &remaining[4..length] {
+            if !crate::ascii_defs::ascii_isdigit(i32::from(b)) {
+                return Some(crate::gettext_defs::gettext_noop("E5080: Digit expected").as_bytes());
+            }
+        }
+
+        let (value, _consumed) = crate::charset::getdigits_int(&remaining[4..], false, -1);
+        *target = i64::from(value);
+        // Num options are generally kept within the signed int range.
+        // We know this number won't be negative because we've already
+        // checked for a minus sign. We'll allow 0 as a means of
+        // disabling mouse scrolling.
+        if *target == -1 {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+
+        match end {
+            None => break,
+            Some(comma_pos) => pos += comma_pos + 1,
+        }
+    }
+
+    // If a direction wasn't set, fall back to the default value.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    opts.p_mousescroll_vert = if vertical == -1 { MOUSESCROLL_VERT_DFLT } else { vertical };
+    opts.p_mousescroll_hor = if horizontal == -1 { MOUSESCROLL_HOR_DFLT } else { horizontal };
+
+    None
 }
 
 #[cfg(test)]
@@ -1869,5 +1944,106 @@ mod tests {
         let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
         let mut args = crate::option_defs::OptsetT { os_varp: varp, ..Default::default() };
         assert_eq!(unsafe { did_set_mouse(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_mousescroll ----
+
+    fn set_p_mousescroll(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_mousescroll.clone();
+        opts.p_mousescroll = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_mousescroll_the_real_default_value_sets_both_directions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"ver:3,hor:6"));
+        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        assert_eq!(opts.p_mousescroll_vert, 3);
+        assert_eq!(opts.p_mousescroll_hor, 6);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_only_vertical_falls_back_to_the_horizontal_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"ver:5"));
+        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        assert_eq!(opts.p_mousescroll_vert, 5);
+        assert_eq!(opts.p_mousescroll_hor, crate::option_vars::MOUSESCROLL_HOR_DFLT);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_only_horizontal_falls_back_to_the_vertical_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"hor:10"));
+        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        assert_eq!(opts.p_mousescroll_vert, crate::option_vars::MOUSESCROLL_VERT_DFLT);
+        assert_eq!(opts.p_mousescroll_hor, 10);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_duplicate_direction_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"ver:1,ver:2"));
+        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_unknown_direction_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"foo:1"));
+        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_too_short_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        // length == 4 ("ver:"), no digit at all - length <= 4 fails
+        // before the direction/digit checks even run.
+        let prev = set_p_mousescroll(Some(b"ver:"));
+        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_non_digit_after_colon_reports_e5080() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"ver:x"));
+        assert_eq!(
+            unsafe { did_set_mousescroll() },
+            Some(crate::gettext_defs::gettext_noop("E5080: Digit expected").as_bytes())
+        );
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_empty_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A genuine, real quirk of the original: an empty value makes
+        // `length` (== strlen("") == 0) satisfy `length <= 4`,
+        // rejecting it immediately - not a translation bug.
+        let prev = set_p_mousescroll(Some(b""));
+        assert_eq!(unsafe { did_set_mousescroll() }, Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
+    }
+
+    #[test]
+    fn did_set_mousescroll_allows_zero_to_disable_scrolling() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_mousescroll(Some(b"ver:0,hor:0"));
+        assert_eq!(unsafe { did_set_mousescroll() }, None);
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        assert_eq!(opts.p_mousescroll_vert, 0);
+        assert_eq!(opts.p_mousescroll_hor, 0);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousescroll = prev;
     }
 }
