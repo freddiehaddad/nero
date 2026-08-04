@@ -311,6 +311,28 @@ pub fn have_sourcing_info() -> bool {
     !unsafe { (*EXESTACK.as_ptr()).is_empty() }
 }
 
+/// The line number of the topmost execution-stack frame (`SOURCING_LNUM`,
+/// a macro in the original:
+/// `((estack_T *)exestack.ga_data)[exestack.ga_len - 1].es_lnum`).
+///
+/// `EXESTACK` is always empty today (see this module's own doc
+/// comment), so there is no real topmost frame to read a line number
+/// from - this returns `0` for that case (matching
+/// [`have_sourcing_info`]'s own `false` "no current execution context"
+/// answer for the identical state), the genuinely correct value today
+/// rather than a hardcoded shortcut: once a future session adds real
+/// script/function/autocmd execution frames, this starts returning the
+/// true topmost frame's own line number automatically, with no changes
+/// needed at any of this function's own call sites (e.g. `option.rs`'s
+/// `set_option_sctx`).
+#[must_use]
+pub fn sourcing_lnum() -> crate::pos_defs::LinenrT {
+    // SAFETY: matching `have_sourcing_info`'s own `EXESTACK.as_ptr()`
+    // precedent - the `&Vec` this briefly, implicitly creates is used
+    // and discarded immediately.
+    unsafe { (*EXESTACK.as_ptr()).last() }.map_or(0, |e| e.es_lnum)
+}
+
 /// Test-only: resets [`SCRIPT_ITEMS`]/[`LAST_CURRENT_SID`] to empty so
 /// each test (in this module, or `eval::vars`'s own tests exercising
 /// [`new_script_item`]/`new_script_vars` together) starts from a clean
@@ -430,6 +452,20 @@ mod tests {
         // "foo#bar" - a genuine package name (# after the first byte) -
         // reaches the not-yet-translated substantive path.
         script_autoload(b"foo#bar", false);
+    }
+
+    // --- have_sourcing_info / sourcing_lnum ---
+
+    #[test]
+    fn have_sourcing_info_is_false_since_exestack_is_always_empty() {
+        let _lock = global_state_test_lock();
+        assert!(!have_sourcing_info());
+    }
+
+    #[test]
+    fn sourcing_lnum_is_zero_since_exestack_is_always_empty() {
+        let _lock = global_state_test_lock();
+        assert_eq!(sourcing_lnum(), 0);
     }
 
     // --- f_getscriptinfo ---

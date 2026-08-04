@@ -136,6 +136,34 @@
 //! simpler substitute). This note is corrected here rather than left
 //! to compound further.
 //!
+//! Also translated: `option_scope_idx` (`options[idx].scope_idx[scope]`,
+//! trivial) and `set_option_sctx` (`did_set_option`'s own `sctx`-
+//! tracking step, previously flagged above as "small, not yet
+//! checked") - the per-option script-context bookkeeping recording
+//! where each option was last set. The original's own
+//! `options[opt_idx].script_ctx = script_ctx` write (for global
+//! options) is modeled as a NEW side-table, `OPTION_SCRIPT_CTX`,
+//! rather than a mutated `VimoptionT` field, exactly mirroring
+//! `OPTION_WAS_SET`'s own already-established reasoning: `get_option`'s
+//! safety doc relies on `VimoptionT` never being mutated once
+//! `OPTIONS` is built, so a real write through a raw pointer into that
+//! array would risk violating that invariant. Buffer-/window-local
+//! script contexts use the already-real `BufT.b_p_script_ctx`/
+//! `WinoptT.wo_script_ctx` fields directly (both `Vec<SctxT>`, grown
+//! on demand via a new `ensure_sctx_len` helper, rather than pre-sized
+//! up front - matching those fields' own already-documented "nothing
+//! here depends on it being a fixed size" design intent). The
+//! original's own `nlua_set_sctx(&script_ctx)` call is omitted
+//! (Lua-diagnostic-message enhancement only, matching `eval/vars.rs`'s
+//! `find_var_ht_dict`'s own identical omission). `SOURCING_LNUM`
+//! (`runtime.rs`'s new `sourcing_lnum()`) is always `0` today, since
+//! `EXESTACK` is always empty (see that module's own doc comment) -
+//! the real, correct answer for "no active execution context", not a
+//! hardcoded shortcut. Translated ahead of `did_set_option` itself
+//! (still deferred, see below), matching this crate's established
+//! "small, simple, mechanically correct piece ahead of its real
+//! caller" precedent.
+//!
 //! Deferred: the full `set_option_value`/`set_option`/
 //! `did_set_option`/`validate_option_value` write pipeline - each
 //! layer found to need a currently-blocked subsystem while scoping
@@ -152,10 +180,10 @@
 //!   options that HAVE one - the other 189 (`opt_did_set_cb == None`)
 //!   skip straight past that branch to the function's OWN remaining,
 //!   option-agnostic machinery (re-reading `new_value`, `set_sid`/
-//!   `sctx`-tracking via `set_option_sctx` - not yet translated -,
-//!   `scope_both`'s global-local-unset handling, then the 3 special-
-//!   cased `curbuf.b_p_syn`/`b_p_ft`/`curwin.w_s.b_p_spl` autocmd
-//!   triggers, `comp_col`/`setmouse`/`redraw_all_later`/
+//!   `sctx`-tracking via `set_option_sctx` (now translated, see
+//!   above), `scope_both`'s global-local-unset handling, then the 3
+//!   special-cased `curbuf.b_p_syn`/`b_p_ft`/`curwin.w_s.b_p_spl`
+//!   autocmd triggers, `comp_col`/`setmouse`/`redraw_all_later`/
 //!   `set_winbar_all`/`check_redraw` redraw-pipeline calls - all
 //!   omittable per this crate's established `redraw_later`-omission
 //!   precedent -, and finally the `insecure_flag`-bit bookkeeping at
@@ -165,10 +193,10 @@
 //!   `unimplemented!()`-ing only at the exact point a real callback
 //!   would be invoked for the other 188 - matching this crate's
 //!   established "translate the real, always-reachable fast path"
-//!   precedent. Not yet attempted: needs `set_option_sctx` (small,
-//!   not yet checked), `check_illegal_path_names` (now translated,
-//!   see below - `did_set_option`'s OWN early check, before the
-//!   callback dispatch), and the small `do_syntax_autocmd`/
+//!   precedent. Not yet attempted: `set_option_sctx` is now
+//!   translated (see above); still needed: `check_illegal_path_names`
+//!   (now translated, see below - `did_set_option`'s OWN early check,
+//!   before the callback dispatch), and the small `do_syntax_autocmd`/
 //!   `do_filetype_autocmd`/`do_spelllang_source` trio (each
 //!   individually gated behind a `varp ==` pointer-identity check
 //!   against 3 SPECIFIC option storage addresses - would need
@@ -207,6 +235,7 @@
 //!   `do_set` itself still being deferred.
 
 use crate::buffer_defs::{BufT, WinT};
+use crate::eval::typval_defs::SctxT;
 use crate::option_defs::{OptIndex, OptScope, OptValType, OptVal, VimoptionT, OPTIONS, OPT_COUNT};
 use crate::option_vars::{EOL_DOS, EOL_MAC, EOL_UNIX};
 use crate::types_defs::{OptInt, TriState};
@@ -737,6 +766,134 @@ pub unsafe fn is_option_local_value_unset(opt_idx: OptIndex) -> bool {
     let unset_local_value = unsafe { get_option_unset_value(opt_idx) };
 
     local_value == unset_local_value
+}
+
+/// The scope-specific index of option `opt_idx` at `scope`
+/// (`option_scope_idx`, `options[opt_idx].scope_idx[scope]`) - e.g.
+/// its position within `BufOptIndex`/`WinOptIndex` when `scope` is
+/// `Buf`/`Win`, used to index into `BufT.b_p_script_ctx`/
+/// `WinoptT.wo_script_ctx`.
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
+/// original's own `assert(opt_idx != kOptInvalid)`.
+#[must_use]
+pub fn option_scope_idx(opt_idx: OptIndex, scope: OptScope) -> isize {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    get_option(opt_idx).scope_idx[scope as usize]
+}
+
+/// Per-option script context (`options[idx].script_ctx` in the
+/// original), for GLOBAL options only. Modeled as its OWN parallel
+/// side-table, exactly mirroring [`OPTION_WAS_SET`]'s own already-
+/// established reasoning (see its own doc comment): `get_option`'s
+/// safety doc relies on `VimoptionT` never being mutated once
+/// `OPTIONS` is built, so a dedicated side-table sidesteps introducing
+/// a real write through a raw pointer into that array.
+static OPTION_SCRIPT_CTX: crate::globals::GlobalCell<[SctxT; crate::option_defs::OPT_COUNT]> =
+    crate::globals::GlobalCell::new(
+        [SctxT { sc_sid: 0, sc_seq: 0, sc_lnum: 0, sc_chan: 0 }; crate::option_defs::OPT_COUNT],
+    );
+
+/// The script context recorded for GLOBAL option `opt_idx` (the
+/// original's own `options[opt_idx].script_ctx`, read directly - there
+/// is no separate named accessor function for this in the original,
+/// every real call site just reads the field). Buffer-/window-local
+/// script contexts live on `BufT.b_p_script_ctx`/
+/// `WinoptT.wo_script_ctx` instead (see [`set_option_sctx`]'s own doc
+/// comment) and are read directly through those fields, matching the
+/// original exactly.
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching
+/// [`option_was_set`]'s own established convention for this exact
+/// side-table shape.
+#[must_use]
+pub fn option_script_ctx(opt_idx: OptIndex) -> SctxT {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: a plain Copy-out read through one exclusive borrow, no
+    // aliasing hazard.
+    let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
+    table[opt_idx as usize]
+}
+
+/// Grow `v` in place (with `SctxT::default()` fill) so that
+/// `v[idx]` is valid, if it isn't already.
+///
+/// `BufT.b_p_script_ctx`/`WinoptT.wo_script_ctx` are `Vec<SctxT>`
+/// standing in for the original's own fixed-size
+/// `sctx_T[kBufOptCount]`/`sctx_T[kWinOptCount]` arrays (a codegen-
+/// derived size not available without running `src/gen/*.lua` -
+/// flagged and deferred since phase 1, see each field's own doc
+/// comment) - starting empty (`Vec::new()` via `#[derive(Default)]`)
+/// and growing on first real write here, rather than pre-sizing every
+/// `BufT`/`WinoptT` up front, matches those fields' own already-
+/// documented "nothing here depends on it being a fixed size" design
+/// intent exactly (no other code reads/writes these fields yet, so
+/// this is the very first real consumer, not a retrofit).
+fn ensure_sctx_len(v: &mut Vec<SctxT>, len: usize) {
+    if v.len() < len {
+        v.resize(len, SctxT::default());
+    }
+}
+
+/// Set the script context for option `opt_idx` (`set_option_sctx`).
+/// Remembers where the option was last set - in `OPTION_SCRIPT_CTX`
+/// for a global option, or in the current buffer's/window's own
+/// `b_p_script_ctx`/`wo_script_ctx` for a local one (both buffer- and
+/// window-local `w_onebuf_opt`, plus `w_allbuf_opt` too when `both` is
+/// set, matching the original's own "also setting the all buffers
+/// value" branch).
+///
+/// The original's own `nlua_set_sctx(&script_ctx)` call is omitted -
+/// a Lua-diagnostic-message enhancement only, matching
+/// `eval/vars.rs`'s `find_var_ht_dict`'s own already-established
+/// handling of the identical call (confirmed via direct reading that
+/// it never touches any field this function itself reads or writes).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` values (only read/written through
+/// when a local option is being recorded), matching `get_varp`'s own
+/// established safety requirement.
+pub unsafe fn set_option_sctx(opt_idx: OptIndex, opt_flags: u32, mut script_ctx: SctxT) {
+    use crate::option_defs::opt_set_flags::{OPT_GLOBAL, OPT_LOCAL, OPT_MODELINE};
+
+    let both = (opt_flags & (OPT_LOCAL | OPT_GLOBAL)) == 0;
+
+    // Modeline already has the line number set.
+    if opt_flags & OPT_MODELINE == 0 {
+        script_ctx.sc_lnum = script_ctx.sc_lnum.wrapping_add(crate::runtime::sourcing_lnum());
+    }
+
+    // Remember where the option was set. For local options need to do
+    // that in the buffer or window structure.
+    if both || (opt_flags & OPT_GLOBAL != 0) || option_is_global_only(opt_idx) {
+        // SAFETY: a plain Copy-in write through one exclusive borrow,
+        // no aliasing hazard.
+        let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
+        table[opt_idx as usize] = script_ctx;
+    }
+    if both || (opt_flags & OPT_LOCAL != 0) {
+        if option_has_scope(opt_idx, OptScope::Buf) {
+            let idx = option_scope_idx(opt_idx, OptScope::Buf) as usize;
+            // SAFETY: forwarded from this function's own safety doc.
+            let buf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+            ensure_sctx_len(&mut buf.b_p_script_ctx, idx + 1);
+            buf.b_p_script_ctx[idx] = script_ctx;
+        } else if option_has_scope(opt_idx, OptScope::Win) {
+            let idx = option_scope_idx(opt_idx, OptScope::Win) as usize;
+            // SAFETY: forwarded from this function's own safety doc.
+            let win = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
+            ensure_sctx_len(&mut win.w_onebuf_opt.wo_script_ctx, idx + 1);
+            win.w_onebuf_opt.wo_script_ctx[idx] = script_ctx;
+            if both {
+                // also setting the "all buffers" value
+                ensure_sctx_len(&mut win.w_allbuf_opt.wo_script_ctx, idx + 1);
+                win.w_allbuf_opt.wo_script_ctx[idx] = script_ctx;
+            }
+        }
+    }
 }
 
 /// Get a raw pointer to `OPTIONS`'s element at `opt_idx`. Built on
@@ -5187,4 +5344,166 @@ mod get_winbuf_options_tests {
         unsafe { tv_dict_free(windict) };
     }
 }
+
+#[cfg(test)]
+mod set_option_sctx_tests {
+    use super::*;
+
+    /// Points `GLOBALS.curbuf`/`curwin` at real, linked `buf`/`win`
+    /// instances for the guard's lifetime, restoring the previous
+    /// values on drop. Callers must hold `global_state_test_lock()`
+    /// for the guard's whole lifetime (matching
+    /// `get_winbuf_options_tests::CurBufWinGuard`'s own identical
+    /// precedent, duplicated here rather than shared since that one is
+    /// private to its own module).
+    struct CurBufWinGuard {
+        prev_buf: *mut BufT,
+        prev_win: *mut WinT,
+    }
+
+    impl CurBufWinGuard {
+        fn set(buf: *mut BufT, win: *mut WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_buf = globals.curbuf;
+            let prev_win = globals.curwin;
+            globals.curbuf = buf;
+            globals.curwin = win;
+            CurBufWinGuard { prev_buf, prev_win }
+        }
+    }
+
+    impl Drop for CurBufWinGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_buf;
+            globals.curwin = self.prev_win;
+        }
+    }
+
+    /// Resets `OPTION_SCRIPT_CTX`'s slot for `opt_idx` back to a fresh
+    /// zeroed `SctxT`, so tests don't leak state into one another via
+    /// this shared side-table (matching `OPTION_WAS_SET`'s own tests'
+    /// established need to reset shared per-option side-table state).
+    fn reset_script_ctx(opt_idx: OptIndex) {
+        let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
+        table[opt_idx as usize] = SctxT::default();
+    }
+
+    #[test]
+    fn option_scope_idx_matches_the_known_buf_opt_index() {
+        // 'tabstop' is BufOptIndex::Tabstop - verified against
+        // option_defs.rs's own BUF_OPT_IDX table.
+        assert_eq!(
+            option_scope_idx(OptIndex::Tabstop, OptScope::Buf),
+            crate::option_defs::BufOptIndex::Tabstop as isize
+        );
+        // A Global-only option has no Buf-scope entry at all (-1,
+        // matching options_enum.generated.h's own "unused scope"
+        // sentinel).
+        assert_eq!(option_scope_idx(OptIndex::Ignorecase, OptScope::Buf), -1);
+    }
+
+    #[test]
+    fn option_script_ctx_defaults_to_a_zeroed_sctx() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_script_ctx(OptIndex::Ignorecase);
+        assert_eq!(option_script_ctx(OptIndex::Ignorecase), SctxT::default());
+    }
+
+    #[test]
+    fn set_option_sctx_records_a_global_only_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_script_ctx(OptIndex::Ignorecase);
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let _guard = CurBufWinGuard::set(&mut buf as *mut BufT, &mut win as *mut WinT);
+
+        let ctx = SctxT { sc_sid: 7, sc_seq: 1, sc_lnum: 10, sc_chan: 0 };
+        unsafe { set_option_sctx(OptIndex::Ignorecase, crate::option_defs::opt_set_flags::OPT_MODELINE, ctx) };
+
+        // OPT_MODELINE means sourcing_lnum() is NOT added (the modeline
+        // already carries its own real line number) - sc_lnum stays
+        // exactly as passed in.
+        assert_eq!(option_script_ctx(OptIndex::Ignorecase), ctx);
+    }
+
+    #[test]
+    fn set_option_sctx_adds_sourcing_lnum_unless_modeline() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_script_ctx(OptIndex::Ignorecase);
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let _guard = CurBufWinGuard::set(&mut buf as *mut BufT, &mut win as *mut WinT);
+
+        let ctx = SctxT { sc_sid: 3, sc_seq: 0, sc_lnum: 5, sc_chan: 0 };
+        // Not OPT_MODELINE, so sourcing_lnum() (0, EXESTACK is always
+        // empty) is added on top of the passed-in sc_lnum - a real,
+        // if currently-inert (0 + 5 == 5), addition.
+        unsafe { set_option_sctx(OptIndex::Ignorecase, 0, ctx) };
+        assert_eq!(option_script_ctx(OptIndex::Ignorecase).sc_lnum, 5 + crate::runtime::sourcing_lnum());
+    }
+
+    #[test]
+    fn set_option_sctx_records_a_buffer_local_option() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let _guard = CurBufWinGuard::set(&mut buf as *mut BufT, &mut win as *mut WinT);
+
+        assert!(buf.b_p_script_ctx.is_empty());
+        let ctx = SctxT { sc_sid: 2, sc_seq: 0, sc_lnum: 0, sc_chan: 0 };
+        unsafe { set_option_sctx(OptIndex::Tabstop, crate::option_defs::opt_set_flags::OPT_MODELINE, ctx) };
+
+        let idx = option_scope_idx(OptIndex::Tabstop, OptScope::Buf) as usize;
+        assert_eq!(buf.b_p_script_ctx[idx], ctx);
+    }
+
+    #[test]
+    fn set_option_sctx_records_a_window_local_option_and_all_buffers_value_when_both() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let _guard = CurBufWinGuard::set(&mut buf as *mut BufT, &mut win as *mut WinT);
+
+        // 'arabic' is pure window-local (option_is_window_local_true_
+        // only_for_pure_window_scope's own precedent).
+        let ctx = SctxT { sc_sid: 9, sc_seq: 0, sc_lnum: 1, sc_chan: 0 };
+        // opt_flags == 0 means "both" (neither OPT_LOCAL nor
+        // OPT_GLOBAL): OPT_MODELINE also set so sourcing_lnum() isn't
+        // added, keeping the assertion exact.
+        unsafe {
+            set_option_sctx(OptIndex::Arabic, crate::option_defs::opt_set_flags::OPT_MODELINE, ctx)
+        };
+
+        let idx = option_scope_idx(OptIndex::Arabic, OptScope::Win) as usize;
+        assert_eq!(win.w_onebuf_opt.wo_script_ctx[idx], ctx);
+        assert_eq!(win.w_allbuf_opt.wo_script_ctx[idx], ctx);
+    }
+
+    #[test]
+    fn set_option_sctx_skips_all_buffers_value_when_opt_local_is_explicit() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut buf = BufT::default();
+        let mut win = WinT { w_buffer: &mut buf as *mut BufT, ..Default::default() };
+        let _guard = CurBufWinGuard::set(&mut buf as *mut BufT, &mut win as *mut WinT);
+
+        let ctx = SctxT { sc_sid: 4, sc_seq: 0, sc_lnum: 2, sc_chan: 0 };
+        let flags = crate::option_defs::opt_set_flags::OPT_LOCAL | crate::option_defs::opt_set_flags::OPT_MODELINE;
+        unsafe { set_option_sctx(OptIndex::Arabic, flags, ctx) };
+
+        let idx = option_scope_idx(OptIndex::Arabic, OptScope::Win) as usize;
+        assert_eq!(win.w_onebuf_opt.wo_script_ctx[idx], ctx);
+        // w_allbuf_opt's own vec was never even grown, since only the
+        // single-buffer value is recorded for an explicit OPT_LOCAL
+        // call (matching the original's own `if (both)` guard around
+        // its "also setting the all buffers value" branch).
+        assert!(win.w_allbuf_opt.wo_script_ctx.is_empty());
+    }
+}
+
 
