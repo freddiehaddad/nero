@@ -40,9 +40,14 @@
 //! (structure/compound-literal initialization: `=|return
 //! [&][(typecast)] [{]`).
 //!
-//! Deferred: everything else - `cin_islinecomment`/`find_line_comment`
-//! (need `ml_get` and the cursor), `cin_ends_in`/`cin_is_cpp_extern_c`
-//! and the rest of the real indent-computation algorithm.
+//! Also the small keyword/shape predicates [`cin_ispreproc`],
+//! [`cin_iscomment`], [`cin_islinecomment`], [`cin_isif`],
+//! [`cin_iselse`], [`cin_isdo`], [`cin_isbreak`] and [`cin_ends_in`].
+//!
+//! Deferred: everything else - `cin_ispreproc_cont`/
+//! `find_line_comment` (need `ml_get` and the cursor),
+//! `cin_is_cpp_extern_c` and the rest of the real indent-computation
+//! algorithm.
 
 use crate::charset::vim_isidc;
 
@@ -568,6 +573,96 @@ pub unsafe fn cin_is_compound_init(line: &[u8], s: usize) -> bool {
     unsafe { cin_nocode(line, p) }
 }
 
+/// Recognize a preprocessor statement: any line starting with `'#'`
+/// (`cin_ispreproc`).
+#[must_use]
+pub fn cin_ispreproc(line: &[u8], s: usize) -> bool {
+    let rest = line.get(s..).unwrap_or(&[]);
+    let w = crate::charset::skipwhite(rest);
+    rest.get(w).copied().unwrap_or(0) == b'#'
+}
+
+/// Recognize the start of a C or C++ comment (`cin_iscomment`).
+#[must_use]
+pub fn cin_iscomment(line: &[u8], p: usize) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    at(p) == b'/' && (at(p + 1) == b'*' || at(p + 1) == b'/')
+}
+
+/// Recognize the start of a `"//"` comment (`cin_islinecomment`).
+#[must_use]
+pub fn cin_islinecomment(line: &[u8], p: usize) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    at(p) == b'/' && at(p + 1) == b'/'
+}
+
+/// Recognize an `"if"` keyword (`cin_isif`).
+///
+/// Spelled out separately in the original even though it is exactly
+/// [`cin_starts_with`]`(p, "if")`; kept as its own function so the
+/// call sites read the same as the original's.
+#[must_use]
+pub fn cin_isif(line: &[u8], p: usize) -> bool {
+    cin_starts_with(line.get(p..).unwrap_or(&[]), b"if")
+}
+
+/// Recognize a `"do"` keyword (`cin_isdo`).
+#[must_use]
+pub fn cin_isdo(line: &[u8], p: usize) -> bool {
+    cin_starts_with(line.get(p..).unwrap_or(&[]), b"do")
+}
+
+/// Recognize a `"break"` keyword (`cin_isbreak`).
+#[must_use]
+pub fn cin_isbreak(line: &[u8], p: usize) -> bool {
+    cin_starts_with(line.get(p..).unwrap_or(&[]), b"break")
+}
+
+/// Recognize an `"else"` keyword, also accepting `"} else"`
+/// (`cin_iselse`).
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_iselse(line: &[u8], p: usize) -> bool {
+    let mut p = p;
+    if line.get(p).copied().unwrap_or(0) == b'}' {
+        // accept "} else"
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p + 1) };
+    }
+    cin_starts_with(line.get(p..).unwrap_or(&[]), b"else")
+}
+
+/// Whether `line[s..]` ends in `find`, ignoring trailing white space
+/// and comments (`cin_ends_in`). Strings and comments are skipped
+/// while scanning.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_ends_in(line: &[u8], s: usize, find: &[u8]) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut p = s;
+
+    while at(p) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        p = unsafe { cin_skipcomment(line, p) };
+        if line.get(p..).is_some_and(|t| t.starts_with(find)) {
+            let after = p + find.len();
+            let r = after + crate::charset::skipwhite(line.get(after..).unwrap_or(&[]));
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { cin_nocode(line, r) } {
+                return true;
+            }
+        }
+        if at(p) != 0 {
+            p += 1;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +749,80 @@ mod tests {
     const DEFAULT_CINSD: &[u8] = b"public,protected,private";
 
     // ---- cin_skip_comment_and_string / cin_is_compound_init ----
+
+    // ---- small cin_* predicates ----
+
+    #[test]
+    fn cin_ispreproc_matches_a_hash_after_optional_whitespace() {
+        assert!(cin_ispreproc(b"#include <x>", 0));
+        assert!(cin_ispreproc(b"   # define X", 0));
+        assert!(cin_ispreproc(b"\t#if", 0));
+        assert!(!cin_ispreproc(b"x = 1;", 0));
+        assert!(!cin_ispreproc(b"", 0));
+    }
+
+    #[test]
+    fn cin_iscomment_and_cin_islinecomment_match_their_openers() {
+        // A block comment is a comment but not a LINE comment.
+        assert!(cin_iscomment(b"/* c */", 0));
+        assert!(!cin_islinecomment(b"/* c */", 0));
+        // A `//` comment is both.
+        assert!(cin_iscomment(b"// c", 0));
+        assert!(cin_islinecomment(b"// c", 0));
+        // A lone slash is neither.
+        assert!(!cin_iscomment(b"/ x", 0));
+        assert!(!cin_islinecomment(b"/ x", 0));
+        assert!(!cin_iscomment(b"", 0));
+    }
+
+    #[test]
+    fn cin_isif_isdo_isbreak_require_a_whole_keyword() {
+        assert!(cin_isif(b"if (x)", 0));
+        assert!(cin_isdo(b"do {", 0));
+        assert!(cin_isbreak(b"break;", 0));
+        // A longer identifier merely starting with the keyword does
+        // not count.
+        assert!(!cin_isif(b"ifx", 0));
+        assert!(!cin_isdo(b"done", 0));
+        assert!(!cin_isbreak(b"breaks", 0));
+        assert!(!cin_isif(b"", 0));
+    }
+
+    #[test]
+    fn cin_iselse_accepts_a_leading_close_brace() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_iselse(b"else", 0) });
+            // "} else" is the whole point of the leading-brace case.
+            assert!(unsafe { cin_iselse(b"} else", 0) });
+            // A comment may sit between the brace and the keyword.
+            assert!(unsafe { cin_iselse(b"}/* c */else", 0) });
+            // A longer identifier does not count.
+            assert!(!unsafe { cin_iselse(b"elsewhere", 0) });
+            assert!(!unsafe { cin_iselse(b"} x", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_ends_in_matches_only_at_the_real_end_of_code() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_ends_in(b"foo,", 0, b",") });
+            // Trailing whitespace and comments are ignored.
+            assert!(unsafe { cin_ends_in(b"foo,  ", 0, b",") });
+            assert!(unsafe { cin_ends_in(b"foo, /* c */", 0, b",") });
+            // A multi-character needle works too.
+            assert!(unsafe { cin_ends_in(b"struct foo", 0, b"foo") });
+        });
+    }
+
+    #[test]
+    fn cin_ends_in_is_false_when_code_follows_the_match() {
+        with_hash_comment(0, || {
+            // The comma is not at the end of the code.
+            assert!(!unsafe { cin_ends_in(b"foo, bar", 0, b",") });
+            assert!(!unsafe { cin_ends_in(b"foo;", 0, b",") });
+            assert!(!unsafe { cin_ends_in(b"", 0, b",") });
+        });
+    }
 
     #[test]
     fn cin_skip_comment_and_string_loops_until_nothing_moves() {
