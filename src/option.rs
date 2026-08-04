@@ -127,6 +127,19 @@
 //! "small, simple, mechanically correct piece ahead of its real
 //! caller" precedent.
 //!
+//! Also translated: `do_syntax_autocmd` - `did_set_option`'s own
+//! `'syntax'`-changed handler, called once `varp == &curbuf->b_p_syn`
+//! is confirmed. Sets `BufT::BF_SYN_SET` and fires the `Syntax`
+//! autocmd event via the already-real `crate::autocmd::apply_autocmds`
+//! (always taking that function's own already-documented empty-
+//! `AUTOCMDS` bypass path today, so this has no observable effect
+//! beyond its own `SYN_RECURSIVE` recursion-depth bookkeeping and the
+//! `BF_SYN_SET` flag update - becomes fully correct automatically once
+//! a future session adds real `Syntax` autocmd registration).
+//! Translated ahead of `did_set_option` itself, matching the same
+//! "small, simple, mechanically correct piece ahead of its real
+//! caller" precedent.
+//!
 //! **STALE-NOTE FIX**: `find_option`/`find_option_len` (below) were
 //! previously (incorrectly) described here as still needing the
 //! perfect-hash generated table - they are, in fact, ALREADY
@@ -193,15 +206,15 @@
 //!   `unimplemented!()`-ing only at the exact point a real callback
 //!   would be invoked for the other 188 - matching this crate's
 //!   established "translate the real, always-reachable fast path"
-//!   precedent. Not yet attempted: `set_option_sctx` is now
-//!   translated (see above); still needed: `check_illegal_path_names`
-//!   (now translated, see below - `did_set_option`'s OWN early check,
-//!   before the callback dispatch), and the small `do_syntax_autocmd`/
-//!   `do_filetype_autocmd`/`do_spelllang_source` trio (each
-//!   individually gated behind a `varp ==` pointer-identity check
-//!   against 3 SPECIFIC option storage addresses - would need
-//!   verifying against real `apply_autocmds`, likely tractable given
-//!   that already exists).
+//!   precedent. `set_option_sctx`/`check_illegal_path_names` are now
+//!   translated (see above), and so is `do_syntax_autocmd` (see
+//!   below) - still needed: the `varp == &curbuf->b_p_ft` FileType-
+//!   autocmd branch (inlined directly in `did_set_option` in current
+//!   neovim, not its own named function despite an earlier note here
+//!   calling it `do_filetype_autocmd` - would need re-verifying
+//!   against real `apply_autocmds`) and `do_spelllang_source` (blocked
+//!   on `source_runtime_vim_lua`, real file I/O/script sourcing - not
+//!   attempted).
 //! - `validate_option_value`/`validate_num_option`/
 //!   `check_num_option_bounds` are now FULLY translated (no remaining
 //!   panics): `OptIndex::Lines`/`OptIndex::Scroll` (previously the
@@ -1066,6 +1079,52 @@ pub unsafe fn check_illegal_path_names(val: &[u8], flags: u32) -> bool {
         && val.iter().any(|b| nfname_chars.contains(b)))
         || (flags & crate::option_defs::opt_flags::NDNAME != 0
             && val.iter().any(|b| b"*?[|;&<>\r\n".contains(b)))
+}
+
+/// Recursion depth guard for [`do_syntax_autocmd`] (`syn_recursive`,
+/// a function-local `static int` in the original).
+static SYN_RECURSIVE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// When `'syntax'` is set, load the syntax of that name
+/// (`do_syntax_autocmd`).
+///
+/// Only passes `force = true` to the `Syntax` autocmd event (via
+/// [`crate::autocmd::apply_autocmds`]) when the value changed or this
+/// isn't a recursive call, to avoid endless recurrence. Since
+/// `AUTOCMDS[EventT::Syntax]` is always empty today (nothing in this
+/// crate can register a real autocmd yet), `apply_autocmds` always
+/// takes its own already-documented bypass path regardless of `force`,
+/// so this call has no observable effect beyond the recursion-depth
+/// bookkeeping today, but becomes fully correct automatically the
+/// moment a future session adds real `Syntax` autocmd registration,
+/// with no changes needed here.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live [`BufT`].
+pub unsafe fn do_syntax_autocmd(buf: *mut BufT, value_changed: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let syn_recursive = unsafe { SYN_RECURSIVE.get_mut() };
+    *syn_recursive += 1;
+    let force = value_changed || *syn_recursive == 1;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).b_flags |= crate::buffer_defs::b_flags::BF_SYN_SET as i32 };
+    // SAFETY: forwarded from this function's own safety doc; a shared
+    // reference (rather than `&mut BufT` as just used above) since
+    // `apply_autocmds` only needs read access, and taking one avoids
+    // any mutable/shared-borrow conflict across the several field
+    // reads below.
+    let b = unsafe { &*buf };
+    let _ = crate::autocmd::apply_autocmds(
+        crate::autocmd_defs::EventT::Syntax,
+        b.b_p_syn.as_deref(),
+        b.b_fname.as_deref(),
+        force,
+        Some(b),
+    );
+
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { SYN_RECURSIVE.get_mut() } -= 1;
 }
 
 /// Get pointer to option variable, given the option and the buffer/
@@ -4607,6 +4666,43 @@ mod varp_tests {
         let flags = crate::option_defs::opt_flags::NFNAME | crate::option_defs::opt_flags::NDNAME;
         assert!(unsafe { check_illegal_path_names(b"a*b", flags) });
         assert!(!unsafe { check_illegal_path_names(b"clean", flags) });
+    }
+
+    // --- do_syntax_autocmd ---
+
+    #[test]
+    fn do_syntax_autocmd_sets_bf_syn_set_without_clobbering_other_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_flags: crate::buffer_defs::b_flags::BF_DUMMY as i32, ..Default::default() };
+        unsafe { do_syntax_autocmd(&mut buf as *mut BufT, true) };
+
+        assert_ne!(buf.b_flags & crate::buffer_defs::b_flags::BF_SYN_SET as i32, 0);
+        assert_ne!(
+            buf.b_flags & crate::buffer_defs::b_flags::BF_DUMMY as i32,
+            0,
+            "the pre-existing BF_DUMMY bit must survive the |="
+        );
+    }
+
+    #[test]
+    fn do_syntax_autocmd_leaves_syn_recursive_back_at_zero_after_a_normal_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { *SYN_RECURSIVE.get_mut() }, 0, "clean starting state");
+
+        let mut buf = BufT::default();
+        unsafe { do_syntax_autocmd(&mut buf as *mut BufT, false) };
+
+        assert_eq!(unsafe { *SYN_RECURSIVE.get_mut() }, 0, "increment/decrement net to zero");
+    }
+
+    #[test]
+    fn do_syntax_autocmd_works_with_no_name_or_fname_set() {
+        // buf.b_p_syn/b_fname both None - do_syntax_autocmd must not
+        // panic when passing them through as Option<&[u8]>::None.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT { b_p_syn: None, b_fname: None, ..Default::default() };
+        unsafe { do_syntax_autocmd(&mut buf as *mut BufT, true) };
+        assert_ne!(buf.b_flags & crate::buffer_defs::b_flags::BF_SYN_SET as i32, 0);
     }
 
     #[cfg(windows)]
