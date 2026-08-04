@@ -260,6 +260,13 @@
 //! script identifier via `userfunc.rs`'s already-real
 //! `get_scriptlocal_funcname`. Never fails.
 //!
+//! Also [`did_set_foldexpr`] - delegates to [`did_set_optexpr`] for
+//! the `<SID>`/`s:` expansion (discarding its return value, matching
+//! the original, which likewise ignores it since it never fails),
+//! then updates the folds when `'foldmethod'` is `"expr"`. Only that
+//! `foldmethodIsExpr`-gated `foldUpdateAll` call panics, the same
+//! shape as [`did_set_foldignore`].
+//!
 //! Also [`did_set_shellpipe_redir`] (`'shellpipe'`/`'shellredir'`) -
 //! a shell command template in which `%s` marks the file-name
 //! substitution point. At most ONE `%s` is allowed, `%%` is a
@@ -2030,6 +2037,40 @@ pub unsafe fn did_set_optexpr(args: &mut crate::option_defs::OptsetT) -> Option<
     if let Some(name) = unsafe { crate::eval::userfunc::get_scriptlocal_funcname(&val) } {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { *varp = Some(name) };
+    }
+
+    None
+}
+
+/// The `'foldexpr'` option is changed (`did_set_foldexpr`).
+///
+/// Delegates to [`did_set_optexpr`] for the `<SID>`/`s:` expansion
+/// (deliberately discarding its return value, matching the original,
+/// which likewise ignores it - `did_set_optexpr` never fails), then
+/// updates the folds when `'foldmethod'` is `"expr"`.
+///
+/// Only that `foldmethodIsExpr`-gated `foldUpdateAll` call panics
+/// (`fold.rs`'s own real fold-tree update machinery isn't translated
+/// yet), so every window whose `'foldmethod'` isn't `"expr"` is fully
+/// working - the same shape as [`did_set_foldignore`].
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` must point to a live, WRITABLE
+/// `Option<Vec<u8>>` (forwarded from [`did_set_optexpr`]).
+pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *const crate::buffer_defs::WinT;
+
+    // The original discards this return value; `did_set_optexpr`
+    // never fails, so nothing is lost.
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { did_set_optexpr(args) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::fold::foldmethod_is_expr(unsafe { &*win_ptr }) {
+        unimplemented!(
+            "did_set_foldexpr: foldUpdateAll - real fold-tree update machinery, not translated"
+        );
     }
 
     None
@@ -4826,6 +4867,56 @@ mod tests {
         let mut args = listflag_args(&mut val);
         assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
         assert_eq!(val, Some(b"s:MyFunc".to_vec()));
+    }
+
+    // ---- did_set_foldexpr ----
+
+    fn foldexpr_args(
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_foldexpr_is_a_no_op_for_a_non_expr_foldmethod() {
+        // Default 'foldmethod' is "manual", so the unimplemented!()
+        // fold-update branch is never reached.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
+        let mut args = foldexpr_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldexpr(&mut args) }, None);
+        assert_eq!(val, Some(b"MyFunc()".to_vec()));
+    }
+
+    #[test]
+    fn did_set_foldexpr_still_expands_a_script_local_prefix() {
+        // Delegation to did_set_optexpr must actually happen.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"s:MyFunc".to_vec());
+        let mut args = foldexpr_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldexpr(&mut args) }, None);
+        assert_eq!(val, Some(format!("<SNR>{sid}_MyFunc").into_bytes()));
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdateAll")]
+    fn did_set_foldexpr_panics_when_foldmethod_is_expr() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"expr".to_vec());
+        let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
+        let mut args = foldexpr_args(&mut win, &mut val);
+        let _ = unsafe { did_set_foldexpr(&mut args) };
     }
 
     // ---- did_set_shellpipe_redir ----
