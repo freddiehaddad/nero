@@ -110,6 +110,15 @@
 //! formatted `illegal_char` message is simplified to a static
 //! `e_invarg`, matching this module's own established policy.
 //!
+//! Also [`did_set_iconstring`]/[`did_set_titlestring`] (both real
+//! `did_set_*` callbacks now, built on a new private
+//! `did_set_titleiconstring` shared helper) - tractable once
+//! `GLOBALS.stl_syntax`/`check_stl_option` existed, plus
+//! `option.rs`'s own new `did_set_title` (a provable, always-taken
+//! no-op today: its real `maketitle()` call is gated behind
+//! `starting != NO_SCREEN`, and `starting` is only ever assigned by
+//! `main.c`'s not-yet-translated startup sequence).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1072,6 +1081,58 @@ pub fn check_stl_option(s: &[u8]) -> Option<&'static [u8]> {
         return Some(crate::gettext_defs::gettext_noop("E542: Unbalanced groups").as_bytes());
     }
     None
+}
+
+/// The `'iconstring'`/`'titlestring'` option is changed
+/// (`did_set_titleiconstring`).
+///
+/// Updates `GLOBALS.stl_syntax`'s `flagval` bit depending on whether
+/// the new value looks like `'statusline'` syntax (contains a `%`
+/// AND passes [`check_stl_option`]), then calls the already-real
+/// `crate::option::did_set_title` (a provable no-op today, see its
+/// own doc comment).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+unsafe fn did_set_titleiconstring(
+    args: &mut crate::option_defs::OptsetT,
+    flagval: i32,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    // NULL => statusline syntax
+    // SAFETY: a plain field read/write, no aliasing hazard (no other
+    // reference into `GLOBALS` is held across this call).
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if crate::strings::vim_strchr(val, i32::from(b'%')).is_some() && check_stl_option(val).is_none() {
+        globals.stl_syntax |= flagval;
+    } else {
+        globals.stl_syntax &= !flagval;
+    }
+    crate::option::did_set_title();
+
+    None
+}
+
+/// The `'iconstring'` option is changed (`did_set_iconstring`).
+///
+/// # Safety
+/// Forwarded from `did_set_titleiconstring`'s own safety doc.
+pub unsafe fn did_set_iconstring(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_titleiconstring(args, crate::globals::STL_IN_ICON) }
+}
+
+/// The `'titlestring'` option is changed (`did_set_titlestring`).
+///
+/// # Safety
+/// Forwarded from `did_set_titleiconstring`'s own safety doc.
+pub unsafe fn did_set_titlestring(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_titleiconstring(args, crate::globals::STL_IN_TITLE) }
 }
 
 #[cfg(test)]
@@ -2472,5 +2533,78 @@ mod tests {
             check_stl_option(b"%{%expr"),
             Some(crate::gettext_defs::gettext_noop("E540: Unclosed expression sequence").as_bytes())
         );
+    }
+
+    // ---- did_set_iconstring / did_set_titlestring ----
+
+    fn stl_syntax_test(value: &[u8], f: impl FnOnce(&mut crate::option_defs::OptsetT) -> Option<&'static [u8]>) -> i32 {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax;
+        unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax = 0;
+
+        let mut val: Option<Vec<u8>> = Some(value.to_vec());
+        let mut args = showbreak_args(&mut val);
+        let result = f(&mut args);
+        assert_eq!(result, None, "did_set_iconstring/titlestring must always return None");
+
+        let stl_syntax = unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax;
+        unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax = prev;
+        stl_syntax
+    }
+
+    #[test]
+    fn did_set_iconstring_sets_stl_in_icon_for_valid_statusline_syntax() {
+        let stl_syntax = stl_syntax_test(b"%f", |args| unsafe { did_set_iconstring(args) });
+        assert_eq!(stl_syntax, crate::globals::STL_IN_ICON);
+    }
+
+    #[test]
+    fn did_set_iconstring_clears_stl_in_icon_for_plain_text() {
+        let stl_syntax = stl_syntax_test(b"just plain text", |args| unsafe { did_set_iconstring(args) });
+        assert_eq!(stl_syntax, 0);
+    }
+
+    #[test]
+    fn did_set_iconstring_clears_stl_in_icon_for_invalid_statusline_syntax() {
+        // Contains a '%', but check_stl_option itself would reject it -
+        // the bit is cleared, but did_set_iconstring's own return
+        // value is still None (this function never reports an error;
+        // 'iconstring' need not look like statusline syntax at all).
+        let stl_syntax = stl_syntax_test(b"%z", |args| unsafe { did_set_iconstring(args) });
+        assert_eq!(stl_syntax, 0);
+    }
+
+    #[test]
+    fn did_set_titlestring_sets_stl_in_title_for_valid_statusline_syntax() {
+        let stl_syntax = stl_syntax_test(b"%f", |args| unsafe { did_set_titlestring(args) });
+        assert_eq!(stl_syntax, crate::globals::STL_IN_TITLE);
+    }
+
+    #[test]
+    fn did_set_titlestring_clears_stl_in_title_for_plain_text() {
+        let stl_syntax = stl_syntax_test(b"just plain text", |args| unsafe { did_set_titlestring(args) });
+        assert_eq!(stl_syntax, 0);
+    }
+
+    #[test]
+    fn did_set_iconstring_and_did_set_titlestring_use_independent_bits() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax;
+        unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax = 0;
+
+        let mut icon_val: Option<Vec<u8>> = Some(b"%f".to_vec());
+        let mut icon_args = showbreak_args(&mut icon_val);
+        assert_eq!(unsafe { did_set_iconstring(&mut icon_args) }, None);
+
+        // Setting 'titlestring' to plain text must not clear the
+        // already-set STL_IN_ICON bit - each option only ever touches
+        // its own bit.
+        let mut title_val: Option<Vec<u8>> = Some(b"plain".to_vec());
+        let mut title_args = showbreak_args(&mut title_val);
+        assert_eq!(unsafe { did_set_titlestring(&mut title_args) }, None);
+
+        let stl_syntax = unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax;
+        unsafe { crate::globals::GLOBALS.get_mut() }.stl_syntax = prev;
+        assert_eq!(stl_syntax, crate::globals::STL_IN_ICON);
     }
 }

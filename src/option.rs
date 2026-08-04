@@ -6480,5 +6480,65 @@ mod did_set_option_tests {
     }
 }
 
+/// Update the window title/icon after `'titlestring'`/`'iconstring'`/
+/// `'title'`/`'icon'` change (`did_set_title`).
+///
+/// The original's own real body (`maketitle()`, terminal-title
+/// escape-sequence output) is gated behind `starting != NO_SCREEN` -
+/// `starting` is only ever assigned by `main.c`'s startup sequence
+/// (confirmed via a direct search: `starting = NO_BUFFERS`/`= 0`, both
+/// in `main.c`, not translated at all in this crate), so
+/// `GLOBALS.starting` stays at its own default
+/// [`crate::globals::NO_SCREEN`] value forever today, making this
+/// guard provably, always false - a real, faithful "always-taken
+/// fast path" no-op, matching this crate's established `AUTOCMDS`/
+/// `ctx_restore`-style precedent (translates the REAL check, not a
+/// hardcoded shortcut, so this becomes correct automatically once
+/// `main.c`'s startup sequence is translated, with zero revision
+/// needed here).
+pub fn did_set_title() {
+    // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
+    let starting = unsafe { crate::globals::GLOBALS.get_mut() }.starting;
+    if starting != crate::globals::NO_SCREEN {
+        unimplemented!("did_set_title: maketitle() - terminal title rendering, not translated");
+    }
+}
+
+#[cfg(test)]
+mod did_set_title_tests {
+    use super::*;
+
+    #[test]
+    fn did_set_title_is_a_no_op_when_starting_is_no_screen() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.starting;
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = crate::globals::NO_SCREEN;
+
+        // Must not panic - the real `maketitle()` branch is
+        // unreachable given `starting`'s own real default.
+        did_set_title();
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = prev;
+    }
+
+    #[test]
+    fn did_set_title_panics_if_starting_were_ever_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.starting;
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = 0;
+
+        let result = std::panic::catch_unwind(did_set_title);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = prev;
+
+        let payload = result.expect_err("expected did_set_title to panic");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(msg.contains("maketitle"), "unexpected panic message: {msg}");
+    }
+}
 
 
