@@ -228,6 +228,16 @@
 //! handling) and [`did_set_commentstring`] (the value must be empty
 //! or contain a literal `%s` placeholder).
 //!
+//! Also [`did_set_comments`] - a real parser for the comma-separated
+//! `flags:string` list. It faithfully preserves a genuinely
+//! surprising control-flow quirk: the illegal-character `break` only
+//! leaves the INNER flag-scanning loop, so the following
+//! "missing colon"/"zero length string" checks still run and can
+//! OVERWRITE that error (`comments=z` reports `E525`, while
+//! `comments=zb:x` reports the illegal-character error). Both were
+//! verified against a real `nvim` binary and have dedicated
+//! regression tests - preserved, not "fixed".
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1768,6 +1778,96 @@ pub unsafe fn did_set_commentstring(args: &mut crate::option_defs::OptsetT) -> O
         );
     }
     None
+}
+
+/// Error message for a `'comments'` entry with no `:` separator
+/// (`E524`, an inline `N_()` literal in the original - kept
+/// file-local here, following this module's own `e_comma_required`
+/// precedent).
+#[allow(non_upper_case_globals)]
+const e_missing_colon: &str = crate::gettext_defs::gettext_noop("E524: Missing colon");
+
+/// Error message for a `'comments'` entry whose comment string is
+/// empty (`E525`, an inline `N_()` literal in the original - see
+/// [`e_missing_colon`]'s own note).
+#[allow(non_upper_case_globals)]
+const e_zero_length_string: &str = crate::gettext_defs::gettext_noop("E525: Zero length string");
+
+/// The `'comments'` option is changed (`did_set_comments`).
+///
+/// `'comments'` is a comma-separated list of `flags:string` parts.
+/// Each part's flag section may contain only `option_vars::COM_ALL`
+/// characters, ASCII digits, and `-`; it must be followed by a `:`
+/// and a non-empty comment string.
+///
+/// **Faithfully preserves a genuinely surprising control-flow quirk.**
+/// When the flag scan hits an illegal character it sets the error and
+/// `break`s - but that `break` only leaves the INNER loop, so the
+/// following "missing colon"/"zero length string" checks still run
+/// and can OVERWRITE the illegal-character error. Concretely,
+/// `comments=z` reports `E525` (not the illegal-character error),
+/// because after the break the scan advances past `z` onto the
+/// string's own end; whereas `comments=zb:x` does report the
+/// illegal-character error, because `b` follows. Both were verified
+/// directly against a real `nvim` binary before this was written, and
+/// each has its own dedicated regression test - this is preserved,
+/// not "fixed".
+///
+/// Per this module's established policy, the original's own
+/// dynamically-formatted `illegal_char` message is simplified to a
+/// static [`crate::errors::e_invarg`].
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_comments(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    let len = val.len();
+
+    let mut errmsg: Option<&'static [u8]> = None;
+    let mut s = 0usize;
+
+    while s < len {
+        // Flag characters, up to the ':' separator.
+        while s < len && val[s] != b':' {
+            let c = val[s];
+            if !crate::option_vars::COM_ALL.as_bytes().contains(&c)
+                && !crate::ascii_defs::ascii_isdigit(i32::from(c))
+                && c != b'-'
+            {
+                errmsg = Some(crate::errors::e_invarg.as_bytes());
+                break;
+            }
+            s += 1;
+        }
+
+        // The original's `if (*s++ == NUL)` reads the current byte and
+        // advances UNCONDITIONALLY, including on the illegal-character
+        // path above - see this function's own doc comment.
+        let at_end = s >= len;
+        s += 1;
+        if at_end {
+            errmsg = Some(e_missing_colon.as_bytes());
+        } else if s >= len || val[s] == b',' {
+            errmsg = Some(e_zero_length_string.as_bytes());
+        }
+        if errmsg.is_some() {
+            break;
+        }
+
+        // The comment string itself, honouring backslash escapes.
+        while s < len && val[s] != b',' {
+            if val[s] == b'\\' && s + 1 < len {
+                s += 1;
+            }
+            s += 1;
+        }
+        s = crate::option::skip_to_option_part(val, s);
+    }
+
+    errmsg
 }
 
 /// The `'breakat'` option is changed (`did_set_breakat`).
@@ -4128,6 +4228,78 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"%".to_vec());
         let mut args = listflag_args(&mut val);
         assert!(unsafe { did_set_commentstring(&mut args) }.is_some());
+    }
+
+    // ---- did_set_comments ----
+
+    fn comments_result(value: &[u8]) -> Option<&'static [u8]> {
+        let mut val: Option<Vec<u8>> = Some(value.to_vec());
+        let mut args = listflag_args(&mut val);
+        unsafe { did_set_comments(&mut args) }
+    }
+
+    #[test]
+    fn did_set_comments_accepts_a_simple_entry() {
+        assert_eq!(comments_result(b"b:x"), None);
+    }
+
+    #[test]
+    fn did_set_comments_accepts_the_real_multi_part_default_shape() {
+        assert_eq!(comments_result(b"s1:/*,mb:*,ex:*/"), None);
+    }
+
+    #[test]
+    fn did_set_comments_empty_is_valid() {
+        assert_eq!(comments_result(b""), None);
+    }
+
+    #[test]
+    fn did_set_comments_accepts_digits_and_minus_in_the_flag_section() {
+        assert_eq!(comments_result(b"-:x"), None);
+        assert_eq!(comments_result(b"3:x"), None);
+    }
+
+    #[test]
+    fn did_set_comments_missing_colon_is_e524() {
+        assert_eq!(comments_result(b"b"), Some(e_missing_colon.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_comments_empty_comment_string_is_e525() {
+        assert_eq!(comments_result(b":"), Some(e_zero_length_string.as_bytes()));
+        assert_eq!(comments_result(b"b:"), Some(e_zero_length_string.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_comments_lone_illegal_char_is_overwritten_by_e525() {
+        // THE QUIRK: the illegal-character `break` only leaves the
+        // inner loop, so the "zero length string" check still runs and
+        // overwrites the error. Verified against a real nvim binary:
+        // `comments=z` genuinely reports E525, not E539.
+        assert_eq!(comments_result(b"z"), Some(e_zero_length_string.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_comments_illegal_char_survives_when_a_flag_char_follows() {
+        // Same quirk, other side: with `b` following the illegal `z`,
+        // neither overwrite condition holds, so the illegal-character
+        // error survives. Verified against a real nvim binary
+        // (`comments=zb:x` reports E539).
+        assert_eq!(comments_result(b"zb:x"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_comments_handles_a_backslash_escaped_comma() {
+        // The comment-string scan skips a backslash-escaped byte, so
+        // an escaped comma does not split the entry.
+        assert_eq!(comments_result(b"b:x\\,y"), None);
+    }
+
+    #[test]
+    fn did_set_comments_trailing_backslash_does_not_run_past_the_end() {
+        // `s[1] != NUL` guards the escape skip in the original; here
+        // that is an explicit `s + 1 < len` bounds check.
+        assert_eq!(comments_result(b"b:x\\"), None);
     }
 
     // ---- did_set_mousescroll ----
