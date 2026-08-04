@@ -207,13 +207,12 @@
 //!   would be invoked for the other 188 - matching this crate's
 //!   established "translate the real, always-reachable fast path"
 //!   precedent. `set_option_sctx`/`check_illegal_path_names` are now
-//!   translated (see above), and so is `do_syntax_autocmd` (see
-//!   below) - still needed: the `varp == &curbuf->b_p_ft` FileType-
-//!   autocmd branch (inlined directly in `did_set_option` in current
-//!   neovim, not its own named function despite an earlier note here
-//!   calling it `do_filetype_autocmd` - would need re-verifying
-//!   against real `apply_autocmds`) and `do_spelllang_source` (blocked
-//!   on `source_runtime_vim_lua`, real file I/O/script sourcing - not
+//!   translated (see above), and so are `do_syntax_autocmd` (see
+//!   below) and `do_filetype_autocmd` (`autocmd.c`, NOT inlined into
+//!   `did_set_option` - a second, now-corrected stale note here had
+//!   claimed otherwise; see `crate::autocmd`'s own module doc). Still
+//!   needed: `do_spelllang_source` (blocked on
+//!   `source_runtime_vim_lua`, real file I/O/script sourcing - not
 //!   attempted).
 //! - `validate_option_value`/`validate_num_option`/
 //!   `check_num_option_bounds` are now FULLY translated (no remaining

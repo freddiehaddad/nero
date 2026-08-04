@@ -73,6 +73,19 @@
 //! the original's `event_names[]` string table (see its own doc
 //! comment for why this is a faithful, not approximate, translation).
 //!
+//! Also translated: [`do_filetype_autocmd`] - fires the `FileType`
+//! autocmd event, called from `option.c`'s (still-untranslated)
+//! `did_set_option` tail when `'filetype'` changes, and from
+//! `api/options.c` (also untranslated). Needed only already-real
+//! `GLOBALS.secure` and `BufT::b_did_filetype`/`b_p_ft`/`b_fname`,
+//! plus this module's own already-real [`apply_autocmds`]. Always
+//! returns `false` today (the identical `AUTOCMDS[EventT::FileType]`-
+//! always-empty bypass-path reasoning as every other function in this
+//! module), but its own recursion-depth bookkeeping (`FT_RECURSIVE`)
+//! and `secure`/`b_did_filetype` side effects are real and correct
+//! right now, becoming fully correct end-to-end the moment a future
+//! session adds real `FileType` autocmd registration.
+//!
 //! Deferred: everything else - `apply_autocmds_group`'s real
 //! autocmd-matching-and-execution body (needs pattern matching,
 //! `exec_autocmds`, script/function invocation via the not-yet-started
@@ -490,6 +503,55 @@ pub unsafe fn aucmd_defer_modified(buf: *mut BufT, _new_val: bool) {
     );
 }
 
+/// Recursion depth guard for [`do_filetype_autocmd`] (`ft_recursive`,
+/// a function-local `static int` in the original).
+static FT_RECURSIVE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Fire the `FileType` autocmd event for `buf` (`do_filetype_autocmd`).
+///
+/// Returns whether any `FileType` autocommands were executed - always
+/// `false` today, since `AUTOCMDS[EventT::FileType]` is always empty
+/// (nothing in this crate can register a real autocmd yet, matching
+/// [`apply_autocmds_group`]'s own established bypass-path precedent).
+/// Temporarily resets `GLOBALS.secure` to `0` for the duration of the
+/// call (the value of `'filetype'` has already been checked safe by
+/// this point in the original's own caller), sets
+/// `buf.b_did_filetype`, and fires the event via the already-real
+/// [`apply_autocmds`] - becomes fully correct automatically once a
+/// future session adds real `FileType` autocmd registration, with no
+/// changes needed here.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live [`BufT`].
+pub unsafe fn do_filetype_autocmd(buf: *mut BufT, force: bool) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ft_recursive = unsafe { FT_RECURSIVE.get_mut() };
+    if *ft_recursive > 0 && !force {
+        return false; // disallow recursion
+    }
+
+    // SAFETY: momentary read/write, no aliasing.
+    let secure_save = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+    // Reset the secure flag, since the value of 'filetype' has been
+    // checked to be safe.
+    unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+
+    *ft_recursive += 1;
+    let force_or_recursive = force || *ft_recursive == 1;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).b_did_filetype = true };
+    // SAFETY: forwarded from this function's own safety doc; a shared
+    // reference for the several field reads below.
+    let b = unsafe { &*buf };
+    let ret = apply_autocmds(EventT::FileType, b.b_p_ft.as_deref(), b.b_fname.as_deref(), force_or_recursive, Some(b));
+
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { FT_RECURSIVE.get_mut() } -= 1;
+    unsafe { crate::globals::GLOBALS.get_mut() }.secure = secure_save;
+    ret
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +925,79 @@ mod tests {
         // `String`.
         let msg = err.downcast_ref::<&str>().copied().unwrap_or("<non-string panic>");
         assert!(msg.contains("aucmd_defer_modified"), "unexpected panic message: {msg}");
+    }
+
+    // --- do_filetype_autocmd ---
+
+    fn reset_ft_recursive() {
+        unsafe { *FT_RECURSIVE.get_mut() = 0 };
+    }
+
+    #[test]
+    fn do_filetype_autocmd_sets_b_did_filetype_and_returns_false_via_the_bypass_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_ft_recursive();
+        let mut buf = BufT::default();
+        assert!(!buf.b_did_filetype);
+
+        let ret = unsafe { do_filetype_autocmd(&mut buf as *mut BufT, false) };
+
+        assert!(!ret, "AUTOCMDS[FileType] is always empty - the bypass path never executes anything");
+        assert!(buf.b_did_filetype);
+        reset_ft_recursive();
+    }
+
+    #[test]
+    fn do_filetype_autocmd_leaves_ft_recursive_back_at_zero_after_a_normal_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_ft_recursive();
+        let mut buf = BufT::default();
+        unsafe { do_filetype_autocmd(&mut buf as *mut BufT, false) };
+        assert_eq!(unsafe { *FT_RECURSIVE.get_mut() }, 0, "increment/decrement net to zero");
+    }
+
+    #[test]
+    fn do_filetype_autocmd_disallows_recursion_when_force_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Simulate being already inside a call (as if called
+        // recursively from within apply_autocmds' own execution).
+        unsafe { *FT_RECURSIVE.get_mut() = 1 };
+        let mut buf = BufT::default();
+
+        let ret = unsafe { do_filetype_autocmd(&mut buf as *mut BufT, false) };
+
+        assert!(!ret);
+        assert!(!buf.b_did_filetype, "the recursion guard returns before touching b_did_filetype");
+        assert_eq!(unsafe { *FT_RECURSIVE.get_mut() }, 1, "guard returns before any incr/decr");
+        reset_ft_recursive();
+    }
+
+    #[test]
+    fn do_filetype_autocmd_force_true_bypasses_the_recursion_guard() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *FT_RECURSIVE.get_mut() = 1 };
+        let mut buf = BufT::default();
+
+        unsafe { do_filetype_autocmd(&mut buf as *mut BufT, true) };
+
+        assert!(buf.b_did_filetype, "force=true bypasses the guard, reaching the real body");
+        assert_eq!(unsafe { *FT_RECURSIVE.get_mut() }, 1, "net zero: 1 -> 2 -> 1");
+        reset_ft_recursive();
+    }
+
+    #[test]
+    fn do_filetype_autocmd_restores_the_secure_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_ft_recursive();
+        let prev_secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+
+        let mut buf = BufT::default();
+        unsafe { do_filetype_autocmd(&mut buf as *mut BufT, false) };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.secure, 1, "restored after the call");
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = prev_secure;
+        reset_ft_recursive();
     }
 }
 
