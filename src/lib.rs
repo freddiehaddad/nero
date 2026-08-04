@@ -64,6 +64,7 @@ pub mod garray;
 pub mod garray_defs;
 pub mod gettext_defs;
 pub mod globals;
+pub mod grid;
 pub mod grid_defs;
 pub mod hashtab;
 pub mod hashtab_defs;
