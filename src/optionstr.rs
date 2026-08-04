@@ -238,6 +238,15 @@
 //! verified against a real `nvim` binary and have dedicated
 //! regression tests - preserved, not "fixed".
 //!
+//! Also [`did_set_breakindentopt`] - delegates to `indent.rs`'s
+//! already-real `briopt_check`, which was deliberately harvested
+//! ahead of this exact caller in an earlier pass. The original's own
+//! `varp == &win->w_p_briopt ? win : NULL` pointer comparison (which
+//! decides whether the parsed values are actually STORED into the
+//! window, or merely validated) is reproduced as a real
+//! `std::ptr::eq` against the window's own `wo_briopt` address. Its
+//! `redraw_all_later` call is omitted - pure redraw scheduling.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1777,6 +1786,50 @@ pub unsafe fn did_set_commentstring(args: &mut crate::option_defs::OptsetT) -> O
             .as_bytes(),
         );
     }
+    None
+}
+
+/// The `'breakindentopt'` option is changed (`did_set_breakindentopt`).
+///
+/// Delegates to `indent.rs`'s already-real `briopt_check`, which was
+/// deliberately harvested ahead of this exact caller in an earlier
+/// pass. `briopt_check`'s own `wp` parameter is `Some` only when the
+/// value being set IS the window-local `'breakindentopt'` storage
+/// (so the parsed values are actually stored into the window),
+/// matching the original's own `varp == &win->w_p_briopt ? win : NULL`
+/// pointer comparison - reproduced here as a real
+/// `std::ptr::eq` against the window's own `wo_briopt` address.
+///
+/// The original's own `redraw_all_later(UPD_NOT_VALID)` call for the
+/// `'list'` sub-option is omitted - pure redraw scheduling, matching
+/// this crate's established policy.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+pub unsafe fn did_set_breakindentopt(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    let varp = args.os_varp as *const Option<Vec<u8>>;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_window_local =
+        std::ptr::eq(varp, unsafe { std::ptr::addr_of!((*win_ptr).w_onebuf_opt.wo_briopt) });
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let val: Option<Vec<u8>> = unsafe { &*varp }.clone();
+
+    let ok = if is_window_local {
+        // SAFETY: forwarded from this function's own safety doc.
+        crate::indent::briopt_check(val.as_deref(), Some(unsafe { &mut *win_ptr }))
+    } else {
+        crate::indent::briopt_check(val.as_deref(), None)
+    };
+
+    if !ok {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
     None
 }
 
@@ -4300,6 +4353,82 @@ mod tests {
         // `s[1] != NUL` guards the escape skip in the original; here
         // that is an explicit `s + 1 < len` bounds check.
         assert_eq!(comments_result(b"b:x\\"), None);
+    }
+
+    // ---- did_set_breakindentopt ----
+
+    fn briopt_args(
+        win: &mut crate::buffer_defs::WinT,
+        window_local: bool,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        // When `window_local`, os_varp must literally BE the window's
+        // own wo_briopt storage, so did_set_breakindentopt's ptr::eq
+        // check matches (mirroring the original's own
+        // `varp == &win->w_p_briopt` comparison).
+        let varp = if window_local {
+            std::ptr::addr_of_mut!(win.w_onebuf_opt.wo_briopt) as *mut c_void
+        } else {
+            val as *mut Option<Vec<u8>> as *mut c_void
+        };
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: varp,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_breakindentopt_empty_is_valid() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = briopt_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_breakindentopt_accepts_real_sub_options() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"min:20,shift:2,sbr".to_vec());
+        let mut args = briopt_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_breakindentopt_rejects_an_unknown_sub_option() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = briopt_args(&mut win, false, &mut val);
+        assert_eq!(
+            unsafe { did_set_breakindentopt(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_breakindentopt_window_local_value_is_stored_into_the_window() {
+        // The ptr::eq branch: because os_varp IS the window's own
+        // wo_briopt storage, briopt_check gets Some(wp) and actually
+        // writes the parsed values into the window.
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_briopt = Some(b"min:7,shift:3".to_vec());
+        let mut unused: Option<Vec<u8>> = None;
+        let mut args = briopt_args(&mut win, true, &mut unused);
+        assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
+        assert_eq!(win.w_briopt_min, 7);
+        assert_eq!(win.w_briopt_shift, 3);
+    }
+
+    #[test]
+    fn did_set_breakindentopt_non_window_local_value_leaves_the_window_alone() {
+        // The NULL branch: os_varp is a disconnected value, so
+        // briopt_check gets None and only validates.
+        let mut win = crate::buffer_defs::WinT::default();
+        let before_min = win.w_briopt_min;
+        let mut val: Option<Vec<u8>> = Some(b"min:7,shift:3".to_vec());
+        let mut args = briopt_args(&mut win, false, &mut val);
+        assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
+        assert_eq!(win.w_briopt_min, before_min);
     }
 
     // ---- did_set_mousescroll ----

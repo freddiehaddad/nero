@@ -535,18 +535,17 @@ pub unsafe fn may_do_si() -> bool {
 /// `w_onebuf_opt.wo_briopt` value directly - matching the original's
 /// own "use `briopt` if given, else fall back to `wp->w_p_briopt`,
 /// else the empty string" 3-way fallback (used by
-/// `did_set_breakindentopt`, not translated, to validate a CANDIDATE
-/// value before it is actually stored).
+/// `did_set_breakindentopt` to validate a CANDIDATE value before it
+/// is actually stored).
 ///
 /// Returns `false` if the value contains an unrecognized entry (a
 /// real parse failure) - `wp`'s own fields are only updated on
 /// success, and only when `wp` is `Some`.
 ///
-/// No real caller is translated yet (`did_set_breakindentopt`, the
-/// `'breakindentopt'` option's own callback, not translated) -
-/// harvested ahead of it, matching this crate's established
-/// precedent for a small, self-contained function with no design
-/// freedom of its own.
+/// Its real caller `optionstr.rs`'s `did_set_breakindentopt` IS now
+/// translated (it passes `Some(wp)` only when the value being set is
+/// the window-local `'breakindentopt'` storage, matching the
+/// original's own `varp == &win->w_p_briopt ? win : NULL` check).
 #[must_use]
 pub fn briopt_check(briopt: Option<&[u8]>, wp: Option<&mut WinT>) -> bool {
     let mut bri_shift = 0i32;
