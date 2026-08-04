@@ -38,6 +38,13 @@
 
 use crate::buffer_defs::{TaggyT, WinT};
 
+/// Max. size of a line in the tags file (`LSIZE`, `tag.h`).
+///
+/// Also used as the per-entry scratch-buffer bound by
+/// `optionstr.rs`'s own `did_set_complete`, matching the original's
+/// own cross-file use of this same constant.
+pub const LSIZE: usize = 512;
+
 /// Add the details of a single tag-stack entry to `retdict`
 /// (`get_tag_details`).
 fn get_tag_details(tag: &TaggyT, retdict: &mut crate::eval::typval_defs::DictT) {

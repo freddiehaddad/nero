@@ -281,6 +281,20 @@
 //! `did_set_statusline`/`did_set_rulerformat` are therefore
 //! deliberately NOT exposed yet.
 //!
+//! Also [`did_set_complete`] - the comma-separated `'complete'`
+//! source list. Hand-traced and then verified case-by-case against a
+//! real `nvim` binary before being written, preserving three real
+//! behaviours rather than tidying them up: an escaped comma consumes
+//! BOTH bytes (so `"u\,"` parses as the bare entry `"u"` and is
+//! VALID, while the `escape` flag it sets makes only a SUBSEQUENT
+//! comma literal); spaces are not skipped during extraction, only
+//! after a completed entry; and an empty entry is a genuine error
+//! (a leading comma yields a NUL first byte, which `vim_strchr`'s own
+//! `c <= 0` guard never matches), though a DOUBLED comma is fine.
+//! Adds `LSIZE` to `tag.rs` (its real home, `tag.h`), matching the
+//! original's own cross-file use of that constant as the per-entry
+//! scratch-buffer bound.
+//!
 //! Also [`did_set_shellpipe_redir`] (`'shellpipe'`/`'shellredir'`) -
 //! a shell command template in which `%s` marks the file-name
 //! substitution point. At most ONE `%s` is allowed, `%%` is a
@@ -1844,6 +1858,133 @@ pub unsafe fn did_set_commentstring(args: &mut crate::option_defs::OptsetT) -> O
             .as_bytes(),
         );
     }
+    None
+}
+
+/// Error message for an entry with trailing junk after a flag
+/// character (`e_illegal_character_after_chr`, a file-local
+/// `static const char[]` in the original - kept file-local here too,
+/// following this module's own `e_comma_required` precedent).
+///
+/// The original formats the offending character into the message's
+/// own `%c` placeholder via `vim_snprintf`; this crate has no
+/// dynamic-message infrastructure wired up for this callback yet, so
+/// the placeholder is returned unformatted. The DISPLAYED text
+/// therefore differs from the original, but the message IDENTITY is
+/// preserved - which is what matters here, since it is genuinely
+/// distinguishable from the `e_invarg` returned by this same
+/// function's other failure path.
+#[allow(non_upper_case_globals)]
+const e_illegal_character_after_chr: &str =
+    crate::gettext_defs::gettext_noop("E535: Illegal character after <%c>");
+
+/// Valid `'complete'` flag characters (the original's own inline
+/// `".wbuksid]tUfFo"` literal).
+const CPT_ALL: &[u8] = b".wbuksid]tUfFo";
+
+/// `'complete'` flags that accept arbitrary trailing text (a file
+/// name, a pattern, a function name) rather than only an optional
+/// `^`-prefixed count - the original's own inline `"ksF"` literal.
+const CPT_TAKES_ARGUMENT: &[u8] = b"ksF";
+
+/// The `'complete'` option is changed (`did_set_complete`).
+///
+/// `'complete'` is a comma-separated list of one-character flags,
+/// each optionally followed by `^` plus a decimal count - except
+/// `k`/`s`/`F`, which instead take arbitrary trailing text (a file
+/// name, a pattern, or a function name).
+///
+/// Hand-traced against the original and then verified case-by-case
+/// against a real `nvim` binary before being written. Three real
+/// behaviours are preserved deliberately rather than tidied up:
+///
+/// - **An escaped comma consumes BOTH bytes.** `\,` contributes
+///   nothing at all to the extracted entry (the original advances
+///   past the `\` inside the `if`, then past the `,` via the loop's
+///   own increment), so `"u\,"` is VALID - it parses as the bare
+///   entry `"u"`. The `escape` flag it sets only makes a
+///   SUBSEQUENT comma literal, so `"u\,,x"` parses as `"u,x"` and is
+///   rejected. Both cases are covered by dedicated tests.
+/// - **Spaces are not skipped during extraction**, only after a
+///   completed entry - so `". , w"` extracts `". "` and is rejected
+///   for the trailing space.
+/// - **An empty entry is an error, not a no-op.** A leading comma
+///   yields an empty buffer, whose first byte the original reads as
+///   its own NUL terminator; `vim_strchr` has a deliberate
+///   `if (c <= 0) return NULL;` guard, so that NUL is reported as an
+///   illegal character (`",w"` is genuinely invalid). A DOUBLED comma
+///   is fine, because the end-of-entry skip loop consumes runs.
+///
+/// The `char_before != NUL` path returns `None` (success) when
+/// `args.os_errbuf` is absent, exactly as the original does - an
+/// asymmetry with its other failure path, which reports an error
+/// either way.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_complete(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    let len = val.len();
+
+    let mut char_before: u8 = 0;
+    let mut p = 0usize;
+
+    while p < len {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut escape = false;
+
+        // Extract one entry, handling escaped commas.
+        while p < len
+            && (val[p] != b',' || escape)
+            && buffer.len() < crate::tag::LSIZE - 1
+        {
+            if val[p] == b'\\' && val.get(p + 1) == Some(&b',') {
+                escape = true;
+                p += 1; // skip the backslash; the loop skips the comma
+            } else {
+                escape = false;
+                buffer.push(val[p]);
+            }
+            p += 1;
+        }
+
+        // An empty entry reads as the original's own NUL terminator,
+        // which `vim_strchr` never matches - see this function's own
+        // doc comment.
+        let first = buffer.first().copied().unwrap_or(0);
+        if !CPT_ALL.contains(&first) {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+
+        if !CPT_TAKES_ARGUMENT.contains(&first) && buffer.get(1).is_some_and(|&c| c != b'^') {
+            char_before = first;
+        } else if let Some(caret) = buffer.iter().position(|&c| c == b'^') {
+            // Everything after the first '^' must be a non-empty run
+            // of decimal digits.
+            let rest = &buffer[caret + 1..];
+            if rest.is_empty()
+                || !rest.iter().all(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c)))
+            {
+                char_before = b'^';
+            }
+        }
+
+        if char_before != 0 {
+            if args.os_errbuf.is_some() {
+                return Some(e_illegal_character_after_chr.as_bytes());
+            }
+            return None;
+        }
+
+        // Skip the entry separator plus any following spaces.
+        while p < len && (val[p] == b',' || val[p] == b' ') {
+            p += 1;
+        }
+    }
+
     None
 }
 
@@ -4830,6 +4971,167 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- did_set_complete ----
+
+    /// Runs `did_set_complete` with a real (non-None) `os_errbuf`, so
+    /// the `char_before` path reports its error rather than taking
+    /// the original's own errbuf-absent success shortcut.
+    fn complete_result(value: &[u8]) -> Option<&'static [u8]> {
+        let mut val: Option<Vec<u8>> = Some(value.to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            os_errbuf: Some(vec![0; 80]),
+            os_errbuflen: 80,
+            ..Default::default()
+        };
+        unsafe { did_set_complete(&mut args) }
+    }
+
+    fn illegal_after() -> Option<&'static [u8]> {
+        Some(e_illegal_character_after_chr.as_bytes())
+    }
+
+    #[test]
+    fn did_set_complete_accepts_the_real_default_value() {
+        assert_eq!(complete_result(b".,w,b,u,t"), None);
+    }
+
+    #[test]
+    fn did_set_complete_empty_is_valid() {
+        assert_eq!(complete_result(b""), None);
+    }
+
+    #[test]
+    fn did_set_complete_accepts_bare_argument_taking_flags() {
+        for v in [&b"k"[..], b"s", b"F"] {
+            assert_eq!(complete_result(v), None, "value {v:?}");
+        }
+    }
+
+    #[test]
+    fn did_set_complete_argument_taking_flags_accept_trailing_text() {
+        assert_eq!(complete_result(b"k/some/path"), None);
+        assert_eq!(complete_result(b"Fmyfunc"), None);
+    }
+
+    #[test]
+    fn did_set_complete_accepts_a_caret_count() {
+        assert_eq!(complete_result(b"u^5"), None);
+        assert_eq!(complete_result(b"w^3"), None);
+    }
+
+    #[test]
+    fn did_set_complete_rejects_a_caret_with_no_digits() {
+        assert_eq!(complete_result(b"u^"), illegal_after());
+        assert_eq!(complete_result(b".^"), illegal_after());
+    }
+
+    #[test]
+    fn did_set_complete_rejects_a_caret_followed_by_a_non_digit() {
+        assert_eq!(complete_result(b"u^x"), illegal_after());
+    }
+
+    #[test]
+    fn did_set_complete_rejects_trailing_text_after_a_plain_flag() {
+        assert_eq!(complete_result(b"ux"), illegal_after());
+    }
+
+    #[test]
+    fn did_set_complete_rejects_an_unknown_flag() {
+        assert_eq!(complete_result(b"z"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_complete_leading_comma_is_an_illegal_empty_entry() {
+        // The empty entry's first byte reads as the original's own NUL
+        // terminator, which vim_strchr's `c <= 0` guard never matches.
+        assert_eq!(complete_result(b",w"), Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_complete_doubled_comma_is_fine() {
+        // Unlike a LEADING comma: the end-of-entry skip loop consumes
+        // runs of commas.
+        assert_eq!(complete_result(b".,,w"), None);
+    }
+
+    #[test]
+    fn did_set_complete_a_space_is_not_skipped_during_extraction() {
+        // ". , w" extracts ". " (with the trailing space), which is
+        // then rejected as trailing text after a plain flag.
+        assert_eq!(complete_result(b". , w"), illegal_after());
+    }
+
+    #[test]
+    fn did_set_complete_escaped_comma_consumes_both_bytes() {
+        // THE QUIRK: `\,` contributes nothing at all, so this parses
+        // as the bare entry "u" and is VALID. Verified against a real
+        // nvim binary.
+        assert_eq!(complete_result(b"u\\,"), None);
+        assert_eq!(complete_result(b"k\\,x"), None);
+    }
+
+    #[test]
+    fn did_set_complete_escape_flag_makes_only_a_following_comma_literal() {
+        // Same quirk, other side: after `\,` is consumed, the escape
+        // flag makes the NEXT comma literal, so this parses as "u,x"
+        // and is rejected. Verified against a real nvim binary.
+        assert_eq!(complete_result(b"u\\,,x"), illegal_after());
+    }
+
+    #[test]
+    fn did_set_complete_without_an_errbuf_the_char_before_path_succeeds() {
+        // The original's own asymmetry: this failure path returns
+        // success when os_errbuf is absent, while the unknown-flag
+        // path reports an error either way.
+        let mut val: Option<Vec<u8>> = Some(b"ux".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            os_errbuf: None,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_complete(&mut args) }, None);
+
+        // ...whereas the unknown-flag path still errors with no errbuf.
+        let mut bad: Option<Vec<u8>> = Some(b"z".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: &mut bad as *mut Option<Vec<u8>> as *mut c_void,
+            os_errbuf: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_complete(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_complete_truncates_an_entry_at_the_lsize_bound() {
+        // An entry is truncated at LSIZE-1 bytes, matching the
+        // original's own `buf_ptr < buffer + LSIZE - 1` guard. The
+        // parse position is left mid-entry, so the untruncated TAIL is
+        // then re-parsed as a fresh entry - which starts with 'x' and
+        // is therefore illegal. All three boundary cases below were
+        // verified against a real nvim binary.
+        let long_k = |n: usize| {
+            let mut v = vec![b'k'];
+            v.extend(std::iter::repeat_n(b'x', n));
+            v
+        };
+
+        // "k" + 510 x's == exactly LSIZE-1 bytes: fits, nothing left.
+        assert_eq!(complete_result(&long_k(crate::tag::LSIZE - 2)), None);
+        // One byte over: the tail re-parses as an illegal entry.
+        assert_eq!(
+            complete_result(&long_k(crate::tag::LSIZE - 1)),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(
+            complete_result(&long_k(crate::tag::LSIZE * 2)),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
     }
 
     // ---- did_set_colorcolumn ----
