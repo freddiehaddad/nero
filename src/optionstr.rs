@@ -183,6 +183,19 @@
 //! character literals having no `SHM_*` constant, transcribed exactly
 //! as-is), `'cpoptions'` against `option_vars::CPO_VI`.
 //!
+//! Also [`did_set_breakat`] - rebuilds `OPTION_VARS.breakat_flags`
+//! (a 256-entry "is this byte a line-break character" lookup table)
+//! from `'breakat'`, with no validation at all. Reads the GLOBAL
+//! `p_breakat` directly rather than `args.os_varp`, exactly as the
+//! original does. Note this does NOT yet change
+//! `charset::vim_isbreak`, which still uses its own fixed
+//! DEFAULT-`'breakat'` table: nothing calls `did_set_breakat` at
+//! startup in this crate yet (its real caller is the
+//! `opt_did_set_cb` dispatch during `option.c`'s own option
+//! initialization, and no `OPTIONS` entry has a populated
+//! `opt_did_set_cb` yet), so the table would still be all-zero at
+//! every real read - wiring that up is a separate, later change.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1512,6 +1525,43 @@ pub unsafe fn did_set_cpoptions(args: &mut crate::option_defs::OptsetT) -> Optio
     let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
     let val: &[u8] = varp.as_deref().unwrap_or(&[]);
     did_set_option_listflag(val, crate::option_vars::CPO_VI.as_bytes())
+}
+
+/// The `'breakat'` option is changed (`did_set_breakat`).
+///
+/// Rebuilds `option_vars::OPTION_VARS.breakat_flags` - a 256-entry
+/// "is this byte a line-break character" lookup table - by clearing
+/// it and then setting one entry per byte of `'breakat'`. No
+/// validation at all: any value is accepted.
+///
+/// Reads the GLOBAL `OPTION_VARS.p_breakat` directly rather than
+/// `args.os_varp`, exactly as the original does. For a real
+/// invocation those are the same storage (`'breakat'` is global-only),
+/// but a test that only sets a disconnected local value would
+/// silently read stale global state - so this function's own tests
+/// set `OPTION_VARS.p_breakat` itself.
+///
+/// Note this does NOT yet change [`crate::charset::vim_isbreak`],
+/// which still uses its own fixed DEFAULT-`'breakat'` table: nothing
+/// calls `did_set_breakat` at startup in this crate yet (the real
+/// caller is the `opt_did_set_cb` dispatch in `option.c`'s option
+/// initialization, and no `OPTIONS` entry has a populated
+/// `opt_did_set_cb` yet), so `breakat_flags` would still be all-zero
+/// at every real read. Wiring that up is a separate, later change.
+pub fn did_set_breakat() -> Option<&'static [u8]> {
+    // SAFETY: a plain field read/write on `OPTION_VARS`, no aliasing
+    // hazard (no other reference into it is held across this call).
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+
+    opts.breakat_flags = [0; 256];
+
+    if let Some(breakat) = opts.p_breakat.clone() {
+        for &b in &breakat {
+            opts.breakat_flags[b as usize] = 1;
+        }
+    }
+
+    None
 }
 
 /// The `'foldignore'` option is changed (`did_set_foldignore`).
@@ -3267,6 +3317,107 @@ mod tests {
             unsafe { did_set_cpoptions(&mut args) },
             Some(crate::errors::e_invarg.as_bytes())
         );
+    }
+
+    // ---- did_set_breakat ----
+
+    fn set_p_breakat(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_breakat.clone();
+        opts.p_breakat = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    /// Restores both the option string and the derived flags table,
+    /// so these tests can't leak state into any other test.
+    fn restore_breakat(prev_val: Option<Vec<u8>>, prev_flags: [u8; 256]) {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_breakat = prev_val;
+        opts.breakat_flags = prev_flags;
+    }
+
+    #[test]
+    fn did_set_breakat_sets_one_flag_per_character_of_the_real_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        let prev = set_p_breakat(Some(b" \t!@*-+;:,./?"));
+
+        assert_eq!(did_set_breakat(), None);
+
+        let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        for b in *b" \t!@*-+;:,./?" {
+            assert_eq!(flags[b as usize], 1, "byte {b:?} should be a break character");
+        }
+        // A character genuinely absent from the default value.
+        assert_eq!(flags[b'a' as usize], 0);
+
+        restore_breakat(prev, prev_flags);
+    }
+
+    #[test]
+    fn did_set_breakat_clears_previously_set_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        let prev = set_p_breakat(Some(b"abc"));
+        assert_eq!(did_set_breakat(), None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags[b'a' as usize], 1);
+
+        // Setting a disjoint value must clear every previous flag -
+        // the original rebuilds the whole table from scratch.
+        set_p_breakat(Some(b"xyz"));
+        assert_eq!(did_set_breakat(), None);
+        let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        assert_eq!(flags[b'a' as usize], 0);
+        assert_eq!(flags[b'x' as usize], 1);
+
+        restore_breakat(prev, prev_flags);
+    }
+
+    #[test]
+    fn did_set_breakat_empty_value_clears_every_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        let prev = set_p_breakat(Some(b"abc"));
+        assert_eq!(did_set_breakat(), None);
+
+        set_p_breakat(Some(b""));
+        assert_eq!(did_set_breakat(), None);
+        assert!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags.iter().all(|&f| f == 0));
+
+        restore_breakat(prev, prev_flags);
+    }
+
+    #[test]
+    fn did_set_breakat_none_value_clears_every_flag() {
+        // Matches the original's own `if (p_breakat != NULL)` guard:
+        // an absent value leaves the freshly-cleared table untouched.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        let prev = set_p_breakat(Some(b"abc"));
+        assert_eq!(did_set_breakat(), None);
+
+        set_p_breakat(None);
+        assert_eq!(did_set_breakat(), None);
+        assert!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags.iter().all(|&f| f == 0));
+
+        restore_breakat(prev, prev_flags);
+    }
+
+    #[test]
+    fn did_set_breakat_handles_high_bytes_without_panicking() {
+        // Every byte value is a valid index into the 256-entry table.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        let prev = set_p_breakat(Some(&[0x00, 0x7F, 0x80, 0xFF]));
+
+        assert_eq!(did_set_breakat(), None);
+
+        let flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.breakat_flags;
+        for b in [0x00u8, 0x7F, 0x80, 0xFF] {
+            assert_eq!(flags[b as usize], 1, "byte {b:#04x} should be set");
+        }
+
+        restore_breakat(prev, prev_flags);
     }
 
     // ---- did_set_mousescroll ----

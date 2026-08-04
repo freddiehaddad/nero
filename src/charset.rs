@@ -622,8 +622,7 @@ pub fn vim_isprintc(c: i32) -> bool {
 /// Characters in the DEFAULT `'breakat'` value (`" \t!@*-+;:,./?"`) -
 /// see [`vim_isbreak`]'s own doc comment for why this is a fixed
 /// default-value table rather than the real, `'breakat'`-customizable
-/// `breakat_flags[256]` (needs `optionstr.c`'s `did_set_breakat`
-/// option-string parsing, not yet translated).
+/// `breakat_flags[256]`.
 const DEFAULT_BREAKAT: &[u8] = b" \t!@*-+;:,./?";
 
 /// Check if `c` is one of the characters in `'breakat'` (`vim_isbreak`).
@@ -631,12 +630,20 @@ const DEFAULT_BREAKAT: &[u8] = b" \t!@*-+;:,./?";
 /// characters, matching the original's own documented limitation.
 ///
 /// Uses the DEFAULT `'breakat'` value (`" \t!@*-+;:,./?"`) rather than
-/// the real, possibly-customized `breakat_flags[256]` table (needs
-/// `optionstr.c`'s `did_set_breakat`, not yet translated) - correct
-/// for every real session that hasn't customized `'breakat'` (the
-/// common case), documented as a simplification rather than pretending
-/// the general mechanism exists (matching [`vim_isprintc`]'s own
-/// precedent exactly).
+/// the real, possibly-customized `OPTION_VARS.breakat_flags[256]`
+/// table - correct for every real session that hasn't customized
+/// `'breakat'` (the common case), documented as a simplification
+/// rather than pretending the general mechanism exists (matching
+/// [`vim_isprintc`]'s own precedent exactly).
+///
+/// `optionstr.rs`'s own `did_set_breakat` - the function that
+/// rebuilds that table - IS now translated, but nothing calls it at
+/// startup yet (its real caller is the `opt_did_set_cb` dispatch
+/// during `option.c`'s own option initialization, and no `OPTIONS`
+/// entry has a populated `opt_did_set_cb` yet), so `breakat_flags`
+/// would still be all-zero at every real read here. Switching this
+/// function over to it is a separate, later change that has to land
+/// together with that startup wiring.
 #[must_use]
 pub fn vim_isbreak(c: i32) -> bool {
     u8::try_from(c).is_ok_and(|b| DEFAULT_BREAKAT.contains(&b))
