@@ -214,6 +214,13 @@
 //! before returning the error - preserved here rather than leaving
 //! the rejected value's own flags in place.
 //!
+//! Also [`did_set_spelloptions`] - unlike this file's other
+//! local-or-global callbacks (which pick ONE storage slot), this one
+//! writes BOTH slots from the SAME `args.os_newval` string, each
+//! guarded by its own inverted flag check (the global `spo_flags`
+//! unless `OPT_LOCAL`, the window's own `w_s.b_p_spo_flags` unless
+//! `OPT_GLOBAL`), so a plain `:set` updates both.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1673,6 +1680,46 @@ unsafe fn bkc_store(buf_ptr: *mut crate::buffer_defs::BufT, use_local: bool, val
     } else {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags = value;
     }
+}
+
+/// The `'spelloptions'` option is changed (`did_set_spelloptions`).
+///
+/// Unlike this file's other local-or-global callbacks (which pick ONE
+/// storage slot), this one writes BOTH slots from the SAME
+/// `args.os_newval` string, each guarded by its own inverted flag
+/// check: the global `OPTION_VARS.spo_flags` unless `OPT_LOCAL`, and
+/// the window's own `w_s.b_p_spo_flags` unless `OPT_GLOBAL`. A plain
+/// `:set` (neither flag) therefore updates both.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// whose own `w_s` is also a valid, non-null pointer to a live
+/// `SynblockT` - but only when `OPT_GLOBAL` is NOT set (the original
+/// likewise only dereferences `win->w_s` on that branch).
+pub unsafe fn did_set_spelloptions(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let opt_flags = args.os_flags as u32;
+    let val: &[u8] = match &args.os_newval {
+        crate::option_defs::OptVal::String(s) => s,
+        _ => &[],
+    };
+
+    if opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL == 0 {
+        let Some(flags) = opt_strings_flags(val, crate::option_vars::OPT_SPO_VALUES, true) else {
+            return Some(crate::errors::e_invarg.as_bytes());
+        };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags = flags;
+    }
+
+    if opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+        let Some(flags) = opt_strings_flags(val, crate::option_vars::OPT_SPO_VALUES, true) else {
+            return Some(crate::errors::e_invarg.as_bytes());
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let synblock = unsafe { &mut *(*(args.os_win as *mut crate::buffer_defs::WinT)).w_s };
+        synblock.b_p_spo_flags = flags;
+    }
+
+    None
 }
 
 /// The `'breakat'` option is changed (`did_set_breakat`).
@@ -3821,6 +3868,127 @@ mod tests {
             assert_eq!(buf.b_bkc_flags, crate::option_vars::opt_bkc_flag::NO);
             // The global flags must be untouched by an OPT_LOCAL call.
             assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.bkc_flags, 0);
+        });
+    }
+
+    // ---- did_set_spelloptions ----
+
+    /// Saves/restores the global `spo_flags` around a test body.
+    fn with_spo_flags<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags = 0;
+        let result = f();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags = prev;
+        result
+    }
+
+    fn spo_args(
+        win: &mut crate::buffer_defs::WinT,
+        flags: u32,
+        newval: &[u8],
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_flags: flags as i32,
+            os_newval: crate::option_defs::OptVal::String(newval.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_spelloptions_plain_set_writes_both_slots() {
+        with_spo_flags(|| {
+            let mut synblock = crate::buffer_defs::SynblockT::default();
+            let mut win = crate::buffer_defs::WinT {
+                w_s: &mut synblock as *mut crate::buffer_defs::SynblockT,
+                ..Default::default()
+            };
+            // opt_flags == 0: neither OPT_LOCAL nor OPT_GLOBAL, so
+            // both inverted guards pass and both slots are written.
+            let mut args = spo_args(&mut win, 0, b"camel");
+            assert_eq!(unsafe { did_set_spelloptions(&mut args) }, None);
+
+            // "camel" is index 0 in OPT_SPO_VALUES.
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags, 0x01);
+            assert_eq!(synblock.b_p_spo_flags, 0x01);
+        });
+    }
+
+    #[test]
+    fn did_set_spelloptions_opt_local_skips_the_global_slot() {
+        with_spo_flags(|| {
+            let mut synblock = crate::buffer_defs::SynblockT::default();
+            let mut win = crate::buffer_defs::WinT {
+                w_s: &mut synblock as *mut crate::buffer_defs::SynblockT,
+                ..Default::default()
+            };
+            let mut args =
+                spo_args(&mut win, crate::option_defs::opt_set_flags::OPT_LOCAL, b"camel");
+            assert_eq!(unsafe { did_set_spelloptions(&mut args) }, None);
+
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags, 0);
+            assert_eq!(synblock.b_p_spo_flags, 0x01);
+        });
+    }
+
+    #[test]
+    fn did_set_spelloptions_opt_global_skips_the_local_slot() {
+        with_spo_flags(|| {
+            // OPT_GLOBAL means `win.w_s` is never dereferenced, so a
+            // null w_s is safe here - matching the original, which
+            // likewise only touches win->w_s on the non-OPT_GLOBAL
+            // branch.
+            let mut win = crate::buffer_defs::WinT::default();
+            let mut args =
+                spo_args(&mut win, crate::option_defs::opt_set_flags::OPT_GLOBAL, b"camel");
+            assert_eq!(unsafe { did_set_spelloptions(&mut args) }, None);
+
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.spo_flags, 0x01);
+        });
+    }
+
+    #[test]
+    fn did_set_spelloptions_accepts_both_values_together() {
+        with_spo_flags(|| {
+            let mut synblock = crate::buffer_defs::SynblockT::default();
+            let mut win = crate::buffer_defs::WinT {
+                w_s: &mut synblock as *mut crate::buffer_defs::SynblockT,
+                ..Default::default()
+            };
+            let mut args = spo_args(&mut win, 0, b"camel,noplainbuffer");
+            assert_eq!(unsafe { did_set_spelloptions(&mut args) }, None);
+            assert_eq!(synblock.b_p_spo_flags, 0x03);
+        });
+    }
+
+    #[test]
+    fn did_set_spelloptions_empty_is_valid() {
+        with_spo_flags(|| {
+            let mut synblock = crate::buffer_defs::SynblockT::default();
+            let mut win = crate::buffer_defs::WinT {
+                w_s: &mut synblock as *mut crate::buffer_defs::SynblockT,
+                ..Default::default()
+            };
+            let mut args = spo_args(&mut win, 0, b"");
+            assert_eq!(unsafe { did_set_spelloptions(&mut args) }, None);
+            assert_eq!(synblock.b_p_spo_flags, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_spelloptions_rejects_an_unknown_value() {
+        with_spo_flags(|| {
+            let mut synblock = crate::buffer_defs::SynblockT::default();
+            let mut win = crate::buffer_defs::WinT {
+                w_s: &mut synblock as *mut crate::buffer_defs::SynblockT,
+                ..Default::default()
+            };
+            let mut args = spo_args(&mut win, 0, b"bogus");
+            assert_eq!(
+                unsafe { did_set_spelloptions(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
         });
     }
 
