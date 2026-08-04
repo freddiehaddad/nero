@@ -175,6 +175,14 @@
 //! path at all - deferred until `fold.rs`'s own real fold-tree
 //! update machinery lands.
 //!
+//! Also [`did_set_shortmess`] and [`did_set_cpoptions`] - two more
+//! thin `did_set_option_listflag` wrappers. `'shortmess'` validates
+//! against a new file-local `SHM_ALL` table (built from
+//! `option_vars.rs`'s own `shm` module, following this module's own
+//! `STL_ALL` precedent; the original's own array ends with 4 bare
+//! character literals having no `SHM_*` constant, transcribed exactly
+//! as-is), `'cpoptions'` against `option_vars::CPO_VI`.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1441,6 +1449,70 @@ pub unsafe fn did_set_completeslash(args: &mut crate::option_defs::OptsetT) -> O
 /// `e_cannot_have_negative_or_zero_number_of_quickfix`).
 #[allow(non_upper_case_globals)]
 const e_comma_required: &str = crate::gettext_defs::gettext_noop("E536: Comma required");
+
+/// All `'shortmess'` flag characters (`SHM_ALL`, a file-local
+/// `static char[]` in the original - kept file-local here too,
+/// matching the original's own scoping, following this module's own
+/// `STL_ALL` precedent).
+///
+/// The original's own array ends with 4 bare character literals
+/// (`'n'`, `'f'`, `'x'`, `'i'`) that have no `SHM_*` constant of
+/// their own - transcribed exactly as-is here, since inventing
+/// constants for them would drift from the original.
+const SHM_ALL: &[u8] = &[
+    crate::option_vars::shm::RO,
+    crate::option_vars::shm::MOD,
+    crate::option_vars::shm::LINES,
+    crate::option_vars::shm::WRI,
+    crate::option_vars::shm::ABBREVIATIONS,
+    crate::option_vars::shm::WRITE,
+    crate::option_vars::shm::TRUNC,
+    crate::option_vars::shm::TRUNCALL,
+    crate::option_vars::shm::OVER,
+    crate::option_vars::shm::OVERALL,
+    crate::option_vars::shm::SEARCH,
+    crate::option_vars::shm::ATTENTION,
+    crate::option_vars::shm::INTRO,
+    crate::option_vars::shm::COMPLETIONMENU,
+    crate::option_vars::shm::COMPLETIONSCAN,
+    crate::option_vars::shm::RECORDING,
+    crate::option_vars::shm::FILEINFO,
+    crate::option_vars::shm::SEARCHCOUNT,
+    crate::option_vars::shm::UNDO,
+    // Bare literals in the original's own array, with no SHM_*
+    // constant of their own.
+    b'n',
+    b'f',
+    b'x',
+    b'i',
+];
+
+/// The `'shortmess'` option is changed (`did_set_shortmess`).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_shortmess(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    did_set_option_listflag(val, SHM_ALL)
+}
+
+/// The `'cpoptions'` option is changed (`did_set_cpoptions`).
+///
+/// Validates against `option_vars::CPO_VI` - the full set of Vi
+/// compatibility flags, which is also the option's own default value.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_cpoptions(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    did_set_option_listflag(val, crate::option_vars::CPO_VI.as_bytes())
+}
 
 /// The `'foldignore'` option is changed (`did_set_foldignore`).
 ///
@@ -3115,6 +3187,86 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"nocomma".to_vec());
         let mut args = fold_args(&mut win, &mut val);
         assert_eq!(unsafe { did_set_foldmarker(&mut args) }, Some(e_comma_required.as_bytes()));
+    }
+
+    // ---- did_set_shortmess / did_set_cpoptions ----
+
+    fn listflag_args(val: &mut Option<Vec<u8>>) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT { os_varp: val as *mut Option<Vec<u8>> as *mut c_void, ..Default::default() }
+    }
+
+    #[test]
+    fn did_set_shortmess_accepts_every_character_in_shm_all() {
+        let mut val: Option<Vec<u8>> = Some(SHM_ALL.to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_shortmess(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_shortmess_accepts_the_real_default_value() {
+        let mut val: Option<Vec<u8>> = Some(b"filnxtToOCF".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_shortmess(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_shortmess_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_shortmess(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_shortmess_rejects_an_unknown_flag_character() {
+        // 'z' is genuinely absent from SHM_ALL.
+        let mut val: Option<Vec<u8>> = Some(b"az".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_shortmess(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn shm_all_contains_the_four_bare_literals_from_the_original() {
+        // The original's own SHM_ALL array ends with 'n', 'f', 'x',
+        // 'i' as bare character literals with no SHM_* constant.
+        for c in *b"nfxi" {
+            assert!(SHM_ALL.contains(&c), "SHM_ALL missing {}", c as char);
+        }
+    }
+
+    #[test]
+    fn did_set_cpoptions_accepts_the_full_vi_default() {
+        let mut val: Option<Vec<u8>> = Some(crate::option_vars::CPO_VI.as_bytes().to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_cpoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_cpoptions_accepts_the_vim_subset() {
+        // CPO_VIM's own characters are all drawn from CPO_VI.
+        let mut val: Option<Vec<u8>> = Some(crate::option_vars::CPO_VIM.as_bytes().to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_cpoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_cpoptions_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_cpoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_cpoptions_rejects_an_unknown_flag_character() {
+        // 'g' is genuinely absent from CPO_VI.
+        let mut val: Option<Vec<u8>> = Some(b"ag".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_cpoptions(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
     }
 
     // ---- did_set_mousescroll ----
