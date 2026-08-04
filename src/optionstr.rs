@@ -59,7 +59,13 @@
 //! `'comments'` default and resets the prompt-start position for
 //! `buftype=prompt`, and flags `w_redr_status` - its own 2 real
 //! redraw-SCHEDULING calls, `redraw_later`/`redraw_titles`, are
-//! omitted, matching this crate's established policy).
+//! omitted, matching this crate's established policy). Also
+//! [`did_set_lispoptions`] (a fixed-shape string validator) and
+//! [`did_set_matchpairs`] (a comma-separated `X:Y` character-pair
+//! validator, hand-traced against the original's own for-loop -
+//! whose OWN increment clause consumes the comma between pairs, on
+//! top of the manual per-character advancement the loop body already
+//! does - see its own doc comment).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -490,6 +496,72 @@ pub unsafe fn did_set_buftype(args: &mut crate::option_defs::OptsetT) -> Option<
     buf.b_help = bt_first == b'h';
     // Real redraw scheduling (`redraw_titles`) is omitted.
 
+    None
+}
+
+/// The `'lispoptions'` option is changed (`did_set_lispoptions`).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the whole
+/// call.
+pub unsafe fn did_set_lispoptions(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    if val.is_empty() || val == b"expr:0" || val == b"expr:1" {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
+/// The `'matchpairs'` option is changed (`did_set_matchpairs`).
+///
+/// Validates a comma-separated list of `X:Y` character pairs (e.g.
+/// `"(:)"`), where `X`/`Y` may each be a multi-byte (composing-aware)
+/// character. Hand-traced against the original's own for-loop, whose
+/// OWN increment clause (`p++`, running after every non-`break`/
+/// `return` iteration) consumes the comma separator between pairs, on
+/// top of the manual advancement the loop body itself already does
+/// for `X`/the literal `:`/`Y` - traced against `"(:),{:}"`
+/// (2 real pairs) before writing any test.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the whole
+/// call. Touches `OPTION_VARS` (via `utfc_ptr2len`).
+pub unsafe fn did_set_matchpairs(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    let mut i = 0usize;
+    while i < val.len() {
+        // Advance past the first character ("X").
+        // SAFETY: forwarded from this function's own safety doc.
+        i += unsafe { crate::mbyte::utfc_ptr2len(&val[i..]) } as usize;
+
+        let mut x2: i32 = -1;
+        if let Some(&b) = val.get(i) {
+            x2 = i32::from(b);
+            i += 1;
+        }
+
+        let mut x3: i32 = -1;
+        if i < val.len() {
+            x3 = crate::mbyte::utf_ptr2char(&val[i..]);
+            // SAFETY: forwarded from this function's own safety doc.
+            i += unsafe { crate::mbyte::utfc_ptr2len(&val[i..]) } as usize;
+        }
+
+        let next = val.get(i).copied();
+        if x2 != i32::from(b':') || x3 == -1 || (next.is_some() && next != Some(b',')) {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        if next.is_none() {
+            break;
+        }
+        // The original for-loop's own increment - consumes the comma.
+        i += 1;
+    }
     None
 }
 
@@ -1205,5 +1277,102 @@ mod tests {
         assert!(!win.w_redr_status);
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    // ---- did_set_lispoptions ----
+
+    fn set_varp_args(val: &mut Option<Vec<u8>>) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT { os_varp: val as *mut Option<Vec<u8>> as *mut c_void, ..Default::default() }
+    }
+
+    #[test]
+    fn did_set_lispoptions_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_lispoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_lispoptions_accepts_expr_0_and_expr_1() {
+        let mut val: Option<Vec<u8>> = Some(b"expr:0".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_lispoptions(&mut args) }, None);
+
+        let mut val2: Option<Vec<u8>> = Some(b"expr:1".to_vec());
+        let mut args2 = set_varp_args(&mut val2);
+        assert_eq!(unsafe { did_set_lispoptions(&mut args2) }, None);
+    }
+
+    #[test]
+    fn did_set_lispoptions_rejects_anything_else() {
+        let mut val: Option<Vec<u8>> = Some(b"expr:2".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_lispoptions(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+
+        let mut val2: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args2 = set_varp_args(&mut val2);
+        assert_eq!(unsafe { did_set_lispoptions(&mut args2) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_matchpairs ----
+
+    #[test]
+    fn did_set_matchpairs_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_matchpairs_single_pair_with_no_trailing_comma_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(b"(:)".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_matchpairs_the_real_default_value_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(b"(:),{:},[:]".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_matchpairs_wrong_middle_character_is_invalid() {
+        let mut val: Option<Vec<u8>> = Some(b"(-)".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_matchpairs_missing_second_character_is_invalid() {
+        let mut val: Option<Vec<u8>> = Some(b"(:".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_matchpairs_trailing_comma_with_nothing_after_is_valid() {
+        // A genuine, real quirk of the original: once one pair parses
+        // successfully and the following byte is a comma, the for
+        // loop's own increment consumes it - if that lands exactly on
+        // the terminator, the loop's own condition simply exits
+        // cleanly, never re-entering the body to notice nothing
+        // follows. Preserved faithfully, not "fixed" to reject this.
+        let mut val: Option<Vec<u8>> = Some(b"(:),".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_matchpairs_a_doubled_comma_is_invalid() {
+        // The comma right after ")" is consumed by the for-loop's own
+        // increment; the SECOND, adjacent comma is then treated as
+        // the next pair's own "X" character, so the byte after it
+        // ('{') is read as x2 - which isn't ':', so this is correctly
+        // rejected.
+        let mut val: Option<Vec<u8>> = Some(b"(:),,{:}".to_vec());
+        let mut args = set_varp_args(&mut val);
+        assert_eq!(unsafe { did_set_matchpairs(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 }
