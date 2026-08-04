@@ -83,6 +83,10 @@
 //! `static pos_T`; the latter returns a `(bool, lnum, amount)` tuple
 //! in place of the original's three in/out parameters.
 //!
+//! Also [`cin_get_equal_amount`] - the indent of the first non-blank
+//! after an `=`, with `-1` reserved for "the line above ends in a
+//! backslash, so this line is itself a continuation".
+//!
 //! Deferred: everything else - `cin_iswhileofdo_end`/
 //! `cin_is_cpp_baseclass`/`cin_isfuncdecl` (need `find_match_paren`
 //! and multi-line backtracking) and the rest of the real
@@ -1251,6 +1255,78 @@ pub unsafe fn cin_ispreproc_cont(
     (retval, out_lnum, if retval { candidate_amount } else { amount })
 }
 
+/// The indent of the first non-blank after an equal sign
+/// (`cin_get_equal_amount`), as in `char *foo = "here";`.
+///
+/// Returns `0` when there is no useful equal sign, and `-1` when the
+/// line ABOVE `lnum` ends in a backslash - i.e. `lnum` is itself a
+/// continuation, so aligning to its own `=` would be wrong.
+///
+/// # Safety
+/// Lines `lnum` and `lnum - 1` must be readable via `ml_get`, and
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`.
+#[must_use]
+pub unsafe fn cin_get_equal_amount(lnum: crate::pos_defs::LinenrT) -> i32 {
+    // The original tests `line[strlen(line) - 1]`, i.e. the last byte
+    // BEFORE the NUL terminator, and `*line != NUL` for emptiness -
+    // so both must stop at a NUL rather than use the raw buffer end.
+    let ends_in_backslash = |l: &[u8]| {
+        let end = l.iter().position(|&c| c == 0).unwrap_or(l.len());
+        end > 0 && l[end - 1] == b'\\'
+    };
+
+    if lnum > 1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let prev = unsafe { crate::memline::ml_get(lnum - 1) };
+        if prev.first().copied().unwrap_or(0) != 0 && ends_in_backslash(&prev) {
+            return -1;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(lnum) };
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+
+    let mut s = 0usize;
+    while at(s) != 0 && crate::strings::vim_strchr(b"=;{}\"'", i32::from(at(s))).is_none() {
+        if cin_iscomment(&line, s) {
+            // ignore comments
+            // SAFETY: forwarded from this function's own safety doc.
+            s = unsafe { cin_skipcomment(&line, s) };
+        } else {
+            s += 1;
+        }
+    }
+    if at(s) != b'=' {
+        return 0;
+    }
+
+    s += 1;
+    s += crate::charset::skipwhite(line.get(s..).unwrap_or(&[]));
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { cin_nocode(&line, s) } {
+        return 0;
+    }
+
+    if at(s) == b'"' {
+        // nice alignment for continued strings
+        s += 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let mut fp = crate::pos_defs::PosT {
+        lnum,
+        col: i32::try_from(s).unwrap_or(0),
+        ..Default::default()
+    };
+    let mut col: crate::pos_defs::ColnrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::plines::getvcol(curwin, &mut fp, Some(&mut col), None, None, 0) };
+    col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +1545,59 @@ mod tests {
         drop(guard);
         close_test_buf(buf);
         result
+    }
+
+    // ---- cin_get_equal_amount ----
+
+    #[test]
+    fn cin_get_equal_amount_reports_the_column_after_an_equal_sign() {
+        // `x = 1;` - the `1` is at column 4.
+        with_lines(&[b"x = 1;"], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 4);
+        });
+    }
+
+    #[test]
+    fn cin_get_equal_amount_steps_inside_a_continued_string() {
+        // For a string value the original deliberately points one
+        // past the opening quote, so continuation lines align with
+        // the string's own text rather than the quote.
+        with_lines(&[b"char *foo = \"here\";"], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 13);
+        });
+    }
+
+    #[test]
+    fn cin_get_equal_amount_is_minus_one_after_a_continuation_line() {
+        // Line 1 ends in a backslash, so line 2 is a continuation and
+        // its own `=` must not be used for alignment.
+        with_lines(&[b"foo = \"asdf\\", b"       bar = 1;"], 2, || {
+            assert_eq!(unsafe { cin_get_equal_amount(2) }, -1);
+        });
+    }
+
+    #[test]
+    fn cin_get_equal_amount_is_zero_without_a_useful_equal_sign() {
+        // No equal sign at all - the scan stops at the `;`.
+        with_lines(&[b"foo();"], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 0);
+        });
+        // An equal sign with nothing after it on the line.
+        with_lines(&[b"x ="], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 0);
+        });
+        // An equal sign followed only by a comment is still no code.
+        with_lines(&[b"x = // c"], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 0);
+        });
+    }
+
+    #[test]
+    fn cin_get_equal_amount_stops_at_a_brace_before_any_equal_sign() {
+        // The scan halts on `{`, so the later `=` is never seen.
+        with_lines(&[b"if (a) { x = 1; }"], 1, || {
+            assert_eq!(unsafe { cin_get_equal_amount(1) }, 0);
+        });
     }
 
     #[test]
