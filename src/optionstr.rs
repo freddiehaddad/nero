@@ -52,7 +52,14 @@
 //! [`did_set_completeopt`] - the `'completeopt'` per-window/buffer
 //! comma-list callback, following the same real
 //! `OPT_LOCAL`/`OPT_GLOBAL`-branching shape `get_varp_scope_from`'s
-//! own already-real dispatch already established.
+//! own already-real dispatch already established. Also
+//! [`did_set_bufhidden`] (a plain single-value validator) and
+//! [`did_set_buftype`] (validates `'buftype'` against
+//! `buf.terminal`/the option's own value list, sets a real
+//! `'comments'` default and resets the prompt-start position for
+//! `buftype=prompt`, and flags `w_redr_status` - its own 2 real
+//! redraw-SCHEDULING calls, `redraw_later`/`redraw_titles`, are
+//! omitted, matching this crate's established policy).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -398,6 +405,92 @@ pub unsafe fn did_set_completeopt(args: &mut crate::option_defs::OptsetT) -> Opt
         }
         None => Some(crate::errors::e_invarg.as_bytes()),
     }
+}
+
+/// The `'bufhidden'` option is changed (`did_set_bufhidden`).
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_bufhidden(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*(args.os_buf as *const crate::buffer_defs::BufT) };
+    let val: &[u8] = buf.b_p_bh.as_deref().unwrap_or(&[]);
+    if opt_strings_flags(val, crate::option_vars::OPT_BH_VALUES, false).is_some() {
+        None
+    } else {
+        Some(crate::errors::e_invarg.as_bytes())
+    }
+}
+
+/// The `'buftype'` option is changed (`did_set_buftype`).
+///
+/// Omits the original's own 2 pure redraw-scheduling calls
+/// (`redraw_later(win, UPD_VALID)`/`redraw_titles()`) - matching this
+/// crate's established "keep the real state mutation, skip the
+/// display-scheduling side effect" policy - while keeping every other
+/// real state mutation: the `'comments'` default reset for
+/// `buftype=prompt` (bypassing the not-yet-translated generic
+/// `set_option_direct` by directly assigning the buffer-local storage
+/// it would have resolved to for `OPT_LOCAL`, matching that call's own
+/// exact effect), the prompt-start-position reset (`RESET_FMARK`,
+/// matching `mark.rs`'s own already-established
+/// `free_fmark`-then-reassign idiom), `w_redr_status`, and `b_help`.
+///
+/// # Safety
+/// `args.os_buf` and `args.os_win` must be valid, non-null pointers to
+/// a live `BufT`/`WinT` respectively, for the whole call.
+pub unsafe fn did_set_buftype(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *buf_ptr };
+    let bt_first = buf.b_p_bt.as_deref().and_then(|s| s.first().copied()).unwrap_or(0);
+    let bt_bytes: &[u8] = buf.b_p_bt.as_deref().unwrap_or(&[]);
+
+    if (!buf.terminal.is_null() && bt_first != b't')
+        || (buf.terminal.is_null() && bt_first == b't')
+        || opt_strings_flags(bt_bytes, crate::option_vars::OPT_BT_VALUES, false).is_none()
+    {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    // buftype=prompt:
+    if bt_first == b'p' {
+        // Set default value for 'comments'.
+        buf.b_p_com = Some(Vec::new());
+
+        // Set the prompt start position to the last line.
+        let next_prompt = crate::pos_defs::PosT {
+            lnum: buf.b_ml.ml_line_count,
+            col: buf.b_prompt_start.mark.col,
+            coladd: 0,
+        };
+        crate::mark::free_fmark(std::mem::take(&mut buf.b_prompt_start));
+        buf.b_prompt_start = crate::mark_defs::FmarkT {
+            mark: next_prompt,
+            fnum: 0,
+            timestamp: crate::os::time::os_time(),
+            view: crate::mark_defs::FmarkvT::default(),
+            additional_data: None,
+        };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *win_ptr };
+    // SAFETY: touches `OPTION_VARS`, matching `global_stl_height`'s
+    // own safety doc.
+    if win.w_status_height != 0 || unsafe { crate::window::global_stl_height() } != 0 {
+        win.w_redr_status = true;
+        // Real redraw scheduling (`redraw_later`) is omitted - the
+        // redraw pipeline isn't tractable yet.
+    }
+
+    buf.b_help = bt_first == b'h';
+    // Real redraw scheduling (`redraw_titles`) is omitted.
+
+    None
 }
 
 #[cfg(test)]
@@ -958,5 +1051,159 @@ mod tests {
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
         opts.p_cot = prev_cot;
         opts.cot_flags = prev_flags;
+    }
+
+    // ---- did_set_bufhidden ----
+
+    #[test]
+    fn did_set_bufhidden_accepts_every_real_value() {
+        for val in crate::option_vars::OPT_BH_VALUES {
+            let mut buf = crate::buffer_defs::BufT { b_p_bh: Some(val.as_bytes().to_vec()), ..Default::default() };
+            let mut args =
+                crate::option_defs::OptsetT { os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void, ..Default::default() };
+            assert_eq!(unsafe { did_set_bufhidden(&mut args) }, None, "value {val:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn did_set_bufhidden_rejects_an_unknown_value() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bh: Some(b"bogus".to_vec()), ..Default::default() };
+        let mut args =
+            crate::option_defs::OptsetT { os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void, ..Default::default() };
+        assert_eq!(unsafe { did_set_bufhidden(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    // ---- did_set_buftype ----
+
+    fn buftype_args(
+        buf: &mut crate::buffer_defs::BufT,
+        win: &mut crate::buffer_defs::WinT,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_buf: buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_buftype_empty_non_terminal_is_valid() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_buftype_terminal_value_without_a_real_terminal_fails() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: Some(b"terminal".to_vec()), ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_buftype_real_terminal_with_non_terminal_value_fails() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"help".to_vec()),
+            terminal: std::ptr::dangling_mut::<crate::types_defs::TerminalT>(),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_buftype_real_terminal_with_terminal_value_is_valid() {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"terminal".to_vec()),
+            terminal: std::ptr::dangling_mut::<crate::types_defs::TerminalT>(),
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_buftype_unknown_value_fails() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: Some(b"bogus".to_vec()), ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_buftype_help_sets_b_help() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: Some(b"help".to_vec()), b_help: false, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+        assert!(buf.b_help);
+    }
+
+    #[test]
+    fn did_set_buftype_non_help_clears_b_help() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: None, b_help: true, ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+        assert!(!buf.b_help);
+    }
+
+    #[test]
+    fn did_set_buftype_prompt_resets_comments_and_prompt_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"prompt".to_vec()),
+            b_p_com: Some(b"some,old,value".to_vec()),
+            b_ml: crate::memline_defs::MemlineT { ml_line_count: 7, ..Default::default() },
+            b_prompt_start: crate::mark_defs::FmarkT { mark: crate::pos_defs::PosT { lnum: 1, col: 3, coladd: 0 }, ..Default::default() },
+            ..Default::default()
+        };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+
+        assert_eq!(buf.b_p_com, Some(Vec::new()));
+        // The new prompt-start position uses the CURRENT line count
+        // (7), but preserves the OLD column (3) - matching the
+        // original's own `next_prompt` construction exactly.
+        assert_eq!(buf.b_prompt_start.mark, crate::pos_defs::PosT { lnum: 7, col: 3, coladd: 0 });
+    }
+
+    #[test]
+    fn did_set_buftype_non_prompt_leaves_comments_untouched() {
+        let mut buf = crate::buffer_defs::BufT { b_p_bt: None, b_p_com: Some(b"some,value".to_vec()), ..Default::default() };
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+        assert_eq!(buf.b_p_com, Some(b"some,value".to_vec()));
+    }
+
+    #[test]
+    fn did_set_buftype_flags_w_redr_status_when_win_has_a_status_line() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_status_height: 1, w_redr_status: false, ..Default::default() };
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+        assert!(win.w_redr_status);
+    }
+
+    #[test]
+    fn did_set_buftype_leaves_w_redr_status_untouched_without_a_status_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_ls = opts.p_ls;
+        opts.p_ls = 2; // not 3, so global_stl_height() == 0
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_status_height: 0, w_redr_status: false, ..Default::default() };
+        let mut args = buftype_args(&mut buf, &mut win);
+        assert_eq!(unsafe { did_set_buftype(&mut args) }, None);
+        assert!(!win.w_redr_status);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
     }
 }
