@@ -49,6 +49,14 @@
 //! rather than the `vim_isIDc` [`cin_starts_with`] uses, so it is
 //! deliberately NOT expressed through that helper.
 //!
+//! Also [`cin_isterminated`] - whether a line starts with `'{'`/`'}'`
+//! or ends with `';'`/`','`/`'{'`/`'}'`, returning the terminating
+//! character itself. Two of its rules are subtle and are pinned by
+//! tests: `"} else"` is deliberately NOT terminated, and after a
+//! leading `"else"` a terminator only counts once any braces opened
+//! on the same line have been matched (so `"else { foo();"` is not
+//! terminated but `"else { foo(); }"` is).
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
 //! `find_line_comment` (need `ml_get` and the cursor) and the rest of
 //! the real indent-computation algorithm.
@@ -733,6 +741,75 @@ pub unsafe fn cin_is_cpp_extern_c(line: &[u8], s: usize) -> bool {
     has_string_literal
 }
 
+/// Recognize a line that starts with `'{'` or `'}'`, or ends with
+/// `';'`, `','`, `'{'` or `'}'` (`cin_isterminated`).
+///
+/// `"} else"` is not considered a terminated line. If a line begins
+/// with an `"else"`, it is only terminated when no unmatched opening
+/// braces follow - which handles `"else { foo();"` correctly.
+///
+/// `incl_open` includes a trailing `'{'` as a terminator;
+/// `incl_comma` recognizes a trailing comma.
+///
+/// Returns the character terminating the line, or `0` for none.
+/// Ending characters take precedence over the leading-brace case,
+/// which is only returned if the scan finds nothing better.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_isterminated(
+    line: &[u8],
+    s: usize,
+    incl_open: bool,
+    incl_comma: bool,
+) -> u8 {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut found_start = 0u8;
+    let mut n_open = 0u32;
+    let mut is_else = false;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut s = unsafe { cin_skipcomment(line, s) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if at(s) == b'{' || (at(s) == b'}' && !unsafe { cin_iselse(line, s) }) {
+        found_start = at(s);
+    }
+
+    if found_start == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        is_else = unsafe { cin_iselse(line, s) };
+    }
+
+    while at(s) != 0 {
+        // skip over comments, "" strings and 'c'haracters
+        // SAFETY: forwarded from this function's own safety doc.
+        s = skip_string(line, unsafe { cin_skipcomment(line, s) });
+        if at(s) == b'}' && n_open > 0 {
+            n_open -= 1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if (!is_else || n_open == 0)
+            && (at(s) == b';' || at(s) == b'}' || (incl_comma && at(s) == b','))
+            && unsafe { cin_nocode(line, s + 1) }
+        {
+            return at(s);
+        } else if at(s) == b'{' {
+            // SAFETY: forwarded from this function's own safety doc.
+            if incl_open && unsafe { cin_nocode(line, s + 1) } {
+                return at(s);
+            }
+            n_open += 1;
+        }
+
+        if at(s) != 0 {
+            s += 1;
+        }
+    }
+    found_start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,6 +900,94 @@ mod tests {
     // ---- small cin_* predicates ----
 
     // ---- cin_is_cpp_extern_c ----
+
+    // ---- cin_isterminated ----
+
+    #[test]
+    fn cin_isterminated_reports_the_terminating_character() {
+        with_hash_comment(0, || {
+            assert_eq!(unsafe { cin_isterminated(b"x = 1;", 0, false, false) }, b';');
+            assert_eq!(unsafe { cin_isterminated(b"foo()}", 0, false, false) }, b'}');
+            // Trailing whitespace and comments are ignored.
+            assert_eq!(
+                unsafe { cin_isterminated(b"x = 1; /* c */", 0, false, false) },
+                b';'
+            );
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_honours_the_incl_open_and_incl_comma_flags() {
+        with_hash_comment(0, || {
+            // A trailing `{` only counts when incl_open is set.
+            assert_eq!(unsafe { cin_isterminated(b"if (x) {", 0, false, false) }, 0);
+            assert_eq!(unsafe { cin_isterminated(b"if (x) {", 0, true, false) }, b'{');
+            // A trailing comma only counts when incl_comma is set.
+            assert_eq!(unsafe { cin_isterminated(b"foo,", 0, false, false) }, 0);
+            assert_eq!(unsafe { cin_isterminated(b"foo,", 0, false, true) }, b',');
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_returns_a_leading_brace_when_nothing_better_is_found() {
+        with_hash_comment(0, || {
+            // A line that is JUST an opening brace reports it via the
+            // `found_start` fallback, even with incl_open off.
+            assert_eq!(unsafe { cin_isterminated(b"{", 0, false, false) }, b'{');
+            // A lone closing brace terminates outright.
+            assert_eq!(unsafe { cin_isterminated(b"}", 0, false, false) }, b'}');
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_does_not_treat_close_brace_else_as_terminated() {
+        with_hash_comment(0, || {
+            // "} else" is explicitly not a terminated line - the
+            // leading `}` is suppressed by the cin_iselse check.
+            assert_eq!(unsafe { cin_isterminated(b"} else", 0, false, false) }, 0);
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_requires_balanced_braces_after_a_leading_else() {
+        with_hash_comment(0, || {
+            // "else { foo();" has an unmatched opening brace, so the
+            // `;` does NOT terminate it.
+            assert_eq!(
+                unsafe { cin_isterminated(b"else { foo();", 0, false, false) },
+                0
+            );
+            // Once the brace is matched the `;` counts again.
+            assert_eq!(
+                unsafe { cin_isterminated(b"else { foo(); }", 0, false, false) },
+                b'}'
+            );
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_ignores_characters_inside_strings() {
+        with_hash_comment(0, || {
+            // The `;` inside the string literal must not count.
+            assert_eq!(
+                unsafe { cin_isterminated(b"x = \";\"", 0, false, false) },
+                0
+            );
+            // The real one outside it does.
+            assert_eq!(
+                unsafe { cin_isterminated(b"x = \";\";", 0, false, false) },
+                b';'
+            );
+        });
+    }
+
+    #[test]
+    fn cin_isterminated_is_zero_for_an_unterminated_line() {
+        with_hash_comment(0, || {
+            assert_eq!(unsafe { cin_isterminated(b"x = 1", 0, false, false) }, 0);
+            assert_eq!(unsafe { cin_isterminated(b"", 0, false, false) }, 0);
+        });
+    }
 
     #[test]
     fn cin_is_cpp_extern_c_accepts_both_linkage_forms() {
