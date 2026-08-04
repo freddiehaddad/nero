@@ -163,6 +163,18 @@
 //! value regardless of which was actually being set, faithfully
 //! matching the original's own two-call `||` condition).
 //!
+//! Also [`did_set_foldignore`] (pure side effect, no validation -
+//! `'foldignore'` accepts any value) and [`did_set_foldmarker`] (the
+//! value must contain a comma with at least one character on either
+//! side of it). Both gate their own real `foldUpdateAll` call behind
+//! a `foldmethodIsIndent`/`foldmethodIsMarker` check, so each panics
+//! only for that specific `'foldmethod'` - every other window is
+//! fully working. `did_set_foldmethod` is deliberately NOT translated
+//! alongside them: it calls `foldUpdateAll` UNCONDITIONALLY, so it
+//! would panic on every single successful call, leaving no working
+//! path at all - deferred until `fold.rs`'s own real fold-tree
+//! update machinery lands.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1418,6 +1430,75 @@ pub unsafe fn did_set_completeslash(args: &mut crate::option_defs::OptsetT) -> O
     {
         return Some(crate::errors::e_invarg.as_bytes());
     }
+    None
+}
+
+/// Error message for `'foldmarker'` given a value with no comma
+/// (`e_comma_required`, a file-local `static const char[]` in the
+/// original - kept file-local here too, matching the original's own
+/// scoping, rather than added to the shared `errors.rs`; same
+/// precedent as `option.rs`'s own
+/// `e_cannot_have_negative_or_zero_number_of_quickfix`).
+#[allow(non_upper_case_globals)]
+const e_comma_required: &str = crate::gettext_defs::gettext_noop("E536: Comma required");
+
+/// The `'foldignore'` option is changed (`did_set_foldignore`).
+///
+/// Pure side effect, no validation at all - `'foldignore'` accepts
+/// any value. Only the `foldmethodIsIndent`-gated `foldUpdateAll`
+/// call panics (`fold.rs`'s own real fold-tree update machinery isn't
+/// translated yet), so the common case - any window whose
+/// `'foldmethod'` isn't `"indent"` - is fully working.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_foldignore(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*(args.os_win as *const crate::buffer_defs::WinT) };
+    if crate::fold::foldmethod_is_indent(win) {
+        unimplemented!(
+            "did_set_foldignore: foldUpdateAll - real fold-tree update machinery, not translated"
+        );
+    }
+    None
+}
+
+/// The `'foldmarker'` option is changed (`did_set_foldmarker`).
+///
+/// The value must contain a comma with at least one character on
+/// EITHER side of it (the start and end marker strings).
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+pub unsafe fn did_set_foldmarker(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*(args.os_win as *const crate::buffer_defs::WinT) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    let Some(p) = crate::strings::vim_strchr(val, i32::from(b',')) else {
+        return Some(e_comma_required.as_bytes());
+    };
+
+    // `p == *varp` (comma is the very first byte, so no start marker)
+    // or `p[1] == NUL` (nothing after the comma, so no end marker).
+    // The latter's own past-the-end read in the original relies on
+    // the implicit C-string NUL terminator; here it's an explicit
+    // "is the comma the last byte" bounds check instead.
+    if p == 0 || p + 1 >= val.len() {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    if crate::fold::foldmethod_is_marker(win) {
+        unimplemented!(
+            "did_set_foldmarker: foldUpdateAll - real fold-tree update machinery, not translated"
+        );
+    }
+
     None
 }
 
@@ -2919,6 +3000,121 @@ mod tests {
         );
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_csl = prev;
+    }
+
+    // ---- did_set_foldignore / did_set_foldmarker ----
+
+    fn fold_args(
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_foldignore_is_a_no_op_for_a_non_indent_foldmethod() {
+        // Default 'foldmethod' is "manual", so foldmethod_is_indent is
+        // false and the unimplemented!() branch is never reached.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"#".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldignore(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_foldignore_accepts_any_value_including_empty() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldignore(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdateAll")]
+    fn did_set_foldignore_panics_when_foldmethod_is_indent() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        let mut val: Option<Vec<u8>> = Some(b"#".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        let _ = unsafe { did_set_foldignore(&mut args) };
+    }
+
+    #[test]
+    fn did_set_foldmarker_accepts_the_real_default_value() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"{{{,}}}".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldmarker(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_foldmarker_requires_a_comma() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"nocomma".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldmarker(&mut args) }, Some(e_comma_required.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_foldmarker_rejects_an_empty_start_marker() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b",}}}".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_foldmarker(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_foldmarker_rejects_an_empty_end_marker() {
+        // The comma is the last byte: the original reads `p[1]` and
+        // finds its own NUL terminator; here that's an explicit
+        // "comma is the last byte" bounds check.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"{{{,".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_foldmarker(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_foldmarker_uses_only_the_first_comma() {
+        // vim_strchr finds the FIRST comma; everything after it is the
+        // end marker, commas included.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"a,b,c".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldmarker(&mut args) }, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdateAll")]
+    fn did_set_foldmarker_panics_when_foldmethod_is_marker() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
+        let mut val: Option<Vec<u8>> = Some(b"{{{,}}}".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        let _ = unsafe { did_set_foldmarker(&mut args) };
+    }
+
+    #[test]
+    fn did_set_foldmarker_validates_before_the_foldmethod_check() {
+        // An invalid value must be rejected (returned, not panicked)
+        // even when 'foldmethod' is "marker" - matching the original's
+        // own ordering, where both validation checks precede the
+        // foldmethodIsMarker branch entirely.
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
+        let mut val: Option<Vec<u8>> = Some(b"nocomma".to_vec());
+        let mut args = fold_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldmarker(&mut args) }, Some(e_comma_required.as_bytes()));
     }
 
     // ---- did_set_mousescroll ----
