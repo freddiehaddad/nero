@@ -23,10 +23,13 @@
 //! octal char-constant path is unreachable because its own digit loop
 //! overshoots by one.
 //!
-//! Deferred: everything else - `check_linecomment` (needs
-//! `cin_skipcomment`), `cin_ends_in`/`cin_is_cpp_extern_c` (need
-//! `cin_skipcomment`/`cin_nocode`), and the rest of the real
-//! indent-computation algorithm.
+//! Also [`cin_skipcomment`] and [`cin_nocode`] - the whitespace and
+//! comment skipper the rest of the indent engine is built on. Needs
+//! only `skipwhite` and the buffer's own `b_ind_hash_comment`.
+//!
+//! Deferred: everything else - `cin_islinecomment`/`find_line_comment`
+//! (need `ml_get` and the cursor), `cin_ends_in`/`cin_is_cpp_extern_c`
+//! and the rest of the real indent-computation algorithm.
 
 use crate::charset::vim_isidc;
 
@@ -217,6 +220,70 @@ pub fn is_pos_in_string(line: &[u8], col: usize) -> bool {
     p > col
 }
 
+/// Skip over white space and C comments within the line
+/// (`cin_skipcomment`). Also skips Perl/shell `#` comments when the
+/// buffer's own `b_ind_hash_comment` is set.
+///
+/// Returns the byte index just past whatever was skipped. Like the
+/// original, a `//` or `#` comment consumes the rest of the line, and
+/// an UNTERMINATED `/*` comment does too.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`, matching [`cindent_on`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_skipcomment(line: &[u8], s: usize) -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let hash_comment = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }.b_ind_hash_comment;
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let mut s = s;
+
+    while at(s) != 0 {
+        let prev_s = s;
+
+        s += crate::charset::skipwhite(line.get(s..).unwrap_or(&[]));
+
+        // Perl/shell # comment continues until eol. Require a space
+        // before # to avoid recognizing $#array.
+        if hash_comment != 0 && s != prev_s && at(s) == b'#' {
+            return line.len();
+        }
+        if at(s) != b'/' {
+            break;
+        }
+        s += 1;
+        if at(s) == b'/' {
+            // slash-slash comment continues till eol
+            return line.len();
+        }
+        if at(s) != b'*' {
+            break;
+        }
+        // skip slash-star comment
+        s += 1;
+        while at(s) != 0 {
+            if at(s) == b'*' && at(s + 1) == b'/' {
+                s += 2;
+                break;
+            }
+            s += 1;
+        }
+    }
+    s
+}
+
+/// Whether there is no code at `s` (`cin_nocode`). White space and
+/// comments are not considered code.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_nocode(line: &[u8], s: usize) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let end = unsafe { cin_skipcomment(line, s) };
+    line.get(end).copied().unwrap_or(0) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +339,101 @@ mod tests {
     const DEFAULT_CINW: &[u8] = b"if,else,while,do,for,switch";
 
     // ---- skip_string / is_pos_in_string ----
+
+    // ---- cin_skipcomment / cin_nocode ----
+
+    /// Runs `f` with a buffer whose `b_ind_hash_comment` is `hash`.
+    fn with_hash_comment<R>(hash: i32, f: impl FnOnce() -> R) -> R {
+        let mut buf = BufT {
+            b_ind_hash_comment: hash,
+            ..Default::default()
+        };
+        let _guard = CurbufGuard::set(&mut buf);
+        f()
+    }
+
+    #[test]
+    fn cin_skipcomment_skips_leading_whitespace() {
+        with_hash_comment(0, || {
+            assert_eq!(unsafe { cin_skipcomment(b"   x", 0) }, 3);
+            assert_eq!(unsafe { cin_skipcomment(b"\t\tx", 0) }, 2);
+            // Nothing to skip.
+            assert_eq!(unsafe { cin_skipcomment(b"x", 0) }, 0);
+        });
+    }
+
+    #[test]
+    fn cin_skipcomment_consumes_a_line_comment_to_end_of_line() {
+        with_hash_comment(0, || {
+            let line = b"// comment";
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, line.len());
+        });
+    }
+
+    #[test]
+    fn cin_skipcomment_skips_a_block_comment_and_stops_after_it() {
+        with_hash_comment(0, || {
+            // The `x` follows the closing `*/`.
+            let line = b"/* c */x";
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, 7);
+            // Several block comments in a row are all skipped.
+            let line = b"/*a*/ /*b*/ y";
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, 12);
+        });
+    }
+
+    #[test]
+    fn cin_skipcomment_consumes_an_unterminated_block_comment() {
+        with_hash_comment(0, || {
+            let line = b"/* never closed";
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, line.len());
+        });
+    }
+
+    #[test]
+    fn cin_skipcomment_stops_at_a_lone_slash() {
+        with_hash_comment(0, || {
+            // A single `/` is division, not a comment; the original
+            // has already stepped past it when it finds out.
+            assert_eq!(unsafe { cin_skipcomment(b"/ x", 0) }, 1);
+        });
+    }
+
+    #[test]
+    fn cin_skipcomment_honours_b_ind_hash_comment_and_its_space_rule() {
+        // The `#` rule requires whitespace to have been skipped first
+        // ("require a space before # to avoid recognizing $#array"),
+        // so a `#` in column 0 is NOT treated as a comment.
+        let line = b" # comment";
+        with_hash_comment(1, || {
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, line.len());
+            // No preceding space -> not a comment, so the scan stops
+            // at the `#` itself.
+            assert_eq!(unsafe { cin_skipcomment(b"#x", 0) }, 0);
+        });
+        // With the option off the `#` is never a comment.
+        with_hash_comment(0, || {
+            assert_eq!(unsafe { cin_skipcomment(line, 0) }, 1);
+        });
+    }
+
+    #[test]
+    fn cin_nocode_is_true_for_blank_and_comment_only_text() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_nocode(b"", 0) });
+            assert!(unsafe { cin_nocode(b"    ", 0) });
+            assert!(unsafe { cin_nocode(b"// just a comment", 0) });
+            assert!(unsafe { cin_nocode(b"  /* block */  ", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_nocode_is_false_when_real_code_follows() {
+        with_hash_comment(0, || {
+            assert!(!unsafe { cin_nocode(b"x = 1;", 0) });
+            assert!(!unsafe { cin_nocode(b"  /* c */ x", 0) });
+        });
+    }
 
     #[test]
     fn skip_string_leaves_a_non_string_position_alone() {
