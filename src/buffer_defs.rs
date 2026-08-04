@@ -625,7 +625,12 @@ pub struct WinConfig {
     pub style: WinStyle,
     pub border: bool,
     pub shadow: bool,
-    pub border_chars: [[crate::types_defs::ScharT; crate::types_defs::MAX_SCHAR_SIZE]; 8],
+    /// `char border_chars[8][MAX_SCHAR_SIZE]` - eight NUL-terminated,
+    /// fixed-capacity byte buffers (one per border position), NOT eight
+    /// `schar_T` values: the original declares this as plain `char`, and
+    /// `parse_border_style` fills each entry with `memcpy` from a
+    /// user-supplied UTF-8 string plus an explicit NUL terminator.
+    pub border_chars: [[u8; crate::types_defs::MAX_SCHAR_SIZE]; 8],
     pub border_hl_ids: [i32; 8],
     pub border_attr: [i32; 8],
     pub title: bool,

@@ -344,6 +344,16 @@
 //! `"auto"` uses), and the `auto:<MIN>-<MAX>` form is NOT in the
 //! value list so it is shape-checked by hand.
 //!
+//! Also [`did_set_winborder`]/[`did_set_pumborder`] - both validate
+//! their option by parsing it into a throwaway `WinConfig` via the
+//! private `parse_border_opt` helper and the newly-translated
+//! `api/win_config.rs`'s `parse_winborder`/`parse_border_style`.
+//! Cross-checked against a real `nvim` binary for every accepted and
+//! rejected form, which caught one non-obvious case: `,2,3,4,5,6,7,8`
+//! DOES split into exactly eight parts, so it passes the length check
+//! and is instead rejected by the "corner char between edge chars"
+//! rule.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -2606,6 +2616,58 @@ unsafe fn did_set_statustabline_rulerformat(
 pub unsafe fn did_set_winbar(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { did_set_statustabline_rulerformat(args, false, false) }
+}
+
+/// `parse_border_opt` - validate one border-style option value.
+///
+/// Parses `border_opt` into a throwaway `WinConfig`, purely to find out
+/// whether it is a legal border style. Both the config and any error
+/// message are discarded; only the accepted/rejected outcome matters.
+fn parse_border_opt(border_opt: &[u8]) -> bool {
+    let mut fconfig = crate::buffer_defs::WinConfig::default();
+    let mut err = crate::api::private::defs::Error::default();
+    let result = crate::api::win_config::parse_winborder(&mut fconfig, border_opt, &mut err);
+    // The original's own `api_clear_error(&err)` frees a heap-allocated
+    // message; `Error`'s own `Drop` already does that here.
+    result
+}
+
+/// The `'winborder'` option is changed (`did_set_winborder`).
+///
+/// Note this reads the global `p_winborder` rather than
+/// `args.os_varp`, matching the original.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `OPTION_VARS`.
+pub unsafe fn did_set_winborder(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let value = opts.p_winborder.clone().unwrap_or_default();
+    if !parse_border_opt(&value) {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+    None
+}
+
+/// The `'pumborder'` option is changed (`did_set_pumborder`).
+///
+/// Note this reads the global `p_pumborder` rather than
+/// `args.os_varp`, matching the original.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `OPTION_VARS`.
+pub unsafe fn did_set_pumborder(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let value = opts.p_pumborder.clone().unwrap_or_default();
+    if !parse_border_opt(&value) {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+    None
 }
 
 /// The `'tabline'` option is changed (`did_set_tabline`).
@@ -5289,6 +5351,109 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- did_set_winborder / did_set_pumborder ----
+
+    /// Saves/restores both global border options around `f`, taking
+    /// the shared test lock exactly ONCE for the whole body.
+    ///
+    /// Deliberately not a per-value helper: a per-value version would
+    /// acquire and release the lock once per case, and this file's own
+    /// verbose-file tests already showed that many short locked
+    /// regions measurably perturb an unrelated pre-existing race.
+    fn with_border_opts<R>(f: impl FnOnce(&mut dyn FnMut(bool, &[u8])) -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_win = opts.p_winborder.clone();
+        let prev_pum = opts.p_pumborder.clone();
+
+        let mut set = |is_win: bool, value: &[u8]| {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            if is_win {
+                opts.p_winborder = Some(value.to_vec());
+            } else {
+                opts.p_pumborder = Some(value.to_vec());
+            }
+        };
+        let result = f(&mut set);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_winborder = prev_win;
+        opts.p_pumborder = prev_pum;
+        result
+    }
+
+    #[test]
+    fn did_set_winborder_accepts_every_valid_form() {
+        // Cross-checked one-for-one against a real nvim binary via
+        // `let &winborder = ...`: each of these is accepted there too.
+        with_border_opts(|set| {
+            for v in [
+                &b"rounded"[..],
+                b"double",
+                b"single",
+                b"shadow",
+                b"solid",
+                b"bold",
+                b"none",
+                b"",
+                b"1,2,3,4,5,6,7,8",
+                b"x,x,x,x,x,x,x,x",
+            ] {
+                set(true, v);
+                let mut args = crate::option_defs::OptsetT::default();
+                assert_eq!(
+                    unsafe { did_set_winborder(&mut args) },
+                    None,
+                    "{:?} should be accepted",
+                    std::string::String::from_utf8_lossy(v)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn did_set_winborder_rejects_every_invalid_form() {
+        // Also cross-checked against a real nvim binary: each of these
+        // reports E474 there. Note `,2,3,4,5,6,7,8` does split into
+        // exactly eight parts, so it passes the length check and is
+        // rejected instead by the "corner char between edge chars"
+        // rule - an easy case to get wrong by assuming otherwise.
+        with_border_opts(|set| {
+            for v in [
+                &b"nope"[..],
+                b"1,2,3",
+                b"1,2,3,4,5,6,7,8,9",
+                b",2,3,4,5,6,7,8",
+                "一,一,一,一,一,一,一,一".as_bytes(),
+            ] {
+                set(true, v);
+                let mut args = crate::option_defs::OptsetT::default();
+                assert_eq!(
+                    unsafe { did_set_winborder(&mut args) },
+                    Some(crate::errors::e_invarg.as_bytes()),
+                    "{:?} should be rejected",
+                    std::string::String::from_utf8_lossy(v)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn did_set_pumborder_shares_the_same_validation() {
+        with_border_opts(|set| {
+            set(false, b"rounded");
+            let mut args = crate::option_defs::OptsetT::default();
+            assert_eq!(unsafe { did_set_pumborder(&mut args) }, None);
+
+            set(false, b"nope");
+            let mut args = crate::option_defs::OptsetT::default();
+            assert_eq!(
+                unsafe { did_set_pumborder(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        });
     }
 
     // ---- did_set_verbosefile ----
