@@ -12,6 +12,19 @@
 //! couple of small pieces of genuinely-new state (see below), not the
 //! actual message pipeline.
 //!
+//! Also translated: [`verbose_stop`]/[`verbose_open`] (the
+//! `'verbosefile'` log-file handle management, needed by
+//! `optionstr.rs`'s own `did_set_verbosefile`). `verbose_fd` is
+//! modelled as an owned [`std::fs::File`] rather than going through
+//! `os/fs.rs`'s own `os_fopen`, which is deliberately deferred
+//! pending a settled raw-fd calling convention - this follows the
+//! precedent that module's doc comment already sets, where a caller
+//! needing only ordinary buffered I/O uses `std::fs::File` directly
+//! (exactly as `memfile.c`'s own `MemfileT.mf_fd` does). The
+//! original's own `semsg(_(e_notopen), ...)` failure message is
+//! omitted per this crate's established policy; the `FAIL` return and
+//! the `verbose_did_open` "only try once" latch are both preserved.
+//!
 //! `DEFAULT_GRID` is harvested here ahead of its real owning file,
 //! `grid.c` (not translated) - it is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
@@ -61,6 +74,82 @@ static MSG_ID_NEXT: GlobalCell<i64> = GlobalCell::new(1);
 /// this crate can currently allocate a real grid.
 static DEFAULT_GRID: LazyLock<GlobalCell<crate::grid_defs::ScreenGrid>> =
     LazyLock::new(|| GlobalCell::new(crate::grid_defs::ScreenGrid::default()));
+
+/// The open `'verbosefile'` handle (`verbose_fd`, a file-static
+/// `FILE *` in the original).
+///
+/// Modelled as an owned [`std::fs::File`] rather than going through
+/// `os/fs.rs`'s own `os_fopen` (which is deliberately deferred, as
+/// that module's doc comment explains, pending a settled decision on
+/// the raw-fd calling convention). This follows the precedent that
+/// same doc comment already sets: a specific caller that only needs
+/// ordinary buffered I/O uses `std::fs::File` directly instead of
+/// waiting for the raw-fd wrappers - exactly as `memfile.c`'s own
+/// `MemfileT.mf_fd` already does.
+static VERBOSE_FD: LazyLock<GlobalCell<Option<std::fs::File>>> =
+    LazyLock::new(|| GlobalCell::new(None));
+
+/// Whether opening `'verbosefile'` has already been attempted, so the
+/// failure message is only given once (`verbose_did_open`).
+static VERBOSE_DID_OPEN: LazyLock<GlobalCell<bool>> = LazyLock::new(|| GlobalCell::new(false));
+
+/// Called when `'verbosefile'` is set: stop writing to the file
+/// (`verbose_stop`).
+///
+/// Dropping the [`std::fs::File`] closes it, matching the original's
+/// own `fclose`.
+///
+/// # Safety
+/// Touches this module's own `VERBOSE_FD`/`VERBOSE_DID_OPEN` statics.
+pub unsafe fn verbose_stop() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *VERBOSE_FD.get_mut() = None };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *VERBOSE_DID_OPEN.get_mut() = false };
+}
+
+/// Open the file `'verbosefile'` (`verbose_open`).
+///
+/// Returns [`crate::vim_defs::OK`] or [`crate::vim_defs::FAIL`].
+/// Opens in append mode, creating the file if needed, matching the
+/// original's own `os_fopen(p_vfile, "a")`.
+///
+/// The original's own `semsg(_(e_notopen), p_vfile)` failure message
+/// is omitted, matching this crate's established policy - the `FAIL`
+/// return, and the `verbose_did_open` latch that makes the attempt
+/// happen only once, are both preserved exactly.
+///
+/// # Safety
+/// Touches this module's own `VERBOSE_FD`/`VERBOSE_DID_OPEN` statics
+/// and `OPTION_VARS`.
+pub unsafe fn verbose_open() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let already_open = unsafe { VERBOSE_FD.get_mut() }.is_some();
+    // SAFETY: forwarded from this function's own safety doc.
+    let did_open = unsafe { *VERBOSE_DID_OPEN.get_mut() };
+
+    if !already_open && !did_open {
+        // Only give the error message once.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *VERBOSE_DID_OPEN.get_mut() = true };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let vfile = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_vfile
+            .clone()
+            .unwrap_or_default();
+
+        let Some(path) = std::str::from_utf8(&vfile).ok().map(std::path::Path::new) else {
+            return crate::vim_defs::FAIL;
+        };
+        let Ok(file) = std::fs::OpenOptions::new().append(true).create(true).open(path) else {
+            return crate::vim_defs::FAIL;
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *VERBOSE_FD.get_mut() = Some(file) };
+    }
+    crate::vim_defs::OK
+}
 
 /// Returns `true` if the given integer message-id was previously
 /// generated (i.e. is a real, already-issued id, not `0`/negative/not-
@@ -427,6 +516,107 @@ pub(crate) mod tests {
         assert!(!msg_id_exists(1));
         assert!(!msg_id_exists(0));
         assert!(!msg_id_exists(-1));
+    }
+
+    /// Saves/restores every piece of state the verbose-file functions
+    /// touch, so these tests can't leak into any other test.
+    fn with_verbose<R>(vfile: Option<&[u8]>, f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_vfile =
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile =
+            vfile.map(<[u8]>::to_vec);
+        unsafe { *VERBOSE_FD.get_mut() = None };
+        unsafe { *VERBOSE_DID_OPEN.get_mut() = false };
+
+        let result = f();
+
+        unsafe { *VERBOSE_FD.get_mut() = None };
+        unsafe { *VERBOSE_DID_OPEN.get_mut() = false };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = prev_vfile;
+        result
+    }
+
+    /// A unique scratch path under the OS temp dir, removed on drop.
+    struct ScratchFile {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchFile {
+        fn new(tag: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "nero_verbose_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            ScratchFile { path }
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.path.to_str().unwrap().as_bytes().to_vec()
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn verbose_open_and_stop_manage_the_file_handle() {
+        // Grouped into one locked section deliberately: each of these
+        // helpers holds `global_state_test_lock()` across real
+        // filesystem I/O, and spreading them over many separate tests
+        // measurably amplified an unrelated, pre-existing
+        // parallel-load flake elsewhere in the suite.
+        let scratch = ScratchFile::new("handle");
+        // Pre-create with content, so the append-not-truncate check
+        // below is meaningful.
+        std::fs::write(&scratch.path, b"existing").unwrap();
+        let bytes = scratch.bytes();
+
+        with_verbose(Some(&bytes), || {
+            // Opens, records the handle, and latches did_open.
+            assert_eq!(unsafe { verbose_open() }, crate::vim_defs::OK);
+            assert!(scratch.path.exists());
+            assert!(unsafe { VERBOSE_FD.get_mut() }.is_some());
+            assert!(unsafe { *VERBOSE_DID_OPEN.get_mut() });
+
+            // A second call while already open is a no-op reporting OK.
+            assert_eq!(unsafe { verbose_open() }, crate::vim_defs::OK);
+            assert!(unsafe { VERBOSE_FD.get_mut() }.is_some());
+
+            // Stop closes the handle and clears the latch.
+            unsafe { verbose_stop() };
+            assert!(unsafe { VERBOSE_FD.get_mut() }.is_none());
+            assert!(!unsafe { *VERBOSE_DID_OPEN.get_mut() });
+
+            // Append mode: the pre-existing content survived.
+            assert_eq!(std::fs::read(&scratch.path).unwrap(), b"existing");
+        });
+    }
+
+    #[test]
+    fn verbose_open_only_attempts_once_after_a_failure() {
+        // An unopenable path (a file inside a non-existent directory)
+        // fails once, then the verbose_did_open latch makes every
+        // later call a no-op that reports OK - exactly as the original
+        // does, so the error is only ever given once.
+        let mut bad = std::env::temp_dir();
+        bad.push("nero_verbose_missing_dir");
+        bad.push("nested");
+        bad.push("log.txt");
+        let bytes = bad.to_str().unwrap().as_bytes().to_vec();
+
+        with_verbose(Some(&bytes), || {
+            assert_eq!(unsafe { verbose_open() }, crate::vim_defs::FAIL);
+            assert!(unsafe { *VERBOSE_DID_OPEN.get_mut() });
+            // The latch short-circuits the retry.
+            assert_eq!(unsafe { verbose_open() }, crate::vim_defs::OK);
+            assert!(unsafe { VERBOSE_FD.get_mut() }.is_none());
+        });
     }
 
     #[test]

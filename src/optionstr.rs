@@ -281,6 +281,10 @@
 //! `OptIndex::Statusline`. `did_set_statusline` is therefore
 //! deliberately NOT exposed yet.
 //!
+//! Also [`did_set_verbosefile`] - closes any currently-open verbose
+//! log file and reopens it when `'verbosefile'` is non-empty, built
+//! on `message.rs`'s own new `verbose_stop`/`verbose_open`.
+//!
 //! Also [`did_set_filetype_or_syntax`] (validates via
 //! [`valid_filetype`], then records `os_value_changed`/
 //! `os_value_checked` back into `args` for the option engine's own
@@ -484,6 +488,34 @@ pub unsafe fn did_set_filetype_or_syntax(
     // `kOptFlagInsecure`, even when the value comes from a modeline.
     args.os_value_checked = true;
 
+    None
+}
+
+/// The `'verbosefile'` option is changed (`did_set_verbosefile`).
+///
+/// Closes any currently-open verbose log file, then reopens it when
+/// `'verbosefile'` is non-empty. Built on `message.rs`'s own new
+/// `verbose_stop`/`verbose_open`.
+///
+/// # Safety
+/// Forwarded from `crate::message::verbose_open`'s own safety doc -
+/// touches that module's `VERBOSE_FD`/`VERBOSE_DID_OPEN` statics and
+/// `OPTION_VARS`.
+pub unsafe fn did_set_verbosefile(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::message::verbose_stop() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let vfile_set = !unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_vfile
+        .as_deref()
+        .unwrap_or(&[])
+        .is_empty();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if vfile_set && unsafe { crate::message::verbose_open() } == crate::vim_defs::FAIL {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
     None
 }
 
@@ -5257,6 +5289,73 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- did_set_verbosefile ----
+
+    /// Saves/restores `p_vfile` and always stops the verbose file
+    /// afterward, so these tests can't leak an open handle.
+    fn with_vfile<R>(vfile: Option<&[u8]>, f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile =
+            vfile.map(<[u8]>::to_vec);
+        unsafe { crate::message::verbose_stop() };
+
+        let result = f();
+
+        unsafe { crate::message::verbose_stop() };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_vfile = prev;
+        result
+    }
+
+    fn vfile_scratch(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "nero_dsvf_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn did_set_verbosefile_stops_for_an_empty_or_absent_value() {
+        // Grouped deliberately - see the note on message.rs's own
+        // verbose tests about lock-hold time and I/O perturbation.
+        for v in [Some(&b""[..]), None] {
+            with_vfile(v, || {
+                let mut args = crate::option_defs::OptsetT::default();
+                assert_eq!(unsafe { did_set_verbosefile(&mut args) }, None);
+            });
+        }
+    }
+
+    #[test]
+    fn did_set_verbosefile_opens_a_real_file_and_reports_open_failures() {
+        let path = vfile_scratch("open");
+        let bytes = path.to_str().unwrap().as_bytes().to_vec();
+        with_vfile(Some(&bytes), || {
+            let mut args = crate::option_defs::OptsetT::default();
+            assert_eq!(unsafe { did_set_verbosefile(&mut args) }, None);
+            assert!(path.exists());
+        });
+        let _ = std::fs::remove_file(&path);
+
+        // A file inside a non-existent directory can't be opened.
+        let mut bad = std::env::temp_dir();
+        bad.push("nero_dsvf_missing_dir");
+        bad.push("nested");
+        bad.push("log.txt");
+        let bad_bytes = bad.to_str().unwrap().as_bytes().to_vec();
+        with_vfile(Some(&bad_bytes), || {
+            let mut args = crate::option_defs::OptsetT::default();
+            assert_eq!(
+                unsafe { did_set_verbosefile(&mut args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        });
     }
 
     // ---- did_set_filetype_or_syntax / did_set_highlight ----
