@@ -70,6 +70,24 @@
 //! original (avoiding over-allocating many small blocks), never a
 //! semantic requirement observable by any reader.
 //!
+//! Also translated: [`save_typeahead`]/[`restore_typeahead`] - save
+//! and restore all 3 kinds of typeahead (the typed-character buffer,
+//! plus both stuff/readahead buffers) around a temporary state change
+//! (e.g. `:normal`). Needed only already-real pieces:
+//! `input_defs.rs`'s own `TasaveT`, this module's own `TYPEBUF`/
+//! `READBUF1`/`READBUF2`. `alloc_typebuf`'s own `xmalloc(TYPELEN_INIT)`
+//! pre-allocation has no counterpart (nothing to pre-size for an
+//! already-owned, on-demand-growing `Vec<u8>`); `free_typebuf`/
+//! `free_buff` are real, faithfully-scoped no-ops/near-no-ops (`Vec`'s
+//! own `Drop` already does the freeing) - see each function's own doc
+//! comment for the exact reasoning, including `free_buff`'s
+//! deliberately-preserved `bh_index`-left-untouched quirk. Translated
+//! ahead of their real callers (`ex_docmd.c`'s `save_current_state`/
+//! `restore_current_state`, and beyond them `exec_normal`/
+//! `menu.c`'s `ex_emenu`-adjacent code - none yet translated),
+//! matching this crate's established "small, simple, mechanically
+//! correct piece ahead of its real caller" precedent.
+//!
 //! Deferred: everything else - `vgetc`/`vgetorpeek` and the whole
 //! typeahead-buffer/mapping-application machinery, `stuffReadbuffLen`/
 //! `stuffReadbuffSpec`/`stuffescaped` (need the `add_last_insert`/
@@ -118,6 +136,22 @@ static TYPEBUF: GlobalCell<TypebufT> = GlobalCell::new(TypebufT {
 pub const RM_NONE: i32 = 1;
 /// `tb_noremap`: remap local script mappings (`RM_SCRIPT`).
 pub const RM_SCRIPT: i32 = 2;
+
+/// Character put back by `vungetc()` (`old_char`), file-static in the
+/// original. Starts at `-1` ("none put back"), matching the original's
+/// own `static int old_char = -1;`.
+static OLD_CHAR: GlobalCell<i32> = GlobalCell::new(-1);
+
+/// `mod_mask` for [`OLD_CHAR`] (`old_mod_mask`), file-static in the
+/// original. Starts at `0`, matching the original's own
+/// zero-initialized `static int old_mod_mask;`.
+static OLD_MOD_MASK: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Maximum length of a key sequence to be mapped (`MAXMAPLEN`,
+/// `mapping_defs.h`). Defined here (rather than a dedicated
+/// `mapping_defs.rs`, which doesn't exist yet) since [`alloc_typebuf`]
+/// is currently its only real user in this crate.
+const MAXMAPLEN: i32 = 50;
 
 /// Whether the stuff buffer is empty (`stuff_empty`).
 #[must_use]
@@ -258,6 +292,113 @@ pub fn stuffchar_readbuff(c: i32) {
 pub fn stuffnum_readbuff(n: i32) {
     // SAFETY: momentary access.
     add_num_buff(unsafe { READBUF1.get_mut() }, n);
+}
+
+/// Free and clear a buffer (`free_buff`).
+///
+/// Only clears `buf.blocks` - matching the original's own real quirk
+/// of leaving `bh_index` untouched (it frees/clears the block list and
+/// resets `bh_curr` to `NULL`, but never resets `bh_index`); this
+/// crate's own [`BuffheaderT`] redesign has no `bh_curr`/`bh_space`/
+/// `bh_create_newblock` counterpart at all (see that struct's own doc
+/// comment), so clearing `blocks` is the only real remaining effect.
+fn free_buff(buf: &mut BuffheaderT) {
+    buf.blocks.clear();
+}
+
+/// Make [`TYPEBUF`] empty and allocate new buffers (`alloc_typebuf`).
+///
+/// The original's own `xmalloc(TYPELEN_INIT)` pre-allocations for
+/// `tb_buf`/`tb_noremap` (raw buffers with a fixed initial capacity,
+/// `TYPELEN_INIT == 5 * (MAXMAPLEN + 3)` bytes) have no counterpart
+/// here: both fields are already owned `Vec<u8>`s (see
+/// `input_defs.rs`'s own `TypebufT` doc comment) that grow on demand,
+/// so there is nothing to pre-size.
+fn alloc_typebuf() {
+    let tb = unsafe { TYPEBUF.get_mut() };
+    tb.tb_buf = Vec::new();
+    tb.tb_noremap = Vec::new();
+    tb.tb_off = MAXMAPLEN + 4;
+    tb.tb_len = 0;
+    tb.tb_maplen = 0;
+    tb.tb_silent = 0;
+    tb.tb_no_abbr_cnt = 0;
+    tb.tb_change_cnt = tb.tb_change_cnt.wrapping_add(1);
+    if tb.tb_change_cnt == 0 {
+        tb.tb_change_cnt = 1;
+    }
+    unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = false;
+}
+
+/// Free the buffers of [`TYPEBUF`] (`free_typebuf`).
+///
+/// A real no-op here: `Vec<u8>`'s own `Drop` already frees `tb_buf`'s/
+/// `tb_noremap`'s storage whenever they are overwritten or the struct
+/// itself is dropped, so there is nothing left to do once
+/// [`save_typeahead`] has already cloned the buffer contents it needs
+/// to preserve. The original's own `internal_error` sanity checks
+/// (guarding against double-freeing the still-in-use static initial
+/// buffers `typebuf_init`/`noremapbuf_init`) have no counterpart
+/// either: those buffers don't exist in this crate's `Vec`-based
+/// redesign in the first place. Kept as a real, named, callable
+/// function (rather than inlined away) since the original has a
+/// second call site, in the not-yet-translated `closescript`.
+fn free_typebuf() {}
+
+/// Save all three kinds of typeahead, so that the user must type at a
+/// prompt (`save_typeahead`).
+///
+/// Clones `TYPEBUF`'s current contents into `tp.save_typebuf` (the
+/// original's own `tp->save_typebuf = typebuf;` plain struct
+/// assignment - a full deep copy here rather than the original's
+/// "steal the pointer" trick, since `tb_buf`/`tb_noremap` are owned
+/// `Vec<u8>`s, not raw pointers; the momentary extra copy is
+/// immediately made moot by `alloc_typebuf`'s own very next
+/// overwrite of the live buffers, so this has no observable effect on
+/// any caller), then resets the live typeahead buffer via
+/// `alloc_typebuf` - called in that exact order so `tb_change_cnt`
+/// continues counting up from its real, pre-save value (matching the
+/// original's own "copy first, increment the still-untouched original
+/// second" order precisely).
+///
+/// Always sets `tp.typebuf_valid = true`, matching the original
+/// exactly (there is no failure path in the current implementation).
+pub fn save_typeahead(tp: &mut crate::input_defs::TasaveT) {
+    tp.save_typebuf = unsafe { TYPEBUF.get_mut() }.clone();
+    alloc_typebuf();
+    tp.typebuf_valid = true;
+
+    tp.old_char = unsafe { *OLD_CHAR.get_mut() };
+    tp.old_mod_mask = unsafe { *OLD_MOD_MASK.get_mut() };
+    unsafe { *OLD_CHAR.get_mut() = -1 };
+
+    tp.save_readbuf1 = unsafe { READBUF1.get_mut() }.clone();
+    free_buff(unsafe { READBUF1.get_mut() });
+    tp.save_readbuf2 = unsafe { READBUF2.get_mut() }.clone();
+    free_buff(unsafe { READBUF2.get_mut() });
+}
+
+/// Restore the typeahead to what it was before calling
+/// [`save_typeahead`] (`restore_typeahead`).
+///
+/// Should only be called once per [`save_typeahead`] call (matching
+/// the original's own "can only be called once!" doc comment) - a
+/// second call would restore whatever `tp`'s fields happen to still
+/// hold (this crate does not statically enforce single-use, matching
+/// the original's own lack of enforcement).
+pub fn restore_typeahead(tp: &mut crate::input_defs::TasaveT) {
+    if tp.typebuf_valid {
+        free_typebuf();
+        *unsafe { TYPEBUF.get_mut() } = std::mem::take(&mut tp.save_typebuf);
+    }
+
+    unsafe { *OLD_CHAR.get_mut() = tp.old_char };
+    unsafe { *OLD_MOD_MASK.get_mut() = tp.old_mod_mask };
+
+    free_buff(unsafe { READBUF1.get_mut() });
+    *unsafe { READBUF1.get_mut() } = std::mem::take(&mut tp.save_readbuf1);
+    free_buff(unsafe { READBUF2.get_mut() });
+    *unsafe { READBUF2.get_mut() } = std::mem::take(&mut tp.save_readbuf2);
 }
 
 #[cfg(test)]
@@ -628,5 +769,160 @@ mod tests {
         stuffnum_readbuff(123);
         assert_eq!(unsafe { READBUF1.get_mut() }.blocks[0].b_str, b"123");
         reset_buffers();
+    }
+
+    // --- free_buff / alloc_typebuf / free_typebuf ---
+
+    #[test]
+    fn free_buff_clears_blocks_but_leaves_bh_index_untouched() {
+        let mut buf = BuffheaderT {
+            blocks: vec![BuffblockT { b_str: b"x".to_vec() }],
+            bh_index: 7,
+        };
+        free_buff(&mut buf);
+        assert!(buf.blocks.is_empty());
+        assert_eq!(buf.bh_index, 7, "free_buff never touches bh_index, matching the original");
+    }
+
+    #[test]
+    fn alloc_typebuf_resets_fields_and_increments_change_cnt() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_buf = vec![1, 2, 3];
+        unsafe { TYPEBUF.get_mut() }.tb_len = 5;
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 10;
+        unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled = true;
+
+        alloc_typebuf();
+
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert!(tb.tb_buf.is_empty());
+        assert!(tb.tb_noremap.is_empty());
+        assert_eq!(tb.tb_off, MAXMAPLEN + 4);
+        assert_eq!(tb.tb_len, 0);
+        assert_eq!(tb.tb_change_cnt, 11);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.typebuf_was_filled);
+        reset_buffers();
+    }
+
+    #[test]
+    fn alloc_typebuf_wraps_change_cnt_from_negative_one_to_one() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = -1;
+        alloc_typebuf();
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_change_cnt, 1);
+        reset_buffers();
+    }
+
+    // --- save_typeahead / restore_typeahead ---
+
+    fn reset_old_char() {
+        unsafe {
+            *OLD_CHAR.get_mut() = -1;
+            *OLD_MOD_MASK.get_mut() = 0;
+        }
+    }
+
+    #[test]
+    fn save_typeahead_captures_and_resets_all_three_buffers() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        reset_old_char();
+
+        unsafe { TYPEBUF.get_mut() }.tb_buf = vec![1, 2, 3];
+        unsafe { TYPEBUF.get_mut() }.tb_len = 5;
+        unsafe { TYPEBUF.get_mut() }.tb_change_cnt = 10;
+        unsafe { READBUF1.get_mut() }.blocks.push(BuffblockT { b_str: b"abc".to_vec() });
+        unsafe { READBUF2.get_mut() }.blocks.push(BuffblockT { b_str: b"xyz".to_vec() });
+        unsafe {
+            *OLD_CHAR.get_mut() = 42;
+            *OLD_MOD_MASK.get_mut() = 7;
+        }
+
+        let mut tp = crate::input_defs::TasaveT::default();
+        save_typeahead(&mut tp);
+
+        // Captured into tp:
+        assert!(tp.typebuf_valid);
+        assert_eq!(tp.save_typebuf.tb_buf, vec![1, 2, 3]);
+        assert_eq!(tp.save_typebuf.tb_len, 5);
+        assert_eq!(tp.save_typebuf.tb_change_cnt, 10);
+        assert_eq!(tp.old_char, 42);
+        assert_eq!(tp.old_mod_mask, 7);
+        assert_eq!(tp.save_readbuf1.blocks[0].b_str, b"abc");
+        assert_eq!(tp.save_readbuf2.blocks[0].b_str, b"xyz");
+
+        // Live state reset:
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert!(tb.tb_buf.is_empty());
+        assert_eq!(tb.tb_len, 0);
+        assert_eq!(tb.tb_change_cnt, 11);
+        assert_eq!(unsafe { *OLD_CHAR.get_mut() }, -1);
+        assert!(unsafe { READBUF1.get_mut() }.blocks.is_empty());
+        assert!(unsafe { READBUF2.get_mut() }.blocks.is_empty());
+
+        reset_buffers();
+        reset_old_char();
+    }
+
+    #[test]
+    fn restore_typeahead_round_trips_through_save_typeahead() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        reset_old_char();
+
+        unsafe { TYPEBUF.get_mut() }.tb_buf = vec![9, 9, 9];
+        unsafe { TYPEBUF.get_mut() }.tb_len = 3;
+        unsafe { READBUF1.get_mut() }.blocks.push(BuffblockT { b_str: b"one".to_vec() });
+        unsafe { READBUF2.get_mut() }.blocks.push(BuffblockT { b_str: b"two".to_vec() });
+        unsafe {
+            *OLD_CHAR.get_mut() = 5;
+            *OLD_MOD_MASK.get_mut() = 1;
+        }
+
+        let mut tp = crate::input_defs::TasaveT::default();
+        save_typeahead(&mut tp);
+        restore_typeahead(&mut tp);
+
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_buf, vec![9, 9, 9]);
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_len, 3);
+        assert_eq!(unsafe { *OLD_CHAR.get_mut() }, 5);
+        assert_eq!(unsafe { *OLD_MOD_MASK.get_mut() }, 1);
+        assert_eq!(unsafe { READBUF1.get_mut() }.blocks[0].b_str, b"one");
+        assert_eq!(unsafe { READBUF2.get_mut() }.blocks[0].b_str, b"two");
+
+        reset_buffers();
+        reset_old_char();
+    }
+
+    #[test]
+    fn restore_typeahead_skips_typebuf_when_not_valid_but_still_restores_the_rest() {
+        let _lock = global_state_test_lock();
+        reset_buffers();
+        reset_old_char();
+
+        unsafe { TYPEBUF.get_mut() }.tb_len = 77;
+
+        let mut tp = crate::input_defs::TasaveT {
+            typebuf_valid: false,
+            save_typebuf: crate::input_defs::TypebufT { tb_len: 999, ..Default::default() },
+            old_char: 5,
+            old_mod_mask: 1,
+            save_readbuf1: BuffheaderT { blocks: vec![BuffblockT { b_str: b"r1".to_vec() }], bh_index: 0 },
+            save_readbuf2: BuffheaderT::default(),
+            save_inputbuf: Default::default(),
+        };
+        restore_typeahead(&mut tp);
+
+        // typebuf itself is untouched since typebuf_valid was false:
+        assert_eq!(unsafe { TYPEBUF.get_mut() }.tb_len, 77);
+        // But old_char/old_mod_mask/readbufs are restored unconditionally:
+        assert_eq!(unsafe { *OLD_CHAR.get_mut() }, 5);
+        assert_eq!(unsafe { *OLD_MOD_MASK.get_mut() }, 1);
+        assert_eq!(unsafe { READBUF1.get_mut() }.blocks[0].b_str, b"r1");
+
+        reset_buffers();
+        reset_old_char();
     }
 }

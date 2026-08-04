@@ -69,6 +69,21 @@
 //! quit-related logic) remain untranslated, matching this crate's
 //! established "small, simple, mechanically correct piece ahead of
 //! its real caller" precedent.
+//!
+//! Also translated: [`SaveStateT`] (`save_state_T`) +
+//! [`save_current_state`]/[`restore_current_state`] - save/restore the
+//! current State/typeahead/operator-pending state around a temporary
+//! switch to Normal mode (e.g. `:normal`). Needed only already-real
+//! `GLOBALS` fields (`msg_scroll`/`restart_edit`/`msg_didout`/`State`/
+//! `finish_op`/`opcount`/`reg_executing`/`pending_end_reg_executing`/
+//! `force_restart_edit`) plus `input.c`'s newly-translated
+//! `save_typeahead`/`restore_typeahead` (`crate::input`). The
+//! original's own `ui_cursor_shape()` call in `restore_current_state`
+//! is omitted (a pure UI-redraw hint, see that function's own doc
+//! comment). Translated ahead of their real callers (`exec_normal` in
+//! this same file, and `menu.c`'s `ex_emenu`-adjacent code - neither
+//! translated yet), matching this crate's established "small, simple,
+//! mechanically correct piece ahead of its real caller" precedent.
 
 use crate::buffer_defs::b_flags;
 
@@ -405,6 +420,99 @@ pub unsafe fn not_exiting(save_exiting: bool) {
     unsafe { crate::globals::GLOBALS.get_mut() }.exiting = save_exiting;
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Exitreason, None) };
+}
+
+/// Structure used to save the current state - used when executing
+/// Normal mode commands while in any other mode (`save_state_T`).
+#[derive(Debug, Clone, Default)]
+pub struct SaveStateT {
+    pub save_msg_scroll: i32,
+    pub save_restart_edit: i32,
+    pub save_msg_didout: bool,
+    /// the original's own `save_State` (matching `GLOBALS.State`'s
+    /// own preserved capitalization; this field itself is just a
+    /// plain copy holder, not a distinctly-recognized identifier, so
+    /// it uses ordinary snake_case).
+    pub save_state: i32,
+    pub save_finish_op: bool,
+    pub save_opcount: i32,
+    pub save_reg_executing: i32,
+    pub save_pending_end_reg_executing: bool,
+    pub tabuf: crate::input_defs::TasaveT,
+}
+
+/// Save the current State and go to Normal mode (`save_current_state`).
+///
+/// Returns whether the typeahead could be saved - forwarded from
+/// `sst.tabuf.typebuf_valid`, which [`crate::input::save_typeahead`]
+/// always sets `true` today (there is no failure path in the current
+/// implementation, matching the original exactly).
+///
+/// # Safety
+/// `crate::globals::GLOBALS` must be in a consistent state, matching
+/// every other direct `GLOBALS` accessor in this crate.
+pub unsafe fn save_current_state(sst: &mut SaveStateT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    sst.save_msg_scroll = g.msg_scroll;
+    sst.save_restart_edit = g.restart_edit;
+    sst.save_msg_didout = g.msg_didout;
+    sst.save_state = g.State;
+    sst.save_finish_op = g.finish_op;
+    sst.save_opcount = g.opcount;
+    sst.save_reg_executing = g.reg_executing;
+    sst.save_pending_end_reg_executing = g.pending_end_reg_executing;
+
+    g.msg_scroll = 0; // no msg scrolling in Normal mode
+    g.restart_edit = 0; // don't go to Insert mode
+
+    // Save the current typeahead. This is required to allow using
+    // ":normal" from an event handler and makes sure we don't hang
+    // when the argument ends with half a command.
+    crate::input::save_typeahead(&mut sst.tabuf);
+    sst.tabuf.typebuf_valid
+}
+
+/// Restore the state saved by [`save_current_state`]
+/// (`restore_current_state`).
+///
+/// The original's own `ui_cursor_shape()` call (may update the cursor
+/// shape and/or handle a cursor now concealed/unconcealed) is omitted:
+/// it is a pure UI-redraw hint
+/// (`ui_cursor_shape_no_check_conceal`/`conceal_check_cursor_line`,
+/// both deep in the not-yet-translated rendering/UI-dispatch
+/// subsystem) with no effect on any state this crate currently models,
+/// matching this crate's established `redraw_later`-omission
+/// precedent.
+///
+/// # Safety
+/// Same as [`save_current_state`].
+pub unsafe fn restore_current_state(sst: &mut SaveStateT) {
+    // Restore the previous typeahead.
+    crate::input::restore_typeahead(&mut sst.tabuf);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.msg_scroll = sst.save_msg_scroll;
+    if g.force_restart_edit {
+        g.force_restart_edit = false;
+    } else {
+        // Some function (terminal_enter()) was aware of ex_normal and
+        // decided to override the value of restart_edit anyway.
+        g.restart_edit = sst.save_restart_edit;
+    }
+    g.finish_op = sst.save_finish_op;
+    g.opcount = sst.save_opcount;
+    g.reg_executing = sst.save_reg_executing;
+    g.pending_end_reg_executing = sst.save_pending_end_reg_executing;
+
+    // don't reset msg_didout now
+    g.msg_didout |= sst.save_msg_didout;
+
+    // Restore the state (needed when called from a function executed
+    // for 'indentexpr'). Update the mouse and cursor, they may have
+    // changed.
+    g.State = sst.save_state;
 }
 
 #[cfg(test)]
@@ -808,5 +916,153 @@ mod tests {
             unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Exitreason) },
             Vec::<u8>::new()
         );
+    }
+
+    // --- save_current_state / restore_current_state ---
+
+    /// Snapshot of every `GLOBALS` field `save_current_state`/
+    /// `restore_current_state` touch, so each test can restore the
+    /// exact pre-test values afterward (this process-wide state is
+    /// shared with every other test in the crate).
+    struct StateSnapshot {
+        msg_scroll: i32,
+        restart_edit: i32,
+        msg_didout: bool,
+        state: i32,
+        finish_op: bool,
+        opcount: i32,
+        reg_executing: i32,
+        pending_end_reg_executing: bool,
+        force_restart_edit: bool,
+    }
+
+    impl StateSnapshot {
+        fn capture() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            StateSnapshot {
+                msg_scroll: g.msg_scroll,
+                restart_edit: g.restart_edit,
+                msg_didout: g.msg_didout,
+                state: g.State,
+                finish_op: g.finish_op,
+                opcount: g.opcount,
+                reg_executing: g.reg_executing,
+                pending_end_reg_executing: g.pending_end_reg_executing,
+                force_restart_edit: g.force_restart_edit,
+            }
+        }
+
+        fn restore(self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.msg_scroll = self.msg_scroll;
+            g.restart_edit = self.restart_edit;
+            g.msg_didout = self.msg_didout;
+            g.State = self.state;
+            g.finish_op = self.finish_op;
+            g.opcount = self.opcount;
+            g.reg_executing = self.reg_executing;
+            g.pending_end_reg_executing = self.pending_end_reg_executing;
+            g.force_restart_edit = self.force_restart_edit;
+        }
+    }
+
+    #[test]
+    fn save_current_state_captures_globals_and_resets_msg_scroll_and_restart_edit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let snap = StateSnapshot::capture();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.msg_scroll = 5;
+        g.restart_edit = 3;
+        g.msg_didout = true;
+        g.State = 0x10;
+        g.finish_op = true;
+        g.opcount = 7;
+        g.reg_executing = i32::from(b'a');
+        g.pending_end_reg_executing = true;
+
+        let mut sst = SaveStateT::default();
+        let ok = unsafe { save_current_state(&mut sst) };
+
+        assert!(ok, "save_typeahead always sets typebuf_valid true today");
+        assert_eq!(sst.save_msg_scroll, 5);
+        assert_eq!(sst.save_restart_edit, 3);
+        assert!(sst.save_msg_didout);
+        assert_eq!(sst.save_state, 0x10);
+        assert!(sst.save_finish_op);
+        assert_eq!(sst.save_opcount, 7);
+        assert_eq!(sst.save_reg_executing, i32::from(b'a'));
+        assert!(sst.save_pending_end_reg_executing);
+
+        let g2 = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g2.msg_scroll, 0, "no msg scrolling in Normal mode");
+        assert_eq!(g2.restart_edit, 0, "don't go to Insert mode");
+
+        snap.restore();
+    }
+
+    #[test]
+    fn restore_current_state_round_trips_through_save_current_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let snap = StateSnapshot::capture();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.msg_scroll = 9;
+        g.restart_edit = 4;
+        g.State = 0x20;
+        g.force_restart_edit = false;
+
+        let mut sst = SaveStateT::default();
+        unsafe { save_current_state(&mut sst) };
+
+        // Simulate state changing during Normal-mode command execution.
+        let g2 = unsafe { crate::globals::GLOBALS.get_mut() };
+        g2.msg_scroll = 999;
+        g2.restart_edit = 999;
+        g2.State = 0xff;
+
+        unsafe { restore_current_state(&mut sst) };
+
+        let g3 = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g3.msg_scroll, 9);
+        assert_eq!(g3.restart_edit, 4);
+        assert_eq!(g3.State, 0x20);
+
+        snap.restore();
+    }
+
+    #[test]
+    fn restore_current_state_force_restart_edit_overrides_saved_restart_edit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let snap = StateSnapshot::capture();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.restart_edit = 100;
+        g.force_restart_edit = true;
+
+        let mut sst = SaveStateT { save_restart_edit: 42, ..Default::default() };
+        unsafe { restore_current_state(&mut sst) };
+
+        let g2 = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g2.restart_edit, 100, "restart_edit untouched since force_restart_edit was true");
+        assert!(!g2.force_restart_edit, "force_restart_edit itself is always cleared");
+
+        snap.restore();
+    }
+
+    #[test]
+    fn restore_current_state_msg_didout_is_ored_in_not_overwritten() {
+        let _lock = crate::globals::global_state_test_lock();
+        let snap = StateSnapshot::capture();
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.msg_didout = true;
+        let mut sst = SaveStateT { save_msg_didout: false, ..Default::default() };
+        unsafe { restore_current_state(&mut sst) };
+        assert!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.msg_didout,
+            "true | false == true, stays true"
+        );
+
+        snap.restore();
     }
 }
