@@ -39,11 +39,16 @@
 //! index-to-valid-values-table lookup, and the generic "is this
 //! string a valid value for this option" checker built on it), and
 //! [`did_set_str_generic`] - the first real, callback-shaped
-//! `did_set_*` function, plus two of its own small siblings that
-//! needed nothing beyond it: [`did_set_backupext_or_patchmode`]
-//! (`'backupext'`/`'patchmode'` can't both resolve to the same
-//! effective suffix) and [`did_set_backspace`] (a numeric legacy
-//! `'2'` spelling, or else delegate to `did_set_str_generic`).
+//! `did_set_*` function, plus 4 of its own small siblings that
+//! needed nothing beyond it/already-real state:
+//! [`did_set_backupext_or_patchmode`] (`'backupext'`/`'patchmode'`
+//! can't both resolve to the same effective suffix),
+//! [`did_set_backspace`] (a numeric legacy `'2'` spelling, or else
+//! delegate to `did_set_str_generic`), [`did_set_helpfile`] (may
+//! unset `$VIM`/`$VIMRUNTIME` to force a later recompute), and
+//! [`did_set_helplang`] (a comma-separated-list-of-2-letter-codes
+//! validator, hand-traced against the original's own NUL-terminator-
+//! relying 3-byte-stride scan - see its own doc comment).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -279,6 +284,76 @@ pub unsafe fn did_set_backspace(args: &mut crate::option_defs::OptsetT) -> Optio
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { did_set_str_generic(args) }
 }
+
+/// The `'helpfile'` option is changed (`did_set_helpfile`).
+///
+/// May force recomputing `$VIM`/`$VIMRUNTIME` (by unsetting them,
+/// deferring the actual recompute to whoever later reads them) - a
+/// real, faithful, state-mutating side effect kept even though
+/// nothing in this crate currently reads `$VIM`/`$VIMRUNTIME` back out
+/// via the recompute path itself (`vim_getenv`'s own
+/// `$VIM`/`$VIMRUNTIME`-auto-discovery fallback is still deferred).
+///
+/// # Safety
+/// Forwards `crate::os::env::vim_unsetenv_ext`'s own safety
+/// requirements (touches `crate::globals::GLOBALS`).
+pub unsafe fn did_set_helpfile() -> Option<&'static [u8]> {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let didset_vim = globals.didset_vim;
+    let didset_vimruntime = globals.didset_vimruntime;
+    if didset_vim {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::os::env::vim_unsetenv_ext(b"VIM") };
+    }
+    if didset_vimruntime {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::os::env::vim_unsetenv_ext(b"VIMRUNTIME") };
+    }
+    None
+}
+
+/// The `'helplang'` option is changed (`did_set_helplang`).
+///
+/// Validates a comma-separated list of exactly-2-letter language
+/// codes (`""`, `"ab"`, `"ab,cd"`, `"ab,cd,ef"`, ...). Hand-traced
+/// against the original's own 3-byte-stride scan (which relies on a
+/// NUL terminator existing at-or-past the string's own logical end -
+/// translated here as `s.get(i + n).is_none()` standing in for "byte
+/// `i + n` is the NUL terminator", exactly matching every real
+/// occurrence of `== NUL`/short-circuited-away read in the original):
+/// - `""` -> valid (loop never runs).
+/// - `"ab"` -> valid (2nd byte is a real char, 3rd position is the
+///   terminator, matching the original's own short-circuited
+///   `(s[2] != ',' || ...) && s[2] != NUL` evaluating to `false`).
+/// - `"ab,cd"` -> valid (each 2-letter code followed by `,` then
+///   another 2-letter code, terminator right after the last one).
+/// - `"a"` (a single trailing byte) -> invalid (`s[1]` would be the
+///   terminator, i.e. no 2nd letter).
+/// - `"ab,"` (trailing comma, nothing after) -> invalid (`s[3]` would
+///   be the terminator right after the comma).
+/// - `"abc"` (3rd byte isn't a comma or the terminator) -> invalid.
+pub fn did_set_helplang() -> Option<&'static [u8]> {
+    // SAFETY: a plain, momentary read - no aliasing hazard.
+    let p_hlg = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg.clone();
+    let s: &[u8] = p_hlg.as_deref().unwrap_or(&[]);
+    let mut i = 0usize;
+    while i < s.len() {
+        if s.get(i + 1).is_none() {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        match s.get(i + 2) {
+            Some(&c2) => {
+                if c2 != b',' || s.get(i + 3).is_none() {
+                    return Some(crate::errors::e_invarg.as_bytes());
+                }
+            }
+            None => break,
+        }
+        i += 3;
+    }
+    None
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -653,5 +728,109 @@ mod tests {
         let mut args = crate::option_defs::OptsetT { os_idx: OptIndex::Backspace, ..Default::default() };
         assert_eq!(unsafe { did_set_backspace(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bs = prev;
+    }
+
+    // ---- did_set_helpfile ----
+
+    #[test]
+    fn did_set_helpfile_unsets_vim_and_vimruntime_when_both_are_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_vim = globals.didset_vim;
+        let prev_vimruntime = globals.didset_vimruntime;
+        globals.didset_vim = true;
+        globals.didset_vimruntime = true;
+
+        assert_eq!(unsafe { did_set_helpfile() }, None);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(!globals.didset_vim);
+        assert!(!globals.didset_vimruntime);
+        globals.didset_vim = prev_vim;
+        globals.didset_vimruntime = prev_vimruntime;
+    }
+
+    #[test]
+    fn did_set_helpfile_leaves_flags_untouched_when_neither_is_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_vim = globals.didset_vim;
+        let prev_vimruntime = globals.didset_vimruntime;
+        globals.didset_vim = false;
+        globals.didset_vimruntime = false;
+
+        assert_eq!(unsafe { did_set_helpfile() }, None);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(!globals.didset_vim);
+        assert!(!globals.didset_vimruntime);
+        globals.didset_vim = prev_vim;
+        globals.didset_vimruntime = prev_vimruntime;
+    }
+
+    // ---- did_set_helplang ----
+
+    fn set_p_hlg(value: Option<&[u8]>) -> Option<Vec<u8>> {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_hlg.clone();
+        opts.p_hlg = value.map(<[u8]>::to_vec);
+        prev
+    }
+
+    #[test]
+    fn did_set_helplang_empty_is_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b""));
+        assert_eq!(did_set_helplang(), None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_single_two_letter_code_is_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b"ab"));
+        assert_eq!(did_set_helplang(), None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_comma_separated_codes_are_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b"ab,cd,ef"));
+        assert_eq!(did_set_helplang(), None);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_single_leftover_byte_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b"a"));
+        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_trailing_comma_with_nothing_after_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b"ab,"));
+        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_third_byte_not_a_comma_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = set_p_hlg(Some(b"abc"));
+        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    #[test]
+    fn did_set_helplang_middle_code_missing_second_letter_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "ab,c" - the 2nd code's own 2nd letter is the terminator.
+        let prev = set_p_hlg(Some(b"ab,c"));
+        assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
     }
 }
