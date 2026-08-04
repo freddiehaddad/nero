@@ -364,6 +364,87 @@ pub fn utf_ptr2char(p: &[u8]) -> i32 {
         as i32
 }
 
+/// Whether `byte` is a UTF-8 continuation (trail) byte
+/// (`utf_is_trail_byte`).
+#[must_use]
+pub const fn utf_is_trail_byte(byte: u8) -> bool {
+    (byte & 0xC0) == 0x80
+}
+
+/// The byte offsets from `p` (at index `pos` within `base`) to the
+/// first and one-past-end bytes of the codepoint it points into,
+/// looking at no more than `p_len` bytes forward
+/// (`utf_cp_bounds_len`).
+///
+/// `pos` may point anywhere in the byte stream, including into the
+/// middle of a multi-byte sequence - that is the whole purpose of this
+/// function. An illegal or incomplete sequence yields `{ 0, 1 }`.
+///
+/// The original takes two raw pointers (`base` and `p_in`) purely so
+/// it can bound how far backward the scan may walk; a slice plus an
+/// index carries the same information without raw pointers.
+///
+/// # Panics
+/// In debug builds, if `pos` is out of bounds or `p_len` is zero.
+#[must_use]
+pub fn utf_cp_bounds_len(
+    base: &[u8],
+    pos: usize,
+    p_len: i32,
+) -> crate::mbyte_defs::CharBoundsOff {
+    use crate::mbyte_defs::CharBoundsOff;
+    const ILLEGAL: CharBoundsOff = CharBoundsOff {
+        begin_off: 0,
+        end_off: 1,
+    };
+    debug_assert!(pos < base.len() && p_len > 0);
+    if base[pos] < 0x80 {
+        // be quick for ASCII
+        return ILLEGAL;
+    }
+
+    // How far back the scan may walk: not past `base`'s start, and
+    // never more than one maximal codepoint.
+    let max_first_off = -(pos.min(crate::mbyte_defs::MB_MAXCHAR - 1) as i32);
+    let mut first_off = 0i32;
+    while utf_is_trail_byte(base[(pos as i32 + first_off) as usize]) {
+        if first_off == max_first_off {
+            // failed to find first byte
+            return ILLEGAL;
+        }
+        first_off -= 1;
+    }
+
+    let lead = base[(pos as i32 + first_off) as usize];
+    let max_end_off = i32::from(UTF8LEN_TAB[lead as usize]) + first_off;
+    if max_end_off <= 0 || max_end_off > p_len {
+        // illegal or incomplete sequence
+        return ILLEGAL;
+    }
+
+    for end_off in 1..max_end_off {
+        let idx = pos as i32 + end_off;
+        if idx as usize >= base.len() || !utf_is_trail_byte(base[idx as usize]) {
+            // not enough trail bytes
+            return ILLEGAL;
+        }
+    }
+
+    CharBoundsOff {
+        begin_off: i8::try_from(-first_off).unwrap_or(0),
+        end_off: i8::try_from(max_end_off).unwrap_or(1),
+    }
+}
+
+/// The byte offsets from `pos` to the first and one-past-end bytes of
+/// the codepoint it points into (`utf_cp_bounds`).
+///
+/// Counts individual codepoints of composed characters separately.
+#[must_use]
+pub fn utf_cp_bounds(base: &[u8], pos: usize) -> crate::mbyte_defs::CharBoundsOff {
+    utf_cp_bounds_len(base, pos, i32::MAX)
+}
+
 /// Determine how many bytes certain unicode codepoint will occupy
 /// (`utf_char2len`).
 #[must_use]
@@ -2493,6 +2574,54 @@ mod tests {
         assert_eq!(ci1.pos, 1);
         assert_eq!(ci1.chr.value, 0);
         assert_eq!(ci1.chr.len, 1);
+    }
+
+    #[test]
+    fn utf_is_trail_byte_matches_the_continuation_bit_pattern() {
+        assert!(utf_is_trail_byte(0x80));
+        assert!(utf_is_trail_byte(0xBF));
+        assert!(!utf_is_trail_byte(0x7F)); // ASCII
+        assert!(!utf_is_trail_byte(0xC0)); // 2-byte lead
+        assert!(!utf_is_trail_byte(0xE0)); // 3-byte lead
+    }
+
+    #[test]
+    fn utf_cp_bounds_locates_the_codepoint_from_any_byte_inside_it() {
+        // "─" is E2 94 80: from each of its three bytes the reported
+        // window must cover the whole codepoint.
+        let s = "─".as_bytes();
+        assert_eq!(s.len(), 3);
+        for (pos, begin, end) in [(0usize, 0i8, 3i8), (1, 1, 2), (2, 2, 1)] {
+            let b = utf_cp_bounds(s, pos);
+            assert_eq!((b.begin_off, b.end_off), (begin, end), "at {pos}");
+            // The codepoint spans `pos - begin_off .. pos + end_off`,
+            // so the two offsets always SUM to its byte length.
+            assert_eq!(i32::from(b.begin_off) + i32::from(b.end_off), 3, "at {pos}");
+        }
+    }
+
+    #[test]
+    fn utf_cp_bounds_reports_a_single_byte_for_ascii_and_illegal_input() {
+        // ASCII takes the fast path.
+        let b = utf_cp_bounds(b"abc", 1);
+        assert_eq!((b.begin_off, b.end_off), (0, 1));
+
+        // A lone continuation byte has no lead byte to find.
+        let b = utf_cp_bounds(&[0x80, 0x80], 0);
+        assert_eq!((b.begin_off, b.end_off), (0, 1));
+
+        // A lead byte whose trail bytes are missing is incomplete.
+        let b = utf_cp_bounds(&[0xE2, 0x41], 0);
+        assert_eq!((b.begin_off, b.end_off), (0, 1));
+    }
+
+    #[test]
+    fn utf_cp_bounds_len_rejects_a_sequence_that_runs_past_the_limit() {
+        // The full three-byte sequence is fine unbounded...
+        let s = "─".as_bytes();
+        assert_eq!(utf_cp_bounds_len(s, 0, 3).end_off, 3);
+        // ...but reports a single byte when only two may be examined.
+        assert_eq!(utf_cp_bounds_len(s, 0, 2).end_off, 1);
     }
 
     #[test]

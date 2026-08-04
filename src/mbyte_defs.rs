@@ -13,7 +13,6 @@
 //! - `ConvFlags`/`vimconv_T`: needs a real `iconv_t` FFI/crate decision
 //!   (`iconv_defs.rs` already notes this - the real iconv binding is a
 //!   vendored third-party dependency, not yet reached via FFI).
-//! - `CharBoundsOff`: not needed by any translated caller yet.
 
 /// Maximum number of bytes in a multi-byte character. It can be one
 /// 32-bit character of up to 6 bytes, or one 16-bit character of up to
@@ -23,6 +22,20 @@ pub const MB_MAXBYTES: usize = 21;
 /// Maximum length of a Unicode character, excluding composing
 /// characters (`MB_MAXCHAR`).
 pub const MB_MAXCHAR: usize = 6;
+
+/// The byte offsets from some position `p` to the first byte, and to
+/// one past the last byte, of the codepoint `p` points into
+/// (`CharBoundsOff`).
+///
+/// `begin_off` is how far BACKWARD the codepoint starts (so `0` when
+/// `p` is already on a lead byte), and `end_off` how far forward it
+/// ends. An illegal or incomplete sequence yields `{ 0, 1 }`, i.e.
+/// "treat this single byte as the whole character".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CharBoundsOff {
+    pub begin_off: i8,
+    pub end_off: i8,
+}
 
 /// Information about a single (possibly multi-byte) character:
 /// its decoded codepoint and its byte length (`CharInfo`).
