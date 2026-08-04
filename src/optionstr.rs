@@ -48,7 +48,11 @@
 //! unset `$VIM`/`$VIMRUNTIME` to force a later recompute), and
 //! [`did_set_helplang`] (a comma-separated-list-of-2-letter-codes
 //! validator, hand-traced against the original's own NUL-terminator-
-//! relying 3-byte-stride scan - see its own doc comment).
+//! relying 3-byte-stride scan - see its own doc comment). Also
+//! [`did_set_completeopt`] - the `'completeopt'` per-window/buffer
+//! comma-list callback, following the same real
+//! `OPT_LOCAL`/`OPT_GLOBAL`-branching shape `get_varp_scope_from`'s
+//! own already-real dispatch already established.
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -354,6 +358,47 @@ pub fn did_set_helplang() -> Option<&'static [u8]> {
     None
 }
 
+/// The `'completeopt'` option is changed (`did_set_completeopt`).
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_completeopt(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf = args.os_buf as *mut crate::buffer_defs::BufT;
+    let opt_flags = args.os_flags as u32;
+
+    let (cot, flags_ptr): (Option<Vec<u8>>, *mut u32) = if opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &mut *buf };
+        (b.b_p_cot.clone(), std::ptr::addr_of_mut!(b.b_cot_flags))
+    } else {
+        if opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+            // When using `:set`, clear the local flags.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                (*buf).b_cot_flags = 0;
+            }
+        }
+        // SAFETY: a plain, momentary read/pointer-take - no aliasing
+        // hazard (the pointer is only dereferenced after this call
+        // returns, once the `opt_strings_flags` result is known).
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (opts.p_cot.clone(), std::ptr::addr_of_mut!(opts.cot_flags))
+    };
+
+    let cot_bytes: &[u8] = cot.as_deref().unwrap_or(&[]);
+    match opt_strings_flags(cot_bytes, crate::option_vars::OPT_COT_VALUES, true) {
+        Some(new_flags) => {
+            // SAFETY: `flags_ptr` points at either `buf.b_cot_flags`
+            // or `OPTION_VARS.cot_flags`, both live for the whole call.
+            unsafe {
+                *flags_ptr = new_flags;
+            }
+            None
+        }
+        None => Some(crate::errors::e_invarg.as_bytes()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -832,5 +877,86 @@ mod tests {
         let prev = set_p_hlg(Some(b"ab,c"));
         assert_eq!(did_set_helplang(), Some(crate::errors::e_invarg.as_bytes()));
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hlg = prev;
+    }
+
+    // ---- did_set_completeopt ----
+
+    #[test]
+    fn did_set_completeopt_local_reads_and_writes_the_buffer_local_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_cot: Some(b"menu,longest".to_vec()), b_cot_flags: 0, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_completeopt(&mut args) }, None);
+        // "menu" is index 2, "longest" is index 1 in OPT_COT_VALUES.
+        assert_eq!(buf.b_cot_flags, (1 << 2) | (1 << 1));
+    }
+
+    #[test]
+    fn did_set_completeopt_local_invalid_value_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT { b_p_cot: Some(b"bogus".to_vec()), b_cot_flags: 0, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_completeopt(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
+    }
+
+    #[test]
+    fn did_set_completeopt_global_reads_and_writes_the_global_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_cot = opts.p_cot.clone();
+        let prev_flags = opts.cot_flags;
+        opts.p_cot = Some(b"noselect".to_vec());
+        opts.cot_flags = 0;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: crate::option_defs::opt_set_flags::OPT_GLOBAL as i32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_completeopt(&mut args) }, None);
+        // "noselect" is index 6 in OPT_COT_VALUES.
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags, 1 << 6);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_cot = prev_cot;
+        opts.cot_flags = prev_flags;
+    }
+
+    #[test]
+    fn did_set_completeopt_plain_set_clears_the_buffer_local_flags_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_cot = opts.p_cot.clone();
+        let prev_flags = opts.cot_flags;
+        opts.p_cot = Some(b"popup".to_vec());
+        opts.cot_flags = 0;
+
+        // Neither OPT_LOCAL nor OPT_GLOBAL set (a plain ":set" call) -
+        // the buffer's own stale local flags must be cleared to 0
+        // first, matching the original's own "clear the local flags"
+        // comment exactly.
+        let mut buf = crate::buffer_defs::BufT { b_cot_flags: 0xFF, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: 0,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_completeopt(&mut args) }, None);
+        assert_eq!(buf.b_cot_flags, 0);
+        // "popup" is index 8 in OPT_COT_VALUES.
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags, 1 << 8);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_cot = prev_cot;
+        opts.cot_flags = prev_flags;
     }
 }
