@@ -2177,10 +2177,10 @@ pub unsafe fn typval_compare(typ1: &mut TypvalT, typ2: &TypvalT, typ: ExprType, 
     } else if matches!(typ1.value, TypvalValue::Blob(_)) || matches!(typ2.value, TypvalValue::Blob(_)) {
         if type_is {
             let mut eq = typ1.var_type() == typ2.var_type();
-            if eq {
-                if let (TypvalValue::Blob(b1), TypvalValue::Blob(b2)) = (&typ1.value, &typ2.value) {
-                    eq = b1 == b2;
-                }
+            if eq
+                && let (TypvalValue::Blob(b1), TypvalValue::Blob(b2)) = (&typ1.value, &typ2.value)
+            {
+                eq = b1 == b2;
             }
             n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
         } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
@@ -2203,10 +2203,10 @@ pub unsafe fn typval_compare(typ1: &mut TypvalT, typ2: &TypvalT, typ: ExprType, 
     } else if matches!(typ1.value, TypvalValue::List(_)) || matches!(typ2.value, TypvalValue::List(_)) {
         if type_is {
             let mut eq = typ1.var_type() == typ2.var_type();
-            if eq {
-                if let (TypvalValue::List(l1), TypvalValue::List(l2)) = (&typ1.value, &typ2.value) {
-                    eq = l1 == l2;
-                }
+            if eq
+                && let (TypvalValue::List(l1), TypvalValue::List(l2)) = (&typ1.value, &typ2.value)
+            {
+                eq = l1 == l2;
             }
             n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
         } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
@@ -2228,10 +2228,10 @@ pub unsafe fn typval_compare(typ1: &mut TypvalT, typ2: &TypvalT, typ: ExprType, 
     } else if matches!(typ1.value, TypvalValue::Dict(_)) || matches!(typ2.value, TypvalValue::Dict(_)) {
         if type_is {
             let mut eq = typ1.var_type() == typ2.var_type();
-            if eq {
-                if let (TypvalValue::Dict(d1), TypvalValue::Dict(d2)) = (&typ1.value, &typ2.value) {
-                    eq = d1 == d2;
-                }
+            if eq
+                && let (TypvalValue::Dict(d1), TypvalValue::Dict(d2)) = (&typ1.value, &typ2.value)
+            {
+                eq = d1 == d2;
             }
             n1 = VarnumberT::from(if typ == ExprType::Isnot { !eq } else { eq });
         } else if typ1.var_type() != typ2.var_type() || !matches!(typ, ExprType::Equal | ExprType::Nequal) {
@@ -2559,10 +2559,10 @@ unsafe fn eval_index_inner(
 
     let mut n1: VarnumberT = 0;
     let mut n2: VarnumberT = 0;
-    if let Some(v1) = var1 {
-        if !matches!(rettv.value, TypvalValue::Dict(_)) {
-            n1 = tv_get_number(v1);
-        }
+    if let Some(v1) = var1
+        && !matches!(rettv.value, TypvalValue::Dict(_))
+    {
+        n1 = tv_get_number(v1);
     }
 
     if is_range {
@@ -2854,13 +2854,13 @@ pub(crate) unsafe fn f_slice(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// Forwarded from [`crate::eval::userfunc::make_partial`]'s own safety
 /// doc.
 pub unsafe fn set_selfdict(rettv: &mut TypvalT, selfdict: *mut crate::eval::typval_defs::DictT) {
-    if let TypvalValue::Partial(p) = rettv.value {
-        if !p.is_null() {
-            // SAFETY: `p` was just checked non-null above.
-            let (pt_auto, pt_dict) = unsafe { ((*p).pt_auto, (*p).pt_dict) };
-            if !pt_auto && !pt_dict.is_null() {
-                return;
-            }
+    if let TypvalValue::Partial(p) = rettv.value
+        && !p.is_null()
+    {
+        // SAFETY: `p` was just checked non-null above.
+        let (pt_auto, pt_dict) = unsafe { ((*p).pt_auto, (*p).pt_dict) };
+        if !pt_auto && !pt_dict.is_null() {
+            return;
         }
     }
     // SAFETY: forwarded from this function's own safety doc.
@@ -4491,10 +4491,10 @@ pub unsafe fn eval0(
             // Some of the expression may not have been consumed. Only
             // execute a next command if it cannot be a "||" operator.
             // The next command may be "catch".
-            if let Some(next) = crate::ex_docmd::check_nextcmd(&arg[pos..]) {
-                if arg.get(pos + next) != Some(&b'|') {
-                    eap.nextcmd = Some(arg[pos + next..].to_vec());
-                }
+            if let Some(next) = crate::ex_docmd::check_nextcmd(&arg[pos..])
+                && arg.get(pos + next) != Some(&b'|')
+            {
+                eap.nextcmd = Some(arg[pos + next..].to_vec());
             }
         }
         return FAIL;
@@ -4935,10 +4935,10 @@ pub unsafe fn var2fpos(
         let li = unsafe { crate::eval::typval::tv_list_find(*l, 1) };
         if !li.is_null() {
             // SAFETY: forwarded from this function's own safety doc.
-            if let TypvalValue::String(Some(s)) = &unsafe { &*li }.li_tv.value {
-                if s == b"$" {
-                    col = len + 1;
-                }
+            if let TypvalValue::String(Some(s)) = &unsafe { &*li }.li_tv.value
+                && s == b"$"
+            {
+                col = len + 1;
             }
         }
 

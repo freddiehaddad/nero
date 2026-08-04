@@ -445,12 +445,11 @@ pub unsafe fn tv_get_lnum(tv: &TypvalT) -> crate::pos_defs::LinenrT {
 /// no other position-string fallback (`tv_get_lnum_buf`).
 #[must_use]
 pub fn tv_get_lnum_buf(tv: &TypvalT, buf: Option<&crate::buffer_defs::BufT>) -> crate::pos_defs::LinenrT {
-    if let TypvalValue::String(Some(s)) = &tv.value {
-        if s.as_slice() == b"$" {
-            if let Some(b) = buf {
-                return b.b_ml.ml_line_count;
-            }
-        }
+    if let TypvalValue::String(Some(s)) = &tv.value
+        && s.as_slice() == b"$"
+        && let Some(b) = buf
+    {
+        return b.b_ml.ml_line_count;
     }
     tv_get_number_chk(tv, None) as crate::pos_defs::LinenrT
 }
@@ -1409,7 +1408,8 @@ pub unsafe fn tv_dict_get_callback(d: *mut DictT, key: &[u8], result: &mut Callb
     }
 
     let mut tv = TypvalT::default();
-    tv_copy(di_tv, &mut tv);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { tv_copy(di_tv, &mut tv) };
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { crate::eval::eval::set_selfdict(&mut tv, d) };
     // SAFETY: forwarded from this function's own safety doc.
@@ -3795,10 +3795,10 @@ pub unsafe fn filter_map_string(str: &[u8], filtermap: FilterMapT, expr: &Typval
                 // display, not tractable; the identical break is kept.
                 break;
             }
-        } else if filtermap == FilterMapT::Foreach || !rem {
-            if let TypvalValue::String(Some(s)) = &tv.value {
-                ga.extend_from_slice(s);
-            }
+        } else if (filtermap == FilterMapT::Foreach || !rem)
+            && let TypvalValue::String(Some(s)) = &tv.value
+        {
+            ga.extend_from_slice(s);
         }
 
         unsafe {

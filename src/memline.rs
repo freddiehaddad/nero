@@ -2769,14 +2769,14 @@ mod tests {
     /// [`ml_setflags`] ever mutates) into a fresh scratch [`ZeroBlock`]
     /// so its `b0_dirty()`/`b0_flags()` accessors can be used to
     /// inspect it, mirroring `ml_setflags`'s own internal technique.
-    unsafe fn read_block0_fname(buf: &mut BufT) -> ZeroBlock {
+    unsafe fn read_block0_fname(buf: &mut BufT) -> ZeroBlock { unsafe {
         let mfp = &mut *buf.b_ml.ml_mfp;
         let hp = mfp.mf_hash.get(&0).copied().expect("block 0 should be cached");
         let data = (*hp).bh_data.as_data();
         let mut zb = ZeroBlock::new(0);
         zb.b0_fname.copy_from_slice(&data[ZB_OFF_FNAME..ZB_OFF_FNAME + B0_FNAME_SIZE_ORG]);
         zb
-    }
+    }}
 
     #[test]
     fn ml_setflags_is_a_noop_when_ml_mfp_is_null() {

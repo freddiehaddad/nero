@@ -957,7 +957,7 @@ pub fn get_option(opt_idx: OptIndex) -> &'static VimoptionT {
 /// the `OPT_LOCAL` branches touching `w_buffer`, its own `w_buffer`
 /// must also be a valid, non-null pointer to a live `BufT`).
 #[must_use]
-pub unsafe fn insecure_flag(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u32) -> *mut u32 {
+pub unsafe fn insecure_flag(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u32) -> *mut u32 { unsafe {
     if opt_flags & crate::option_defs::opt_set_flags::OPT_LOCAL != 0 {
         match opt_idx {
             OptIndex::Wrap => return std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_wrap_flags),
@@ -981,7 +981,7 @@ pub unsafe fn insecure_flag(wp: *mut WinT, opt_idx: OptIndex, opt_flags: u32) ->
     }
     // Nothing special, return global flags field.
     std::ptr::addr_of_mut!((*opt_ptr(opt_idx)).flags)
-}
+}}
 
 /// Check whether option `opt_idx` was set insecurely (e.g. from a
 /// modeline) (`was_set_insecurely`).
@@ -1140,7 +1140,7 @@ pub unsafe fn do_syntax_autocmd(buf: *mut BufT, value_changed: bool) {
 /// original itself has no way to know which in advance either, hence
 /// both are always required).
 #[must_use]
-pub unsafe fn get_varp_from(opt_idx: OptIndex, buf: *mut BufT, win: *mut WinT) -> *mut c_void {
+pub unsafe fn get_varp_from(opt_idx: OptIndex, buf: *mut BufT, win: *mut WinT) -> *mut c_void { unsafe {
     let p = get_option(opt_idx);
 
     // Hidden options and global-only options always use the same var pointer.
@@ -1513,7 +1513,7 @@ pub unsafe fn get_varp_from(opt_idx: OptIndex, buf: *mut BufT, win: *mut WinT) -
             std::ptr::addr_of_mut!((*buf).b_p_wm) as *mut c_void
         }
     }
-}
+}}
 
 /// Get pointer to option variable, using the current buffer/window
 /// (`get_varp`).
@@ -2827,10 +2827,10 @@ pub fn copy_option_part(option: &[u8], p: usize, maxlen: usize, sep_chars: &[u8]
         {
             p += 1;
         }
-        if let Some(&c) = option.get(p) {
-            if buf.len() < maxlen.saturating_sub(1) {
-                buf.push(c);
-            }
+        if let Some(&c) = option.get(p)
+            && buf.len() < maxlen.saturating_sub(1)
+        {
+            buf.push(c);
         }
         p += 1;
     }

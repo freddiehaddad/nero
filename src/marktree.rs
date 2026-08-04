@@ -1305,7 +1305,9 @@ unsafe fn split_node(b: &mut MarkTree, x: *mut MtNode, i: i32, next: &MtKey) {
         for j in 0..T {
             // SAFETY: `y` is valid; `j < T <= y.n` (y is full, n == 2T-1).
             let k = unsafe { &(*y).key[j as usize] };
-            let pi_end = pseudo_index_for_id(b, mt_lookup_id(k.ns, k.id, true), true);
+            // SAFETY: forwarded from this function's own safety doc
+            // (every node reachable from `b.id2node` must be valid).
+            let pi_end = unsafe { pseudo_index_for_id(b, mt_lookup_id(k.ns, k.id, true), true) };
             if mt_start(k) && pi_end > pi && mt_lookup_key(k) != last_start {
                 let id = mt_lookup_id(k.ns, k.id, false);
                 // SAFETY: `z` is valid.
@@ -1317,7 +1319,9 @@ unsafe fn split_node(b: &mut MarkTree, x: *mut MtNode, i: i32, next: &MtKey) {
         for j in (T - 1)..(T * 2 - 1) {
             // SAFETY: same as above.
             let k = unsafe { &(*y).key[j as usize] };
-            let pi_start = pseudo_index_for_id(b, mt_lookup_id(k.ns, k.id, false), true);
+            // SAFETY: forwarded from this function's own safety doc,
+            // matching the identical call above.
+            let pi_start = unsafe { pseudo_index_for_id(b, mt_lookup_id(k.ns, k.id, false), true) };
             if mt_end(k) && pi_start > 0 && pi_start < pi {
                 let id = mt_lookup_id(k.ns, k.id, false);
                 // SAFETY: `y` is valid.
@@ -1853,10 +1857,11 @@ fn marktree_itr_next_skip(
     itr.i += 1;
     // SAFETY: `itr.x` non-null (checked above) and valid.
     let level = unsafe { (*itr.x).level };
-    if let Some(mf) = meta_filter {
-        if level > 0 && !meta_has(&unsafe { node_meta(itr.x, itr.i as usize) }, mf) {
-            skip = true;
-        }
+    if let Some(mf) = meta_filter
+        && level > 0
+        && !meta_has(&unsafe { node_meta(itr.x, itr.i as usize) }, mf)
+    {
+        skip = true;
     }
     if level == 0 || skip {
         // SAFETY: `itr.x` valid.
@@ -1898,11 +1903,11 @@ fn marktree_itr_next_skip(
                 let base = unsafe { (*itr.x).key[itr.i as usize - 1].pos };
                 compose(&mut itr.pos, base);
             }
-            if itr.i == 0 {
-                if let Some(ob) = oldbase.as_deref_mut() {
-                    let lvl = itr.lvl as usize;
-                    ob[lvl + 1] = ob[lvl];
-                }
+            if itr.i == 0
+                && let Some(ob) = oldbase.as_deref_mut()
+            {
+                let lvl = itr.lvl as usize;
+                ob[lvl + 1] = ob[lvl];
             }
             itr.s[itr.lvl as usize].i = itr.i;
             // SAFETY: `itr.x` valid internal node.
@@ -1915,12 +1920,13 @@ fn marktree_itr_next_skip(
                 break;
             }
             itr.i = 0;
-            if let Some(mf) = meta_filter {
-                if unsafe { (*itr.x).level } != 0 && !meta_has(&unsafe { node_meta(itr.x, 0) }, mf) {
-                    // `itr.x` has filtered keys but `ptr[0]` does not, don't
-                    // enter the latter.
-                    break;
-                }
+            if let Some(mf) = meta_filter
+                && unsafe { (*itr.x).level } != 0
+                && !meta_has(&unsafe { node_meta(itr.x, 0) }, mf)
+            {
+                // `itr.x` has filtered keys but `ptr[0]` does not, don't
+                // enter the latter.
+                break;
             }
         }
     }

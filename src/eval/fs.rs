@@ -486,10 +486,11 @@ pub fn file_pat_to_reg_pat(pat: &[u8], mut allow_dirs: Option<&mut bool>, no_bsl
                             reg_pat.push(b'{');
                             p += 2;
                         } else {
-                            if let Some(ad) = allow_dirs.as_deref_mut() {
-                                if crate::path::vim_ispathsep(i32::from(c)) && (!cfg!(windows) || !no_bslash || c != b'\\') {
-                                    *ad = true;
-                                }
+                            if let Some(ad) = allow_dirs.as_deref_mut()
+                                && crate::path::vim_ispathsep(i32::from(c))
+                                && (!cfg!(windows) || !no_bslash || c != b'\\')
+                            {
+                                *ad = true;
                             }
                             reg_pat.push(b'\\');
                             reg_pat.push(c);
@@ -522,10 +523,10 @@ pub fn file_pat_to_reg_pat(pat: &[u8], mut allow_dirs: Option<&mut bool>, no_bsl
                 }
             }
             c => {
-                if let Some(ad) = allow_dirs.as_deref_mut() {
-                    if crate::path::vim_ispathsep(i32::from(c)) {
-                        *ad = true;
-                    }
+                if let Some(ad) = allow_dirs.as_deref_mut()
+                    && crate::path::vim_ispathsep(i32::from(c))
+                {
+                    *ad = true;
                 }
                 reg_pat.push(c);
             }

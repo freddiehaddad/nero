@@ -119,13 +119,13 @@ impl GarrayT {
     /// The caller must ensure `self.ga_itemsize == size_of::<T>()` (set via
     /// [`GarrayT::new`]) - like the original macro, this is not checked.
     #[inline]
-    pub unsafe fn ga_append_item<T: Copy>(&mut self, item: T) {
+    pub unsafe fn ga_append_item<T: Copy>(&mut self, item: T) { unsafe {
         self.ga_grow(1);
         let idx = self.ga_len as usize * std::mem::size_of::<T>();
         let ptr = self.ga_data.as_mut_ptr().add(idx) as *mut T;
         ptr.write(item);
         self.ga_len += 1;
-    }
+    }}
 
     /// Reserves room for one more item and returns a pointer to it, without
     /// initializing it (`ga_append_via_ptr`).
@@ -134,7 +134,7 @@ impl GarrayT {
     /// The returned pointer is valid for exactly `self.ga_itemsize` bytes;
     /// the caller must fully initialize it (matches the original's
     /// contract, which hands back a raw, uninitialized slot).
-    pub unsafe fn ga_append_via_ptr(&mut self, item_size: usize) -> *mut u8 {
+    pub unsafe fn ga_append_via_ptr(&mut self, item_size: usize) -> *mut u8 { unsafe {
         if item_size as i32 != self.ga_itemsize {
             crate::log::logmsg(
                 crate::log::LOGLVL_WRN,
@@ -149,7 +149,7 @@ impl GarrayT {
         let idx = self.ga_len as usize * self.ga_itemsize as usize;
         self.ga_len += 1;
         self.ga_data.as_mut_ptr().add(idx)
-    }
+    }}
 
     /// Concatenate a string (as a byte slice) to a growarray which contains
     /// bytes (`ga_concat_len`).

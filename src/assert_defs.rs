@@ -17,7 +17,7 @@
 /// build and has no Rust equivalent (Rust always checks here).
 #[macro_export]
 macro_rules! strict_add {
-    ($a:expr, $b:expr) => {
+    ($a:expr_2021, $b:expr_2021) => {
         ($a).checked_add($b).unwrap_or_else(|| panic!("STRICT_ADD overflow"))
     };
 }
@@ -26,7 +26,7 @@ macro_rules! strict_add {
 /// `*c`. Aborts (panics) on overflow.
 #[macro_export]
 macro_rules! strict_sub {
-    ($a:expr, $b:expr) => {
+    ($a:expr_2021, $b:expr_2021) => {
         ($a).checked_sub($b).unwrap_or_else(|| panic!("STRICT_SUB overflow"))
     };
 }

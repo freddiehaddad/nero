@@ -81,9 +81,9 @@ pub fn _hash_key_removed() -> *mut std::os::raw::c_char {
 /// duration of the call - exactly the same contract the original places on
 /// every `hi_key` a caller stores via [`hash_add_item`].
 #[inline]
-unsafe fn hi_key_bytes<'a>(hi_key: *const std::os::raw::c_char) -> &'a [u8] {
+unsafe fn hi_key_bytes<'a>(hi_key: *const std::os::raw::c_char) -> &'a [u8] { unsafe {
     std::ffi::CStr::from_ptr(hi_key).to_bytes()
-}
+}}
 
 impl HashtabT {
     /// Initialize an empty hash table (`hash_init`).
@@ -220,7 +220,7 @@ impl HashtabT {
     /// contained in the (externally owned) value the caller will store: it
     /// must outlive the hashtable entry, matching the original's
     /// raw-pointer contract.
-    pub unsafe fn hash_add(&mut self, key: *mut std::os::raw::c_char) -> i32 {
+    pub unsafe fn hash_add(&mut self, key: *mut std::os::raw::c_char) -> i32 { unsafe {
         let key_bytes = hi_key_bytes(key);
         let hash = hash_hash_len(key_bytes);
         let idx = self.hash_lookup_idx(key_bytes, hash);
@@ -230,14 +230,14 @@ impl HashtabT {
         }
         self.hash_add_item(key, hash);
         OK
-    }
+    }}
 
     /// Add item for key `key` (already looked up via [`HashtabT::hash_lookup`]
     /// on an empty slot) to the hashtable (`hash_add_item`).
     ///
     /// # Safety
     /// Same contract as [`HashtabT::hash_add`].
-    pub unsafe fn hash_add_item(&mut self, key: *mut std::os::raw::c_char, hash: HashT) {
+    pub unsafe fn hash_add_item(&mut self, key: *mut std::os::raw::c_char, hash: HashT) { unsafe {
         let key_bytes = hi_key_bytes(key);
         let idx = self.hash_lookup_idx(key_bytes, hash);
         self.ht_used += 1;
@@ -251,7 +251,7 @@ impl HashtabT {
 
         // When the space gets low may resize the array.
         self.hash_may_resize(0);
-    }
+    }}
 
     /// Remove the item found at `key` from the hashtable (`hash_remove`).
     ///

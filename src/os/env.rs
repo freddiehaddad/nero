@@ -326,12 +326,12 @@ pub unsafe fn os_setenv_append_path(fname: &[u8]) -> bool {
     }
 
     let mut temp = Vec::with_capacity(new_len);
-    if let Some(path) = path.as_deref() {
-        if !path.is_empty() {
-            temp.extend_from_slice(path);
-            if path.last() != Some(&(crate::os::os_defs::ENV_SEPCHAR as u8)) {
-                temp.push(crate::os::os_defs::ENV_SEPCHAR as u8);
-            }
+    if let Some(path) = path.as_deref()
+        && !path.is_empty()
+    {
+        temp.extend_from_slice(path);
+        if path.last() != Some(&(crate::os::os_defs::ENV_SEPCHAR as u8)) {
+            temp.push(crate::os::os_defs::ENV_SEPCHAR as u8);
         }
     }
     temp.extend_from_slice(dir);
@@ -399,7 +399,7 @@ fn os_get_hostname_windows() -> Vec<u8> {
     const MAX_COMPUTERNAME_LENGTH: usize = 15;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetComputerNameW(lp_buffer: *mut u16, n_size: *mut u32) -> i32;
     }
 
@@ -517,12 +517,12 @@ pub unsafe fn init_homedir() {
         });
         if let Some((name, suffix)) = indirect_ref {
             var = None;
-            if let Some(exp) = os_getenv(&name) {
-                if !exp.is_empty() {
-                    let mut combined = exp;
-                    combined.extend_from_slice(&suffix[1..]);
-                    var = Some(combined);
-                }
+            if let Some(exp) = os_getenv(&name)
+                && !exp.is_empty()
+            {
+                let mut combined = exp;
+                combined.extend_from_slice(&suffix[1..]);
+                var = Some(combined);
             }
         }
 
@@ -537,12 +537,11 @@ pub unsafe fn init_homedir() {
         }
 
         // Get the actual path. This resolves links.
-        if let Some(v) = &var {
-            if let Ok(path_str) = std::str::from_utf8(v) {
-                if let Some(real) = crate::os::fs::os_realpath(std::path::Path::new(path_str)) {
-                    var = Some(real);
-                }
-            }
+        if let Some(v) = &var
+            && let Ok(path_str) = std::str::from_utf8(v)
+            && let Some(real) = crate::os::fs::os_realpath(std::path::Path::new(path_str))
+        {
+            var = Some(real);
         }
 
         // Fall back to current working directory if home is not found.
@@ -717,25 +716,25 @@ pub unsafe fn expand_env_esc(srcp: &[u8], esc_chars: Option<&[u8]>, one: bool, p
                 );
             }
 
-            if let (Some(ec), Some(v)) = (esc_chars, &var) {
-                if v.iter().any(|b| ec.contains(b)) {
-                    // SAFETY: forwarded from this function's own
-                    // safety doc.
-                    var = Some(unsafe { crate::strings::vim_strsave_escaped(v, ec) });
-                }
+            if let (Some(ec), Some(v)) = (esc_chars, &var)
+                && v.iter().any(|b| ec.contains(b))
+            {
+                // SAFETY: forwarded from this function's own
+                // safety doc.
+                var = Some(unsafe { crate::strings::vim_strsave_escaped(v, ec) });
             }
 
-            if let Some(v) = &var {
-                if !v.is_empty() {
-                    dst.extend_from_slice(v);
-                    if crate::path::after_pathsep(v, v.len())
-                        && srcp.get(tail).is_some_and(|&b| crate::path::vim_ispathsep(i32::from(b)))
-                    {
-                        tail += 1;
-                    }
-                    pos = tail;
-                    copy_char = false;
+            if let Some(v) = &var
+                && !v.is_empty()
+            {
+                dst.extend_from_slice(v);
+                if crate::path::after_pathsep(v, v.len())
+                    && srcp.get(tail).is_some_and(|&b| crate::path::vim_ispathsep(i32::from(b)))
+                {
+                    tail += 1;
                 }
+                pos = tail;
+                copy_char = false;
             }
         }
 
@@ -753,10 +752,10 @@ pub unsafe fn expand_env_esc(srcp: &[u8], esc_chars: Option<&[u8]>, one: bool, p
             if pos < srcp.len() {
                 dst.push(srcp[pos]);
                 pos += 1;
-                if let Some(pfx) = prefix {
-                    if pos >= pfx.len() && &srcp[pos - pfx.len()..pos] == pfx {
-                        at_start = true;
-                    }
+                if let Some(pfx) = prefix
+                    && pos >= pfx.len() && &srcp[pos - pfx.len()..pos] == pfx
+                {
+                    at_start = true;
                 }
             }
         }

@@ -846,12 +846,11 @@ pub unsafe fn mf_close(mut mfp: MemfileT, del_file: bool) {
     // why the original's emsg() on a close error is omitted).
     mfp.mf_fd = None;
 
-    if del_file {
-        if let Some(fname) = &mfp.mf_fname {
-            if let Ok(fname_str) = std::str::from_utf8(fname) {
-                crate::os::fs::os_remove(std::path::Path::new(fname_str));
-            }
-        }
+    if del_file
+        && let Some(fname) = &mfp.mf_fname
+        && let Ok(fname_str) = std::str::from_utf8(fname)
+    {
+        crate::os::fs::os_remove(std::path::Path::new(fname_str));
     }
 
     // free entries in used list (`map_foreach_value`) - no need to

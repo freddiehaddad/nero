@@ -125,20 +125,18 @@ pub unsafe fn stdpaths_get_xdg_var(idx: XdgVarType) -> Option<Vec<u8>> {
 
     if cfg!(windows) {
         #[cfg(windows)]
-        if env_val.is_none() {
-            if let Some(fallback_env) = xdg_default_env_var(idx) {
-                env_val = os_getenv(fallback_env);
-            }
+        if env_val.is_none()
+            && let Some(fallback_env) = xdg_default_env_var(idx)
+        {
+            env_val = os_getenv(fallback_env);
         }
         #[cfg(windows)]
-        if idx == XdgVarType::CacheHome {
-            if let Some(v) = &env_val {
-                if let Ok(path_str) = std::str::from_utf8(v) {
-                    if let Some(real_path) = crate::os::fs::os_realpath(std::path::Path::new(path_str)) {
-                        env_val = Some(real_path);
-                    }
-                }
-            }
+        if idx == XdgVarType::CacheHome
+            && let Some(v) = &env_val
+            && let Ok(path_str) = std::str::from_utf8(v)
+            && let Some(real_path) = crate::os::fs::os_realpath(std::path::Path::new(path_str))
+        {
+            env_val = Some(real_path);
         }
     } else if env_val.is_none() && crate::os::env::os_env_exists(env, false) {
         // Set but empty ("FOO=" with no value): matches the

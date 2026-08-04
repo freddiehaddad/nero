@@ -1062,11 +1062,9 @@ pub unsafe fn evalvars_init() {
         // need to replicate.
         if let Some(startreason) =
             crate::os::env::os_getenv(crate::os::os::ENV_STARTREASON.as_bytes())
-        {
-            if startreason == b"restart!" || startreason == b"restart" {
+            && (startreason == b"restart!" || startreason == b"restart") {
                 set_vim_var_string(VimVarIndex::Startreason, Some(&startreason));
             }
-        }
         if crate::os::env::os_env_exists(crate::os::os::ENV_STARTREASON.as_bytes(), false) {
             crate::os::env::os_unsetenv(crate::os::os::ENV_STARTREASON.as_bytes());
         }
@@ -4645,8 +4643,8 @@ unsafe fn get_var_from(
 
     rettv.value = TypvalValue::String(None);
 
-    if let Some(varname) = varname {
-        if !tp.is_null() && !win.is_null() && (htname != b'b' || !buf.is_null()) {
+    if let Some(varname) = varname
+        && !tp.is_null() && !win.is_null() && (htname != b'b' || !buf.is_null()) {
             // SAFETY: forwarded from this function's own safety doc.
             let g = unsafe { crate::globals::GLOBALS.get_mut() };
             let need_switch_win =
@@ -4740,7 +4738,6 @@ unsafe fn get_var_from(
                 }
             }
         }
-    }
 
     if !done && !matches!(deftv.value, TypvalValue::Unknown) {
         // SAFETY: forwarded from this function's own safety doc.

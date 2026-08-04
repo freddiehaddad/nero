@@ -426,10 +426,10 @@ pub unsafe fn get_leader_len(
         while byte_at(com, list) != 0 {
             // Get one option part into part_buf. Advance "list" to
             // next one.
-            if !got_com {
-                if let Some(f) = flags.as_mut() {
-                    **f = list; // remember where flags started
-                }
+            if !got_com
+                && let Some(f) = flags.as_mut()
+            {
+                **f = list; // remember where flags started
             }
             let prev_list = list;
             let (buf, next_list) = copy_option_part(com, list, COM_MAX_LEN as usize, b",");
@@ -525,10 +525,10 @@ pub unsafe fn get_leader_len(
         if middle_match_len != 0 {
             // Use the previously found middle match after failing to
             // find a match with an end.
-            if !got_com {
-                if let (Some(f), Some(sf)) = (flags.as_mut(), saved_flags) {
-                    **f = sf;
-                }
+            if !got_com
+                && let (Some(f), Some(sf)) = (flags.as_mut(), saved_flags)
+            {
+                **f = sf;
             }
             i += middle_match_len;
             found_one = true;

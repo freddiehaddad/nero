@@ -121,7 +121,7 @@ fn os_proc_running_windows(pid: i32) -> bool {
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetCurrentProcess() -> Handle;
         fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32)
             -> Handle;

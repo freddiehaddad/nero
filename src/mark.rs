@@ -1066,10 +1066,10 @@ pub unsafe fn mark_check(fm: Option<&FmarkT>) -> Result<(), &'static str> {
 ///
 /// Should be done after the buffer is loaded into memory.
 pub fn mark_check_line_bounds(buf: Option<&crate::buffer_defs::BufT>, fm: &FmarkT) -> Result<(), &'static str> {
-    if let Some(buf) = buf {
-        if fm.mark.lnum > buf.b_ml.ml_line_count {
-            return Err(crate::errors::e_markinval);
-        }
+    if let Some(buf) = buf
+        && fm.mark.lnum > buf.b_ml.ml_line_count
+    {
+        return Err(crate::errors::e_markinval);
     }
     Ok(())
 }
@@ -1747,17 +1747,17 @@ pub unsafe fn mark_get(
         fm = unsafe { mark_get_local(buf, win, name) };
     }
 
-    if let Some(fmp) = fmp {
-        if !fm.is_null() {
-            // SAFETY: `fm` is non-null (just checked). `FmarkT` owns
-            // heap data (`additional_data`), so this needs a real
-            // deep clone, not a bitwise copy, matching the original's
-            // own `*fmp = *fm;` struct-copy semantics faithfully
-            // (a shallow bitwise copy here would alias/double-free
-            // `additional_data`).
-            *fmp = unsafe { (*fm).clone() };
-            return fmp as *mut FmarkT;
-        }
+    if let Some(fmp) = fmp
+        && !fm.is_null()
+    {
+        // SAFETY: `fm` is non-null (just checked). `FmarkT` owns
+        // heap data (`additional_data`), so this needs a real
+        // deep clone, not a bitwise copy, matching the original's
+        // own `*fmp = *fm;` struct-copy semantics faithfully
+        // (a shallow bitwise copy here would alias/double-free
+        // `additional_data`).
+        *fmp = unsafe { (*fm).clone() };
+        return fmp as *mut FmarkT;
     }
     fm
 }

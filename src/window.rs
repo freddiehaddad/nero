@@ -2844,10 +2844,10 @@ pub unsafe fn frame_check_width(topfrp: *const crate::buffer_defs::FrameT, width
 /// "buffer was closed") or a valid, live `BufT` pointer.
 #[must_use]
 pub unsafe fn check_colorcolumn(cc: Option<&[u8]>, wp: Option<&mut WinT>) -> bool {
-    if let Some(ref w) = wp {
-        if w.w_buffer.is_null() {
-            return true; // buffer was closed
-        }
+    if let Some(ref w) = wp
+        && w.w_buffer.is_null()
+    {
+        return true; // buffer was closed
     }
 
     // Resolve the effective string to parse: cc if given, else wp's

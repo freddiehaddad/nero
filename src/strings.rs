@@ -554,13 +554,13 @@ pub unsafe fn vim_strsave_shellescape(string: &[u8], do_special: bool, do_newlin
             p += 1;
             continue;
         }
-        if do_special {
-            if let Some((_, used_len)) = crate::ex_docmd::find_cmdline_var(&string[p..]) {
-                out.push(b'\\'); // insert backslash
-                out.extend_from_slice(&string[p..p + used_len]);
-                p += used_len;
-                continue;
-            }
+        if do_special
+            && let Some((_, used_len)) = crate::ex_docmd::find_cmdline_var(&string[p..])
+        {
+            out.push(b'\\'); // insert backslash
+            out.extend_from_slice(&string[p..p + used_len]);
+            p += used_len;
+            continue;
         }
         if c == b'\\' && fish_like {
             out.push(b'\\');

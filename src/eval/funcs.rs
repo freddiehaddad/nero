@@ -1987,14 +1987,12 @@ unsafe fn f_indexof(argvars: &[TypvalT], rettv: &mut TypvalT) {
     }
 
     let mut startidx: crate::eval::typval_defs::VarnumberT = 0;
-    if argvars.len() > 2 {
-        if let TypvalValue::Dict(d) = &argvars[2].value {
-            let d = *d;
-            // SAFETY: forwarded from this function's own safety doc.
-            startidx = unsafe {
-                crate::eval::typval::tv_dict_get_number_def(d.as_mut(), b"startidx", 0)
-            };
-        }
+    if argvars.len() > 2
+        && let TypvalValue::Dict(d) = &argvars[2].value
+    {
+        let d = *d;
+        // SAFETY: forwarded from this function's own safety doc.
+        startidx = unsafe { crate::eval::typval::tv_dict_get_number_def(d.as_mut(), b"startidx", 0) };
     }
 
     let mut save_val = TypvalT::default();
@@ -3230,10 +3228,10 @@ fn f_getfontname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// `isinf({expr})` - `1` for positive infinity, `-1` for negative
 /// infinity, `0` otherwise (`f_isinf`, `funcs.c`).
 fn f_isinf(argvars: &[TypvalT], rettv: &mut TypvalT) {
-    if let TypvalValue::Float(f) = argvars[0].value {
-        if f.is_infinite() {
-            rettv.value = TypvalValue::Number(if f > 0.0 { 1 } else { -1 });
-        }
+    if let TypvalValue::Float(f) = argvars[0].value
+        && f.is_infinite()
+    {
+        rettv.value = TypvalValue::Number(if f > 0.0 { 1 } else { -1 });
     }
 }
 
@@ -5052,15 +5050,13 @@ unsafe fn getpos_both(argvars: &[TypvalT], rettv: &mut TypvalT, getcurpos: bool,
             // SAFETY: forwarded from this function's own safety doc.
             fp = Some(unsafe { &*curwin }.w_cursor);
         }
-        if let Some(ref mut pos) = fp {
-            if charcol {
-                // SAFETY: forwarded from this function's own safety doc.
-                let buf = unsafe { &*wp }.w_buffer;
-                // SAFETY: forwarded from this function's own safety doc.
-                pos.col = unsafe {
-                    crate::eval::eval::buf_byteidx_to_charidx(&mut *buf, pos.lnum, pos.col)
-                };
-            }
+        if let Some(ref mut pos) = fp
+            && charcol
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let buf = unsafe { &*wp }.w_buffer;
+            // SAFETY: forwarded from this function's own safety doc.
+            pos.col = unsafe { crate::eval::eval::buf_byteidx_to_charidx(&mut *buf, pos.lnum, pos.col) };
         }
     } else {
         // SAFETY: forwarded from this function's own safety doc.
@@ -6256,35 +6252,34 @@ unsafe fn get_col(argvars: &[TypvalT], rettv: &mut TypvalT, charcol: bool) {
     let fnum = bp.handle;
     // SAFETY: forwarded from this function's own safety doc.
     let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], false, charcol, wp) };
-    if let Some(fp) = fp {
-        if fnum == bp.handle {
-            if fp.col == crate::pos_defs::MAXCOL {
-                // '> can be MAXCOL, get the length of the line then
-                if fp.lnum <= bp.b_ml.ml_line_count {
-                    // SAFETY: forwarded from this function's own safety doc.
-                    col = unsafe { crate::memline::ml_get_buf_len(bp, fp.lnum) } + 1;
-                } else {
-                    col = crate::pos_defs::MAXCOL;
-                }
+    if let Some(fp) = fp
+        && fnum == bp.handle
+    {
+        if fp.col == crate::pos_defs::MAXCOL {
+            // '> can be MAXCOL, get the length of the line then
+            if fp.lnum <= bp.b_ml.ml_line_count {
+                // SAFETY: forwarded from this function's own safety doc.
+                col = unsafe { crate::memline::ml_get_buf_len(bp, fp.lnum) } + 1;
             } else {
-                col = fp.col + 1;
-                // col(".") when the cursor is on the NUL at the end of
-                // the line because of "coladd" can be seen as an extra
-                // column.
-                if crate::state::virtual_active(w) && fp == w.w_cursor {
+                col = crate::pos_defs::MAXCOL;
+            }
+        } else {
+            col = fp.col + 1;
+            // col(".") when the cursor is on the NUL at the end of
+            // the line because of "coladd" can be seen as an extra
+            // column.
+            if crate::state::virtual_active(w) && fp == w.w_cursor {
+                // SAFETY: forwarded from this function's own safety doc.
+                let line = unsafe { crate::memline::ml_get_buf(bp, w.w_cursor.lnum) };
+                let p = &line[(w.w_cursor.col as usize).min(line.len())..];
+                // SAFETY: forwarded from this function's own safety doc.
+                let want =
+                    unsafe { crate::plines::win_chartabsize(w, p, w.w_virtcol - w.w_cursor.coladd) };
+                if w.w_cursor.coladd >= want {
                     // SAFETY: forwarded from this function's own safety doc.
-                    let line = unsafe { crate::memline::ml_get_buf(bp, w.w_cursor.lnum) };
-                    let p = &line[(w.w_cursor.col as usize).min(line.len())..];
-                    // SAFETY: forwarded from this function's own safety doc.
-                    let want = unsafe {
-                        crate::plines::win_chartabsize(w, p, w.w_virtcol - w.w_cursor.coladd)
-                    };
-                    if w.w_cursor.coladd >= want {
-                        // SAFETY: forwarded from this function's own safety doc.
-                        let l = unsafe { crate::mbyte::utfc_ptr2len(p) };
-                        if p.first().copied().unwrap_or(0) != 0 && p.get(l as usize).copied().unwrap_or(0) == 0 {
-                            col += l;
-                        }
+                    let l = unsafe { crate::mbyte::utfc_ptr2len(p) };
+                    if p.first().copied().unwrap_or(0) != 0 && p.get(l as usize).copied().unwrap_or(0) == 0 {
+                        col += l;
                     }
                 }
             }
@@ -11721,10 +11716,10 @@ mod tests {
     fn reset_v_errors_for_funcs_test() {
         unsafe {
             let tv = crate::eval::vars::get_vim_var_tv(crate::eval::vars::VimVarIndex::Errors);
-            if let TypvalValue::List(l) = (*tv).value {
-                if !l.is_null() {
-                    crate::eval::typval::tv_list_unref(l);
-                }
+            if let TypvalValue::List(l) = (*tv).value
+                && !l.is_null()
+            {
+                crate::eval::typval::tv_list_unref(l);
             }
             (*tv).value = TypvalValue::List(std::ptr::null_mut());
         }

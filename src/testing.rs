@@ -432,10 +432,10 @@ mod tests {
     fn reset_v_errors() {
         unsafe {
             let tv = crate::eval::vars::get_vim_var_tv(crate::eval::vars::VimVarIndex::Errors);
-            if let TypvalValue::List(l) = (*tv).value {
-                if !l.is_null() {
-                    crate::eval::typval::tv_list_unref(l);
-                }
+            if let TypvalValue::List(l) = (*tv).value
+                && !l.is_null()
+            {
+                crate::eval::typval::tv_list_unref(l);
             }
             (*tv).value = TypvalValue::List(std::ptr::null_mut());
         }

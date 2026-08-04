@@ -512,10 +512,10 @@ pub unsafe fn get_reg_type(regname: i32, reg_width: Option<&mut crate::pos_defs:
     let reg = unsafe { &*get_yank_register(regname, YregModeT::Paste) };
 
     if reg.y_array.is_some() {
-        if let Some(w) = reg_width {
-            if reg.y_type == crate::normal_defs::MotionType::BlockWise {
-                *w = reg.y_width;
-            }
+        if let Some(w) = reg_width
+            && reg.y_type == crate::normal_defs::MotionType::BlockWise
+        {
+            *w = reg.y_width;
         }
         Some(reg.y_type)
     } else {

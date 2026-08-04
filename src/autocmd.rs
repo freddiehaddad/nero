@@ -318,10 +318,10 @@ pub fn apply_autocmds_group(
         // BYPASS_AU:
         // When wiping out a buffer make sure all its buffer-local
         // autocommands are deleted.
-        if event == EventT::BufWipeout {
-            if let Some(buf) = buf {
-                unsafe { aubuflocal_remove(buf) };
-            }
+        if event == EventT::BufWipeout
+            && let Some(buf) = buf
+        {
+            unsafe { aubuflocal_remove(buf) };
         }
 
         // `retval == OK && event == EVENT_FILETYPE` omitted: `retval`

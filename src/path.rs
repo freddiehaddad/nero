@@ -450,14 +450,14 @@ pub fn append_path(path: &mut Vec<u8>, to_append: &[u8], max_len: usize) -> bool
     }
 
     // Combine the path segments, separated by a slash.
-    if let Some(&last) = path.last() {
-        if !vim_ispathsep_nocolon(last as i32) {
-            // +1 for the NUL at the end.
-            if path.len() + crate::ascii_defs::PATHSEPSTR.len() + 1 > max_len {
-                return false; // No space for trailing slash.
-            }
-            path.push(crate::ascii_defs::PATHSEP);
+    if let Some(&last) = path.last()
+        && !vim_ispathsep_nocolon(last as i32)
+    {
+        // +1 for the NUL at the end.
+        if path.len() + crate::ascii_defs::PATHSEPSTR.len() + 1 > max_len {
+            return false; // No space for trailing slash.
         }
+        path.push(crate::ascii_defs::PATHSEP);
     }
 
     // +1 for the NUL at the end.
@@ -647,7 +647,7 @@ fn utf_ptr2char_or_nul(p: &[u8]) -> i32 {
 /// Returns the current default drive number: 1 = A, 2 = B, 3 = C, etc.
 #[cfg(windows)]
 fn win32_getdrive() -> i32 {
-    extern "C" {
+    unsafe extern "C" {
         fn _getdrive() -> i32;
     }
     // SAFETY: _getdrive() takes no arguments, has no preconditions, and
@@ -874,10 +874,10 @@ pub unsafe fn pathcmp(p: &[u8], q: &[u8], maxlen: Option<usize>) -> i32 {
     let mut s: Option<&[u8]> = None;
 
     loop {
-        if let Some(maxlen) = maxlen {
-            if i >= maxlen || j >= maxlen {
-                break;
-            }
+        if let Some(maxlen) = maxlen
+            && (i >= maxlen || j >= maxlen)
+        {
+            break;
         }
 
         let c1 = utf_ptr2char_or_nul(&p[i.min(p.len())..]);

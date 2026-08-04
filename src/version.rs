@@ -151,7 +151,8 @@ pub unsafe fn may_show_intro() -> bool {
     let g = unsafe { crate::globals::GLOBALS.get_mut() };
     // SAFETY: forwarded from this function's own safety doc.
     let curbuf = unsafe { &mut *g.curbuf };
-    crate::buffer::buf_is_empty(curbuf)
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { crate::buffer::buf_is_empty(curbuf) })
         && curbuf.b_fname.is_none()
         && curbuf.handle == 1
         // SAFETY: forwarded from this function's own safety doc.
