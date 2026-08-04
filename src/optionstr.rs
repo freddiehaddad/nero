@@ -78,9 +78,13 @@
 //! established `curtab`-vs-`tp_firstwin` window-list-walk
 //! convention), [`did_set_spellsuggest`] (re-scanned once
 //! `spellsuggest.rs`'s own `spell_check_sps` landed in an earlier
-//! commit this segment - its only remaining real blocker), and
+//! commit this segment - its only remaining real blocker),
 //! [`did_set_mkspellmem`] (same shape, now that `spellfile.rs`'s own
-//! new `spell_check_msm` exists).
+//! new `spell_check_msm` exists), and [`did_set_mouse`] (built on a
+//! new `did_set_option_listflag` helper - its own dynamically-
+//! formatted `"E539: Illegal character <c>"` message is simplified
+//! to a static `e_invarg`, matching this whole module's established
+//! "display text differs, boolean outcome identical" policy).
 //! `check_str_opt`'s own real, load-bearing side effect - writing the
 //! computed flags bitmask into the option's `flags_var`, when it has
 //! one - is preserved even though nothing currently reads it (no
@@ -726,6 +730,37 @@ pub unsafe fn did_set_mkspellmem() -> Option<&'static [u8]> {
     } else {
         Some(crate::errors::e_invarg.as_bytes())
     }
+}
+
+/// An option which is a list of flags is set. Valid values are in
+/// `flags` (`did_set_option_listflag`, a `static` helper).
+///
+/// The original's own dynamically-formatted `"E539: Illegal character
+/// <%s>"` message (built via `illegal_char`, needing a shared
+/// scratch `errbuf`) is simplified to the same static `e_invarg`
+/// message this whole module already uses for every other validation
+/// failure - the DISPLAYED text differs from the original, but the
+/// boolean valid/invalid outcome (the only thing any translated
+/// caller can observe) is identical.
+fn did_set_option_listflag(val: &[u8], flags: &[u8]) -> Option<&'static [u8]> {
+    for &c in val {
+        if crate::strings::vim_strchr(flags, i32::from(c)).is_none() {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+    }
+    None
+}
+
+/// The `'mouse'` option is changed (`did_set_mouse`).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_mouse(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    did_set_option_listflag(val, crate::option_vars::MOUSE_ALL.as_bytes())
 }
 
 #[cfg(test)]
@@ -1788,5 +1823,51 @@ mod tests {
         let prev = set_p_msm(Some(b"bogus"));
         assert_eq!(unsafe { did_set_mkspellmem() }, Some(crate::errors::e_invarg.as_bytes()));
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_msm = prev;
+    }
+
+    // ---- did_set_option_listflag / did_set_mouse ----
+
+    #[test]
+    fn did_set_option_listflag_accepts_every_character_in_flags() {
+        assert_eq!(did_set_option_listflag(b"anvi", crate::option_vars::MOUSE_ALL.as_bytes()), None);
+    }
+
+    #[test]
+    fn did_set_option_listflag_empty_val_is_vacuously_valid() {
+        assert_eq!(did_set_option_listflag(b"", crate::option_vars::MOUSE_ALL.as_bytes()), None);
+    }
+
+    #[test]
+    fn did_set_option_listflag_rejects_a_character_not_in_flags() {
+        assert_eq!(
+            did_set_option_listflag(b"anz", crate::option_vars::MOUSE_ALL.as_bytes()),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_mouse_accepts_every_real_mouse_flag() {
+        // MOUSE_ALL == "anvichr" - every one of its own characters,
+        // in any combination, must be individually valid.
+        let mut val: Option<Vec<u8>> = Some(b"anvichr".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_mouse(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_mouse_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_mouse(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_mouse_rejects_an_unknown_flag_character() {
+        let mut val: Option<Vec<u8>> = Some(b"az".to_vec());
+        let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
+        let mut args = crate::option_defs::OptsetT { os_varp: varp, ..Default::default() };
+        assert_eq!(unsafe { did_set_mouse(&mut args) }, Some(crate::errors::e_invarg.as_bytes()));
     }
 }
