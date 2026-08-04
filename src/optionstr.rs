@@ -252,6 +252,14 @@
 //! the original's own `varp == &win->w_p_cc ? win : NULL` comparison
 //! the same `std::ptr::eq` way.
 //!
+//! Also [`did_set_optexpr`] - the `'*expr'` family (`'diffexpr'`,
+//! `'foldexpr'`, `'formatexpr'`, `'includeexpr'`, `'indentexpr'`,
+//! `'patchexpr'`, `'printexpr'`, `'charconvert'`). It is the only
+//! callback in this file that REPLACES the option value rather than
+//! just reading it: a `<SID>`/`s:` prefix is expanded to the real
+//! script identifier via `userfunc.rs`'s already-real
+//! `get_scriptlocal_funcname`. Never fails.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1874,6 +1882,37 @@ pub unsafe fn did_set_colorcolumn(args: &mut crate::option_defs::OptsetT) -> Opt
 
     if !ok {
         return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    None
+}
+
+/// The `'*expr'` family of options is changed (`did_set_optexpr`) -
+/// `'diffexpr'`, `'foldexpr'`, `'formatexpr'`, `'includeexpr'`,
+/// `'indentexpr'`, `'patchexpr'`, `'printexpr'`, `'charconvert'`.
+///
+/// If the value starts with `<SID>` or `s:`, that prefix is replaced
+/// with the real, resolved script identifier, via `userfunc.rs`'s
+/// already-real `get_scriptlocal_funcname`. Never fails.
+///
+/// The original frees the old string and stores the expanded one
+/// through `*varp`; here that is a plain assignment through the same
+/// pointer, with Rust's own `Vec` drop handling the free.
+///
+/// # Safety
+/// `args.os_varp` must point to a live, WRITABLE `Option<Vec<u8>>`
+/// for the whole call (this callback REPLACES the value, unlike every
+/// other one in this file, which only read it). Touches
+/// `crate::globals::GLOBALS` via `get_scriptlocal_funcname`.
+pub unsafe fn did_set_optexpr(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let varp = args.os_varp as *mut Option<Vec<u8>>;
+    // SAFETY: forwarded from this function's own safety doc.
+    let val: Vec<u8> = unsafe { &*varp }.clone().unwrap_or_default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(name) = unsafe { crate::eval::userfunc::get_scriptlocal_funcname(&val) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *varp = Some(name) };
     }
 
     None
@@ -4563,6 +4602,67 @@ mod tests {
         let mut args = cc_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_colorcolumn(&mut args) }, None);
         assert!(win.w_p_cc_cols.is_none());
+    }
+
+    // ---- did_set_optexpr ----
+
+    #[test]
+    fn did_set_optexpr_leaves_a_plain_name_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
+        assert_eq!(val, Some(b"MyFunc()".to_vec()));
+    }
+
+    #[test]
+    fn did_set_optexpr_leaves_an_empty_value_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
+        assert_eq!(val, Some(Vec::new()));
+    }
+
+    #[test]
+    fn did_set_optexpr_expands_an_s_colon_prefix_in_place() {
+        // The only callback in this file that REPLACES the value.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let mut val: Option<Vec<u8>> = Some(b"s:MyFunc".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
+        assert_eq!(val, Some(format!("<SNR>{sid}_MyFunc").into_bytes()));
+    }
+
+    #[test]
+    fn did_set_optexpr_expands_a_sid_tag_prefix_in_place() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        let (sid, _) = crate::runtime::new_script_item(None);
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = sid;
+
+        let mut val: Option<Vec<u8>> = Some(b"<SID>MyFunc".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
+        assert_eq!(val, Some(format!("<SNR>{sid}_MyFunc").into_bytes()));
+    }
+
+    #[test]
+    fn did_set_optexpr_leaves_the_value_alone_when_the_sid_is_invalid() {
+        // get_scriptlocal_funcname returns None when the script
+        // context has no valid SID, so the value is left as-is.
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid = 0;
+
+        let mut val: Option<Vec<u8>> = Some(b"s:MyFunc".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_optexpr(&mut args) }, None);
+        assert_eq!(val, Some(b"s:MyFunc".to_vec()));
     }
 
     // ---- did_set_mousescroll ----
