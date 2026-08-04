@@ -275,6 +275,15 @@
 //! exactly rather than re-encoded as a cleaner bitmask, since real
 //! consumers decode those decimal digits positionally.
 //!
+//! Also [`did_set_fileformat`] - refuses the change when the buffer
+//! is not `'modifiable'` (unless the GLOBAL value is what's being
+//! set), then delegates to [`did_set_str_generic`] and updates the
+//! swap file's own flags via `memline.rs`'s already-real
+//! `ml_setflags`. Its `redraw_titles`/`redraw_buf_later` calls are
+//! pure redraw scheduling and are omitted - so the `'mac'`-related
+//! redraw condition, which exists only to decide WHICH redraw to
+//! schedule, has no observable effect here and is omitted with them.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1898,6 +1907,45 @@ pub unsafe fn did_set_colorcolumn(args: &mut crate::option_defs::OptsetT) -> Opt
     if !ok {
         return Some(crate::errors::e_invarg.as_bytes());
     }
+
+    None
+}
+
+/// The `'fileformat'` option is changed (`did_set_fileformat`).
+///
+/// Refuses the change when the buffer is not `'modifiable'`, unless
+/// the GLOBAL value is what's being set, then delegates to
+/// [`did_set_str_generic`] for the actual value validation and
+/// updates the swap file's own flags via `memline.rs`'s already-real
+/// `ml_setflags`.
+///
+/// The original's `redraw_titles`/`redraw_buf_later` calls are pure
+/// redraw scheduling and are omitted, matching this crate's
+/// established policy - so the `'mac'`-related redraw condition (which
+/// exists only to decide WHICH redraw to schedule) has no observable
+/// effect here and is omitted with it.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_fileformat(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    let opt_flags = args.os_flags as u32;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let modifiable = unsafe { &*buf_ptr }.b_p_ma != 0;
+    if !modifiable && opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL == 0 {
+        return Some(crate::errors::e_modifiable.as_bytes());
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(errmsg) = unsafe { did_set_str_generic(args) } {
+        return Some(errmsg);
+    }
+
+    // Update the flag in the swap file.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::ml_setflags(&mut *buf_ptr) };
 
     None
 }
@@ -4913,6 +4961,79 @@ mod tests {
         with_cia(Some(b"abbr,kind,menu,abbr"), || {
             assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
         });
+    }
+
+    // ---- did_set_fileformat ----
+
+    fn ff_args(
+        buf: &mut crate::buffer_defs::BufT,
+        flags: u32,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Fileformat,
+            os_buf: buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: flags as i32,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_fileformat_modifiable_buffer_accepts_a_valid_value() {
+        // ml_setflags returns early on a null ml_mfp, so a default
+        // BufT needs no real swap file here.
+        let mut buf = crate::buffer_defs::BufT { b_p_ma: 1, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"unix".to_vec());
+        let mut args = ff_args(&mut buf, 0, &mut val);
+        assert_eq!(unsafe { did_set_fileformat(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_fileformat_non_modifiable_buffer_is_rejected() {
+        let mut buf = crate::buffer_defs::BufT { b_p_ma: 0, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"unix".to_vec());
+        let mut args = ff_args(&mut buf, 0, &mut val);
+        assert_eq!(
+            unsafe { did_set_fileformat(&mut args) },
+            Some(crate::errors::e_modifiable.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_fileformat_non_modifiable_buffer_is_allowed_for_the_global_value() {
+        // The !MODIFIABLE check is skipped entirely for OPT_GLOBAL.
+        let mut buf = crate::buffer_defs::BufT { b_p_ma: 0, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"unix".to_vec());
+        let mut args =
+            ff_args(&mut buf, crate::option_defs::opt_set_flags::OPT_GLOBAL, &mut val);
+        assert_eq!(unsafe { did_set_fileformat(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_fileformat_rejects_an_invalid_value() {
+        // The modifiable check passes, so this is did_set_str_generic
+        // rejecting the value itself.
+        let mut buf = crate::buffer_defs::BufT { b_p_ma: 1, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = ff_args(&mut buf, 0, &mut val);
+        assert_eq!(
+            unsafe { did_set_fileformat(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_fileformat_checks_modifiable_before_validating_the_value() {
+        // An invalid value on a non-modifiable buffer must report
+        // E21, not E474 - the original checks MODIFIABLE first.
+        let mut buf = crate::buffer_defs::BufT { b_p_ma: 0, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = ff_args(&mut buf, 0, &mut val);
+        assert_eq!(
+            unsafe { did_set_fileformat(&mut args) },
+            Some(crate::errors::e_modifiable.as_bytes())
+        );
     }
 
     // ---- did_set_mousescroll ----
