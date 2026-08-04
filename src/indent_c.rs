@@ -73,6 +73,11 @@
 //! or `MAXCOL` for none. Handles both the C `//` form and, for a
 //! `'lisp'` buffer, the `;` form with its own string tracking.
 //!
+//! Also [`cin_first_id_amount`] - the virtual column of the
+//! identifier following a leading type keyword on the cursor line. It
+//! is the first function here to need a real memline, so its tests
+//! follow `cursor.rs`'s own `open_and_set_test_buf` precedent.
+//!
 //! Deferred: everything else - `cin_ispreproc_cont`/
 //! `find_line_comment`/`cin_iswhileofdo_end` (need `ml_get`, the
 //! cursor and `find_match_paren`) and the rest of the real
@@ -1073,6 +1078,77 @@ pub unsafe fn check_linecomment(line: &[u8]) -> i32 {
     }
 }
 
+/// The virtual column of the identifier following a leading type
+/// keyword on the cursor line (`cin_first_id_amount`).
+///
+/// Skips an optional `"static"`, then a `"struct"`/`"enum"`, or an
+/// `"unsigned"`/`"signed"` when followed by `int`/`long`/`short`/
+/// `char`. Returns `0` when there is no such identifier.
+///
+/// # Safety
+/// `crate::globals::GLOBALS`' own `curwin`/`curbuf` must be valid,
+/// non-null pointers to live objects, and the cursor line must exist -
+/// matching `crate::cursor::get_cursor_line_ptr`'s own safety doc.
+#[must_use]
+pub unsafe fn cin_first_id_amount() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    let starts = |i: usize, w: &[u8]| line.get(i..).is_some_and(|t| t.starts_with(w));
+    let skipw = |i: usize| i + crate::charset::skipwhite(line.get(i..).unwrap_or(&[]));
+    let tow = |i: usize| crate::charset::skiptowhite(line.get(i..).unwrap_or(&[]));
+
+    let mut p = skipw(0);
+    let mut len = tow(p);
+
+    if len == 6 && starts(p, b"static") {
+        p = skipw(p + 6);
+        len = tow(p);
+    }
+    if len == 6 && starts(p, b"struct") {
+        p = skipw(p + 6);
+    } else if len == 4 && starts(p, b"enum") {
+        p = skipw(p + 4);
+    } else if (len == 8 && starts(p, b"unsigned")) || (len == 6 && starts(p, b"signed")) {
+        let s = skipw(p + len);
+        let iswhite_at = |i: usize| crate::ascii_defs::ascii_iswhite(i32::from(at(i)));
+        if (starts(s, b"int") && iswhite_at(s + 3))
+            || (starts(s, b"long") && iswhite_at(s + 4))
+            || (starts(s, b"short") && iswhite_at(s + 5))
+            || (starts(s, b"char") && iswhite_at(s + 4))
+        {
+            p = s;
+        }
+    }
+
+    let mut len = 0usize;
+    while crate::charset::vim_isidc(i32::from(at(p + len))) {
+        len += 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if len == 0
+        || !crate::ascii_defs::ascii_iswhite(i32::from(at(p + len)))
+        || unsafe { cin_nocode(&line, p) }
+    {
+        return 0;
+    }
+
+    let p = skipw(p + len);
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    let mut fp = crate::pos_defs::PosT {
+        lnum,
+        col: i32::try_from(p).unwrap_or(0),
+        ..Default::default()
+    };
+    let mut col: crate::pos_defs::ColnrT = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::plines::getvcol(curwin, &mut fp, Some(&mut col), None, None, 0) };
+    col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1160,7 @@ mod tests {
     /// precedent.
     struct CurbufGuard {
         prev_curbuf: *mut BufT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -1091,15 +1168,36 @@ mod tests {
         fn set(buf: *mut BufT) -> Self {
             let _lock = crate::globals::global_state_test_lock();
             let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-            let guard = CurbufGuard { prev_curbuf: globals.curbuf, _lock };
+            let guard = CurbufGuard {
+                prev_curbuf: globals.curbuf,
+                prev_curwin: globals.curwin,
+                _lock,
+            };
             globals.curbuf = buf;
             guard
         }
-    }
 
+        /// As [`CurbufGuard::set`], but also installs `win` as
+        /// `curwin` - needed by anything reaching the cursor line.
+        fn set_win_and_buf(win: *mut crate::buffer_defs::WinT, buf: *mut BufT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = CurbufGuard {
+                prev_curbuf: globals.curbuf,
+                prev_curwin: globals.curwin,
+                _lock,
+            };
+            globals.curbuf = buf;
+            globals.curwin = win;
+            unsafe { &mut *win }.w_buffer = buf;
+            guard
+        }
+    }
     impl Drop for CurbufGuard {
         fn drop(&mut self) {
-            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.prev_curbuf;
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_curbuf;
+            globals.curwin = self.prev_curwin;
         }
     }
 
@@ -1180,6 +1278,87 @@ mod tests {
         };
         let _guard = CurbufGuard::set(&mut buf);
         f()
+    }
+
+    // ---- cin_first_id_amount ----
+
+    /// Installs `win`/`buf` as curwin/curbuf, opens a fresh memline
+    /// and puts `line` on line 1 - mirroring `cursor.rs`'s own
+    /// `open_and_set_test_buf` precedent. Callers must close
+    /// `buf.b_ml.ml_mfp` afterward.
+    fn open_test_buf(
+        win: &mut crate::buffer_defs::WinT,
+        buf: &mut BufT,
+        line: &[u8],
+    ) -> CurbufGuard {
+        let guard = CurbufGuard::set_win_and_buf(win, buf);
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        guard
+    }
+
+    fn close_test_buf(buf: BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// Runs `cin_first_id_amount` over a single-line buffer.
+    fn first_id_amount(line: &[u8]) -> i32 {
+        let mut buf = BufT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut text = line.to_vec();
+        text.push(0);
+        let guard = open_test_buf(&mut win, &mut buf, &text);
+        win.w_cursor.lnum = 1;
+        let result = unsafe { cin_first_id_amount() };
+        drop(guard);
+        close_test_buf(buf);
+        result
+    }
+
+    #[test]
+    fn cin_first_id_amount_reports_the_column_of_the_identifier() {
+        // "int foo bar" - the identifier after the type is at
+        // column 4.
+        assert_eq!(first_id_amount(b"int foo bar"), 4);
+        // A leading "static" is skipped.
+        assert_eq!(first_id_amount(b"static int foo bar"), 11);
+    }
+
+    #[test]
+    fn cin_first_id_amount_skips_struct_and_enum_keywords() {
+        // "struct foo bar" - `foo` is the type name, `bar` follows.
+        assert_eq!(first_id_amount(b"struct foo bar"), 11);
+        assert_eq!(first_id_amount(b"enum foo bar"), 9);
+    }
+
+    #[test]
+    fn cin_first_id_amount_skips_signed_and_unsigned_only_before_a_base_type() {
+        // Hand-traced: `p` is moved onto the base type, and the
+        // identifier scan then consumes that base type itself - so the
+        // reported column is the word AFTER it, not the last word.
+        // "unsigned int foo bar": p lands on `int` (9), the scan eats
+        // `int`, and the column reported is that of `foo` (13).
+        assert_eq!(first_id_amount(b"unsigned int foo bar"), 13);
+        // "signed char foo bar": same shape, `char` at 7, `foo` at 12.
+        assert_eq!(first_id_amount(b"signed char foo bar"), 12);
+        // Without a base type after it the `unsigned` is NOT skipped,
+        // so it is consumed as the identifier and `foo` (9) follows.
+        assert_eq!(first_id_amount(b"unsigned foo bar"), 9);
+    }
+
+    #[test]
+    fn cin_first_id_amount_is_zero_without_a_trailing_identifier() {
+        // Nothing after the type name.
+        assert_eq!(first_id_amount(b"int"), 0);
+        // Comment-only and empty lines have no code at all.
+        assert_eq!(first_id_amount(b"// c"), 0);
+        assert_eq!(first_id_amount(b""), 0);
     }
 
     #[test]
