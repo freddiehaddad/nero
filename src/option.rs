@@ -118,6 +118,15 @@
 //! detail this crate's growable `Vec<u8>` could otherwise drop).
 //! `path.rs`'s `match_suffix` is their first real caller.
 //!
+//! Also translated: `check_illegal_path_names` (`optionstr.c`) -
+//! `did_set_option`'s own early "is this string value shaped like a
+//! real file/directory name, or does it contain a shell-wildcard/
+//! separator character that shouldn't be there" guard, needing only
+//! `GLOBALS.secure`. Translated ahead of `did_set_option` itself
+//! (still deferred, see below), matching this crate's established
+//! "small, simple, mechanically correct piece ahead of its real
+//! caller" precedent.
+//!
 //! **STALE-NOTE FIX**: `find_option`/`find_option_len` (below) were
 //! previously (incorrectly) described here as still needing the
 //! perfect-hash generated table - they are, in fact, ALREADY
@@ -138,7 +147,33 @@
 //!   `redraw_all_later`/`changed_window_setting` - already documented
 //!   as blocking `undo.c`'s undo/redo state machine, per this
 //!   project's own plan) AND the `OptionSet` autocommand trigger
-//!   machinery.
+//!   machinery. **Re-scoped precisely this pass**: `did_set_option`'s
+//!   own real body only reaches `opt.opt_did_set_cb` for the 188/377
+//!   options that HAVE one - the other 189 (`opt_did_set_cb == None`)
+//!   skip straight past that branch to the function's OWN remaining,
+//!   option-agnostic machinery (re-reading `new_value`, `set_sid`/
+//!   `sctx`-tracking via `set_option_sctx` - not yet translated -,
+//!   `scope_both`'s global-local-unset handling, then the 3 special-
+//!   cased `curbuf.b_p_syn`/`b_p_ft`/`curwin.w_s.b_p_spl` autocmd
+//!   triggers, `comp_col`/`setmouse`/`redraw_all_later`/
+//!   `set_winbar_all`/`check_redraw` redraw-pipeline calls - all
+//!   omittable per this crate's established `redraw_later`-omission
+//!   precedent -, and finally the `insecure_flag`-bit bookkeeping at
+//!   the very end, ALL of which is real, tractable, option-agnostic
+//!   logic). This means a translated `did_set_option` could be
+//!   genuinely correct and complete TODAY for those 189 options,
+//!   `unimplemented!()`-ing only at the exact point a real callback
+//!   would be invoked for the other 188 - matching this crate's
+//!   established "translate the real, always-reachable fast path"
+//!   precedent. Not yet attempted: needs `set_option_sctx` (small,
+//!   not yet checked), `check_illegal_path_names` (now translated,
+//!   see below - `did_set_option`'s OWN early check, before the
+//!   callback dispatch), and the small `do_syntax_autocmd`/
+//!   `do_filetype_autocmd`/`do_spelllang_source` trio (each
+//!   individually gated behind a `varp ==` pointer-identity check
+//!   against 3 SPECIFIC option storage addresses - would need
+//!   verifying against real `apply_autocmds`, likely tractable given
+//!   that already exists).
 //! - `validate_option_value`/`validate_num_option`/
 //!   `check_num_option_bounds` are now FULLY translated (no remaining
 //!   panics): `OptIndex::Lines`/`OptIndex::Scroll` (previously the
@@ -844,6 +879,36 @@ pub fn reset_option_was_set(opt_idx: OptIndex) {
     // aliasing hazard.
     let table = unsafe { OPTION_WAS_SET.get_mut() };
     table[opt_idx as usize] = false;
+}
+
+/// Whether `val` (a prospective new string-option value) contains a
+/// character illegal for a normal file name (`kOptFlagNFname`) or
+/// directory name (`kOptFlagNDname`) option - e.g. `'*'`/`'?'`/`'['`
+/// are shell-wildcard-shaped and never allowed in either, while
+/// `'/'`/`'\\'`/`'<'`/`'>'` are additionally disallowed for a bare
+/// file name (not a full path) unless `sandbox`-adjacent
+/// `GLOBALS.secure` mode further restricts it with `'|'`/`';'`/`'&'`
+/// too (`check_illegal_path_names`, `optionstr.c`).
+///
+/// `groups.contains(b)`-style membership checks replace the
+/// original's own `strpbrk(val, charset) != NULL` (does ANY character
+/// from `charset` appear anywhere in `val`) - `.iter().any(...)`
+/// over a fixed byte-set is an exact, idiomatic Rust equivalent, with
+/// no dependency on `val` being NUL-terminated (matching this crate's
+/// own "option string values carry no trailing NUL" convention).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.secure`.
+#[must_use]
+pub unsafe fn check_illegal_path_names(val: &[u8], flags: u32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let secure = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+    let nfname_chars: &[u8] =
+        if secure != 0 { b"/\\*?[|;&<>\r\n" } else { b"/\\*?[<>\r\n" };
+    (flags & crate::option_defs::opt_flags::NFNAME != 0
+        && val.iter().any(|b| nfname_chars.contains(b)))
+        || (flags & crate::option_defs::opt_flags::NDNAME != 0
+            && val.iter().any(|b| b"*?[|;&<>\r\n".contains(b)))
 }
 
 /// Get pointer to option variable, given the option and the buffer/
@@ -4309,6 +4374,82 @@ mod varp_tests {
 
         reset_option_was_set(OptIndex::Tabstop);
         assert!(!option_was_set(OptIndex::Tabstop));
+    }
+
+    // --- check_illegal_path_names ---
+
+    #[test]
+    fn check_illegal_path_names_neither_flag_set_is_always_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!unsafe { check_illegal_path_names(b"a*b", 0) });
+    }
+
+    #[test]
+    fn check_illegal_path_names_clean_value_is_false() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!unsafe {
+            check_illegal_path_names(b"hello-world_123", crate::option_defs::opt_flags::NFNAME)
+        });
+    }
+
+    #[test]
+    fn check_illegal_path_names_nfname_wildcard_is_illegal() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe {
+            check_illegal_path_names(b"foo*bar", crate::option_defs::opt_flags::NFNAME)
+        });
+    }
+
+    #[test]
+    fn check_illegal_path_names_nfname_non_secure_allows_pipe_and_semicolon() {
+        // Outside secure mode, NFNAME's own charset omits '|'/';'/'&' -
+        // only present when GLOBALS.secure is set (see the next test).
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        assert!(!unsafe {
+            check_illegal_path_names(b"a|b;c&d", crate::option_defs::opt_flags::NFNAME)
+        });
+    }
+
+    #[test]
+    fn check_illegal_path_names_nfname_secure_mode_also_forbids_pipe_semicolon_ampersand() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.secure;
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+
+        assert!(unsafe { check_illegal_path_names(b"a|b", crate::option_defs::opt_flags::NFNAME) });
+        assert!(unsafe { check_illegal_path_names(b"a;b", crate::option_defs::opt_flags::NFNAME) });
+        assert!(unsafe { check_illegal_path_names(b"a&b", crate::option_defs::opt_flags::NFNAME) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = prev;
+    }
+
+    #[test]
+    fn check_illegal_path_names_ndname_always_forbids_pipe_semicolon_ampersand() {
+        // NDNAME's own charset includes '|'/';'/'&' unconditionally,
+        // regardless of GLOBALS.secure (unlike NFNAME above).
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        assert!(unsafe { check_illegal_path_names(b"a|b", crate::option_defs::opt_flags::NDNAME) });
+    }
+
+    #[test]
+    fn check_illegal_path_names_ndname_allows_backslash_and_forward_slash() {
+        // NDNAME's own charset omits '/'/'\\' entirely (unlike
+        // NFNAME) - a directory name option is expected to contain
+        // real path separators.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!unsafe {
+            check_illegal_path_names(br"C:\some/dir", crate::option_defs::opt_flags::NDNAME)
+        });
+    }
+
+    #[test]
+    fn check_illegal_path_names_both_flags_set_matches_either_condition() {
+        let _lock = crate::globals::global_state_test_lock();
+        let flags = crate::option_defs::opt_flags::NFNAME | crate::option_defs::opt_flags::NDNAME;
+        assert!(unsafe { check_illegal_path_names(b"a*b", flags) });
+        assert!(!unsafe { check_illegal_path_names(b"clean", flags) });
     }
 
     #[cfg(windows)]
