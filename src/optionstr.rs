@@ -380,6 +380,20 @@
 //! exactly that, and it is pinned by its own test rather than papered
 //! over.
 //!
+//! Also `check_chars_options`, `did_set_global_chars_option`,
+//! [`did_set_chars_option`], [`did_set_ambiwidth`] and
+//! [`did_set_emoji`] - the four callbacks `set_chars_option` unlocked.
+//! `did_set_emoji` deliberately validates `'ambiwidth'` rather than
+//! `'emoji'` itself, since both feed the same character-width tables.
+//! The `E834`/`E835` "conflicts with value of" messages are kept
+//! distinguishable so a caller can tell which of the two options was
+//! at fault. `clear_string_option` is inlined as a plain assignment:
+//! it exists in the original purely to free a C string and point it at
+//! the shared empty one, which an owned `Option<Vec<u8>>` handles.
+//!
+//! `did_set_background` remains deferred - it needs `init_highlight`
+//! and `do_unlet` (colorscheme reload), neither translated.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -3527,6 +3541,275 @@ pub unsafe fn set_chars_option(
     None // no error
 }
 
+/// Error message for a `'listchars'` value that conflicts with the
+/// current character widths (`e_conflicts_with_value_of_listchars`, a
+/// file-local `static const char[]` in the original - kept file-local
+/// here too, same precedent as `e_comma_required`).
+#[allow(non_upper_case_globals)]
+const e_conflicts_with_value_of_listchars: &str =
+    crate::gettext_defs::gettext_noop("E834: Conflicts with value of 'listchars'");
+
+/// Error message for a `'fillchars'` value that conflicts with the
+/// current character widths (`e_conflicts_with_value_of_fillchars`).
+/// Same file-local scoping as above.
+#[allow(non_upper_case_globals)]
+const e_conflicts_with_value_of_fillchars: &str =
+    crate::gettext_defs::gettext_noop("E835: Conflicts with value of 'fillchars'");
+
+/// The global `'listchars'` or `'fillchars'` option is changed
+/// (`did_set_global_chars_option`).
+///
+/// # Safety
+/// Forwarded from `set_chars_option`'s own safety doc. `win` must be
+/// a valid, live `WinT`, and `GLOBALS`' own tabpage/window chains
+/// must consist of valid, live pointers.
+unsafe fn did_set_global_chars_option(
+    win: *mut crate::buffer_defs::WinT,
+    val: &[u8],
+    what: CharsOption,
+    opt_flags: i32,
+    errbuf: Option<&mut Vec<u8>>,
+) -> Option<&'static [u8]> {
+    let is_global = (opt_flags & crate::option_defs::opt_set_flags::OPT_GLOBAL as i32) != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let local_empty = unsafe {
+        let w = &*win;
+        match what {
+            CharsOption::Listchars => w.w_onebuf_opt.wo_lcs.as_deref().unwrap_or(b""),
+            CharsOption::Fillchars => w.w_onebuf_opt.wo_fcs.as_deref().unwrap_or(b""),
+        }
+        .is_empty()
+    };
+
+    // only apply the global value to "win" when it does not have a
+    // local value
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe {
+        set_chars_option(
+            &mut *win,
+            val,
+            what,
+            local_empty || !is_global,
+            errbuf,
+        )
+    };
+    if errmsg.is_some() {
+        return errmsg;
+    }
+
+    // If the current window is set to use the global
+    // 'listchars'/'fillchars' value, clear the window-local value.
+    if !is_global {
+        // `clear_string_option` in the original: frees the old string
+        // and points it at the shared empty one. With an owned
+        // `Option<Vec<u8>>` that is just an assignment.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            let w = &mut *win;
+            match what {
+                CharsOption::Listchars => w.w_onebuf_opt.wo_lcs = Some(Vec::new()),
+                CharsOption::Fillchars => w.w_onebuf_opt.wo_fcs = Some(Vec::new()),
+            }
+        }
+    }
+
+    // If a window has a local value it needs to be applied again, it
+    // was changed when setting the global value. No error is expected
+    // here since none was returned above, so the result is ignored -
+    // exactly as the original notes.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        for_all_tab_windows(|wp| {
+            let opt = match what {
+                CharsOption::Listchars => (*wp).w_onebuf_opt.wo_lcs.clone(),
+                CharsOption::Fillchars => (*wp).w_onebuf_opt.wo_fcs.clone(),
+            };
+            let opt = opt.unwrap_or_default();
+            if opt.is_empty() {
+                let _ = set_chars_option(&mut *wp, &opt, what, true, None);
+            }
+        });
+    }
+
+    None
+}
+
+/// Call `f` for every window in every tabpage (`FOR_ALL_TAB_WINDOWS`),
+/// following `move.rs`'s own established walk idiom.
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// own window list (`GLOBALS.firstwin`/`tp_firstwin`, then `w_next`),
+/// must consist of valid, live pointers.
+unsafe fn for_all_tab_windows(mut f: impl FnMut(*mut crate::buffer_defs::WinT)) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            f(wp);
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+}
+
+/// Check all global and local values of `'listchars'` and
+/// `'fillchars'` (`check_chars_options`). May set different defaults
+/// in case character widths change.
+///
+/// Returns an untranslated error message if any of them is invalid,
+/// `None` otherwise.
+///
+/// # Safety
+/// Forwarded from `set_chars_option`'s own safety doc.
+/// `GLOBALS.curwin` must be a valid, live `WinT`, and the
+/// tabpage/window chains must consist of valid, live pointers.
+pub unsafe fn check_chars_options() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let (p_lcs, p_fcs) = (
+        opts.p_lcs.clone().unwrap_or_default(),
+        opts.p_fcs.clone().unwrap_or_default(),
+    );
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { set_chars_option(&mut *curwin, &p_lcs, CharsOption::Listchars, false, None) }
+        .is_some()
+    {
+        return Some(e_conflicts_with_value_of_listchars.as_bytes());
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { set_chars_option(&mut *curwin, &p_fcs, CharsOption::Fillchars, false, None) }
+        .is_some()
+    {
+        return Some(e_conflicts_with_value_of_fillchars.as_bytes());
+    }
+
+    let mut err: Option<&'static [u8]> = None;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        for_all_tab_windows(|wp| {
+            if err.is_some() {
+                return;
+            }
+            let lcs = (*wp).w_onebuf_opt.wo_lcs.clone().unwrap_or_default();
+            if set_chars_option(&mut *wp, &lcs, CharsOption::Listchars, true, None).is_some() {
+                err = Some(e_conflicts_with_value_of_listchars.as_bytes());
+                return;
+            }
+            let fcs = (*wp).w_onebuf_opt.wo_fcs.clone().unwrap_or_default();
+            if set_chars_option(&mut *wp, &fcs, CharsOption::Fillchars, true, None).is_some() {
+                err = Some(e_conflicts_with_value_of_fillchars.as_bytes());
+            }
+        });
+    }
+    err
+}
+
+/// The `'fillchars'` option or the `'listchars'` option is changed
+/// (`did_set_chars_option`).
+///
+/// # Safety
+/// Forwarded from `did_set_global_chars_option`'s own safety doc.
+/// `args.os_win` must be a valid, live `WinT`, and `args.os_varp`
+/// must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_chars_option(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win.cast::<crate::buffer_defs::WinT>();
+    let varp = args.os_varp.cast::<Option<Vec<u8>>>();
+    // SAFETY: forwarded from this function's own safety doc.
+    let val = unsafe { &*varp }.clone().unwrap_or_default();
+    let opt_flags = args.os_flags;
+    let mut errbuf = args.os_errbuf.take();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let is_global_lcs = std::ptr::eq(varp, std::ptr::addr_of_mut!(opts.p_lcs));
+    let is_global_fcs = std::ptr::eq(varp, std::ptr::addr_of_mut!(opts.p_fcs));
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe {
+        if is_global_lcs {
+            did_set_global_chars_option(
+                win,
+                &val,
+                CharsOption::Listchars,
+                opt_flags,
+                errbuf.as_mut(),
+            )
+        } else if is_global_fcs {
+            did_set_global_chars_option(
+                win,
+                &val,
+                CharsOption::Fillchars,
+                opt_flags,
+                errbuf.as_mut(),
+            )
+        } else if std::ptr::eq(varp, std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_lcs)) {
+            set_chars_option(&mut *win, &val, CharsOption::Listchars, true, errbuf.as_mut())
+        } else if std::ptr::eq(varp, std::ptr::addr_of_mut!((*win).w_onebuf_opt.wo_fcs)) {
+            set_chars_option(&mut *win, &val, CharsOption::Fillchars, true, errbuf.as_mut())
+        } else {
+            // The original leaves `errmsg` NULL when `varp` matches
+            // none of the four - there is no final `else`.
+            None
+        }
+    };
+
+    args.os_errbuf = errbuf;
+    errmsg
+}
+
+/// The `'ambiwidth'` option is changed (`did_set_ambiwidth`).
+///
+/// # Safety
+/// Forwarded from `did_set_str_generic`'s and `check_chars_options`'s
+/// own safety docs.
+pub unsafe fn did_set_ambiwidth(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe { did_set_str_generic(args) };
+    if errmsg.is_some() {
+        return errmsg;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_chars_options() }
+}
+
+/// The `'emoji'` option is changed (`did_set_emoji`).
+///
+/// Note this validates `'ambiwidth'`, not `'emoji'` itself - both
+/// feed the same character-width tables, so a change to either has to
+/// be re-checked against the current `'ambiwidth'` value.
+///
+/// # Safety
+/// Forwarded from `check_str_opt`'s and `check_chars_options`'s own
+/// safety docs.
+pub unsafe fn did_set_emoji(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { check_str_opt(crate::option_defs::OptIndex::Ambiwidth, None) } {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { check_chars_options() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6160,6 +6443,184 @@ mod tests {
             };
             assert_eq!(got, Some(e_wrong_number_of_characters_for_field_str.as_bytes()));
             assert_eq!(errbuf, e_wrong_number_of_characters_for_field_str.as_bytes());
+        });
+    }
+
+    // ---- check_chars_options / did_set_chars_option ----
+
+    /// Runs `f` with `GLOBALS.curwin`/`firstwin`/tabpage chain
+    /// pointed at `win`, restoring everything afterward, so the
+    /// `FOR_ALL_TAB_WINDOWS` walk has exactly one window to visit.
+    fn with_one_window<R>(win: &mut crate::buffer_defs::WinT, f: impl FnOnce() -> R) -> R {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (g.curwin, g.firstwin, g.first_tabpage, g.curtab);
+        let wp: *mut crate::buffer_defs::WinT = win;
+        unsafe { &mut *wp }.w_next = std::ptr::null_mut();
+        g.curwin = wp;
+        g.firstwin = wp;
+        // A null tabpage list means the walk visits nothing; give it
+        // one tabpage whose "is curtab" test picks up `firstwin`.
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_firstwin: wp,
+            tp_next: std::ptr::null_mut(),
+            ..Default::default()
+        };
+        let tpp: *mut crate::buffer_defs::TabpageT = &mut tp;
+        g.first_tabpage = tpp;
+        g.curtab = tpp;
+
+        let result = f();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        (g.curwin, g.firstwin, g.first_tabpage, g.curtab) = saved;
+        result
+    }
+
+    #[test]
+    fn check_chars_options_accepts_valid_globals_and_rejects_invalid_ones() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            with_one_window(&mut win, || {
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_lcs = Some(b"eol:$".to_vec());
+                opts.p_fcs = Some(b"vert:|".to_vec());
+                assert_eq!(unsafe { check_chars_options() }, None);
+
+                // A bad global 'listchars' is reported as E834, and a
+                // bad 'fillchars' as E835 - the two are deliberately
+                // distinguishable.
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_lcs = Some(b"bogus:x".to_vec());
+                assert_eq!(
+                    unsafe { check_chars_options() },
+                    Some(e_conflicts_with_value_of_listchars.as_bytes())
+                );
+
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_lcs = Some(b"eol:$".to_vec());
+                opts.p_fcs = Some(b"bogus:x".to_vec());
+                assert_eq!(
+                    unsafe { check_chars_options() },
+                    Some(e_conflicts_with_value_of_fillchars.as_bytes())
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn did_set_chars_option_applies_a_window_local_value() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"tab:>-".to_vec());
+            with_one_window(&mut win, || {
+                let wp: *mut crate::buffer_defs::WinT =
+                    unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+                let mut args = crate::option_defs::OptsetT {
+                    os_win: wp.cast(),
+                    os_varp: unsafe { std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_lcs) }.cast(),
+                    ..Default::default()
+                };
+                assert_eq!(unsafe { did_set_chars_option(&mut args) }, None);
+                assert_eq!(
+                    unsafe { &*wp }.w_p_lcs_chars.tab1,
+                    crate::grid::schar_from_char(i32::from(b'>'))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn did_set_chars_option_reports_a_bad_window_local_value() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_fcs = Some(b"bogus:x".to_vec());
+            with_one_window(&mut win, || {
+                let wp: *mut crate::buffer_defs::WinT =
+                    unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+                let mut args = crate::option_defs::OptsetT {
+                    os_win: wp.cast(),
+                    os_varp: unsafe { std::ptr::addr_of_mut!((*wp).w_onebuf_opt.wo_fcs) }.cast(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe { did_set_chars_option(&mut args) },
+                    Some(crate::errors::e_invarg.as_bytes())
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn did_set_chars_option_clears_the_local_value_for_a_non_global_set() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            win.w_onebuf_opt.wo_lcs = Some(b"tab:>-".to_vec());
+            with_one_window(&mut win, || {
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_lcs = Some(b"eol:$".to_vec());
+                let wp: *mut crate::buffer_defs::WinT =
+                    unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+                let mut args = crate::option_defs::OptsetT {
+                    os_win: wp.cast(),
+                    os_varp: std::ptr::addr_of_mut!(
+                        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lcs
+                    )
+                    .cast(),
+                    os_flags: 0, // not OPT_GLOBAL
+                    ..Default::default()
+                };
+                assert_eq!(unsafe { did_set_chars_option(&mut args) }, None);
+                // Setting the global value without OPT_GLOBAL clears
+                // the window-local one.
+                assert_eq!(
+                    unsafe { &*wp }.w_onebuf_opt.wo_lcs.as_deref(),
+                    Some(&b""[..])
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn did_set_ambiwidth_and_emoji_validate_and_recheck_the_chars_options() {
+        with_chars(|| {
+            let mut win = crate::buffer_defs::WinT::default();
+            with_one_window(&mut win, || {
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_lcs = Some(b"eol:$".to_vec());
+                opts.p_fcs = Some(b"vert:|".to_vec());
+                let prev_ambw = opts.p_ambw.clone();
+
+                // A valid 'ambiwidth' passes, then re-checks the
+                // chars options and finds them fine.
+                opts.p_ambw = Some(b"single".to_vec());
+                let mut args = crate::option_defs::OptsetT {
+                    os_idx: crate::option_defs::OptIndex::Ambiwidth,
+                    ..Default::default()
+                };
+                assert_eq!(unsafe { did_set_ambiwidth(&mut args) }, None);
+                let mut args = crate::option_defs::OptsetT::default();
+                assert_eq!(unsafe { did_set_emoji(&mut args) }, None);
+
+                // An invalid 'ambiwidth' is rejected by both - E474
+                // from real nvim, cross-checked.
+                let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+                opts.p_ambw = Some(b"bogus".to_vec());
+                let mut args = crate::option_defs::OptsetT {
+                    os_idx: crate::option_defs::OptIndex::Ambiwidth,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe { did_set_ambiwidth(&mut args) },
+                    Some(crate::errors::e_invarg.as_bytes())
+                );
+                let mut args = crate::option_defs::OptsetT::default();
+                assert_eq!(
+                    unsafe { did_set_emoji(&mut args) },
+                    Some(crate::errors::e_invarg.as_bytes())
+                );
+
+                unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ambw = prev_ambw;
+            });
         });
     }
 
