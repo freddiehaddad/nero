@@ -32,6 +32,10 @@
 //! rather than the original's bool-plus-in-place-advance `const char
 //! **s`.
 //!
+//! Also [`cin_iscase`], [`cin_isdefault`] and [`cin_isscopedecl`] -
+//! the switch-label and `'cinscopedecls'` recognizers, all resting on
+//! `cin_skipcomment`.
+//!
 //! Deferred: everything else - `cin_islinecomment`/`find_line_comment`
 //! (need `ml_get` and the cursor), `cin_ends_in`/`cin_is_cpp_extern_c`
 //! and the rest of the real indent-computation algorithm.
@@ -366,6 +370,100 @@ pub unsafe fn cin_has_js_key(line: &[u8]) -> bool {
     at(s) == b':' && at(s + 1) != b':'
 }
 
+/// Recognize a `"default"` switch label (`cin_isdefault`).
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_isdefault(line: &[u8], s: usize) -> bool {
+    if !line.get(s..).is_some_and(|t| t.starts_with(b"default")) {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let skip = unsafe { cin_skipcomment(line, s + 7) };
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    at(skip) == b':' && at(skip + 1) != b':'
+}
+
+/// Recognize a switch label - `"case .*:"` or `"default:"`
+/// (`cin_iscase`).
+///
+/// `strict` false relaxes the check for JavaScript, where a string
+/// after `case` still counts as a label.
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_iscase(line: &[u8], s: usize, strict: bool) -> bool {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { cin_skipcomment(line, s) };
+
+    if cin_starts_with(line.get(s..).unwrap_or(&[]), b"case") {
+        let mut p = s + 4;
+        while at(p) != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            p = unsafe { cin_skipcomment(line, p) };
+            if at(p) == 0 {
+                break;
+            }
+            if at(p) == b':' {
+                if at(p + 1) == b':' {
+                    // skip over "::" for C++
+                    p += 1;
+                } else {
+                    return true;
+                }
+            }
+            if at(p) == b'\'' && at(p + 1) != 0 && at(p + 2) == b'\'' {
+                p += 2; // skip over ':'
+            } else if at(p) == b'/' && (at(p + 1) == b'*' || at(p + 1) == b'/') {
+                return false; // stop at comment
+            } else if at(p) == b'"' {
+                // JS etc.
+                return !strict; // strict: stop at string
+            }
+            p += 1;
+        }
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { cin_isdefault(line, s) }
+}
+
+/// Recognize a scope declaration label from the `'cinscopedecls'`
+/// option (`cin_isscopedecl`).
+///
+/// # Safety
+/// Forwarded from [`cin_skipcomment`]'s own safety doc.
+#[must_use]
+pub unsafe fn cin_isscopedecl(line: &[u8], p: usize) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { cin_skipcomment(line, p) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let cinsd = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }
+        .b_p_cinsd
+        .clone()
+        .unwrap_or_default();
+    let cinsd_len = cinsd.len() + 1;
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+
+    let mut c = 0usize;
+    while c < cinsd.len() {
+        let (part, next) = crate::option::copy_option_part(&cinsd, c, cinsd_len, b",");
+        c = next;
+        if line.get(s..).is_some_and(|t| t.starts_with(&part)) {
+            // SAFETY: forwarded from this function's own safety doc.
+            let skip = unsafe { cin_skipcomment(line, s + part.len()) };
+            if at(skip) == b':' && at(skip + 1) != b':' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +533,127 @@ mod tests {
     }
 
     // ---- cin_islabel_skip / cin_has_js_key ----
+
+    // ---- cin_iscase / cin_isdefault / cin_isscopedecl ----
+
+    /// Runs `f` with a buffer whose `'cinscopedecls'` is `cinsd`.
+    fn with_cinsd<R>(cinsd: &[u8], f: impl FnOnce() -> R) -> R {
+        let mut buf = BufT {
+            b_p_cinsd: Some(cinsd.to_vec()),
+            ..Default::default()
+        };
+        let _guard = CurbufGuard::set(&mut buf);
+        f()
+    }
+
+    /// The real default `'cinscopedecls'`, read off a live nvim binary.
+    const DEFAULT_CINSD: &[u8] = b"public,protected,private";
+
+    #[test]
+    fn cin_isdefault_recognizes_a_default_label() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_isdefault(b"default:", 0) });
+            // A comment may sit between the word and the colon.
+            assert!(unsafe { cin_isdefault(b"default/* c */:", 0) });
+            // "::" is C++ scope resolution, not a label.
+            assert!(!unsafe { cin_isdefault(b"default::x", 0) });
+            // No colon at all.
+            assert!(!unsafe { cin_isdefault(b"default x", 0) });
+            assert!(!unsafe { cin_isdefault(b"defaults:", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_recognizes_case_and_default_labels() {
+        with_hash_comment(0, || {
+            assert!(unsafe { cin_iscase(b"case 1:", 0, true) });
+            assert!(unsafe { cin_iscase(b"case FOO:", 0, true) });
+            assert!(unsafe { cin_iscase(b"default:", 0, true) });
+            // Leading whitespace and comments are skipped first.
+            assert!(unsafe { cin_iscase(b"  case 1:", 0, true) });
+            assert!(unsafe { cin_iscase(b"/* c */case 1:", 0, true) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_skips_a_cpp_scope_resolution_inside_the_value() {
+        with_hash_comment(0, || {
+            // "Foo::Bar" contains "::", which is stepped over rather
+            // than treated as the label's own colon.
+            assert!(unsafe { cin_iscase(b"case Foo::Bar:", 0, true) });
+            // Without a real trailing colon it is not a label.
+            assert!(!unsafe { cin_iscase(b"case Foo::Bar", 0, true) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_handles_a_colon_char_constant() {
+        with_hash_comment(0, || {
+            // `case ':':` - the quoted colon must not end the label,
+            // but the real one after it does.
+            assert!(unsafe { cin_iscase(b"case ':':", 0, true) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_strict_flag_only_changes_the_string_case() {
+        with_hash_comment(0, || {
+            // A string after `case` stops a strict (C) check but is
+            // accepted by the relaxed (JS) one.
+            let line = b"case \"foo\":";
+            assert!(!unsafe { cin_iscase(line, 0, true) });
+            assert!(unsafe { cin_iscase(line, 0, false) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_stops_at_a_comment_before_any_colon() {
+        with_hash_comment(0, || {
+            // A comment INSIDE the value aborts the scan.
+            assert!(!unsafe { cin_iscase(b"case x /* c */", 0, true) });
+        });
+    }
+
+    #[test]
+    fn cin_iscase_rejects_non_labels() {
+        with_hash_comment(0, || {
+            assert!(!unsafe { cin_iscase(b"x = 1;", 0, true) });
+            assert!(!unsafe { cin_iscase(b"", 0, true) });
+            // "cases" is not "case" - cin_starts_with requires a
+            // non-identifier character to follow.
+            assert!(!unsafe { cin_iscase(b"cases:", 0, true) });
+        });
+    }
+
+    #[test]
+    fn cin_isscopedecl_matches_each_default_cinscopedecl() {
+        with_cinsd(DEFAULT_CINSD, || {
+            assert!(unsafe { cin_isscopedecl(b"public:", 0) });
+            assert!(unsafe { cin_isscopedecl(b"protected:", 0) });
+            assert!(unsafe { cin_isscopedecl(b"private:", 0) });
+            // Leading whitespace is skipped first.
+            assert!(unsafe { cin_isscopedecl(b"   public:", 0) });
+            // A comment may sit between the word and the colon.
+            assert!(unsafe { cin_isscopedecl(b"public/* c */:", 0) });
+        });
+    }
+
+    #[test]
+    fn cin_isscopedecl_rejects_non_matches() {
+        with_cinsd(DEFAULT_CINSD, || {
+            // No colon.
+            assert!(!unsafe { cin_isscopedecl(b"public x", 0) });
+            // "::" is scope resolution, not a declaration label.
+            assert!(!unsafe { cin_isscopedecl(b"public::x", 0) });
+            // Not in the list at all.
+            assert!(!unsafe { cin_isscopedecl(b"internal:", 0) });
+            assert!(!unsafe { cin_isscopedecl(b"", 0) });
+        });
+        // An empty 'cinscopedecls' can never match.
+        with_cinsd(b"", || {
+            assert!(!unsafe { cin_isscopedecl(b"public:", 0) });
+        });
+    }
 
     #[test]
     fn cin_islabel_skip_accepts_a_plain_label() {
