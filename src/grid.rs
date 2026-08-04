@@ -23,6 +23,16 @@
 //! `ui_call_grid_scroll`), the highlight attribute registry
 //! (`hl_combine_attr`), and `decor`'s own providers, none translated.
 //! `schar_cache_clear` likewise needs `decor_check_invalid_glyphs`.
+//!
+//! `line_do_arabic_shape` needs `arabic.c`'s own `arabic_shape`, not
+//! translated; its two private helpers (`schar_in_arabic_block`,
+//! `schar_get_first_two_codepoints`) have no other caller and are held
+//! back with it rather than landed as dead code.
+//!
+//! `schar_get_adv` is deliberately NOT translated: the original's
+//! `schar_get`/`schar_get_adv` split exists purely so a caller can
+//! append into a larger scratch buffer without a second copy, and
+//! [`schar_get`] here already returns the bytes owned.
 
 use crate::map::Set;
 use crate::types_defs::{MAX_SCHAR_SIZE, ScharT};
@@ -138,6 +148,75 @@ pub fn schar_from_str(str: Option<&[u8]>) -> ScharT {
     }
 }
 
+/// The number of bytes in `sc`'s own glyph (`schar_len`).
+#[must_use]
+pub fn schar_len(sc: ScharT) -> usize {
+    if schar_high(sc) {
+        // SAFETY: a plain global-cell borrow, no aliasing hazard.
+        let cache = unsafe { GLYPH_CACHE.get_mut() };
+        let idx = schar_idx(sc) as usize;
+        debug_assert!(idx < cache.len());
+        cache.keys().get(idx).map_or(0, Vec::len)
+    } else {
+        let bytes = sc.to_ne_bytes();
+        bytes.iter().position(|&b| b == 0).unwrap_or(4)
+    }
+}
+
+/// `sc`'s glyph bytes with a trailing NUL, as the original's own
+/// `char sc_buf[MAX_SCHAR_SIZE]` scratch buffer always has.
+///
+/// `utf_ptr2char`/`utf_ptr2cells` both read a NUL-terminated buffer
+/// and rely on that terminator to stop; [`schar_get`] returns just the
+/// glyph, so callers that hand the bytes to those two must re-add it.
+/// Without the terminator an empty glyph would index an empty slice.
+fn schar_get_nul_terminated(sc: ScharT) -> Vec<u8> {
+    let mut buf = schar_get(sc);
+    buf.push(0);
+    buf
+}
+
+/// How many screen cells `sc` occupies (`schar_cells`).
+#[must_use]
+pub fn schar_cells(sc: ScharT) -> i32 {
+    // hot path
+    let ascii = if cfg!(target_endian = "big") {
+        (sc & 0x80FF_FFFF) == 0
+    } else {
+        sc < 0x80
+    };
+    if ascii {
+        return 1;
+    }
+
+    // SAFETY: the buffer is NUL-terminated, which is exactly what
+    // `utf_ptr2cells` needs to stop.
+    unsafe { crate::mbyte::utf_ptr2cells(&schar_get_nul_terminated(sc)) }
+}
+
+/// `sc`'s first codepoint (`schar_get_first_codepoint`).
+#[must_use]
+pub fn schar_get_first_codepoint(sc: ScharT) -> i32 {
+    crate::mbyte::utf_ptr2char(&schar_get_nul_terminated(sc))
+}
+
+/// `sc` as an ASCII byte, or NUL when it is not ASCII
+/// (`schar_get_ascii`).
+#[must_use]
+pub const fn schar_get_ascii(sc: ScharT) -> u8 {
+    if cfg!(target_endian = "big") {
+        if (sc & 0x80FF_FFFF) == 0 {
+            (sc >> 24) as u8
+        } else {
+            0
+        }
+    } else if sc < 0x80 {
+        sc as u8
+    } else {
+        0
+    }
+}
+
 /// `schar_get(char *buf_out, schar_T sc)` - the glyph's own bytes.
 ///
 /// Returns them owned rather than filling a caller-provided buffer:
@@ -238,6 +317,65 @@ mod tests {
         assert_eq!(schar_get(schar_from_char(0x0030_0000)), "\u{FFFD}".as_bytes());
         // One below the limit still encodes as itself.
         assert_ne!(schar_from_char(0x001F_FFFF), schar_from_char(0xFFFD));
+    }
+
+    #[test]
+    fn schar_len_and_cells_agree_for_inline_and_interned_glyphs() {
+        let _l = lock();
+        // (glyph, expected byte length, expected screen cells)
+        for (s, len, cells) in [
+            ("a", 1usize, 1i32),
+            ("é", 2, 1),
+            ("─", 3, 1),
+            ("一", 3, 2),
+            ("a\u{0301}\u{0302}", 5, 1),
+        ] {
+            let sc = schar_from_buf(s.as_bytes());
+            assert_eq!(schar_len(sc), len, "len of {s}");
+            assert_eq!(schar_cells(sc), cells, "cells of {s}");
+        }
+    }
+
+    #[test]
+    fn schar_cells_takes_the_ascii_fast_path() {
+        let _l = lock();
+        for c in *b"a ~@" {
+            assert_eq!(schar_cells(schar_from_ascii(c)), 1);
+        }
+    }
+
+    #[test]
+    fn schar_get_ascii_returns_the_byte_only_for_ascii() {
+        let _l = lock();
+        for c in *b"a ~@" {
+            assert_eq!(schar_get_ascii(schar_from_ascii(c)), c);
+        }
+        // A non-ASCII glyph yields NUL instead.
+        assert_eq!(schar_get_ascii(schar_from_buf("é".as_bytes())), 0);
+        assert_eq!(schar_get_ascii(schar_from_buf("─".as_bytes())), 0);
+    }
+
+    #[test]
+    fn schar_get_first_codepoint_reads_through_the_cache() {
+        let _l = lock();
+        assert_eq!(schar_get_first_codepoint(schar_from_ascii(b'a')), 0x61);
+        assert_eq!(schar_get_first_codepoint(schar_from_buf("─".as_bytes())), 0x2500);
+        // An interned (>4 byte) glyph reports its BASE codepoint.
+        let long = schar_from_buf("a\u{0301}\u{0302}".as_bytes());
+        assert!(schar_high(long));
+        assert_eq!(schar_get_first_codepoint(long), 0x61);
+    }
+
+    #[test]
+    fn schar_accessors_handle_the_empty_glyph() {
+        let _l = lock();
+        // Zero decodes to no bytes at all. The NUL terminator that
+        // `schar_get_nul_terminated` re-adds is what keeps
+        // `utf_ptr2char` from indexing an empty slice here.
+        assert_eq!(schar_len(0), 0);
+        assert_eq!(schar_get_first_codepoint(0), 0);
+        assert_eq!(schar_get_ascii(0), 0);
+        assert_eq!(schar_cells(0), 1);
     }
 
     #[test]
