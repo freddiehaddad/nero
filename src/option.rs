@@ -172,48 +172,42 @@
 //! (`runtime.rs`'s new `sourcing_lnum()`) is always `0` today, since
 //! `EXESTACK` is always empty (see that module's own doc comment) -
 //! the real, correct answer for "no active execution context", not a
-//! hardcoded shortcut. Translated ahead of `did_set_option` itself
-//! (still deferred, see below), matching this crate's established
-//! "small, simple, mechanically correct piece ahead of its real
-//! caller" precedent.
+//! hardcoded shortcut.
+//!
+//! Also translated: `crate::drawscreen::comp_col` (real screen-column
+//! geometry - see that module's own doc comment), `do_syntax_autocmd`
+//! (below), and `crate::autocmd::do_filetype_autocmd` (`autocmd.c`,
+//! NOT inlined into `did_set_option` - a stale note here had
+//! previously claimed otherwise; see `crate::autocmd`'s own module
+//! doc) - `did_set_option`'s own 3 remaining real prerequisites beyond
+//! `set_option_sctx`/`check_illegal_path_names` (previous paragraph).
+//!
+//! **`did_set_option` itself is now translated** (see its own doc
+//! comment for its precise remaining gaps: the per-option callback
+//! dispatch - currently unreachable for every option in this crate's
+//! own table, see that doc comment -, `'spelllang'`'s
+//! `do_spelllang_source`, and `'winbar'`'s real frame-layout
+//! resizing). Every other piece of its own real body is genuinely
+//! correct and complete today: `set_option_varp`'s error-path value
+//! restoration, `set_option_sctx`'s script-context tracking,
+//! `scope_both`'s global-local-unset handling, the 3 autocmd-trigger
+//! pointer-identity checks, `comp_col`, `curwin.w_set_curswant`
+//! bookkeeping, and the final `insecure_flag`-bit maintenance. The
+//! redraw-only calls in its own tail (`setmouse`/`redraw_all_later`/
+//! `check_redraw`) are omitted per this crate's established
+//! `redraw_later`-omission precedent (see that function's own doc
+//! comment for the exact reasoning at each call site). Its own real
+//! callers (`set_option`/`set_option_value`/`do_set`) remain
+//! untranslated - harvested ahead of them, matching this crate's
+//! established "small, simple, mechanically correct piece ahead of
+//! its real caller" precedent (here, simply a much larger "piece"
+//! than usual, given how much groundwork had already accumulated
+//! across many earlier commits this session).
 //!
 //! Deferred: the full `set_option_value`/`set_option`/
-//! `did_set_option`/`validate_option_value` write pipeline - each
-//! layer found to need a currently-blocked subsystem while scoping
-//! this pass:
-//! - `did_set_option` needs the ~150 real `did_set_*`/`expand_*`
-//!   per-option callbacks (already known-deferred, see
-//!   `option_defs.rs`'s own `OPTIONS` doc comment) AND the redraw
-//!   pipeline (`check_redraw`/`redraw_later`/`redraw_buf_later`/
-//!   `redraw_all_later`/`changed_window_setting` - already documented
-//!   as blocking `undo.c`'s undo/redo state machine, per this
-//!   project's own plan) AND the `OptionSet` autocommand trigger
-//!   machinery. **Re-scoped precisely this pass**: `did_set_option`'s
-//!   own real body only reaches `opt.opt_did_set_cb` for the 188/377
-//!   options that HAVE one - the other 189 (`opt_did_set_cb == None`)
-//!   skip straight past that branch to the function's OWN remaining,
-//!   option-agnostic machinery (re-reading `new_value`, `set_sid`/
-//!   `sctx`-tracking via `set_option_sctx` (now translated, see
-//!   above), `scope_both`'s global-local-unset handling, then the 3
-//!   special-cased `curbuf.b_p_syn`/`b_p_ft`/`curwin.w_s.b_p_spl`
-//!   autocmd triggers, `comp_col`/`setmouse`/`redraw_all_later`/
-//!   `set_winbar_all`/`check_redraw` redraw-pipeline calls - all
-//!   omittable per this crate's established `redraw_later`-omission
-//!   precedent -, and finally the `insecure_flag`-bit bookkeeping at
-//!   the very end, ALL of which is real, tractable, option-agnostic
-//!   logic). This means a translated `did_set_option` could be
-//!   genuinely correct and complete TODAY for those 189 options,
-//!   `unimplemented!()`-ing only at the exact point a real callback
-//!   would be invoked for the other 188 - matching this crate's
-//!   established "translate the real, always-reachable fast path"
-//!   precedent. `set_option_sctx`/`check_illegal_path_names` are now
-//!   translated (see above), and so are `do_syntax_autocmd` (see
-//!   below) and `do_filetype_autocmd` (`autocmd.c`, NOT inlined into
-//!   `did_set_option` - a second, now-corrected stale note here had
-//!   claimed otherwise; see `crate::autocmd`'s own module doc). Still
-//!   needed: `do_spelllang_source` (blocked on
-//!   `source_runtime_vim_lua`, real file I/O/script sourcing - not
-//!   attempted).
+//! `validate_option_value` write pipeline around `did_set_option` -
+//! each layer found to need a currently-blocked subsystem while
+//! scoping this pass:
 //! - `validate_option_value`/`validate_num_option`/
 //!   `check_num_option_bounds` are now FULLY translated (no remaining
 //!   panics): `OptIndex::Lines`/`OptIndex::Scroll` (previously the
@@ -1014,12 +1008,11 @@ static OPTION_WAS_SET: crate::globals::GlobalCell<[bool; crate::option_defs::OPT
     crate::globals::GlobalCell::new([false; crate::option_defs::OPT_COUNT]);
 
 /// Whether option `opt_idx` has ever been explicitly `:set`
-/// (`option_was_set`). Always `false` today: nothing in this crate can
-/// currently set this bit (only `option.c`'s own not-yet-translated
-/// `did_set_option`, via `opt->flags |= kOptFlagWasSet`, ever does) -
-/// a faithful, always-taken consequence of the current state, not a
-/// hardcoded stub (matching this crate's established `AUTOCMDS`/
-/// `get_hislen` precedent for this exact pattern).
+/// (`option_was_set`). Set for real by [`did_set_option`] (via
+/// [`set_option_was_set`], below) whenever an option is successfully
+/// set through it - matching the original's own `opt->flags |=
+/// kOptFlagWasSet`, translated as a side-table write instead (see
+/// `OPTION_WAS_SET`'s own doc comment).
 ///
 /// # Panics
 /// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
@@ -1033,11 +1026,26 @@ pub fn option_was_set(opt_idx: OptIndex) -> bool {
     table[opt_idx as usize]
 }
 
+/// Record that option `opt_idx` has been explicitly `:set`
+/// (`opt->flags |= kOptFlagWasSet` in the original, mutating
+/// `options[opt_idx].flags` directly - translated as a side-table
+/// write instead, exactly mirroring [`reset_option_was_set`]'s own
+/// established reasoning). [`did_set_option`]'s own real caller.
+///
+/// # Panics
+/// Debug-asserts `opt_idx != OptIndex::Invalid`, matching
+/// [`option_was_set`]'s own established convention for this exact
+/// side-table shape.
+pub fn set_option_was_set(opt_idx: OptIndex) {
+    debug_assert!(opt_idx != OptIndex::Invalid);
+    // SAFETY: a plain bool write-through-exclusive-borrow, no
+    // aliasing hazard.
+    let table = unsafe { OPTION_WAS_SET.get_mut() };
+    table[opt_idx as usize] = true;
+}
+
 /// Reset the flag indicating option `opt_idx` was set
-/// (`reset_option_was_set`). A real, faithful no-op today (the flag
-/// is always already `false` - see [`option_was_set`]'s own doc
-/// comment), kept as a real function (not omitted) since a future
-/// session's `did_set_option` will make it a genuine state change.
+/// (`reset_option_was_set`).
 ///
 /// # Panics
 /// Debug-asserts `opt_idx != OptIndex::Invalid`, matching the
@@ -1124,6 +1132,284 @@ pub unsafe fn do_syntax_autocmd(buf: *mut BufT, value_changed: bool) {
 
     // SAFETY: forwarded from this function's own safety doc.
     *unsafe { SYN_RECURSIVE.get_mut() } -= 1;
+}
+
+/// Handle side-effects of setting an option (`did_set_option`).
+///
+/// The `opt.opt_did_set_cb.is_some()` branch `unimplemented!()`s at
+/// the exact point a real per-option callback would be invoked -
+/// currently unreachable for EVERY option in this crate's own
+/// [`OPTIONS`] table (all 377 entries have `opt_did_set_cb: None`
+/// today, matching `option_defs.rs`'s own module doc: none of the
+/// ~150 real `did_set_*`/`expand_*` callback FUNCTIONS have been
+/// translated yet, so there is nothing for any entry's own
+/// `opt_did_set_cb` to reference - this is a stronger statement than
+/// the original's own "188/377 options have one, 189 don't" split,
+/// which describes upstream neovim's real callback population, not
+/// this crate's own not-yet-populated one). Kept as a real branch
+/// (not omitted) so a future session translating even a single real
+/// callback and wiring it into that option's own [`OPTIONS`] entry
+/// makes this genuinely reachable, with no restructuring needed here.
+///
+/// Also `unimplemented!()`s for 2 further real-but-substantial
+/// branches: `curwin.w_s.b_p_spl` (`'spelllang'`, needs
+/// `do_spelllang_source`'s own `source_runtime_vim_lua` - real file
+/// I/O/script sourcing) and `p_wbr`/`curwin.w_onebuf_opt.wo_wbr`
+/// (`'winbar'`, needs `set_winbar`/`set_winbar_all`'s own real frame-
+/// layout resizing, `window.c`'s `set_winbar_win`/`win_set_inner_size`,
+/// substantially more than a redraw hint unlike every other omitted
+/// call in this function's own tail).
+///
+/// Since nothing in this scope ever runs a real per-option callback,
+/// `value_changed`/`value_checked`/`restore_chartab` (the callback's
+/// own `os_value_changed`/`os_value_checked`/`os_restore_chartab`
+/// outputs) can only ever be `false` here - kept as real, named
+/// bindings (not inlined `false` literals at each use) so a future
+/// session wiring up even one real callback can just start assigning
+/// them, with no restructuring needed here. The original's own
+/// `buf_init_chartab(curbuf, true)` call (reached only when
+/// `restore_chartab` is true) is therefore unreachable in this scope
+/// and not translated.
+///
+/// Drops `errbuf`/`errbuflen` from the original's own signature
+/// entirely: both are used ONLY to populate `optset_T`'s own fields
+/// for the (here, `unimplemented!()`'d) per-option callback dispatch;
+/// this function's own 3 real error messages are all static
+/// `&'static str` constants, never written through a caller-supplied
+/// buffer.
+///
+/// Returns `None` on success, `Some(message)` on error - collapsing
+/// the original's own `NULL`/non-`NULL` `const char *` return into an
+/// `Option`, matching this crate's usual preference.
+///
+/// # Safety
+/// `varp` must be a valid, non-null pointer of the correct concrete
+/// type for `opt_idx`'s own declared `OptValType` (see
+/// [`optval_from_varp`]'s own safety doc for the exact mapping).
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers to live `BufT`/`WinT` values, and `curwin.w_s` must be a
+/// valid, non-null pointer to a live `SynblockT`.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn did_set_option(
+    opt_idx: OptIndex,
+    varp: *mut c_void,
+    old_value: OptVal,
+    mut new_value: OptVal,
+    opt_flags: u32,
+    set_sid: crate::eval::typval_defs::ScidT,
+    direct: bool,
+    value_replaced: bool,
+) -> Option<&'static str> {
+    let opt = get_option(opt_idx);
+    let mut errmsg: Option<&'static str> = None;
+    let value_changed = false;
+    let value_checked = false;
+
+    // Disallow changing some options from secure mode.
+    // SAFETY: momentary read.
+    let disallowed_in_secure_mode = {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        (g.secure != 0 || g.sandbox != 0) && (opt.flags & crate::option_defs::opt_flags::SECURE != 0)
+    };
+
+    if direct {
+        // Don't do any extra processing if setting directly.
+    } else if opt.immutable && old_value != new_value {
+        // Disallow changing immutable options.
+        errmsg = Some(crate::errors::e_unsupportedoption);
+    } else if disallowed_in_secure_mode {
+        errmsg = Some(crate::errors::e_secure);
+    } else if let OptVal::String(ref s) = new_value
+        // Check for a "normal" directory or file name in some string options.
+        // SAFETY: forwarded from this function's own safety doc.
+        && unsafe { check_illegal_path_names(s, opt.flags) }
+    {
+        errmsg = Some(crate::errors::e_invarg);
+    } else if opt.opt_did_set_cb.is_some() {
+        // Invoke the option specific callback function to validate and
+        // apply the new value.
+        unimplemented!(
+            "did_set_option: {opt_idx:?} has a real opt_did_set_cb - only the 189/377 \
+             options without one are translated so far"
+        );
+    }
+
+    // If option is hidden or if an error is detected, restore the
+    // previous value and don't do any further processing.
+    if let Some(e) = errmsg {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_option_varp(opt_idx, varp, old_value) };
+        return Some(e);
+    }
+
+    // Re-assign the new value as its value may get freed or modified
+    // by the option callback.
+    // SAFETY: forwarded from this function's own safety doc.
+    new_value = unsafe { optval_from_varp(opt_idx, varp) };
+
+    if set_sid != crate::globals::SID_NONE {
+        let script_ctx = if set_sid == 0 {
+            // SAFETY: momentary read.
+            unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx
+        } else {
+            crate::eval::typval_defs::SctxT { sc_sid: set_sid, ..Default::default() }
+        };
+        // Remember where the option was set.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_option_sctx(opt_idx, opt_flags, script_ctx) };
+    }
+
+    // optval_free(old_value): `Vec<u8>`'s own `Drop` already frees the
+    // `String` variant's storage (`Nil`/`Boolean`/`Number` need no
+    // cleanup at all) - an explicit `drop` here (rather than letting
+    // `old_value` fall out of scope implicitly at the function's own
+    // end) mirrors the original's own explicit release point.
+    drop(old_value);
+
+    let scope_both = (opt_flags
+        & (crate::option_defs::opt_set_flags::OPT_LOCAL | crate::option_defs::opt_set_flags::OPT_GLOBAL))
+        == 0;
+
+    if scope_both {
+        if option_is_global_local(opt_idx) {
+            // Global option with local value set to use global value.
+            // Free the local value and clear it.
+            // SAFETY: forwarded from this function's own safety doc.
+            let varp_local = unsafe { get_varp_scope(opt_idx, crate::option_defs::opt_set_flags::OPT_LOCAL) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let local_unset_value = unsafe { get_option_unset_value(opt_idx) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_option_varp(opt_idx, varp_local, local_unset_value) };
+        } else {
+            // May set global value for local option.
+            // SAFETY: forwarded from this function's own safety doc.
+            let varp_global = unsafe { get_varp_scope(opt_idx, crate::option_defs::opt_set_flags::OPT_GLOBAL) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_option_varp(opt_idx, varp_global, new_value.clone()) };
+        }
+    }
+
+    // Don't do anything else if setting the option directly.
+    if direct {
+        return errmsg;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curbuf = g.curbuf;
+    let curwin = g.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_p_syn_ptr = unsafe { std::ptr::addr_of_mut!((*curbuf).b_p_syn) as *mut c_void };
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_p_ft_ptr = unsafe { std::ptr::addr_of_mut!((*curbuf).b_p_ft) as *mut c_void };
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_p_spl_ptr = unsafe { std::ptr::addr_of_mut!((*(*curwin).w_s).b_p_spl) as *mut c_void };
+
+    // Trigger the autocommand only after setting the flags.
+    if varp == b_p_syn_ptr {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { do_syntax_autocmd(curbuf, value_changed) };
+    } else if varp == b_p_ft_ptr {
+        // 'filetype' is set, trigger the FileType autocommand. Skip
+        // this when called from a modeline. Force autocmd when the
+        // filetype was changed.
+        if opt_flags & crate::option_defs::opt_set_flags::OPT_MODELINE == 0 || value_changed {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::autocmd::do_filetype_autocmd(curbuf, value_changed) };
+        }
+    } else if varp == b_p_spl_ptr {
+        unimplemented!(
+            "did_set_option: 'spelllang' needs do_spelllang_source's own \
+             source_runtime_vim_lua (real file I/O/script sourcing), not yet translated"
+        );
+    }
+
+    // In case 'ruler' or 'showcmd' or 'columns' or 'ls' changed.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::comp_col() };
+
+    // SAFETY: momentary reads, no aliasing.
+    let p_mouse_ptr = unsafe { std::ptr::addr_of_mut!(crate::option_vars::OPTION_VARS.get_mut().p_mouse) as *mut c_void };
+    // SAFETY: momentary reads, no aliasing.
+    let p_flp_ptr = unsafe { std::ptr::addr_of_mut!(crate::option_vars::OPTION_VARS.get_mut().p_flp) as *mut c_void };
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_p_flp_ptr = unsafe { std::ptr::addr_of_mut!((*curbuf).b_p_flp) as *mut c_void };
+    // SAFETY: momentary reads, no aliasing.
+    let p_wbr_ptr = unsafe { std::ptr::addr_of_mut!(crate::option_vars::OPTION_VARS.get_mut().p_wbr) as *mut c_void };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_p_wbr_ptr = unsafe { std::ptr::addr_of_mut!((*curwin).w_onebuf_opt.wo_wbr) as *mut c_void };
+    // SAFETY: forwarded from this function's own safety doc.
+    let w_briopt_list = unsafe { &*curwin }.w_briopt_list;
+
+    if varp == p_mouse_ptr {
+        // setmouse() omitted: pure UI-cursor-shape/mouse-on-off
+        // dispatch, matching this crate's established `ui_cursor_shape`
+        // omission precedent (see `ex_docmd.rs`'s
+        // `restore_current_state` for the identical reasoning).
+    } else if (varp == p_flp_ptr || varp == b_p_flp_ptr) && w_briopt_list != 0 {
+        // redraw_all_later(UPD_NOT_VALID) omitted: pure redraw
+        // scheduling, matching this crate's established `redraw_later`
+        // omission precedent.
+    } else if varp == p_wbr_ptr || varp == w_p_wbr_ptr {
+        unimplemented!(
+            "did_set_option: 'winbar' needs set_winbar/set_winbar_all's own real \
+             frame-layout resizing (window.c's set_winbar_win/win_set_inner_size), \
+             not yet translated"
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin_ref = unsafe { &mut *curwin };
+    if curwin_ref.w_curswant != crate::pos_defs::MAXCOL
+        && (opt.flags & (crate::option_defs::opt_flags::CURSWANT | crate::option_defs::opt_flags::REDR_ALL)) != 0
+        && (opt.flags & crate::option_defs::opt_flags::HL_ONLY) == 0
+    {
+        curwin_ref.w_set_curswant = true;
+    }
+
+    // check_redraw(opt.flags) omitted: pure redraw-scheduling dispatch
+    // (redraw_buf_later/redraw_all_later), matching this crate's
+    // established `redraw_later`-omission precedent.
+
+    if errmsg.is_none() {
+        set_option_was_set(opt_idx);
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let flagsp = unsafe { insecure_flag(curwin, opt_idx, opt_flags) };
+        let flagsp_local = if scope_both {
+            // SAFETY: forwarded from this function's own safety doc.
+            Some(unsafe { insecure_flag(curwin, opt_idx, crate::option_defs::opt_set_flags::OPT_LOCAL) })
+        } else {
+            None
+        };
+
+        // SAFETY: momentary read.
+        let g2 = unsafe { crate::globals::GLOBALS.get_mut() };
+        // When an option is set in the sandbox, from a modeline or in
+        // secure mode set the kOptFlagInsecure flag. Otherwise, if a
+        // new value is stored reset the flag.
+        if !value_checked
+            && (g2.secure != 0 || g2.sandbox != 0 || (opt_flags & crate::option_defs::opt_set_flags::OPT_MODELINE != 0))
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *flagsp |= crate::option_defs::opt_flags::INSECURE };
+            if let Some(fl) = flagsp_local {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { *fl |= crate::option_defs::opt_flags::INSECURE };
+            }
+        } else if value_replaced {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *flagsp &= !crate::option_defs::opt_flags::INSECURE };
+            if let Some(fl) = flagsp_local {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { *fl &= !crate::option_defs::opt_flags::INSECURE };
+            }
+        }
+    }
+
+    errmsg
 }
 
 /// Get pointer to option variable, given the option and the buffer/
@@ -5600,5 +5886,599 @@ mod set_option_sctx_tests {
         assert!(win.w_allbuf_opt.wo_script_ctx.is_empty());
     }
 }
+
+#[cfg(test)]
+mod did_set_option_tests {
+    use super::*;
+
+    /// Points `GLOBALS.curbuf`/`curwin` at real, linked `buf`/`win`
+    /// instances for the guard's lifetime, restoring the previous
+    /// values on drop. Callers must hold `global_state_test_lock()`
+    /// for the guard's whole lifetime (matching
+    /// `set_option_sctx_tests::CurBufWinGuard`'s own identical
+    /// precedent, duplicated here rather than shared since that one is
+    /// private to its own module).
+    struct CurBufWinGuard {
+        prev_buf: *mut BufT,
+        prev_win: *mut WinT,
+    }
+
+    impl CurBufWinGuard {
+        fn set(buf: *mut BufT, win: *mut WinT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_buf = globals.curbuf;
+            let prev_win = globals.curwin;
+            globals.curbuf = buf;
+            globals.curwin = win;
+            CurBufWinGuard { prev_buf, prev_win }
+        }
+    }
+
+    impl Drop for CurBufWinGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.curbuf = self.prev_buf;
+            globals.curwin = self.prev_win;
+        }
+    }
+
+    /// Resets every piece of shared global state a `did_set_option`
+    /// test could observe leaking from a sibling test: `GLOBALS.secure`/
+    /// `sandbox`, `OPTION_VARS.p_mouse`/`p_flp`/`p_wbr`, and (for the
+    /// specific `opt_idx`es this module's own tests exercise)
+    /// `OPTION_WAS_SET`/`OPTION_SCRIPT_CTX`.
+    fn reset_shared_state() {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.secure = 0;
+        g.sandbox = 0;
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_mouse = None;
+        ov.p_flp = None;
+        ov.p_wbr = None;
+        for &idx in &[OptIndex::Aleph, OptIndex::Cdhome, OptIndex::Backupext, OptIndex::Allowrevins, OptIndex::Arabic]
+        {
+            reset_option_was_set(idx);
+            let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
+            table[idx as usize] = SctxT::default();
+        }
+    }
+
+    /// Sets up a real, linked `buf`/`win` pair (with `win.w_s` pointing
+    /// at a real `SynblockT`) and installs them as `curbuf`/`curwin`
+    /// via [`CurBufWinGuard`]. Returns the guard, plus raw pointers to
+    /// the (heap-boxed, deliberately leaked for the test's duration)
+    /// `buf`/`win`/`syn` - leaked rather than stack-allocated so the
+    /// returned pointers stay valid for the caller's own use after
+    /// this function returns (matching this crate's own established
+    /// "small, deliberate test-only leak" precedent elsewhere for the
+    /// identical stack-lifetime problem).
+    fn setup_curbuf_curwin() -> (CurBufWinGuard, *mut BufT, *mut WinT) {
+        let buf = Box::into_raw(Box::new(BufT::default()));
+        let syn = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+        let win = Box::into_raw(Box::new(WinT { w_buffer: buf, w_s: syn, ..Default::default() }));
+        let guard = CurBufWinGuard::set(buf, win);
+        (guard, buf, win)
+    }
+
+    #[test]
+    fn immutable_option_with_a_changed_value_is_rejected_and_restores_old_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut dummy: OptInt = 999; // simulates varp already holding new_value
+        let varp = &mut dummy as *mut OptInt as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Aleph,
+                varp,
+                OptVal::Number(224),
+                OptVal::Number(999),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, Some(crate::errors::e_unsupportedoption));
+        // The previous value was restored through varp.
+        assert_eq!(dummy, 224);
+    }
+
+    #[test]
+    fn immutable_option_with_an_unchanged_value_is_not_rejected() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        let mut dummy: OptInt = 224;
+        let varp = &mut dummy as *mut OptInt as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Aleph,
+                varp,
+                OptVal::Number(224),
+                OptVal::Number(224),
+                // OPT_GLOBAL (not 0/scope_both): 'aleph' is a hidden
+                // option (immutable + null `var`), so scope_both's own
+                // "set the global/local value" step - which would
+                // resolve through the SAME null `var` via
+                // get_varp_scope - must be skipped here; this test
+                // only cares about the immutable-check bypass itself.
+                crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        // Same value -> immutable check doesn't fire -> proceeds to
+        // the real, always-reachable tail (no callback, no other
+        // special-cased varp match for 'aleph') -> succeeds.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn secure_mode_rejects_a_secure_flagged_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 1;
+
+        let mut dummy: i32 = 0;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Cdhome,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, Some(crate::errors::e_secure));
+        // Old value restored.
+        assert_eq!(dummy, TriState::False as i32);
+        reset_shared_state();
+    }
+
+    #[test]
+    fn illegal_path_name_in_a_string_option_is_rejected() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let mut dummy: Option<Vec<u8>> = Some(b"old".to_vec());
+        let varp = &mut dummy as *mut Option<Vec<u8>> as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Backupext,
+                varp,
+                OptVal::String(b"old".to_vec()),
+                OptVal::String(b"foo*bar".to_vec()),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, Some(crate::errors::e_invarg));
+        assert_eq!(dummy, Some(b"old".to_vec()));
+    }
+
+    #[test]
+    fn direct_mode_skips_the_error_checks_and_the_autocmd_redraw_tail() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        // Even an otherwise-immutable option's "changed value" check
+        // is skipped entirely when direct == true.
+        let mut dummy: OptInt = 999;
+        let varp = &mut dummy as *mut OptInt as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Aleph,
+                varp,
+                OptVal::Number(224),
+                OptVal::Number(999),
+                // OPT_GLOBAL: see immutable_option_with_an_unchanged_
+                // value_is_not_rejected's own identical comment -
+                // scope_both's write step still runs even when direct
+                // == true, and 'aleph' is a hidden (null `var`) option.
+                crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                crate::globals::SID_NONE,
+                true,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        // The tail (set_option_was_set) is never reached in direct
+        // mode - it returns before that point.
+        assert!(!option_was_set(OptIndex::Aleph));
+    }
+
+    #[test]
+    fn normal_success_path_records_was_set_and_script_ctx() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+        assert!(!option_was_set(OptIndex::Allowrevins));
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0,
+                7, // set_sid: a concrete script ID, not 0/SID_NONE
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        assert!(option_was_set(OptIndex::Allowrevins));
+        assert_eq!(option_script_ctx(OptIndex::Allowrevins).sc_sid, 7);
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_sid_zero_uses_current_sctx() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        let prev_sctx = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = SctxT { sc_sid: 42, ..Default::default() };
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0,
+                0, // set_sid == 0: use current_sctx
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(option_script_ctx(OptIndex::Allowrevins).sc_sid, 42);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx = prev_sctx;
+        reset_shared_state();
+    }
+
+    #[test]
+    fn set_sid_none_never_records_a_script_ctx() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(option_script_ctx(OptIndex::Allowrevins), SctxT::default());
+        reset_shared_state();
+    }
+
+    #[test]
+    fn scope_both_global_local_option_resets_local_value_to_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+        unsafe { (*buf).b_p_ep = Some(b"local".to_vec()) };
+
+        // 'equalprg' is global-local (Buf + Global scope) - verified
+        // against option_is_global_local's own established tests.
+        let mut dummy: Option<Vec<u8>> = Some(b"new-global".to_vec());
+        let varp = &mut dummy as *mut Option<Vec<u8>> as *mut c_void;
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Equalprg,
+                varp,
+                OptVal::String(b"old-global".to_vec()),
+                OptVal::String(b"new-global".to_vec()),
+                0, // scope_both: neither OPT_LOCAL nor OPT_GLOBAL
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        // The buffer-local value was reset to the "unset" sentinel
+        // (empty string, for a String-typed global-local option).
+        assert_eq!(unsafe { &*buf }.b_p_ep, Some(Vec::new()));
+    }
+
+    #[test]
+    fn scope_both_non_global_local_option_sets_the_global_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ari;
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0, // scope_both
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        // 'allowrevins' is global-only, so the "set the global value"
+        // branch runs, writing through get_varp_scope(OPT_GLOBAL) -
+        // which for a global-only option resolves to the same
+        // OPTION_VARS storage varp itself already points at.
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ari, TriState::True as i32);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ari = prev;
+        reset_shared_state();
+    }
+
+    #[test]
+    fn syntax_option_triggers_do_syntax_autocmd() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+
+        // SAFETY: matches did_set_option's own internal resolution.
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf).b_p_syn) as *mut c_void };
+        assert_eq!(unsafe { &*buf }.b_flags & crate::buffer_defs::b_flags::BF_SYN_SET as i32, 0);
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Syntax,
+                varp,
+                OptVal::String(b"".to_vec()),
+                OptVal::String(b"rust".to_vec()),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        assert_ne!(unsafe { &*buf }.b_flags & crate::buffer_defs::b_flags::BF_SYN_SET as i32, 0);
+    }
+
+    #[test]
+    fn filetype_option_triggers_do_filetype_autocmd_when_not_from_a_modeline() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf).b_p_ft) as *mut c_void };
+        assert!(!unsafe { &*buf }.b_did_filetype);
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Filetype,
+                varp,
+                OptVal::String(b"".to_vec()),
+                OptVal::String(b"rust".to_vec()),
+                0, // no OPT_MODELINE
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        assert!(unsafe { &*buf }.b_did_filetype);
+    }
+
+    #[test]
+    fn filetype_option_from_a_modeline_skips_do_filetype_autocmd() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, buf, _win) = setup_curbuf_curwin();
+
+        let varp = unsafe { std::ptr::addr_of_mut!((*buf).b_p_ft) as *mut c_void };
+
+        let result = unsafe {
+            did_set_option(
+                OptIndex::Filetype,
+                varp,
+                OptVal::String(b"".to_vec()),
+                OptVal::String(b"rust".to_vec()),
+                crate::option_defs::opt_set_flags::OPT_MODELINE,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert_eq!(result, None);
+        // value_changed is always false in this scope (no real
+        // callback ever runs), so "!(opt_flags & OPT_MODELINE) ||
+        // value_changed" is false || false == false: the FileType
+        // autocmd trigger is skipped, and b_did_filetype stays false.
+        assert!(!unsafe { &*buf }.b_did_filetype);
+    }
+
+    #[test]
+    #[should_panic(expected = "spelllang")]
+    fn spelllang_option_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, win) = setup_curbuf_curwin();
+
+        let varp = unsafe { std::ptr::addr_of_mut!((*(*win).w_s).b_p_spl) as *mut c_void };
+
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Spelllang,
+                varp,
+                OptVal::String(b"".to_vec()),
+                OptVal::String(b"en".to_vec()),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+    }
+
+    #[test]
+    #[should_panic(expected = "winbar")]
+    fn winbar_option_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, _win) = setup_curbuf_curwin();
+
+        let varp =
+            unsafe { std::ptr::addr_of_mut!(crate::option_vars::OPTION_VARS.get_mut().p_wbr) as *mut c_void };
+
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Winbar,
+                varp,
+                OptVal::String(b"".to_vec()),
+                OptVal::String(b"%f".to_vec()),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+    }
+
+    #[test]
+    fn curswant_flagged_option_sets_w_set_curswant() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, win) = setup_curbuf_curwin();
+        unsafe {
+            (*win).w_curswant = 5; // != MAXCOL
+            (*win).w_set_curswant = false;
+        }
+
+        // 'arabic' has opt_flags::CURSWANT and no HL_ONLY.
+        let mut dummy: i32 = 0;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Arabic,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert!(unsafe { &*win }.w_set_curswant);
+    }
+
+    #[test]
+    fn insecure_flag_is_set_when_option_set_from_a_modeline() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, win) = setup_curbuf_curwin();
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                crate::option_defs::opt_set_flags::OPT_MODELINE,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+
+        assert!(unsafe { was_set_insecurely(win, OptIndex::Allowrevins, 0) });
+        reset_shared_state();
+    }
+
+    #[test]
+    fn insecure_flag_is_cleared_when_value_replaced_outside_secure_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_shared_state();
+        let (_guard, _buf, win) = setup_curbuf_curwin();
+
+        // First, mark it insecure (as the previous test's own scenario
+        // would), then set again with value_replaced == true and no
+        // secure/sandbox/modeline context - the flag must clear.
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                &mut (1_i32) as *mut i32 as *mut c_void,
+                OptVal::Boolean(TriState::False),
+                OptVal::Boolean(TriState::True),
+                crate::option_defs::opt_set_flags::OPT_MODELINE,
+                crate::globals::SID_NONE,
+                false,
+                false,
+            )
+        };
+        assert!(unsafe { was_set_insecurely(win, OptIndex::Allowrevins, 0) });
+
+        let mut dummy: i32 = 1;
+        let varp = &mut dummy as *mut i32 as *mut c_void;
+        let _ = unsafe {
+            did_set_option(
+                OptIndex::Allowrevins,
+                varp,
+                OptVal::Boolean(TriState::True),
+                OptVal::Boolean(TriState::False),
+                0,
+                crate::globals::SID_NONE,
+                false,
+                true, // value_replaced
+            )
+        };
+
+        assert!(!unsafe { was_set_insecurely(win, OptIndex::Allowrevins, 0) });
+        reset_shared_state();
+    }
+}
+
 
 
