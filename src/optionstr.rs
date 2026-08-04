@@ -268,17 +268,17 @@
 //! shape as [`did_set_foldignore`].
 //!
 //! Also [`did_set_winbar`]/[`did_set_tabline`]/
-//! [`did_set_statuscolumn`], built on a new private
-//! `did_set_statustabline_rulerformat` shared helper (unlocked by
-//! `check_stl_option` landing earlier in this segment). All five
-//! options in that family share one body in the original; two of its
-//! branches are NOT translated and panic if reached (the
-//! `'statusline'` ones need `get_option_default`/`win_config_float`,
-//! the `'rulerformat'` one needs `ui_has`). Those are provably
-//! unreachable from these three wrappers, each of which passes
-//! `rulerformat == false` and an `os_idx` that is never
-//! `OptIndex::Statusline` - so all three are fully working.
-//! `did_set_statusline`/`did_set_rulerformat` are therefore
+//! [`did_set_statuscolumn`]/[`did_set_rulerformat`], built on a new
+//! private `did_set_statustabline_rulerformat` shared helper
+//! (unlocked by `check_stl_option` landing earlier in this segment;
+//! the `'rulerformat'` path additionally needed `ui.rs`'s `ui_has`,
+//! `globals.rs`'s `ru_wid` and `drawscreen.rs`'s `comp_col`, all of
+//! which already existed). All five options in that family share one
+//! body in the original; only the `'statusline'` branches remain
+//! untranslated (they need `get_option_default`/`win_config_float`)
+//! and panic if reached, which is provably impossible from these
+//! four wrappers since none of them passes
+//! `OptIndex::Statusline`. `did_set_statusline` is therefore
 //! deliberately NOT exposed yet.
 //!
 //! Also [`did_set_complete`] - the comma-separated `'complete'`
@@ -2419,12 +2419,16 @@ pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option
 /// # Safety
 /// `args.os_win` must be a valid, non-null pointer to a live `WinT`
 /// when `statuscolumn` is true. `args.os_varp` must point to a live
-/// `Option<Vec<u8>>`.
+/// `Option<Vec<u8>>`. When `rulerformat` is true,
+/// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain must
+/// consist of valid, live `WinT` pointers (forwarded to `comp_col`).
 unsafe fn did_set_statustabline_rulerformat(
     args: &mut crate::option_defs::OptsetT,
     rulerformat: bool,
     statuscolumn: bool,
 ) -> Option<&'static [u8]> {
+    let mut errmsg: Option<&'static [u8]> = None;
+
     if rulerformat {
         // Reset ru_wid first.
         unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid = 0;
@@ -2445,20 +2449,54 @@ unsafe fn did_set_statustabline_rulerformat(
         );
     }
 
-    if rulerformat {
-        unimplemented!(
-            "did_set_statustabline_rulerformat: the 'rulerformat' branch needs ui_has, \
-             not translated"
-        );
+    if rulerformat
+        && !crate::ui::ui_has(crate::ui::UiExtension::Messages)
+        && s.first() == Some(&b'%')
+    {
+        // Set ru_wid if 'ruf' starts with "%99(".
+        //
+        // Note this validates the GLOBAL `p_ruf` rather than the local
+        // `s`, and reads `(*varp)[1]` (the ORIGINAL value) rather than
+        // the advanced scan position - both exactly as the original
+        // does.
+        let p_ruf = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_ruf
+            .clone()
+            .unwrap_or_default();
+
+        let mut pos = 1usize; // the original's own `*++s`
+        if s.get(pos) == Some(&b'-') {
+            pos += 1; // ignore a '-'
+        }
+        let (wid, consumed) =
+            crate::charset::getdigits_int(&s[pos.min(s.len())..], true, 0);
+        pos += consumed;
+
+        let mut took_wid = false;
+        if wid != 0 && s.get(pos) == Some(&b'(') {
+            errmsg = check_stl_option(&p_ruf);
+            if errmsg.is_none() {
+                unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid = wid;
+                took_wid = true;
+            }
+        }
+        if !took_wid && s.get(1) != Some(&b'!') {
+            // Validate the flags in 'rulerformat' only if it doesn't
+            // point to a custom function ("%!" flag).
+            errmsg = check_stl_option(&p_ruf);
+        }
+    } else if s.first() != Some(&b'%') || s.get(1) != Some(&b'!') {
+        // Check the value only if it doesn't start with "%!" (a custom
+        // function reference, which isn't statusline syntax at all).
+        errmsg = check_stl_option(s);
     }
 
-    // Check the value only if it doesn't start with "%!" (a custom
-    // function reference, which isn't statusline syntax at all).
-    if s.first() != Some(&b'%') || s.get(1) != Some(&b'!') {
-        return check_stl_option(s);
+    if rulerformat && errmsg.is_none() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::comp_col() };
     }
 
-    None
+    errmsg
 }
 
 /// The `'winbar'` option is changed (`did_set_winbar`).
@@ -2491,6 +2529,23 @@ pub unsafe fn did_set_tabline(args: &mut crate::option_defs::OptsetT) -> Option<
 pub unsafe fn did_set_statuscolumn(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { did_set_statustabline_rulerformat(args, false, true) }
+}
+
+/// The `'rulerformat'` option is changed (`did_set_rulerformat`).
+///
+/// Takes the shared helper's own `rulerformat` path: reset `ru_wid`,
+/// then - when the value starts with `%` and the `messages` UI
+/// extension is not active - parse a leading `%99(`-style width and
+/// store it in `ru_wid`, finally recomputing the ruler column via
+/// `drawscreen.rs`'s already-real `comp_col`.
+///
+/// # Safety
+/// Forwarded from `did_set_statustabline_rulerformat`'s own safety
+/// doc - in particular `GLOBALS.firstwin`'s own `w_next` chain must
+/// be valid, since this variant always reaches `comp_col`.
+pub unsafe fn did_set_rulerformat(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_statustabline_rulerformat(args, true, false) }
 }
 
 /// Validate `'shellpipe'`/`'shellredir'` (`did_set_shellpipe_redir`).
@@ -5821,6 +5876,121 @@ mod tests {
             ..Default::default()
         };
         let _ = unsafe { did_set_winbar(&mut args) };
+    }
+
+    // ---- did_set_rulerformat ----
+
+    /// `did_set_rulerformat` always reaches `comp_col`, which walks
+    /// `GLOBALS.firstwin`'s own `w_next` chain - so these tests hold
+    /// the global state lock and point `firstwin`/`lastwin` at a real
+    /// single window, restoring the previous pointers afterward.
+    fn with_ruf<R>(value: &[u8], f: impl FnOnce(&mut crate::option_defs::OptsetT) -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first = globals.firstwin;
+        let prev_last = globals.lastwin;
+        let prev_ruwid = globals.ru_wid;
+        globals.firstwin = &mut win as *mut crate::buffer_defs::WinT;
+        globals.lastwin = &mut win as *mut crate::buffer_defs::WinT;
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_ruf = opts.p_ruf.clone();
+        opts.p_ruf = Some(value.to_vec());
+
+        let mut val: Option<Vec<u8>> = Some(value.to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Rulerformat,
+            os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        let result = f(&mut args);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_ruf = prev_ruf;
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = prev_first;
+        globals.lastwin = prev_last;
+        globals.ru_wid = prev_ruwid;
+        result
+    }
+
+    #[test]
+    fn did_set_rulerformat_accepts_a_width_group_and_stores_ru_wid() {
+        with_ruf(b"%99(hello%)", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid, 99);
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_ignores_a_minus_before_the_width() {
+        // The original skips one '-' before reading the digits, so
+        // "%-99(" still yields the width group.
+        with_ruf(b"%-99(hello%)", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid, 99);
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_width_needs_an_immediately_following_paren() {
+        // The real default-shaped value: after the '-' and the digits
+        // "14" comes a '.', NOT a '(', so the `wid && *s == '('`
+        // condition fails and ru_wid is left at the 0 it was reset to
+        // on entry. The value is still perfectly valid - it just
+        // doesn't carry a ruler width.
+        with_ruf(b"%-14.14(%l,%c%V%) %P", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_empty_is_valid_and_leaves_ru_wid_reset() {
+        with_ruf(b"", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+            // ru_wid is reset to 0 at entry and never re-set.
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_plain_text_is_valid() {
+        with_ruf(b"plain text", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+            assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_rejects_invalid_statusline_syntax() {
+        with_ruf(b"%z", |args| {
+            assert_eq!(
+                unsafe { did_set_rulerformat(args) },
+                Some(crate::errors::e_invarg.as_bytes())
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_rejects_unbalanced_groups() {
+        with_ruf(b"%(", |args| {
+            assert_eq!(
+                unsafe { did_set_rulerformat(args) },
+                Some(crate::gettext_defs::gettext_noop("E542: Unbalanced groups").as_bytes())
+            );
+        });
+    }
+
+    #[test]
+    fn did_set_rulerformat_skips_validation_for_a_percent_bang_function_ref() {
+        // (*varp)[1] == '!' suppresses the check_stl_option call.
+        with_ruf(b"%!MyFunc()", |args| {
+            assert_eq!(unsafe { did_set_rulerformat(args) }, None);
+        });
     }
 
     // ---- did_set_shellpipe_redir ----
