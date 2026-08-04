@@ -49,6 +49,26 @@
 //! setter pair over a new `EX_PRESSEDRETURN` file-static (matching the
 //! original's own file-static `ex_pressedreturn`), starting `false`
 //! like the original.
+//!
+//! Also translated: [`checkforcmd`] - checks whether a command-line
+//! position starts with (at least) a minimum-length abbreviation of a
+//! full command name (e.g. `:sil`/`:silent` both matching `"silent"`
+//! with `minlen == 3`), needed by `parse_command_modifiers`'s (not yet
+//! translated) modifier-keyword recognition and `eval/userfunc.c`'s
+//! `get_function_body`. Needed only `charset.rs`'s `skipwhite` and
+//! `macros_defs.rs`'s `ascii_isalpha`, both already real. Returns
+//! `Option<usize>`, collapsing the original's own `bool` return +
+//! `char **pp` in-out pointer, matching [`check_nextcmd`]'s own
+//! identical precedent.
+//!
+//! Also translated: [`not_exiting`] - restores `GLOBALS.exiting` after
+//! a failed quit attempt and clears `v:exitreason` back to unset,
+//! needed only the already-real `GLOBALS.exiting` field (its first
+//! real reader/writer) and `eval::vars::set_vim_var_string`. Its own
+//! callers (`before_quit_autocmds`/`before_quit_all`/`ex_cmds.c`'s
+//! quit-related logic) remain untranslated, matching this crate's
+//! established "small, simple, mechanically correct piece ahead of
+//! its real caller" precedent.
 
 use crate::buffer_defs::b_flags;
 
@@ -177,6 +197,39 @@ pub fn find_cmdline_var(src: &[u8]) -> Option<(CmdlineSpecialVar, usize)> {
         }
     }
     None
+}
+
+/// Check whether `p` starts with (at least) `len` characters of the
+/// full command name `cmd`, followed by a non-alphabetic byte (a
+/// genuine command-name boundary, not a longer, different word merely
+/// sharing the same prefix) (`checkforcmd`).
+///
+/// Returns the offset within `p`, after skipping any trailing
+/// whitespace, of the byte right after the match - or `None` if `p`
+/// doesn't match. Collapses the original's own `bool` return + `char
+/// **pp` in-out pointer into a single `Option<usize>`, matching this
+/// crate's established "offset, not pointer" idiom for this exact
+/// class of C string-scanning function ([`check_nextcmd`]'s own
+/// identical precedent). Running off the end of `p` is treated the
+/// same as hitting the original's own C-string `NUL` terminator
+/// (matching [`modifier_len`]'s own identical `p.get(j)` idiom): it is
+/// never alphabetic, so a `p` that ends exactly at the matched prefix
+/// (e.g. `p == b"sil"` against `cmd == b"silent"`) still counts as a
+/// full match.
+#[must_use]
+pub fn checkforcmd(p: &[u8], cmd: &[u8], len: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < cmd.len() {
+        if p.get(i) != Some(&cmd[i]) {
+            break;
+        }
+        i += 1;
+    }
+    if i >= len && !p.get(i).is_some_and(|&c| crate::macros_defs::ascii_isalpha(i32::from(c))) {
+        Some(i + crate::charset::skipwhite(&p[i..]))
+    } else {
+        None
+    }
 }
 
 /// The `'findfunc'` callback (`ffu_cb`, a file-static `Callback`).
@@ -341,6 +394,19 @@ pub fn set_pressedreturn(val: bool) {
     unsafe { *EX_PRESSEDRETURN.get_mut() = val };
 }
 
+/// Call this if we thought we were going to exit, but we won't
+/// (because of an error). Restores `GLOBALS.exiting` to `save_exiting`
+/// and clears `v:exitreason` back to unset (`not_exiting`).
+///
+/// # Safety
+/// Same as [`crate::eval::vars::set_vim_var_string`].
+pub unsafe fn not_exiting(save_exiting: bool) {
+    // SAFETY: momentary write.
+    unsafe { crate::globals::GLOBALS.get_mut() }.exiting = save_exiting;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Exitreason, None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +555,47 @@ mod tests {
         // "<cword>" is a real prefix of "<cwordXYZ>" - starts_with
         // matches regardless of what follows.
         assert_eq!(find_cmdline_var(b"<cword>XYZ"), Some((CmdlineSpecialVar::Cword, 7)));
+    }
+
+    #[test]
+    fn checkforcmd_minimal_abbreviation_matches() {
+        // ":sil" is the minimum abbreviation of "silent" (minlen 3).
+        assert_eq!(checkforcmd(b"sil foo", b"silent", 3), Some(4));
+    }
+
+    #[test]
+    fn checkforcmd_full_word_matches() {
+        assert_eq!(checkforcmd(b"silent foo", b"silent", 3), Some(7));
+    }
+
+    #[test]
+    fn checkforcmd_below_minlen_does_not_match() {
+        // "si" is only 2 characters - below the required minlen of 3.
+        assert_eq!(checkforcmd(b"si foo", b"silent", 3), None);
+    }
+
+    #[test]
+    fn checkforcmd_wrong_continuation_does_not_match() {
+        // "silx" shares "sil" with "silent" but continues with a
+        // different letter - not a valid abbreviation of "silent".
+        assert_eq!(checkforcmd(b"silx foo", b"silent", 3), None);
+    }
+
+    #[test]
+    fn checkforcmd_no_match_at_all() {
+        assert_eq!(checkforcmd(b"vertical foo", b"silent", 3), None);
+    }
+
+    #[test]
+    fn checkforcmd_matches_when_input_ends_exactly_at_minlen() {
+        // Running off the end of `p` counts the same as the original's
+        // own C-string NUL terminator - not alphabetic.
+        assert_eq!(checkforcmd(b"sil", b"silent", 3), Some(3));
+    }
+
+    #[test]
+    fn checkforcmd_skips_multiple_trailing_spaces() {
+        assert_eq!(checkforcmd(b"sil   foo", b"silent", 3), Some(6));
     }
 
     #[test]
@@ -661,5 +768,45 @@ mod tests {
         assert!(get_pressedreturn());
         set_pressedreturn(false);
         assert!(!get_pressedreturn());
+    }
+
+    // --- not_exiting ---
+
+    #[test]
+    fn not_exiting_restores_globals_exiting_to_the_saved_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.exiting = true;
+        unsafe { not_exiting(false) };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.exiting);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.exiting = false;
+        unsafe { not_exiting(true) };
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.exiting);
+
+        // Leave GLOBALS.exiting false for other tests sharing this
+        // process-wide state.
+        unsafe { crate::globals::GLOBALS.get_mut() }.exiting = false;
+    }
+
+    #[test]
+    fn not_exiting_clears_v_exitreason() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Exitreason,
+                Some(b"quit"),
+            )
+        };
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Exitreason) },
+            b"quit"
+        );
+
+        unsafe { not_exiting(false) };
+
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Exitreason) },
+            Vec::<u8>::new()
+        );
     }
 }
