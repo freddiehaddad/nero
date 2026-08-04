@@ -4,8 +4,18 @@
 //! of lines) - almost entirely dependent on the real TUI/grid
 //! rendering pipeline, not attempted here. Translated: `number_width`
 //! (needed by `plines.c`'s/`move.c`'s window-column-offset
-//! calculations) and `redraw_buf_status_later` (needed by `change.c`'s
-//! `changed_internal`/`unchanged`).
+//! calculations), `redraw_buf_status_later` (needed by `change.c`'s
+//! `changed_internal`/`unchanged`), and [`comp_col`] - computes
+//! `sc_col`/`ru_col` (screen columns reserved for the "showcmd"/ruler
+//! areas of the last status/command line) and `v:echospace`, whenever
+//! `'ruler'`/`'showcmd'`/`'showcmdloc'`/`Columns` change. Needed only
+//! already-real pieces: `window.rs`'s `last_stl_height`,
+//! `option_vars.rs`'s `p_ru`/`p_sc`/`p_sloc`, `globals.rs`'s
+//! `Columns`/`ru_wid`/`sc_col`/`ru_col`, and `eval/vars.rs`'s
+//! `set_vim_var_nr`. Harvested ahead of its real caller, `option.c`'s
+//! `did_set_option` (not yet translated), matching this crate's
+//! established "small, simple, mechanically correct piece ahead of
+//! its real caller" precedent.
 //!
 //! Deferred: everything else in the file.
 
@@ -110,6 +120,80 @@ pub unsafe fn redraw_buf_status_later(buf: *mut BufT) {
         }
         wp = w.w_next;
     }
+}
+
+/// Columns needed by the standard ruler (`COL_RULER`).
+const COL_RULER: i32 = 17;
+
+/// Compute columns for the ruler and shown-command areas. `sc_col` is
+/// also used to decide the maximum length of a message on the status
+/// line. If there is a status line for the last window, `sc_col` is
+/// independent of `ru_col` (`comp_col`).
+///
+/// The original's own `sc_col`/`ru_col` globals are mutated directly
+/// throughout its body; this translation instead computes into local
+/// variables and assigns `GLOBALS.sc_col`/`ru_col` once at the very
+/// end - a faithful, purely-cosmetic reordering, since nothing else
+/// reads either global mid-computation (this crate is single-
+/// threaded throughout, matching every other function's own
+/// established assumption).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.firstwin`'s own `w_next` chain must
+/// consist of valid, live `WinT` pointers (forwarded to
+/// `crate::window::last_stl_height`, which in turn forwards to
+/// `crate::window::one_window`).
+pub unsafe fn comp_col() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let last_has_status = unsafe { crate::window::last_stl_height(false) } > 0;
+
+    // SAFETY: momentary reads, no aliasing.
+    let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let p_ru = ov.p_ru;
+    let p_sc = ov.p_sc;
+    let sloc_is_l = ov.p_sloc.as_deref().and_then(<[u8]>::first).copied() == Some(b'l');
+
+    let mut sc_col: i32 = 0;
+    let mut ru_col: i32 = 0;
+
+    // SAFETY: momentary read, no aliasing.
+    let ru_wid = unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid;
+    if p_ru != 0 {
+        ru_col = (if ru_wid != 0 { ru_wid } else { COL_RULER }) + 1;
+        // no last status line, adjust sc_col
+        if !last_has_status {
+            sc_col = ru_col;
+        }
+    }
+    if p_sc != 0 && sloc_is_l {
+        sc_col += crate::normal_defs::SHOWCMD_COLS as i32;
+        if p_ru == 0 || last_has_status {
+            // no need for separating space
+            sc_col += 1;
+        }
+    }
+
+    // SAFETY: momentary read, no aliasing.
+    let columns = unsafe { crate::globals::GLOBALS.get_mut() }.Columns;
+    debug_assert!(sc_col >= 0);
+    sc_col = columns - sc_col;
+    debug_assert!(ru_col >= 0);
+    ru_col = columns - ru_col;
+    if sc_col <= 0 {
+        // screen too narrow, will become a mess
+        sc_col = 1;
+    }
+    if ru_col <= 0 {
+        ru_col = 1;
+    }
+
+    // SAFETY: momentary writes, no aliasing.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.sc_col = sc_col;
+    g.ru_col = ru_col;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_vim_var_nr(crate::eval::vars::VimVarIndex::Echospace, i64::from(sc_col - 1)) };
 }
 
 #[cfg(test)]
@@ -344,6 +428,154 @@ mod tests {
         unsafe { redraw_buf_status_later(buf_ptr) };
         assert!(!unsafe { &*win1_ptr }.w_redr_status);
         assert!(unsafe { &*win2_ptr }.w_redr_status);
+    }
+
+    // --- comp_col ---
+
+    /// Resets every global [`comp_col`] reads/writes to a known,
+    /// neutral state.
+    fn reset_comp_col_globals() {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.ru_wid = 0;
+        g.Columns = 80;
+        g.sc_col = 0;
+        g.ru_col = 0;
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_ru = 0;
+        ov.p_sc = 0;
+        ov.p_sloc = None;
+    }
+
+    #[test]
+    fn comp_col_with_everything_off_yields_full_width_sc_col_and_ru_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+
+        unsafe { comp_col() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // Neither 'ruler' nor 'showcmd'/'l' are set, so sc_col starts
+        // at 0 -> Columns - 0 == 80; ru_col starts at 0 -> Columns - 0
+        // == 80 too (still computed unconditionally, matching the
+        // original).
+        assert_eq!(g.sc_col, 80);
+        assert_eq!(g.ru_col, 80);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_with_ruler_and_single_window_reserves_ru_col_width_in_sc_col() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 1;
+
+        unsafe { comp_col() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // last_has_status is false (single window, default 'laststatus'
+        // doesn't force one) so sc_col == ru_col == Columns -
+        // (COL_RULER + 1) == 80 - 18 == 62.
+        assert_eq!(g.ru_col, 62);
+        assert_eq!(g.sc_col, 62);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_with_ru_wid_override_uses_it_instead_of_col_ruler() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid = 30;
+
+        unsafe { comp_col() };
+
+        // ru_col == Columns - (ru_wid + 1) == 80 - 31 == 49.
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_col, 49);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_with_showcmd_at_line_adds_showcmd_cols_and_a_separator_space() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc = 1;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sloc = Some(b"last".to_vec());
+
+        unsafe { comp_col() };
+
+        // 'ruler' is off, so the "!p_ru || last_has_status" separator
+        // condition is true (p_ru == 0) -> +1 extra:
+        // sc_col == Columns - (SHOWCMD_COLS + 1) == 80 - 11 == 69.
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.sc_col, 69);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_showcmd_at_column_is_not_recognized_as_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sc = 1;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sloc = Some(b"statusline".to_vec());
+
+        unsafe { comp_col() };
+
+        // p_sloc doesn't start with 'l' ("statusline" starts with
+        // 's'), so the whole SHOWCMD_COLS branch is skipped entirely.
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.sc_col, 80);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_clamps_to_1_when_the_screen_is_too_narrow() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+        unsafe { crate::globals::GLOBALS.get_mut() }.Columns = 5;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 1;
+
+        unsafe { comp_col() };
+
+        // ru_col would be 5 - 18 == -13, clamped to 1; sc_col follows
+        // the same clamp (ru_col's own pre-clamp value, since
+        // last_has_status is false here too).
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.ru_col, 1);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.sc_col, 1);
+        reset_comp_col_globals();
+    }
+
+    #[test]
+    fn comp_col_sets_v_echospace_to_sc_col_minus_1() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_comp_col_globals();
+        let mut win = WinT { handle: crate::window::LOWEST_WIN_ID, ..Default::default() };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = WinGlobalsGuard::set(win_ptr, win_ptr);
+
+        unsafe { comp_col() };
+
+        let sc_col = unsafe { crate::globals::GLOBALS.get_mut() }.sc_col;
+        assert_eq!(
+            unsafe { crate::eval::vars::get_vim_var_nr(crate::eval::vars::VimVarIndex::Echospace) },
+            i64::from(sc_col - 1)
+        );
+        reset_comp_col_globals();
     }
 }
 
