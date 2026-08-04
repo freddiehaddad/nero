@@ -87,6 +87,9 @@
 //! after an `=`, with `-1` reserved for "the line above ends in a
 //! backslash, so this line is itself a continuation".
 //!
+//! Also [`cin_isinit`] - `"[typedef] [static|public|protected|
+//! private] enum"`, falling back to [`cin_is_compound_init`].
+//!
 //! Deferred: everything else - `cin_iswhileofdo_end`/
 //! `cin_is_cpp_baseclass`/`cin_isfuncdecl` (need `find_match_paren`
 //! and multi-line backtracking) and the rest of the real
@@ -1327,6 +1330,52 @@ pub unsafe fn cin_get_equal_amount(lnum: crate::pos_defs::LinenrT) -> i32 {
     col
 }
 
+/// Recognize enumerations - `"[typedef] [static|public|protected|
+/// private] enum"` - falling back to structure initialization
+/// (`cin_isinit`).
+///
+/// # Safety
+/// `crate::globals::GLOBALS`' own `curwin`/`curbuf` must be valid,
+/// non-null pointers to live objects and the cursor line must exist,
+/// matching `crate::cursor::get_cursor_line_ptr`'s own safety doc.
+#[must_use]
+pub unsafe fn cin_isinit() -> bool {
+    const SKIP: [&[u8]; 4] = [b"static", b"public", b"protected", b"private"];
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut s = unsafe { cin_skipcomment(&line, 0) };
+
+    if cin_starts_with(line.get(s..).unwrap_or(&[]), b"typedef") {
+        // SAFETY: forwarded from this function's own safety doc.
+        s = unsafe { cin_skipcomment(&line, s + 7) };
+    }
+
+    // Skip any number of the access/storage keywords, in any order.
+    loop {
+        let mut matched = false;
+        for w in SKIP {
+            if cin_starts_with(line.get(s..).unwrap_or(&[]), w) {
+                // SAFETY: forwarded from this function's own safety doc.
+                s = unsafe { cin_skipcomment(&line, s + w.len()) };
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            break;
+        }
+    }
+
+    if cin_starts_with(line.get(s..).unwrap_or(&[]), b"enum") {
+        return true;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { cin_is_compound_init(&line, s) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1548,6 +1597,49 @@ mod tests {
     }
 
     // ---- cin_get_equal_amount ----
+
+    // ---- cin_isinit ----
+
+    /// Runs `cin_isinit` over a single-line buffer.
+    fn isinit(line: &[u8]) -> bool {
+        with_lines(&[line], 1, || unsafe { cin_isinit() })
+    }
+
+    #[test]
+    fn cin_isinit_recognizes_a_plain_enum() {
+        assert!(isinit(b"enum Foo {"));
+        assert!(isinit(b"  enum {"));
+        // A comment before the keyword is skipped.
+        assert!(isinit(b"/* c */enum Foo {"));
+    }
+
+    #[test]
+    fn cin_isinit_skips_typedef_and_access_keywords() {
+        assert!(isinit(b"typedef enum Foo {"));
+        assert!(isinit(b"static enum Foo {"));
+        assert!(isinit(b"public enum Foo {"));
+        assert!(isinit(b"protected enum Foo {"));
+        assert!(isinit(b"private enum Foo {"));
+        // Several skip words in a row, in any order.
+        assert!(isinit(b"typedef static public enum Foo {"));
+    }
+
+    #[test]
+    fn cin_isinit_falls_back_to_compound_initialization() {
+        // Not an enum, but a compound initializer - accepted by the
+        // cin_is_compound_init fallback.
+        assert!(isinit(b"struct foo x = {"));
+        assert!(isinit(b"static int x = {"));
+    }
+
+    #[test]
+    fn cin_isinit_rejects_ordinary_declarations() {
+        assert!(!isinit(b"int x;"));
+        assert!(!isinit(b""));
+        // "enumerate" is not the `enum` keyword, and the line has no
+        // assignment either.
+        assert!(!isinit(b"enumerate();"));
+    }
 
     #[test]
     fn cin_get_equal_amount_reports_the_column_after_an_equal_sign() {
