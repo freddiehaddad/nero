@@ -221,6 +221,13 @@
 //! unless `OPT_LOCAL`, the window's own `w_s.b_p_spo_flags` unless
 //! `OPT_GLOBAL`), so a plain `:set` updates both.
 //!
+//! Also [`did_set_formatoptions`] (a thin
+//! `did_set_option_listflag` wrapper over `option_vars::FO_ALL` -
+//! which itself already contains a literal `,`, so no separator has
+//! to be appended, unlike [`did_set_whichwrap`]'s own `WW_ALL`
+//! handling) and [`did_set_commentstring`] (the value must be empty
+//! or contain a literal `%s` placeholder).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1719,6 +1726,47 @@ pub unsafe fn did_set_spelloptions(args: &mut crate::option_defs::OptsetT) -> Op
         synblock.b_p_spo_flags = flags;
     }
 
+    None
+}
+
+/// The `'formatoptions'` option is changed (`did_set_formatoptions`).
+///
+/// A thin `did_set_option_listflag` wrapper over
+/// `option_vars::FO_ALL`. Note `FO_ALL` itself contains a literal
+/// `,` character, so no separator has to be appended here (unlike
+/// [`did_set_whichwrap`]'s own `WW_ALL` handling).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_formatoptions(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+    did_set_option_listflag(val, crate::option_vars::FO_ALL.as_bytes())
+}
+
+/// The `'commentstring'` option is changed (`did_set_commentstring`).
+///
+/// The value must be empty, or contain a literal `%s` placeholder
+/// somewhere.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_commentstring(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    if !val.is_empty() && !val.windows(2).any(|w| w == b"%s") {
+        return Some(
+            crate::gettext_defs::gettext_noop(
+                "E537: 'commentstring' must be empty or contain %s",
+            )
+            .as_bytes(),
+        );
+    }
     None
 }
 
@@ -3990,6 +4038,96 @@ mod tests {
                 Some(crate::errors::e_invarg.as_bytes())
             );
         });
+    }
+
+    // ---- did_set_formatoptions / did_set_commentstring ----
+
+    #[test]
+    fn did_set_formatoptions_accepts_every_character_in_fo_all() {
+        let mut val: Option<Vec<u8>> = Some(crate::option_vars::FO_ALL.as_bytes().to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_formatoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_formatoptions_accepts_the_real_default_value() {
+        let mut val: Option<Vec<u8>> = Some(b"tcqj".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_formatoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_formatoptions_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_formatoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_formatoptions_accepts_a_comma_since_fo_all_contains_one() {
+        // Unlike WW_ALL, FO_ALL itself already contains a literal ','
+        // so no separator has to be appended by the caller.
+        assert!(crate::option_vars::FO_ALL.as_bytes().contains(&b','));
+        let mut val: Option<Vec<u8>> = Some(b"t,c".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_formatoptions(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_formatoptions_rejects_an_unknown_flag_character() {
+        // 'z' is genuinely absent from FO_ALL.
+        let mut val: Option<Vec<u8>> = Some(b"tz".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_formatoptions(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_commentstring_empty_is_valid() {
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_commentstring(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_commentstring_accepts_a_value_containing_the_placeholder() {
+        let mut val: Option<Vec<u8>> = Some(b"/*%s*/".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_commentstring(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_commentstring_accepts_the_placeholder_at_the_very_end() {
+        // Exercises the 2-byte window scan reaching the last position.
+        let mut val: Option<Vec<u8>> = Some(b"# %s".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_commentstring(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_commentstring_rejects_a_non_empty_value_without_the_placeholder() {
+        let mut val: Option<Vec<u8>> = Some(b"# ".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_commentstring(&mut args) },
+            Some(
+                crate::gettext_defs::gettext_noop(
+                    "E537: 'commentstring' must be empty or contain %s"
+                )
+                .as_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn did_set_commentstring_rejects_a_lone_percent() {
+        // A single '%' with no following 's' must not satisfy the
+        // 2-byte "%s" scan.
+        let mut val: Option<Vec<u8>> = Some(b"%".to_vec());
+        let mut args = listflag_args(&mut val);
+        assert!(unsafe { did_set_commentstring(&mut args) }.is_some());
     }
 
     // ---- did_set_mousescroll ----
