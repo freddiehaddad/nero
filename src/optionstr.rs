@@ -267,6 +267,14 @@
 //! bare `%`) is rejected. Reads `args.os_newval` rather than
 //! `args.os_varp`, matching the original exactly.
 //!
+//! Also [`did_set_completeitemalign`] - the value must list EXACTLY
+//! the three items `"abbr"`, `"kind"` and `"menu"` (in any order,
+//! each exactly once). The resulting order is packed into
+//! `OPTION_VARS.cia_flags` as a base-10 digit sequence via the
+//! original's own `new_cia_flags * 10 + CPT_*` accumulation, kept
+//! exactly rather than re-encoded as a cleaner bitmask, since real
+//! consumers decode those decimal digits positionally.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1891,6 +1899,60 @@ pub unsafe fn did_set_colorcolumn(args: &mut crate::option_defs::OptsetT) -> Opt
         return Some(crate::errors::e_invarg.as_bytes());
     }
 
+    None
+}
+
+/// The `'completeitemalign'` option is changed
+/// (`did_set_completeitemalign`).
+///
+/// The value must list EXACTLY the three items `"abbr"`, `"kind"`
+/// and `"menu"` (in any order, each exactly once) as a
+/// comma-separated list. The resulting order is packed into
+/// `OPTION_VARS.cia_flags` as a base-10 digit sequence - the
+/// original's own `new_cia_flags * 10 + CPT_*` accumulation, kept
+/// exactly rather than re-encoded as a cleaner bitmask, since real
+/// consumers decode those decimal digits positionally.
+///
+/// Reads the GLOBAL `OPTION_VARS.p_cia` directly rather than
+/// `args.os_varp`, exactly as the original does (see
+/// [`did_set_breakat`]'s own note about this recurring pattern).
+pub fn did_set_completeitemalign() -> Option<&'static [u8]> {
+    // SAFETY: a plain field read on `OPTION_VARS`, no aliasing hazard.
+    let p_cia = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cia.clone().unwrap_or_default();
+
+    let mut new_cia_flags: u32 = 0;
+    let mut seen = [false; 3];
+    let mut count = 0;
+    let mut p = 0usize;
+
+    while p < p_cia.len() {
+        let (buf, next) = crate::option::copy_option_part(&p_cia, p, 10, b",");
+        p = next;
+
+        if count >= 3 {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+
+        let idx = match buf.as_slice() {
+            b"abbr" => crate::insexpand::CPT_ABBR,
+            b"kind" => crate::insexpand::CPT_KIND,
+            b"menu" => crate::insexpand::CPT_MENU,
+            _ => return Some(crate::errors::e_invarg.as_bytes()),
+        };
+
+        if seen[idx as usize] {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        new_cia_flags = new_cia_flags * 10 + idx as u32;
+        seen[idx as usize] = true;
+        count += 1;
+    }
+
+    if new_cia_flags == 0 || count != 3 {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags = new_cia_flags;
     None
 }
 
@@ -4775,6 +4837,82 @@ mod tests {
             shellpipe_result(b"%d"),
             Some(crate::errors::e_invalid_format_string_single_percent_s.as_bytes())
         );
+    }
+
+    // ---- did_set_completeitemalign ----
+
+    /// Saves/restores both `p_cia` and the derived `cia_flags`.
+    fn with_cia<R>(value: Option<&[u8]>, f: impl FnOnce() -> R) -> R {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_cia = opts.p_cia.clone();
+        let prev_flags = opts.cia_flags;
+        opts.p_cia = value.map(<[u8]>::to_vec);
+        opts.cia_flags = 0;
+
+        let result = f();
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_cia = prev_cia;
+        opts.cia_flags = prev_flags;
+        result
+    }
+
+    #[test]
+    fn did_set_completeitemalign_accepts_the_real_default_order() {
+        with_cia(Some(b"abbr,kind,menu"), || {
+            assert_eq!(did_set_completeitemalign(), None);
+            // CPT_ABBR=0, CPT_KIND=1, CPT_MENU=2 packed base-10:
+            // ((0*10+1)*10+2) == 12.
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 12);
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_accepts_a_reordered_list() {
+        with_cia(Some(b"menu,kind,abbr"), || {
+            assert_eq!(did_set_completeitemalign(), None);
+            // ((2*10+1)*10+0) == 210.
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 210);
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_rejects_a_duplicate_item() {
+        with_cia(Some(b"abbr,abbr,menu"), || {
+            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+            // Rejected before any store, so the flags stay untouched.
+            assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cia_flags, 0);
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_rejects_too_few_items() {
+        with_cia(Some(b"abbr,kind"), || {
+            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_rejects_an_empty_value() {
+        // Zero items means new_cia_flags == 0 AND count != 3.
+        with_cia(Some(b""), || {
+            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_rejects_an_unknown_item() {
+        with_cia(Some(b"abbr,kind,bogus"), || {
+            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+        });
+    }
+
+    #[test]
+    fn did_set_completeitemalign_rejects_more_than_three_items() {
+        with_cia(Some(b"abbr,kind,menu,abbr"), || {
+            assert_eq!(did_set_completeitemalign(), Some(crate::errors::e_invarg.as_bytes()));
+        });
     }
 
     // ---- did_set_mousescroll ----
