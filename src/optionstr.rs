@@ -281,6 +281,14 @@
 //! `OptIndex::Statusline`. `did_set_statusline` is therefore
 //! deliberately NOT exposed yet.
 //!
+//! Also [`did_set_filetype_or_syntax`] (validates via
+//! [`valid_filetype`], then records `os_value_changed`/
+//! `os_value_checked` back into `args` for the option engine's own
+//! later use) and [`did_set_highlight`] (`'highlight'` is not
+//! configurable at all - the ONLY accepted value is the built-in
+//! `option_vars::HIGHLIGHT_INIT` default, anything else is rejected
+//! with `e_unsupportedoption`).
+//!
 //! Also [`did_set_complete`] - the comma-separated `'complete'`
 //! source list. Hand-traced and then verified case-by-case against a
 //! real `nvim` binary before being written, preserving three real
@@ -438,6 +446,65 @@ pub fn check_ff_value(p: &[u8]) -> bool {
 #[must_use]
 pub fn valid_filetype(val: &[u8]) -> bool {
     crate::option::valid_name(val, b".-_")
+}
+
+/// The `'filetype'`/`'syntax'` option is changed
+/// (`did_set_filetype_or_syntax`).
+///
+/// Validates the value via [`valid_filetype`], then records two flags
+/// back into `args` for the option engine's own later use:
+/// `os_value_changed` (whether the value genuinely differs from
+/// `os_oldval`) and `os_value_checked` (always `true` - since the
+/// value has been validated here, the caller need not mark it
+/// insecure even when it came from a modeline).
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_filetype_or_syntax(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    if !valid_filetype(val) {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    args.os_value_changed = match &args.os_oldval {
+        crate::option_defs::OptVal::String(old) => old.as_slice() != val,
+        // A non-string old value can never compare equal to the new
+        // string, matching the original's own `strcmp(...) != 0`
+        // against a real old string.
+        _ => true,
+    };
+
+    // Since we check the value, there is no need to set
+    // `kOptFlagInsecure`, even when the value comes from a modeline.
+    args.os_value_checked = true;
+
+    None
+}
+
+/// The `'highlight'` option is changed (`did_set_highlight`).
+///
+/// `'highlight'` is not configurable: the ONLY accepted value is the
+/// built-in default `option_vars::HIGHLIGHT_INIT`, and anything else
+/// is rejected outright.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>` for the
+/// whole call.
+pub unsafe fn did_set_highlight(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    if val != crate::option_vars::HIGHLIGHT_INIT.as_bytes() {
+        return Some(crate::errors::e_unsupportedoption.as_bytes());
+    }
+    None
 }
 
 /// Get the array of valid string values for `opt_idx` (`opt_values`, a
@@ -5190,6 +5257,104 @@ mod tests {
         let mut args = briopt_args(&mut win, false, &mut val);
         assert_eq!(unsafe { did_set_breakindentopt(&mut args) }, None);
         assert_eq!(win.w_briopt_min, before_min);
+    }
+
+    // ---- did_set_filetype_or_syntax / did_set_highlight ----
+
+    fn ft_args(val: &mut Option<Vec<u8>>, oldval: &[u8]) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            os_oldval: crate::option_defs::OptVal::String(oldval.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_accepts_a_plain_name() {
+        let mut val: Option<Vec<u8>> = Some(b"rust".to_vec());
+        let mut args = ft_args(&mut val, b"c");
+        assert_eq!(unsafe { did_set_filetype_or_syntax(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_accepts_the_extra_name_characters() {
+        // valid_filetype additionally allows '.', '-' and '_'.
+        let mut val: Option<Vec<u8>> = Some(b"a.b-c_d".to_vec());
+        let mut args = ft_args(&mut val, b"c");
+        assert_eq!(unsafe { did_set_filetype_or_syntax(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_rejects_an_invalid_name() {
+        let mut val: Option<Vec<u8>> = Some(b"bad/name".to_vec());
+        let mut args = ft_args(&mut val, b"c");
+        assert_eq!(
+            unsafe { did_set_filetype_or_syntax(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_sets_value_changed_when_it_differs() {
+        let mut val: Option<Vec<u8>> = Some(b"rust".to_vec());
+        let mut args = ft_args(&mut val, b"c");
+        assert_eq!(unsafe { did_set_filetype_or_syntax(&mut args) }, None);
+        assert!(args.os_value_changed);
+        assert!(args.os_value_checked);
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_clears_value_changed_when_it_matches() {
+        let mut val: Option<Vec<u8>> = Some(b"rust".to_vec());
+        let mut args = ft_args(&mut val, b"rust");
+        assert_eq!(unsafe { did_set_filetype_or_syntax(&mut args) }, None);
+        assert!(!args.os_value_changed);
+        // os_value_checked is set unconditionally on success.
+        assert!(args.os_value_checked);
+    }
+
+    #[test]
+    fn did_set_filetype_or_syntax_leaves_the_flags_alone_on_failure() {
+        // Both flags are only touched AFTER validation succeeds.
+        let mut val: Option<Vec<u8>> = Some(b"bad/name".to_vec());
+        let mut args = ft_args(&mut val, b"c");
+        assert!(unsafe { did_set_filetype_or_syntax(&mut args) }.is_some());
+        assert!(!args.os_value_changed);
+        assert!(!args.os_value_checked);
+    }
+
+    #[test]
+    fn did_set_highlight_accepts_only_the_builtin_default() {
+        let mut val: Option<Vec<u8>> =
+            Some(crate::option_vars::HIGHLIGHT_INIT.as_bytes().to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(unsafe { did_set_highlight(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_highlight_rejects_anything_else() {
+        for v in [&b""[..], b"8:SpecialKey", b"bogus"] {
+            let mut val: Option<Vec<u8>> = Some(v.to_vec());
+            let mut args = listflag_args(&mut val);
+            assert_eq!(
+                unsafe { did_set_highlight(&mut args) },
+                Some(crate::errors::e_unsupportedoption.as_bytes()),
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn did_set_highlight_rejects_a_truncated_default() {
+        // Even a strict prefix of the default is rejected - the
+        // comparison is a whole-value equality, not a prefix match.
+        let full = crate::option_vars::HIGHLIGHT_INIT.as_bytes();
+        let mut val: Option<Vec<u8>> = Some(full[..full.len() - 1].to_vec());
+        let mut args = listflag_args(&mut val);
+        assert_eq!(
+            unsafe { did_set_highlight(&mut args) },
+            Some(crate::errors::e_unsupportedoption.as_bytes())
+        );
     }
 
     // ---- did_set_complete ----
