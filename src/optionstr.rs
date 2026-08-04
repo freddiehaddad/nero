@@ -196,6 +196,15 @@
 //! `opt_did_set_cb` yet), so the table would still be all-zero at
 //! every real read - wiring that up is a separate, later change.
 //!
+//! Also [`did_set_cursorlineopt`] (rejects an empty value outright,
+//! then delegates to `option.rs`'s already-real `fill_culopt_flags`;
+//! the original's own "could be changed to use opt_strings_flags()"
+//! note is preserved as-is rather than acted on, since doing so would
+//! change real behavior) and [`did_set_inccommand`] (refuses to change
+//! `'inccommand'` while a command preview is already running, via
+//! `GLOBALS.cmdpreview`, otherwise delegating to
+//! [`did_set_str_generic`]).
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -1525,6 +1534,50 @@ pub unsafe fn did_set_cpoptions(args: &mut crate::option_defs::OptsetT) -> Optio
     let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
     let val: &[u8] = varp.as_deref().unwrap_or(&[]);
     did_set_option_listflag(val, crate::option_vars::CPO_VI.as_bytes())
+}
+
+/// The `'cursorlineopt'` option is changed (`did_set_cursorlineopt`).
+///
+/// Rejects an empty value outright, then delegates to the already-real
+/// `option::fill_culopt_flags` (which parses the comma-separated flag
+/// list into `WinT.w_p_culopt_flags`). The original carries a
+/// `// This could be changed to use opt_strings_flags() instead.`
+/// note - preserved as-is here rather than acted on, since doing so
+/// would change real behavior.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+pub unsafe fn did_set_cursorlineopt(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *(args.os_win as *mut crate::buffer_defs::WinT) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let val: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    if val.is_empty() || crate::option::fill_culopt_flags(Some(val), win) != crate::vim_defs::OK {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+
+    None
+}
+
+/// The `'inccommand'` option is changed (`did_set_inccommand`).
+///
+/// Refuses to change `'inccommand'` while a command preview is
+/// already running (`GLOBALS.cmdpreview`), otherwise delegates to
+/// [`did_set_str_generic`].
+///
+/// # Safety
+/// Forwarded from [`did_set_str_generic`]'s own safety doc.
+pub unsafe fn did_set_inccommand(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: a plain `bool` copy-out read, no aliasing hazard.
+    if unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview {
+        return Some(crate::errors::e_invarg.as_bytes());
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_str_generic(args) }
 }
 
 /// The `'breakat'` option is changed (`did_set_breakat`).
@@ -3418,6 +3471,103 @@ mod tests {
         }
 
         restore_breakat(prev, prev_flags);
+    }
+
+    // ---- did_set_cursorlineopt / did_set_inccommand ----
+
+    fn culopt_args(
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_cursorlineopt_accepts_the_real_default_value() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"both".to_vec());
+        let mut args = culopt_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_cursorlineopt(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_cursorlineopt_accepts_a_comma_separated_list() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"line,number".to_vec());
+        let mut args = culopt_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_cursorlineopt(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_cursorlineopt_rejects_an_empty_value() {
+        // The original's own `**varp == NUL` guard - an empty
+        // 'cursorlineopt' is invalid, unlike most flag-list options.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = culopt_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_cursorlineopt(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_cursorlineopt_rejects_an_unknown_token() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = culopt_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_cursorlineopt(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_inccommand_delegates_when_no_preview_is_running() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview;
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview = false;
+
+        let prev_icm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_icm.clone();
+        let opts_ptr = crate::option_vars::OPTION_VARS.as_ptr();
+        let varp = unsafe { std::ptr::addr_of_mut!((*opts_ptr).p_icm) };
+        unsafe { (*varp) = Some(b"split".to_vec()) };
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Inccommand,
+            os_varp: varp as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_inccommand(&mut args) }, None);
+
+        unsafe { (*varp) = prev_icm };
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview = prev;
+    }
+
+    #[test]
+    fn did_set_inccommand_refuses_while_a_preview_is_running() {
+        // Rejected before did_set_str_generic even runs, so the value
+        // itself is irrelevant here.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview;
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview = true;
+
+        let mut val: Option<Vec<u8>> = Some(b"split".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Inccommand,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_inccommand(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdpreview = prev;
     }
 
     // ---- did_set_mousescroll ----
