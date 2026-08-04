@@ -267,6 +267,20 @@
 //! `foldmethodIsExpr`-gated `foldUpdateAll` call panics, the same
 //! shape as [`did_set_foldignore`].
 //!
+//! Also [`did_set_winbar`]/[`did_set_tabline`]/
+//! [`did_set_statuscolumn`], built on a new private
+//! `did_set_statustabline_rulerformat` shared helper (unlocked by
+//! `check_stl_option` landing earlier in this segment). All five
+//! options in that family share one body in the original; two of its
+//! branches are NOT translated and panic if reached (the
+//! `'statusline'` ones need `get_option_default`/`win_config_float`,
+//! the `'rulerformat'` one needs `ui_has`). Those are provably
+//! unreachable from these three wrappers, each of which passes
+//! `rulerformat == false` and an `os_idx` that is never
+//! `OptIndex::Statusline` - so all three are fully working.
+//! `did_set_statusline`/`did_set_rulerformat` are therefore
+//! deliberately NOT exposed yet.
+//!
 //! Also [`did_set_shellpipe_redir`] (`'shellpipe'`/`'shellredir'`) -
 //! a shell command template in which `%s` marks the file-name
 //! substitution point. At most ONE `%s` is allowed, `%%` is a
@@ -2074,6 +2088,104 @@ pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option
     }
 
     None
+}
+
+/// The `'statusline'`/`'winbar'`/`'tabline'`/`'rulerformat'`/
+/// `'statuscolumn'` option is changed
+/// (`did_set_statustabline_rulerformat`, a `static` helper in the
+/// original).
+///
+/// All five options share this one body, distinguished by the
+/// `rulerformat`/`statuscolumn` flags plus an `os_idx ==
+/// kOptStatusline` check. Two of its branches are NOT translated and
+/// panic if reached:
+///
+/// - the `is_stl` branches (reset an empty global `'statusline'` to
+///   its default, and reconfigure a floating window) need
+///   `get_option_default`/`win_config_float`, neither translated;
+/// - the `rulerformat` branch needs `ui_has`, not translated.
+///
+/// Both are provably unreachable from the three wrappers exposed
+/// today ([`did_set_winbar`], [`did_set_tabline`],
+/// [`did_set_statuscolumn`]), each of which passes
+/// `rulerformat == false` and an `os_idx` that is never
+/// `OptIndex::Statusline` - so those three are fully working.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// when `statuscolumn` is true. `args.os_varp` must point to a live
+/// `Option<Vec<u8>>`.
+unsafe fn did_set_statustabline_rulerformat(
+    args: &mut crate::option_defs::OptsetT,
+    rulerformat: bool,
+    statuscolumn: bool,
+) -> Option<&'static [u8]> {
+    if rulerformat {
+        // Reset ru_wid first.
+        unsafe { crate::globals::GLOBALS.get_mut() }.ru_wid = 0;
+    } else if statuscolumn {
+        // Reset the 'statuscolumn' width.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *(args.os_win as *mut crate::buffer_defs::WinT) }.w_nrwidth_line_count = 0;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+    let s: &[u8] = varp.as_deref().unwrap_or(&[]);
+
+    if args.os_idx == crate::option_defs::OptIndex::Statusline {
+        unimplemented!(
+            "did_set_statustabline_rulerformat: the 'statusline' branches need \
+             get_option_default/win_config_float, not translated"
+        );
+    }
+
+    if rulerformat {
+        unimplemented!(
+            "did_set_statustabline_rulerformat: the 'rulerformat' branch needs ui_has, \
+             not translated"
+        );
+    }
+
+    // Check the value only if it doesn't start with "%!" (a custom
+    // function reference, which isn't statusline syntax at all).
+    if s.first() != Some(&b'%') || s.get(1) != Some(&b'!') {
+        return check_stl_option(s);
+    }
+
+    None
+}
+
+/// The `'winbar'` option is changed (`did_set_winbar`).
+///
+/// # Safety
+/// Forwarded from `did_set_statustabline_rulerformat`'s own safety
+/// doc.
+pub unsafe fn did_set_winbar(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_statustabline_rulerformat(args, false, false) }
+}
+
+/// The `'tabline'` option is changed (`did_set_tabline`).
+///
+/// # Safety
+/// Forwarded from `did_set_statustabline_rulerformat`'s own safety
+/// doc.
+pub unsafe fn did_set_tabline(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_statustabline_rulerformat(args, false, false) }
+}
+
+/// The `'statuscolumn'` option is changed (`did_set_statuscolumn`).
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// (this variant always resets the window's own
+/// `w_nrwidth_line_count`). Otherwise forwarded from
+/// `did_set_statustabline_rulerformat`'s own safety doc.
+pub unsafe fn did_set_statuscolumn(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_statustabline_rulerformat(args, false, true) }
 }
 
 /// Validate `'shellpipe'`/`'shellredir'` (`did_set_shellpipe_redir`).
@@ -4917,6 +5029,113 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
         let mut args = foldexpr_args(&mut win, &mut val);
         let _ = unsafe { did_set_foldexpr(&mut args) };
+    }
+
+    // ---- did_set_winbar / did_set_tabline / did_set_statuscolumn ----
+
+    fn stl_family_args(
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            // Any index EXCEPT Statusline keeps the untranslated
+            // is_stl branches unreachable.
+            os_idx: crate::option_defs::OptIndex::Winbar,
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_winbar_accepts_valid_statusline_syntax() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"%f %m".to_vec());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_winbar(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_winbar_empty_is_valid() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(Vec::new());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_winbar(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_winbar_rejects_invalid_statusline_syntax() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"%z".to_vec());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_winbar(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_winbar_skips_validation_for_a_percent_bang_function_ref() {
+        // "%!" means a custom function reference, which is NOT
+        // statusline syntax - the original skips check_stl_option
+        // entirely for it, so an otherwise-invalid tail is accepted.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"%!MyFunc()".to_vec());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_winbar(&mut args) }, None);
+    }
+
+    #[test]
+    fn did_set_tabline_validates_the_same_way() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut ok: Option<Vec<u8>> = Some(b"%f".to_vec());
+        let mut args = stl_family_args(&mut win, &mut ok);
+        assert_eq!(unsafe { did_set_tabline(&mut args) }, None);
+
+        let mut bad: Option<Vec<u8>> = Some(b"%z".to_vec());
+        let mut args = stl_family_args(&mut win, &mut bad);
+        assert_eq!(
+            unsafe { did_set_tabline(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+    }
+
+    #[test]
+    fn did_set_statuscolumn_resets_the_windows_nrwidth_line_count() {
+        // The statuscolumn variant's own extra side effect.
+        let mut win = crate::buffer_defs::WinT { w_nrwidth_line_count: 42, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"%l".to_vec());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_statuscolumn(&mut args) }, None);
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    #[test]
+    fn did_set_statuscolumn_resets_the_count_even_when_the_value_is_invalid() {
+        // The reset happens BEFORE validation, matching the original's
+        // own ordering.
+        let mut win = crate::buffer_defs::WinT { w_nrwidth_line_count: 42, ..Default::default() };
+        let mut val: Option<Vec<u8>> = Some(b"%z".to_vec());
+        let mut args = stl_family_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_statuscolumn(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "get_option_default")]
+    fn statustabline_helper_panics_for_the_statusline_index() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"%f".to_vec());
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Statusline,
+            os_win: &mut win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: &mut val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        };
+        let _ = unsafe { did_set_winbar(&mut args) };
     }
 
     // ---- did_set_shellpipe_redir ----
