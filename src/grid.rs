@@ -105,6 +105,26 @@ pub fn schar_from_buf(buf: &[u8]) -> ScharT {
     }
 }
 
+/// `schar_from_char(int c)` - a single codepoint as a `schar_T`.
+///
+/// The original clamps anything at or above `0x200000` to `U+FFFD`
+/// with a "this must NEVER happen, even if the file contained overlong
+/// sequences" note, and encodes straight into the `schar_T`'s own four
+/// bytes - a codepoint below that limit is at most four UTF-8 bytes,
+/// so it always fits inline and never touches the glyph cache.
+#[must_use]
+pub fn schar_from_char(c: i32) -> ScharT {
+    let c = if c >= 0x0020_0000 { 0xFFFD } else { c };
+    let mut bytes = [0u8; 4];
+    let len = crate::mbyte::utf_char2bytes(c, &mut bytes);
+    let len = usize::try_from(len).unwrap_or(0).min(4);
+    ScharT::from_ne_bytes({
+        let mut b = [0u8; 4];
+        b[..len].copy_from_slice(&bytes[..len]);
+        b
+    })
+}
+
 /// `schar_from_str(const char *str)`
 ///
 /// `None` models the original's own `NULL` argument, which yields `0`
@@ -196,6 +216,28 @@ mod tests {
         assert_ne!(sa, sb);
         assert_eq!(schar_get(sa), a);
         assert_eq!(schar_get(sb), b);
+    }
+
+    #[test]
+    fn schar_from_char_encodes_a_codepoint_inline() {
+        let _l = lock();
+        for (c, s) in [(0x61, "a"), (0xE9, "é"), (0x2500, "─"), (0x1F600, "\u{1F600}")] {
+            assert_eq!(schar_get(schar_from_char(c)), s.as_bytes(), "U+{c:04X}");
+        }
+    }
+
+    #[test]
+    fn schar_from_char_clamps_an_out_of_range_codepoint_to_replacement() {
+        let _l = lock();
+        // The original clamps anything >= 0x200000 to U+FFFD.
+        assert_eq!(
+            schar_from_char(0x0020_0000),
+            schar_from_char(0xFFFD),
+            "at the limit"
+        );
+        assert_eq!(schar_get(schar_from_char(0x0030_0000)), "\u{FFFD}".as_bytes());
+        // One below the limit still encodes as itself.
+        assert_ne!(schar_from_char(0x001F_FFFF), schar_from_char(0xFFFD));
     }
 
     #[test]

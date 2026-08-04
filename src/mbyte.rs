@@ -626,6 +626,51 @@ pub unsafe fn utfc_ptr2len_len(p: &[u8], size: usize) -> i32 {
     len
 }
 
+/// Build a `schar_T` from `buf`, prefixing a space when the sequence
+/// begins with a composing character (`schar_from_buf_first`).
+///
+/// A leading composing character has nothing to combine with, so the
+/// original gives it a space to sit on rather than letting it merge
+/// into whatever precedes it on screen.
+fn schar_from_buf_first(buf: &[u8], first_compose: bool) -> crate::types_defs::ScharT {
+    if first_compose {
+        let mut cbuf = [0u8; crate::types_defs::MAX_SCHAR_SIZE];
+        cbuf[0] = b' ';
+        cbuf[1..=buf.len()].copy_from_slice(buf);
+        crate::grid::schar_from_buf(&cbuf[..buf.len() + 1])
+    } else {
+        crate::grid::schar_from_buf(buf)
+    }
+}
+
+/// Get the screen character at `p`, along with its first codepoint
+/// (`utfc_ptr2schar`).
+///
+/// Returns `(schar, firstc)`. The original takes `firstc` as an
+/// out-parameter with a "NOT optional, you are gonna need it" note;
+/// a tuple says the same thing without letting a caller skip it.
+///
+/// Returns a `schar` of `0` for an invalid byte sequence.
+///
+/// # Safety
+/// Forwarded from [`utfc_ptr2len_len`]'s own safety doc.
+#[must_use]
+pub unsafe fn utfc_ptr2schar(p: &[u8]) -> (crate::types_defs::ScharT, i32) {
+    let c = utf_ptr2char(p);
+    let firstc = c;
+    let first_compose = utf_iscomposing_first(c);
+    let maxlen = crate::types_defs::MAX_SCHAR_SIZE - 1 - usize::from(first_compose);
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { utfc_ptr2len_len(p, maxlen.min(p.len())) };
+    let len = usize::try_from(len).unwrap_or(0);
+
+    if len == 1 && p[0] >= 0x80 {
+        return (0, firstc); // invalid sequence
+    }
+
+    (schar_from_buf_first(&p[..len], first_compose), firstc)
+}
+
 /// Return the folded-case equivalent of `a`, which is a UCS-4
 /// character. Uses full case folding (`utf_fold`).
 #[must_use]
@@ -2546,6 +2591,44 @@ mod tests {
         let full_len = unsafe { utfc_ptr2len(&bytes) };
         let bounded_len = unsafe { utfc_ptr2len_len(&bytes, bytes.len()) };
         assert_eq!(full_len, bounded_len);
+    }
+
+    #[test]
+    fn utfc_ptr2schar_returns_the_glyph_and_its_first_codepoint() {
+        let _l = crate::globals::global_state_test_lock();
+        for (s, first) in [("a", 0x61i32), ("é", 0xE9), ("─", 0x2500)] {
+            let (sc, firstc) = unsafe { utfc_ptr2schar(s.as_bytes()) };
+            assert_eq!(firstc, first, "{s}");
+            assert_eq!(crate::grid::schar_get(sc), s.as_bytes(), "{s}");
+        }
+    }
+
+    #[test]
+    fn utfc_ptr2schar_keeps_a_combining_char_with_its_base() {
+        let _l = crate::globals::global_state_test_lock();
+        let bytes = "e\u{0301}".as_bytes();
+        let (sc, firstc) = unsafe { utfc_ptr2schar(bytes) };
+        assert_eq!(firstc, i32::from(b'e'));
+        assert_eq!(crate::grid::schar_get(sc), bytes);
+    }
+
+    #[test]
+    fn utfc_ptr2schar_rejects_an_invalid_utf8_byte() {
+        let _l = crate::globals::global_state_test_lock();
+        // A lone continuation byte is not a valid sequence.
+        let (sc, _) = unsafe { utfc_ptr2schar(&[0x80]) };
+        assert_eq!(sc, 0);
+    }
+
+    #[test]
+    fn utfc_ptr2schar_gives_a_leading_combining_char_a_space_to_sit_on() {
+        let _l = crate::globals::global_state_test_lock();
+        // U+0301 has nothing to combine with, so the original
+        // prefixes a space rather than letting it merge into whatever
+        // precedes it on screen.
+        let bytes = "\u{0301}".as_bytes();
+        let (sc, _) = unsafe { utfc_ptr2schar(bytes) };
+        assert_eq!(crate::grid::schar_get(sc), " \u{0301}".as_bytes());
     }
 
     #[test]
