@@ -49,6 +49,14 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: [`qf_alloc_stack`]/[`qf_free_list_stack_items`].
+//! `qf_alloc_stack` returns an owned stack rather than the original's
+//! pointer to one of two places (the `ql_info_actual` singleton for a
+//! quickfix stack, a fresh allocation for a location list) - that
+//! choice belongs to `qf_init_stack`/the per-window `w_llist` fields,
+//! neither translated yet. The refcount difference between the two IS
+//! kept, since it is part of the value rather than of where it lives.
+//!
 //! Also translated: the stack-management pair [`qf_pop_stack`]/
 //! [`qf_new_list`], plus the `last_qf_id` counter handing out list
 //! ids. The original works inside a fixed `qf_maxcount` array, shifting
@@ -268,6 +276,45 @@ pub fn is_qf_list(qfl: &QfListT) -> bool {
 #[must_use]
 pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
+}
+
+/// Free every list in the stack, but not the stack itself
+/// (`qf_free_list_stack_items`).
+///
+/// Only the first `qf_listcount` lists are live, so slots beyond that
+/// are left alone - they are already cleared.
+pub fn qf_free_list_stack_items(qi: &mut crate::types_defs::QfInfoT) {
+    let live = usize::try_from(qi.qf_listcount).unwrap_or(0).min(qi.qf_lists.len());
+    for qfl in &mut qi.qf_lists[..live] {
+        qf_free(qfl);
+    }
+}
+
+/// Build a new quickfix/location list stack holding up to `n` lists
+/// (`qf_alloc_stack`).
+///
+/// Returns an owned stack. The original instead returns a POINTER to
+/// one of two places: the file-static `ql_info_actual` singleton for a
+/// quickfix stack, or a fresh allocation whose `qf_refcount` starts at
+/// one for a location list. That choice is a storage decision
+/// belonging to `qf_init_stack`/the per-window `w_llist` fields,
+/// neither of which is translated yet, so it is left to the caller
+/// here. The refcount difference between the two IS preserved, since
+/// it is part of the returned value rather than of where it lives.
+#[must_use]
+pub fn qf_alloc_stack(qfltype: QfltypeT, n: i32) -> crate::types_defs::QfInfoT {
+    let count = usize::try_from(n).unwrap_or(0);
+    crate::types_defs::QfInfoT {
+        // Only a location list stack is reference-counted; the
+        // quickfix one is a static singleton in the original.
+        qf_refcount: i32::from(qfltype != QfltypeT::Quickfix),
+        qf_listcount: 0,
+        qf_curlist: 0,
+        qf_maxcount: n,
+        qf_lists: (0..count).map(|_| QfListT::default()).collect(),
+        qfl_type: qfltype,
+        qf_bufnr: INVALID_QFBUFNR,
+    }
 }
 
 /// Counter handing out the unique id for each new list (`last_qf_id`).
@@ -672,6 +719,56 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { LAST_QF_ID.get_mut() } = self.saved;
         }
+    }
+
+    #[test]
+    fn qf_alloc_stack_builds_an_empty_stack_of_the_requested_size() {
+        let qi = qf_alloc_stack(QfltypeT::Quickfix, 10);
+        assert_eq!(qi.qf_maxcount, 10);
+        assert_eq!(qi.qf_lists.len(), 10);
+        // Allocated but not yet populated: no lists are live.
+        assert_eq!(qi.qf_listcount, 0);
+        assert_eq!(qi.qf_curlist, 0);
+        assert_eq!(qi.qf_bufnr, INVALID_QFBUFNR);
+        assert!(is_qf_stack(&qi));
+    }
+
+    #[test]
+    fn qf_alloc_stack_only_refcounts_location_lists() {
+        // The quickfix stack is a static singleton in the original, so
+        // it is never reference-counted; a location list is.
+        assert_eq!(qf_alloc_stack(QfltypeT::Quickfix, 1).qf_refcount, 0);
+        assert_eq!(qf_alloc_stack(QfltypeT::Location, 1).qf_refcount, 1);
+    }
+
+    #[test]
+    fn qf_alloc_stack_accepts_a_zero_size() {
+        let qi = qf_alloc_stack(QfltypeT::Quickfix, 0);
+        assert!(qi.qf_lists.is_empty());
+        assert!(qf_stack_empty(Some(&qi)));
+    }
+
+    #[test]
+    fn qf_free_list_stack_items_frees_only_the_live_lists() {
+        let mut qi = stack_with(3);
+        for (i, qfl) in qi.qf_lists.iter_mut().enumerate() {
+            qfl.qf_id = u32::try_from(i).unwrap() + 1;
+            qfl.qf_title = Some(b"t".to_vec());
+            qfl.qf_entries.push(QflineT::default());
+        }
+        // Only the first two are live.
+        qi.qf_listcount = 2;
+
+        qf_free_list_stack_items(&mut qi);
+
+        assert_eq!(qi.qf_lists[0].qf_id, 0);
+        assert_eq!(qi.qf_lists[0].qf_title, None);
+        assert_eq!(qi.qf_lists[1].qf_count(), 0);
+        // The slot past qf_listcount is untouched.
+        assert_eq!(qi.qf_lists[2].qf_id, 3);
+        assert_eq!(qi.qf_lists[2].qf_title.as_deref(), Some(&b"t"[..]));
+        // The stack itself survives - only its lists are freed.
+        assert_eq!(qi.qf_lists.len(), 3);
     }
 
     #[test]
