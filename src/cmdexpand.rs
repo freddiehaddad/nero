@@ -10,11 +10,74 @@
 //! both pure functions needing only already-translated option fields
 //! (`option_vars.rs`) or plain byte-string comparison.
 //!
+//! Also translated: [`cmdline_compl_use_pum`] plus the three
+//! self-contained `ExpandGeneric()` argument callbacks
+//! [`get_retab_arg`]/[`get_messages_arg`]/[`get_mapclear_arg`], whose
+//! values were read out of a real `nvim` via
+//! `getcompletion('retab ', 'cmdline')` and friends. The remaining
+//! `get_*_arg` callbacks in that group stay deferred: they run Lua
+//! (`get_arg1_from_lua`/`nlua_exec`).
+//!
 //! Deferred: everything else - `nextwild`/`copy_substring_from_pos`/
 //! `is_regex_match`/`concat_pattern_with_buffer_match`/
 //! `expand_pattern_in_buf` (the completion/search machinery),
 //! `wildescape`/`ExpandEscape` (need `vim_strsave_fnameescape`/
 //! `escape_fname`/`tilde_replace`, not translated).
+
+/// Whether the popup menu should be used for cmdline completion
+/// wildmenu (`cmdline_compl_use_pum`).
+///
+/// `need_wildmenu` is whether the current `'wildmode'` part wants a
+/// wildmenu at all.
+///
+/// The first branch is deliberately narrow: `'wildoptions'` having
+/// `pum` is not enough on its own, because an external cmdline UI
+/// without its own cmdline window draws the menu itself. The two
+/// remaining branches are unconditional UI capabilities.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::option_vars::OPTION_VARS` or `crate::globals::GLOBALS`.
+#[must_use]
+pub unsafe fn cmdline_compl_use_pum(need_wildmenu: bool) -> bool {
+    use crate::ui::{ui_has, UiExtension};
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let wop_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.wop_flags;
+    // SAFETY: forwarded from this function's own safety doc.
+    let cmdline_win = unsafe { crate::globals::GLOBALS.get_mut() }.cmdline_win;
+
+    let external_cmdline_draws_it = ui_has(UiExtension::Cmdline) && cmdline_win.is_null();
+    if need_wildmenu
+        && wop_flags & crate::option_vars::opt_wop_flag::PUM != 0
+        && !external_cmdline_draws_it
+    {
+        return true;
+    }
+    ui_has(UiExtension::Wildmenu)
+        || (ui_has(UiExtension::Cmdline) && ui_has(UiExtension::Popupmenu))
+}
+
+/// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
+///
+/// Returns `None` past the end, which is how `ExpandGeneric()` learns
+/// to stop.
+#[must_use]
+pub fn get_retab_arg(idx: i32) -> Option<&'static str> {
+    (idx == 0).then_some("-indentonly")
+}
+
+/// The possible arguments of `:messages {clear}` (`get_messages_arg`).
+#[must_use]
+pub fn get_messages_arg(idx: i32) -> Option<&'static str> {
+    (idx == 0).then_some("clear")
+}
+
+/// The possible arguments of `:mapclear` (`get_mapclear_arg`).
+#[must_use]
+pub fn get_mapclear_arg(idx: i32) -> Option<&'static str> {
+    (idx == 0).then_some("<buffer>")
+}
 
 /// Whether fuzzy completion for cmdline completion is enabled AND
 /// `fuzzystr` is not empty - an empty search pattern should never use
@@ -52,6 +115,75 @@ pub fn sort_func_compare(s1: &[u8], s2: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Saves and restores `'wildoptions'` flags across a test.
+    struct WopFlagsGuard {
+        saved: u32,
+    }
+
+    impl WopFlagsGuard {
+        fn set(flags: u32) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.wop_flags;
+            opts.wop_flags = flags;
+            Self { saved }
+        }
+    }
+
+    impl Drop for WopFlagsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.wop_flags = self.saved;
+        }
+    }
+
+    /// Every expected value below was read out of a real `nvim`
+    /// binary via `getcompletion('retab ', 'cmdline')` and friends.
+    #[test]
+    fn get_retab_arg_offers_only_indentonly() {
+        assert_eq!(get_retab_arg(0), Some("-indentonly"));
+        assert_eq!(get_retab_arg(1), None);
+    }
+
+    #[test]
+    fn get_messages_arg_offers_only_clear() {
+        assert_eq!(get_messages_arg(0), Some("clear"));
+        assert_eq!(get_messages_arg(1), None);
+    }
+
+    #[test]
+    fn get_mapclear_arg_offers_only_buffer() {
+        assert_eq!(get_mapclear_arg(0), Some("<buffer>"));
+        assert_eq!(get_mapclear_arg(1), None);
+    }
+
+    #[test]
+    fn the_arg_callbacks_reject_negative_indices() {
+        // ExpandGeneric only ever passes idx >= 0, but a negative
+        // index must not be mistaken for the single valid entry.
+        assert_eq!(get_retab_arg(-1), None);
+        assert_eq!(get_messages_arg(-1), None);
+        assert_eq!(get_mapclear_arg(-1), None);
+    }
+
+    #[test]
+    fn cmdline_compl_use_pum_needs_both_wildmenu_and_the_pum_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        // ui_has() is always false in this crate today, so the two
+        // UI-capability branches never fire and this isolates the
+        // 'wildoptions' branch.
+        let _wop = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::PUM);
+        assert!(unsafe { cmdline_compl_use_pum(true) });
+        // The flag alone is not enough without a wildmenu.
+        assert!(!unsafe { cmdline_compl_use_pum(false) });
+    }
+
+    #[test]
+    fn cmdline_compl_use_pum_is_false_without_the_pum_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _wop = WopFlagsGuard::set(0);
+        assert!(!unsafe { cmdline_compl_use_pum(true) });
+        assert!(!unsafe { cmdline_compl_use_pum(false) });
+    }
 
     fn set_wop_fuzzy(enabled: bool) -> u32 {
         let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
