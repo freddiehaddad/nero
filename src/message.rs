@@ -32,6 +32,14 @@
 //! pair collapses into a single assignment to an owned
 //! `Option<Vec<u8>>`, since dropping the old value frees it.
 //!
+//! [`reset_last_sourcing`] and [`msg_starthere`] are translated too -
+//! both are pure state resets over globals that already exist, save
+//! for `last_sourcing_name`/`last_sourcing_lnum`, which are file
+//! statics in the original and so live here rather than in
+//! `globals.rs`. Note that adding them does NOT unblock
+//! `other_sourcing_name`'s remaining body, which still needs
+//! `SOURCING_NAME`.
+//!
 //! `DEFAULT_GRID` is harvested here ahead of its real owning file,
 //! `grid.c` (not translated) - it is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
@@ -73,6 +81,17 @@ use std::sync::LazyLock;
 
 /// message id to be allocated to the next message (`msg_id_next`).
 static MSG_ID_NEXT: GlobalCell<i64> = GlobalCell::new(1);
+
+/// The source name last displayed alongside a message
+/// (`last_sourcing_name`, a file-static in the original).
+///
+/// Owned rather than a borrowed pointer, so the original's
+/// `XFREE_CLEAR` is just assigning `None`.
+static LAST_SOURCING_NAME: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
+
+/// The source line number last displayed alongside a message
+/// (`last_sourcing_lnum`, a file-static in the original).
+static LAST_SOURCING_LNUM: GlobalCell<crate::pos_defs::LinenrT> = GlobalCell::new(0);
 
 /// `default_grid` - the main screen's own [`crate::grid_defs::ScreenGrid`],
 /// harvested here from `grid.c` ahead of the rest of that file (see this
@@ -526,6 +545,36 @@ pub unsafe fn set_keep_msg(s: Option<&[u8]>, hl_id: i32) {
     globals.keep_msg_hl_id = hl_id;
 }
 
+/// Forget the source name/line last displayed with a message
+/// (`reset_last_sourcing`), so the next message re-prints its source
+/// header even if it comes from the same script.
+///
+/// The original's `XFREE_CLEAR(last_sourcing_name)` is just assigning
+/// `None` to an owned `Option<Vec<u8>>` here.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `LAST_SOURCING_NAME`/`LAST_SOURCING_LNUM`.
+pub unsafe fn reset_last_sourcing() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { LAST_SOURCING_NAME.get_mut() } = None;
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { LAST_SOURCING_LNUM.get_mut() } = 0;
+}
+
+/// Start writing messages at the current cursor position
+/// (`msg_starthere`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `crate::globals::GLOBALS`.
+pub unsafe fn msg_starthere() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.lines_left = globals.cmdline_row;
+    globals.msg_didany = false;
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -541,6 +590,58 @@ pub(crate) mod tests {
         let old = *cell;
         *cell = value;
         old
+    }
+
+    #[test]
+    fn reset_last_sourcing_clears_both_fields() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved_name = unsafe { LAST_SOURCING_NAME.get_mut() }.clone();
+        let saved_lnum = *unsafe { LAST_SOURCING_LNUM.get_mut() };
+
+        *unsafe { LAST_SOURCING_NAME.get_mut() } = Some(b"init.lua".to_vec());
+        *unsafe { LAST_SOURCING_LNUM.get_mut() } = 42;
+
+        unsafe { reset_last_sourcing() };
+        assert_eq!(*unsafe { LAST_SOURCING_NAME.get_mut() }, None);
+        assert_eq!(*unsafe { LAST_SOURCING_LNUM.get_mut() }, 0);
+
+        *unsafe { LAST_SOURCING_NAME.get_mut() } = saved_name;
+        *unsafe { LAST_SOURCING_LNUM.get_mut() } = saved_lnum;
+    }
+
+    #[test]
+    fn reset_last_sourcing_is_idempotent() {
+        let _guard = crate::globals::global_state_test_lock();
+        let saved_name = unsafe { LAST_SOURCING_NAME.get_mut() }.clone();
+        let saved_lnum = *unsafe { LAST_SOURCING_LNUM.get_mut() };
+
+        unsafe { reset_last_sourcing() };
+        unsafe { reset_last_sourcing() };
+        assert_eq!(*unsafe { LAST_SOURCING_NAME.get_mut() }, None);
+        assert_eq!(*unsafe { LAST_SOURCING_LNUM.get_mut() }, 0);
+
+        *unsafe { LAST_SOURCING_NAME.get_mut() } = saved_name;
+        *unsafe { LAST_SOURCING_LNUM.get_mut() } = saved_lnum;
+    }
+
+    #[test]
+    fn msg_starthere_copies_cmdline_row_into_lines_left() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (globals.lines_left, globals.cmdline_row, globals.msg_didany);
+
+        globals.cmdline_row = 23;
+        globals.lines_left = 0;
+        globals.msg_didany = true;
+
+        unsafe { msg_starthere() };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.lines_left, 23);
+        assert!(!globals.msg_didany);
+        // cmdline_row itself is only read, never written.
+        assert_eq!(globals.cmdline_row, 23);
+
+        (globals.lines_left, globals.cmdline_row, globals.msg_didany) = saved;
     }
 
     #[test]
