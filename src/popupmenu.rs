@@ -66,6 +66,31 @@ static PUM_EXTERNAL: GlobalCell<bool> = GlobalCell::new(false);
 /// forever in this crate today.
 static PUM_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
 
+/// State for `pum_ext_select_item` (`pum_want`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PumWant {
+    /// Whether an external selection request is pending (`active`).
+    pub active: bool,
+    /// The item index being requested (`item`).
+    pub item: i32,
+    /// Whether the requested item should be inserted (`insert`).
+    pub insert: bool,
+    /// Whether completion should finish afterwards (`finish`).
+    pub finish: bool,
+}
+
+/// `pum_want` - the pending external popup-menu selection request.
+///
+/// Only ever set by `pum_ext_select_item`, which is not translated, so
+/// this stays at its default in this crate today - matching
+/// `PUM_HEIGHT`'s own established treatment.
+pub static PUM_WANT: GlobalCell<PumWant> = GlobalCell::new(PumWant {
+    active: false,
+    item: 0,
+    insert: false,
+    finish: false,
+});
+
 /// `true` if the popup menu is currently displayed (`pum_visible`).
 #[must_use]
 pub fn pum_visible() -> bool {

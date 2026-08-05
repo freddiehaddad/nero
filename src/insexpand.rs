@@ -29,6 +29,15 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: the key-mapping trio [`ins_compl_key2dir`]/
+//! [`ins_compl_pum_key`]/[`ins_compl_key2count`], plus the
+//! `compl_selected_item` static and `popupmenu.rs`'s `pum_want`. For
+//! the externally-driven keys (`K_EVENT`/`K_COMMAND`/`K_LUA`) the
+//! direction and the count are BOTH derived from where the requested
+//! item sits relative to the current selection, rather than being
+//! fixed by the key - `key2count` returns the absolute distance and
+//! `key2dir` carries the sign.
+//!
 //! Also translated: the word-scanning trio [`find_word_start`]/
 //! [`find_word_end`]/[`find_line_end`], returning byte offsets rather
 //! than advanced pointers. `find_word_end` guards its whole scan
@@ -181,6 +190,98 @@ static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// The index of the currently selected completion item
+/// (`compl_selected_item`).
+///
+/// `-1` means "nothing selected", which is its own initial value in
+/// the original.
+static COMPL_SELECTED_ITEM: GlobalCell<i32> = GlobalCell::new(-1);
+
+/// Decide the direction of Insert-mode completion from the key typed
+/// (`ins_compl_key2dir`). Returns `Backward` or `Forward`.
+///
+/// For the externally-driven keys the direction follows whichever way
+/// the requested item sits relative to the current selection, rather
+/// than being fixed by the key itself.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::popupmenu::PUM_WANT` or `COMPL_SELECTED_ITEM`.
+#[must_use]
+pub unsafe fn ins_compl_key2dir(c: i32) -> crate::vim_defs::Direction {
+    use crate::keycodes_defs::{K_COMMAND, K_EVENT, K_LUA, K_PAGEUP, K_S_UP, K_UP};
+    if c == K_EVENT || c == K_COMMAND || c == K_LUA {
+        // SAFETY: forwarded from this function's own safety doc.
+        let want = unsafe { *crate::popupmenu::PUM_WANT.get_mut() }.item;
+        // SAFETY: forwarded from this function's own safety doc.
+        let selected = unsafe { *COMPL_SELECTED_ITEM.get_mut() };
+        return if want < selected {
+            crate::vim_defs::Direction::Backward
+        } else {
+            crate::vim_defs::Direction::Forward
+        };
+    }
+    if c == i32::from(crate::ascii_defs::CTRL_P)
+        || c == i32::from(crate::ascii_defs::CTRL_L)
+        || c == K_PAGEUP
+        || c == crate::keycodes_defs::K_KPAGEUP
+        || c == K_S_UP
+        || c == K_UP
+    {
+        return crate::vim_defs::Direction::Backward;
+    }
+    crate::vim_defs::Direction::Forward
+}
+
+/// Whether `c` is a completion key that is only valid while the popup
+/// menu is shown (`ins_compl_pum_key`).
+#[must_use]
+pub fn ins_compl_pum_key(c: i32) -> bool {
+    use crate::keycodes_defs::{
+        K_DOWN, K_KPAGEDOWN, K_KPAGEUP, K_PAGEDOWN, K_PAGEUP, K_S_DOWN, K_S_UP, K_UP,
+    };
+    crate::popupmenu::pum_visible()
+        && (c == K_PAGEUP
+            || c == K_KPAGEUP
+            || c == K_S_UP
+            || c == K_PAGEDOWN
+            || c == K_KPAGEDOWN
+            || c == K_S_DOWN
+            || c == K_UP
+            || c == K_DOWN)
+}
+
+/// Decide how many completions to move (`ins_compl_key2count`).
+///
+/// One for most keys; for the page-up/down keys the popup menu's own
+/// height, less two lines of retained context when it is tall enough
+/// for that to leave any movement.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::popupmenu::PUM_WANT` or `COMPL_SELECTED_ITEM`.
+#[must_use]
+pub unsafe fn ins_compl_key2count(c: i32) -> i32 {
+    use crate::keycodes_defs::{K_COMMAND, K_DOWN, K_EVENT, K_LUA, K_UP};
+    if c == K_EVENT || c == K_COMMAND || c == K_LUA {
+        // SAFETY: forwarded from this function's own safety doc.
+        let want = unsafe { *crate::popupmenu::PUM_WANT.get_mut() }.item;
+        // SAFETY: forwarded from this function's own safety doc.
+        let selected = unsafe { *COMPL_SELECTED_ITEM.get_mut() };
+        return want.saturating_sub(selected).saturating_abs();
+    }
+
+    if ins_compl_pum_key(c) && c != K_UP && c != K_DOWN {
+        let mut h = crate::popupmenu::pum_get_height();
+        if h > 3 {
+            // Keep some context.
+            h -= 2;
+        }
+        return h;
+    }
+    1
+}
 
 /// Find the start of the next word (`find_word_start`), as a byte
 /// offset into `ptr`.
@@ -868,6 +969,137 @@ mod tests {
     impl Drop for CotFlagsGuard {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
+        }
+    }
+
+    #[test]
+    fn ins_compl_key2dir_maps_backward_keys() {
+        let _lock = global_state_test_lock();
+        use crate::keycodes_defs::{K_KPAGEUP, K_PAGEUP, K_S_UP, K_UP};
+        for c in [
+            i32::from(crate::ascii_defs::CTRL_P),
+            i32::from(crate::ascii_defs::CTRL_L),
+            K_PAGEUP,
+            K_KPAGEUP,
+            K_S_UP,
+            K_UP,
+        ] {
+            assert_eq!(
+                unsafe { ins_compl_key2dir(c) },
+                crate::vim_defs::Direction::Backward,
+                "key {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn ins_compl_key2dir_defaults_to_forward() {
+        let _lock = global_state_test_lock();
+        use crate::keycodes_defs::{K_DOWN, K_PAGEDOWN};
+        for c in [
+            i32::from(crate::ascii_defs::CTRL_N),
+            K_PAGEDOWN,
+            K_DOWN,
+            i32::from(b'x'),
+        ] {
+            assert_eq!(
+                unsafe { ins_compl_key2dir(c) },
+                crate::vim_defs::Direction::Forward,
+                "key {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn ins_compl_key2dir_follows_the_requested_item_for_external_keys() {
+        let _lock = global_state_test_lock();
+        let prev_want = unsafe { *crate::popupmenu::PUM_WANT.get_mut() };
+        let prev_sel = unsafe { *COMPL_SELECTED_ITEM.get_mut() };
+        unsafe { *COMPL_SELECTED_ITEM.get_mut() = 5 };
+
+        // The direction is not fixed by the key: it follows whichever
+        // way the requested item sits from the current selection.
+        unsafe { crate::popupmenu::PUM_WANT.get_mut().item = 2 };
+        assert_eq!(
+            unsafe { ins_compl_key2dir(crate::keycodes_defs::K_EVENT) },
+            crate::vim_defs::Direction::Backward
+        );
+
+        unsafe { crate::popupmenu::PUM_WANT.get_mut().item = 9 };
+        assert_eq!(
+            unsafe { ins_compl_key2dir(crate::keycodes_defs::K_EVENT) },
+            crate::vim_defs::Direction::Forward
+        );
+
+        unsafe {
+            *crate::popupmenu::PUM_WANT.get_mut() = prev_want;
+            *COMPL_SELECTED_ITEM.get_mut() = prev_sel;
+        }
+    }
+
+    #[test]
+    fn ins_compl_pum_key_needs_the_menu_to_be_visible() {
+        let _lock = global_state_test_lock();
+        let _guard = crate::popupmenu::tests::PumVisibleGuard;
+
+        crate::popupmenu::tests::set_pum_is_visible(false);
+        assert!(!ins_compl_pum_key(crate::keycodes_defs::K_PAGEUP));
+
+        crate::popupmenu::tests::set_pum_is_visible(true);
+        assert!(ins_compl_pum_key(crate::keycodes_defs::K_PAGEUP));
+        // An unrelated key is still not a pum key.
+        assert!(!ins_compl_pum_key(i32::from(b'x')));
+        assert!(!ins_compl_pum_key(i32::from(crate::ascii_defs::CTRL_P)));
+    }
+
+    #[test]
+    fn ins_compl_key2count_is_one_for_ordinary_keys() {
+        let _lock = global_state_test_lock();
+        let _guard = crate::popupmenu::tests::PumVisibleGuard;
+        crate::popupmenu::tests::set_pum_is_visible(false);
+
+        assert_eq!(unsafe { ins_compl_key2count(i32::from(b'x')) }, 1);
+        assert_eq!(
+            unsafe { ins_compl_key2count(i32::from(crate::ascii_defs::CTRL_P)) },
+            1
+        );
+        // Arrow keys move one at a time even with the menu shown.
+        crate::popupmenu::tests::set_pum_is_visible(true);
+        assert_eq!(unsafe { ins_compl_key2count(crate::keycodes_defs::K_UP) }, 1);
+        assert_eq!(unsafe { ins_compl_key2count(crate::keycodes_defs::K_DOWN) }, 1);
+    }
+
+    #[test]
+    fn ins_compl_key2count_uses_the_menu_height_for_page_keys() {
+        let _lock = global_state_test_lock();
+        let _guard = crate::popupmenu::tests::PumVisibleGuard;
+        crate::popupmenu::tests::set_pum_is_visible(true);
+        // PUM_HEIGHT stays 0 in this crate today, so a page key moves
+        // by 0 - the height is not clamped up to 1.
+        assert_eq!(
+            unsafe { ins_compl_key2count(crate::keycodes_defs::K_PAGEUP) },
+            crate::popupmenu::pum_get_height()
+        );
+    }
+
+    #[test]
+    fn ins_compl_key2count_is_the_distance_for_external_keys() {
+        let _lock = global_state_test_lock();
+        let prev_want = unsafe { *crate::popupmenu::PUM_WANT.get_mut() };
+        let prev_sel = unsafe { *COMPL_SELECTED_ITEM.get_mut() };
+        unsafe { *COMPL_SELECTED_ITEM.get_mut() = 5 };
+
+        // The count is the absolute distance, so it is positive in
+        // both directions - the sign is carried by key2dir instead.
+        unsafe { crate::popupmenu::PUM_WANT.get_mut().item = 9 };
+        assert_eq!(unsafe { ins_compl_key2count(crate::keycodes_defs::K_EVENT) }, 4);
+
+        unsafe { crate::popupmenu::PUM_WANT.get_mut().item = 1 };
+        assert_eq!(unsafe { ins_compl_key2count(crate::keycodes_defs::K_EVENT) }, 4);
+
+        unsafe {
+            *crate::popupmenu::PUM_WANT.get_mut() = prev_want;
+            *COMPL_SELECTED_ITEM.get_mut() = prev_sel;
         }
     }
 
