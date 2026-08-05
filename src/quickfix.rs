@@ -49,6 +49,14 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: the stack-management pair [`qf_pop_stack`]/
+//! [`qf_new_list`], plus the `last_qf_id` counter handing out list
+//! ids. The original works inside a fixed `qf_maxcount` array, shifting
+//! entries down and zeroing the vacated top slot rather than
+//! shortening the allocation, so `qf_pop_stack` pushes a default entry
+//! after removing the first to keep that same shape - `qf_listcount`,
+//! not the vector's length, is what tracks how many lists are live.
+//!
 //! Also translated: [`qf_free_items`]/[`qf_free`]/[`qf_id2nr`]. Note
 //! that `qf_free_items`' original walks the linked list wrapped in two
 //! defensive workarounds - a `stop` flag catching a node whose
@@ -260,6 +268,82 @@ pub fn is_qf_list(qfl: &QfListT) -> bool {
 #[must_use]
 pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
+}
+
+/// Counter handing out the unique id for each new list (`last_qf_id`).
+static LAST_QF_ID: crate::globals::GlobalCell<u32> = crate::globals::GlobalCell::new(0);
+
+/// Drop the oldest list off the bottom of the stack (`qf_pop_stack`).
+///
+/// `adjust` also fixes up `qf_listcount`/`qf_curlist` so the current
+/// list stays pointed at the same list, or at the newest one if it was
+/// the one removed.
+///
+/// The original shifts the entries down inside a fixed `qf_maxcount`
+/// array and zeroes the now-unused top slot, so the allocation's own
+/// length never changes and `qf_listcount` alone tracks how many are
+/// live. Pushing a default entry after removing the first reproduces
+/// exactly that.
+pub fn qf_pop_stack(qi: &mut crate::types_defs::QfInfoT, adjust: bool) {
+    if qi.qf_lists.is_empty() {
+        return;
+    }
+    qf_free(&mut qi.qf_lists[0]);
+    qi.qf_lists.remove(0);
+    qi.qf_lists.push(QfListT::default());
+
+    if adjust {
+        qi.qf_listcount -= 1;
+        if qi.qf_curlist == 0 {
+            qi.qf_curlist = qi.qf_listcount - 1;
+        } else {
+            qi.qf_curlist -= 1;
+        }
+    }
+}
+
+/// Prepare a new, empty list at the top of the stack (`qf_new_list`).
+///
+/// Any lists above the current one are freed first, so that browsing
+/// back and then starting a new list replaces the abandoned branch -
+/// what makes `:grep` navigable in a tree-like way. When the stack is
+/// already at `qf_maxcount`, the oldest list is dropped instead.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `LAST_QF_ID`.
+pub unsafe fn qf_new_list(qi: &mut crate::types_defs::QfInfoT, qf_title: Option<&[u8]>) {
+    // Delete any lists beyond the current entry.
+    while qi.qf_listcount > qi.qf_curlist + 1 {
+        qi.qf_listcount -= 1;
+        if let Some(qfl) = usize::try_from(qi.qf_listcount).ok().and_then(|i| qi.qf_lists.get_mut(i))
+        {
+            qf_free(qfl);
+        }
+    }
+
+    if qi.qf_listcount == qi.qf_maxcount {
+        qf_pop_stack(qi, false);
+        qi.qf_curlist = qi.qf_listcount - 1;
+    } else {
+        qi.qf_curlist = qi.qf_listcount;
+        qi.qf_listcount += 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let id = unsafe { LAST_QF_ID.get_mut() };
+    *id += 1;
+    let new_id = *id;
+
+    let qfl_type = qi.qfl_type;
+    let Some(qfl) = usize::try_from(qi.qf_curlist).ok().and_then(|i| qi.qf_lists.get_mut(i)) else {
+        return;
+    };
+    // CLEAR_POINTER: the slot is reset in full before being reused.
+    *qfl = QfListT::default();
+    qf_store_title(qfl, qf_title);
+    qfl.qfl_type = qfl_type;
+    qfl.qf_id = new_id;
+    qfl.qf_has_user_data = false;
 }
 
 /// Free all the entries in a quickfix list (`qf_free_items`).
@@ -570,6 +654,146 @@ mod tests {
     fn a_default_stack_is_a_quickfix_stack() {
         // QFLT_QUICKFIX is the original enum's own first (zero) value.
         assert_eq!(QfltypeT::default(), QfltypeT::Quickfix);
+    }
+
+    /// Resets `LAST_QF_ID` after a test so the shared id counter
+    /// cannot leak into another test's expectations.
+    struct LastQfIdGuard {
+        saved: u32,
+    }
+
+    impl LastQfIdGuard {
+        fn new() -> Self {
+            Self { saved: *unsafe { LAST_QF_ID.get_mut() } }
+        }
+    }
+
+    impl Drop for LastQfIdGuard {
+        fn drop(&mut self) {
+            *unsafe { LAST_QF_ID.get_mut() } = self.saved;
+        }
+    }
+
+    #[test]
+    fn qf_pop_stack_drops_the_oldest_list_and_keeps_the_array_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = stack_with(3);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_lists[2].qf_id = 33;
+
+        qf_pop_stack(&mut qi, false);
+
+        // The remaining lists shift down...
+        assert_eq!(qi.qf_lists[0].qf_id, 22);
+        assert_eq!(qi.qf_lists[1].qf_id, 33);
+        // ...and the freed top slot is zeroed but still there, since
+        // the original works inside a fixed qf_maxcount allocation.
+        assert_eq!(qi.qf_lists.len(), 3);
+        assert_eq!(qi.qf_lists[2].qf_id, 0);
+        // Without `adjust`, the counts are left to the caller.
+        assert_eq!(qi.qf_listcount, 3);
+    }
+
+    #[test]
+    fn qf_pop_stack_adjust_moves_curlist_down() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = stack_with(3);
+        qi.qf_curlist = 2;
+
+        qf_pop_stack(&mut qi, true);
+
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_curlist, 1);
+    }
+
+    #[test]
+    fn qf_pop_stack_adjust_from_the_oldest_jumps_to_the_newest() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = stack_with(3);
+        // The list being removed IS the current one, so the original
+        // points at the newest remaining list instead of at -1.
+        qi.qf_curlist = 0;
+
+        qf_pop_stack(&mut qi, true);
+
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_curlist, 1);
+    }
+
+    #[test]
+    fn qf_new_list_appends_and_hands_out_increasing_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut qi = stack_with(3);
+        qi.qf_listcount = 0;
+        qi.qf_maxcount = 3;
+
+        unsafe { qf_new_list(&mut qi, Some(b"first")) };
+        assert_eq!(qi.qf_curlist, 0);
+        assert_eq!(qi.qf_listcount, 1);
+        let first_id = qi.qf_lists[0].qf_id;
+        assert_eq!(qi.qf_lists[0].qf_title.as_deref(), Some(&b"first"[..]));
+
+        unsafe { qf_new_list(&mut qi, Some(b"second")) };
+        assert_eq!(qi.qf_curlist, 1);
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_lists[1].qf_id, first_id + 1);
+    }
+
+    #[test]
+    fn qf_new_list_inherits_the_stacks_own_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut qi = stack_with(2);
+        qi.qf_listcount = 0;
+        qi.qf_maxcount = 2;
+        qi.qfl_type = QfltypeT::Location;
+
+        unsafe { qf_new_list(&mut qi, None) };
+        assert!(is_ll_list(&qi.qf_lists[0]));
+    }
+
+    #[test]
+    fn qf_new_list_discards_lists_above_the_current_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut qi = stack_with(4);
+        qi.qf_maxcount = 4;
+        qi.qf_listcount = 3;
+        qi.qf_lists[2].qf_id = 99;
+        // Browsing back to the first list and starting a new one
+        // replaces the abandoned branch rather than growing past it.
+        qi.qf_curlist = 0;
+
+        unsafe { qf_new_list(&mut qi, Some(b"new")) };
+
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_curlist, 1);
+        assert_eq!(qi.qf_lists[1].qf_title.as_deref(), Some(&b"new"[..]));
+        // The discarded list is gone, not merely shadowed.
+        assert_ne!(qi.qf_lists[1].qf_id, 99);
+    }
+
+    #[test]
+    fn qf_new_list_on_a_full_stack_drops_the_oldest() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ids = LastQfIdGuard::new();
+        let mut qi = stack_with(2);
+        qi.qf_maxcount = 2;
+        qi.qf_listcount = 2;
+        qi.qf_curlist = 1;
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+
+        unsafe { qf_new_list(&mut qi, Some(b"newest")) };
+
+        // Count stays at the cap, the oldest is gone, and the newest
+        // list occupies the top slot.
+        assert_eq!(qi.qf_listcount, 2);
+        assert_eq!(qi.qf_curlist, 1);
+        assert_eq!(qi.qf_lists[0].qf_id, 22);
+        assert_eq!(qi.qf_lists[1].qf_title.as_deref(), Some(&b"newest"[..]));
     }
 
     #[test]
