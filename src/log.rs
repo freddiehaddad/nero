@@ -16,7 +16,11 @@
 //! a settable file path or stderr. Deferred, and clearly separated below:
 //! - `log_path_init`'s XDG-based path auto-discovery (needs `os/stdpaths.c`,
 //!   `path.c`, `os/env.c`) - callers must call [`set_log_file_path`]
-//!   explicitly for now, or messages go to stderr.
+//!   explicitly for now, or messages go to stderr. Its `log_try_create`
+//!   helper IS translated (it is plain file I/O with no such
+//!   dependencies), as is `open_log_file`, which [`logmsg`] now routes
+//!   through so the "fall back to stderr" path is real rather than
+//!   decorative.
 //! - The "instance name" logic in the original's `v_do_log_to_file`
 //!   (parent/servername/pid-based; needs `eval/vars.c`, `ui_client.c`,
 //!   `os/proc.c`) - omitted from the log line for now.
@@ -153,19 +157,178 @@ pub fn logmsg(
     };
 
     let result = match &state.file_path {
-        Some(path) => std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .and_then(|mut f| f.write_all(line.as_bytes())),
+        Some(path) => open_sink(Some(path)).write_all(line.as_bytes()),
         None => std::io::stderr().write_all(line.as_bytes()),
     };
     result.is_ok()
 }
 
+/// Try to create/append to `fname` to prove it is usable as a log file
+/// (`log_try_create`).
+///
+/// Returns false for an absent or empty path, or if it cannot be opened
+/// for appending. The original opens the file and immediately closes it
+/// again purely as a probe; dropping the [`std::fs::File`] here is the
+/// direct equivalent of that `fclose`.
+#[must_use]
+pub fn log_try_create(fname: Option<&std::path::Path>) -> bool {
+    let Some(fname) = fname else {
+        return false;
+    };
+    if fname.as_os_str().is_empty() {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(fname)
+        .is_ok()
+}
+
+/// Where a log line ends up: the log file, or stderr as the fallback.
+///
+/// The original's `open_log_file` returns a `FILE *` that is either a
+/// freshly opened log file or the process-wide `stderr`. Rust has no
+/// single owned type covering both, so this enum makes the two cases
+/// explicit instead of relying on pointer identity (which is also how
+/// the original's own callers test it, via `log_file != stderr`).
+pub enum LogSink {
+    /// An opened log file, owned by the caller.
+    File(std::fs::File),
+    /// Fallback when there is no usable log file.
+    Stderr,
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LogSink::File(f) => f.write(buf),
+            LogSink::Stderr => std::io::stderr().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            LogSink::File(f) => f.flush(),
+            LogSink::Stderr => std::io::stderr().flush(),
+        }
+    }
+}
+
+/// Open the log file for appending, falling back to stderr
+/// (`open_log_file`).
+///
+/// May fall back if the open failed, the directory does not exist, the
+/// file is not writable, or logging was used before [`log_init`].
+pub fn open_log_file() -> LogSink {
+    let path = LOG_STATE.lock().unwrap().file_path.clone();
+    open_sink(path.as_deref())
+}
+
+/// The body of [`open_log_file`], factored out so [`logmsg`] can reuse
+/// it while already holding `LOG_STATE`'s lock.
+///
+/// The original can simply call `open_log_file()` from anywhere because
+/// its mutex is created with `uv_mutex_init_recursive`; `std::sync::Mutex`
+/// is not reentrant, so the lock-taking and the actual work are split
+/// rather than risking a deadlock.
+fn open_sink(path: Option<&std::path::Path>) -> LogSink {
+    if let Some(path) = path
+        && !path.as_os_str().is_empty()
+    {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => return LogSink::File(f),
+            Err(e) => {
+                // The original logs this failure to stderr itself,
+                // rather than silently degrading.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "failed to open log file ({e}): {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    LogSink::Stderr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_try_create_rejects_an_absent_or_empty_path() {
+        assert!(!log_try_create(None));
+        assert!(!log_try_create(Some(std::path::Path::new(""))));
+    }
+
+    #[test]
+    fn log_try_create_creates_a_usable_file_and_leaves_it_closed() {
+        let path = std::env::temp_dir()
+            .join(format!("nero_log_try_create_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(log_try_create(Some(&path)));
+        // The probe creates the file but writes nothing to it.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_try_create_fails_for_a_path_under_a_missing_directory() {
+        let path = std::env::temp_dir()
+            .join(format!("nero_no_such_dir_{}", std::process::id()))
+            .join("nested")
+            .join("nvim.log");
+        assert!(!log_try_create(Some(&path)));
+    }
+
+    #[test]
+    fn log_try_create_appends_rather_than_truncating() {
+        let path = std::env::temp_dir()
+            .join(format!("nero_log_try_append_{}.log", std::process::id()));
+        std::fs::write(&path, b"existing").unwrap();
+        assert!(log_try_create(Some(&path)));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_log_file_returns_the_file_when_the_path_is_usable() {
+        let path = std::env::temp_dir()
+            .join(format!("nero_open_log_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let saved = LOG_STATE.lock().unwrap().file_path.clone();
+        set_log_file_path(&path);
+
+        assert!(matches!(open_log_file(), LogSink::File(_)));
+
+        LOG_STATE.lock().unwrap().file_path = saved;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_log_file_falls_back_to_stderr_without_a_path() {
+        let saved = LOG_STATE.lock().unwrap().file_path.clone();
+        LOG_STATE.lock().unwrap().file_path = None;
+
+        assert!(matches!(open_log_file(), LogSink::Stderr));
+
+        LOG_STATE.lock().unwrap().file_path = saved;
+    }
+
+    #[test]
+    fn open_log_file_falls_back_to_stderr_for_an_unusable_path() {
+        let path = std::env::temp_dir()
+            .join(format!("nero_bad_log_dir_{}", std::process::id()))
+            .join("nested")
+            .join("nvim.log");
+        let saved = LOG_STATE.lock().unwrap().file_path.clone();
+        set_log_file_path(&path);
+
+        assert!(matches!(open_log_file(), LogSink::Stderr));
+
+        LOG_STATE.lock().unwrap().file_path = saved;
+    }
 
     #[test]
     fn respects_min_log_level_filter() {
