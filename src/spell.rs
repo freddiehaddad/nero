@@ -29,6 +29,14 @@
 //! header with no other translated members). Needed only already-real
 //! `mbyte.c`'s `utf_fold`/`mb_toupper`/`mb_isupper`/`mb_islower`.
 //!
+//! Also translated: [`clear_midword`]/[`spell_mb_isword_class`]/
+//! [`spell_to_word_end`]. Note `spell_mb_isword_class`'s `b_cjk`
+//! branch REPLACES the default rule rather than narrowing it, so a
+//! class accepted by default can be rejected with CJK on.
+//! `spell_to_word_end` inherits [`spell_iswordp`]'s own
+//! `unimplemented!()` above 255, so it handles single-byte input only
+//! for now.
+//!
 //! Also translated: [`spell_is_upper`] (the `SPELL_ISUPPER` macro) and
 //! [`spell_iswordp_nmw`] (the ASCII/Latin-1 `c <= 255` fast path via
 //! `SPELLTAB`; panics for `c > 255`, which needs `mb_get_class`/
@@ -294,6 +302,63 @@ pub unsafe fn spell_iswordp_nmw(p: &[u8]) -> bool {
     // SAFETY: a plain read through one shared borrow of this file's
     // own static.
     unsafe { SPELLTAB.get_mut() }.st_isw[c as usize]
+}
+
+/// Clear the midword characters for window `wp`'s spell settings
+/// (`clear_midword`).
+///
+/// # Safety
+/// `wp.w_s` must be a valid, non-null pointer to a live synblock.
+pub unsafe fn clear_midword(wp: &crate::buffer_defs::WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let s = unsafe { &mut *wp.w_s };
+    s.b_spell_ismw = [false; 256];
+    s.b_spell_ismw_mb = None;
+}
+
+/// Whether a character class indicates a word character
+/// (`spell_mb_isword_class`), for characters above 255 only.
+///
+/// Unicode subscripts (`0x2070`) and superscripts (`0x2080`) are
+/// excluded, as is class 3. With `b_cjk` set the rule changes
+/// entirely rather than merely narrowing: East Asian characters stop
+/// counting as word characters, leaving only classes 2 and `0x2800`.
+///
+/// # Safety
+/// `wp.w_s` must be a valid, non-null pointer to a live synblock.
+#[must_use]
+pub unsafe fn spell_mb_isword_class(cl: i32, wp: &crate::buffer_defs::WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cjk = unsafe { (*wp.w_s).b_cjk };
+    if cjk != 0 {
+        return cl == 2 || cl == 0x2800;
+    }
+    cl >= 2 && cl != 0x2070 && cl != 0x2080 && cl != 3
+}
+
+/// Move to the end of the word starting at `start`
+/// (`spell_to_word_end`), returning the byte offset just past it.
+///
+/// Uses the spell-checking word characters rather than
+/// `'iskeyword'`, so this can differ from the ordinary word motions.
+///
+/// # Safety
+/// Forwarded from [`spell_iswordp`] - which means this inherits that
+/// function's `unimplemented!()` for characters above 255, so only
+/// single-byte input is supported today.
+#[must_use]
+pub unsafe fn spell_to_word_end(start: &[u8], win: &crate::buffer_defs::WinT) -> usize {
+    let mut p = 0usize;
+    while !matches!(start.get(p), None | Some(&crate::ascii_defs::NUL)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { spell_iswordp(&start[p..], win) } {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&start[p..]) };
+        p += usize::try_from(len).unwrap_or(1).max(1);
+    }
+    p.min(start.len())
 }
 
 /// Returns `true` if `p` points to a word character. As a special
@@ -875,6 +940,80 @@ mod tests {
     }
 
     // --- spell_iswordp ---
+
+    #[test]
+    fn clear_midword_resets_both_midword_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        syn.b_spell_ismw[usize::from(b'\'')] = true;
+        syn.b_spell_ismw_mb = Some(b"\xe2\x80\x99".to_vec());
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        unsafe { clear_midword(&win) };
+
+        assert!(!syn.b_spell_ismw.iter().any(|&b| b));
+        assert_eq!(syn.b_spell_ismw_mb, None);
+    }
+
+    #[test]
+    fn spell_mb_isword_class_excludes_sub_and_superscripts() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(unsafe { spell_mb_isword_class(2, &win) });
+        assert!(unsafe { spell_mb_isword_class(4, &win) });
+        // Below 2 is never a word class.
+        assert!(!unsafe { spell_mb_isword_class(1, &win) });
+        // Class 3 and the sub/superscript classes are carved out even
+        // though they are >= 2.
+        assert!(!unsafe { spell_mb_isword_class(3, &win) });
+        assert!(!unsafe { spell_mb_isword_class(0x2070, &win) });
+        assert!(!unsafe { spell_mb_isword_class(0x2080, &win) });
+    }
+
+    #[test]
+    fn spell_mb_isword_class_cjk_replaces_the_rule_entirely() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT { b_cjk: 1, ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        // With CJK on, only these two classes qualify...
+        assert!(unsafe { spell_mb_isword_class(2, &win) });
+        assert!(unsafe { spell_mb_isword_class(0x2800, &win) });
+        // ...so a class that passes in the default rule now fails.
+        assert!(!unsafe { spell_mb_isword_class(4, &win) });
+    }
+
+    #[test]
+    fn spell_to_word_end_stops_at_a_non_word_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert_eq!(unsafe { spell_to_word_end(b"word rest", &win) }, 4);
+        // A word running to the end of the slice terminates cleanly.
+        assert_eq!(unsafe { spell_to_word_end(b"word", &win) }, 4);
+    }
+
+    #[test]
+    fn spell_to_word_end_returns_zero_off_a_word() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert_eq!(unsafe { spell_to_word_end(b" word", &win) }, 0);
+        assert_eq!(unsafe { spell_to_word_end(b"", &win) }, 0);
+        // A NUL terminator ends the scan just like the original's.
+        assert_eq!(unsafe { spell_to_word_end(b"\0word", &win) }, 0);
+    }
 
     #[test]
     fn spell_iswordp_ascii_non_midword_matches_iswordp_nmw() {
