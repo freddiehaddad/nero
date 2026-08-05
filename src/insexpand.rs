@@ -29,6 +29,18 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: the completion-continuation state
+//! (`compl_cont_status` with its `CONT_*` flags, plus
+//! `compl_direction`/`compl_shows_dir`) and the small predicates over
+//! it - [`compl_status_adding`]/[`compl_status_sol`]/
+//! [`compl_status_local`]/[`compl_status_clear`]/[`compl_dir_forward`]/
+//! [`compl_shows_dir_forward`]/[`compl_shows_dir_backward`]. These
+//! stay at their initial values today for the same reason as
+//! `CTRL_X_MODE`/`COMPL_STARTED` above. Note
+//! `compl_shows_dir_backward` is NOT the negation of
+//! `compl_shows_dir_forward`: `Direction` also carries the
+//! `FORWARD_FILE`/`BACKWARD_FILE` values, so both can be false.
+//!
 //! Also translated: [`set_ref_in_cpt_callbacks`]/
 //! [`set_ref_in_insexpand_funcs`] - mark the global `'completefunc'`/
 //! `'omnifunc'`/`'thesaurusfunc'`/`'complete'`-`F{func}` callbacks with
@@ -117,6 +129,125 @@ static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
 /// completion-source dispatch machinery, isn't translated), matching
 /// [`CTRL_X_MODE`]'s own established treatment exactly.
 static COMPL_STARTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// "normal" or "adding" expansion (`CONT_ADDING`).
+pub const CONT_ADDING: i32 = 1;
+/// A `^X` interrupted the current expansion (`CONT_INTRPT`).
+///
+/// Deliberately `2 + 4` in the original: it implies
+/// [`CONT_N_ADDS`], so testing for it also reports "next `^X<>` will
+/// add-new or expand-current".
+pub const CONT_INTRPT: i32 = 2 + 4;
+/// Next `^X<>` will add-new or expand-current (`CONT_N_ADDS`).
+pub const CONT_N_ADDS: i32 = 4;
+/// Next `^X<>` will set the initial position (`CONT_S_IPOS`).
+pub const CONT_S_IPOS: i32 = 8;
+/// Pattern includes start of line, just for word-wise expansion
+/// (`CONT_SOL`).
+pub const CONT_SOL: i32 = 16;
+/// For `ctrl_x_mode` 0, `^X^P`/`^X^N` do a local completion
+/// (`CONT_LOCAL`).
+pub const CONT_LOCAL: i32 = 32;
+
+/// Flags tracking how the current completion continues
+/// (`compl_cont_status`).
+///
+/// Stays `0` in this crate today for the same reason as
+/// [`CTRL_X_MODE`]/[`COMPL_STARTED`]: nothing translated yet can start
+/// a real completion session to set it.
+static COMPL_CONT_STATUS: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Direction the completion is searching in (`compl_direction`).
+static COMPL_DIRECTION: GlobalCell<crate::vim_defs::Direction> =
+    GlobalCell::new(crate::vim_defs::Direction::Forward);
+
+/// Direction whose matches are currently being shown
+/// (`compl_shows_dir`).
+///
+/// Tracked separately from [`COMPL_DIRECTION`] because the displayed
+/// direction can differ from the one being searched.
+static COMPL_SHOWS_DIR: GlobalCell<crate::vim_defs::Direction> =
+    GlobalCell::new(crate::vim_defs::Direction::Forward);
+
+/// Whether in "normal" or "adding" insert completion matches state
+/// (`compl_status_adding`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_CONT_STATUS`.
+#[must_use]
+pub unsafe fn compl_status_adding() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_CONT_STATUS.get_mut() }) & CONT_ADDING != 0
+}
+
+/// Whether the completion pattern includes the start of the line, just
+/// for word-wise expansion (`compl_status_sol`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_CONT_STATUS`.
+#[must_use]
+pub unsafe fn compl_status_sol() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_CONT_STATUS.get_mut() }) & CONT_SOL != 0
+}
+
+/// Whether `^X^P`/`^X^N` will do a local completion, i.e. use
+/// `complete=.` (`compl_status_local`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_CONT_STATUS`.
+#[must_use]
+pub unsafe fn compl_status_local() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_CONT_STATUS.get_mut() }) & CONT_LOCAL != 0
+}
+
+/// Clear the completion status flags (`compl_status_clear`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `COMPL_CONT_STATUS`.
+pub unsafe fn compl_status_clear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { COMPL_CONT_STATUS.get_mut() } = 0;
+}
+
+/// Whether completion is using the forward direction matches
+/// (`compl_dir_forward`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_DIRECTION`.
+#[must_use]
+pub unsafe fn compl_dir_forward() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_DIRECTION.get_mut() }) == crate::vim_defs::Direction::Forward
+}
+
+/// Whether forward completion matches are currently being shown
+/// (`compl_shows_dir_forward`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_SHOWS_DIR`.
+#[must_use]
+pub unsafe fn compl_shows_dir_forward() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_SHOWS_DIR.get_mut() }) == crate::vim_defs::Direction::Forward
+}
+
+/// Whether backward completion matches are currently being shown
+/// (`compl_shows_dir_backward`).
+///
+/// Note this is NOT the negation of [`compl_shows_dir_forward`]: the
+/// original's `Direction` also has the `FORWARD_FILE`/`BACKWARD_FILE`
+/// values, so both can be false at once.
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_SHOWS_DIR`.
+#[must_use]
+pub unsafe fn compl_shows_dir_backward() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { *COMPL_SHOWS_DIR.get_mut() }) == crate::vim_defs::Direction::Backward
+}
 
 /// Check that Insert-mode completion is active (`ins_compl_active`).
 ///
@@ -387,6 +518,133 @@ mod tests {
         fn drop(&mut self) {
             unsafe { *CTRL_X_MODE.get_mut() = self.prev };
         }
+    }
+
+    /// RAII guard temporarily overriding the completion continuation
+    /// state, restoring the previous values on drop (even on panic).
+    struct ComplStateGuard {
+        prev_status: i32,
+        prev_dir: crate::vim_defs::Direction,
+        prev_shows: crate::vim_defs::Direction,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ComplStateGuard {
+        fn new() -> Self {
+            let _lock = global_state_test_lock();
+            Self {
+                prev_status: unsafe { *COMPL_CONT_STATUS.get_mut() },
+                prev_dir: unsafe { *COMPL_DIRECTION.get_mut() },
+                prev_shows: unsafe { *COMPL_SHOWS_DIR.get_mut() },
+                _lock,
+            }
+        }
+    }
+
+    impl Drop for ComplStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *COMPL_CONT_STATUS.get_mut() = self.prev_status;
+                *COMPL_DIRECTION.get_mut() = self.prev_dir;
+                *COMPL_SHOWS_DIR.get_mut() = self.prev_shows;
+            }
+        }
+    }
+
+    #[test]
+    fn compl_cont_status_defaults_to_no_flags_set() {
+        let _guard = ComplStateGuard::new();
+        assert!(!unsafe { compl_status_adding() });
+        assert!(!unsafe { compl_status_sol() });
+        assert!(!unsafe { compl_status_local() });
+    }
+
+    #[test]
+    fn compl_status_predicates_each_read_their_own_flag() {
+        let _guard = ComplStateGuard::new();
+
+        unsafe { *COMPL_CONT_STATUS.get_mut() = CONT_ADDING };
+        assert!(unsafe { compl_status_adding() });
+        assert!(!unsafe { compl_status_sol() });
+        assert!(!unsafe { compl_status_local() });
+
+        unsafe { *COMPL_CONT_STATUS.get_mut() = CONT_SOL };
+        assert!(!unsafe { compl_status_adding() });
+        assert!(unsafe { compl_status_sol() });
+
+        unsafe { *COMPL_CONT_STATUS.get_mut() = CONT_LOCAL };
+        assert!(!unsafe { compl_status_sol() });
+        assert!(unsafe { compl_status_local() });
+    }
+
+    #[test]
+    fn compl_status_flags_combine() {
+        let _guard = ComplStateGuard::new();
+        unsafe { *COMPL_CONT_STATUS.get_mut() = CONT_ADDING | CONT_SOL | CONT_LOCAL };
+        assert!(unsafe { compl_status_adding() });
+        assert!(unsafe { compl_status_sol() });
+        assert!(unsafe { compl_status_local() });
+    }
+
+    #[test]
+    fn cont_intrpt_implies_cont_n_adds() {
+        // CONT_INTRPT is deliberately 2 + 4 in the original, so it
+        // carries CONT_N_ADDS with it rather than being a lone bit.
+        assert_eq!(CONT_INTRPT, 6);
+        assert_ne!(CONT_INTRPT & CONT_N_ADDS, 0);
+    }
+
+    #[test]
+    fn cont_flags_are_distinct_bits() {
+        // Every flag but CONT_INTRPT is a single, distinct bit.
+        for (a, b) in [
+            (CONT_ADDING, CONT_N_ADDS),
+            (CONT_ADDING, CONT_S_IPOS),
+            (CONT_N_ADDS, CONT_S_IPOS),
+            (CONT_S_IPOS, CONT_SOL),
+            (CONT_SOL, CONT_LOCAL),
+        ] {
+            assert_eq!(a & b, 0, "{a} and {b} overlap");
+        }
+    }
+
+    #[test]
+    fn compl_status_clear_resets_every_flag() {
+        let _guard = ComplStateGuard::new();
+        unsafe { *COMPL_CONT_STATUS.get_mut() = CONT_ADDING | CONT_SOL | CONT_LOCAL };
+        unsafe { compl_status_clear() };
+        assert_eq!(unsafe { *COMPL_CONT_STATUS.get_mut() }, 0);
+        assert!(!unsafe { compl_status_adding() });
+    }
+
+    #[test]
+    fn completion_directions_default_to_forward() {
+        let _guard = ComplStateGuard::new();
+        assert!(unsafe { compl_dir_forward() });
+        assert!(unsafe { compl_shows_dir_forward() });
+        assert!(!unsafe { compl_shows_dir_backward() });
+    }
+
+    #[test]
+    fn compl_dir_forward_is_independent_of_the_shown_direction() {
+        let _guard = ComplStateGuard::new();
+        unsafe { *COMPL_DIRECTION.get_mut() = crate::vim_defs::Direction::Backward };
+        assert!(!unsafe { compl_dir_forward() });
+        // The direction being shown is tracked separately.
+        assert!(unsafe { compl_shows_dir_forward() });
+    }
+
+    #[test]
+    fn shows_dir_forward_and_backward_can_both_be_false() {
+        let _guard = ComplStateGuard::new();
+        // Direction also has the *_FILE values, so these two
+        // predicates are not each other's negation.
+        unsafe { *COMPL_SHOWS_DIR.get_mut() = crate::vim_defs::Direction::ForwardFile };
+        assert!(!unsafe { compl_shows_dir_forward() });
+        assert!(!unsafe { compl_shows_dir_backward() });
+
+        unsafe { *COMPL_SHOWS_DIR.get_mut() = crate::vim_defs::Direction::Backward };
+        assert!(unsafe { compl_shows_dir_backward() });
     }
 
     #[test]
