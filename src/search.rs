@@ -6,6 +6,14 @@
 //! on the real regex engine (`regexp.c`), the search-pattern-history
 //! subsystem, and message display, not attempted here.
 //!
+//! Also translated: [`last_search_pattern`]/
+//! [`last_search_pattern_len`]/[`set_search_direction`]/
+//! [`check_prevcol`]. The original keeps a `patlen` field alongside
+//! each pattern; here the length is simply the stored bytes' length,
+//! so the two cannot disagree. `check_prevcol` steps back over a
+//! multibyte character's trailing bytes, so `prevcol` lands on a
+//! character start rather than mid-sequence.
+//!
 //! Translated: the small "last character search" (`f`/`F`/`t`/`T`)
 //! file-static state and its six simple accessors - `last_csearch`/
 //! `last_csearch_forward`/`last_csearch_until`/`set_last_csearch`/
@@ -294,6 +302,71 @@ struct SearchPatterns {
 static SEARCH_PATTERNS: std::sync::LazyLock<crate::globals::GlobalCell<SearchPatterns>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SearchPatterns::default()));
 
+/// The last search pattern, borrowed (`last_search_pattern`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `SEARCH_PATTERNS`.
+#[must_use]
+pub unsafe fn last_search_pattern() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat.as_deref()
+}
+
+/// The length of the last search pattern
+/// (`last_search_pattern_len`).
+///
+/// The original keeps this in its own `patlen` field alongside the
+/// pattern; here it is simply the stored bytes' length, so the two
+/// cannot disagree. An unset pattern reports `0`.
+///
+/// # Safety
+/// Must not run concurrently with any write to `SEARCH_PATTERNS`.
+#[must_use]
+pub unsafe fn last_search_pattern_len() -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { last_search_pattern() }.map_or(0, <[u8]>::len)
+}
+
+/// Set the search direction (`set_search_direction`), `b'/'` for
+/// forward or `b'?'` for backward.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `SEARCH_PATTERNS`.
+pub unsafe fn set_search_direction(cdir: u8) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].off.dir = cdir;
+}
+
+/// Whether the character before `col` in `linep` is `ch`
+/// (`check_prevcol`), returning the previous character's column in
+/// `prevcol` when given.
+///
+/// Handles multibyte text by stepping back over any trailing bytes,
+/// so `prevcol` lands on a character start rather than mid-sequence.
+/// Returns `false` when `col` is zero, since there is no previous
+/// character then.
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::utf_head_off`].
+#[must_use]
+pub unsafe fn check_prevcol(
+    linep: &[u8],
+    col: i32,
+    ch: u8,
+    prevcol: Option<&mut i32>,
+) -> bool {
+    let mut col = col - 1;
+    if col > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        col -= unsafe { crate::mbyte::utf_head_off(linep, col as usize) };
+    }
+    if let Some(prevcol) = prevcol {
+        *prevcol = col;
+    }
+    col >= 0 && linep.get(col as usize) == Some(&ch)
+}
+
 /// Get the last search pattern, as a copy (`get_search_pattern`).
 #[must_use]
 pub fn get_search_pattern() -> SearchPattern {
@@ -448,6 +521,92 @@ pub unsafe fn set_last_search_pat(s: &[u8], is_substitute: bool, magic: bool, se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Saves and restores the whole search-pattern state.
+    struct SpatsGuard {
+        saved: SearchPatterns,
+    }
+
+    impl SpatsGuard {
+        fn new() -> Self {
+            Self { saved: unsafe { SEARCH_PATTERNS.get_mut() }.clone() }
+        }
+    }
+
+    impl Drop for SpatsGuard {
+        fn drop(&mut self) {
+            *unsafe { SEARCH_PATTERNS.get_mut() } = self.saved.clone();
+        }
+    }
+
+    #[test]
+    fn last_search_pattern_reports_the_stored_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = SpatsGuard::new();
+
+        unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = Some(b"needle".to_vec());
+        assert_eq!(unsafe { last_search_pattern() }, Some(&b"needle"[..]));
+        assert_eq!(unsafe { last_search_pattern_len() }, 6);
+    }
+
+    #[test]
+    fn last_search_pattern_len_is_zero_when_unset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = SpatsGuard::new();
+
+        unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = None;
+        assert_eq!(unsafe { last_search_pattern() }, None);
+        assert_eq!(unsafe { last_search_pattern_len() }, 0);
+
+        // An empty pattern is stored-but-empty, not absent.
+        unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].pat = Some(Vec::new());
+        assert_eq!(unsafe { last_search_pattern() }, Some(&b""[..]));
+        assert_eq!(unsafe { last_search_pattern_len() }, 0);
+    }
+
+    #[test]
+    fn set_search_direction_updates_only_the_search_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = SpatsGuard::new();
+
+        unsafe { set_search_direction(b'?') };
+        let spats = unsafe { SEARCH_PATTERNS.get_mut() };
+        assert_eq!(spats.spats[0].off.dir, b'?');
+
+        unsafe { set_search_direction(b'/') };
+        assert_eq!(unsafe { SEARCH_PATTERNS.get_mut() }.spats[0].off.dir, b'/');
+    }
+
+    #[test]
+    fn check_prevcol_matches_the_previous_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let line = b"abc";
+        let mut prev = -1;
+        assert!(unsafe { check_prevcol(line, 1, b'a', Some(&mut prev)) });
+        assert_eq!(prev, 0);
+        assert!(!unsafe { check_prevcol(line, 1, b'z', None) });
+    }
+
+    #[test]
+    fn check_prevcol_is_false_at_column_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        // There is no previous character, so this is false whatever
+        // `ch` is - and prevcol goes negative to say so.
+        let mut prev = 99;
+        assert!(!unsafe { check_prevcol(b"abc", 0, b'a', Some(&mut prev)) });
+        assert_eq!(prev, -1);
+    }
+
+    #[test]
+    fn check_prevcol_steps_back_over_a_multibyte_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "é" is two bytes, so the byte before column 3 starts at 1,
+        // not 2 - landing mid-sequence would compare a trailing byte.
+        let line = "aéb".as_bytes();
+        let mut prev = -1;
+        assert!(!unsafe { check_prevcol(line, 3, b'b', Some(&mut prev)) });
+        assert_eq!(prev, 1);
+    }
 
     #[test]
     fn last_csearch_forward_true_by_default() {
