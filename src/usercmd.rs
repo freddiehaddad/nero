@@ -28,6 +28,16 @@
 //! [`crate::ascii_defs::ascii_iswhite`]/`crate::macros_defs::
 //! ascii_isalpha`/`crate::macros_defs::ascii_isalnum`.
 //!
+//! Also translated: the four `ExpandGeneric()` callbacks
+//! [`get_user_cmd_addr_type`]/[`get_user_cmd_flags`]/
+//! [`get_user_cmd_nargs`]/[`get_user_cmd_complete`], which only need
+//! the `ADDR_TYPE_COMPLETE`/`COMMAND_COMPLETE` tables above and no
+//! part of the command registry. Their expected outputs were read out
+//! of a real `nvim` binary via `getcompletion('command -nargs=',
+//! 'cmdline')` and friends; notably it reports 45 `-complete=` names
+//! against `COMMAND_COMPLETE`'s 46 entries, confirming that
+//! `EXPAND_USER_LUA`'s `"<Lua function>"` really is blanked out.
+//!
 //! Deferred: everything else - `uc_add_command`/`ex_command`/
 //! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`/`uc_scan_attr`
 //! (the real user-command registry and its `:command`-parsing
@@ -233,6 +243,90 @@ const COMMAND_COMPLETE: &[(crate::cmdexpand_defs::ExpandContext, &str)] = {
 #[must_use]
 fn get_command_complete(arg: i32) -> Option<&'static str> {
     COMMAND_COMPLETE.iter().find(|(ec, _)| *ec as i32 == arg).map(|&(_, name)| name)
+}
+
+/// `ARRAY_SIZE(command_complete)`.
+///
+/// The original's `command_complete[]` is a SPARSE C designated-
+/// initializer array indexed by the `EXPAND_*` value, so its length is
+/// the largest index it initialises plus one - not its number of
+/// populated entries. That distinction matters because
+/// [`get_user_cmd_complete`] bounds-checks against the length but then
+/// returns `""` for the unpopulated holes below it.
+///
+/// Derived from [`COMMAND_COMPLETE`] rather than hardcoded, so it
+/// cannot drift if an entry is ever added.
+const fn command_complete_len() -> i32 {
+    let mut max = 0;
+    let mut i = 0;
+    while i < COMMAND_COMPLETE.len() {
+        let v = COMMAND_COMPLETE[i].0 as i32;
+        if v > max {
+            max = v;
+        }
+        i += 1;
+    }
+    max + 1
+}
+
+/// Obtain the list of user address type names, for `ExpandGeneric()`
+/// (`get_user_cmd_addr_type`).
+///
+/// The original indexes `addr_type_complete[]` directly and relies on
+/// its trailing `{ ADDR_NONE, NULL, NULL }` sentinel to return `NULL`
+/// and stop the caller's enumeration. `ADDR_TYPE_COMPLETE` holds only
+/// the eight real entries, so running off its end is exactly that
+/// sentinel.
+#[must_use]
+pub fn get_user_cmd_addr_type(idx: i32) -> Option<&'static str> {
+    if idx < 0 {
+        return None;
+    }
+    ADDR_TYPE_COMPLETE.get(idx as usize).map(|&(_, name, _)| name)
+}
+
+/// Obtain the list of user command attributes, for `ExpandGeneric()`
+/// (`get_user_cmd_flags`).
+#[must_use]
+pub fn get_user_cmd_flags(idx: i32) -> Option<&'static str> {
+    const USER_CMD_FLAGS: &[&str] = &[
+        "addr", "bang", "bar", "buffer", "complete", "count", "nargs", "range", "register",
+        "keepscript",
+    ];
+    if idx < 0 {
+        return None;
+    }
+    USER_CMD_FLAGS.get(idx as usize).copied()
+}
+
+/// Obtain the list of values for `-nargs`, for `ExpandGeneric()`
+/// (`get_user_cmd_nargs`).
+#[must_use]
+pub fn get_user_cmd_nargs(idx: i32) -> Option<&'static str> {
+    const USER_CMD_NARGS: &[&str] = &["0", "1", "_", "*", "?", "+"];
+    if idx < 0 {
+        return None;
+    }
+    USER_CMD_NARGS.get(idx as usize).copied()
+}
+
+/// Obtain the list of values for `-complete`, for `ExpandGeneric()`
+/// (`get_user_cmd_complete`).
+///
+/// Returns `Some("")` - NOT `None` - for an in-range index that names
+/// no completion type, so the caller keeps enumerating past the sparse
+/// array's holes; `None` only once `idx` runs past the array itself.
+/// `EXPAND_USER_LUA` is deliberately blanked the same way, since
+/// `"<Lua function>"` is not a name a user can type after `-complete=`.
+#[must_use]
+pub fn get_user_cmd_complete(idx: i32) -> Option<&'static str> {
+    if idx < 0 || idx >= command_complete_len() {
+        return None;
+    }
+    match get_command_complete(idx) {
+        Some(name) if idx != crate::cmdexpand_defs::ExpandContext::UserLua as i32 => Some(name),
+        _ => Some(""),
+    }
 }
 
 /// Get the name of completion type `expand` as an owned byte string,
@@ -724,5 +818,97 @@ mod tests {
         // no scan is entered - position 0 itself ('1') is neither an
         // end-of-command nor whitespace byte, so this fails.
         assert_eq!(uc_validate_name(b"123abc"), None);
+    }
+
+    /// The expected sets below were all read out of a real `nvim`
+    /// binary with `getcompletion('command -nargs=', 'cmdline')` and
+    /// friends before being written here.
+    #[test]
+    fn get_user_cmd_nargs_enumerates_the_six_nargs_values() {
+        let mut got: Vec<&str> = (0..).map_while(get_user_cmd_nargs).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["*", "+", "0", "1", "?", "_"]);
+    }
+
+    #[test]
+    fn get_user_cmd_flags_enumerates_the_ten_attributes() {
+        let mut got: Vec<&str> = (0..).map_while(get_user_cmd_flags).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                "addr", "bang", "bar", "buffer", "complete", "count", "keepscript", "nargs",
+                "range", "register"
+            ]
+        );
+    }
+
+    #[test]
+    fn get_user_cmd_addr_type_enumerates_the_eight_address_types() {
+        let mut got: Vec<&str> = (0..).map_while(get_user_cmd_addr_type).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [
+                "arguments",
+                "buffers",
+                "lines",
+                "loaded_buffers",
+                "other",
+                "quickfix",
+                "tabs",
+                "windows"
+            ]
+        );
+    }
+
+    #[test]
+    fn get_user_cmd_complete_yields_45_real_names_plus_blanks() {
+        let all: Vec<&str> = (0..).map_while(get_user_cmd_complete).collect();
+        // The bound is the sparse array's LENGTH, not its number of
+        // populated entries, so enumeration runs well past 46.
+        assert_eq!(all.len() as i32, command_complete_len());
+
+        let mut named: Vec<&str> = all.into_iter().filter(|s| !s.is_empty()).collect();
+        named.sort_unstable();
+        // Real nvim reports exactly 45 completable names here, one
+        // fewer than COMMAND_COMPLETE's 46 entries, because
+        // "<Lua function>" is blanked out.
+        assert_eq!(named.len(), 45);
+        assert_eq!(COMMAND_COMPLETE.len(), 46);
+        assert!(!named.contains(&"<Lua function>"));
+        assert_eq!(named.first(), Some(&"arglist"));
+        assert_eq!(named.last(), Some(&"var"));
+        for expected in ["custom", "customlist", "dir_in_path", "retab", "filetypecmd"] {
+            assert!(named.contains(&expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn get_user_cmd_complete_blanks_the_lua_entry_rather_than_ending() {
+        let lua = crate::cmdexpand_defs::ExpandContext::UserLua as i32;
+        // Present in the table...
+        assert_eq!(get_command_complete(lua), Some("<Lua function>"));
+        // ...but not offered as a typeable -complete= name.
+        assert_eq!(get_user_cmd_complete(lua), Some(""));
+    }
+
+    #[test]
+    fn get_user_cmd_complete_returns_a_blank_for_an_unpopulated_hole() {
+        // ExpandContext::Nothing (0) is a real in-range index that
+        // `command_complete[]` never initialises.
+        let nothing = crate::cmdexpand_defs::ExpandContext::Nothing as i32;
+        assert_eq!(get_command_complete(nothing), None);
+        assert_eq!(get_user_cmd_complete(nothing), Some(""));
+    }
+
+    #[test]
+    fn the_expand_generic_callbacks_reject_negative_indices() {
+        // The original is only ever called with idx >= 0; guarding
+        // keeps the `as usize` cast from wrapping into a huge index.
+        assert_eq!(get_user_cmd_nargs(-1), None);
+        assert_eq!(get_user_cmd_flags(-1), None);
+        assert_eq!(get_user_cmd_addr_type(-1), None);
+        assert_eq!(get_user_cmd_complete(-1), None);
     }
 }
