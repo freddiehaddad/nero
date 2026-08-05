@@ -29,6 +29,12 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: [`ins_compl_refresh_always`]/
+//! [`ins_compl_need_restart`]/[`ins_compl_has_autocomplete`]. Note
+//! `'autocomplete'` uses a NEGATIVE buffer-local value as its "unset"
+//! marker, so a local `0` is a real "off" - unlike `'completeopt'`,
+//! where `0` itself means unset (see [`get_cot_flags`]).
+//!
 //! Also translated: the key-mapping trio [`ins_compl_key2dir`]/
 //! [`ins_compl_pum_key`]/[`ins_compl_key2count`], plus the
 //! `compl_selected_item` static and `popupmenu.rs`'s `pum_want`. For
@@ -190,6 +196,70 @@ static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Whether the complete function returned `"always"` in the
+/// `"refresh"` dictionary item (`compl_opt_refresh_always`).
+static COMPL_OPT_REFRESH_ALWAYS: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether the previous attempt to find matches was interrupted
+/// (`compl_was_interrupted`).
+static COMPL_WAS_INTERRUPTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether the complete function asked to be re-run on every keystroke
+/// (`ins_compl_refresh_always`).
+///
+/// Only meaningful for the function-driven completion modes, so the
+/// flag alone is not enough.
+///
+/// # Safety
+/// Forwarded from `ctrl_x_mode()`; must also not run concurrently with
+/// any write to `COMPL_OPT_REFRESH_ALWAYS`.
+#[must_use]
+pub unsafe fn ins_compl_refresh_always() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mode_uses_a_function =
+        unsafe { ctrl_x_mode_function() } || unsafe { ctrl_x_mode_omni() };
+    // SAFETY: forwarded from this function's own safety doc.
+    mode_uses_a_function && unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() }
+}
+
+/// Whether matches must be looked up again, i.e. `ins_compl_restart`
+/// should be called (`ins_compl_need_restart`).
+///
+/// True when the previous search did not finish, or when the complete
+/// function asked to be refreshed every time.
+///
+/// # Safety
+/// Forwarded from [`ins_compl_refresh_always`]; must also not run
+/// concurrently with any write to `COMPL_WAS_INTERRUPTED`.
+#[must_use]
+pub unsafe fn ins_compl_need_restart() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_WAS_INTERRUPTED.get_mut() || ins_compl_refresh_always() }
+}
+
+/// Whether the `'autocomplete'` option is on
+/// (`ins_compl_has_autocomplete`).
+///
+/// Uses the buffer-local value when it is set, i.e. non-negative;
+/// `-1` means "unset" and falls back to the global. Note this differs
+/// from `'completeopt'`'s own convention, where `0` rather than a
+/// negative value is the "unset" marker - see [`get_cot_flags`].
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer,
+/// and this must not run concurrently with any write to
+/// `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn ins_compl_has_autocomplete() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let local = unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_ac };
+    if local >= 0 {
+        return local != 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ac != 0
+}
 
 /// The index of the currently selected completion item
 /// (`compl_selected_item`).
@@ -970,6 +1040,108 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
         }
+    }
+
+    #[test]
+    fn ins_compl_refresh_always_needs_a_function_driven_mode() {
+        // NOTE: no global_state_test_lock() here - CtrlXModeGuard::set
+        // takes it internally, and the lock is not reentrant.
+        let prev = unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() };
+        unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() = true };
+
+        // The flag alone is not enough outside the function modes.
+        {
+            let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+            assert!(!unsafe { ins_compl_refresh_always() });
+        }
+        {
+            let _guard = CtrlXModeGuard::set(CTRL_X_FUNCTION);
+            assert!(unsafe { ins_compl_refresh_always() });
+        }
+        {
+            let _guard = CtrlXModeGuard::set(CTRL_X_OMNI);
+            assert!(unsafe { ins_compl_refresh_always() });
+        }
+
+        unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() = prev };
+    }
+
+    #[test]
+    fn ins_compl_refresh_always_needs_the_flag_too() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_FUNCTION);
+        let prev = unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() };
+        unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() = false };
+
+        assert!(!unsafe { ins_compl_refresh_always() });
+
+        unsafe { *COMPL_OPT_REFRESH_ALWAYS.get_mut() = prev };
+    }
+
+    #[test]
+    fn ins_compl_need_restart_covers_both_causes() {
+        let _lock = global_state_test_lock();
+        let (pw, pr) = unsafe {
+            (*COMPL_WAS_INTERRUPTED.get_mut(), *COMPL_OPT_REFRESH_ALWAYS.get_mut())
+        };
+
+        unsafe {
+            *COMPL_WAS_INTERRUPTED.get_mut() = false;
+            *COMPL_OPT_REFRESH_ALWAYS.get_mut() = false;
+        }
+        assert!(!unsafe { ins_compl_need_restart() });
+
+        // An unfinished previous search alone forces a restart, with
+        // no function mode involved.
+        unsafe { *COMPL_WAS_INTERRUPTED.get_mut() = true };
+        assert!(unsafe { ins_compl_need_restart() });
+
+        unsafe {
+            *COMPL_WAS_INTERRUPTED.get_mut() = pw;
+            *COMPL_OPT_REFRESH_ALWAYS.get_mut() = pr;
+        }
+    }
+
+    #[test]
+    fn ins_compl_has_autocomplete_prefers_a_nonnegative_local_value() {
+        let _lock = global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_global = opts.p_ac;
+        opts.p_ac = 1;
+
+        // A local 0 is a real "off", not "unset" - unlike
+        // 'completeopt', where 0 means unset.
+        let mut buf = crate::buffer_defs::BufT { b_p_ac: 0, ..Default::default() };
+        {
+            let _curbuf = CurbufGuard::set(&mut buf);
+            assert!(!unsafe { ins_compl_has_autocomplete() });
+        }
+
+        let mut buf = crate::buffer_defs::BufT { b_p_ac: 1, ..Default::default() };
+        {
+            let _curbuf = CurbufGuard::set(&mut buf);
+            assert!(unsafe { ins_compl_has_autocomplete() });
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ac = prev_global;
+    }
+
+    #[test]
+    fn ins_compl_has_autocomplete_falls_back_on_a_negative_local_value() {
+        let _lock = global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_global = opts.p_ac;
+
+        // -1 is the "unset" marker, so the global decides.
+        let mut buf = crate::buffer_defs::BufT { b_p_ac: -1, ..Default::default() };
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ac = 1;
+        assert!(unsafe { ins_compl_has_autocomplete() });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ac = 0;
+        assert!(!unsafe { ins_compl_has_autocomplete() });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ac = prev_global;
     }
 
     #[test]
