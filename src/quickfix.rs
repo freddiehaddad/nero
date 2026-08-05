@@ -49,6 +49,16 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: [`qf_store_title`]/[`qf_cmdtitle`]. Cross-checking
+//! against a real `nvim` showed the original's own doc comment on
+//! `qf_store_title` ("Prepends ':' to the title") is stale - the body
+//! does not, and `setqflist(.., {'title': 'mytitle'})` reports back
+//! `mytitle` unchanged. The `':'` comes from `qf_cmdtitle`, which
+//! callers pass a command through first (`cexpr! []` yields the title
+//! `:cexpr! []`). `qf_cmdtitle` returns an owned buffer instead of the
+//! original's shared `static char qftitle_str[IOSIZE]`, but keeps the
+//! `IOSIZE` truncation, which is observable in the title.
+//!
 //! Also translated: the shared `qfga` scratch grow-array and its
 //! [`qfga_get`]/[`qfga_clear`] pair, which are self-contained buffer
 //! management with no dependency on the parsing machinery. The
@@ -242,6 +252,40 @@ pub fn is_qf_list(qfl: &QfListT) -> bool {
 #[must_use]
 pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
+}
+
+/// Set the title of the specified quickfix list (`qf_store_title`).
+///
+/// `None` leaves the previous title cleared. The original's
+/// `XFREE_CLEAR` plus `xmallocz`/`xstrlcpy` pair collapses into a
+/// single assignment to an owned `Option<Vec<u8>>`, since dropping the
+/// old value frees it.
+///
+/// Note the original's own doc comment claims this prepends `':'`, but
+/// its body does not - that happens in [`qf_cmdtitle`], which callers
+/// pass through first. The comment is stale in the original; this
+/// follows the code.
+pub fn qf_store_title(qfl: &mut QfListT, title: Option<&[u8]>) {
+    qfl.qf_title = title.map(<[u8]>::to_vec);
+}
+
+/// Build a quickfix list title by prefixing `':'` to a user command
+/// (`qf_cmdtitle`).
+///
+/// Returns an owned buffer rather than the original's shared
+/// `static char qftitle_str[IOSIZE]`, matching this crate's
+/// established preference for owned return values over the original's
+/// shared-mutable-scratch memory model. The `IOSIZE` truncation IS
+/// preserved, since it is observable in the resulting title.
+#[must_use]
+pub fn qf_cmdtitle(cmd: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cmd.len() + 1);
+    out.push(b':');
+    out.extend_from_slice(cmd);
+    // snprintf(.., IOSIZE, ..) writes at most IOSIZE-1 bytes plus its
+    // own NUL terminator, which this owned buffer does not carry.
+    out.truncate(crate::globals::IOSIZE - 1);
+    out
 }
 
 /// Shared scratch grow-array reused across quickfix commands to cut
@@ -467,9 +511,62 @@ mod tests {
         assert_eq!(QfltypeT::default(), QfltypeT::Quickfix);
     }
 
+    #[test]
+    fn qf_store_title_stores_the_title_verbatim() {
+        // Verified against a real nvim: setqflist(.., {'title':
+        // 'mytitle'}) reports back exactly "mytitle" with no ':'
+        // prefix, so this function does NOT prepend one despite what
+        // the original's own doc comment claims.
+        let mut qfl = QfListT::default();
+        qf_store_title(&mut qfl, Some(b"mytitle"));
+        assert_eq!(qfl.qf_title.as_deref(), Some(&b"mytitle"[..]));
+    }
+
+    #[test]
+    fn qf_store_title_none_clears_the_previous_title() {
+        let mut qfl = QfListT::default();
+        qf_store_title(&mut qfl, Some(b"first"));
+        qf_store_title(&mut qfl, None);
+        assert_eq!(qfl.qf_title, None);
+    }
+
+    #[test]
+    fn qf_store_title_replaces_rather_than_appends() {
+        let mut qfl = QfListT::default();
+        qf_store_title(&mut qfl, Some(b"first"));
+        qf_store_title(&mut qfl, Some(b"second"));
+        assert_eq!(qfl.qf_title.as_deref(), Some(&b"second"[..]));
+    }
+
+    #[test]
+    fn qf_store_title_accepts_an_empty_title() {
+        // Real nvim reports an empty title back as empty, NOT as
+        // absent, so an empty slice must not collapse into None.
+        let mut qfl = QfListT::default();
+        qf_store_title(&mut qfl, Some(b""));
+        assert_eq!(qfl.qf_title.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn qf_cmdtitle_prepends_a_colon() {
+        // Verified against a real nvim: `cexpr! []` produces the
+        // title ":cexpr! []".
+        assert_eq!(qf_cmdtitle(b"cexpr! []"), b":cexpr! []".to_vec());
+        assert_eq!(qf_cmdtitle(b""), b":".to_vec());
+    }
+
+    #[test]
+    fn qf_cmdtitle_truncates_at_iosize() {
+        let long = vec![b'x'; crate::globals::IOSIZE * 2];
+        let title = qf_cmdtitle(&long);
+        // snprintf writes at most IOSIZE-1 bytes plus its own NUL,
+        // which this owned buffer does not carry.
+        assert_eq!(title.len(), crate::globals::IOSIZE - 1);
+        assert_eq!(title[0], b':');
+    }
+
     /// Restores `QFGA` after a test, so its shared state cannot leak.
     struct QfgaGuard;
-
     impl Drop for QfgaGuard {
         fn drop(&mut self) {
             let ga = unsafe { QFGA.get_mut() };
