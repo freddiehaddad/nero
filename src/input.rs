@@ -103,7 +103,9 @@
 //! original's `free_buff` calls before each buffer move are subsumed
 //! by assigning an owned value, which drops the previous contents.
 //! `CancelRedo` and `saveRedobuff` stay deferred - they need
-//! `start_stuff`/`read_readbuffers`/`get_buffcont`.
+//! `start_stuff`/`read_readbuffers`/`get_buffcont`. [`stop_redo_ins`]
+//! and [`can_get_old_char`] are translated too, the latter needing a
+//! new `old_KeyStuffed` alongside the existing `old_char`.
 //!
 //! Still deferred: `recordbuff` (macro recording),
 //! `close_all_scripts` (real script-file I/O).
@@ -266,6 +268,39 @@ static OLD_CHAR: GlobalCell<i32> = GlobalCell::new(-1);
 /// original. Starts at `0`, matching the original's own
 /// zero-initialized `static int old_mod_mask;`.
 static OLD_MOD_MASK: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Whether [`OLD_CHAR`] was stuffed rather than typed
+/// (`old_KeyStuffed`), file-static in the original.
+static OLD_KEY_STUFFED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether the character put back by `vungetc()` can be taken now
+/// (`can_get_old_char`).
+///
+/// If that character was NOT stuffed and something has since been
+/// added to the stuff buffer, the stuffed characters have to be
+/// consumed first - so a put-back character alone is not enough.
+///
+/// # Safety
+/// Must not run concurrently with any write to `OLD_CHAR`,
+/// `OLD_KEY_STUFFED`, `READBUF1` or `READBUF2`.
+#[must_use]
+pub unsafe fn can_get_old_char() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_char = unsafe { *OLD_CHAR.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let stuffed = unsafe { *OLD_KEY_STUFFED.get_mut() };
+    old_char != -1 && (stuffed || stuff_empty())
+}
+
+/// Stop blocking the redo buffer after an Insert-mode redo
+/// (`stop_redo_ins`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to `BLOCK_REDO`.
+pub unsafe fn stop_redo_ins() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { BLOCK_REDO.get_mut() } = false;
+}
 
 /// Maximum length of a key sequence to be mapped (`MAXMAPLEN`,
 /// `mapping_defs.h`). Defined here (rather than a dedicated
@@ -736,6 +771,82 @@ mod tests {
     /// The concatenated bytes currently held in a buffer.
     fn buff_bytes(buf: &BuffheaderT) -> Vec<u8> {
         buf.blocks.iter().flat_map(|b| b.b_str.clone()).collect()
+    }
+
+    #[test]
+    fn stop_redo_ins_unblocks_the_redo_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        unsafe { stop_redo_ins() };
+        assert!(!unsafe { *BLOCK_REDO.get_mut() });
+        // Appends work again afterwards.
+        unsafe { append_to_redobuff(b"ok") };
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"ok".to_vec());
+    }
+
+    /// Saves and restores the `vungetc()` put-back state.
+    struct OldCharGuard {
+        chr: i32,
+        stuffed: bool,
+        rb1: BuffheaderT,
+        rb2: BuffheaderT,
+    }
+
+    impl OldCharGuard {
+        fn new() -> Self {
+            unsafe {
+                Self {
+                    chr: *OLD_CHAR.get_mut(),
+                    stuffed: *OLD_KEY_STUFFED.get_mut(),
+                    rb1: std::mem::take(READBUF1.get_mut()),
+                    rb2: std::mem::take(READBUF2.get_mut()),
+                }
+            }
+        }
+    }
+
+    impl Drop for OldCharGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *OLD_CHAR.get_mut() = self.chr;
+                *OLD_KEY_STUFFED.get_mut() = self.stuffed;
+                *READBUF1.get_mut() = std::mem::take(&mut self.rb1);
+                *READBUF2.get_mut() = std::mem::take(&mut self.rb2);
+            }
+        }
+    }
+
+    #[test]
+    fn can_get_old_char_needs_a_character_put_back() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = OldCharGuard::new();
+
+        // -1 means nothing was put back.
+        unsafe { *OLD_CHAR.get_mut() = -1 };
+        assert!(!unsafe { can_get_old_char() });
+
+        unsafe { *OLD_CHAR.get_mut() = i32::from(b'x') };
+        unsafe { *OLD_KEY_STUFFED.get_mut() = false };
+        assert!(unsafe { can_get_old_char() });
+    }
+
+    #[test]
+    fn can_get_old_char_yields_to_pending_stuffed_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = OldCharGuard::new();
+        unsafe { *OLD_CHAR.get_mut() = i32::from(b'x') };
+
+        // A character that was NOT stuffed must wait behind anything
+        // since added to the stuff buffer.
+        unsafe { *OLD_KEY_STUFFED.get_mut() = false };
+        add_buff(unsafe { READBUF1.get_mut() }, b"pending");
+        assert!(!unsafe { can_get_old_char() });
+
+        // A character that WAS stuffed is taken regardless.
+        unsafe { *OLD_KEY_STUFFED.get_mut() = true };
+        assert!(unsafe { can_get_old_char() });
     }
 
     #[test]
