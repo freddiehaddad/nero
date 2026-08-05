@@ -29,6 +29,14 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: the completion-state accessors
+//! [`ins_compl_used_match`]/[`ins_compl_init_get_longest`]/
+//! [`ins_compl_interrupted`]/[`ins_compl_enter_selects`]/
+//! [`ins_compl_col`]/[`ins_compl_len`] and their backing statics.
+//! Note `ins_compl_interrupted` is an OR of two separate conditions -
+//! an explicit interruption AND the current source running out of its
+//! time budget - so it is not a plain accessor.
+//!
 //! Also translated: [`get_cot_flags`] and the `'completeopt'`
 //! predicates over it - [`cot_fuzzy`]/[`is_nearest_active`]/
 //! [`ins_compl_preinsert_longest`] - plus the `compl_autocomplete`
@@ -137,6 +145,104 @@ static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
 /// completion-source dispatch machinery, isn't translated), matching
 /// [`CTRL_X_MODE`]'s own established treatment exactly.
 static COMPL_STARTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether one of the matches was selected, rather than the text
+/// being edited or the longest common string used (`compl_used_match`).
+///
+/// The original declares this without an initializer, so it starts
+/// `false` like the rest.
+static COMPL_USED_MATCH: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether to put the longest common string in `compl_leader`
+/// (`compl_get_longest`).
+static COMPL_GET_LONGEST: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether insert completion was interrupted (`compl_interrupted`).
+static COMPL_INTERRUPTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether the time budget for the current source was exceeded
+/// (`compl_time_slice_expired`).
+static COMPL_TIME_SLICE_EXPIRED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether `<Enter>` selects a match in the completion popup menu
+/// (`compl_enter_selects`).
+static COMPL_ENTER_SELECTS: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Column where the text being completed starts (`compl_col`).
+static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
+
+/// Length in bytes of the text being completed (`compl_length`).
+static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Whether one of the matches was selected (`ins_compl_used_match`).
+///
+/// False when the match was edited instead, or when the longest
+/// common string was used.
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_USED_MATCH`.
+#[must_use]
+pub unsafe fn ins_compl_used_match() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_USED_MATCH.get_mut() }
+}
+
+/// Start over on finding the longest common string
+/// (`ins_compl_init_get_longest`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `COMPL_GET_LONGEST`.
+pub unsafe fn ins_compl_init_get_longest() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { COMPL_GET_LONGEST.get_mut() } = false;
+}
+
+/// Whether insert completion was interrupted
+/// (`ins_compl_interrupted`).
+///
+/// Running out of the current source's time budget counts as an
+/// interruption too, not only an explicit one.
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_INTERRUPTED` or
+/// `COMPL_TIME_SLICE_EXPIRED`.
+#[must_use]
+pub unsafe fn ins_compl_interrupted() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_INTERRUPTED.get_mut() || *COMPL_TIME_SLICE_EXPIRED.get_mut() }
+}
+
+/// Whether `<Enter>` selects a match in the completion popup menu
+/// (`ins_compl_enter_selects`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_ENTER_SELECTS`.
+#[must_use]
+pub unsafe fn ins_compl_enter_selects() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_ENTER_SELECTS.get_mut() }
+}
+
+/// The column where the text being completed starts (`ins_compl_col`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_COL`.
+#[must_use]
+pub unsafe fn ins_compl_col() -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_COL.get_mut() }
+}
+
+/// The length in bytes of the text being completed (`ins_compl_len`).
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_LENGTH`.
+#[must_use]
+pub unsafe fn ins_compl_len() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_LENGTH.get_mut() }
+}
 
 /// Whether autocompletion is active (`compl_autocomplete`).
 ///
@@ -679,6 +785,87 @@ mod tests {
     impl Drop for CotFlagsGuard {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
+        }
+    }
+
+    #[test]
+    fn ins_compl_accessors_default_to_the_initial_state() {
+        let _lock = global_state_test_lock();
+        assert!(!unsafe { ins_compl_used_match() });
+        assert!(!unsafe { ins_compl_interrupted() });
+        assert!(!unsafe { ins_compl_enter_selects() });
+        assert_eq!(unsafe { ins_compl_col() }, 0);
+        assert_eq!(unsafe { ins_compl_len() }, 0);
+    }
+
+    #[test]
+    fn ins_compl_col_and_len_report_their_statics() {
+        let _lock = global_state_test_lock();
+        let (pc, pl) = unsafe { (*COMPL_COL.get_mut(), *COMPL_LENGTH.get_mut()) };
+
+        unsafe {
+            *COMPL_COL.get_mut() = 12;
+            *COMPL_LENGTH.get_mut() = 5;
+        }
+        assert_eq!(unsafe { ins_compl_col() }, 12);
+        assert_eq!(unsafe { ins_compl_len() }, 5);
+
+        unsafe {
+            *COMPL_COL.get_mut() = pc;
+            *COMPL_LENGTH.get_mut() = pl;
+        }
+    }
+
+    #[test]
+    fn ins_compl_interrupted_also_covers_an_expired_time_slice() {
+        let _lock = global_state_test_lock();
+        let (pi, pt) =
+            unsafe { (*COMPL_INTERRUPTED.get_mut(), *COMPL_TIME_SLICE_EXPIRED.get_mut()) };
+
+        // Either condition alone counts as interrupted.
+        unsafe { *COMPL_INTERRUPTED.get_mut() = true };
+        assert!(unsafe { ins_compl_interrupted() });
+
+        unsafe {
+            *COMPL_INTERRUPTED.get_mut() = false;
+            *COMPL_TIME_SLICE_EXPIRED.get_mut() = true;
+        }
+        assert!(unsafe { ins_compl_interrupted() });
+
+        unsafe {
+            *COMPL_INTERRUPTED.get_mut() = pi;
+            *COMPL_TIME_SLICE_EXPIRED.get_mut() = pt;
+        }
+    }
+
+    #[test]
+    fn ins_compl_init_get_longest_clears_the_flag() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { *COMPL_GET_LONGEST.get_mut() };
+
+        unsafe { *COMPL_GET_LONGEST.get_mut() = true };
+        unsafe { ins_compl_init_get_longest() };
+        assert!(!unsafe { *COMPL_GET_LONGEST.get_mut() });
+
+        unsafe { *COMPL_GET_LONGEST.get_mut() = prev };
+    }
+
+    #[test]
+    fn ins_compl_used_match_and_enter_selects_read_their_own_statics() {
+        let _lock = global_state_test_lock();
+        let (pu, pe) = unsafe { (*COMPL_USED_MATCH.get_mut(), *COMPL_ENTER_SELECTS.get_mut()) };
+
+        unsafe { *COMPL_USED_MATCH.get_mut() = true };
+        assert!(unsafe { ins_compl_used_match() });
+        // The two are independent.
+        assert!(!unsafe { ins_compl_enter_selects() });
+
+        unsafe { *COMPL_ENTER_SELECTS.get_mut() = true };
+        assert!(unsafe { ins_compl_enter_selects() });
+
+        unsafe {
+            *COMPL_USED_MATCH.get_mut() = pu;
+            *COMPL_ENTER_SELECTS.get_mut() = pe;
         }
     }
 
