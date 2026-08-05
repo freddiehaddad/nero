@@ -29,6 +29,14 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: the word-scanning trio [`find_word_start`]/
+//! [`find_word_end`]/[`find_line_end`], returning byte offsets rather
+//! than advanced pointers. `find_word_end` guards its whole scan
+//! behind `start_class > 1`, so starting off a word returns the start
+//! rather than running forward to find one - it assumes it is already
+//! inside a word. `find_line_end` scans to the NUL terminator, so an
+//! embedded NUL ends the line.
+//!
 //! Also translated: the completion-state accessors
 //! [`ins_compl_used_match`]/[`ins_compl_init_get_longest`]/
 //! [`ins_compl_interrupted`]/[`ins_compl_enter_selects`]/
@@ -173,6 +181,81 @@ static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Find the start of the next word (`find_word_start`), as a byte
+/// offset into `ptr`.
+///
+/// Skips over everything that is not word-ish, stopping at a NUL or a
+/// newline. Returns an offset rather than the original's advanced
+/// pointer, following this crate's established convention for
+/// pointer-walking scans.
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::mb_get_class`]/
+/// [`crate::mbyte::utfc_ptr2len`].
+#[must_use]
+pub unsafe fn find_word_start(ptr: &[u8]) -> usize {
+    let mut i = 0usize;
+    loop {
+        match ptr.get(i) {
+            None | Some(&crate::ascii_defs::NUL) | Some(b'\n') => return i,
+            Some(_) => {}
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::mbyte::mb_get_class(&ptr[i..]) } > 1 {
+            return i;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&ptr[i..]) };
+        i += usize::try_from(len).unwrap_or(1).max(1);
+    }
+}
+
+/// Find the end of the word (`find_word_end`), as a byte offset into
+/// `ptr`. Assumes `ptr` starts inside a word.
+///
+/// Returns `0` when `ptr` does not start on a word character at all,
+/// matching the original's `start_class > 1` guard - the scan is
+/// skipped entirely rather than running to the end of the string.
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::mb_get_class`]/
+/// [`crate::mbyte::utfc_ptr2len`].
+#[must_use]
+pub unsafe fn find_word_end(ptr: &[u8]) -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let start_class = unsafe { crate::mbyte::mb_get_class(ptr) };
+    if start_class <= 1 {
+        return 0;
+    }
+    let mut i = 0usize;
+    while !matches!(ptr.get(i), None | Some(&crate::ascii_defs::NUL)) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&ptr[i..]) };
+        i += usize::try_from(len).unwrap_or(1).max(1);
+        if i >= ptr.len() {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::mbyte::mb_get_class(&ptr[i..]) } != start_class {
+            break;
+        }
+    }
+    i.min(ptr.len())
+}
+
+/// Find the end of the line (`find_line_end`), as a byte offset into
+/// `ptr`, omitting any trailing CR and NL.
+#[must_use]
+pub fn find_line_end(ptr: &[u8]) -> usize {
+    // The original scans to the NUL terminator, not to a Rust slice
+    // length, so stop at the first NUL if there is one.
+    let mut s = ptr.iter().position(|&c| c == crate::ascii_defs::NUL).unwrap_or(ptr.len());
+    while s > 0 && matches!(ptr[s - 1], crate::ascii_defs::CAR | crate::ascii_defs::NL) {
+        s -= 1;
+    }
+    s
+}
 
 /// Whether one of the matches was selected (`ins_compl_used_match`).
 ///
@@ -786,6 +869,88 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
         }
+    }
+
+    #[test]
+    fn find_word_start_skips_blanks_and_punctuation() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        assert_eq!(unsafe { find_word_start(b"  abc") }, 2);
+        // Punctuation is class 1, which is also "not word-ish yet".
+        assert_eq!(unsafe { find_word_start(b"...abc") }, 3);
+        // Already at a word: no movement.
+        assert_eq!(unsafe { find_word_start(b"abc") }, 0);
+    }
+
+    #[test]
+    fn find_word_start_stops_at_a_newline_or_end() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        // The scan stops at '\n' even though there is a word after it.
+        assert_eq!(unsafe { find_word_start(b"\nabc") }, 0);
+        assert_eq!(unsafe { find_word_start(b"  \nabc") }, 2);
+        assert_eq!(unsafe { find_word_start(b"") }, 0);
+        // Nothing word-ish at all: runs to the end.
+        assert_eq!(unsafe { find_word_start(b"   ") }, 3);
+    }
+
+    #[test]
+    fn find_word_end_runs_to_the_end_of_the_word() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        assert_eq!(unsafe { find_word_end(b"abc def") }, 3);
+        // A word running to the end of the slice still terminates.
+        assert_eq!(unsafe { find_word_end(b"abc") }, 3);
+    }
+
+    #[test]
+    fn find_word_end_does_nothing_off_a_word() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        // The original guards the whole scan behind `start_class > 1`,
+        // so starting off a word returns the start rather than running
+        // forward to find one.
+        assert_eq!(unsafe { find_word_end(b" abc") }, 0);
+        assert_eq!(unsafe { find_word_end(b"...") }, 0);
+        assert_eq!(unsafe { find_word_end(b"") }, 0);
+    }
+
+    #[test]
+    fn find_word_end_stops_when_the_character_class_changes() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        // Punctuation (class 1) ends a word run just as a blank does.
+        assert_eq!(unsafe { find_word_end(b"abc.def") }, 3);
+    }
+
+    #[test]
+    fn find_line_end_omits_trailing_cr_and_nl() {
+        assert_eq!(find_line_end(b"line\r\n"), 4);
+        assert_eq!(find_line_end(b"line\n"), 4);
+        assert_eq!(find_line_end(b"line"), 4);
+        // Every trailing CR/NL is dropped, not just one.
+        assert_eq!(find_line_end(b"line\n\r\n"), 4);
+        assert_eq!(find_line_end(b"\r\n"), 0);
+        assert_eq!(find_line_end(b""), 0);
+    }
+
+    #[test]
+    fn find_line_end_stops_at_an_embedded_nul() {
+        // The original scans to the NUL terminator, so a NUL inside
+        // the slice ends the line rather than being scanned past.
+        assert_eq!(find_line_end(b"line\0more"), 4);
+        // Trailing CR/NL before the NUL are still trimmed.
+        assert_eq!(find_line_end(b"line\r\n\0more"), 4);
     }
 
     #[test]
