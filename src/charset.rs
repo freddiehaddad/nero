@@ -113,6 +113,308 @@
 use crate::ascii_defs::{ascii_isbdigit, ascii_isdigit, ascii_isodigit, ascii_iswhite, ascii_isxdigit};
 use crate::eval::typval_defs::{UvarnumberT, VarnumberT, UVARNUMBER_MAX, VARNUMBER_MAX, VARNUMBER_MIN};
 
+/// Mask for the number of display cells (1, 2 or 4) held in the low
+/// bits of a `g_chartab` entry (`CT_CELL_MASK`).
+pub const CT_CELL_MASK: u8 = 0x07;
+/// Flag: set for printable characters (`CT_PRINT_CHAR`).
+pub const CT_PRINT_CHAR: u8 = 0x10;
+/// Flag: set for ID characters (`CT_ID_CHAR`).
+pub const CT_ID_CHAR: u8 = 0x20;
+/// Flag: set for file name characters (`CT_FNAME_CHAR`).
+pub const CT_FNAME_CHAR: u8 = 0x40;
+
+/// The real character table (`g_chartab`), one entry per byte value:
+/// display cell count in the low bits, plus the `CT_*` flags.
+///
+/// Built by [`buf_init_chartab`] from `'isident'`/`'isprint'`/
+/// `'isfname'`/`'iskeyword'`. Until that is called this stays all
+/// zeroes, which is why this module's other predicates still use
+/// their documented default-rule approximations rather than reading
+/// it - see each one's own doc comment.
+pub static G_CHARTAB: std::sync::LazyLock<crate::globals::GlobalCell<[u8; 256]>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new([0; 256]));
+
+/// Set character `c`'s keyword bit in a buffer's own `b_chartab`
+/// (`SET_CHARTAB`).
+///
+/// `b_chartab` is a 256-bit set held as four `u64`s, so the byte
+/// value selects both the word (`c >> 6`) and the bit within it
+/// (`c & 0x3f`).
+pub fn set_chartab(buf: &mut crate::buffer_defs::BufT, c: i32) {
+    let c = (c as u32) & 0xFF;
+    buf.b_chartab[(c >> 6) as usize] |= 1u64 << (c & 0x3f);
+}
+
+/// Clear character `c`'s keyword bit in a buffer's own `b_chartab`
+/// (`RESET_CHARTAB`).
+pub fn reset_chartab(buf: &mut crate::buffer_defs::BufT, c: i32) {
+    let c = (c as u32) & 0xFF;
+    buf.b_chartab[(c >> 6) as usize] &= !(1u64 << (c & 0x3f));
+}
+
+/// Which option a `parse_isopt` call is filling in - the original
+/// distinguishes them by comparing the `var` POINTER against
+/// `p_isi`/`p_isp`/`p_isf`, which has no Rust equivalent, so the
+/// caller names the option instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsOpt {
+    /// `'isident'`
+    Ident,
+    /// `'isprint'`
+    Print,
+    /// `'isfname'`
+    Fname,
+    /// `'iskeyword'` (global `p_isk` or the buffer's own `b_p_isk`)
+    Keyword,
+}
+
+/// Parse one of the `'isident'`/`'iskeyword'`/`'isfname'`/`'isprint'`
+/// options (`parse_isopt`).
+///
+/// Each option is a list of characters, character numbers or ranges
+/// separated by commas, e.g. `"200-210,x,#-178,-"`. A leading `^`
+/// REMOVES the character(s) instead of adding them.
+///
+/// `only_check` false also refills `G_CHARTAB`/`buf.b_chartab`.
+/// Returns `OK`/`FAIL`.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `G_CHARTAB` or
+/// `OPTION_VARS`.
+pub unsafe fn parse_isopt(
+    var: &[u8],
+    buf: Option<&mut crate::buffer_defs::BufT>,
+    which: IsOpt,
+    only_check: bool,
+) -> i32 {
+    let at = |i: usize| var.get(i).copied().unwrap_or(0);
+    let mut p = 0usize;
+    let mut buf = buf;
+
+    while at(p) != 0 {
+        let mut tilde = false;
+        let mut do_isalpha = false;
+
+        if at(p) == b'^' && at(p + 1) != 0 {
+            tilde = true;
+            p += 1;
+        }
+
+        let mut c;
+        if ascii_isdigit(i32::from(at(p))) {
+            let (v, adv) = getdigits_int(&var[p..], true, 0);
+            c = v;
+            p += adv;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (v, adv) = unsafe { crate::mbyte::mb_ptr2char_adv(&var[p..]) };
+            c = v;
+            p += adv;
+        }
+        let mut c2 = -1;
+
+        if at(p) == b'-' && at(p + 1) != 0 {
+            p += 1;
+            if ascii_isdigit(i32::from(at(p))) {
+                let (v, adv) = getdigits_int(&var[p..], true, 0);
+                c2 = v;
+                p += adv;
+            } else {
+                // SAFETY: forwarded from this function's own safety doc.
+                let (v, adv) = unsafe { crate::mbyte::mb_ptr2char_adv(&var[p..]) };
+                c2 = v;
+                p += adv;
+            }
+        }
+
+        if c <= 0
+            || c >= 256
+            || (c2 < c && c2 != -1)
+            || c2 >= 256
+            || !(at(p) == 0 || at(p) == b',')
+        {
+            return crate::vim_defs::FAIL;
+        }
+
+        let trail_comma = at(p) == b',';
+        p = crate::option::skip_to_option_part(var, p);
+        if trail_comma && at(p) == 0 {
+            // Trailing comma is not allowed.
+            return crate::vim_defs::FAIL;
+        }
+
+        if only_check {
+            continue;
+        }
+
+        if c2 == -1 {
+            // Not a range. A single '@' (not "@-@") means "decide on
+            // letters being ID/printable/keyword chars with the
+            // standard isalpha()".
+            if c == i32::from(b'@') {
+                do_isalpha = true;
+                c = 1;
+                c2 = 255;
+            } else {
+                c2 = c;
+            }
+        }
+
+        while c <= c2 {
+            // The original uses the MB_ functions here because
+            // isalpha() misbehaves for 'encoding' "latin1" under the
+            // "C" locale.
+            if !do_isalpha
+                // SAFETY: forwarded from this function's own safety doc.
+                || unsafe { crate::mbyte::mb_islower(c) }
+                // SAFETY: forwarded from this function's own safety doc.
+                || unsafe { crate::mbyte::mb_isupper(c) }
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                let chartab = unsafe { G_CHARTAB.get_mut() };
+                let idx = c as usize;
+                match which {
+                    IsOpt::Ident => {
+                        if tilde {
+                            chartab[idx] &= !CT_ID_CHAR;
+                        } else {
+                            chartab[idx] |= CT_ID_CHAR;
+                        }
+                    }
+                    IsOpt::Print => {
+                        if c < i32::from(b' ') || c > i32::from(b'~') {
+                            // SAFETY: forwarded from this fn's own doc.
+                            let dy = unsafe {
+                                crate::option_vars::OPTION_VARS.get_mut()
+                            }
+                            .dy_flags;
+                            let uhex =
+                                dy & crate::option_vars::opt_dy_flag::UHEX != 0;
+                            if tilde {
+                                chartab[idx] = (chartab[idx] & !CT_CELL_MASK)
+                                    + if uhex { 4 } else { 2 };
+                                chartab[idx] &= !CT_PRINT_CHAR;
+                            } else {
+                                chartab[idx] = (chartab[idx] & !CT_CELL_MASK) + 1;
+                                chartab[idx] |= CT_PRINT_CHAR;
+                            }
+                        }
+                    }
+                    IsOpt::Fname => {
+                        if tilde {
+                            chartab[idx] &= !CT_FNAME_CHAR;
+                        } else {
+                            chartab[idx] |= CT_FNAME_CHAR;
+                        }
+                    }
+                    IsOpt::Keyword => {
+                        if let Some(b) = buf.as_deref_mut() {
+                            if tilde {
+                                reset_chartab(b, c);
+                            } else {
+                                set_chartab(b, c);
+                            }
+                        }
+                    }
+                }
+            }
+            c += 1;
+        }
+    }
+
+    crate::vim_defs::OK
+}
+
+/// Check the format of `'iskeyword'`/`'isident'`/`'isfname'`/
+/// `'isprint'` (`check_isopt`). Returns `FAIL` on an error, `OK`
+/// otherwise.
+///
+/// # Safety
+/// Forwarded from [`parse_isopt`]'s own safety doc - though with
+/// `only_check` set nothing is actually written.
+#[must_use]
+pub unsafe fn check_isopt(var: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { parse_isopt(var, None, IsOpt::Keyword, true) }
+}
+
+/// Fill `G_CHARTAB` and the buffer's own `b_chartab` keyword flags
+/// (`buf_init_chartab`). Returns `OK`/`FAIL`.
+///
+/// `global` false skips the global table reset and only re-reads
+/// `'iskeyword'`, matching the original's own `i = global ? 0 : 3`
+/// loop bound.
+///
+/// # Safety
+/// Forwarded from [`parse_isopt`]'s own safety doc.
+pub unsafe fn buf_init_chartab(buf: &mut crate::buffer_defs::BufT, global: bool) -> i32 {
+    if global {
+        // SAFETY: forwarded from this function's own safety doc.
+        let dy = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
+        let unprintable = if dy & crate::option_vars::opt_dy_flag::UHEX != 0 {
+            4
+        } else {
+            2
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let chartab = unsafe { G_CHARTAB.get_mut() };
+
+        // Default cell widths: <Space>..'~' is 1 (printable), the
+        // rest 2 (or 4 with 'display' "uhex"). This also clears every
+        // 'isident'/'isfname' flag.
+        let mut c = 0usize;
+        while c < usize::from(b' ') {
+            chartab[c] = unprintable;
+            c += 1;
+        }
+        while c <= usize::from(b'~') {
+            chartab[c] = 1 + CT_PRINT_CHAR;
+            c += 1;
+        }
+        while c < 256 {
+            if c >= 0xa0 {
+                // UTF-8: 0xa0-0xff are printable (latin1). Also
+                // assume every multi-byte char is a filename char.
+                chartab[c] = (CT_PRINT_CHAR | CT_FNAME_CHAR) + 1;
+            } else {
+                chartab[c] = unprintable;
+            }
+            c += 1;
+        }
+    }
+
+    // Init word char flags all to false.
+    buf.b_chartab = [0; 4];
+
+    // In lisp mode the '-' character is included in keywords.
+    if buf.b_p_lisp != 0 {
+        set_chartab(buf, i32::from(b'-'));
+    }
+
+    // Walk through 'isident', 'isprint', 'isfname' and 'iskeyword'.
+    let start = if global { 0 } else { 3 };
+    for i in start..=3 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (p, which) = match i {
+            0 => (opts.p_isi.clone().unwrap_or_default(), IsOpt::Ident),
+            1 => (opts.p_isp.clone().unwrap_or_default(), IsOpt::Print),
+            2 => (opts.p_isf.clone().unwrap_or_default(), IsOpt::Fname),
+            _ => (
+                buf.b_p_isk.clone().unwrap_or_default(),
+                IsOpt::Keyword,
+            ),
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { parse_isopt(&p, Some(buf), which, false) } == crate::vim_defs::FAIL {
+            return crate::vim_defs::FAIL;
+        }
+    }
+
+    crate::vim_defs::OK
+}
+
+
 /// Skip over whitespace (`skipwhite`). Returns the offset of the first
 /// non-whitespace byte (or `p.len()` if none).
 pub fn skipwhite(p: &[u8]) -> usize {
@@ -2372,5 +2674,332 @@ mod tests {
         // consuming each whole character, never mid-character).
         let bytes = "一x".as_bytes();
         assert_eq!(unsafe { vim_strnsize(bytes, 2) }, 2);
+    }
+
+    /// Saves and restores `G_CHARTAB` for a test's whole body, so a
+    /// test that fills it in for real cannot leak that state into
+    /// any other test.
+    struct ChartabGuard {
+        saved: [u8; 256],
+    }
+
+    impl ChartabGuard {
+        fn new() -> Self {
+            Self {
+                saved: *unsafe { G_CHARTAB.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for ChartabGuard {
+        fn drop(&mut self) {
+            *unsafe { G_CHARTAB.get_mut() } = self.saved;
+        }
+    }
+
+    /// Whether character `c`'s keyword bit is set in `b_chartab`.
+    fn chartab_has(buf: &crate::buffer_defs::BufT, c: u8) -> bool {
+        buf.b_chartab[usize::from(c) >> 6] & (1u64 << (c & 0x3f)) != 0
+    }
+
+    #[test]
+    fn set_and_reset_chartab_toggle_one_bit_each() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert!(!chartab_has(&buf, b'a'));
+        set_chartab(&mut buf, i32::from(b'a'));
+        assert!(chartab_has(&buf, b'a'));
+        // A neighbouring character is untouched.
+        assert!(!chartab_has(&buf, b'b'));
+        reset_chartab(&mut buf, i32::from(b'a'));
+        assert!(!chartab_has(&buf, b'a'));
+    }
+
+    #[test]
+    fn set_chartab_reaches_every_one_of_the_four_words() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        // One character from each 64-bit word of the 256-bit set.
+        for c in [0u8, 64, 128, 192] {
+            set_chartab(&mut buf, i32::from(c));
+        }
+        assert_eq!(buf.b_chartab, [1, 1, 1, 1]);
+    }
+
+    /// Every one of these was verified against a real `nvim` binary
+    /// (`:set isident=<value>`, checking whether it errors) before
+    /// being written here - see this commit's own message.
+    #[test]
+    fn check_isopt_accepts_the_values_real_nvim_accepts() {
+        let _guard = crate::globals::global_state_test_lock();
+        for v in [
+            &b"200-210,x,#-178,-"[..],
+            &b"@,48-57,_,192-255"[..],
+            &b"^a"[..],
+            &b"@"[..],
+        ] {
+            assert_eq!(
+                unsafe { check_isopt(v) },
+                crate::vim_defs::OK,
+                "expected OK for {:?}",
+                String::from_utf8_lossy(v)
+            );
+        }
+    }
+
+    #[test]
+    fn check_isopt_rejects_the_values_real_nvim_rejects() {
+        let _guard = crate::globals::global_state_test_lock();
+        for v in [
+            // Trailing comma.
+            &b"a,"[..],
+            // Empty part between two commas.
+            &b"a,,b"[..],
+            // Out of range (>= 256).
+            &b"300"[..],
+            // Zero is not allowed.
+            &b"0"[..],
+            // Reversed range.
+            &b"20-10"[..],
+            // Range with nothing after the '-'.
+            &b"a-"[..],
+            // Space is not a valid separator.
+            &b"a b"[..],
+        ] {
+            assert_eq!(
+                unsafe { check_isopt(v) },
+                crate::vim_defs::FAIL,
+                "expected FAIL for {:?}",
+                String::from_utf8_lossy(v)
+            );
+        }
+    }
+
+    #[test]
+    fn check_isopt_accepts_an_empty_value() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { check_isopt(b"") }, crate::vim_defs::OK);
+    }
+
+    #[test]
+    fn parse_isopt_ident_sets_and_a_caret_clears_the_id_flag() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        *unsafe { G_CHARTAB.get_mut() } = [0; 256];
+
+        assert_eq!(
+            unsafe { parse_isopt(b"a-c", None, IsOpt::Ident, false) },
+            crate::vim_defs::OK
+        );
+        let tab = unsafe { G_CHARTAB.get_mut() };
+        for c in b'a'..=b'c' {
+            assert_ne!(tab[usize::from(c)] & CT_ID_CHAR, 0);
+        }
+        assert_eq!(tab[usize::from(b'd')] & CT_ID_CHAR, 0);
+
+        // A leading '^' removes the characters again.
+        assert_eq!(
+            unsafe { parse_isopt(b"^b", None, IsOpt::Ident, false) },
+            crate::vim_defs::OK
+        );
+        let tab = unsafe { G_CHARTAB.get_mut() };
+        assert_ne!(tab[usize::from(b'a')] & CT_ID_CHAR, 0);
+        assert_eq!(tab[usize::from(b'b')] & CT_ID_CHAR, 0);
+        assert_ne!(tab[usize::from(b'c')] & CT_ID_CHAR, 0);
+    }
+
+    #[test]
+    fn parse_isopt_only_check_does_not_touch_the_table() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        *unsafe { G_CHARTAB.get_mut() } = [0; 256];
+
+        assert_eq!(
+            unsafe { parse_isopt(b"a-c", None, IsOpt::Ident, true) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(*unsafe { G_CHARTAB.get_mut() }, [0; 256]);
+    }
+
+    #[test]
+    fn parse_isopt_fname_sets_the_fname_flag() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        *unsafe { G_CHARTAB.get_mut() } = [0; 256];
+
+        assert_eq!(
+            unsafe { parse_isopt(b"/", None, IsOpt::Fname, false) },
+            crate::vim_defs::OK
+        );
+        assert_ne!(
+            unsafe { G_CHARTAB.get_mut() }[usize::from(b'/')] & CT_FNAME_CHAR,
+            0
+        );
+    }
+
+    #[test]
+    fn parse_isopt_keyword_fills_the_buffers_own_chartab() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        let mut buf = crate::buffer_defs::BufT::default();
+
+        assert_eq!(
+            unsafe { parse_isopt(b"a-c", Some(&mut buf), IsOpt::Keyword, false) },
+            crate::vim_defs::OK
+        );
+        for c in b'a'..=b'c' {
+            assert!(chartab_has(&buf, c));
+        }
+        assert!(!chartab_has(&buf, b'd'));
+    }
+
+    #[test]
+    fn parse_isopt_at_sign_means_alphabetic_characters() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        let mut buf = crate::buffer_defs::BufT::default();
+
+        // A single '@' (not "@-@") means "decide with isalpha()".
+        assert_eq!(
+            unsafe { parse_isopt(b"@", Some(&mut buf), IsOpt::Keyword, false) },
+            crate::vim_defs::OK
+        );
+        assert!(chartab_has(&buf, b'a'));
+        assert!(chartab_has(&buf, b'Z'));
+        // Digits and punctuation are not alphabetic.
+        assert!(!chartab_has(&buf, b'0'));
+        assert!(!chartab_has(&buf, b'-'));
+    }
+
+    #[test]
+    fn parse_isopt_print_marks_a_high_byte_printable_and_one_cell() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        *unsafe { G_CHARTAB.get_mut() } = [0; 256];
+
+        assert_eq!(
+            unsafe { parse_isopt(b"192", None, IsOpt::Print, false) },
+            crate::vim_defs::OK
+        );
+        let e = unsafe { G_CHARTAB.get_mut() }[192];
+        assert_ne!(e & CT_PRINT_CHAR, 0);
+        assert_eq!(e & CT_CELL_MASK, 1);
+    }
+
+    #[test]
+    fn parse_isopt_print_leaves_plain_ascii_alone() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        *unsafe { G_CHARTAB.get_mut() } = [0; 256];
+
+        // ' '..'~' is skipped entirely by the 'isprint' branch (the
+        // original only acts on `c < ' ' || c > '~'`).
+        assert_eq!(
+            unsafe { parse_isopt(b"a", None, IsOpt::Print, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { G_CHARTAB.get_mut() }[usize::from(b'a')], 0);
+    }
+
+    #[test]
+    fn buf_init_chartab_global_sets_the_default_cell_widths() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        let saved_isi = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isi.clone();
+        let saved_isp = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isp.clone();
+        let saved_isf = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isf.clone();
+
+        {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            opts.p_isi = Some(b"@,48-57,_,192-255".to_vec());
+            opts.p_isp = Some(b"@,161-255".to_vec());
+            opts.p_isf = Some(b"@,48-57,/,.,-,_,+,,,#,$,%,~,=".to_vec());
+        }
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"@,48-57,_,192-255".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { buf_init_chartab(&mut buf, true) },
+            crate::vim_defs::OK
+        );
+
+        let tab = unsafe { G_CHARTAB.get_mut() };
+        // Control characters are unprintable and 2 cells wide.
+        assert_eq!(tab[0] & CT_PRINT_CHAR, 0);
+        assert_eq!(tab[0] & CT_CELL_MASK, 2);
+        // Printable ASCII is printable and 1 cell wide.
+        assert_ne!(tab[usize::from(b'a')] & CT_PRINT_CHAR, 0);
+        assert_eq!(tab[usize::from(b'a')] & CT_CELL_MASK, 1);
+        // 'a' is an ID char and a keyword char via the '@' entry.
+        assert_ne!(tab[usize::from(b'a')] & CT_ID_CHAR, 0);
+        assert!(chartab_has(&buf, b'a'));
+        // '/' is a file name char but not an ID char.
+        assert_ne!(tab[usize::from(b'/')] & CT_FNAME_CHAR, 0);
+        assert_eq!(tab[usize::from(b'/')] & CT_ID_CHAR, 0);
+
+        {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            opts.p_isi = saved_isi;
+            opts.p_isp = saved_isp;
+            opts.p_isf = saved_isf;
+        }
+    }
+
+    #[test]
+    fn buf_init_chartab_non_global_only_rereads_iskeyword() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        // Put a recognisable value in the global table and prove the
+        // non-global path leaves it completely untouched.
+        *unsafe { G_CHARTAB.get_mut() } = [0xAB; 256];
+
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"a-c".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { buf_init_chartab(&mut buf, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(*unsafe { G_CHARTAB.get_mut() }, [0xAB; 256]);
+        for c in b'a'..=b'c' {
+            assert!(chartab_has(&buf, c));
+        }
+        assert!(!chartab_has(&buf, b'd'));
+    }
+
+    #[test]
+    fn buf_init_chartab_adds_the_dash_in_lisp_mode() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_lisp: 1,
+            b_p_isk: Some(b"a".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { buf_init_chartab(&mut buf, false) },
+            crate::vim_defs::OK
+        );
+        assert!(chartab_has(&buf, b'-'));
+        assert!(chartab_has(&buf, b'a'));
+    }
+
+    #[test]
+    fn buf_init_chartab_fails_on_a_malformed_iskeyword() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        let mut buf = crate::buffer_defs::BufT {
+            // Trailing comma - rejected by real nvim too.
+            b_p_isk: Some(b"a,".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { buf_init_chartab(&mut buf, false) },
+            crate::vim_defs::FAIL
+        );
     }
 }
