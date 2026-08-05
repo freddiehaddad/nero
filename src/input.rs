@@ -103,9 +103,10 @@
 //! original's `free_buff` calls before each buffer move are subsumed
 //! by assigning an owned value, which drops the previous contents.
 //! `CancelRedo` and `saveRedobuff` stay deferred - they need
-//! `start_stuff`/`read_readbuffers`/`get_buffcont`. [`stop_redo_ins`]
-//! and [`can_get_old_char`] are translated too, the latter needing a
-//! new `old_KeyStuffed` alongside the existing `old_char`.
+//! `start_stuff`/`read_readbuffers`/`get_buffcont`. [`stop_redo_ins`],
+//! [`can_get_old_char`] and [`may_sync_undo`] are translated too, the
+//! second needing a new `old_KeyStuffed` alongside the existing
+//! `old_char`.
 //!
 //! Still deferred: `recordbuff` (macro recording),
 //! `close_all_scripts` (real script-file I/O).
@@ -272,6 +273,33 @@ static OLD_MOD_MASK: GlobalCell<i32> = GlobalCell::new(0);
 /// Whether [`OLD_CHAR`] was stuffed rather than typed
 /// (`old_KeyStuffed`), file-static in the original.
 static OLD_KEY_STUFFED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Sync undo before a blocking wait, unless it would break an
+/// in-progress edit (`may_sync_undo`).
+///
+/// Skipped in Insert or Cmdline mode unless a cursor key has been
+/// used (which already ends the current undo block), and skipped
+/// entirely while reading a script file.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `crate::globals::GLOBALS` or `CURSCRIPT`, and forwarded from
+/// [`crate::undo::u_sync`].
+pub unsafe fn may_sync_undo() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let in_insert_or_cmdline = globals.State as u32
+        & (crate::state_defs::mode::INSERT | crate::state_defs::mode::CMDLINE)
+        != 0;
+    let arrow_used = globals.Ins.arrow_used;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curscript = unsafe { *CURSCRIPT.get_mut() };
+
+    if (!in_insert_or_cmdline || arrow_used) && curscript < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::undo::u_sync(false) };
+    }
+}
 
 /// Whether the character put back by `vungetc()` can be taken now
 /// (`can_get_old_char`).
@@ -771,6 +799,74 @@ mod tests {
     /// The concatenated bytes currently held in a buffer.
     fn buff_bytes(buf: &BuffheaderT) -> Vec<u8> {
         buf.blocks.iter().flat_map(|b| b.b_str.clone()).collect()
+    }
+
+    /// Sets up a buffer/window and the `may_sync_undo` inputs, then
+    /// reports whether `u_sync` actually ran.
+    ///
+    /// `b_p_ul` and the global `p_ul` are both forced negative so
+    /// `u_sync` takes its simple "no entries, nothing to do" branch,
+    /// which just sets `b_u_synced` - a clean observable effect.
+    fn ran_u_sync(state: u32, arrow_used: bool, curscript: i32) -> bool {
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_ul: -1,
+            b_u_synced: false,
+            ..Default::default()
+        };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_buf = globals.curbuf;
+        let prev_state = globals.State;
+        let prev_arrow = globals.Ins.arrow_used;
+        let prev_script = unsafe { *CURSCRIPT.get_mut() };
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_ul = opts.p_ul;
+        opts.p_ul = -1;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+        globals.State = state as i32;
+        globals.Ins.arrow_used = arrow_used;
+        unsafe { *CURSCRIPT.get_mut() = curscript };
+
+        unsafe { may_sync_undo() };
+        let ran = buf.b_u_synced;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curbuf = prev_buf;
+        globals.State = prev_state;
+        globals.Ins.arrow_used = prev_arrow;
+        unsafe { *CURSCRIPT.get_mut() = prev_script };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = prev_ul;
+        ran
+    }
+
+    #[test]
+    fn may_sync_undo_syncs_outside_insert_and_cmdline() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(ran_u_sync(0, false, -1));
+    }
+
+    #[test]
+    fn may_sync_undo_skips_mid_insert_until_a_cursor_key_is_used() {
+        let _lock = crate::globals::global_state_test_lock();
+        use crate::state_defs::mode::{CMDLINE, INSERT};
+
+        // Mid-edit: syncing here would split the undo block.
+        assert!(!ran_u_sync(INSERT, false, -1));
+        assert!(!ran_u_sync(CMDLINE, false, -1));
+
+        // A cursor key already ended the block, so syncing is fine.
+        assert!(ran_u_sync(INSERT, true, -1));
+        assert!(ran_u_sync(CMDLINE, true, -1));
+    }
+
+    #[test]
+    fn may_sync_undo_never_syncs_while_reading_a_script() {
+        let _lock = crate::globals::global_state_test_lock();
+        // curscript >= 0 means a script is being read; that blocks the
+        // sync even in the cases that would otherwise allow it.
+        assert!(!ran_u_sync(0, false, 0));
+        assert!(!ran_u_sync(crate::state_defs::mode::INSERT, true, 0));
     }
 
     #[test]
