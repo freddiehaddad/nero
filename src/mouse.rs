@@ -15,6 +15,14 @@
 //! `vim_strchr`, and `memline.c`'s `ml_get` (the current-buffer-
 //! implicit form, already translated).
 //!
+//! Also translated: [`mouse_model_popup`]/[`reset_dragwin`]/
+//! [`set_mouse_topline`], along with the `dragwin`/`orig_topline`/
+//! `orig_topfill` file-statics they own. `mouse_model_popup` tests
+//! only the FIRST byte of `'mousemodel'` for `'p'`, which is what
+//! makes one check cover both `"popup"` and `"popup_setpos"` - and
+//! why an empty value reads as false. `setmouse` stays deferred
+//! (needs `ui_cursor_shape`/`ui_check_mouse`).
+//!
 //! Deferred: everything else - `move_tab_to_mouse` (needs
 //! `tab_page_click_defs`/`tabpage_move`, tabline-click-region state,
 //! not translated) and the entire real mouse-click dispatch/dragging
@@ -65,6 +73,60 @@ unsafe fn get_mouse_class(p: &[u8]) -> i32 {
         return 1;
     }
     c
+}
+
+/// The window currently being dragged (`dragwin`), file-static in the
+/// original. Null when no drag is in progress.
+static DRAGWIN: crate::globals::GlobalCell<*mut crate::buffer_defs::WinT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// `w_topline` of the window at the start of a mouse selection
+/// (`orig_topline`), file-static in the original.
+static ORIG_TOPLINE: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
+    crate::globals::GlobalCell::new(0);
+
+/// `w_topfill` of the window at the start of a mouse selection
+/// (`orig_topfill`), file-static in the original.
+static ORIG_TOPFILL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// Whether `'mousemodel'` is `"popup"` or `"popup_setpos"`
+/// (`mouse_model_popup`).
+///
+/// The original tests only the FIRST byte for `'p'`, which is what
+/// makes one check cover both values; an empty option is therefore
+/// false.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn mouse_model_popup() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mousem = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousem.as_deref();
+    mousem.and_then(<[u8]>::first) == Some(&b'p')
+}
+
+/// Reset the window being dragged (`reset_dragwin`), called when
+/// switching tab page.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `DRAGWIN`.
+pub unsafe fn reset_dragwin() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { DRAGWIN.get_mut() } = std::ptr::null_mut();
+}
+
+/// Remember a window's top line, so a double click still works after
+/// jumping to another window (`set_mouse_topline`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to `ORIG_TOPLINE`
+/// or `ORIG_TOPFILL`.
+pub unsafe fn set_mouse_topline(wp: &crate::buffer_defs::WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { ORIG_TOPLINE.get_mut() } = wp.w_topline;
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { ORIG_TOPFILL.get_mut() } = wp.w_topfill;
 }
 
 /// Move `pos` back to the start of the word it's in
@@ -139,6 +201,83 @@ mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
     use crate::pos_defs::PosT;
+
+    /// Saves and restores `'mousemodel'` across a test.
+    struct MousemGuard {
+        saved: Option<Vec<u8>>,
+    }
+
+    impl MousemGuard {
+        fn set(value: Option<&[u8]>) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.p_mousem.take();
+            opts.p_mousem = value.map(<[u8]>::to_vec);
+            Self { saved }
+        }
+    }
+
+    impl Drop for MousemGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mousem = self.saved.take();
+        }
+    }
+
+    #[test]
+    fn mouse_model_popup_matches_both_popup_variants() {
+        let _lock = crate::globals::global_state_test_lock();
+        for value in [&b"popup"[..], &b"popup_setpos"[..]] {
+            let _guard = MousemGuard::set(Some(value));
+            assert!(unsafe { mouse_model_popup() }, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn mouse_model_popup_rejects_the_other_models() {
+        let _lock = crate::globals::global_state_test_lock();
+        for value in [&b"extend"[..], &b"mac"[..]] {
+            let _guard = MousemGuard::set(Some(value));
+            assert!(!unsafe { mouse_model_popup() }, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn mouse_model_popup_is_false_for_an_empty_or_absent_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The original indexes byte 0 of a NUL-terminated string, so
+        // an empty value reads the terminator and is not 'p'.
+        let _guard = MousemGuard::set(Some(b""));
+        assert!(!unsafe { mouse_model_popup() });
+        drop(_guard);
+
+        let _guard = MousemGuard::set(None);
+        assert!(!unsafe { mouse_model_popup() });
+    }
+
+    #[test]
+    fn reset_dragwin_clears_the_dragged_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        unsafe { *DRAGWIN.get_mut() = &mut win as *mut crate::buffer_defs::WinT };
+
+        unsafe { reset_dragwin() };
+        assert!(unsafe { *DRAGWIN.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn set_mouse_topline_records_both_fields() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (pl, pf) = unsafe { (*ORIG_TOPLINE.get_mut(), *ORIG_TOPFILL.get_mut()) };
+
+        let win = crate::buffer_defs::WinT { w_topline: 42, w_topfill: 3, ..Default::default() };
+        unsafe { set_mouse_topline(&win) };
+        assert_eq!(unsafe { *ORIG_TOPLINE.get_mut() }, 42);
+        assert_eq!(unsafe { *ORIG_TOPFILL.get_mut() }, 3);
+
+        unsafe {
+            *ORIG_TOPLINE.get_mut() = pl;
+            *ORIG_TOPFILL.get_mut() = pf;
+        }
+    }
 
     /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
     /// restoring the previous value on drop. Callers must hold
