@@ -75,8 +75,77 @@ static LAST_CURRENT_SID: GlobalCell<ScidT> = GlobalCell::new(0);
 /// sourcing - see `testing.rs`'s own identical observation for
 /// `estack_sfile`'s "always empty" reasoning), matching this crate's
 /// established `AUTOCMDS`-style "genuinely, provably always-empty
-/// registry" precedent, not a hardcoded shortcut.
+/// registry" precedent, not a hardcoded shortcut. [`estack_init`]/
+/// [`estack_push`]/[`estack_pop`] are translated, but nothing calls
+/// them yet, so that "always empty" property still holds.
 static EXESTACK: GlobalCell<Vec<crate::runtime_defs::EstackT>> = GlobalCell::new(Vec::new());
+
+/// Initialize the execution stack (`estack_init`) with its base
+/// `ETYPE_TOP` frame.
+///
+/// Nothing in this crate calls this yet, so `EXESTACK` remains empty
+/// in practice and [`have_sourcing_info`] still always reports
+/// `false`. That matters beyond this file: `message.rs`'s
+/// `other_sourcing_name` has an `unimplemented!()` body guarded by
+/// exactly that predicate, so the first real caller of this function
+/// has to translate `SOURCING_NAME` alongside it.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `EXESTACK`.
+pub unsafe fn estack_init() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { EXESTACK.get_mut() };
+    // The original's `ga_grow(&exestack, 10)` is a capacity hint, not
+    // a length change.
+    stack.reserve(10);
+    stack.push(crate::runtime_defs::EstackT {
+        es_type: crate::runtime_defs::EtypeT::Top,
+        es_name: std::ptr::null_mut(),
+        es_lnum: 0,
+        ..Default::default()
+    });
+}
+
+/// Push an item onto the execution stack (`estack_push`), returning
+/// its index.
+///
+/// The original returns a pointer to the new entry; an index is the
+/// same information over a `Vec` and stays valid across the
+/// reallocation a push can cause.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `EXESTACK`.
+/// `name` is stored as-is and must outlive the entry.
+pub unsafe fn estack_push(
+    etype: crate::runtime_defs::EtypeT,
+    name: *mut u8,
+    lnum: crate::pos_defs::LinenrT,
+) -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { EXESTACK.get_mut() };
+    stack.push(crate::runtime_defs::EstackT {
+        es_type: etype,
+        es_name: name,
+        es_lnum: lnum,
+        ..Default::default()
+    });
+    stack.len() - 1
+}
+
+/// Take an item off the execution stack (`estack_pop`).
+///
+/// The base `ETYPE_TOP` frame installed by [`estack_init`] is never
+/// removed, so this is a no-op at a length of one or less.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `EXESTACK`.
+pub unsafe fn estack_pop() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { EXESTACK.get_mut() };
+    if stack.len() > 1 {
+        stack.pop();
+    }
+}
 
 /// Look up the script item for script ID `id` (`SCRIPT_ITEM(id)`).
 ///
@@ -357,6 +426,96 @@ pub(crate) fn tests_reset_for_test() {
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    /// Saves and restores `EXESTACK` so a test cannot leak frames,
+    /// which would flip `have_sourcing_info()` for every later test.
+    struct ExestackGuard {
+        saved: Vec<crate::runtime_defs::EstackT>,
+    }
+
+    impl ExestackGuard {
+        fn new() -> Self {
+            Self { saved: std::mem::take(unsafe { EXESTACK.get_mut() }) }
+        }
+    }
+
+    impl Drop for ExestackGuard {
+        fn drop(&mut self) {
+            *unsafe { EXESTACK.get_mut() } = std::mem::take(&mut self.saved);
+        }
+    }
+
+    #[test]
+    fn estack_init_installs_a_single_top_frame() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+
+        unsafe { estack_init() };
+        let stack = unsafe { EXESTACK.get_mut() };
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].es_type, crate::runtime_defs::EtypeT::Top);
+        assert!(stack[0].es_name.is_null());
+        assert_eq!(stack[0].es_lnum, 0);
+    }
+
+    #[test]
+    fn estack_push_appends_and_reports_its_index() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+
+        let idx = unsafe {
+            estack_push(crate::runtime_defs::EtypeT::Script, std::ptr::null_mut(), 12)
+        };
+        assert_eq!(idx, 1);
+        let stack = unsafe { EXESTACK.get_mut() };
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack[idx].es_type, crate::runtime_defs::EtypeT::Script);
+        assert_eq!(stack[idx].es_lnum, 12);
+    }
+
+    #[test]
+    fn estack_pop_never_removes_the_base_frame() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+        unsafe { estack_push(crate::runtime_defs::EtypeT::Script, std::ptr::null_mut(), 1) };
+
+        unsafe { estack_pop() };
+        assert_eq!(unsafe { EXESTACK.get_mut() }.len(), 1);
+
+        // The ETYPE_TOP frame stays no matter how often this is called.
+        unsafe { estack_pop() };
+        unsafe { estack_pop() };
+        assert_eq!(unsafe { EXESTACK.get_mut() }.len(), 1);
+    }
+
+    #[test]
+    fn estack_pop_on_an_empty_stack_is_a_no_op() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        *unsafe { EXESTACK.get_mut() } = Vec::new();
+
+        unsafe { estack_pop() };
+        assert!(unsafe { EXESTACK.get_mut() }.is_empty());
+    }
+
+    #[test]
+    fn have_sourcing_info_still_reports_false_by_default() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        // Nothing calls estack_init() in this crate, so the stack is
+        // empty and message.rs's other_sourcing_name stays on its
+        // early-return path rather than its unimplemented!() body.
+        *unsafe { EXESTACK.get_mut() } = Vec::new();
+        assert!(!have_sourcing_info());
+
+        // ...but a pushed frame does flip it, which is exactly why the
+        // first real caller of estack_init must translate
+        // SOURCING_NAME alongside it.
+        unsafe { estack_init() };
+        assert!(have_sourcing_info());
+    }
 
     #[test]
     fn new_script_item_assigns_sequential_sids() {
