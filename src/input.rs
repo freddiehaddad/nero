@@ -94,8 +94,18 @@
 //! `last_insert_ga` "last insert text" tracking pair, or
 //! `mb_cptr2char_adv`, not yet examined), `ins_typebuf` itself (the
 //! real typeahead-buffer WRITE path - needs `state_no_longer_safe`,
-//! not yet examined), `redobuff`/`old_redobuff`/`recordbuff` (the "."
-//! and macro-recording buffers), `openscript`/`open_scriptin`/
+//! not yet examined).
+//!
+//! `redobuff`/`old_redobuff` and their `ResetRedobuff`/
+//! `restoreRedobuff`/`AppendToRedobuff`/`AppendCharToRedobuff`/
+//! `AppendNumberToRedobuff` group ARE now translated, along with
+//! `block_redo`/`typeahead_char` and `typeahead_noflush`. The
+//! original's `free_buff` calls before each buffer move are subsumed
+//! by assigning an owned value, which drops the previous contents.
+//! `CancelRedo` and `saveRedobuff` stay deferred - they need
+//! `start_stuff`/`read_readbuffers`/`get_buffcont`.
+//!
+//! Still deferred: `recordbuff` (macro recording),
 //! `close_all_scripts` (real script-file I/O).
 
 use crate::globals::GlobalCell;
@@ -108,6 +118,116 @@ static READBUF1: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks:
 /// Second read ahead buffer. Used for redo (`readbuf2`). File-static
 /// in the original.
 static READBUF2: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
+
+/// The redo buffer, holding the last change for the `.` command
+/// (`redobuff`). File-static in the original.
+static REDOBUFF: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
+
+/// The previous contents of the redo buffer (`old_redobuff`), kept for
+/// the CTRL-O `.` command in Insert mode. File-static in the original.
+static OLD_REDOBUFF: GlobalCell<BuffheaderT> = GlobalCell::new(BuffheaderT { blocks: Vec::new(), bh_index: 0 });
+
+/// Whether appending to the redo buffer is currently suppressed
+/// (`block_redo`). File-static in the original.
+static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
+
+/// A typeahead character that will not be flushed (`typeahead_char`).
+/// File-static in the original.
+static TYPEAHEAD_CHAR: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Set a typeahead character that will not be flushed
+/// (`typeahead_noflush`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to `TYPEAHEAD_CHAR`.
+pub unsafe fn typeahead_noflush(c: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { TYPEAHEAD_CHAR.get_mut() } = c;
+}
+
+/// Start a new redo buffer, keeping the previous one for the CTRL-O
+/// `.` command (`ResetRedobuff`).
+///
+/// Does nothing while redo is blocked, so a caller cannot silently
+/// discard a redo buffer another one is still building.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `REDOBUFF`,
+/// `OLD_REDOBUFF` or `BLOCK_REDO`.
+pub unsafe fn reset_redobuff() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let redo = std::mem::take(unsafe { REDOBUFF.get_mut() });
+    // The original frees old_redobuff and then moves redobuff into
+    // it; assigning an owned value here frees the old one by dropping.
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { OLD_REDOBUFF.get_mut() } = redo;
+}
+
+/// Restore the redo buffers saved by `saveRedobuff`
+/// (`restoreRedobuff`), used after running autocommands and user
+/// functions.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `REDOBUFF` or
+/// `OLD_REDOBUFF`.
+pub unsafe fn restore_redobuff(save_redo: &mut crate::input_defs::SaveRedoT) {
+    // Both `free_buff` calls in the original are subsumed by
+    // assigning an owned value, which drops the previous contents.
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { REDOBUFF.get_mut() } = std::mem::take(&mut save_redo.sr_redobuff);
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { OLD_REDOBUFF.get_mut() } = std::mem::take(&mut save_redo.sr_old_redobuff);
+}
+
+/// Append `s` to the redo buffer (`AppendToRedobuff`).
+///
+/// `K_SPECIAL` should already have been escaped by the caller.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `REDOBUFF` or
+/// `BLOCK_REDO`.
+pub unsafe fn append_to_redobuff(s: &[u8]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    add_buff(unsafe { REDOBUFF.get_mut() }, s);
+}
+
+/// Append one character to the redo buffer (`AppendCharToRedobuff`),
+/// translating special keys, NUL, `K_SPECIAL` and multibyte
+/// characters.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `REDOBUFF` or
+/// `BLOCK_REDO`.
+pub unsafe fn append_char_to_redobuff(c: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    add_char_buff(unsafe { REDOBUFF.get_mut() }, c);
+}
+
+/// Append a number to the redo buffer (`AppendNumberToRedobuff`).
+///
+/// # Safety
+/// Must not run concurrently with any other access to `REDOBUFF` or
+/// `BLOCK_REDO`.
+pub unsafe fn append_number_to_redobuff(n: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *BLOCK_REDO.get_mut() } {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    add_num_buff(unsafe { REDOBUFF.get_mut() }, n);
+}
 
 /// Index in `scriptin` (`curscript`). File-static in the original;
 /// `-1` means no script is being read.
@@ -582,6 +702,148 @@ mod tests {
     }
 
     // --- add_buff / add_num_buff / add_byte_buff / add_char_buff ---
+
+    /// Saves and restores the redo-buffer statics, so a failing test
+    /// cannot leak them into another.
+    struct RedobuffGuard {
+        redo: BuffheaderT,
+        old: BuffheaderT,
+        block: bool,
+    }
+
+    impl RedobuffGuard {
+        fn new() -> Self {
+            unsafe {
+                Self {
+                    redo: std::mem::take(REDOBUFF.get_mut()),
+                    old: std::mem::take(OLD_REDOBUFF.get_mut()),
+                    block: *BLOCK_REDO.get_mut(),
+                }
+            }
+        }
+    }
+
+    impl Drop for RedobuffGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *REDOBUFF.get_mut() = std::mem::take(&mut self.redo);
+                *OLD_REDOBUFF.get_mut() = std::mem::take(&mut self.old);
+                *BLOCK_REDO.get_mut() = self.block;
+            }
+        }
+    }
+
+    /// The concatenated bytes currently held in a buffer.
+    fn buff_bytes(buf: &BuffheaderT) -> Vec<u8> {
+        buf.blocks.iter().flat_map(|b| b.b_str.clone()).collect()
+    }
+
+    #[test]
+    fn typeahead_noflush_stores_the_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *TYPEAHEAD_CHAR.get_mut() };
+        unsafe { typeahead_noflush(42) };
+        assert_eq!(unsafe { *TYPEAHEAD_CHAR.get_mut() }, 42);
+        unsafe { *TYPEAHEAD_CHAR.get_mut() = prev };
+    }
+
+    #[test]
+    fn append_to_redobuff_accumulates() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe { append_to_redobuff(b"abc") };
+        unsafe { append_to_redobuff(b"de") };
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"abcde".to_vec());
+    }
+
+    #[test]
+    fn append_number_and_char_to_redobuff() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+
+        unsafe { append_number_to_redobuff(42) };
+        unsafe { append_char_to_redobuff(i32::from(b'z')) };
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"42z".to_vec());
+    }
+
+    #[test]
+    fn block_redo_suppresses_every_append() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        unsafe { append_to_redobuff(b"abc") };
+        unsafe { append_char_to_redobuff(i32::from(b'z')) };
+        unsafe { append_number_to_redobuff(42) };
+        assert!(unsafe { REDOBUFF.get_mut() }.blocks.is_empty());
+    }
+
+    #[test]
+    fn reset_redobuff_moves_the_current_buffer_aside() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"current") };
+
+        unsafe { reset_redobuff() };
+
+        // The redo buffer starts over, and the previous contents are
+        // kept for CTRL-O '.'.
+        assert!(unsafe { REDOBUFF.get_mut() }.blocks.is_empty());
+        assert_eq!(buff_bytes(unsafe { OLD_REDOBUFF.get_mut() }), b"current".to_vec());
+    }
+
+    #[test]
+    fn reset_redobuff_does_nothing_while_redo_is_blocked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        unsafe { append_to_redobuff(b"keep") };
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        unsafe { reset_redobuff() };
+
+        // The buffer is left intact rather than being rotated away.
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"keep".to_vec());
+        assert!(unsafe { OLD_REDOBUFF.get_mut() }.blocks.is_empty());
+    }
+
+    #[test]
+    fn restore_redobuff_puts_both_buffers_back() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { *BLOCK_REDO.get_mut() = false };
+        // Something else is in the buffers at restore time; it must be
+        // replaced, not appended to.
+        unsafe { append_to_redobuff(b"discard me") };
+
+        let mut saved = crate::input_defs::SaveRedoT::default();
+        add_buff(&mut saved.sr_redobuff, b"saved");
+        add_buff(&mut saved.sr_old_redobuff, b"saved-old");
+
+        unsafe { restore_redobuff(&mut saved) };
+
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"saved".to_vec());
+        assert_eq!(buff_bytes(unsafe { OLD_REDOBUFF.get_mut() }), b"saved-old".to_vec());
+    }
+
+    #[test]
+    fn restore_redobuff_ignores_block_redo() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        // Unlike the appends and ResetRedobuff, the original's
+        // restoreRedobuff has no block_redo guard at all.
+        unsafe { *BLOCK_REDO.get_mut() = true };
+
+        let mut saved = crate::input_defs::SaveRedoT::default();
+        add_buff(&mut saved.sr_redobuff, b"saved");
+
+        unsafe { restore_redobuff(&mut saved) };
+        assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"saved".to_vec());
+    }
 
     #[test]
     fn add_buff_skips_empty_strings() {
