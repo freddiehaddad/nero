@@ -39,6 +39,14 @@
 //! `fuzmatch_str_free` needs no counterpart: dropping the owned
 //! `Vec<u8>`/`Vec<FuzmatchStrT>` is what frees them.
 //!
+//! Also [`fuzzy_match_func_compare`]/[`fuzzy_match_func_sort`], which
+//! additionally sort `<SNR>` function names to the end. Two details
+//! are preserved rather than tidied: the check tests only the FIRST
+//! byte for `'<'` (so any name starting with `'<'` is pushed back, not
+//! just a real `<SNR>` prefix), and it runs BEFORE the score
+//! comparison, so it dominates - a high-scoring `<SNR>` name still
+//! sorts after a low-scoring ordinary one.
+//!
 //! Deferred: `fuzzy_match_in_list`/`fuzzy_match_str_with_pos`/
 //! `fuzzy_match_str_in_line`/`search_for_fuzzy_match`/`f_matchfuzzy`/
 //! `f_matchfuzzypos`/everything operating on `list_T`/`typval_T`/`buf_T`/
@@ -97,6 +105,65 @@ mod fuzmatch_tests {
     }
 
     #[test]
+    fn fuzzy_match_func_compare_sorts_angle_bracket_names_to_the_end() {
+        let snr = FuzmatchStrT {
+            idx: 0,
+            str: b"<SNR>1_foo".to_vec(),
+            score: 100,
+        };
+        let plain = FuzmatchStrT {
+            idx: 1,
+            str: b"foo".to_vec(),
+            score: 1,
+        };
+        // The '<' check runs BEFORE the score comparison, so it
+        // dominates: the high-scoring <SNR> name still sorts last.
+        assert_eq!(
+            fuzzy_match_func_compare(&plain, &snr),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            fuzzy_match_func_compare(&snr, &plain),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_func_compare_falls_back_to_the_score_order() {
+        // Two ordinary names compare exactly like the str comparator.
+        for (a, b) in [(item(0, 10), item(1, 5)), (item(1, 7), item(2, 7))] {
+            assert_eq!(
+                fuzzy_match_func_compare(&a, &b),
+                fuzzy_match_str_compare(&a, &b)
+            );
+        }
+        // Two <SNR> names also fall through to the score order.
+        let a = FuzmatchStrT { idx: 0, str: b"<a".to_vec(), score: 5 };
+        let b = FuzmatchStrT { idx: 1, str: b"<b".to_vec(), score: 20 };
+        assert_eq!(
+            fuzzy_match_func_compare(&a, &b),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_func_sort_puts_every_angle_bracket_name_last() {
+        let mut v = vec![
+            FuzmatchStrT { idx: 0, str: b"<SNR>x".to_vec(), score: 99 },
+            FuzmatchStrT { idx: 1, str: b"aaa".to_vec(), score: 5 },
+            FuzmatchStrT { idx: 2, str: b"<SNR>y".to_vec(), score: 50 },
+            FuzmatchStrT { idx: 3, str: b"bbb".to_vec(), score: 40 },
+        ];
+        fuzzy_match_func_sort(&mut v);
+        // Ordinary names first (by descending score), then the
+        // <SNR> ones (also by descending score).
+        assert_eq!(
+            v.iter().map(|f| f.idx).collect::<Vec<_>>(),
+            vec![3, 1, 0, 2]
+        );
+    }
+
+    #[test]
     fn fuzzy_match_str_compare_puts_higher_scores_first() {
         assert_eq!(
             fuzzy_match_str_compare(&item(0, 10), &item(1, 5)),
@@ -145,6 +212,36 @@ mod fuzmatch_tests {
         fuzzy_match_str_sort(&mut one);
         assert_eq!(one[0].idx, 9);
     }
+}
+
+/// Order two fuzzy function-name matches
+/// (`fuzzy_match_func_compare`).
+///
+/// Same as [`fuzzy_match_str_compare`] except that `<SNR>` functions
+/// sort to the END. The original tests only the FIRST byte for `'<'`,
+/// not the whole `<SNR>` prefix, so any name starting with `'<'` is
+/// pushed back - preserved rather than tightened.
+///
+/// Note the `<`-check runs BEFORE the score comparison, so it
+/// dominates: a high-scoring `<SNR>` name still sorts after a
+/// low-scoring ordinary one.
+#[must_use]
+pub fn fuzzy_match_func_compare(s1: &FuzmatchStrT, s2: &FuzmatchStrT) -> std::cmp::Ordering {
+    let lt1 = s1.str.first() == Some(&b'<');
+    let lt2 = s2.str.first() == Some(&b'<');
+    if !lt1 && lt2 {
+        return std::cmp::Ordering::Less;
+    }
+    if lt1 && !lt2 {
+        return std::cmp::Ordering::Greater;
+    }
+    fuzzy_match_str_compare(s1, s2)
+}
+
+/// Sort fuzzy matches of function names by score, with `<SNR>`
+/// functions sorted to the end (`fuzzy_match_func_sort`).
+pub fn fuzzy_match_func_sort(fm: &mut [FuzmatchStrT]) {
+    fm.sort_by(fuzzy_match_func_compare);
 }
 
 const SCORE_MAX: f64 = f64::INFINITY;
