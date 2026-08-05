@@ -42,9 +42,15 @@
 //! deferred: it needs `vim_regcomp`/`vim_regexec`, and the regex
 //! engine is not translated.
 //!
-//! Deferred: everything else - `get_histentry`/`set_histentry`/
-//! `get_hisidx`/`get_hisnum`/`get_history_arg`/`init_history`/
-//! `add_to_history`/`clr_history`/`f_histadd`/`f_histdel`/
+//! Also the table accessors `get_histentry`/`set_histentry`/
+//! `get_hisidx`/`get_hisnum` and `clr_history`. The original's
+//! accessors return raw `histentry_T *`/`int *` into the file-static
+//! arrays so callers can both read and write; each splits into a
+//! getter plus a `set_*` counterpart here, which is the same
+//! capability without handing out a pointer into a mutable static.
+//!
+//! Deferred: everything else - `get_history_arg`/`init_history`/
+//! `add_to_history`/`f_histadd`/`f_histdel`/
 //! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
 //! history-table storage, and the command-line editing subsystem to
 //! ever populate it).
@@ -217,6 +223,100 @@ pub unsafe fn in_history(
     // NULL; dropping the value does the same.
     slot.additional_data = None;
     true
+}
+
+/// The history table for `hist_type` (`get_histentry`).
+///
+/// The original returns a raw `histentry_T *` into the file-static
+/// array so callers can both read and write it; here that splits into
+/// this read-only view plus [`set_histentry`], which is the same
+/// capability without handing out a pointer into a mutable static.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables.
+#[must_use]
+pub unsafe fn get_histentry(hist_type: HistoryType) -> Vec<HistentryT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISTORY.get_mut() })[hist_type as usize].clone()
+}
+
+/// Replace the history table for `hist_type` (`set_histentry`).
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+pub unsafe fn set_histentry(hist_type: HistoryType, entry: Vec<HistentryT>) {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISTORY.get_mut() })[hist_type as usize] = entry;
+}
+
+/// The last-used index for `hist_type` (`get_hisidx`).
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_hisidx(hist_type: HistoryType) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISIDX.get_mut() })[hist_type as usize]
+}
+
+/// Set the last-used index for `hist_type` - the write half of the
+/// original's own `int *get_hisidx(int)`.
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+pub unsafe fn set_hisidx(hist_type: HistoryType, value: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISIDX.get_mut() })[hist_type as usize] = value;
+}
+
+/// The newest entry number for `hist_type` (`get_hisnum`).
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_hisnum(hist_type: HistoryType) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISNUM.get_mut() })[hist_type as usize]
+}
+
+/// Set the newest entry number for `hist_type` - the write half of
+/// the original's own `int *get_hisnum(int)`.
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+pub unsafe fn set_hisnum(hist_type: HistoryType, value: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISNUM.get_mut() })[hist_type as usize] = value;
+}
+
+/// Clear all entries in a history (`clr_history`).
+///
+/// Returns `OK` when there was something to clear and `histype` was a
+/// real history type, `FAIL` otherwise.
+///
+/// # Safety
+/// Forwarded from [`get_histentry`]'s own safety doc.
+pub unsafe fn clr_history(histype: HistoryType) -> i32 {
+    let hislen = get_hislen();
+    let t = histype as i32;
+    if hislen != 0 && t >= 0 && t < HIST_COUNT as i32 {
+        let t = t as usize;
+        // SAFETY: forwarded from this function's own safety doc.
+        let history = unsafe { HISTORY.get_mut() };
+        // The original walks exactly `hislen` slots; the table is
+        // sized to `hislen` once `init_history` has run, so iterating
+        // it is the same walk without risking an out-of-bounds one.
+        for e in &mut history[t] {
+            hist_free_entry(e);
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        (unsafe { HISIDX.get_mut() })[t] = -1; // mark history as cleared
+        // SAFETY: forwarded from this function's own safety doc.
+        (unsafe { HISNUM.get_mut() })[t] = 0; // reset identifier counter
+        return crate::vim_defs::OK;
+    }
+    crate::vim_defs::FAIL
 }
 
 /// Returns the length of the history tables (`get_hislen`).
@@ -791,6 +891,66 @@ pub(crate) mod tests {
     }
 
     // --- calc_hist_idx / f_histget ---
+
+    #[test]
+    fn history_table_accessors_round_trip() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            // get_histentry sees what with_history installed.
+            let entries = unsafe { get_histentry(HistoryType::Cmd) };
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].hisstrlen, 3);
+
+            // hisidx/hisnum reflect the same setup.
+            assert_eq!(unsafe { get_hisidx(HistoryType::Cmd) }, 1);
+            assert_eq!(unsafe { get_hisnum(HistoryType::Cmd) }, 2);
+
+            // The write halves of the original's own `int *` returns.
+            unsafe { set_hisidx(HistoryType::Cmd, 0) };
+            assert_eq!(unsafe { get_hisidx(HistoryType::Cmd) }, 0);
+            unsafe { set_hisnum(HistoryType::Cmd, 7) };
+            assert_eq!(unsafe { get_hisnum(HistoryType::Cmd) }, 7);
+
+            unsafe { set_histentry(HistoryType::Cmd, Vec::new()) };
+            assert!(unsafe { get_histentry(HistoryType::Cmd) }.is_empty());
+        });
+    }
+
+    #[test]
+    fn clr_history_empties_the_table_and_resets_its_counters() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            assert_eq!(
+                unsafe { clr_history(HistoryType::Cmd) },
+                crate::vim_defs::OK
+            );
+            // Every entry is cleared, but the table keeps its length.
+            let entries = unsafe { get_histentry(HistoryType::Cmd) };
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().all(|e| e.hisstr.is_none()));
+            // hisidx marks the history as cleared; hisnum resets.
+            assert_eq!(unsafe { get_hisidx(HistoryType::Cmd) }, -1);
+            assert_eq!(unsafe { get_hisnum(HistoryType::Cmd) }, 0);
+        });
+    }
+
+    #[test]
+    fn clr_history_fails_when_hislen_is_zero_or_the_type_is_invalid() {
+        let _lock = crate::globals::global_state_test_lock();
+        // hislen is 0 by default, so there is nothing to clear.
+        assert_eq!(get_hislen(), 0);
+        assert_eq!(
+            unsafe { clr_history(HistoryType::Cmd) },
+            crate::vim_defs::FAIL
+        );
+        // A non-real history type fails even with a sized table.
+        with_history(HistoryType::Cmd, &[(b"one", 0)], || {
+            assert_eq!(
+                unsafe { clr_history(HistoryType::Invalid) },
+                crate::vim_defs::FAIL
+            );
+        });
+    }
 
     #[test]
     fn calc_hist_idx_is_negative_one_when_hislen_is_zero() {
