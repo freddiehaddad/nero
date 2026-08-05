@@ -67,11 +67,14 @@
 //! `maptick`/`last_maptick` comparison rather than each consuming a
 //! ring slot.
 //!
-//! Deferred: everything else - `get_history_arg`/`init_history`/
-//! `add_to_history`/`f_histadd`/`f_histdel`/
-//! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
-//! history-table storage, and the command-line editing subsystem to
-//! ever populate it).
+//! Also `get_history_arg`, which yields `:history`'s own argument
+//! completion candidates. The original writes a one-character short
+//! name into the caller's `xp->xp_buf` and returns that pointer purely
+//! for somewhere to put it; an owned `Vec<u8>` needs no scratch space,
+//! so `xp` is not a parameter here at all.
+//!
+//! Deferred: `f_histdel`/`del_history_entry` (need the untranslated
+//! regex engine) and `ex_history` (needs message display).
 
 use crate::globals::GlobalCell;
 
@@ -551,6 +554,38 @@ pub fn hist_char2type(c: i32) -> HistoryType {
     } else {
         HistoryType::Invalid
     }
+}
+
+/// One completion candidate for `:history`'s own argument
+/// (`get_history_arg`), or `None` once `idx` runs past the end.
+///
+/// The candidates are, in order: the six short history names
+/// (`:=@>?/`), then the long names from `HISTORY_NAMES`, then
+/// `"all"`.
+///
+/// The original writes a single short name into the caller's own
+/// `xp->xp_buf` and returns that pointer, purely so it has somewhere
+/// to put a one-character string; an owned `Vec<u8>` needs no such
+/// scratch space, so `xp` is not a parameter here at all.
+#[must_use]
+pub fn get_history_arg(idx: i32) -> Option<Vec<u8>> {
+    const SHORT_NAMES: &[u8] = b":=@>?/";
+    let short_count = SHORT_NAMES.len() as i32;
+    let name_count = HISTORY_NAMES.len() as i32;
+
+    if idx < 0 {
+        return None;
+    }
+    if idx < short_count {
+        return Some(vec![SHORT_NAMES[idx as usize]]);
+    }
+    if idx < short_count + name_count {
+        return Some(HISTORY_NAMES[(idx - short_count) as usize].to_vec());
+    }
+    if idx == short_count + name_count {
+        return Some(b"all".to_vec());
+    }
+    None
 }
 
 /// Table of history names (`history_names[]`), used by
@@ -1095,6 +1130,37 @@ pub(crate) mod tests {
     }
 
     // --- get_history_idx / f_histnr ---
+
+    #[test]
+    fn get_history_arg_lists_short_names_then_long_names_then_all() {
+        // Order comes from the original: the six short names first,
+        // then HISTORY_NAMES, then "all". Real nvim's own
+        // `getcompletion('', 'history')` sorts its output, so it
+        // confirms the SET (`/ : = > ? @ all cmd debug expr input
+        // search` - twelve candidates) rather than this order.
+        let got: Vec<Vec<u8>> = (0..12).filter_map(get_history_arg).collect();
+        assert_eq!(got.len(), 12);
+        assert_eq!(&got[..6], &[b":".to_vec(), b"=".to_vec(), b"@".to_vec(), b">".to_vec(), b"?".to_vec(), b"/".to_vec()]);
+        assert_eq!(got[6], b"cmd".to_vec());
+        assert_eq!(got[10], b"debug".to_vec());
+        assert_eq!(got[11], b"all".to_vec());
+
+        // Sorting our candidates reproduces real nvim's own list.
+        let mut sorted = got.clone();
+        sorted.sort();
+        let joined: Vec<String> = sorted
+            .iter()
+            .map(|s| std::string::String::from_utf8_lossy(s).into_owned())
+            .collect();
+        assert_eq!(joined.join(" "), "/ : = > ? @ all cmd debug expr input search");
+    }
+
+    #[test]
+    fn get_history_arg_is_none_past_the_end() {
+        assert!(get_history_arg(12).is_none());
+        assert!(get_history_arg(99).is_none());
+        assert!(get_history_arg(-1).is_none());
+    }
 
     #[test]
     fn histadd_stores_an_entry_and_reports_success() {
