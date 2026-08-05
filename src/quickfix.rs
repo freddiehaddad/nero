@@ -49,6 +49,12 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: the shared `qfga` scratch grow-array and its
+//! [`qfga_get`]/[`qfga_clear`] pair, which are self-contained buffer
+//! management with no dependency on the parsing machinery. The
+//! original's `static bool initialized` guarding a one-time `ga_init`
+//! becomes a [`std::sync::LazyLock`], so that flag has no counterpart.
+//!
 //! Deferred: everything else in the file - the errorformat parsing
 //! machinery (`efm_T`, `qfstate_T`, `qffields_T`, and the
 //! `dir_stack_T` directory tracking, whose two `qf_list_T` fields are
@@ -238,6 +244,51 @@ pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
 }
 
+/// Shared scratch grow-array reused across quickfix commands to cut
+/// down on alloc/free churn (`qfga`).
+///
+/// The original pairs this with a `static bool initialized` guarding a
+/// one-time `ga_init`; a [`std::sync::LazyLock`] expresses that
+/// directly, so the flag has no counterpart here.
+static QFGA: std::sync::LazyLock<crate::globals::GlobalCell<GarrayT>> =
+    std::sync::LazyLock::new(|| {
+        let mut ga = GarrayT::default();
+        ga.ga_init(1, 256);
+        crate::globals::GlobalCell::new(ga)
+    });
+
+/// Borrow the shared scratch buffer, reset to empty (`qfga_get`).
+///
+/// Retains the previously-allocated capacity, which is the whole point
+/// of sharing it.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `QFGA`.
+pub unsafe fn qfga_get() -> &'static mut GarrayT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ga = unsafe { QFGA.get_mut() };
+    ga.ga_len = 0;
+    ga
+}
+
+/// Release the shared scratch buffer after use (`qfga_clear`).
+///
+/// Frees the backing memory outright if it grew beyond 1000 bytes,
+/// rather than holding a large allocation between commands; otherwise
+/// just resets the length so the capacity is reused.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `QFGA`.
+pub unsafe fn qfga_clear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ga = unsafe { QFGA.get_mut() };
+    if ga.ga_maxlen > 1000 {
+        ga.ga_clear();
+    } else {
+        ga.ga_len = 0;
+    }
+}
+
 /// Adjust quickfix/location-list error entries for changed line numbers.
 ///
 /// `wp` is `None` to check the quickfix list, or `Some` for a potential
@@ -414,6 +465,80 @@ mod tests {
     fn a_default_stack_is_a_quickfix_stack() {
         // QFLT_QUICKFIX is the original enum's own first (zero) value.
         assert_eq!(QfltypeT::default(), QfltypeT::Quickfix);
+    }
+
+    /// Restores `QFGA` after a test, so its shared state cannot leak.
+    struct QfgaGuard;
+
+    impl Drop for QfgaGuard {
+        fn drop(&mut self) {
+            let ga = unsafe { QFGA.get_mut() };
+            ga.ga_clear();
+            ga.ga_init(1, 256);
+        }
+    }
+
+    #[test]
+    fn qfga_get_hands_back_an_empty_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QfgaGuard;
+
+        let ga = unsafe { qfga_get() };
+        ga.ga_len = 17;
+        // Getting it again resets the length, which is what makes it
+        // safe to share between commands.
+        assert_eq!(unsafe { qfga_get() }.ga_len, 0);
+    }
+
+    #[test]
+    fn qfga_clear_keeps_a_small_buffer_allocated() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QfgaGuard;
+
+        let ga = unsafe { qfga_get() };
+        ga.ga_maxlen = 256;
+        ga.ga_len = 42;
+
+        unsafe { qfga_clear() };
+        let ga = unsafe { QFGA.get_mut() };
+        assert_eq!(ga.ga_len, 0);
+        // Capacity is retained - the whole reason the buffer is shared.
+        assert_eq!(ga.ga_maxlen, 256);
+    }
+
+    #[test]
+    fn qfga_clear_frees_a_large_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QfgaGuard;
+
+        let ga = unsafe { qfga_get() };
+        ga.ga_data = vec![0; 2000];
+        ga.ga_maxlen = 2000;
+        ga.ga_len = 2000;
+
+        unsafe { qfga_clear() };
+        let ga = unsafe { QFGA.get_mut() };
+        // Over the 1000-byte threshold the memory is handed back
+        // rather than held between commands.
+        assert_eq!(ga.ga_maxlen, 0);
+        assert!(ga.ga_data.is_empty());
+    }
+
+    #[test]
+    fn qfga_clear_threshold_is_exclusive_at_1000() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QfgaGuard;
+
+        // The original tests `> 1000`, so exactly 1000 is retained.
+        let ga = unsafe { qfga_get() };
+        ga.ga_maxlen = 1000;
+        unsafe { qfga_clear() };
+        assert_eq!(unsafe { QFGA.get_mut() }.ga_maxlen, 1000);
+
+        let ga = unsafe { QFGA.get_mut() };
+        ga.ga_maxlen = 1001;
+        unsafe { qfga_clear() };
+        assert_eq!(unsafe { QFGA.get_mut() }.ga_maxlen, 0);
     }
 
     #[test]
