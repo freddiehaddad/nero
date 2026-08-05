@@ -26,6 +26,20 @@
 //! (never a real history entry to return) unless `{history}` itself
 //! is a type error, matching the original's own `NULL`-string case.
 //!
+//! Also the history tables themselves - `HistentryT`, `HISTORY`,
+//! `HISIDX`, `HISNUM` - plus [`clear_hist_entry`],
+//! [`hist_free_entry`] and [`in_history`]. `hisstr` is an
+//! `Option<Vec<u8>>` so that the original's own `NULL` (an unused ring
+//! slot, which several loops stop on) stays distinguishable from an
+//! empty string. `hisstrlen` is kept as its own field rather than
+//! derived, because the original stores a search history entry's
+//! separator character one byte PAST that length - which is exactly
+//! how `in_history` checks it.
+//!
+//! `hist_free_entry`'s two `xfree` calls have no counterpart: dropping
+//! the owned `Option`s is what frees them, so it reduces to
+//! `clear_hist_entry` plus the ownership release that implies.
+//!
 //! Deferred: everything else - `get_histentry`/`set_histentry`/
 //! `get_hisidx`/`get_hisnum`/`get_history_arg`/`init_history`/
 //! `add_to_history`/`clr_history`/`f_histadd`/`f_histdel`/
@@ -60,6 +74,148 @@ pub const HIST_COUNT: usize = 5;
 
 /// actual length of the history tables (`hislen`).
 static HISLEN: GlobalCell<i32> = GlobalCell::new(0);
+
+/// One command-line history entry (`histentry_T`, `cmdhist.h`).
+#[derive(Debug, Clone, Default)]
+pub struct HistentryT {
+    /// Entry identifier number.
+    pub hisnum: i32,
+    /// Actual entry. `None` models the original's own `NULL`, which
+    /// marks an unused slot in the ring - it is NOT the same as an
+    /// empty string, and several loops here stop on it.
+    pub hisstr: Option<Vec<u8>>,
+    /// Length of `hisstr` (excluding the NUL). Kept as its own field
+    /// rather than derived, because the original stores the search
+    /// separator character one byte PAST that length.
+    pub hisstrlen: usize,
+    /// Time when entry was added.
+    pub timestamp: crate::os::time_defs::Timestamp,
+    /// Additional entries from a ShaDa file.
+    pub additional_data: Option<crate::types_defs::AdditionalData>,
+}
+
+/// The history tables themselves (`history`), one ring buffer per
+/// [`HistoryType`].
+static HISTORY: GlobalCell<[Vec<HistentryT>; HIST_COUNT]> =
+    GlobalCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
+
+/// Index of the last used entry in each table (`hisidx`), `-1` when
+/// the table is empty.
+static HISIDX: GlobalCell<[i32; HIST_COUNT]> = GlobalCell::new([-1; HIST_COUNT]);
+
+/// Identifying (unique) number of the newest history entry in each
+/// table (`hisnum`).
+static HISNUM: GlobalCell<[i32; HIST_COUNT]> = GlobalCell::new([0; HIST_COUNT]);
+
+/// Clear one history entry (`clear_hist_entry`).
+///
+/// The original's `CLEAR_POINTER` zeroes the whole struct, which is
+/// exactly `Default`.
+pub fn clear_hist_entry(hisptr: &mut HistentryT) {
+    *hisptr = HistentryT::default();
+}
+
+/// Free one history entry and clear it (`hist_free_entry`).
+///
+/// The original's two `xfree` calls have no counterpart - dropping
+/// the owned `Option`s is what frees them - so this is
+/// [`clear_hist_entry`] plus the ownership release it implies.
+pub fn hist_free_entry(hisptr: &mut HistentryT) {
+    clear_hist_entry(hisptr);
+}
+
+/// Whether command line `str` is already in history
+/// (`in_history`).
+///
+/// When `move_to_front` is set, a matching entry is rotated to the
+/// end of the history ring and given a fresh entry number and
+/// timestamp. For [`HistoryType::Search`] the separator character
+/// must match too - the original stores it one byte past the entry's
+/// own NUL, so it is read at `hisstrlen + 1`.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables.
+pub unsafe fn in_history(
+    htype: HistoryType,
+    str: &[u8],
+    move_to_front: bool,
+    sep: i32,
+) -> bool {
+    let Ok(t) = usize::try_from(htype as i32) else {
+        return false;
+    };
+    if t >= HIST_COUNT {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisidx = unsafe { HISIDX.get_mut() };
+    if hisidx[t] < 0 {
+        return false;
+    }
+    let hislen = get_hislen();
+    if hislen <= 0 {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let history = unsafe { HISTORY.get_mut() };
+    let mut last_i: i32 = -1;
+    let mut i = hisidx[t];
+    loop {
+        let Some(entry) = history[t].get(i as usize) else {
+            return false;
+        };
+        let Some(p) = entry.hisstr.as_ref() else {
+            return false;
+        };
+
+        // For search history, check that the separator character
+        // matches as well.
+        let sep_ok = htype != HistoryType::Search
+            || p.get(entry.hisstrlen + 1).map(|&c| i32::from(c)) == Some(sep);
+        if p.as_slice() == str && sep_ok {
+            if !move_to_front {
+                return true;
+            }
+            last_i = i;
+            break;
+        }
+        i -= 1;
+        if i < 0 {
+            i = hislen - 1;
+        }
+        if i == hisidx[t] {
+            break;
+        }
+    }
+
+    if last_i < 0 {
+        return false;
+    }
+
+    let saved = history[t][i as usize].clone();
+    while i != hisidx[t] {
+        i += 1;
+        if i >= hislen {
+            i = 0;
+        }
+        history[t][last_i as usize] = history[t][i as usize].clone();
+        last_i = i;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisnum = unsafe { HISNUM.get_mut() };
+    hisnum[t] += 1;
+    let slot = &mut history[t][i as usize];
+    slot.hisnum = hisnum[t];
+    slot.hisstr = saved.hisstr;
+    slot.hisstrlen = saved.hisstrlen;
+    slot.timestamp = crate::os::time::os_time();
+    // The original frees the old `additional_data` here and stores
+    // NULL; dropping the value does the same.
+    slot.additional_data = None;
+    true
+}
 
 /// Returns the length of the history tables (`get_hislen`).
 ///
@@ -255,6 +411,133 @@ pub(crate) mod tests {
         let old = *cell;
         *cell = value;
         old
+    }
+
+    /// Installs `entries` as history table `t` with `hisidx`/`hisnum`
+    /// set, runs `f`, then restores everything. Caller must hold
+    /// `global_state_test_lock()`.
+    fn with_history<R>(
+        t: HistoryType,
+        entries: &[(&[u8], i32)],
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let idx = t as usize;
+        let old_hislen = set_hislen(entries.len() as i32);
+        let history = unsafe { HISTORY.get_mut() };
+        let hisidx = unsafe { HISIDX.get_mut() };
+        let hisnum = unsafe { HISNUM.get_mut() };
+        let saved = (history[idx].clone(), hisidx[idx], hisnum[idx]);
+
+        history[idx] = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (s, sep))| {
+                // The original stores the search separator one byte
+                // PAST the entry's own NUL, so the stored buffer is
+                // "text\0<sep>".
+                let mut buf = (*s).to_vec();
+                buf.push(0);
+                buf.push(u8::try_from(*sep).unwrap_or(0));
+                HistentryT {
+                    hisnum: i as i32 + 1,
+                    hisstrlen: s.len(),
+                    hisstr: Some(buf),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        hisidx[idx] = entries.len() as i32 - 1;
+        hisnum[idx] = entries.len() as i32;
+
+        let result = f();
+
+        let history = unsafe { HISTORY.get_mut() };
+        let hisidx = unsafe { HISIDX.get_mut() };
+        let hisnum = unsafe { HISNUM.get_mut() };
+        (history[idx], hisidx[idx], hisnum[idx]) = saved;
+        set_hislen(old_hislen);
+        result
+    }
+
+    #[test]
+    fn clear_hist_entry_zeroes_every_field() {
+        let mut e = HistentryT {
+            hisnum: 7,
+            hisstr: Some(b"x".to_vec()),
+            hisstrlen: 1,
+            timestamp: 123,
+            additional_data: None,
+        };
+        clear_hist_entry(&mut e);
+        assert_eq!(e.hisnum, 0);
+        assert!(e.hisstr.is_none());
+        assert_eq!(e.hisstrlen, 0);
+        assert_eq!(e.timestamp, 0);
+    }
+
+    #[test]
+    fn hist_free_entry_also_releases_the_entry_text() {
+        let mut e = HistentryT {
+            hisnum: 3,
+            hisstr: Some(b"abc".to_vec()),
+            hisstrlen: 3,
+            ..Default::default()
+        };
+        hist_free_entry(&mut e);
+        assert!(e.hisstr.is_none());
+        assert_eq!(e.hisnum, 0);
+    }
+
+    #[test]
+    fn in_history_is_false_for_an_empty_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        // hisidx is -1 by default, so nothing can match.
+        assert!(!unsafe { in_history(HistoryType::Cmd, b"x", false, 0) });
+    }
+
+    #[test]
+    fn in_history_finds_an_existing_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            assert!(unsafe { in_history(HistoryType::Cmd, b"two\0\0", false, 0) });
+            assert!(unsafe { in_history(HistoryType::Cmd, b"one\0\0", false, 0) });
+            assert!(!unsafe { in_history(HistoryType::Cmd, b"three\0\0", false, 0) });
+        });
+    }
+
+    #[test]
+    fn in_history_requires_a_matching_separator_for_search_history() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Entry stored with separator '/'; only that separator
+        // matches, because HIST_SEARCH checks the byte one PAST the
+        // entry's own NUL.
+        with_history(HistoryType::Search, &[(b"pat", i32::from(b'/'))], || {
+            let stored: &[u8] = b"pat\0/";
+            assert!(unsafe {
+                in_history(HistoryType::Search, stored, false, i32::from(b'/'))
+            });
+            assert!(!unsafe {
+                in_history(HistoryType::Search, stored, false, i32::from(b'?'))
+            });
+        });
+    }
+
+    #[test]
+    fn in_history_move_to_front_rotates_the_entry_and_renumbers_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            // Moving the OLDER entry to the front rotates the ring.
+            assert!(unsafe { in_history(HistoryType::Cmd, b"one\0\0", true, 0) });
+            let history = unsafe { HISTORY.get_mut() };
+            let idx = HistoryType::Cmd as usize;
+            let last = unsafe { HISIDX.get_mut() }[idx] as usize;
+            assert_eq!(
+                history[idx][last].hisstr.as_deref(),
+                Some(&b"one\0\0"[..])
+            );
+            // It gets a fresh, higher entry number.
+            assert_eq!(history[idx][last].hisnum, 3);
+        });
     }
 
     #[test]
