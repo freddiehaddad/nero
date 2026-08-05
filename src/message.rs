@@ -25,6 +25,13 @@
 //! omitted per this crate's established policy; the `FAIL` return and
 //! the `verbose_did_open` "only try once" latch are both preserved.
 //!
+//! Also translated: [`set_keep_msg`] - the "message to redisplay after
+//! a redraw" setter. It needs only `keep_msg`/`keep_msg_hl_id`/
+//! `msg_silent` (all already present) plus a new `keep_msg_more`
+//! global, and none of the message pipeline. Its `xfree`/`xstrdup`
+//! pair collapses into a single assignment to an owned
+//! `Option<Vec<u8>>`, since dropping the old value frees it.
+//!
 //! `DEFAULT_GRID` is harvested here ahead of its real owning file,
 //! `grid.c` (not translated) - it is the original's own file-static
 //! `ScreenGrid default_grid` (declared in `grid.c`, `SCREEN_GRID_INIT`-
@@ -492,6 +499,33 @@ pub fn emsg_not_now() -> bool {
         || globals.emsg_skip > 0
 }
 
+/// Set `keep_msg` to `s`, the message to redisplay after a redraw
+/// (`set_keep_msg`).
+///
+/// Takes an `Option<&[u8]>` where the original takes a possibly-NULL
+/// `const char *`, and stores an owned copy - so the original's
+/// `xfree(keep_msg)`/`xstrdup(s)` pair is just the assignment here
+/// (dropping the old `Option` frees it).
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `crate::globals::GLOBALS`.
+pub unsafe fn set_keep_msg(s: Option<&[u8]>, hl_id: i32) {
+    // Kept message is not cleared and re-emitted with ext_messages.
+    if crate::ui::ui_has(crate::ui::UiExtension::Messages) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    globals.keep_msg = match s {
+        Some(s) if globals.msg_silent == 0 => Some(s.to_vec()),
+        _ => None,
+    };
+    globals.keep_msg_more = false;
+    globals.keep_msg_hl_id = hl_id;
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -507,6 +541,70 @@ pub(crate) mod tests {
         let old = *cell;
         *cell = value;
         old
+    }
+
+    #[test]
+    fn set_keep_msg_stores_an_owned_copy() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (globals.keep_msg.clone(), globals.keep_msg_hl_id, globals.msg_silent);
+
+        globals.msg_silent = 0;
+        unsafe { set_keep_msg(Some(b"hello"), 7) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.keep_msg.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(globals.keep_msg_hl_id, 7);
+        assert!(!globals.keep_msg_more);
+
+        (globals.keep_msg, globals.keep_msg_hl_id, globals.msg_silent) = saved;
+    }
+
+    #[test]
+    fn set_keep_msg_none_clears_the_message() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (globals.keep_msg.clone(), globals.keep_msg_hl_id, globals.msg_silent);
+
+        globals.msg_silent = 0;
+        unsafe { set_keep_msg(Some(b"hello"), 1) };
+        unsafe { set_keep_msg(None, 3) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(globals.keep_msg, None);
+        // The highlight id is still updated even when clearing.
+        assert_eq!(globals.keep_msg_hl_id, 3);
+
+        (globals.keep_msg, globals.keep_msg_hl_id, globals.msg_silent) = saved;
+    }
+
+    #[test]
+    fn set_keep_msg_stores_nothing_while_msg_silent() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (globals.keep_msg.clone(), globals.keep_msg_hl_id, globals.msg_silent);
+
+        globals.msg_silent = 1;
+        unsafe { set_keep_msg(Some(b"hello"), 5) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        // A silenced message is dropped, but hl_id still follows it.
+        assert_eq!(globals.keep_msg, None);
+        assert_eq!(globals.keep_msg_hl_id, 5);
+
+        (globals.keep_msg, globals.keep_msg_hl_id, globals.msg_silent) = saved;
+    }
+
+    #[test]
+    fn set_keep_msg_resets_keep_msg_more() {
+        let _guard = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (globals.keep_msg.clone(), globals.keep_msg_more, globals.msg_silent);
+
+        globals.msg_silent = 0;
+        globals.keep_msg_more = true;
+        unsafe { set_keep_msg(Some(b"x"), 0) };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(!globals.keep_msg_more);
+
+        (globals.keep_msg, globals.keep_msg_more, globals.msg_silent) = saved;
     }
 
     #[test]

@@ -277,6 +277,8 @@ pub struct Globals {
     pub keep_msg: Option<Vec<u8>>,
     /// highlight id for `keep_msg`
     pub keep_msg_hl_id: i32,
+    /// `keep_msg` was set by `msg_more()`
+    pub keep_msg_more: bool,
     /// do fileinfo() after redraw
     pub need_fileinfo: bool,
     /// `msg_start()` will scroll
@@ -934,6 +936,7 @@ impl Default for Globals {
             msg_did_scroll: false,
             keep_msg: None,
             keep_msg_hl_id: 0,
+            keep_msg_more: false,
             need_fileinfo: false,
             msg_scroll: 0,
             msg_didout: false,
