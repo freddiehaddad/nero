@@ -29,6 +29,14 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: [`pum_wanted`]/[`ins_compl_has_preinsert`]/
+//! [`get_compl_len`]. `ins_compl_has_preinsert` needs a DIFFERENT
+//! flag combination per mode - without autocomplete it wants
+//! `preinsert` AND `menuone` and NOT `fuzzy`; with autocomplete the
+//! `menuone` requirement drops, and it is disabled outright while
+//! `'ignorecase'` is on without `'infercase'`. Neither branch is
+//! simply "is preinsert set".
+//!
 //! Also translated: [`ins_compl_leader`]/[`ins_compl_leader_len`] and
 //! the `compl_leader`/`compl_orig_text` statics. These are
 //! `Option<Vec<u8>>` because the original tests `.data != NULL`
@@ -204,6 +212,70 @@ static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// Whether the popup menu should be displayed (`pum_wanted`).
+///
+/// `'completeopt'` must contain `menu` or `menuone`, unless
+/// autocomplete is on - which wants the menu regardless.
+///
+/// # Safety
+/// Forwarded from [`get_cot_flags`].
+#[must_use]
+pub unsafe fn pum_wanted() -> bool {
+    use crate::option_vars::opt_cot_flag::{MENU, MENUONE};
+    // SAFETY: forwarded from this function's own safety doc.
+    if (unsafe { get_cot_flags() }) & (MENU | MENUONE) != 0 {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_AUTOCOMPLETE.get_mut() }
+}
+
+/// Whether `'completeopt'`'s `preinsert` effect is in force
+/// (`ins_compl_has_preinsert`).
+///
+/// The required flag combination differs by mode, and neither branch
+/// is simply "is preinsert set": without autocomplete it needs
+/// `preinsert` AND `menuone` and NOT `fuzzy`; with autocomplete it
+/// needs `preinsert` and NOT `fuzzy`, and is disabled outright while
+/// `'ignorecase'` is on without `'infercase'`.
+///
+/// # Safety
+/// Forwarded from [`get_cot_flags`].
+#[must_use]
+pub unsafe fn ins_compl_has_preinsert() -> bool {
+    use crate::option_vars::opt_cot_flag::{FUZZY, MENUONE, PREINSERT};
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur_cot_flags = unsafe { get_cot_flags() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let autocomplete = unsafe { *COMPL_AUTOCOMPLETE.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+
+    if autocomplete && opts.p_ic != 0 && opts.p_inf == 0 {
+        return false;
+    }
+    if autocomplete {
+        cur_cot_flags & (PREINSERT | FUZZY) == PREINSERT
+    } else {
+        cur_cot_flags & (PREINSERT | FUZZY | MENUONE) == (PREINSERT | MENUONE)
+    }
+}
+
+/// The length of the completion so far (`get_compl_len`): from the
+/// completion start column to the cursor column, never negative.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer,
+/// and this must not run concurrently with any write to `COMPL_COL`.
+#[must_use]
+pub unsafe fn get_compl_len() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor_col = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.col };
+    // SAFETY: forwarded from this function's own safety doc.
+    let start_col = unsafe { *COMPL_COL.get_mut() };
+    (cursor_col - start_col).max(0)
+}
 
 /// The text typed so far that matches are filtered against
 /// (`compl_leader`).
@@ -1090,6 +1162,130 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
         }
+    }
+
+    #[test]
+    fn pum_wanted_needs_menu_or_menuone_or_autocomplete() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        use crate::option_vars::opt_cot_flag::{FUZZY, MENU, MENUONE};
+
+        for (flags, expected) in [(MENU, true), (MENUONE, true), (FUZZY, false), (0, false)] {
+            let _cot = CotFlagsGuard::set(flags);
+            assert_eq!(unsafe { pum_wanted() }, expected, "flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn pum_wanted_is_forced_on_by_autocomplete() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        let _cot = CotFlagsGuard::set(0);
+
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
+        assert!(unsafe { pum_wanted() });
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
+    }
+
+    #[test]
+    fn ins_compl_has_preinsert_without_autocomplete_needs_menuone_too() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        use crate::option_vars::opt_cot_flag::{FUZZY, MENUONE, PREINSERT};
+
+        for (flags, expected) in [
+            // preinsert alone is NOT enough here.
+            (PREINSERT, false),
+            (PREINSERT | MENUONE, true),
+            // fuzzy disables it either way.
+            (PREINSERT | MENUONE | FUZZY, false),
+            (MENUONE, false),
+        ] {
+            let _cot = CotFlagsGuard::set(flags);
+            assert_eq!(
+                unsafe { ins_compl_has_preinsert() },
+                expected,
+                "flags {flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ins_compl_has_preinsert_with_autocomplete_drops_the_menuone_requirement() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        use crate::option_vars::opt_cot_flag::{FUZZY, PREINSERT};
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (pic, pinf) = (opts.p_ic, opts.p_inf);
+        opts.p_ic = 0;
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
+
+        {
+            let _cot = CotFlagsGuard::set(PREINSERT);
+            assert!(unsafe { ins_compl_has_preinsert() });
+        }
+        {
+            let _cot = CotFlagsGuard::set(PREINSERT | FUZZY);
+            assert!(!unsafe { ins_compl_has_preinsert() });
+        }
+
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (opts.p_ic, opts.p_inf) = (pic, pinf);
+    }
+
+    #[test]
+    fn ins_compl_has_preinsert_is_off_for_ignorecase_without_infercase() {
+        let _lock = global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::PREINSERT);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (pic, pinf) = (opts.p_ic, opts.p_inf);
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
+
+        // This early-out applies only with autocomplete on.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (opts.p_ic, opts.p_inf) = (1, 0);
+        assert!(!unsafe { ins_compl_has_preinsert() });
+
+        // 'infercase' cancels the early-out.
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_inf = 1;
+        assert!(unsafe { ins_compl_has_preinsert() });
+
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        (opts.p_ic, opts.p_inf) = (pic, pinf);
+    }
+
+    #[test]
+    fn get_compl_len_is_the_distance_from_the_start_column() {
+        let _lock = global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 10, coladd: 0 },
+            ..Default::default()
+        };
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_win = globals.curwin;
+        globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+        let prev_col = unsafe { *COMPL_COL.get_mut() };
+
+        unsafe { *COMPL_COL.get_mut() = 4 };
+        assert_eq!(unsafe { get_compl_len() }, 6);
+
+        // Never negative, even when the cursor sits before the start.
+        unsafe { *COMPL_COL.get_mut() = 20 };
+        assert_eq!(unsafe { get_compl_len() }, 0);
+
+        unsafe { *COMPL_COL.get_mut() = prev_col };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
     }
 
     /// Saves and restores the completion leader/original-text pair.
