@@ -29,6 +29,14 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: [`ins_compl_leader`]/[`ins_compl_leader_len`] and
+//! the `compl_leader`/`compl_orig_text` statics. These are
+//! `Option<Vec<u8>>` because the original tests `.data != NULL`
+//! rather than the size, so a leader that is SET BUT EMPTY still wins
+//! over the original text - `None` and `Some(vec![])` are genuinely
+//! different states here, the same distinction `cmdhist.rs` needs for
+//! its own `hisstr`.
+//!
 //! Also translated: [`ins_compl_refresh_always`]/
 //! [`ins_compl_need_restart`]/[`ins_compl_has_autocomplete`]. Note
 //! `'autocomplete'` uses a NEGATIVE buffer-local value as its "unset"
@@ -196,6 +204,48 @@ static COMPL_COL: GlobalCell<crate::pos_defs::ColnrT> = GlobalCell::new(0);
 
 /// Length in bytes of the text being completed (`compl_length`).
 static COMPL_LENGTH: GlobalCell<i32> = GlobalCell::new(0);
+
+/// The text typed so far that matches are filtered against
+/// (`compl_leader`).
+///
+/// `None` is the original's NULL `.data`, meaning "no leader set" -
+/// distinct from `Some(vec![])`, a leader that is set but empty. That
+/// distinction is what [`ins_compl_leader`]'s fallback turns on, so
+/// collapsing the two would change behaviour.
+static COMPL_LEADER: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
+
+/// The text as it was before completion started (`compl_orig_text`).
+static COMPL_ORIG_TEXT: GlobalCell<Option<Vec<u8>>> = GlobalCell::new(None);
+
+/// The current completion leader (`ins_compl_leader`), falling back to
+/// the original text when no leader is set.
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_LEADER` or
+/// `COMPL_ORIG_TEXT`.
+#[must_use]
+pub unsafe fn ins_compl_leader() -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let leader = unsafe { COMPL_LEADER.get_mut() };
+    if let Some(leader) = leader.as_deref() {
+        return Some(leader);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { COMPL_ORIG_TEXT.get_mut() }.as_deref()
+}
+
+/// The length of the current completion leader
+/// (`ins_compl_leader_len`), falling back to the original text's
+/// length the same way [`ins_compl_leader`] does.
+///
+/// # Safety
+/// Must not run concurrently with any write to `COMPL_LEADER` or
+/// `COMPL_ORIG_TEXT`.
+#[must_use]
+pub unsafe fn ins_compl_leader_len() -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ins_compl_leader() }.map_or(0, <[u8]>::len)
+}
 
 /// Whether the complete function returned `"always"` in the
 /// `"refresh"` dictionary item (`compl_opt_refresh_always`).
@@ -1040,6 +1090,85 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
         }
+    }
+
+    /// Saves and restores the completion leader/original-text pair.
+    struct ComplTextGuard {
+        leader: Option<Vec<u8>>,
+        orig: Option<Vec<u8>>,
+    }
+
+    impl ComplTextGuard {
+        fn new() -> Self {
+            Self {
+                leader: unsafe { COMPL_LEADER.get_mut() }.clone(),
+                orig: unsafe { COMPL_ORIG_TEXT.get_mut() }.clone(),
+            }
+        }
+    }
+
+    impl Drop for ComplTextGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *COMPL_LEADER.get_mut() = self.leader.take();
+                *COMPL_ORIG_TEXT.get_mut() = self.orig.take();
+            }
+        }
+    }
+
+    #[test]
+    fn ins_compl_leader_prefers_the_leader_over_the_original_text() {
+        let _lock = global_state_test_lock();
+        let _guard = ComplTextGuard::new();
+
+        unsafe {
+            *COMPL_LEADER.get_mut() = Some(b"lead".to_vec());
+            *COMPL_ORIG_TEXT.get_mut() = Some(b"original".to_vec());
+        }
+        assert_eq!(unsafe { ins_compl_leader() }, Some(&b"lead"[..]));
+        assert_eq!(unsafe { ins_compl_leader_len() }, 4);
+    }
+
+    #[test]
+    fn ins_compl_leader_falls_back_to_the_original_text() {
+        let _lock = global_state_test_lock();
+        let _guard = ComplTextGuard::new();
+
+        unsafe {
+            *COMPL_LEADER.get_mut() = None;
+            *COMPL_ORIG_TEXT.get_mut() = Some(b"original".to_vec());
+        }
+        assert_eq!(unsafe { ins_compl_leader() }, Some(&b"original"[..]));
+        assert_eq!(unsafe { ins_compl_leader_len() }, 8);
+    }
+
+    #[test]
+    fn ins_compl_leader_distinguishes_an_empty_leader_from_no_leader() {
+        let _lock = global_state_test_lock();
+        let _guard = ComplTextGuard::new();
+
+        // The original tests `.data != NULL`, not the size, so a
+        // leader that is SET BUT EMPTY still wins over the original
+        // text. Collapsing None and Some(vec![]) would break this.
+        unsafe {
+            *COMPL_LEADER.get_mut() = Some(Vec::new());
+            *COMPL_ORIG_TEXT.get_mut() = Some(b"original".to_vec());
+        }
+        assert_eq!(unsafe { ins_compl_leader() }, Some(&b""[..]));
+        assert_eq!(unsafe { ins_compl_leader_len() }, 0);
+    }
+
+    #[test]
+    fn ins_compl_leader_is_none_when_neither_is_set() {
+        let _lock = global_state_test_lock();
+        let _guard = ComplTextGuard::new();
+
+        unsafe {
+            *COMPL_LEADER.get_mut() = None;
+            *COMPL_ORIG_TEXT.get_mut() = None;
+        }
+        assert_eq!(unsafe { ins_compl_leader() }, None);
+        assert_eq!(unsafe { ins_compl_leader_len() }, 0);
     }
 
     #[test]
