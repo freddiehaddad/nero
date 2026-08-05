@@ -49,6 +49,14 @@
 //! getter plus a `set_*` counterpart here, which is the same
 //! capability without handing out a pointer into a mutable static.
 //!
+//! Also `init_history`, which resizes the tables to match
+//! `'history'`. On resize the original REORDERS the ring into a plain
+//! oldest-first table (copying the oldest run first, then the newest)
+//! and leaves `hisidx` on the last copied entry; that reordering is
+//! preserved and pinned by its own grow/shrink tests. The original's
+//! `memset(temp + l3, 0, ...)` needs no counterpart - the new table is
+//! built from `HistentryT::default()`, which is already that.
+//!
 //! Deferred: everything else - `get_history_arg`/`init_history`/
 //! `add_to_history`/`f_histadd`/`f_histdel`/
 //! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
@@ -319,6 +327,90 @@ pub unsafe fn clr_history(histype: HistoryType) -> i32 {
     crate::vim_defs::FAIL
 }
 
+/// Resize the history tables to match `'history'` (`init_history`).
+///
+/// The tables are circular arrays whose current position is marked by
+/// `hisidx[type]`. On resize the original reallocates and takes the
+/// chance to REORDER them, so the new table is laid out oldest-first
+/// with `hisidx` pointing at the last copied entry. Entries that no
+/// longer fit are freed.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables or to `OPTION_VARS`.
+pub unsafe fn init_history() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_hi = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hi;
+    let newlen = i32::try_from(p_hi).unwrap_or(0).max(0);
+    let oldlen = get_hislen();
+
+    if newlen == oldlen {
+        // history length didn't change
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let history = unsafe { HISTORY.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisidx = unsafe { HISIDX.get_mut() };
+
+    for t in 0..HIST_COUNT {
+        let mut temp: Vec<HistentryT> = vec![HistentryT::default(); newlen.max(0) as usize];
+
+        let j = hisidx[t];
+        // Number of entries actually carried over.
+        let mut l3 = 0;
+        if j >= 0 {
+            // The old array partitions as:
+            //   [0        , i1     ) newest entries to be deleted
+            //   [i1       , i1 + l1) newest entries to be copied
+            //   [i1 + l1  , i2     ) oldest entries to be deleted
+            //   [i2       , i2 + l2) oldest entries to be copied
+            let l1 = (j + 1).min(newlen); // how many newest to copy
+            let l2 = newlen.min(oldlen) - l1; // how many oldest to copy
+            let i1 = j + 1 - l1; // copy newest from here
+            let i2 = l1.max(oldlen - newlen + l1); // copy oldest from here
+
+            if newlen > 0 {
+                // Copy oldest entries, then newest - this is what
+                // reorders the ring into a plain oldest-first table.
+                for k in 0..l2 {
+                    if let Some(e) = history[t].get((i2 + k) as usize) {
+                        temp[k as usize] = e.clone();
+                    }
+                }
+                for k in 0..l1 {
+                    if let Some(e) = history[t].get((i1 + k) as usize) {
+                        temp[(l2 + k) as usize] = e.clone();
+                    }
+                }
+            }
+
+            // Delete entries that don't fit in newlen, if any.
+            for i in 0..i1 {
+                if let Some(e) = history[t].get_mut(i as usize) {
+                    hist_free_entry(e);
+                }
+            }
+            for i in (i1 + l1)..i2 {
+                if let Some(e) = history[t].get_mut(i as usize) {
+                    hist_free_entry(e);
+                }
+            }
+
+            l3 = newlen.min(oldlen);
+        }
+
+        // The remaining space is already cleared: `temp` was built
+        // from `HistentryT::default()`, which is the original's own
+        // `memset(temp + l3, 0, ...)`.
+        hisidx[t] = l3 - 1;
+        history[t] = std::mem::take(&mut temp);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *HISLEN.get_mut() = newlen };
+}
+
 /// Returns the length of the history tables (`get_hislen`).
 ///
 /// Still `0` until `init_history`/`add_to_history` land: those are
@@ -461,12 +553,12 @@ unsafe fn calc_hist_idx(histype: HistoryType, num: i32) -> i32 {
     }
     let t = histype as usize;
     // SAFETY: forwarded from this function's own safety doc.
-    let mut i = unsafe { HISIDX.get_mut() }[t];
+    let mut i = (unsafe { HISIDX.get_mut() })[t];
     if i < 0 {
         return -1;
     }
     // SAFETY: forwarded from this function's own safety doc.
-    let hist = &unsafe { HISTORY.get_mut() }[t];
+    let hist = &(unsafe { HISTORY.get_mut() })[t];
     let at = |i: i32| hist.get(i as usize);
 
     if num > 0 {
@@ -517,7 +609,7 @@ pub unsafe fn del_history_idx(histype: HistoryType, idx: i32) -> bool {
     let t = histype as usize;
     let hislen = get_hislen();
     // SAFETY: forwarded from this function's own safety doc.
-    let idx = unsafe { HISIDX.get_mut() }[t];
+    let idx = (unsafe { HISIDX.get_mut() })[t];
     // SAFETY: forwarded from this function's own safety doc.
     let history = unsafe { HISTORY.get_mut() };
     hist_free_entry(&mut history[t][i as usize]);
@@ -891,6 +983,142 @@ pub(crate) mod tests {
     }
 
     // --- calc_hist_idx / f_histget ---
+
+    /// Runs `f` with `'history'` set to `newlen`, restoring it after.
+    fn with_p_hi<R>(newlen: i64, f: impl FnOnce() -> R) -> R {
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let old = opts.p_hi;
+        opts.p_hi = newlen;
+        let result = f();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hi = old;
+        result
+    }
+
+    /// Restores the history tables and `HISLEN` after a test that
+    /// calls `init_history` directly.
+    fn restore_history_state(saved: ([Vec<HistentryT>; HIST_COUNT], [i32; HIST_COUNT], i32)) {
+        let (hist, idx, len) = saved;
+        *unsafe { HISTORY.get_mut() } = hist;
+        *unsafe { HISIDX.get_mut() } = idx;
+        set_hislen(len);
+    }
+
+    fn save_history_state() -> ([Vec<HistentryT>; HIST_COUNT], [i32; HIST_COUNT], i32) {
+        (
+            unsafe { HISTORY.get_mut() }.clone(),
+            *unsafe { HISIDX.get_mut() },
+            get_hislen(),
+        )
+    }
+
+    #[test]
+    fn init_history_sizes_the_tables_from_the_history_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+
+        with_p_hi(4, || unsafe { init_history() });
+        assert_eq!(get_hislen(), 4);
+        for t in 0..HIST_COUNT {
+            assert_eq!((unsafe { HISTORY.get_mut() })[t].len(), 4);
+            // No entries carried over, so the index marks "empty".
+            assert_eq!((unsafe { HISIDX.get_mut() })[t], -1);
+        }
+
+        restore_history_state(saved);
+    }
+
+    #[test]
+    fn init_history_is_a_no_op_when_the_length_is_unchanged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+
+        with_p_hi(3, || unsafe { init_history() });
+        // Put a recognisable entry in place, then re-run with the
+        // SAME length: the early return must leave it untouched.
+        (unsafe { HISTORY.get_mut() })[0][0].hisnum = 42;
+        (unsafe { HISIDX.get_mut() })[0] = 0;
+        with_p_hi(3, || unsafe { init_history() });
+        assert_eq!((unsafe { HISTORY.get_mut() })[0][0].hisnum, 42);
+        assert_eq!((unsafe { HISIDX.get_mut() })[0], 0);
+
+        restore_history_state(saved);
+    }
+
+    #[test]
+    fn init_history_reorders_entries_oldest_first_when_growing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+
+        // A two-slot ring holding "one","two" with hisidx at the last
+        // slot; growing to four must carry both over, oldest first,
+        // and leave hisidx pointing at the last copied entry.
+        set_hislen(2);
+        (unsafe { HISTORY.get_mut() })[0] = vec![
+            HistentryT { hisnum: 1, hisstr: Some(b"one".to_vec()), hisstrlen: 3, ..Default::default() },
+            HistentryT { hisnum: 2, hisstr: Some(b"two".to_vec()), hisstrlen: 3, ..Default::default() },
+        ];
+        (unsafe { HISIDX.get_mut() })[0] = 1;
+
+        with_p_hi(4, || unsafe { init_history() });
+
+        assert_eq!(get_hislen(), 4);
+        let h = &(unsafe { HISTORY.get_mut() })[0];
+        assert_eq!(h.len(), 4);
+        assert_eq!(h[0].hisnum, 1);
+        assert_eq!(h[1].hisnum, 2);
+        // The grown tail is cleared.
+        assert!(h[2].hisstr.is_none());
+        assert!(h[3].hisstr.is_none());
+        assert_eq!((unsafe { HISIDX.get_mut() })[0], 1);
+
+        restore_history_state(saved);
+    }
+
+    #[test]
+    fn init_history_drops_the_oldest_entries_when_shrinking() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+
+        // Four entries shrinking to two keeps only the NEWEST two.
+        set_hislen(4);
+        (unsafe { HISTORY.get_mut() })[0] = (1..=4)
+            .map(|n| HistentryT {
+                hisnum: n,
+                hisstr: Some(vec![b'a' + n as u8]),
+                hisstrlen: 1,
+                ..Default::default()
+            })
+            .collect();
+        (unsafe { HISIDX.get_mut() })[0] = 3;
+
+        with_p_hi(2, || unsafe { init_history() });
+
+        assert_eq!(get_hislen(), 2);
+        let h = &(unsafe { HISTORY.get_mut() })[0];
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].hisnum, 3);
+        assert_eq!(h[1].hisnum, 4);
+        assert_eq!((unsafe { HISIDX.get_mut() })[0], 1);
+
+        restore_history_state(saved);
+    }
+
+    #[test]
+    fn init_history_clears_the_tables_when_history_is_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+
+        set_hislen(2);
+        (unsafe { HISTORY.get_mut() })[0] = vec![HistentryT::default(); 2];
+        (unsafe { HISIDX.get_mut() })[0] = 1;
+
+        with_p_hi(0, || unsafe { init_history() });
+
+        assert_eq!(get_hislen(), 0);
+        assert!((unsafe { HISTORY.get_mut() })[0].is_empty());
+
+        restore_history_state(saved);
+    }
 
     #[test]
     fn history_table_accessors_round_trip() {
