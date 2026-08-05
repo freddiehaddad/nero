@@ -133,6 +133,57 @@ pub static DIFF_FLAGS: crate::globals::GlobalCell<i32> = crate::globals::GlobalC
         | diff_flag::INLINE_CHAR,
 );
 
+/// Free one diff block (`clear_diffblock`).
+///
+/// # Safety
+/// `dp` must be a non-null pointer to a `DiffT` that was allocated as
+/// a `Box` and is not referenced anywhere else; it is invalid
+/// afterwards.
+pub unsafe fn clear_diffblock(dp: *mut crate::buffer_defs::DiffT) {
+    if dp.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc. Taking
+    // the Box back subsumes the original's `ga_clear(&dp->df_changes)`
+    // plus `xfree(dp)`: dropping it frees the growable array too.
+    drop(unsafe { Box::from_raw(dp) });
+}
+
+/// Free the whole list of diff blocks for tab page `tp`
+/// (`diff_clear`).
+///
+/// Each `df_next` is read BEFORE its block is freed, since reading it
+/// afterwards would be a use-after-free.
+///
+/// # Safety
+/// `tp.tp_first_diff` must be either null or a valid chain of
+/// `Box`-allocated `DiffT`s, none referenced elsewhere.
+pub unsafe fn diff_clear(tp: &mut crate::buffer_defs::TabpageT) {
+    let mut p = tp.tp_first_diff;
+    while !p.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*p).df_next };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { clear_diffblock(p) };
+        p = next;
+    }
+    tp.tp_first_diff = std::ptr::null_mut();
+}
+
+/// Compare two line numbers (`lnum_compare`), the original's `qsort`
+/// comparator for sorting a list of line numbers.
+///
+/// Returns [`std::cmp::Ordering`] rather than a C comparator's
+/// negative/zero/positive `int`, so it drops straight into Rust's own
+/// `sort_by` - the shape already used for `fuzzy.rs`'s comparators.
+#[must_use]
+pub fn lnum_compare(
+    lnum1: crate::pos_defs::LinenrT,
+    lnum2: crate::pos_defs::LinenrT,
+) -> std::cmp::Ordering {
+    lnum1.cmp(&lnum2)
+}
+
 /// Return `true` if `'diffopt'` contains `"closeoff"` (`diffopt_closeoff`).
 #[must_use]
 pub fn diffopt_closeoff() -> bool {
@@ -594,6 +645,72 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    /// Allocates a diff block chain of `n` blocks, returning the head.
+    fn alloc_diff_chain(n: usize) -> *mut crate::buffer_defs::DiffT {
+        let mut head = std::ptr::null_mut();
+        for i in (0..n).rev() {
+            let block = Box::new(crate::buffer_defs::DiffT {
+                df_next: head,
+                df_lnum: [crate::pos_defs::LinenrT::try_from(i).unwrap();
+                    crate::buffer_defs::DB_COUNT],
+                ..Default::default()
+            });
+            head = Box::into_raw(block);
+        }
+        head
+    }
+
+    #[test]
+    fn lnum_compare_orders_line_numbers() {
+        use std::cmp::Ordering;
+        assert_eq!(lnum_compare(1, 2), Ordering::Less);
+        assert_eq!(lnum_compare(2, 1), Ordering::Greater);
+        assert_eq!(lnum_compare(3, 3), Ordering::Equal);
+    }
+
+    #[test]
+    fn lnum_compare_sorts_a_list() {
+        let mut lnums = vec![5, 1, 3, 2, 4];
+        lnums.sort_by(|a, b| lnum_compare(*a, *b));
+        assert_eq!(lnums, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn clear_diffblock_on_null_is_a_no_op() {
+        unsafe { clear_diffblock(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn diff_clear_frees_the_whole_chain() {
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_first_diff: alloc_diff_chain(4),
+            ..Default::default()
+        };
+        assert!(!tp.tp_first_diff.is_null());
+
+        unsafe { diff_clear(&mut tp) };
+
+        // The head is cleared, so a later walk sees no blocks at all.
+        assert!(tp.tp_first_diff.is_null());
+    }
+
+    #[test]
+    fn diff_clear_on_an_empty_tabpage_is_a_no_op() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        unsafe { diff_clear(&mut tp) };
+        assert!(tp.tp_first_diff.is_null());
+    }
+
+    #[test]
+    fn diff_clear_handles_a_single_block() {
+        let mut tp = crate::buffer_defs::TabpageT {
+            tp_first_diff: alloc_diff_chain(1),
+            ..Default::default()
+        };
+        unsafe { diff_clear(&mut tp) };
+        assert!(tp.tp_first_diff.is_null());
+    }
 
     #[test]
     fn diff_flags_default_matches_the_real_diffopt_default() {
