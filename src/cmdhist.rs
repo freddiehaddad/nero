@@ -57,6 +57,16 @@
 //! `memset(temp + l3, 0, ...)` needs no counterpart - the new table is
 //! built from `HistentryT::default()`, which is already that.
 //!
+//! Also `add_to_history`, the last piece needed for entries to
+//! actually be stored. The separator is written one byte PAST the
+//! entry's own NUL (the original allocates `new_entrylen + 2` for
+//! exactly this), which is what `in_history` reads back at
+//! `hisstrlen + 1`. Two behaviours are preserved and pinned by tests:
+//! `:keeppatterns` suppresses only SEARCH history, and consecutive
+//! searches from within one mapping overwrite each other via the
+//! `maptick`/`last_maptick` comparison rather than each consuming a
+//! ring slot.
+//!
 //! Deferred: everything else - `get_history_arg`/`init_history`/
 //! `add_to_history`/`f_histadd`/`f_histdel`/
 //! `ex_history` (need `histentry_T`'s own `AdditionalData`/full
@@ -409,6 +419,105 @@ pub unsafe fn init_history() {
     }
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *HISLEN.get_mut() = newlen };
+}
+
+/// Add the given string to a history (`add_to_history`).
+///
+/// `in_map` marks the entry as coming from inside a mapping;
+/// consecutive searches within one mapping overwrite each other so
+/// only the last is kept. `sep` is the search separator character,
+/// which the original stores one byte PAST the entry's own NUL - so
+/// the buffer allocated is `new_entrylen + 2` bytes.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables, `GLOBALS` or `OPTION_VARS`.
+pub unsafe fn add_to_history(
+    histype: HistoryType,
+    new_entry: &[u8],
+    in_map: bool,
+    sep: i32,
+) {
+    let hislen = get_hislen();
+    if hislen == 0 || histype == HistoryType::Invalid {
+        // no history
+        return;
+    }
+    debug_assert!(histype != HistoryType::Default);
+    let t = histype as usize;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if (globals.cmdmod.cmod_flags & crate::ex_cmds_defs::cmod::KEEPPATTERNS) != 0
+        && histype == HistoryType::Search
+    {
+        return;
+    }
+    let maptick = globals.maptick;
+
+    // Searches inside the same mapping overwrite each other, so that
+    // only the last line is kept. Be careful not to remove a line that
+    // was moved down, only lines that were added.
+    if histype == HistoryType::Search && in_map {
+        // SAFETY: forwarded from this function's own safety doc.
+        let last_maptick = unsafe { LAST_MAPTICK.get_mut() };
+        let s = HistoryType::Search as usize;
+        // SAFETY: forwarded from this function's own safety doc.
+        let hisidx = unsafe { HISIDX.get_mut() };
+        if maptick == *last_maptick && hisidx[s] >= 0 {
+            // Current line is from the same mapping, remove it.
+            // SAFETY: forwarded from this function's own safety doc.
+            let history = unsafe { HISTORY.get_mut() };
+            if let Some(e) = history[s].get_mut(hisidx[s] as usize) {
+                hist_free_entry(e);
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            (unsafe { HISNUM.get_mut() })[t] -= 1;
+            hisidx[s] -= 1;
+            if hisidx[s] < 0 {
+                hisidx[s] = hislen - 1;
+            }
+        }
+        *last_maptick = -1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { in_history(histype, new_entry, true, sep) } {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisidx = unsafe { HISIDX.get_mut() };
+    hisidx[t] += 1;
+    if hisidx[t] == hislen {
+        hisidx[t] = 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let history = unsafe { HISTORY.get_mut() };
+    let Some(hisptr) = history[t].get_mut(hisidx[t] as usize) else {
+        return;
+    };
+    hist_free_entry(hisptr);
+
+    // Store the separator after the NUL of the string - the original
+    // allocates `new_entrylen + 2` bytes for exactly this.
+    let mut buf = new_entry.to_vec();
+    buf.resize(new_entry.len() + 2, 0);
+    buf[new_entry.len() + 1] = u8::try_from(sep).unwrap_or(0);
+    hisptr.hisstr = Some(buf);
+    hisptr.timestamp = crate::os::time::os_time();
+    hisptr.additional_data = None;
+    hisptr.hisstrlen = new_entry.len();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisnum = unsafe { HISNUM.get_mut() };
+    hisnum[t] += 1;
+    history[t][hisidx[t] as usize].hisnum = hisnum[t];
+
+    if histype == HistoryType::Search && in_map {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *LAST_MAPTICK.get_mut() = maptick };
+    }
 }
 
 /// Returns the length of the history tables (`get_hislen`).
@@ -1009,6 +1118,131 @@ pub(crate) mod tests {
             *unsafe { HISIDX.get_mut() },
             get_hislen(),
         )
+    }
+
+    /// Sets up a sized, empty history table, runs `f`, restores.
+    fn with_sized_history<R>(len: i32, f: impl FnOnce() -> R) -> R {
+        let saved = save_history_state();
+        let saved_num = *unsafe { HISNUM.get_mut() };
+        with_p_hi(i64::from(len), || unsafe { init_history() });
+        let result = f();
+        *unsafe { HISNUM.get_mut() } = saved_num;
+        restore_history_state(saved);
+        result
+    }
+
+    #[test]
+    fn add_to_history_stores_an_entry_with_its_separator_after_the_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_sized_history(4, || {
+            unsafe { add_to_history(HistoryType::Search, b"pat", false, i32::from(b'/')) };
+            let t = HistoryType::Search as usize;
+            let idx = (unsafe { HISIDX.get_mut() })[t];
+            assert_eq!(idx, 0);
+            let e = &(unsafe { HISTORY.get_mut() })[t][idx as usize];
+            assert_eq!(e.hisstrlen, 3);
+            assert_eq!(e.hisnum, 1);
+            // The buffer is `new_entrylen + 2` bytes: text, NUL, sep.
+            assert_eq!(e.hisstr.as_deref(), Some(&b"pat\0/"[..]));
+        });
+    }
+
+    #[test]
+    fn add_to_history_advances_and_wraps_the_ring() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_sized_history(2, || {
+            let t = HistoryType::Cmd as usize;
+            for s in [&b"one"[..], b"two", b"three"] {
+                unsafe { add_to_history(HistoryType::Cmd, s, false, 0) };
+            }
+            // Three entries into a two-slot ring wraps back to slot 0.
+            assert_eq!((unsafe { HISIDX.get_mut() })[t], 0);
+            let h = &(unsafe { HISTORY.get_mut() })[t];
+            assert_eq!(h[0].hisstr.as_deref(), Some(&b"three\0\0"[..]));
+            // Entry numbers keep increasing across the wrap.
+            assert_eq!(h[0].hisnum, 3);
+        });
+    }
+
+    #[test]
+    fn add_to_history_does_nothing_without_a_history_or_for_an_invalid_type() {
+        let _lock = crate::globals::global_state_test_lock();
+        // hislen is 0 by default.
+        assert_eq!(get_hislen(), 0);
+        unsafe { add_to_history(HistoryType::Cmd, b"x", false, 0) };
+        assert!((unsafe { HISTORY.get_mut() })[HistoryType::Cmd as usize].is_empty());
+
+        with_sized_history(2, || {
+            unsafe { add_to_history(HistoryType::Invalid, b"x", false, 0) };
+            // Nothing was stored anywhere.
+            let h = unsafe { HISTORY.get_mut() };
+            assert!(h.iter().all(|t| t.iter().all(|e| e.hisstr.is_none())));
+        });
+    }
+
+    #[test]
+    fn add_to_history_skips_search_history_under_keeppatterns() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_sized_history(2, || {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old = globals.cmdmod.cmod_flags;
+            globals.cmdmod.cmod_flags |= crate::ex_cmds_defs::cmod::KEEPPATTERNS;
+
+            unsafe { add_to_history(HistoryType::Search, b"pat", false, 0) };
+            let s = HistoryType::Search as usize;
+            assert_eq!((unsafe { HISIDX.get_mut() })[s], -1);
+
+            // Only SEARCH history is skipped; :cmd history still adds.
+            unsafe { add_to_history(HistoryType::Cmd, b"cmd", false, 0) };
+            assert_eq!((unsafe { HISIDX.get_mut() })[HistoryType::Cmd as usize], 0);
+
+            unsafe { crate::globals::GLOBALS.get_mut() }.cmdmod.cmod_flags = old;
+        });
+    }
+
+    #[test]
+    fn add_to_history_overwrites_consecutive_searches_from_one_mapping() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_sized_history(4, || {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let old_tick = globals.maptick;
+            globals.maptick = 7;
+
+            let s = HistoryType::Search as usize;
+            unsafe { add_to_history(HistoryType::Search, b"aa", true, 0) };
+            assert_eq!((unsafe { HISIDX.get_mut() })[s], 0);
+
+            // Same maptick, so the previous entry is replaced rather
+            // than appended - the index stays put.
+            unsafe { add_to_history(HistoryType::Search, b"bb", true, 0) };
+            assert_eq!((unsafe { HISIDX.get_mut() })[s], 0);
+            assert_eq!(
+                (unsafe { HISTORY.get_mut() })[s][0].hisstr.as_deref(),
+                Some(&b"bb\0\0"[..])
+            );
+
+            unsafe { crate::globals::GLOBALS.get_mut() }.maptick = old_tick;
+        });
+    }
+
+    #[test]
+    fn add_to_history_moves_a_duplicate_to_the_front_instead_of_appending() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_sized_history(4, || {
+            let t = HistoryType::Cmd as usize;
+            unsafe { add_to_history(HistoryType::Cmd, b"one", false, 0) };
+            unsafe { add_to_history(HistoryType::Cmd, b"two", false, 0) };
+            assert_eq!((unsafe { HISIDX.get_mut() })[t], 1);
+
+            // Re-adding an existing entry goes through in_history's
+            // move-to-front path, so no new slot is consumed.
+            unsafe { add_to_history(HistoryType::Cmd, b"one\0\0", false, 0) };
+            assert_eq!((unsafe { HISIDX.get_mut() })[t], 1);
+            assert_eq!(
+                (unsafe { HISTORY.get_mut() })[t][1].hisstr.as_deref(),
+                Some(&b"one\0\0"[..])
+            );
+        });
     }
 
     #[test]
