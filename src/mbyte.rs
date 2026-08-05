@@ -1158,7 +1158,8 @@ pub unsafe fn utf_char2cells(c: i32) -> i32 {
         return 1;
     }
 
-    if !crate::charset::vim_isprintc(c) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { crate::charset::vim_isprintc(c) } {
         // unprintable is displayed either as <xx> or <xxxx>
         return if c > 0xFF { 6 } else { 4 };
     }

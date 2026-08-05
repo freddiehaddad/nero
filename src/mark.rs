@@ -2012,7 +2012,10 @@ pub unsafe fn mark_mb_adjustpos(buf: &mut BufT, lp: &mut PosT) {
         // a double-wide character.
         if lp.coladd == 1
             && p[lp.col as usize] != crate::ascii_defs::TAB
-            && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&p[lp.col as usize..]))
+            // SAFETY: forwarded from this function's own safety doc.
+            && unsafe {
+                crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&p[lp.col as usize..]))
+            }
             // SAFETY: forwarded from this function's own safety doc.
             && unsafe { crate::charset::ptr2cells(&p[lp.col as usize..]) } > 1
         {

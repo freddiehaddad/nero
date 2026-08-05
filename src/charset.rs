@@ -18,18 +18,21 @@
 //! dedicated module of its own in this crate, same treatment as
 //! `buffer.h`'s `buf_meta_total` in `buffer.rs`).
 //!
-//! `vim_isprintc`/`char2cells`/`byte2cells` need `g_chartab`, which isn't
-//! translated (needs `buf_T`/option parsing), but their *default* (pre-
-//! `'isprint'`-customization) values follow a simple, fixed rule directly
-//! verified against `buf_init_chartab`'s own global-reset branch: control
-//! characters unprintable/2-cells, printable ASCII and Latin-1
-//! printable/1-cell. This crate implements exactly that fixed rule
-//! rather than the general `g_chartab` machinery - correct for every
-//! real session that hasn't customized `'isprint'` (the common case),
-//! documented as a simplification on each function rather than
-//! pretending the general mechanism exists. `char2cells`'s special-key
-//! (`IS_SPECIAL`/negative `c`) branch is deferred separately (needs
-//! `keycodes.h`, no current caller passes such a value).
+//! `g_chartab` IS now translated (`G_CHARTAB` plus `buf_init_chartab`/
+//! `parse_isopt`/`check_isopt`), and `vim_isprintc` reads it for real,
+//! so an `'isprint'` customization is reflected. The static starts out
+//! holding exactly what `buf_init_chartab`'s global-reset branch
+//! produces (control characters unprintable/2-cells, printable ASCII
+//! and Latin-1 printable/1-cell), because nero has no startup sequence
+//! to call `init_chartab()` the way the original does.
+//!
+//! `char2cells`/`byte2cells` still use that same rule inline rather
+//! than the table's `CT_CELL_MASK`, and `vim_isidc`/`vim_isfilec`
+//! still use their own fixed default rules - switching those over is a
+//! separate change, documented on each function. `char2cells`'s
+//! special-key (`IS_SPECIAL`/negative `c`) branch is deferred
+//! separately (needs `keycodes.h`, no current caller passes such a
+//! value).
 //!
 //! Deferred (real forward dependencies):
 //! - `init_chartab`/`buf_init_chartab`/`check_isopt`: need `buf_T`
@@ -126,13 +129,48 @@ pub const CT_FNAME_CHAR: u8 = 0x40;
 /// The real character table (`g_chartab`), one entry per byte value:
 /// display cell count in the low bits, plus the `CT_*` flags.
 ///
-/// Built by [`buf_init_chartab`] from `'isident'`/`'isprint'`/
-/// `'isfname'`/`'iskeyword'`. Until that is called this stays all
-/// zeroes, which is why this module's other predicates still use
-/// their documented default-rule approximations rather than reading
-/// it - see each one's own doc comment.
+/// Initialised to exactly what [`buf_init_chartab`]'s global-reset
+/// branch produces with `'display'` not containing `"uhex"`. The
+/// original relies on `init_chartab()` running during startup before
+/// anything reads the table; nero has no startup sequence yet, so
+/// building the same default state up front means readers see the real
+/// table rather than an all-zero one. A later [`buf_init_chartab`]
+/// call overwrites it with the option-derived contents as usual.
 pub static G_CHARTAB: std::sync::LazyLock<crate::globals::GlobalCell<[u8; 256]>> =
-    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new([0; 256]));
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(default_chartab(false)));
+
+/// The default `g_chartab` contents: `buf_init_chartab`'s
+/// global-reset branch, before any of the four options are applied.
+///
+/// `uhex` is whether `'display'` contains `"uhex"`, which controls the
+/// cell width used for unprintable characters.
+#[must_use]
+fn default_chartab(uhex: bool) -> [u8; 256] {
+    let unprintable = if uhex { 4 } else { 2 };
+    let mut tab = [0u8; 256];
+
+    // <Space>..'~' is printable and one cell; everything below is not.
+    let mut c = 0usize;
+    while c < usize::from(b' ') {
+        tab[c] = unprintable;
+        c += 1;
+    }
+    while c <= usize::from(b'~') {
+        tab[c] = 1 + CT_PRINT_CHAR;
+        c += 1;
+    }
+    while c < 256 {
+        if c >= 0xa0 {
+            // UTF-8: 0xa0-0xff are printable (latin1). Also assume
+            // every multi-byte char is a filename char.
+            tab[c] = (CT_PRINT_CHAR | CT_FNAME_CHAR) + 1;
+        } else {
+            tab[c] = unprintable;
+        }
+        c += 1;
+    }
+    tab
+}
 
 /// Set character `c`'s keyword bit in a buffer's own `b_chartab`
 /// (`SET_CHARTAB`).
@@ -351,36 +389,12 @@ pub unsafe fn buf_init_chartab(buf: &mut crate::buffer_defs::BufT, global: bool)
     if global {
         // SAFETY: forwarded from this function's own safety doc.
         let dy = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
-        let unprintable = if dy & crate::option_vars::opt_dy_flag::UHEX != 0 {
-            4
-        } else {
-            2
-        };
-        // SAFETY: forwarded from this function's own safety doc.
-        let chartab = unsafe { G_CHARTAB.get_mut() };
-
+        let uhex = dy & crate::option_vars::opt_dy_flag::UHEX != 0;
         // Default cell widths: <Space>..'~' is 1 (printable), the
         // rest 2 (or 4 with 'display' "uhex"). This also clears every
         // 'isident'/'isfname' flag.
-        let mut c = 0usize;
-        while c < usize::from(b' ') {
-            chartab[c] = unprintable;
-            c += 1;
-        }
-        while c <= usize::from(b'~') {
-            chartab[c] = 1 + CT_PRINT_CHAR;
-            c += 1;
-        }
-        while c < 256 {
-            if c >= 0xa0 {
-                // UTF-8: 0xa0-0xff are printable (latin1). Also
-                // assume every multi-byte char is a filename char.
-                chartab[c] = (CT_PRINT_CHAR | CT_FNAME_CHAR) + 1;
-            } else {
-                chartab[c] = unprintable;
-            }
-            c += 1;
-        }
+        // SAFETY: forwarded from this function's own safety doc.
+        *unsafe { G_CHARTAB.get_mut() } = default_chartab(uhex);
     }
 
     // Init word char flags all to false.
@@ -899,26 +913,24 @@ pub fn vim_str2nr(
 
 /// Check that `c` is a printable character (`vim_isprintc`).
 ///
-/// This uses `g_chartab`'s own DEFAULT initialization rule
-/// (`buf_init_chartab`'s unconditional, global-reset branch) rather
-/// than the real, possibly-`'isprint'`-customized `g_chartab` itself
-/// (not yet translated - needs `buf_T`/option parsing): control
-/// characters (0x00-0x1F, 0x7F-0x9F) are unprintable, printable ASCII
-/// (0x20-0x7E) and Latin-1 (0xA0-0xFF) are printable. This is exactly
-/// the behavior of any real session that hasn't customized
-/// `'isprint'` (a rare, non-default configuration), not a made-up
-/// approximation. For `c >= 0x100`, delegates to
+/// Reads the real `g_chartab`'s `CT_PRINT_CHAR` flag for `c < 0x100`,
+/// so a `'isprint'` customization applied via [`buf_init_chartab`] is
+/// reflected here. For `c >= 0x100`, delegates to
 /// [`crate::mbyte::utf_printable`] (fully general, no option
 /// dependency at all).
+///
+/// # Safety
+/// Must not run concurrently with any write to [`G_CHARTAB`].
 #[must_use]
-pub fn vim_isprintc(c: i32) -> bool {
+pub unsafe fn vim_isprintc(c: i32) -> bool {
     if c <= 0 {
         return false;
     }
     if c >= 0x100 {
         return crate::mbyte::utf_printable(c);
     }
-    (0x20..=0x7E).contains(&c) || c >= 0xA0
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { G_CHARTAB.get_mut() })[c as usize] & CT_PRINT_CHAR != 0
 }
 
 /// Characters in the DEFAULT `'breakat'` value (`" \t!@*-+;:,./?"`) -
@@ -1377,7 +1389,8 @@ pub unsafe fn transchar_nonprint(buf: Option<&crate::buffer_defs::BufT>, c: i32)
 /// [`transchar_nonprint`]).
 #[must_use]
 pub unsafe fn transchar_buf(buf: Option<&crate::buffer_defs::BufT>, c: i32) -> Vec<u8> {
-    if c <= 0xFF && vim_isprintc(c) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if c <= 0xFF && unsafe { vim_isprintc(c) } {
         // printable character
         vec![c as u8, 0]
     } else if c <= 0xFF {
@@ -1462,7 +1475,8 @@ pub unsafe fn transstr(s: &[u8], untab: bool) -> Vec<u8> {
         let l = unsafe { crate::mbyte::utfc_ptr2len(&s[pos..]) } as usize;
         if l > 1 {
             let c = crate::mbyte::utf_ptr2char(&s[pos..]);
-            if vim_isprintc(c) {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { vim_isprintc(c) } {
                 out.extend_from_slice(&s[pos..pos + l]);
             } else {
                 let mut off = 0usize;
@@ -1965,21 +1979,26 @@ mod tests {
 
     #[test]
     fn vim_isprintc_matches_g_chartab_default_rule_below_0x100() {
-        assert!(!vim_isprintc(0)); // NUL
-        assert!(!vim_isprintc(-1));
-        assert!(!vim_isprintc(0x1f)); // control char
-        assert!(vim_isprintc(i32::from(b' '))); // start of printable ASCII
-        assert!(vim_isprintc(i32::from(b'~'))); // end of printable ASCII
-        assert!(!vim_isprintc(0x7f)); // DEL
-        assert!(!vim_isprintc(0x9f)); // still in the unprintable gap
-        assert!(vim_isprintc(0xa0)); // start of printable Latin-1
-        assert!(vim_isprintc(0xff)); // end of printable Latin-1
+        let _guard = crate::globals::global_state_test_lock();
+        // These are unchanged from before `vim_isprintc` started
+        // reading the real table: `G_CHARTAB`'s default contents
+        // reproduce the default rule exactly.
+        assert!(!unsafe { vim_isprintc(0) }); // NUL
+        assert!(!unsafe { vim_isprintc(-1) });
+        assert!(!unsafe { vim_isprintc(0x1f) }); // control char
+        assert!(unsafe { vim_isprintc(i32::from(b' ')) }); // start of printable ASCII
+        assert!(unsafe { vim_isprintc(i32::from(b'~')) }); // end of printable ASCII
+        assert!(!unsafe { vim_isprintc(0x7f) }); // DEL
+        assert!(!unsafe { vim_isprintc(0x9f) }); // still in the unprintable gap
+        assert!(unsafe { vim_isprintc(0xa0) }); // start of printable Latin-1
+        assert!(unsafe { vim_isprintc(0xff) }); // end of printable Latin-1
     }
 
     #[test]
     fn vim_isprintc_delegates_to_utf_printable_at_and_above_0x100() {
-        assert!(vim_isprintc(0x0100)); // ordinary Latin Extended-A
-        assert!(!vim_isprintc(0x200b)); // in utf_printable's nonprint table
+        let _guard = crate::globals::global_state_test_lock();
+        assert!(unsafe { vim_isprintc(0x0100) }); // ordinary Latin Extended-A
+        assert!(!unsafe { vim_isprintc(0x200b) }); // in utf_printable's nonprint table
     }
 
     #[test]
@@ -2897,6 +2916,55 @@ mod tests {
             crate::vim_defs::OK
         );
         assert_eq!(unsafe { G_CHARTAB.get_mut() }[usize::from(b'a')], 0);
+    }
+
+    #[test]
+    fn vim_isprintc_reflects_an_isprint_customization() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+
+        // 0x80 is unprintable by default...
+        assert!(!unsafe { vim_isprintc(0x80) });
+        // ...but 'isprint' can say otherwise, and vim_isprintc now
+        // genuinely reads the table rather than a fixed rule.
+        assert_eq!(
+            unsafe { parse_isopt(b"128", None, IsOpt::Print, false) },
+            crate::vim_defs::OK
+        );
+        assert!(unsafe { vim_isprintc(0x80) });
+
+        // And '^' removes it again.
+        assert_eq!(
+            unsafe { parse_isopt(b"^128", None, IsOpt::Print, false) },
+            crate::vim_defs::OK
+        );
+        assert!(!unsafe { vim_isprintc(0x80) });
+    }
+
+    #[test]
+    fn default_chartab_uhex_only_changes_unprintable_cell_widths() {
+        let plain = default_chartab(false);
+        let uhex = default_chartab(true);
+        // Printable characters are unaffected by 'display' "uhex".
+        assert_eq!(plain[usize::from(b'a')], uhex[usize::from(b'a')]);
+        assert_eq!(plain[0xa0], uhex[0xa0]);
+        // Unprintable ones widen from 2 cells to 4.
+        assert_eq!(plain[0] & CT_CELL_MASK, 2);
+        assert_eq!(uhex[0] & CT_CELL_MASK, 4);
+        assert_eq!(plain[0x7f] & CT_CELL_MASK, 2);
+        assert_eq!(uhex[0x7f] & CT_CELL_MASK, 4);
+        // Neither marks them printable.
+        assert_eq!(plain[0] & CT_PRINT_CHAR, 0);
+        assert_eq!(uhex[0] & CT_PRINT_CHAR, 0);
+    }
+
+    #[test]
+    fn g_chartab_starts_out_holding_the_default_table() {
+        let _guard = crate::globals::global_state_test_lock();
+        let _chartab = ChartabGuard::new();
+        // Whatever else has run, buf_init_chartab(global) with the
+        // default options must reproduce the static's initial value.
+        assert_eq!(*unsafe { G_CHARTAB.get_mut() }, default_chartab(false));
     }
 
     #[test]

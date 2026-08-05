@@ -1097,7 +1097,8 @@ pub unsafe fn getvvcol(
         // SAFETY: forwarded from this function's own safety doc.
         if pos.col < unsafe { crate::memline::ml_get_buf_len(buf, pos.lnum) } {
             let c = crate::mbyte::utf_ptr2char(&ptr[pos.col as usize..]);
-            if c != i32::from(TAB) && crate::charset::vim_isprintc(c) {
+            // SAFETY: forwarded from this function's own safety doc.
+            if c != i32::from(TAB) && unsafe { crate::charset::vim_isprintc(c) } {
                 // SAFETY: forwarded from this function's own safety doc.
                 endadd = unsafe { crate::charset::ptr2cells(&ptr[pos.col as usize..]) } - 1;
                 if coladd > endadd {

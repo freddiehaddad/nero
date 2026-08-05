@@ -153,7 +153,8 @@ pub unsafe fn oneright() -> i32 {
         // SAFETY: forwarded from this function's own safety doc.
         let viscol = unsafe { crate::cursor::getviscol() };
         let extra = if ptr.first() != Some(&crate::ascii_defs::TAB)
-            && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr))
+            // SAFETY: forwarded from this function's own safety doc.
+            && unsafe { crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr)) }
         {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { crate::charset::ptr2cells(&ptr) }
@@ -238,7 +239,8 @@ pub unsafe fn oneleft() -> i32 {
             // SAFETY: forwarded from this function's own safety doc.
             let ptr = unsafe { crate::cursor::get_cursor_pos_ptr() };
             if ptr.first() != Some(&crate::ascii_defs::TAB)
-                && crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr))
+                // SAFETY: forwarded from this function's own safety doc.
+                && unsafe { crate::charset::vim_isprintc(crate::mbyte::utf_ptr2char(&ptr)) }
                 // SAFETY: forwarded from this function's own safety doc.
                 && unsafe { crate::charset::ptr2cells(&ptr) } > 1
             {

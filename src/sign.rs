@@ -151,7 +151,8 @@ pub unsafe fn init_sign_text(
         if let Some(slot) = sign_text.get_mut(cells) {
             *slot = sc;
         }
-        if !crate::charset::vim_isprintc(c) {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { crate::charset::vim_isprintc(c) } {
             break;
         }
         // SAFETY: a plain width lookup; the slice is non-empty.
