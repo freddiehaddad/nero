@@ -608,25 +608,76 @@ pub fn get_histtype(name: &[u8], return_default: bool) -> HistoryType {
 }
 
 /// Gets the identifier of the newest entry in history table `histype`
-/// (`get_history_idx`). Always `-1` today: [`get_hislen`] always
-/// returns `0` (no history entry can exist yet), so this function's
-/// own real early-return condition is always taken - a faithful,
-/// always-taken early return (matching this crate's established
-/// `AUTOCMDS`/`cmdline_is_active` precedent), not a hardcoded
-/// shortcut. The real per-table `hisidx[]` lookup (reached only once
-/// `init_history`/`add_to_history` exist) is `unimplemented!()`.
+/// (`get_history_idx`), or `-1` when there is no such entry.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables.
 #[must_use]
-pub fn get_history_idx(histype: HistoryType) -> i32 {
+pub unsafe fn get_history_idx(histype: HistoryType) -> i32 {
     if get_hislen() == 0 || (histype as i32) < 0 || (histype as i32) >= HIST_COUNT as i32 {
         return -1;
     }
-    unimplemented!("get_history_idx: needs the real hisidx[]/history[] table, not yet translated")
+    let t = histype as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let idx = (unsafe { HISIDX.get_mut() })[t];
+    if idx < 0 {
+        return -1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { HISTORY.get_mut() })[t]
+        .get(idx as usize)
+        .map_or(-1, |e| e.hisnum)
+}
+
+/// `histadd({history}, {item})` - add `{item}` to the given history
+/// (`f_histadd`, `cmdhist.c`). Returns `1` on success, `0` otherwise.
+///
+/// Safe like its `f_histget`/`f_histnr` siblings so it can go in
+/// `funcs.rs`'s own builtin table, which holds plain `fn` pointers;
+/// the history tables' exclusive-access requirement is discharged
+/// internally, since Vimscript evaluation is single-threaded.
+pub fn f_histadd(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(0);
+    // SAFETY: single-threaded Vimscript evaluation - see this
+    // function's own doc comment.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+    let histype = match crate::eval::typval::tv_get_string_chk(&argvars[0]) {
+        Some(name) => get_histtype(&name, false),
+        None => HistoryType::Invalid,
+    };
+    if histype == HistoryType::Invalid {
+        return;
+    }
+
+    // The original's `tv_get_string_buf` differs from `tv_get_string`
+    // only in taking a caller-supplied scratch buffer for the
+    // number-to-string conversion; an owned return needs none.
+    let str = match argvars.get(1) {
+        Some(a) => crate::eval::typval::tv_get_string(a),
+        None => Vec::new(),
+    };
+    if str.first().copied().unwrap_or(0) == 0 {
+        return;
+    }
+
+    // SAFETY: as above.
+    unsafe { init_history() };
+    // SAFETY: as above.
+    unsafe { add_to_history(histype, &str, false, 0) };
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(1);
 }
 
 /// `histnr({history})` - the identifier of the newest entry in the
 /// given history table, or `-1` for an unknown history name
-/// (`f_histnr`, `cmdhist.c`). Always `-1` today, since
-/// [`get_history_idx`]'s own real early-return is always taken.
+/// (`f_histnr`, `cmdhist.c`).
+///
+/// Safe for the same reason as [`f_histadd`].
 pub fn f_histnr(
     argvars: &[crate::eval::typval_defs::TypvalT],
     rettv: &mut crate::eval::typval_defs::TypvalT,
@@ -636,7 +687,13 @@ pub fn f_histnr(
         Some(name) => get_histtype(name, false),
         None => HistoryType::Invalid,
     };
-    let n = if i == HistoryType::Invalid { HistoryType::Invalid as i32 } else { get_history_idx(i) };
+    let n = if i == HistoryType::Invalid {
+        HistoryType::Invalid as i32
+    } else {
+        // SAFETY: single-threaded Vimscript evaluation - see this
+        // function's own doc comment.
+        unsafe { get_history_idx(i) }
+    };
     rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
 }
 
@@ -773,7 +830,10 @@ pub fn f_histget(
             let idx = if argvars.len() > 1 {
                 crate::eval::typval::tv_get_number_chk(&argvars[1], None) as i32
             } else {
-                get_history_idx(histype)
+                // SAFETY: exclusive access to the history tables -
+                // `f_histget` is only reached from single-threaded
+                // Vimscript evaluation.
+                unsafe { get_history_idx(histype) }
             };
             // SAFETY: exclusive access to the history tables, as
             // required by `calc_hist_idx` - `f_histget` is only
@@ -1037,30 +1097,108 @@ pub(crate) mod tests {
     // --- get_history_idx / f_histnr ---
 
     #[test]
+    fn histadd_stores_an_entry_and_reports_success() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+        let saved_num = *unsafe { HISNUM.get_mut() };
+
+        with_p_hi(4, || {
+            let mut rettv = crate::eval::typval_defs::TypvalT::default();
+            f_histadd(
+                &[
+                    crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::String(Some(
+                            b"cmd".to_vec(),
+                        )),
+                        ..Default::default()
+                    },
+                    crate::eval::typval_defs::TypvalT {
+                        value: crate::eval::typval_defs::TypvalValue::String(Some(
+                            b"echo".to_vec(),
+                        )),
+                        ..Default::default()
+                    },
+                ],
+                &mut rettv,
+            );
+            assert_eq!(
+                rettv.value,
+                crate::eval::typval_defs::TypvalValue::Number(1)
+            );
+            // The entry really landed in the :cmd table.
+            assert_eq!(unsafe { get_history_idx(HistoryType::Cmd) }, 1);
+        });
+
+        *unsafe { HISNUM.get_mut() } = saved_num;
+        restore_history_state(saved);
+    }
+
+    #[test]
+    fn histadd_reports_failure_for_a_bad_name_or_an_empty_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let saved = save_history_state();
+        let saved_num = *unsafe { HISNUM.get_mut() };
+
+        with_p_hi(4, || {
+            for (name, item) in [(&b"bogus"[..], &b"x"[..]), (b"cmd", b"")] {
+                let mut rettv = crate::eval::typval_defs::TypvalT::default();
+                f_histadd(
+                    &[
+                        crate::eval::typval_defs::TypvalT {
+                            value: crate::eval::typval_defs::TypvalValue::String(Some(
+                                name.to_vec(),
+                            )),
+                            ..Default::default()
+                        },
+                        crate::eval::typval_defs::TypvalT {
+                            value: crate::eval::typval_defs::TypvalValue::String(Some(
+                                item.to_vec(),
+                            )),
+                            ..Default::default()
+                        },
+                    ],
+                    &mut rettv,
+                );
+                assert_eq!(
+                    rettv.value,
+                    crate::eval::typval_defs::TypvalValue::Number(0),
+                    "{:?}/{:?}",
+                    std::string::String::from_utf8_lossy(name),
+                    std::string::String::from_utf8_lossy(item)
+                );
+            }
+        });
+
+        *unsafe { HISNUM.get_mut() } = saved_num;
+        restore_history_state(saved);
+    }
+
+    #[test]
     fn get_history_idx_is_negative_one_when_hislen_is_zero() {
         let _lock = crate::globals::global_state_test_lock();
         assert_eq!(get_hislen(), 0);
-        assert_eq!(get_history_idx(HistoryType::Cmd), -1);
-        assert_eq!(get_history_idx(HistoryType::Search), -1);
+        assert_eq!(unsafe { get_history_idx(HistoryType::Cmd) }, -1);
+        assert_eq!(unsafe { get_history_idx(HistoryType::Search) }, -1);
     }
 
     #[test]
     fn get_history_idx_is_negative_one_for_an_out_of_range_type() {
         let _lock = crate::globals::global_state_test_lock();
-        assert_eq!(get_history_idx(HistoryType::Invalid), -1);
-        assert_eq!(get_history_idx(HistoryType::Default), -1);
+        assert_eq!(unsafe { get_history_idx(HistoryType::Invalid) }, -1);
+        assert_eq!(unsafe { get_history_idx(HistoryType::Default) }, -1);
     }
 
     #[test]
-    #[should_panic(expected = "get_history_idx: needs the real hisidx")]
-    fn get_history_idx_panics_when_hislen_is_genuinely_nonzero() {
+    fn get_history_idx_reports_the_newest_entry_number() {
         let _lock = crate::globals::global_state_test_lock();
-        let old = set_hislen(10);
-        let result = std::panic::catch_unwind(|| get_history_idx(HistoryType::Cmd));
-        set_hislen(old);
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            // with_history numbers entries 1..=N, so the newest is 2.
+            assert_eq!(unsafe { get_history_idx(HistoryType::Cmd) }, 2);
+        });
+        // An empty table still reports -1 via the hisidx < 0 branch.
+        with_sized_history(4, || {
+            assert_eq!(unsafe { get_history_idx(HistoryType::Cmd) }, -1);
+        });
     }
 
     #[test]
