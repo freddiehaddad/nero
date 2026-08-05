@@ -26,13 +26,15 @@
 //! and Latin-1 printable/1-cell), because nero has no startup sequence
 //! to call `init_chartab()` the way the original does.
 //!
-//! `char2cells`/`byte2cells` still use that same rule inline rather
-//! than the table's `CT_CELL_MASK`, and `vim_isidc`/`vim_isfilec`
-//! still use their own fixed default rules - switching those over is a
-//! separate change, documented on each function. `char2cells`'s
-//! special-key (`IS_SPECIAL`/negative `c`) branch is deferred
-//! separately (needs `keycodes.h`, no current caller passes such a
-//! value).
+//! `char2cells`/`byte2cells` read the table's `CT_CELL_MASK` too, so
+//! `'display'` `"uhex"` takes effect via [`init_chartab`] rather than
+//! being re-read on every call - the original's own arrangement, where
+//! `did_set_display` re-runs `init_chartab()`. `vim_isidc`/
+//! `vim_isfilec` still use their own fixed default rules - switching
+//! those over is a separate change, documented on each function.
+//! `char2cells`'s special-key (`IS_SPECIAL`/negative `c`) branch is
+//! deferred separately (needs `keycodes.h`, no current caller passes
+//! such a value).
 //!
 //! Deferred (real forward dependencies):
 //! - `init_chartab`/`buf_init_chartab`/`check_isopt`: need `buf_T`
@@ -204,6 +206,24 @@ pub enum IsOpt {
     Fname,
     /// `'iskeyword'` (global `p_isk` or the buffer's own `b_p_isk`)
     Keyword,
+}
+
+/// Fill `G_CHARTAB` and the current buffer's own `b_chartab`
+/// (`init_chartab`). Returns `OK`/`FAIL`.
+///
+/// The original calls this during startup and again from
+/// `did_set_display`/`did_set_isopt`, which is what makes it correct
+/// for [`char2cells`]/[`vim_isprintc`] to read the cached table rather
+/// than re-reading the options on every call.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer,
+/// and the rest is forwarded from [`buf_init_chartab`].
+pub unsafe fn init_chartab() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_init_chartab(curbuf, true) }
 }
 
 /// Parse one of the `'isident'`/`'iskeyword'`/`'isfname'`/`'isprint'`
@@ -1229,29 +1249,24 @@ pub fn vim_isfilec_or_wc(c: i32) -> bool {
 /// `keycodes.h`, not yet translated) - deferred, documented gap: no
 /// caller in this crate yet passes an encoded special-key value here.
 ///
+/// Reads the real `g_chartab`'s `CT_CELL_MASK` below `0x80`, so a
+/// `'display'` change takes effect once [`init_chartab`] has re-run -
+/// exactly the original's own arrangement, where `did_set_display`
+/// calls `init_chartab()` rather than having this function consult
+/// `'display'` on every call.
+///
 /// # Safety
 /// Touches `crate::option_vars::OPTION_VARS` (for `c >= 0x80`, via
-/// [`crate::mbyte::utf_char2cells`]; and for `'display'`'s `"uhex"`
-/// flag on the control-character path).
+/// [`crate::mbyte::utf_char2cells`]) and must not run concurrently
+/// with any write to [`G_CHARTAB`].
 #[must_use]
 pub unsafe fn char2cells(c: i32) -> i32 {
     if c >= 0x80 {
         // SAFETY: forwarded from this function's own safety doc.
         return unsafe { crate::mbyte::utf_char2cells(c) };
     }
-    if (0x20..=0x7E).contains(&c) {
-        return 1;
-    }
-    // g_chartab's own DEFAULT initialization rule for the remaining
-    // (control/DEL) range: 2 cells normally (displayed as e.g. "^I"),
-    // 4 if 'display' contains "uhex".
     // SAFETY: forwarded from this function's own safety doc.
-    let dy_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
-    if dy_flags & crate::option_vars::opt_dy_flag::UHEX != 0 {
-        4
-    } else {
-        2
-    }
+    i32::from((unsafe { G_CHARTAB.get_mut() })[c as usize] & CT_CELL_MASK)
 }
 
 /// Return number of display cells occupied by byte `b`, treated as an
@@ -1259,30 +1274,17 @@ pub unsafe fn char2cells(c: i32) -> i32 {
 /// character (`byte2cells`). Returns `0` for any byte `>= 0x80` (a
 /// lone byte like that has no standalone cell width of its own in a
 /// UTF-8 stream - a real difference from [`char2cells`], which
-/// decodes a full character there instead). For `b < 0x80`, uses the
-/// same `g_chartab`-default-rule width as [`char2cells`] (see that
-/// function's own doc comment for the "fixed default rule, not the
-/// real `'isprint'`-customizable `g_chartab`" caveat, which applies
-/// identically here).
+/// decodes a full character there instead).
 ///
 /// # Safety
-/// Touches `crate::option_vars::OPTION_VARS` (for `'display'`'s
-/// `"uhex"` flag on the control-character path, same as [`char2cells`]).
+/// Must not run concurrently with any write to [`G_CHARTAB`].
 #[must_use]
 pub unsafe fn byte2cells(b: i32) -> i32 {
     if b >= 0x80 {
         return 0;
     }
-    if (0x20..=0x7E).contains(&b) {
-        return 1;
-    }
     // SAFETY: forwarded from this function's own safety doc.
-    let dy_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags;
-    if dy_flags & crate::option_vars::opt_dy_flag::UHEX != 0 {
-        4
-    } else {
-        2
-    }
+    i32::from((unsafe { G_CHARTAB.get_mut() })[b as usize] & CT_CELL_MASK)
 }
 
 /// Convert `n`'s low nibble to its lowercase hex digit character
@@ -2339,13 +2341,15 @@ mod tests {
     #[test]
     fn char2cells_control_char_is_four_with_uhex() {
         let _guard = crate::globals::global_state_test_lock();
-        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
-        let prev = opts.dy_flags;
-        opts.dy_flags = crate::option_vars::opt_dy_flag::UHEX;
+        let _chartab = ChartabGuard::new();
+        let _dy = DyFlagsGuard::set(crate::option_vars::opt_dy_flag::UHEX);
 
+        // Setting 'display' alone is not enough any more: the width
+        // lives in the table, and the original's own `did_set_display`
+        // re-runs `init_chartab()` for exactly this reason.
+        assert_eq!(unsafe { char2cells(0x01) }, 2);
+        *unsafe { G_CHARTAB.get_mut() } = default_chartab(true);
         assert_eq!(unsafe { char2cells(0x01) }, 4);
-
-        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = prev;
     }
 
     #[test]
@@ -2367,13 +2371,12 @@ mod tests {
     #[test]
     fn byte2cells_control_char_is_four_with_uhex() {
         let _guard = crate::globals::global_state_test_lock();
-        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
-        let prev = opts.dy_flags;
-        opts.dy_flags = crate::option_vars::opt_dy_flag::UHEX;
+        let _chartab = ChartabGuard::new();
+        let _dy = DyFlagsGuard::set(crate::option_vars::opt_dy_flag::UHEX);
 
+        assert_eq!(unsafe { byte2cells(0x01) }, 2);
+        *unsafe { G_CHARTAB.get_mut() } = default_chartab(true);
         assert_eq!(unsafe { byte2cells(0x01) }, 4);
-
-        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = prev;
     }
 
     #[test]
@@ -2713,6 +2716,30 @@ mod tests {
     impl Drop for ChartabGuard {
         fn drop(&mut self) {
             *unsafe { G_CHARTAB.get_mut() } = self.saved;
+        }
+    }
+
+    /// Saves and restores `'display'`'s flags across a test.
+    ///
+    /// Restoring on drop rather than on the last line matters: a
+    /// failing assertion skips a trailing restore, which leaks the
+    /// flag into every later test in the same process.
+    struct DyFlagsGuard {
+        saved: u32,
+    }
+
+    impl DyFlagsGuard {
+        fn set(flags: u32) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.dy_flags;
+            opts.dy_flags = flags;
+            Self { saved }
+        }
+    }
+
+    impl Drop for DyFlagsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.dy_flags = self.saved;
         }
     }
 
