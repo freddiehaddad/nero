@@ -29,18 +29,214 @@
 //! plain `&[u8]` input, with no dependency on `qf_info_T`/`qf_list_T`
 //! at all (unlike most of this file).
 //!
-//! Deferred: everything else in the file - in particular, every OTHER
-//! function operating on `qf_info_T`/`qf_list_T`'s own real fields
-//! (e.g. `qf_stack_empty`/`qf_list_empty`/`qf_cmdtitle`/
-//! `qf_store_title`) remains genuinely blocked: those structs are
-//! still just an opaque placeholder
-//! ([`crate::types_defs::QfInfoT`]) with no real fields translated -
-//! individually "small" helper functions built on top of them are NOT
-//! tractable until the underlying quickfix-list storage itself is
-//! translated (a separate, substantial undertaking).
+//! The quickfix list STORAGE is now translated: `qfline_T`
+//! ([`QflineT`]), `qfltype_T` ([`QfltypeT`]), `qf_list_T`
+//! ([`QfListT`]) and `qf_info_T` ([`crate::types_defs::QfInfoT`], no
+//! longer an opaque placeholder). That unblocks the small helpers
+//! built directly on them: [`qf_stack_empty`], [`qf_list_empty`],
+//! [`qf_list_has_valid_entries`], [`qf_get_list`], [`qf_get_curlist`]
+//! and the `IS_QF_STACK`/`IS_LL_STACK`/`IS_QF_LIST`/`IS_LL_LIST`
+//! macros ([`is_qf_stack`]/[`is_ll_stack`]/[`is_qf_list`]/
+//! [`is_ll_list`]). It also made `funcs.rs`'s `f_win_gettype`
+//! "loclist" branch testable for the first time, which had been
+//! explicitly noted there as untestable while the placeholder had no
+//! public constructor.
+//!
+//! The entries are held in a `Vec<QflineT>` rather than reproducing
+//! the original's `qf_next`/`qf_prev` doubly-linked list: the list
+//! wholly owns its entries and only ever walks them in order, so the
+//! links carry nothing the `Vec` does not, and a self-referential
+//! structure would need raw pointers to express. `qf_count` becomes a
+//! method over that vector rather than a separately-maintained field.
+//!
+//! Deferred: everything else in the file - the errorformat parsing
+//! machinery (`efm_T`, `qfstate_T`, `qffields_T`, and the
+//! `dir_stack_T` directory tracking, whose two `qf_list_T` fields are
+//! omitted here for that reason), the quickfix window/buffer UI, and
+//! error navigation.
 
 use crate::buffer_defs::{BufT, WinT, BUF_HAS_LL_ENTRY, BUF_HAS_QF_ENTRY};
 use crate::garray_defs::GarrayT;
+
+/// Sentinel for "no quickfix list index" (`INVALID_QFIDX`).
+pub const INVALID_QFIDX: i32 = -1;
+/// Sentinel for "no quickfix window buffer" (`INVALID_QFBUFNR`).
+pub const INVALID_QFBUFNR: i32 = 0;
+
+/// Quickfix list type (`qfltype_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QfltypeT {
+    /// Quickfix list - global list (`QFLT_QUICKFIX`).
+    #[default]
+    Quickfix,
+    /// Location list - per window list (`QFLT_LOCATION`).
+    Location,
+    /// Temporary list used by `getqflist()`/`getloclist()`
+    /// (`QFLT_INTERNAL`).
+    Internal,
+}
+
+/// One error entry in a quickfix/location list (`qfline_T`).
+///
+/// The original threads these on a `qf_next`/`qf_prev` doubly-linked
+/// list that its owning [`QfListT`] wholly owns and only ever walks in
+/// order, so the links carry no information the containing `Vec` does
+/// not already provide. Storing the entries in a `Vec` and addressing
+/// the current one by index is the direct equivalent, and avoids a
+/// self-referential structure that Rust cannot express without raw
+/// pointers - the same reasoning already applied to `cmdhist.c`'s own
+/// history ring.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QflineT {
+    /// Line number where the error occurred (`qf_lnum`).
+    pub qf_lnum: crate::pos_defs::LinenrT,
+    /// Line number when the error has a range, or zero (`qf_end_lnum`).
+    pub qf_end_lnum: crate::pos_defs::LinenrT,
+    /// File number for the line (`qf_fnum`).
+    pub qf_fnum: i32,
+    /// Column where the error occurred (`qf_col`).
+    pub qf_col: i32,
+    /// Column when the error has a range, or zero (`qf_end_col`).
+    pub qf_end_col: i32,
+    /// Error number (`qf_nr`).
+    pub qf_nr: i32,
+    /// Module name for this error (`qf_module`).
+    pub qf_module: Option<Vec<u8>>,
+    /// Different filename if there are hard links (`qf_fname`).
+    pub qf_fname: Option<Vec<u8>>,
+    /// Search pattern for the error (`qf_pattern`).
+    pub qf_pattern: Option<Vec<u8>>,
+    /// Description of the error (`qf_text`).
+    pub qf_text: Option<Vec<u8>>,
+    /// Whether `qf_col`/`qf_end_col` are screen columns (`qf_viscol`).
+    pub qf_viscol: bool,
+    /// Whether this line has been deleted (`qf_cleared`).
+    pub qf_cleared: bool,
+    /// Type of the error (mostly `b'E'`); 1 for `:helpgrep` (`qf_type`).
+    pub qf_type: u8,
+    /// Custom user data associated with this item (`qf_user_data`).
+    pub qf_user_data: crate::eval::typval_defs::TypvalT,
+    /// Whether a valid error message was detected (`qf_valid`).
+    pub qf_valid: bool,
+}
+
+/// One quickfix/location list (`qf_list_T`).
+///
+/// Usually holds one or more entries, but an empty list can be created
+/// by `setqflist()`/`setloclist()` with only a title and/or context,
+/// with entries added later.
+#[derive(Debug, Default)]
+pub struct QfListT {
+    /// Unique identifier for this list (`qf_id`).
+    pub qf_id: u32,
+    /// Whether this is a quickfix or location list (`qfl_type`).
+    pub qfl_type: QfltypeT,
+    /// The error entries themselves - the original's `qf_start`/
+    /// `qf_last` linked list (see [`QflineT`]). `qf_count` is this
+    /// vector's own length rather than a separate field.
+    pub qf_entries: Vec<QflineT>,
+    /// Current 1-based index into `qf_entries` - the original's
+    /// `qf_index`, which its `qf_ptr` always tracks (`qf_index`).
+    pub qf_index: i32,
+    /// Whether not a single valid entry was found (`qf_nonevalid`).
+    pub qf_nonevalid: bool,
+    /// Whether at least one item has user data attached
+    /// (`qf_has_user_data`).
+    pub qf_has_user_data: bool,
+    /// Title derived from the command that created the list, or set by
+    /// `setqflist` (`qf_title`).
+    pub qf_title: Option<Vec<u8>>,
+    /// Context set by `setqflist`/`setloclist` (`qf_ctx`).
+    pub qf_ctx: Option<Box<crate::eval::typval_defs::TypvalT>>,
+    /// `'quickfixtextfunc'` callback (`qf_qftf_cb`).
+    pub qf_qftf_cb: crate::eval::typval_defs::Callback,
+    /// Directory being parsed into (`qf_directory`).
+    pub qf_directory: Option<Vec<u8>>,
+    /// File currently being parsed (`qf_currfile`).
+    pub qf_currfile: Option<Vec<u8>>,
+    /// Whether the errorformat is multi-line (`qf_multiline`).
+    pub qf_multiline: bool,
+    /// Multi-line parse state (`qf_multiignore`).
+    pub qf_multiignore: bool,
+    /// Multi-line parse state (`qf_multiscan`).
+    pub qf_multiscan: bool,
+    /// Changed-tick for this list (`qf_changedtick`).
+    pub qf_changedtick: i32,
+}
+
+impl QfListT {
+    /// Number of errors in this list (`qf_count`), which the original
+    /// tracks in its own field alongside the linked list.
+    #[must_use]
+    pub fn qf_count(&self) -> i32 {
+        i32::try_from(self.qf_entries.len()).unwrap_or(i32::MAX)
+    }
+}
+
+/// Returns whether the specified quickfix/location stack is empty
+/// (`qf_stack_empty`).
+///
+/// `None` stands for the original's own `qi == NULL` case.
+#[must_use]
+pub fn qf_stack_empty(qi: Option<&crate::types_defs::QfInfoT>) -> bool {
+    qi.is_none_or(|qi| qi.qf_listcount <= 0)
+}
+
+/// Returns whether the specified quickfix/location list is empty
+/// (`qf_list_empty`).
+#[must_use]
+pub fn qf_list_empty(qfl: Option<&QfListT>) -> bool {
+    qfl.is_none_or(|qfl| qfl.qf_count() <= 0)
+}
+
+/// Returns whether the list is non-empty AND has valid entries
+/// (`qf_list_has_valid_entries`).
+#[must_use]
+pub fn qf_list_has_valid_entries(qfl: &QfListT) -> bool {
+    !qf_list_empty(Some(qfl)) && !qfl.qf_nonevalid
+}
+
+/// Return the list at `idx` in the specified quickfix stack
+/// (`qf_get_list`).
+///
+/// The original indexes `qi->qf_lists[idx]` with no bounds check at
+/// all; returning `Option` keeps an out-of-range index from panicking
+/// where the original would simply read past the array.
+#[must_use]
+pub fn qf_get_list(qi: &crate::types_defs::QfInfoT, idx: i32) -> Option<&QfListT> {
+    usize::try_from(idx).ok().and_then(|idx| qi.qf_lists.get(idx))
+}
+
+/// Return the current list in the specified quickfix stack
+/// (`qf_get_curlist`).
+#[must_use]
+pub fn qf_get_curlist(qi: &crate::types_defs::QfInfoT) -> Option<&QfListT> {
+    qf_get_list(qi, qi.qf_curlist)
+}
+
+/// Whether `qi` is a quickfix (not location) stack (`IS_QF_STACK`).
+#[must_use]
+pub fn is_qf_stack(qi: &crate::types_defs::QfInfoT) -> bool {
+    qi.qfl_type == QfltypeT::Quickfix
+}
+
+/// Whether `qi` is a location list stack (`IS_LL_STACK`).
+#[must_use]
+pub fn is_ll_stack(qi: &crate::types_defs::QfInfoT) -> bool {
+    qi.qfl_type == QfltypeT::Location
+}
+
+/// Whether `qfl` is a quickfix (not location) list (`IS_QF_LIST`).
+#[must_use]
+pub fn is_qf_list(qfl: &QfListT) -> bool {
+    qfl.qfl_type == QfltypeT::Quickfix
+}
+
+/// Whether `qfl` is a location list (`IS_LL_LIST`).
+#[must_use]
+pub fn is_ll_list(qfl: &QfListT) -> bool {
+    qfl.qfl_type == QfltypeT::Location
+}
 
 /// Adjust quickfix/location-list error entries for changed line numbers.
 ///
@@ -96,6 +292,129 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stack holding `count` freshly-defaulted lists, with
+    /// `qf_listcount` kept consistent with them.
+    fn stack_with(count: usize) -> crate::types_defs::QfInfoT {
+        crate::types_defs::QfInfoT {
+            qf_listcount: i32::try_from(count).unwrap(),
+            qf_lists: (0..count).map(|_| QfListT::default()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A list holding `count` entries, all valid.
+    fn list_with(count: usize) -> QfListT {
+        QfListT {
+            qf_entries: (0..count).map(|_| QflineT::default()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qf_stack_empty_treats_a_missing_stack_as_empty() {
+        assert!(qf_stack_empty(None));
+    }
+
+    #[test]
+    fn qf_stack_empty_follows_qf_listcount_not_the_vector() {
+        assert!(qf_stack_empty(Some(&stack_with(0))));
+        assert!(!qf_stack_empty(Some(&stack_with(1))));
+
+        // The original tests qf_listcount alone, so a stack whose
+        // count says zero reads as empty even holding a list.
+        let mut qi = stack_with(1);
+        qi.qf_listcount = 0;
+        assert!(qf_stack_empty(Some(&qi)));
+    }
+
+    #[test]
+    fn qf_list_empty_treats_a_missing_list_as_empty() {
+        assert!(qf_list_empty(None));
+    }
+
+    #[test]
+    fn qf_list_empty_follows_the_entry_count() {
+        assert!(qf_list_empty(Some(&QfListT::default())));
+        assert!(!qf_list_empty(Some(&list_with(1))));
+    }
+
+    #[test]
+    fn qf_count_is_the_number_of_entries() {
+        assert_eq!(QfListT::default().qf_count(), 0);
+        assert_eq!(list_with(3).qf_count(), 3);
+    }
+
+    #[test]
+    fn qf_list_has_valid_entries_needs_both_conditions() {
+        // Empty -> false regardless of qf_nonevalid.
+        assert!(!qf_list_has_valid_entries(&QfListT::default()));
+
+        // Non-empty and some entry valid -> true.
+        let qfl = list_with(2);
+        assert!(qf_list_has_valid_entries(&qfl));
+
+        // Non-empty but nothing valid -> false.
+        let qfl = QfListT { qf_nonevalid: true, ..list_with(2) };
+        assert!(!qf_list_has_valid_entries(&qfl));
+    }
+
+    #[test]
+    fn qf_get_list_returns_the_list_at_an_index() {
+        let mut qi = stack_with(2);
+        qi.qf_lists[1].qf_id = 77;
+        assert_eq!(qf_get_list(&qi, 1).unwrap().qf_id, 77);
+    }
+
+    #[test]
+    fn qf_get_list_rejects_out_of_range_indices() {
+        let qi = stack_with(1);
+        // The original would read past the array here; returning None
+        // keeps that from panicking.
+        assert!(qf_get_list(&qi, 1).is_none());
+        assert!(qf_get_list(&qi, INVALID_QFIDX).is_none());
+    }
+
+    #[test]
+    fn qf_get_curlist_follows_qf_curlist() {
+        let mut qi = stack_with(3);
+        qi.qf_lists[2].qf_id = 9;
+        qi.qf_curlist = 2;
+        assert_eq!(qf_get_curlist(&qi).unwrap().qf_id, 9);
+    }
+
+    #[test]
+    fn stack_and_list_type_predicates_are_mutually_exclusive() {
+        let qf = crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Quickfix,
+            ..Default::default()
+        };
+        assert!(is_qf_stack(&qf) && !is_ll_stack(&qf));
+
+        let ll = crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        };
+        assert!(is_ll_stack(&ll) && !is_qf_stack(&ll));
+
+        // An internal list is neither.
+        let int = crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Internal,
+            ..Default::default()
+        };
+        assert!(!is_qf_stack(&int) && !is_ll_stack(&int));
+
+        let qfl = QfListT { qfl_type: QfltypeT::Quickfix, ..Default::default() };
+        assert!(is_qf_list(&qfl) && !is_ll_list(&qfl));
+        let lll = QfListT { qfl_type: QfltypeT::Location, ..Default::default() };
+        assert!(is_ll_list(&lll) && !is_qf_list(&lll));
+    }
+
+    #[test]
+    fn a_default_stack_is_a_quickfix_stack() {
+        // QFLT_QUICKFIX is the original enum's own first (zero) value.
+        assert_eq!(QfltypeT::default(), QfltypeT::Quickfix);
+    }
 
     #[test]
     fn always_false_for_the_quickfix_list_when_b_has_qf_entry_is_unset() {

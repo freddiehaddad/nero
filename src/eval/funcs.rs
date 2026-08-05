@@ -16045,11 +16045,34 @@ mod tests {
         let mut rettv = TypvalT::default();
         unsafe { f_win_gettype(&[], &mut rettv) };
         // w_llist_ref is null by default, so this is a quickfix window,
-        // not a loclist one (the only distinction between the two -
-        // QfInfoT is an opaque placeholder with no public constructor,
-        // so the "loclist" branch isn't separately tested here, only
-        // this one-line null-check itself is worth noting as trivial).
+        // not a loclist one - that null check is the only distinction
+        // between the two. See the loclist test below for the other
+        // branch.
         assert_eq!(rettv.value, TypvalValue::String(Some(b"quickfix".to_vec())));
+    }
+
+    #[test]
+    fn win_gettype_loclist_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_bt: Some(b"quickfix".to_vec()),
+            ..Default::default()
+        };
+        // Now that QfInfoT has real fields, the "loclist" branch is
+        // reachable: it differs from "quickfix" only by w_llist_ref
+        // being non-null.
+        let mut llist = crate::types_defs::QfInfoT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf as *mut crate::buffer_defs::BufT,
+            w_llist_ref: &mut llist as *mut crate::types_defs::QfInfoT,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_win_gettype(&[], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::String(Some(b"loclist".to_vec())));
     }
 
     #[test]

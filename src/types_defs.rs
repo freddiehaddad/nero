@@ -151,9 +151,27 @@ pub struct SynstateT {
 pub struct TerminalT {
     _private: (),
 }
-/// Placeholder for `qf_info_T` (`struct qf_info_S`) - see `src/nvim/quickfix.c` (phase 8).
+/// Quickfix/location list stack (`qf_info_T`, `struct qf_info_S`) -
+/// a stack of quickfix/location lists.
+#[derive(Debug, Default)]
 pub struct QfInfoT {
-    _private: (),
+    /// Reference count, used only for location lists (`qf_refcount`).
+    ///
+    /// A location list window referencing this list makes it 2,
+    /// otherwise 1; the list is freed when it reaches 0.
+    pub qf_refcount: i32,
+    /// Current number of lists (`qf_listcount`).
+    pub qf_listcount: i32,
+    /// Index of the current error list (`qf_curlist`).
+    pub qf_curlist: i32,
+    /// Maximum number of lists (`qf_maxcount`).
+    pub qf_maxcount: i32,
+    /// The lists themselves (`qf_lists`).
+    pub qf_lists: Vec<crate::quickfix::QfListT>,
+    /// Whether this is a quickfix or location list stack (`qfl_type`).
+    pub qfl_type: crate::quickfix::QfltypeT,
+    /// Quickfix window buffer number (`qf_bufnr`).
+    pub qf_bufnr: i32,
 }
 /// Placeholder for `mapblock_T` (`struct mapblock`) - see `src/nvim/mapping_defs.h` (phase 7).
 pub struct MapblockT {
