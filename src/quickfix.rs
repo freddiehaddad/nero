@@ -49,6 +49,16 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: the entry-navigation trio [`get_next_valid_entry`]/
+//! [`get_prev_valid_entry`]/[`get_nth_entry`], plus
+//! [`QfListT::entry_at`] for the original's 1-BASED `qf_index`
+//! numbering. These return an index rather than an entry pointer,
+//! which is the same information over a `Vec`. Their `qf_next ==
+//! NULL`/`qf_prev == NULL` guards are defensive against a chain
+//! shorter than `qf_count`; over a `Vec` the index bound is exact, so
+//! they drop out. `get_nth_valid_entry`/`qf_get_entry` stay deferred -
+//! they report `e_no_more_items` through `emsg`.
+//!
 //! Also translated: [`qf_alloc_stack`]/[`qf_free_list_stack_items`].
 //! `qf_alloc_stack` returns an owned stack rather than the original's
 //! pointer to one of two places (the `ql_info_actual` singleton for a
@@ -211,6 +221,94 @@ impl QfListT {
     pub fn qf_count(&self) -> i32 {
         i32::try_from(self.qf_entries.len()).unwrap_or(i32::MAX)
     }
+
+    /// The entry at a 1-BASED index, as the original's `qf_index`
+    /// numbering uses (quickfix entry numbers start at 1).
+    #[must_use]
+    pub fn entry_at(&self, idx: i32) -> Option<&QflineT> {
+        if idx < 1 {
+            return None;
+        }
+        self.qf_entries.get(usize::try_from(idx - 1).ok()?)
+    }
+}
+
+/// Step to the next valid entry at or after the current one
+/// (`get_next_valid_entry`), returning its 1-based index, or `None` if
+/// there is none.
+///
+/// Always advances at least once, then keeps going while the entry is
+/// invalid - unless the list has no valid entries at all, in which
+/// case every entry counts. [`crate::vim_defs::Direction::ForwardFile`]
+/// additionally skips entries in the file it started from.
+///
+/// The original also tests `qf_ptr->qf_next == NULL` on each step,
+/// which is defensive against a chain shorter than `qf_count`; over a
+/// `Vec` the index bound alone is exact, so that check drops out.
+#[must_use]
+pub fn get_next_valid_entry(
+    qfl: &QfListT,
+    qf_index: i32,
+    dir: crate::vim_defs::Direction,
+) -> Option<i32> {
+    let old_fnum = qfl.entry_at(qf_index).map(|e| e.qf_fnum);
+    let mut idx = qf_index;
+    loop {
+        if idx >= qfl.qf_count() {
+            return None;
+        }
+        idx += 1;
+        let entry = qfl.entry_at(idx)?;
+        let skip_invalid = !qfl.qf_nonevalid && !entry.qf_valid;
+        let skip_same_file = dir == crate::vim_defs::Direction::ForwardFile
+            && Some(entry.qf_fnum) == old_fnum;
+        if !skip_invalid && !skip_same_file {
+            return Some(idx);
+        }
+    }
+}
+
+/// Step to the previous valid entry (`get_prev_valid_entry`), the
+/// mirror of [`get_next_valid_entry`], stopping at the first entry.
+#[must_use]
+pub fn get_prev_valid_entry(
+    qfl: &QfListT,
+    qf_index: i32,
+    dir: crate::vim_defs::Direction,
+) -> Option<i32> {
+    let old_fnum = qfl.entry_at(qf_index).map(|e| e.qf_fnum);
+    let mut idx = qf_index;
+    loop {
+        if idx <= 1 {
+            return None;
+        }
+        idx -= 1;
+        let entry = qfl.entry_at(idx)?;
+        let skip_invalid = !qfl.qf_nonevalid && !entry.qf_valid;
+        let skip_same_file = dir == crate::vim_defs::Direction::BackwardFile
+            && Some(entry.qf_fnum) == old_fnum;
+        if !skip_invalid && !skip_same_file {
+            return Some(idx);
+        }
+    }
+}
+
+/// Move to entry number `errornr` (`get_nth_entry`), returning the
+/// 1-based index actually reached.
+///
+/// The original walks the chain from the current entry toward
+/// `errornr`, stopping at either end, so an out-of-range request
+/// clamps to the nearest end rather than failing.
+#[must_use]
+pub fn get_nth_entry(qfl: &QfListT, errornr: i32) -> i32 {
+    let mut idx = qfl.qf_index;
+    while errornr < idx && idx > 1 {
+        idx -= 1;
+    }
+    while errornr > idx && idx < qfl.qf_count() {
+        idx += 1;
+    }
+    idx
 }
 
 /// Returns whether the specified quickfix/location stack is empty
@@ -719,6 +817,118 @@ mod tests {
         fn drop(&mut self) {
             *unsafe { LAST_QF_ID.get_mut() } = self.saved;
         }
+    }
+
+    /// A list of `n` entries, all valid, each in its own file.
+    fn nav_list(n: usize) -> QfListT {
+        QfListT {
+            qf_entries: (0..n)
+                .map(|i| QflineT {
+                    qf_valid: true,
+                    qf_fnum: i32::try_from(i).unwrap() + 1,
+                    ..Default::default()
+                })
+                .collect(),
+            qf_index: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entry_at_uses_one_based_indexing() {
+        let qfl = nav_list(3);
+        assert_eq!(qfl.entry_at(1).unwrap().qf_fnum, 1);
+        assert_eq!(qfl.entry_at(3).unwrap().qf_fnum, 3);
+        // Quickfix entry numbers start at 1, so 0 is out of range.
+        assert!(qfl.entry_at(0).is_none());
+        assert!(qfl.entry_at(4).is_none());
+    }
+
+    #[test]
+    fn get_next_valid_entry_advances_one_step() {
+        let qfl = nav_list(3);
+        assert_eq!(get_next_valid_entry(&qfl, 1, crate::vim_defs::Direction::Forward), Some(2));
+    }
+
+    #[test]
+    fn get_next_valid_entry_stops_at_the_end() {
+        let qfl = nav_list(3);
+        assert_eq!(get_next_valid_entry(&qfl, 3, crate::vim_defs::Direction::Forward), None);
+    }
+
+    #[test]
+    fn get_next_valid_entry_skips_invalid_entries() {
+        let mut qfl = nav_list(4);
+        qfl.qf_entries[1].qf_valid = false;
+        qfl.qf_entries[2].qf_valid = false;
+        assert_eq!(get_next_valid_entry(&qfl, 1, crate::vim_defs::Direction::Forward), Some(4));
+    }
+
+    #[test]
+    fn get_next_valid_entry_treats_every_entry_as_valid_when_none_are() {
+        // qf_nonevalid means the list has no valid entries at all, in
+        // which case navigation must not skip them or it could never
+        // move.
+        let mut qfl = nav_list(3);
+        for e in &mut qfl.qf_entries {
+            e.qf_valid = false;
+        }
+        qfl.qf_nonevalid = true;
+        assert_eq!(get_next_valid_entry(&qfl, 1, crate::vim_defs::Direction::Forward), Some(2));
+    }
+
+    #[test]
+    fn get_next_valid_entry_forward_file_skips_the_starting_file() {
+        let mut qfl = nav_list(4);
+        // Entries 1 and 2 share a file; ForwardFile must skip past it.
+        qfl.qf_entries[1].qf_fnum = qfl.qf_entries[0].qf_fnum;
+        assert_eq!(
+            get_next_valid_entry(&qfl, 1, crate::vim_defs::Direction::ForwardFile),
+            Some(3)
+        );
+        // Plain Forward stops at the very next entry instead.
+        assert_eq!(get_next_valid_entry(&qfl, 1, crate::vim_defs::Direction::Forward), Some(2));
+    }
+
+    #[test]
+    fn get_prev_valid_entry_mirrors_the_forward_walk() {
+        let qfl = nav_list(3);
+        assert_eq!(get_prev_valid_entry(&qfl, 3, crate::vim_defs::Direction::Backward), Some(2));
+        assert_eq!(get_prev_valid_entry(&qfl, 1, crate::vim_defs::Direction::Backward), None);
+    }
+
+    #[test]
+    fn get_prev_valid_entry_skips_invalid_and_same_file_entries() {
+        let mut qfl = nav_list(4);
+        qfl.qf_entries[2].qf_valid = false;
+        assert_eq!(get_prev_valid_entry(&qfl, 4, crate::vim_defs::Direction::Backward), Some(2));
+
+        let mut qfl = nav_list(4);
+        qfl.qf_entries[2].qf_fnum = qfl.qf_entries[3].qf_fnum;
+        assert_eq!(
+            get_prev_valid_entry(&qfl, 4, crate::vim_defs::Direction::BackwardFile),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn get_nth_entry_moves_to_the_requested_number() {
+        let qfl = nav_list(5);
+        assert_eq!(get_nth_entry(&qfl, 4), 4);
+
+        let mut qfl = nav_list(5);
+        qfl.qf_index = 5;
+        assert_eq!(get_nth_entry(&qfl, 2), 2);
+    }
+
+    #[test]
+    fn get_nth_entry_clamps_out_of_range_requests() {
+        let qfl = nav_list(3);
+        // Past the end clamps to the last entry rather than failing.
+        assert_eq!(get_nth_entry(&qfl, 99), 3);
+        // Below the first clamps to 1, since entries are 1-based.
+        assert_eq!(get_nth_entry(&qfl, -5), 1);
+        assert_eq!(get_nth_entry(&qfl, 0), 1);
     }
 
     #[test]
