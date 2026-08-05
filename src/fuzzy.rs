@@ -28,11 +28,124 @@
 //! the default configuration, though it won't track a customized
 //! `'iskeyword'` until the option system exists.
 //!
+//! Also `fuzmatch_str_T` (as [`FuzmatchStrT`]),
+//! [`fuzzy_match_str_compare`] and [`fuzzy_match_str_sort`]. The
+//! comparator returns a `std::cmp::Ordering` rather than a C `qsort`
+//! comparison code. The original sorts with `qsort`, which is NOT
+//! stable - which is exactly why `idx` exists as a tiebreaker, making
+//! the comparator a total order; Rust's stable `sort_by` therefore
+//! produces the same result.
+//!
+//! `fuzmatch_str_free` needs no counterpart: dropping the owned
+//! `Vec<u8>`/`Vec<FuzmatchStrT>` is what frees them.
+//!
 //! Deferred: `fuzzy_match_in_list`/`fuzzy_match_str_with_pos`/
 //! `fuzzy_match_str_in_line`/`search_for_fuzzy_match`/`f_matchfuzzy`/
 //! `f_matchfuzzypos`/everything operating on `list_T`/`typval_T`/`buf_T`/
 //! `garray_T` (eval engine phase 5, buffer phase 3) or `pos_T`-based buffer
 //! search.
+
+/// Fuzzy matched string list item, used for fuzzy match completion
+/// (`fuzmatch_str_T`, `fuzzy.h`). Items are usually sorted by
+/// `score`; `idx` is the stable-sort tiebreaker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FuzmatchStrT {
+    pub idx: i32,
+    pub str: Vec<u8>,
+    pub score: i32,
+}
+
+/// Order two fuzzy string matches (`fuzzy_match_str_compare`).
+///
+/// Higher scores sort FIRST (the original returns `-1` when `v1 >
+/// v2`), with the lower `idx` first on a tie.
+///
+/// The original returns a C `qsort` comparison code; an
+/// `std::cmp::Ordering` is the direct Rust equivalent and is what
+/// `sort_by` wants.
+#[must_use]
+pub fn fuzzy_match_str_compare(s1: &FuzmatchStrT, s2: &FuzmatchStrT) -> std::cmp::Ordering {
+    if s1.score == s2.score {
+        s1.idx.cmp(&s2.idx)
+    } else {
+        // Descending by score.
+        s2.score.cmp(&s1.score)
+    }
+}
+
+/// Sort a fuzzy match list by descending match score
+/// (`fuzzy_match_str_sort`).
+///
+/// The original calls `qsort`, which is NOT stable - which is exactly
+/// why `idx` exists as a tiebreaker, making the comparator a total
+/// order. Rust's `sort_by` is stable, so it produces the same result
+/// either way.
+pub fn fuzzy_match_str_sort(fm: &mut [FuzmatchStrT]) {
+    fm.sort_by(fuzzy_match_str_compare);
+}
+
+#[cfg(test)]
+mod fuzmatch_tests {
+    use super::*;
+
+    fn item(idx: i32, score: i32) -> FuzmatchStrT {
+        FuzmatchStrT {
+            idx,
+            str: format!("s{idx}").into_bytes(),
+            score,
+        }
+    }
+
+    #[test]
+    fn fuzzy_match_str_compare_puts_higher_scores_first() {
+        assert_eq!(
+            fuzzy_match_str_compare(&item(0, 10), &item(1, 5)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            fuzzy_match_str_compare(&item(0, 5), &item(1, 10)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_str_compare_breaks_score_ties_by_ascending_idx() {
+        assert_eq!(
+            fuzzy_match_str_compare(&item(1, 7), &item(2, 7)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            fuzzy_match_str_compare(&item(2, 7), &item(1, 7)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            fuzzy_match_str_compare(&item(3, 7), &item(3, 7)),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_str_sort_orders_by_descending_score_then_idx() {
+        let mut v = vec![item(0, 5), item(1, 20), item(2, 5), item(3, 20)];
+        fuzzy_match_str_sort(&mut v);
+        // Score 20 first (idx 1 then 3), then score 5 (idx 0 then 2).
+        assert_eq!(
+            v.iter().map(|f| f.idx).collect::<Vec<_>>(),
+            vec![1, 3, 0, 2]
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_str_sort_handles_empty_and_single_element_slices() {
+        let mut empty: Vec<FuzmatchStrT> = Vec::new();
+        fuzzy_match_str_sort(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut one = vec![item(9, 1)];
+        fuzzy_match_str_sort(&mut one);
+        assert_eq!(one[0].idx, 9);
+    }
+}
 
 const SCORE_MAX: f64 = f64::INFINITY;
 const SCORE_MIN: f64 = f64::NEG_INFINITY;
