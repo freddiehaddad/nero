@@ -29,6 +29,14 @@
 //! call these 2 real predicates directly instead of its own
 //! hardcoded-false assumption, since both now exist for real.
 //!
+//! Also translated: [`get_cot_flags`] and the `'completeopt'`
+//! predicates over it - [`cot_fuzzy`]/[`is_nearest_active`]/
+//! [`ins_compl_preinsert_longest`] - plus the `compl_autocomplete`
+//! static they consult. Note `ins_compl_preinsert_longest` masks
+//! `longest|preinsert|fuzzy` and compares the WHOLE result against
+//! `longest`, so it is true only when `longest` is set WITHOUT either
+//! companion - not merely when `longest` is present.
+//!
 //! Also translated: the completion-continuation state
 //! (`compl_cont_status` with its `CONT_*` flags, plus
 //! `compl_direction`/`compl_shows_dir`) and the small predicates over
@@ -129,6 +137,87 @@ static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
 /// completion-source dispatch machinery, isn't translated), matching
 /// [`CTRL_X_MODE`]'s own established treatment exactly.
 static COMPL_STARTED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Whether autocompletion is active (`compl_autocomplete`).
+///
+/// Stays `false` today for the same reason as the statics above: the
+/// completion engine that sets it is not translated.
+static COMPL_AUTOCOMPLETE: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Get the local or global value of `'completeopt'` flags
+/// (`get_cot_flags`).
+///
+/// A buffer-local value of `0` means "unset", so the global value is
+/// used - the original spells this as a plain `!= 0` test rather than
+/// tracking whether the local option was ever assigned.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer,
+/// and this must not run concurrently with any write to
+/// `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn get_cot_flags() -> u32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let local = unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_cot_flags };
+    if local != 0 {
+        return local;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags
+}
+
+/// Whether fuzzy matching is enabled (`cot_fuzzy`).
+///
+/// Thesaurus completion opts out, since its matches are looked up
+/// rather than filtered.
+///
+/// # Safety
+/// Forwarded from [`get_cot_flags`].
+#[must_use]
+pub unsafe fn cot_fuzzy() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { get_cot_flags() }) & crate::option_vars::opt_cot_flag::FUZZY != 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && !unsafe { ctrl_x_mode_thesaurus() }
+}
+
+/// Whether matches should be sorted by proximity to the cursor
+/// (`is_nearest_active`).
+///
+/// Fuzzy matching wins outright, since it imposes its own ordering.
+///
+/// # Safety
+/// Forwarded from [`get_cot_flags`].
+#[must_use]
+pub unsafe fn is_nearest_active() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let autocomplete = unsafe { *COMPL_AUTOCOMPLETE.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let nearest = unsafe { get_cot_flags() } & crate::option_vars::opt_cot_flag::NEAREST != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    (autocomplete || nearest) && !unsafe { cot_fuzzy() }
+}
+
+/// Whether autocomplete is active and the pre-insert effect targets
+/// the longest prefix (`ins_compl_preinsert_longest`).
+///
+/// The original masks `longest|preinsert|fuzzy` and compares the whole
+/// result against `longest` alone, so this is true ONLY when
+/// `'completeopt'` has `longest` WITHOUT either `preinsert` or
+/// `fuzzy` - not merely when `longest` is present.
+///
+/// # Safety
+/// Forwarded from [`get_cot_flags`].
+#[must_use]
+pub unsafe fn ins_compl_preinsert_longest() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { *COMPL_AUTOCOMPLETE.get_mut() } {
+        return false;
+    }
+    use crate::option_vars::opt_cot_flag::{FUZZY, LONGEST, PREINSERT};
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { get_cot_flags() }) & (LONGEST | PREINSERT | FUZZY) == LONGEST
+}
 
 /// "normal" or "adding" expansion (`CONT_ADDING`).
 pub const CONT_ADDING: i32 = 1;
@@ -549,6 +638,173 @@ mod tests {
                 *COMPL_SHOWS_DIR.get_mut() = self.prev_shows;
             }
         }
+    }
+
+    /// Installs a buffer as `curbuf` for the test's duration and
+    /// restores the previous one on drop, so a failing assertion
+    /// cannot leave a dangling pointer behind.
+    struct CurbufGuard {
+        prev: *mut crate::buffer_defs::BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(buf: &mut crate::buffer_defs::BufT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev = globals.curbuf;
+            globals.curbuf = buf as *mut crate::buffer_defs::BufT;
+            Self { prev }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.prev;
+        }
+    }
+
+    /// Saves and restores the global `'completeopt'` flags.
+    struct CotFlagsGuard {
+        saved: u32,
+    }
+
+    impl CotFlagsGuard {
+        fn set(flags: u32) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.cot_flags;
+            opts.cot_flags = flags;
+            Self { saved }
+        }
+    }
+
+    impl Drop for CotFlagsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.cot_flags = self.saved;
+        }
+    }
+
+    #[test]
+    fn get_cot_flags_prefers_a_nonzero_buffer_local_value() {
+        let _lock = global_state_test_lock();
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::MENU);
+        let mut buf = crate::buffer_defs::BufT {
+            b_cot_flags: crate::option_vars::opt_cot_flag::FUZZY,
+            ..Default::default()
+        };
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        assert_eq!(unsafe { get_cot_flags() }, crate::option_vars::opt_cot_flag::FUZZY);
+    }
+
+    #[test]
+    fn get_cot_flags_falls_back_to_the_global_when_local_is_zero() {
+        let _lock = global_state_test_lock();
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::MENU);
+        // Zero means "unset" here, not "no flags".
+        let mut buf = crate::buffer_defs::BufT { b_cot_flags: 0, ..Default::default() };
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        assert_eq!(unsafe { get_cot_flags() }, crate::option_vars::opt_cot_flag::MENU);
+    }
+
+    #[test]
+    fn cot_fuzzy_follows_the_fuzzy_flag() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::FUZZY);
+        assert!(unsafe { cot_fuzzy() });
+        drop(_cot);
+
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::MENU);
+        assert!(!unsafe { cot_fuzzy() });
+    }
+
+    #[test]
+    fn cot_fuzzy_is_off_in_thesaurus_mode() {
+        // Thesaurus matches are looked up rather than filtered, so
+        // fuzzy matching opts out even with the flag set.
+        let _guard = CtrlXModeGuard::set(CTRL_X_THESAURUS);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::FUZZY);
+
+        assert!(unsafe { ctrl_x_mode_thesaurus() });
+        assert!(!unsafe { cot_fuzzy() });
+    }
+
+    #[test]
+    fn is_nearest_active_follows_the_nearest_flag() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::NEAREST);
+        assert!(unsafe { is_nearest_active() });
+        drop(_cot);
+
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::MENU);
+        assert!(!unsafe { is_nearest_active() });
+    }
+
+    #[test]
+    fn is_nearest_active_yields_to_fuzzy_matching() {
+        // Fuzzy imposes its own ordering, so it wins outright.
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        let _cot = CotFlagsGuard::set(
+            crate::option_vars::opt_cot_flag::NEAREST | crate::option_vars::opt_cot_flag::FUZZY,
+        );
+
+        assert!(!unsafe { is_nearest_active() });
+    }
+
+    #[test]
+    fn ins_compl_preinsert_longest_needs_autocomplete() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        let _cot = CotFlagsGuard::set(crate::option_vars::opt_cot_flag::LONGEST);
+
+        // Autocomplete is off by default, so the flag alone is not
+        // enough.
+        assert!(!unsafe { ins_compl_preinsert_longest() });
+
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
+        assert!(unsafe { ins_compl_preinsert_longest() });
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
+    }
+
+    #[test]
+    fn ins_compl_preinsert_longest_wants_longest_alone() {
+        let _guard = CtrlXModeGuard::set(CTRL_X_NORMAL);
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = CurbufGuard::set(&mut buf);
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = true };
+
+        use crate::option_vars::opt_cot_flag::{FUZZY, LONGEST, MENU, PREINSERT};
+        // The original masks longest|preinsert|fuzzy and compares the
+        // whole result to longest, so either companion flag disables
+        // it - it is not merely "is longest set".
+        for (flags, expected) in [
+            (LONGEST, true),
+            // An unrelated flag does not disturb the masked compare.
+            (LONGEST | MENU, true),
+            (LONGEST | PREINSERT, false),
+            (LONGEST | FUZZY, false),
+            (PREINSERT, false),
+            (0, false),
+        ] {
+            let _cot = CotFlagsGuard::set(flags);
+            assert_eq!(
+                unsafe { ins_compl_preinsert_longest() },
+                expected,
+                "flags {flags:#x}"
+            );
+        }
+
+        unsafe { *COMPL_AUTOCOMPLETE.get_mut() = false };
     }
 
     #[test]
