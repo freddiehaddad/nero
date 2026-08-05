@@ -49,6 +49,14 @@
 //! structure would need raw pointers to express. `qf_count` becomes a
 //! method over that vector rather than a separately-maintained field.
 //!
+//! Also translated: [`qf_free_items`]/[`qf_free`]/[`qf_id2nr`]. Note
+//! that `qf_free_items`' original walks the linked list wrapped in two
+//! defensive workarounds - a `stop` flag catching a node whose
+//! `qf_next` points at itself, and a `qf_count = 1` fixup for
+//! `qf_count` disagreeing with the real chain (carrying its own
+//! `TODO(vim)`). Neither hazard can arise over a `Vec`, so both drop
+//! out rather than being reproduced as dead defensive code.
+//!
 //! Also translated: [`qf_store_title`]/[`qf_cmdtitle`]. Cross-checking
 //! against a real `nvim` showed the original's own doc comment on
 //! `qf_store_title` ("Prepends ':' to the title") is stale - the body
@@ -252,6 +260,59 @@ pub fn is_qf_list(qfl: &QfListT) -> bool {
 #[must_use]
 pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
+}
+
+/// Free all the entries in a quickfix list (`qf_free_items`).
+///
+/// The context and title are deliberately left alone; [`qf_free`]
+/// clears those.
+///
+/// The original walks the `qf_start` linked list freeing each node,
+/// wrapped in two defensive workarounds that have no counterpart
+/// here: a `stop` flag detecting a node whose `qf_next` points at
+/// itself, and a `qf_count = 1` fixup for `qf_count` disagreeing with
+/// the actual chain (carrying its own `TODO(vim)`). Neither hazard can
+/// arise with a `Vec` - it cannot be circular, and `qf_count` is
+/// derived from its length rather than tracked separately - so the
+/// whole loop is just clearing the vector.
+pub fn qf_free_items(qfl: &mut QfListT) {
+    qfl.qf_entries.clear();
+    qfl.qf_index = 0;
+    qfl.qf_nonevalid = true;
+    qfl.qf_directory = None;
+    qfl.qf_currfile = None;
+    qfl.qf_multiline = false;
+    qfl.qf_multiignore = false;
+    qfl.qf_multiscan = false;
+}
+
+/// Free a quickfix list entirely (`qf_free`): its entries, plus the
+/// associated context, title and callback that [`qf_free_items`]
+/// leaves alone.
+pub fn qf_free(qfl: &mut QfListT) {
+    qf_free_items(qfl);
+
+    qfl.qf_title = None;
+    qfl.qf_ctx = None;
+    qfl.qf_qftf_cb = crate::eval::typval_defs::Callback::default();
+    qfl.qf_id = 0;
+    qfl.qf_changedtick = 0;
+}
+
+/// Find the stack index of the list with the given unique id
+/// (`qf_id2nr`), or [`INVALID_QFIDX`] if there is no such list.
+///
+/// Searches only the first `qf_listcount` lists, as the original does
+/// - entries beyond that are not live.
+#[must_use]
+pub fn qf_id2nr(qi: &crate::types_defs::QfInfoT, qfid: u32) -> i32 {
+    let live = usize::try_from(qi.qf_listcount).unwrap_or(0).min(qi.qf_lists.len());
+    for (idx, qfl) in qi.qf_lists[..live].iter().enumerate() {
+        if qfl.qf_id == qfid {
+            return i32::try_from(idx).unwrap_or(INVALID_QFIDX);
+        }
+    }
+    INVALID_QFIDX
 }
 
 /// Set the title of the specified quickfix list (`qf_store_title`).
@@ -509,6 +570,110 @@ mod tests {
     fn a_default_stack_is_a_quickfix_stack() {
         // QFLT_QUICKFIX is the original enum's own first (zero) value.
         assert_eq!(QfltypeT::default(), QfltypeT::Quickfix);
+    }
+
+    #[test]
+    fn qf_free_items_clears_entries_and_parse_state() {
+        let mut qfl = QfListT {
+            qf_index: 3,
+            qf_nonevalid: false,
+            qf_directory: Some(b"/tmp".to_vec()),
+            qf_currfile: Some(b"a.c".to_vec()),
+            qf_multiline: true,
+            qf_multiignore: true,
+            qf_multiscan: true,
+            ..list_with(4)
+        };
+
+        qf_free_items(&mut qfl);
+
+        assert_eq!(qfl.qf_count(), 0);
+        assert_eq!(qfl.qf_index, 0);
+        // An emptied list has, by definition, no valid entries.
+        assert!(qfl.qf_nonevalid);
+        assert_eq!(qfl.qf_directory, None);
+        assert_eq!(qfl.qf_currfile, None);
+        assert!(!qfl.qf_multiline);
+        assert!(!qfl.qf_multiignore);
+        assert!(!qfl.qf_multiscan);
+    }
+
+    #[test]
+    fn qf_free_items_leaves_the_title_and_context_alone() {
+        // The original is explicit that these survive qf_free_items
+        // and are only cleared by qf_free.
+        let mut qfl = QfListT {
+            qf_title: Some(b"keep me".to_vec()),
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT::default())),
+            qf_id: 5,
+            qf_changedtick: 9,
+            ..list_with(2)
+        };
+
+        qf_free_items(&mut qfl);
+
+        assert_eq!(qfl.qf_title.as_deref(), Some(&b"keep me"[..]));
+        assert!(qfl.qf_ctx.is_some());
+        assert_eq!(qfl.qf_id, 5);
+        assert_eq!(qfl.qf_changedtick, 9);
+    }
+
+    #[test]
+    fn qf_free_also_clears_the_title_context_and_id() {
+        let mut qfl = QfListT {
+            qf_title: Some(b"gone".to_vec()),
+            qf_ctx: Some(Box::new(crate::eval::typval_defs::TypvalT::default())),
+            qf_id: 5,
+            qf_changedtick: 9,
+            ..list_with(2)
+        };
+
+        qf_free(&mut qfl);
+
+        assert_eq!(qfl.qf_count(), 0);
+        assert_eq!(qfl.qf_title, None);
+        assert!(qfl.qf_ctx.is_none());
+        assert_eq!(qfl.qf_id, 0);
+        assert_eq!(qfl.qf_changedtick, 0);
+    }
+
+    #[test]
+    fn qf_free_is_safe_on_an_already_empty_list() {
+        let mut qfl = QfListT::default();
+        qf_free(&mut qfl);
+        assert_eq!(qfl.qf_count(), 0);
+        assert!(qfl.qf_nonevalid);
+    }
+
+    #[test]
+    fn qf_id2nr_finds_a_list_by_its_unique_id() {
+        let mut qi = stack_with(3);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_lists[2].qf_id = 33;
+
+        assert_eq!(qf_id2nr(&qi, 11), 0);
+        assert_eq!(qf_id2nr(&qi, 22), 1);
+        assert_eq!(qf_id2nr(&qi, 33), 2);
+    }
+
+    #[test]
+    fn qf_id2nr_returns_invalid_for_an_unknown_id() {
+        let mut qi = stack_with(2);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        assert_eq!(qf_id2nr(&qi, 99), INVALID_QFIDX);
+        assert_eq!(qf_id2nr(&crate::types_defs::QfInfoT::default(), 11), INVALID_QFIDX);
+    }
+
+    #[test]
+    fn qf_id2nr_ignores_lists_beyond_qf_listcount() {
+        // The original loops to qf_listcount, not to the array's own
+        // size, so a matching id past the live range is not found.
+        let mut qi = stack_with(3);
+        qi.qf_lists[2].qf_id = 33;
+        qi.qf_listcount = 2;
+        assert_eq!(qf_id2nr(&qi, 33), INVALID_QFIDX);
     }
 
     #[test]
