@@ -2239,6 +2239,23 @@ pub unsafe fn ml_get_buf_mut(buf: &mut BufT, lnum: LinenrT) -> Vec<u8> {
     unsafe { ml_get_buf_impl(buf, lnum, true) }
 }
 
+/// Whether the line most recently returned by [`ml_get`] lives in
+/// allocated memory (`ml_line_alloced`).
+///
+/// Tests `ML_LINE_DIRTY` ONLY. `ML_ALLOCATED` is deliberately ignored
+/// so the answer matches a build without `ML_GET_ALLOC_LINES`, which
+/// is what the original's callers are written against.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn ml_line_alloced() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*GLOBALS.get_mut().curbuf };
+    curbuf.b_ml.ml_flags & crate::memline_defs::ML_LINE_DIRTY != 0
+}
+
 /// @return a pointer to a (read-only copy of a) line in `curbuf`
 /// (`ml_get`).
 ///
@@ -2460,6 +2477,48 @@ pub unsafe fn decl(lp: &mut crate::pos_defs::PosT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ml_line_alloced_follows_ml_line_dirty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let ptr: *mut crate::buffer_defs::BufT = &mut buf;
+        let globals = unsafe { GLOBALS.get_mut() };
+        let prev = globals.curbuf;
+        globals.curbuf = ptr;
+
+        unsafe { (*ptr).b_ml.ml_flags = 0 };
+        assert!(!unsafe { ml_line_alloced() });
+
+        unsafe { (*ptr).b_ml.ml_flags = crate::memline_defs::ML_LINE_DIRTY };
+        assert!(unsafe { ml_line_alloced() });
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn ml_line_alloced_ignores_ml_allocated() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let ptr: *mut crate::buffer_defs::BufT = &mut buf;
+        let globals = unsafe { GLOBALS.get_mut() };
+        let prev = globals.curbuf;
+        globals.curbuf = ptr;
+
+        // ML_ALLOCATED is deliberately NOT consulted, so the answer
+        // matches a build without ML_GET_ALLOC_LINES.
+        unsafe { (*ptr).b_ml.ml_flags = crate::memline_defs::ML_ALLOCATED };
+        assert!(!unsafe { ml_line_alloced() });
+
+        // Both set still reports true, via ML_LINE_DIRTY alone.
+        unsafe {
+            (*ptr).b_ml.ml_flags =
+                crate::memline_defs::ML_ALLOCATED | crate::memline_defs::ML_LINE_DIRTY;
+        }
+        assert!(unsafe { ml_line_alloced() });
+
+        unsafe { GLOBALS.get_mut() }.curbuf = prev;
+    }
 
     #[test]
     fn zero_block_size_fits_within_min_swap_page_size() {
