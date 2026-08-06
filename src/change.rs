@@ -218,6 +218,156 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Delete `count` bytes at the cursor position (`del_bytes`).
+///
+/// Returns `FAIL` when the cursor sits on the NUL past the end of the
+/// line, or when `count` is negative; `OK` otherwise (including for a
+/// zero `count`, which does nothing).
+///
+/// With `use_delcombine` and `'delcombine'` set, deleting less than one
+/// whole character instead removes only the last combining character.
+/// `fixpos` keeps the cursor off the trailing NUL when the last
+/// character of a non-blank line is removed.
+///
+/// The original's `siemsg("E292: ...")` for a negative count is
+/// omitted, matching this crate's established "skip the deferred
+/// message-display side effect, keep the exact same pass/fail
+/// outcome" policy (`arglist::check_arglist_locked`,
+/// `window::check_split_disallowed`).
+///
+/// # Safety
+/// `GLOBALS.curwin`/`curbuf` must be valid and the buffer must have a
+/// live memline; same as [`inserted_bytes`].
+pub unsafe fn del_bytes(count: ColnrT, fixpos_arg: bool, use_delcombine: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    let curbuf = g.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut col = unsafe { &*curwin }.w_cursor.col;
+    let mut fixpos = fixpos_arg;
+    // SAFETY: forwarded from this function's own safety doc.
+    let oldp = unsafe { crate::memline::ml_get(lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let oldlen = unsafe { crate::memline::ml_get_len(lnum) };
+    let mut count = count;
+
+    // Can't do anything when the cursor is on the NUL after the line.
+    if col >= oldlen {
+        return crate::vim_defs::FAIL;
+    }
+    // If "count" is zero there is nothing to do.
+    if count == 0 {
+        return crate::vim_defs::OK;
+    }
+    // If "count" is negative the caller must be doing something wrong.
+    if count < 1 {
+        return crate::vim_defs::FAIL;
+    }
+
+    // If 'delcombine' is set and we are deleting (less than) one
+    // character, only delete the last combining character.
+    // SAFETY: reading `'delcombine'`.
+    let deco = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_deco;
+    // SAFETY: forwarded from this function's own safety doc.
+    if deco != 0
+        && use_delcombine
+        && unsafe { crate::mbyte::utfc_ptr2len(&oldp[col as usize..]) } >= count
+    {
+        let mut state = crate::mbyte_defs::GRAPHEME_STATE_INIT;
+        let first_len = crate::mbyte::utf_ptr2len(&oldp[col as usize..]);
+        // SAFETY: forwarded from this function's own safety doc.
+        let composing = unsafe {
+            crate::mbyte::utf_composinglike(
+                &oldp[col as usize..],
+                &oldp[(col + first_len) as usize..],
+                &mut state,
+            )
+        };
+        if composing {
+            // Find the last composing char; there can be several.
+            let mut n = col;
+            loop {
+                col = n;
+                count = crate::mbyte::utf_ptr2len(&oldp[n as usize..]);
+                n += count;
+                // SAFETY: forwarded from this function's own safety doc.
+                let more = unsafe {
+                    crate::mbyte::utf_composinglike(
+                        &oldp[col as usize..],
+                        &oldp[n as usize..],
+                        &mut state,
+                    )
+                };
+                if !more {
+                    break;
+                }
+            }
+            fixpos = false;
+        }
+    }
+
+    // When count is too big, reduce it. `movelen` includes the
+    // trailing NUL.
+    let mut movelen = oldlen - col - count + 1;
+    if movelen <= 1 {
+        // If we just took off the last character of a non-blank line,
+        // and fixpos is true, we don't want to end up positioned at
+        // the NUL - unless "restart_edit" is set or 'virtualedit'
+        // contains "onemore".
+        // SAFETY: forwarded from this function's own safety doc.
+        let restart_edit = unsafe { crate::globals::GLOBALS.get_mut() }.restart_edit;
+        // SAFETY: forwarded from this function's own safety doc.
+        let ve = crate::option::get_ve_flags(unsafe { &*curwin });
+        if col > 0 && fixpos && restart_edit == 0 && ve & crate::option_vars::opt_ve_flag::ONEMORE == 0
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *curwin };
+            w.w_cursor.col -= 1;
+            w.w_cursor.coladd = 0;
+            // SAFETY: forwarded from this function's own safety doc.
+            w.w_cursor.col -= unsafe { crate::mbyte::utf_head_off(&oldp, w.w_cursor.col as usize) };
+        }
+        count = oldlen - col;
+        movelen = 1;
+    }
+    let newlen = oldlen - count;
+
+    // Build the line with the deleted range removed. The original
+    // either edits the memline's own allocation in place (when the
+    // line is already dirty) or allocates a fresh line; this crate's
+    // `ml_get` hands back an owned copy either way, so the new content
+    // is assembled once and then stored through whichever path the
+    // original would have taken.
+    let mut newp = Vec::with_capacity((newlen + 1) as usize);
+    newp.extend_from_slice(&oldp[..col as usize]);
+    newp.extend_from_slice(&oldp[(col + count) as usize..(col + count + movelen) as usize]);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let alloc_newp = !unsafe { crate::memline::ml_line_alloced() };
+    if alloc_newp {
+        // SAFETY: forwarded from this function's own safety doc.
+        // (the original ignores ml_replace's return value here too.)
+        let _ = unsafe { crate::memline::ml_replace(lnum, &newp) };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &mut *curbuf };
+        if let Some(ptr) = b.b_ml.ml_line_ptr.as_deref() {
+            crate::memline::ml_add_deleted_len(ptr, Some(oldlen as usize));
+        }
+        b.b_ml.ml_line_ptr = Some(newp);
+        b.b_ml.ml_line_textlen = newlen + 1;
+    }
+
+    // Mark the buffer as changed and prepare for displaying.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { inserted_bytes(lnum, col, count, 0) };
+
+    crate::vim_defs::OK
+}
+
 /// Insert or delete bytes at a column (`inserted_bytes`).
 ///
 /// Like [`changed_bytes`], but also adjusts extmarks for the "new"
@@ -1676,6 +1826,151 @@ mod tests {
         win.w_buffer = buf_ptr;
         let win_ptr: *mut WinT = win;
         (buf_ptr, win_ptr)
+    }
+
+    /// Builds a buffer with a REAL memline holding one line, plus a
+    /// window whose cursor sits at `col` (0-based). `del_bytes` reads
+    /// and writes the line through the memline, so unlike the
+    /// `changed_fixture` above this needs genuine storage.
+    ///
+    /// Returns the boxes so the caller keeps them alive; pointers are
+    /// derived afterwards via [`fixture_ptrs`].
+    fn del_fixture(line: &[u8], col: ColnrT) -> (Box<BufT>, Box<WinT>) {
+        let mut buf = Box::new(BufT::default());
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        let mut owned = line.to_vec();
+        owned.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &owned) },
+            crate::vim_defs::OK
+        );
+        // A real undo header, so u_force_get_undo_header hands one
+        // back rather than trying to create one (which needs undo
+        // state this fixture doesn't build).
+        buf.b_u_curhead = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        let mut win = Box::new(WinT {
+            w_cursor: PosT { lnum: 1, col, coladd: 0 },
+            w_topline: 1,
+            w_botline: 2,
+            ..Default::default()
+        });
+        win.w_lines_valid = 0;
+        (buf, win)
+    }
+
+    fn close_del_fixture(mut buf: Box<BufT>) {
+        unsafe {
+            if !buf.b_u_curhead.is_null() {
+                drop(Box::from_raw(buf.b_u_curhead));
+                buf.b_u_curhead = std::ptr::null_mut();
+            }
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn del_bytes_removes_the_requested_range() {
+        // Cross-verified against real nvim: "abcdef" with the cursor
+        // on column 3 (1-based) and "2x" yields "abef" with the cursor
+        // still on column 3.
+        let (mut buf, mut win) = del_fixture(b"abcdef", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(2, true, false) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abef\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 2, "cursor unmoved");
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_bytes_fixpos_steps_back_off_the_trailing_nul() {
+        // Cross-verified against real nvim: "abcdef" with the cursor
+        // on column 6 (1-based, the last char) and "x" yields "abcde"
+        // with the cursor pulled back to column 5.
+        let (mut buf, mut win) = del_fixture(b"abcdef", 5);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(1, true, false) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcde\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 4, "pulled back one");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_bytes_clamps_a_count_past_the_end_of_the_line() {
+        // Cross-verified against real nvim: "ab" with the cursor on
+        // column 1 and "5x" empties the line, leaving the cursor on
+        // column 1.
+        let (mut buf, mut win) = del_fixture(b"ab", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(5, true, false) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_bytes_fails_on_the_nul_past_the_end() {
+        let (mut buf, mut win) = del_fixture(b"ab", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(1, true, false) }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_bytes_zero_count_succeeds_without_changing_anything() {
+        let (mut buf, mut win) = del_fixture(b"ab", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(0, true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+        assert_eq!(unsafe { (*buf_ptr).b_changed }, 0, "no change recorded");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_bytes_rejects_a_negative_count() {
+        let (mut buf, mut win) = del_fixture(b"ab", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_bytes(-1, true, false) }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
