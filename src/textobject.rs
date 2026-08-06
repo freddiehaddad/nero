@@ -67,6 +67,39 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Skip `count`/2 sentences and `count`/2 separating runs of white
+/// space (`findsent_forward`).
+///
+/// `at_start_sent` says the cursor is currently at the start of a
+/// sentence; it alternates on each pass, which is what makes the
+/// motion step sentence, gap, sentence, gap.
+///
+/// # Safety
+/// Same as [`find_first_blank`], plus `crate::search::findsent`'s own.
+pub unsafe fn findsent_forward(count: i32, at_start_sent: bool) {
+    let mut count = count;
+    let mut at_start_sent = at_start_sent;
+    while {
+        let go = count != 0;
+        count -= 1;
+        go
+    } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { findsent(crate::vim_defs::Direction::Forward, 1) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        if at_start_sent {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { find_first_blank(&mut (*curwin).w_cursor) };
+        }
+        if count == 0 || at_start_sent {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::memline::decl(&mut (*curwin).w_cursor) };
+        }
+        at_start_sent = !at_start_sent;
+    }
+}
+
 /// Move `posp` back to the first character of the run of white space
 /// it currently sits in (`find_first_blank`).
 ///
@@ -1039,6 +1072,86 @@ mod tests {
             ..Default::default()
         });
         (buf, win)
+    }
+
+    #[test]
+    fn findsent_forward_steps_one_sentence_then_backs_off() {
+        // The underlying findsent is cross-verified against real nvim:
+        // on "One two. Three four. Five six." the ")" motion from
+        // column 1 lands on column 10 (1-based) - the 'T' of "Three",
+        // i.e. 0-based column 9.
+        //
+        // findsent_forward(1, false) then applies its own trailing
+        // decl(), landing one back on the space before "Three".
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"One two. Three four. Five six.", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { findsent_forward(1, false) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 8);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn findsent_forward_at_start_sent_trims_back_over_the_gap() {
+        // With at_start_sent, find_first_blank first pulls the cursor
+        // back to the start of the whitespace run (column 8), then the
+        // trailing decl() steps once more onto the '.' at column 7.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"One two. Three four. Five six.", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { findsent_forward(1, true) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 7);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn findsent_forward_alternates_sentence_and_gap_for_a_count() {
+        // Cross-verified against real nvim: "2)" from column 1 lands
+        // on column 22 (1-based) - the 'F' of "Five", i.e. 0-based 21.
+        //
+        // With count 2 the flag alternates, so the first pass skips
+        // its decl() and the second runs both find_first_blank and
+        // decl(), ending on the '.' after "four" at column 19.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"One two. Three four. Five six.", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { findsent_forward(2, false) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 19);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn findsent_forward_with_zero_count_is_a_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"One two. Three four.", 3);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { findsent_forward(0, false) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3, "cursor untouched");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
     }
 
     #[test]
