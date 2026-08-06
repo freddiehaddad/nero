@@ -692,6 +692,37 @@ pub fn fold_find(gap: &[FoldT], lnum: crate::pos_defs::LinenrT) -> (bool, usize)
     (false, low as usize)
 }
 
+/// Fold level at line number `lnum` in window `wp` (`foldLevelWin`).
+///
+/// Walks down the fold tree from the top level, following whichever
+/// fold contains the line, until no deeper fold does; the number of
+/// steps taken is the level. Nested folds store `fd_top` relative to
+/// their parent, so the line number is rebased on each descent.
+///
+/// Returns 0 when `lnum` is in no fold at all.
+#[must_use]
+pub fn fold_level_win(wp: &WinT, lnum: crate::pos_defs::LinenrT) -> i32 {
+    let mut lnum_rel = lnum;
+    let mut level = 0;
+
+    // Recursively search for a fold that contains "lnum".
+    let mut gap: &[FoldT] = &wp.w_folds;
+    loop {
+        let (found, idx) = fold_find(gap, lnum_rel);
+        if !found {
+            break;
+        }
+        // Check nested folds. Line number is relative to the
+        // containing fold.
+        let fp = &gap[idx];
+        lnum_rel -= fp.fd_top;
+        gap = &fp.fd_nested;
+        level += 1;
+    }
+
+    level
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1528,5 +1559,82 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(fold_find(&gap, 5), (false, 1));
+    }
+
+    /// Mirrors the layout cross-checked against real nvim: an outer
+    /// fold over lines 10-24 with a nested fold over lines 14-18.
+    /// The nested fold's `fd_top` is relative to its parent, so 14
+    /// becomes 14 - 10 = 4.
+    fn nested_outer_inner() -> Vec<FoldT> {
+        vec![FoldT {
+            fd_top: 10,
+            fd_len: 15,
+            fd_nested: vec![FoldT {
+                fd_top: 4,
+                fd_len: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn fold_level_win_matches_real_nvim_foldlevel() {
+        // Cross-verified against real nvim with an identical buffer:
+        // :14,18fold then :10,24fold gives foldlevel() 0 outside,
+        // 1 in the outer fold, and 2 inside the nested one.
+        let win = WinT {
+            w_folds: nested_outer_inner(),
+            ..Default::default()
+        };
+        for (lnum, level) in [
+            (5, 0),
+            (10, 1),
+            (12, 1),
+            (14, 2),
+            (16, 2),
+            (18, 2),
+            (19, 1),
+            (24, 1),
+            (25, 0),
+        ] {
+            assert_eq!(fold_level_win(&win, lnum), level, "line {lnum}");
+        }
+    }
+
+    #[test]
+    fn fold_level_win_is_zero_when_the_window_has_no_folds() {
+        let win = WinT::default();
+        assert_eq!(fold_level_win(&win, 1), 0);
+        assert_eq!(fold_level_win(&win, 100), 0);
+    }
+
+    #[test]
+    fn fold_level_win_counts_three_levels_of_nesting() {
+        let win = WinT {
+            w_folds: vec![FoldT {
+                fd_top: 10,
+                fd_len: 20,
+                fd_nested: vec![FoldT {
+                    // Relative to the outer fold: absolute line 15.
+                    fd_top: 5,
+                    fd_len: 10,
+                    fd_nested: vec![FoldT {
+                        // Relative to its parent: absolute line 18.
+                        fd_top: 3,
+                        fd_len: 4,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(fold_level_win(&win, 12), 1);
+        assert_eq!(fold_level_win(&win, 16), 2);
+        assert_eq!(fold_level_win(&win, 19), 3);
+        // Past the innermost fold but still inside the middle one.
+        assert_eq!(fold_level_win(&win, 23), 2);
     }
 }
