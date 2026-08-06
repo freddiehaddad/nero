@@ -25,9 +25,12 @@
 //! crate (e.g. `stl_clear_click_defs`).
 //!
 //! Deferred: everything else in the file - `buf_updates_register`/
-//! `_unregister`/`_send_end`/`_send_changes`/`_send_splice`/
+//! `_unregister`/`_send_end`/`_send_changes`/
 //! `_changedtick(_single)`/`_unload` all need the channel/Lua
-//! callback-dispatch machinery above.
+//! callback-dispatch machinery above. [`buf_updates_send_splice`] is
+//! translated only as far as its own guard reaches: both halves of
+//! that guard are real, and the dispatch loop behind them is
+//! `unimplemented!()` since nothing can subscribe yet.
 
 use crate::buffer_defs::BufT;
 
@@ -38,10 +41,79 @@ pub fn buf_updates_active(buf: &BufT) -> bool {
     !buf.update_channels.is_empty() || !buf.update_callbacks.is_empty()
 }
 
+/// Notify live update subscribers of a byte-level splice
+/// (`buf_updates_send_splice`).
+///
+/// Always returns without notifying anything in this crate today.
+/// That is the original's own first, real check
+/// (`if (!buf_updates_active(buf) || (old_byte == 0 && new_byte == 0))
+/// return;`), not a shortcut: nothing translated can register an RPC
+/// channel or Lua callback yet, so [`buf_updates_active`] is
+/// genuinely always `false` and the notification loop is unreachable.
+/// This matches this crate's established "translate the real,
+/// always-taken early-return path" precedent (`quickfix.rs`'s
+/// `qf_mark_adjust`, `fold.rs`'s `checkupdate`).
+///
+/// The second half of that condition IS reachable and is translated
+/// too: a splice that moves no bytes at all notifies nobody even with
+/// subscribers attached.
+#[allow(clippy::too_many_arguments)]
+pub fn buf_updates_send_splice(
+    buf: &BufT,
+    _start_row: i32,
+    _start_col: crate::pos_defs::ColnrT,
+    _start_byte: crate::extmark_defs::BcountT,
+    _old_row: i32,
+    _old_col: crate::pos_defs::ColnrT,
+    old_byte: crate::extmark_defs::BcountT,
+    _new_row: i32,
+    _new_col: crate::pos_defs::ColnrT,
+    new_byte: crate::extmark_defs::BcountT,
+) {
+    if !buf_updates_active(buf) || (old_byte == 0 && new_byte == 0) {
+        return;
+    }
+    // The real per-callback dispatch loop needs `nlua_call_ref`/
+    // `rpc_send_event`, neither translated - see this module's own doc
+    // comment. Unreachable today for the reason given above.
+    unimplemented!(
+        "buf_updates_send_splice: the notification dispatch needs the Lua/RPC callback layer, \
+         not yet translated - unreachable today since buf_updates_active() is always false"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::BufUpdateCallbacks;
+
+    #[test]
+    fn send_splice_returns_quietly_without_subscribers() {
+        // Nothing translated can register a channel or callback yet, so
+        // this is the always-taken path.
+        let buf = BufT::default();
+        buf_updates_send_splice(&buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+    }
+
+    #[test]
+    fn send_splice_returns_quietly_for_a_zero_byte_splice() {
+        // The other half of the guard: with subscribers attached but no
+        // bytes moved, there is still nothing to report.
+        let mut buf = BufT::default();
+        buf.update_callbacks.push(BufUpdateCallbacks::default());
+        assert!(buf_updates_active(&buf));
+        buf_updates_send_splice(&buf, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not yet translated")]
+    fn send_splice_with_subscribers_and_real_bytes_is_unimplemented() {
+        // Documents the boundary: this is only reachable once buffer
+        // updates can actually be registered.
+        let mut buf = BufT::default();
+        buf.update_callbacks.push(BufUpdateCallbacks::default());
+        buf_updates_send_splice(&buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+    }
 
     #[test]
     fn inactive_when_both_lists_are_empty() {
