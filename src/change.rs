@@ -218,6 +218,44 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Insert the NUL-terminated byte string `p` at the cursor position
+/// (`ins_bytes`).
+///
+/// # Safety
+/// Same as [`ins_char_bytes`].
+pub unsafe fn ins_bytes(p: &[u8]) {
+    // The original takes a NUL-terminated `char *` and measures it
+    // with strlen; here the slice may or may not carry a trailing NUL,
+    // so stop at the first one if present.
+    let len = p.iter().position(|&b| b == 0).unwrap_or(p.len());
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ins_bytes_len(&p[..len]) };
+}
+
+/// Insert the byte string `p` at the cursor position, one whole
+/// character at a time (`ins_bytes_len`).
+///
+/// Handles Replace mode and multi-byte characters, since each
+/// character is handed to [`ins_char_bytes`] individually.
+///
+/// # Safety
+/// Same as [`ins_char_bytes`].
+pub unsafe fn ins_bytes_len(p: &[u8]) {
+    let len = p.len();
+    let mut i = 0usize;
+    while i < len {
+        // Avoid reading past the end of `p`.
+        // SAFETY: forwarded from this function's own safety doc.
+        let n = unsafe { crate::mbyte::utfc_ptr2len_len(&p[i..], len - i) } as usize;
+        if n == 0 {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ins_char_bytes(&p[i..i + n]) };
+        i += n;
+    }
+}
+
 /// Insert the character `c` at the cursor position (`ins_char`).
 ///
 /// # Safety
@@ -2128,6 +2166,61 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn ins_bytes_len_inserts_each_character_whole() {
+        // Cross-verified against real nvim: "af" with the cursor on
+        // column 2 (1-based) and inserting "bécd" yields "abécdf" with
+        // strlen 7, so the 2-byte é is handed to ins_char_bytes as one
+        // character rather than split across two calls.
+        let (mut buf, mut win) = del_fixture(b"af", 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_bytes_len("bécd".as_bytes()) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, "abécdf\0".as_bytes());
+        assert_eq!(unsafe { crate::memline::ml_get_len(1) }, 7);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 6, "advanced 5 bytes");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_bytes_stops_at_a_trailing_nul() {
+        // The original takes a NUL-terminated char * and measures it
+        // with strlen, so the NUL itself must never be inserted.
+        let (mut buf, mut win) = del_fixture(b"ad", 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_bytes(b"bc\0") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcd\0");
+        assert_eq!(unsafe { crate::memline::ml_get_len(1) }, 4);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_bytes_len_with_an_empty_slice_is_a_noop() {
+        let (mut buf, mut win) = del_fixture(b"ab", 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_bytes_len(b"") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+        assert_eq!(unsafe { (*buf_ptr).b_changed }, 0, "nothing changed");
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
