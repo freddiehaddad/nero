@@ -1288,7 +1288,22 @@ pub unsafe fn get_changelist(buf: &mut BufT, win: &mut WinT, count: i32) -> *mut
         n += count;
     }
     win.w_changelistidx = n;
-    let curbuf_handle = unsafe { &*GLOBALS.get_mut().curbuf }.handle;
+    // The original reads the global `curbuf` here while `buf` is also
+    // live. In C both are raw pointers so aliasing is fine, but in
+    // Rust taking a second reference through the global while `buf` is
+    // borrowed is undefined behaviour whenever they are the same
+    // object - which is the common case, since callers pass `curbuf`.
+    // So read the handle out of `buf` directly in that case, and only
+    // go through the global when they genuinely differ. Same fix as
+    // `memline::ml_find_line_or_offset`.
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf_ptr = unsafe { GLOBALS.get_mut() }.curbuf;
+    let curbuf_handle = if std::ptr::eq(curbuf_ptr, buf) {
+        buf.handle
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &*curbuf_ptr }.handle
+    };
     // Changelist marks are always buffer local, Shada does not set it
     // when loading.
     buf.b_changelist[n as usize].fnum = curbuf_handle;
@@ -3853,18 +3868,28 @@ mod tests {
     #[test]
     fn setpcmark_discards_forward_jumplist_when_jumpoptions_stack() {
         let mut buf = BufT::default();
-        let mut win = WinT::default();
+
+        // Every write to `win` must happen BEFORE the guard captures a
+        // raw pointer to it. Writing through the original variable
+        // afterwards is a foreign write that disables the pointer
+        // lineage stored in `GLOBALS.curwin`, making `setpcmark`'s own
+        // reborrow through that global undefined behaviour under Tree
+        // Borrows. Reads after the guard are fine.
+        //
+        // Simulate 3 marks already in the jumplist, with the index
+        // currently sitting in the middle (as if the user had jumped
+        // back with CTRL-O).
+        let mut win = WinT {
+            w_jumplistlen: 3,
+            w_jumplistidx: 1,
+            w_cursor: PosT { lnum: 99, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+
         let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
         let prev_jop = unsafe { OPTION_VARS.get_mut() }.jop_flags;
         unsafe { OPTION_VARS.get_mut() }.jop_flags = opt_jop_flag::STACK;
 
-        // Simulate 3 marks already in the jumplist, with the index
-        // currently sitting in the middle (as if the user had jumped
-        // back with CTRL-O).
-        win.w_jumplistlen = 3;
-        win.w_jumplistidx = 1;
-
-        win.w_cursor = PosT { lnum: 99, col: 0, coladd: 0 };
         unsafe { setpcmark() };
 
         // Everything after index 1 is discarded (truncating to
