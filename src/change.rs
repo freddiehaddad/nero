@@ -73,19 +73,150 @@
 //!
 //! Also translated: [`changed_lines_redraw_buf`] - maintains the
 //! `b_mod_*` "region that must be redisplayed" bookkeeping, widening
-//! it across repeated changes. Fully faithful: it touches only
-//! already-real `BufT` fields plus `buf_meta_total`, so it needs none
-//! of the display pipeline (which only later reads `b_mod_*`).
+//! it across repeated changes - and
+//! [`changed_lines_invalidate_win`]/[`changed_lines_invalidate_buf`],
+//! which invalidate the cached cursor/botline values and renumber the
+//! `w_lines[]` display cache after a change. All three are fully
+//! faithful: they touch only already-real `BufT`/`WinT` fields plus
+//! `buf_meta_total`, `fold.rs`'s `find_wl_entry` and `move.rs`'s own
+//! cache-invalidation helpers, so they need none of the display
+//! pipeline (which only later reads what they record).
 //!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display
 //! pipeline, the fold/diff subsystems, etc. - see above).
 
 use crate::ascii_defs::ascii_iswhite;
-use crate::buffer_defs::{b_flags, BufT};
+use crate::buffer_defs::{b_flags, BufT, WinT};
 use crate::option::copy_option_part;
-use crate::pos_defs::LinenrT;
+use crate::pos_defs::{ColnrT, LinenrT};
 use crate::strings::vim_strchr;
+
+/// Invalidate the cached cursor/botline values and the `w_lines[]`
+/// display cache of window `wp` after lines `lnum..lnume` changed
+/// (`changed_lines_invalidate_win`).
+///
+/// `xtra` is the number of lines added (positive) or removed
+/// (negative). Entries below the change have their line numbers
+/// corrected so display can stop early; entries covered by the change
+/// are invalidated.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose
+/// `w_buffer` is valid and whose marktree is well-formed.
+pub unsafe fn changed_lines_invalidate_win(
+    wp: *mut WinT,
+    lnum: LinenrT,
+    col: ColnrT,
+    lnume: LinenrT,
+    xtra: LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *wp };
+    let mut lnume = lnume;
+
+    // If the changed line is in a range of previously folded lines,
+    // compare with the first line in that range.
+    if w.w_cursor.lnum <= lnum {
+        // (`find_wl_entry` returns `Option<usize>` here, the checked
+        // form of the original's `int i` / `i >= 0` sentinel.)
+        let found = crate::fold::find_wl_entry(w, lnum);
+        if let Some(i) = found
+            && w.w_cursor.lnum > w.w_lines[i].wl_lnum
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::changed_line_abv_curs_win(w) };
+        }
+    }
+
+    if w.w_cursor.lnum > lnum {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::changed_line_abv_curs_win(w) };
+    } else if w.w_cursor.lnum == lnum && w.w_cursor.col >= col {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::changed_cline_bef_curs(w) };
+    }
+    if w.w_botline >= lnum {
+        if xtra < 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::invalidate_botline_win(w) };
+        } else {
+            // Assume that botline doesn't change (inserted lines make
+            // other lines scroll down below botline).
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::approximate_botline_win(w) };
+        }
+    }
+
+    // If lines have been inserted/deleted and the buffer has
+    // virt_lines, or inline virt_text with 'wrap' enabled, invalidate
+    // the line after the changed lines: virt_lines may now be drawn
+    // above that line, and inline virt_text may cause it to wrap.
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*w.w_buffer };
+    if (xtra < 0
+        && w.w_onebuf_opt.wo_wrap != 0
+        && crate::buffer::buf_meta_total(buf, crate::marktree_defs::MetaIndex::Inline) != 0)
+        || (xtra != 0
+            && crate::buffer::buf_meta_total(buf, crate::marktree_defs::MetaIndex::Lines) != 0)
+    {
+        lnume += 1;
+    }
+
+    // Check if any w_lines[] entries have become invalid. For entries
+    // below the change, correct the lnums for inserted/deleted lines,
+    // which makes it possible to stop displaying after the change.
+    for i in 0..w.w_lines_valid {
+        let entry = &mut w.w_lines[i as usize];
+        if !entry.wl_valid {
+            continue;
+        }
+        if entry.wl_lnum >= lnum {
+            // Do not change wl_lnum at index zero, it is used to
+            // compare with w_topline. Invalidate it instead.
+            if i == 0 || entry.wl_lnum < lnume {
+                // Line included in the change.
+                entry.wl_valid = false;
+            } else if xtra != 0 {
+                // Line below the change.
+                entry.wl_lnum += xtra;
+                entry.wl_foldend += xtra;
+                entry.wl_lastlnum += xtra;
+            }
+        } else if entry.wl_lastlnum >= lnum {
+            // Change somewhere inside this range of folded or
+            // concealed lines, so it may need to be redrawn.
+            entry.wl_valid = false;
+        }
+    }
+}
+
+/// Like [`changed_lines_invalidate_win`], but for every window
+/// displaying `buf` (`changed_lines_invalidate_buf`).
+///
+/// # Safety
+/// Same as [`changed_lines_invalidate_win`], for every window in
+/// `GLOBALS.firstwin`'s own `w_next` chain.
+pub unsafe fn changed_lines_invalidate_buf(
+    buf: *mut BufT,
+    lnum: LinenrT,
+    col: ColnrT,
+    lnume: LinenrT,
+    xtra: LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        let next = w.w_next;
+        if w.w_buffer == buf {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { changed_lines_invalidate_win(wp, lnum, col, lnume, xtra) };
+        }
+        wp = next;
+    }
+}
 
 /// Record that lines `lnum..lnume` of `buf` changed, so that
 /// `win_update()` redisplays them (`changed_lines_redraw_buf`).
@@ -844,6 +975,110 @@ pub unsafe fn get_last_leader_offset(line: &[u8], mut flags: Option<&mut usize>)
 mod tests {
     use super::*;
     use crate::buffer::buf_get_changedtick;
+    use crate::buffer_defs::WlineT;
+    use crate::pos_defs::PosT;
+
+    /// A window with a small, fully-valid `w_lines[]` display cache
+    /// covering lines 1..=4, so the invalidation pass has something
+    /// real to walk.
+    fn win_with_line_cache(buf: *mut BufT, cursor_lnum: LinenrT) -> WinT {
+        let lines: Vec<WlineT> = (1..=4)
+            .map(|n| WlineT {
+                wl_lnum: n,
+                wl_lastlnum: n,
+                wl_foldend: n,
+                wl_valid: true,
+                ..Default::default()
+            })
+            .collect();
+        WinT {
+            w_buffer: buf,
+            w_cursor: PosT { lnum: cursor_lnum, col: 0, coladd: 0 },
+            w_topline: 1,
+            w_botline: 5,
+            w_lines_valid: 4,
+            w_lines: lines,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn invalidate_win_marks_covered_lines_invalid() {
+        let mut buf = BufT::default();
+        let mut win = win_with_line_cache(&mut buf, 1);
+
+        // Change covering lines 2..3 with no line-count change.
+        unsafe { changed_lines_invalidate_win(&mut win, 2, 0, 4, 0) };
+
+        assert!(!win.w_lines[1].wl_valid, "line 2 is inside the change");
+        assert!(!win.w_lines[2].wl_valid, "line 3 is inside the change");
+        assert!(win.w_lines[3].wl_valid, "line 4 is below it and unshifted");
+        assert_eq!(win.w_lines[3].wl_lnum, 4);
+    }
+
+    #[test]
+    fn invalidate_win_shifts_entries_below_the_change() {
+        let mut buf = BufT::default();
+        let mut win = win_with_line_cache(&mut buf, 1);
+
+        // Two lines inserted at line 2: entries below shift down.
+        unsafe { changed_lines_invalidate_win(&mut win, 2, 0, 2, 2) };
+
+        assert_eq!(win.w_lines[1].wl_lnum, 4);
+        assert_eq!(win.w_lines[1].wl_lastlnum, 4);
+        assert_eq!(win.w_lines[1].wl_foldend, 4);
+        assert!(win.w_lines[1].wl_valid, "still valid, just renumbered");
+        assert_eq!(win.w_lines[3].wl_lnum, 6);
+    }
+
+    #[test]
+    fn invalidate_win_never_renumbers_entry_zero() {
+        let mut buf = BufT::default();
+        let mut win = win_with_line_cache(&mut buf, 1);
+
+        // The change starts at line 1, so entry 0 would otherwise be
+        // shifted; it is invalidated instead, since it is what
+        // w_topline is compared against.
+        unsafe { changed_lines_invalidate_win(&mut win, 1, 0, 1, 3) };
+
+        assert!(!win.w_lines[0].wl_valid);
+        assert_eq!(win.w_lines[0].wl_lnum, 1, "left untouched, not shifted");
+    }
+
+    #[test]
+    fn invalidate_win_invalidates_a_folded_range_containing_the_change() {
+        let mut buf = BufT::default();
+        let mut win = win_with_line_cache(&mut buf, 1);
+        // Entry 0 stands for a fold covering lines 1..=9.
+        win.w_lines[0].wl_lastlnum = 9;
+
+        // The change is at line 6, inside that folded range, even
+        // though the entry's own wl_lnum is below lnum.
+        unsafe { changed_lines_invalidate_win(&mut win, 6, 0, 7, 0) };
+
+        assert!(!win.w_lines[0].wl_valid);
+    }
+
+    #[test]
+    fn invalidate_buf_only_touches_windows_on_that_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf_a = BufT::default();
+        let mut buf_b = BufT::default();
+        let mut win_b = win_with_line_cache(&mut buf_b, 1);
+        let mut win_a = win_with_line_cache(&mut buf_a, 1);
+        win_a.w_next = &mut win_b;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_firstwin = g.firstwin;
+        g.firstwin = &mut win_a;
+
+        unsafe { changed_lines_invalidate_buf(&mut buf_a, 2, 0, 4, 0) };
+
+        assert!(!win_a.w_lines[1].wl_valid);
+        assert!(win_b.w_lines[1].wl_valid, "other buffer's window untouched");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
 
     #[test]
     fn changed_lines_redraw_buf_sets_a_fresh_region() {
