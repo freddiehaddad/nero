@@ -1315,8 +1315,9 @@ unsafe fn free_funccal(fc: *mut FunccallT) {
     let base = fc_ref.fc_ufuncs.ga_data.as_mut_ptr() as *mut *mut UfuncT;
     for i in 0..count {
         // SAFETY: `i < count == ga_len`, in-bounds; forwarded from this
-        // function's own safety doc.
-        let fp = unsafe { *base.add(i) };
+        // function's own safety doc. The `Vec<u8>` backing store carries
+        // only byte alignment, so the typed read must be unaligned.
+        let fp = unsafe { base.add(i).read_unaligned() };
         // When garbage collecting, a funccall_T may be freed before the
         // function that references it - clear its uf_scoped field. The
         // function may have been redefined and point to another
@@ -1552,10 +1553,12 @@ unsafe fn funccal_unref(fc: *mut FunccallT, fp: *mut UfuncT, force: bool) {
     for i in 0..count {
         // SAFETY: `i < count == ga_len`, in-bounds.
         let slot = unsafe { base.add(i) };
-        // SAFETY: forwarded from this function's own safety doc.
-        if unsafe { *slot } == fp {
+        // SAFETY: forwarded from this function's own safety doc. The
+        // `Vec<u8>` backing store carries only byte alignment, so the
+        // typed accesses must be unaligned.
+        if unsafe { slot.read_unaligned() } == fp {
             // SAFETY: forwarded from this function's own safety doc.
-            unsafe { *slot = std::ptr::null_mut() };
+            unsafe { slot.write_unaligned(std::ptr::null_mut()) };
         }
     }
 }
@@ -1594,7 +1597,9 @@ unsafe fn register_closure(fp: *mut UfuncT) {
         (*current).fc_ufuncs.ga_grow(1);
         let base = (*current).fc_ufuncs.ga_data.as_mut_ptr() as *mut *mut UfuncT;
         let idx = (*current).fc_ufuncs.ga_len;
-        *base.add(idx as usize) = fp;
+        // The `Vec<u8>` backing store carries only byte alignment, so
+        // the typed store must be unaligned.
+        base.add(idx as usize).write_unaligned(fp);
         (*current).fc_ufuncs.ga_len += 1;
     }
 }
@@ -2618,7 +2623,7 @@ mod tests {
         unsafe { funccal_unref(fc_ptr, fp_ptr, false) };
         assert_eq!(fc.fc_refcount, 4);
         let base = fc.fc_ufuncs.ga_data.as_ptr() as *const *mut UfuncT;
-        assert!(unsafe { *base }.is_null());
+        assert!(unsafe { base.read_unaligned() }.is_null());
     }
 
     #[test]
@@ -2727,7 +2732,7 @@ mod tests {
         assert_eq!(unsafe { (*fc_ptr).fc_refcount }, 2);
         assert_eq!(unsafe { (*fc_ptr).fc_ufuncs.ga_len }, 1);
         let base = unsafe { (*fc_ptr).fc_ufuncs.ga_data.as_ptr() as *const *mut UfuncT };
-        assert_eq!(unsafe { *base }, &mut fp as *mut UfuncT);
+        assert_eq!(unsafe { base.read_unaligned() }, &mut fp as *mut UfuncT);
 
         unsafe { *CURRENT_FUNCCAL.get_mut() = std::ptr::null_mut() };
     }

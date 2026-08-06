@@ -115,6 +115,16 @@ impl GarrayT {
     /// `GA_APPEND(item_type, gap, item)` (from `src/nvim/garray.h`): append
     /// a single item of any `Copy` type to the array.
     ///
+    /// # Alignment
+    /// The original stores items in an `xmalloc`ed `void *ga_data`, which is
+    /// aligned for any fundamental type, so it dereferences the slot as a
+    /// plain `item_type *`. This translation backs the array with a
+    /// `Vec<u8>`, which guarantees only byte alignment, so the typed store
+    /// must be an unaligned one - an aligned write here is undefined
+    /// behaviour for any `T` with an alignment above 1 (confirmed under
+    /// Miri). The observable result is identical, and on the platforms this
+    /// targets an unaligned store of an aligned-size scalar costs nothing.
+    ///
     /// # Safety
     /// The caller must ensure `self.ga_itemsize == size_of::<T>()` (set via
     /// [`GarrayT::new`]) - like the original macro, this is not checked.
@@ -123,7 +133,7 @@ impl GarrayT {
         self.ga_grow(1);
         let idx = self.ga_len as usize * std::mem::size_of::<T>();
         let ptr = self.ga_data.as_mut_ptr().add(idx) as *mut T;
-        ptr.write(item);
+        ptr.write_unaligned(item);
         self.ga_len += 1;
     }}
 
@@ -134,6 +144,13 @@ impl GarrayT {
     /// The returned pointer is valid for exactly `self.ga_itemsize` bytes;
     /// the caller must fully initialize it (matches the original's
     /// contract, which hands back a raw, uninitialized slot).
+    ///
+    /// It carries only byte alignment, because the backing store is a
+    /// `Vec<u8>` rather than the original's `xmalloc`ed `void *` (see
+    /// [`GarrayT::ga_append_item`]). A caller that casts it to some
+    /// `*mut T` must therefore use [`std::ptr::write_unaligned`] and
+    /// [`std::ptr::read_unaligned`]; an aligned access is undefined
+    /// behaviour for any `T` whose alignment exceeds 1.
     pub unsafe fn ga_append_via_ptr(&mut self, item_size: usize) -> *mut u8 { unsafe {
         if item_size as i32 != self.ga_itemsize {
             crate::log::logmsg(
@@ -264,10 +281,12 @@ mod tests {
             ga.ga_append_item::<i32>(20);
         }
         assert_eq!(ga.ga_len, 2);
+        // The `Vec<u8>` backing store carries only byte alignment, so
+        // reading items back out must be unaligned too.
         let ptr = ga.ga_data.as_ptr() as *const i32;
         unsafe {
-            assert_eq!(*ptr, 10);
-            assert_eq!(*ptr.add(1), 20);
+            assert_eq!(ptr.read_unaligned(), 10);
+            assert_eq!(ptr.add(1).read_unaligned(), 20);
         }
     }
 
@@ -276,12 +295,12 @@ mod tests {
         let mut ga = GarrayT::new(4, 2);
         unsafe {
             let p = ga.ga_append_via_ptr(4) as *mut i32;
-            p.write(42);
+            p.write_unaligned(42);
         }
         assert_eq!(ga.ga_len, 1);
         let ptr = ga.ga_data.as_ptr() as *const i32;
         unsafe {
-            assert_eq!(*ptr, 42);
+            assert_eq!(ptr.read_unaligned(), 42);
         }
     }
 
