@@ -67,6 +67,28 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Move `posp` back to the first character of the run of white space
+/// it currently sits in (`find_first_blank`).
+///
+/// Walks backwards while the character is whitespace, then steps
+/// forward one so `posp` lands on the first blank rather than the
+/// non-blank before it. Stops at the start of the file.
+///
+/// # Safety
+/// Same as [`crate::memline::gchar_pos`].
+pub unsafe fn find_first_blank(posp: &mut crate::pos_defs::PosT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    while unsafe { crate::memline::decl(posp) } != -1 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe { crate::memline::gchar_pos(posp) };
+        if !crate::ascii_defs::ascii_iswhite(c) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::memline::incl(posp) };
+            break;
+        }
+    }
+}
+
 /// Move back to the end of the previous word (`bckend_word`), the
 /// `ge`/`gE` motion.
 ///
@@ -1017,6 +1039,64 @@ mod tests {
             ..Default::default()
         });
         (buf, win)
+    }
+
+    #[test]
+    fn find_first_blank_lands_on_the_first_of_a_run() {
+        // Walking back from "b" over "   " should land on the FIRST
+        // space, not the "a" before it.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a   b", 4);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        let mut pos = crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 };
+        unsafe { find_first_blank(&mut pos) };
+
+        assert_eq!(pos.col, 1, "first space of the run");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn find_first_blank_steps_back_one_when_already_on_a_non_blank() {
+        // Starting on "c" with "b" immediately before it, the loop
+        // stops on the very first step and the incl() puts us back.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"abc", 2);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        let mut pos = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        unsafe { find_first_blank(&mut pos) };
+
+        assert_eq!(pos.col, 2, "back to where it started");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn find_first_blank_stops_at_the_start_of_the_file() {
+        // The whole line is blank, so the backward walk runs out
+        // rather than finding a non-blank to stop at.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"   ", 2);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        let mut pos = crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 };
+        unsafe { find_first_blank(&mut pos) };
+
+        assert_eq!(pos.lnum, 1);
+        assert_eq!(pos.col, 0, "ran back to the start of the file");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
     }
 
     #[test]
