@@ -15,6 +15,25 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Clear a pending operator (`clearop`).
+///
+/// Resets both the operator argument's own fields AND the global
+/// `motion_force`, which is separate state the caller would otherwise
+/// have to remember to clear itself.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `crate::globals::GLOBALS`.
+pub unsafe fn clearop(oap: &mut crate::normal_defs::OpargT) {
+    oap.op_type = crate::ops_defs::OpType::Nop as i32;
+    oap.regname = 0;
+    oap.motion_force = i32::from(crate::ascii_defs::NUL);
+    oap.use_reg_one = false;
+    oap.restore_cursor = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.motion_force = i32::from(crate::ascii_defs::NUL);
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///
@@ -63,6 +82,53 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearop_resets_every_operator_field() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT {
+            op_type: crate::ops_defs::OpType::Delete as i32,
+            regname: i32::from(b'a'),
+            motion_force: i32::from(b'v'),
+            use_reg_one: true,
+            restore_cursor: true,
+            ..Default::default()
+        };
+
+        unsafe { clearop(&mut oap) };
+
+        assert_eq!(oap.op_type, crate::ops_defs::OpType::Nop as i32);
+        assert_eq!(oap.regname, 0);
+        assert_eq!(oap.motion_force, 0);
+        assert!(!oap.use_reg_one);
+        assert!(!oap.restore_cursor);
+    }
+
+    #[test]
+    fn clearop_also_clears_the_global_motion_force() {
+        let _lock = crate::globals::global_state_test_lock();
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = globals.motion_force;
+        globals.motion_force = i32::from(b'v');
+
+        let mut oap = crate::normal_defs::OpargT::default();
+        unsafe { clearop(&mut oap) };
+
+        // The global is separate state from the oparg's own field, so
+        // clearing only the latter would leave a stale force behind.
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.motion_force, 0);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.motion_force = prev;
+    }
+
+    #[test]
+    fn clearop_on_an_already_clear_oparg_is_idempotent() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut oap = crate::normal_defs::OpargT::default();
+        unsafe { clearop(&mut oap) };
+        unsafe { clearop(&mut oap) };
+        assert_eq!(oap.op_type, crate::ops_defs::OpType::Nop as i32);
+    }
 
     #[test]
     fn is_ident_plain_code_before_offset_is_true() {
