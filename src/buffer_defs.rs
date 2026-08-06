@@ -2149,7 +2149,7 @@ pub struct WinT {
     pub w_lines: Vec<WlineT>,
 
     /// array of nested folds
-    pub w_folds: GarrayT,
+    pub w_folds: Vec<crate::fold::FoldT>,
     /// when true: some folds are opened/closed manually
     pub w_fold_manual: bool,
     /// when true: folding needs to be recomputed
@@ -2428,7 +2428,7 @@ impl Default for WinT {
             w_filler_rows: 0,
             w_lines_valid: 0,
             w_lines: Vec::new(),
-            w_folds: GarrayT::default(),
+            w_folds: Vec::new(),
             w_fold_manual: false,
             w_foldinvalid: false,
             w_nrwidth: 0,

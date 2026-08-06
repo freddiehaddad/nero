@@ -5910,7 +5910,7 @@ mod tests {
         // to detect whether the call happens at all.
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;
@@ -5923,13 +5923,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    #[should_panic(expected = "needs the fold-tree machinery")]
     fn mark_adjust_buf_panics_via_fold_mark_adjust_when_adjust_folds_is_true_and_folds_exist() {
         let mut buf = BufT::default();
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;
@@ -5983,13 +5983,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    #[should_panic(expected = "needs the fold-tree machinery")]
     fn mark_adjust_enables_fold_adjustment_unlike_mark_adjust_nofold() {
         let mut buf = BufT::default();
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;
@@ -6007,7 +6007,7 @@ mod tests {
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;

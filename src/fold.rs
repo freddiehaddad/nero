@@ -53,8 +53,8 @@
 //! fields - returns `Option<usize>` in place of the original's own
 //! `-1` sentinel); `getDeepestNesting` (+ its own
 //! `getDeepestNestingRecurse` helper) - the real recursive-descent-
-//! into-nested-folds body is `unimplemented!()` (no `fold_T`/
-//! `fd_nested` equivalent type exists yet), but the "no folds at all"
+//! into-nested-folds body is `unimplemented!()` (it needs the
+//! fold-level machinery), but the "no folds at all"
 //! fast path (`w_folds` empty) is real and exact, covering every
 //! currently-reachable case; `foldAdjustCursor` (as
 //! [`fold_adjust_cursor`]) - currently always a no-op, since
@@ -142,9 +142,8 @@ pub fn foldmethod_is_diff(wp: &WinT) -> bool {
 /// Two branches behind those guards are `unimplemented!()`, and both
 /// are unreachable today:
 ///
-/// The maybe-small pass needs `foldFind` plus a real `fold_T` array
-/// view over `w_folds`; `w_folds.ga_len` is always `0`, because
-/// nothing translated can create a fold yet.
+/// The maybe-small pass needs `foldFind`; `w_folds` is always empty,
+/// because nothing translated can create a fold yet.
 ///
 /// `foldUpdateIEMS` is only reached when `'foldmethod'` is one of
 /// `"indent"`/`"expr"`/`"marker"`/`"diff"`/`"syntax"`. `wo_fdm` is
@@ -169,12 +168,12 @@ pub unsafe fn fold_update(wp: &mut WinT, top: crate::pos_defs::LinenrT, bot: cra
         return;
     }
 
-    if wp.w_folds.ga_len > 0 {
+    if !wp.w_folds.is_empty() {
         // Mark all folds from top to bot (or bot to top) as
         // maybe-small.
         unimplemented!(
-            "marking folds maybe-small needs foldFind and a fold_T view over w_folds, \
-             not yet translated; unreachable while no fold can be created"
+            "marking folds maybe-small needs foldFind, not yet translated; \
+             unreachable while no fold can be created"
         );
     }
 
@@ -408,25 +407,25 @@ pub unsafe fn get_deepest_nesting(wp: &mut WinT) -> i32 {
     get_deepest_nesting_recurse(&wp.w_folds)
 }
 
-/// Recursive per-`garray_T` step of [`get_deepest_nesting`]
+/// Recursive per-fold-array step of [`get_deepest_nesting`]
 /// (`getDeepestNestingRecurse`).
 ///
 /// The real recursive-descent-into-nested-folds body is
-/// `unimplemented!()` - this crate has no `fold_T`/`fd_nested`
-/// equivalent type yet (nothing can create folds, so `w_folds` is
-/// always empty in practice, matching [`has_any_folding`]'s own
-/// established reasoning) - but the "no folds at all" fast path (an
-/// empty `gap`) is real and exact: the original's own `for` loop over
-/// `gap->ga_len` entries simply never executes for an empty array,
-/// returning `maxlevel`'s untouched initial value of `0`.
+/// `unimplemented!()` - nothing translated can create a fold yet, so
+/// `w_folds` is always empty in practice, matching
+/// [`has_any_folding`]'s own established reasoning - but the "no
+/// folds at all" fast path (an empty `gap`) is real and exact: the
+/// original's own `for` loop over `gap->ga_len` entries simply never
+/// executes for an empty array, returning `maxlevel`'s untouched
+/// initial value of `0`.
 #[must_use]
-fn get_deepest_nesting_recurse(gap: &crate::garray_defs::GarrayT) -> i32 {
+fn get_deepest_nesting_recurse(gap: &[FoldT]) -> i32 {
     if gap.is_empty() {
         return 0;
     }
     unimplemented!(
-        "fold::get_deepest_nesting_recurse: no fold_T/fd_nested equivalent type exists yet to \
-         recurse into"
+        "fold::get_deepest_nesting_recurse: recursing into nested folds needs the fold-level \
+         machinery, not yet translated"
     );
 }
 
@@ -516,17 +515,17 @@ fn fold_mark_adjust_effective_range(
     (line1, line2)
 }
 
-/// Recursive per-`garray_T` step of [`fold_mark_adjust`]
+/// Recursive per-fold-array step of [`fold_mark_adjust`]
 /// (`foldMarkAdjustRecurse`).
 ///
 /// The real recursive line-number-adjustment-within-nested-folds body
-/// is `unimplemented!()` - this crate has no `fold_T`/nested-fold
-/// equivalent type yet (matching [`fold_mark_adjust`]'s own doc
-/// comment) - but the "no folds at all" fast path (an empty `gap`) is
-/// real and exact: the original's own `if (gap->ga_len == 0) return;`
-/// is its own very first statement, taken unconditionally today.
+/// is `unimplemented!()` - nothing translated can create a fold yet
+/// (matching [`fold_mark_adjust`]'s own doc comment) - but the "no
+/// folds at all" fast path (an empty `gap`) is real and exact: the
+/// original's own `if (gap->ga_len == 0) return;` is its own very
+/// first statement, taken unconditionally today.
 fn fold_mark_adjust_recurse(
-    gap: &crate::garray_defs::GarrayT,
+    gap: &[FoldT],
     _line1: crate::pos_defs::LinenrT,
     _line2: crate::pos_defs::LinenrT,
     _amount: crate::pos_defs::LinenrT,
@@ -536,9 +535,77 @@ fn fold_mark_adjust_recurse(
         return;
     }
     unimplemented!(
-        "fold::fold_mark_adjust_recurse: no fold_T/nested-fold equivalent type exists yet to \
-         recurse into"
+        "fold::fold_mark_adjust_recurse: recursing into nested folds needs the fold-tree \
+         machinery, not yet translated"
     );
+}
+
+/// A single fold (`fold_T`, defined in `fold.c` itself rather than
+/// `fold_defs.h` - kept with its own `.c` file's translation, the
+/// same convention already used for `mark.h`/`memfile.h`).
+///
+/// # Translation note
+/// The original nests folds through a `garray_T`, a type-erased
+/// growable array. This crate's [`crate::garray_defs::GarrayT`] backs
+/// that with a `Vec<u8>`, i.e. a byte buffer with alignment 1, which
+/// cannot soundly hold a `FoldT`: the writes would be unaligned, and
+/// nothing would run the destructor of the nested array each fold
+/// owns. So `fd_nested` is a plain `Vec<FoldT>` here - genuinely the
+/// same "growable array of folds" the original means, with the item
+/// type made explicit instead of erased, and with growth and
+/// ownership handled by `Vec` exactly as `garray_defs.rs`'s own doc
+/// comment already describes for every other growing array.
+///
+/// That also makes `cloneFoldGrowArray`'s deep copy an ordinary
+/// `Clone`, which is why this derives it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FoldT {
+    /// First line of fold; for a nested fold, relative to its parent.
+    pub fd_top: crate::pos_defs::LinenrT,
+    /// Number of lines in the fold.
+    pub fd_len: crate::pos_defs::LinenrT,
+    /// Array of nested folds.
+    pub fd_nested: Vec<FoldT>,
+    /// See the `fd_flags` module.
+    pub fd_flags: u8,
+    /// Whether the fold is smaller than `'foldminlines'`;
+    /// [`crate::types_defs::TriState::None`] applies to nested folds
+    /// too.
+    pub fd_small: crate::types_defs::TriState,
+}
+
+/// `fold_T.fd_flags` values (`FD_OPEN`/`FD_CLOSED`/`FD_LEVEL`).
+pub mod fd_flags {
+    /// Fold is open (nested ones can be closed).
+    pub const FD_OPEN: u8 = 0;
+    /// Fold is closed.
+    pub const FD_CLOSED: u8 = 1;
+    /// Depends on `'foldlevel'` (nested folds too).
+    pub const FD_LEVEL: u8 = 2;
+}
+
+/// Maximum fold depth (`MAX_LEVEL`).
+pub const MAX_LEVEL: i32 = 20;
+
+/// Deep-copy a fold array, including every nested fold beneath it
+/// (`cloneFoldGrowArray`).
+///
+/// # Translation note
+/// The original has to walk the array by hand, copying each
+/// `fold_T`'s four scalar fields and then recursing into `fd_nested`,
+/// because a `garray_T` of `garray_T`s cannot be copied wholesale -
+/// a shallow `memcpy` would leave the two arrays sharing one nested
+/// allocation. With [`FoldT`] carrying a real `Vec<FoldT>`, that
+/// recursion is exactly what `Clone` already does, so this is
+/// `from.clone()`: same deep copy, same independence between source
+/// and destination, with the recursion generated rather than
+/// hand-written.
+///
+/// It is kept as a named function rather than inlined at its call
+/// sites so `copyFoldingState` and friends still translate one-to-one.
+#[must_use]
+pub fn clone_fold_grow_array(from: &[FoldT]) -> Vec<FoldT> {
+    from.to_vec()
 }
 
 #[cfg(test)]
@@ -944,13 +1011,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no fold_T/fd_nested equivalent type exists yet")]
+    #[should_panic(expected = "needs the fold-level machinery")]
     fn get_deepest_nesting_panics_once_a_fold_actually_exists() {
         let mut buf = BufT::default();
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
             w_foldinvalid: false,
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         let _ = unsafe { get_deepest_nesting(&mut win) };
@@ -1053,21 +1120,21 @@ mod tests {
 
     #[test]
     fn fold_mark_adjust_recurse_is_a_no_op_when_gap_is_empty() {
-        let gap = crate::garray_defs::GarrayT::default();
+        let gap: Vec<FoldT> = Vec::new();
         fold_mark_adjust_recurse(&gap, 1, 5, 2, 0); // must not panic
     }
 
     #[test]
-    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    #[should_panic(expected = "needs the fold-tree machinery")]
     fn fold_mark_adjust_recurse_panics_when_gap_is_non_empty() {
-        let gap = crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() };
+        let gap = vec![crate::fold::FoldT::default()];
         fold_mark_adjust_recurse(&gap, 1, 5, 2, 0);
     }
 
     #[test]
     fn fold_mark_adjust_is_a_no_op_when_win_has_no_folds() {
         let _lock = crate::globals::global_state_test_lock();
-        let win = WinT { w_folds: crate::garray_defs::GarrayT::default(), ..Default::default() };
+        let win = WinT { w_folds: Vec::new(), ..Default::default() };
         // A representative spread of amount/line1/line2/amount_after
         // combinations, covering every branch of the internal
         // effective-range computation - none should panic, since
@@ -1079,11 +1146,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no fold_T/nested-fold equivalent type exists yet")]
+    #[should_panic(expected = "needs the fold-tree machinery")]
     fn fold_mark_adjust_panics_when_win_has_real_folds() {
         let _lock = crate::globals::global_state_test_lock();
         let win = WinT {
-            w_folds: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
         unsafe { fold_mark_adjust(&win, 1, 5, 2, 0) };
@@ -1152,5 +1219,87 @@ mod tests {
         let _guard = CurwinGuard::set(&mut win as *mut WinT);
         assert!(!unsafe { fold_manual_allowed(true) });
         assert!(!unsafe { fold_manual_allowed(false) });
+    }
+
+    /// Builds a two-level fold tree: one outer fold with two nested
+    /// folds, the second of which itself has one nested fold.
+    fn nested_fold_tree() -> Vec<FoldT> {
+        vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_CLOSED,
+            fd_small: crate::types_defs::TriState::True,
+            fd_nested: vec![
+                FoldT {
+                    fd_top: 2,
+                    fd_len: 3,
+                    ..Default::default()
+                },
+                FoldT {
+                    fd_top: 8,
+                    fd_len: 5,
+                    fd_flags: fd_flags::FD_LEVEL,
+                    fd_nested: vec![FoldT {
+                        fd_top: 1,
+                        fd_len: 2,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        }]
+    }
+
+    #[test]
+    fn fold_t_defaults_to_an_open_leaf_fold_with_unknown_smallness() {
+        let fold = FoldT::default();
+        assert_eq!(fold.fd_top, 0);
+        assert_eq!(fold.fd_len, 0);
+        assert!(fold.fd_nested.is_empty());
+        assert_eq!(fold.fd_flags, fd_flags::FD_OPEN);
+        // kNone is the "applies to nested folds too" state, and is what
+        // a freshly created fold starts in.
+        assert_eq!(fold.fd_small, crate::types_defs::TriState::None);
+    }
+
+    #[test]
+    fn clone_fold_grow_array_copies_every_level_of_nesting() {
+        let from = nested_fold_tree();
+        let to = clone_fold_grow_array(&from);
+
+        assert_eq!(to, from, "the copy must equal the original");
+        assert_eq!(to[0].fd_top, 10);
+        assert_eq!(to[0].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(to[0].fd_small, crate::types_defs::TriState::True);
+        // Two levels down is the part a shallow copy would get wrong.
+        assert_eq!(to[0].fd_nested.len(), 2);
+        assert_eq!(to[0].fd_nested[1].fd_nested.len(), 1);
+        assert_eq!(to[0].fd_nested[1].fd_nested[0].fd_top, 1);
+    }
+
+    #[test]
+    fn clone_fold_grow_array_produces_an_independent_copy() {
+        let mut from = nested_fold_tree();
+        let to = clone_fold_grow_array(&from);
+
+        // Mutating the source at every depth must not disturb the
+        // copy - the whole reason the original cannot just memcpy.
+        from[0].fd_top = 999;
+        from[0].fd_nested[0].fd_len = 999;
+        from[0].fd_nested[1].fd_nested[0].fd_top = 999;
+        from[0].fd_nested.push(FoldT::default());
+
+        assert_eq!(to[0].fd_top, 10);
+        assert_eq!(to[0].fd_nested.len(), 2);
+        assert_eq!(to[0].fd_nested[0].fd_len, 3);
+        assert_eq!(to[0].fd_nested[1].fd_nested[0].fd_top, 1);
+    }
+
+    #[test]
+    fn clone_fold_grow_array_of_an_empty_array_is_empty() {
+        // The original's own `if (GA_EMPTY(from)) return;` leaves the
+        // destination as ga_init left it, i.e. empty.
+        let from: Vec<FoldT> = Vec::new();
+        assert!(clone_fold_grow_array(&from).is_empty());
     }
 }
