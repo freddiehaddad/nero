@@ -1297,6 +1297,54 @@ fn nr2hex(n: u32) -> u8 {
     }
 }
 
+/// Compute the length of the string that `transstr_buf` would
+/// produce for `s` (`transstr_len`).
+///
+/// With `untab`, TABs are translated like any other unprintable
+/// character rather than being kept as-is.
+///
+/// # Safety
+/// Same as [`byte2cells`] (touches `crate::globals::GLOBALS` for the
+/// current buffer's `'fileformat'`).
+#[must_use]
+pub unsafe fn transstr_len(s: &[u8], untab: bool) -> usize {
+    let mut p = 0usize;
+    let mut len = 0usize;
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+
+    while at(p) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) } as usize;
+        if l > 1 {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { vim_isprintc(crate::mbyte::utf_ptr2char(&s[p..])) } {
+                len += l;
+            } else {
+                let mut off = 0usize;
+                while off < l {
+                    let c = crate::mbyte::utf_ptr2char(&s[p + off..]);
+                    // `transchar_hex` owns its trailing NUL here,
+                    // while the original's returns the byte count
+                    // written without one.
+                    len += transchar_hex(c).len() - 1;
+                    off += crate::mbyte::utf_ptr2len(&s[p + off..]) as usize;
+                }
+            }
+            p += l;
+        } else if at(p) == crate::ascii_defs::TAB && !untab {
+            len += 1;
+            p += 1;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let b2c_l = unsafe { byte2cells(i32::from(at(p))) };
+            p += 1;
+            // An illegal byte sequence may occupy up to 4 characters.
+            len += if b2c_l > 0 { b2c_l as usize } else { 4 };
+        }
+    }
+    len
+}
+
 /// Convert a non-printable/illegal character to a hex string like
 /// `"<FFFF>"` (`transchar_hex`). Returns the formatted bytes including
 /// their own trailing NUL, matching this crate's usual
@@ -2358,6 +2406,49 @@ mod tests {
         assert_eq!(unsafe { char2cells(0x4e00) }, unsafe {
             crate::mbyte::utf_char2cells(0x4e00)
         });
+    }
+
+    #[test]
+    fn transstr_len_counts_plain_ascii_as_itself() {
+        // Cross-verified against real nvim: strtrans("abc") has
+        // strlen 3.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transstr_len(b"abc\0", true) }, 3);
+    }
+
+    #[test]
+    fn transstr_len_counts_a_control_character_as_two_cells() {
+        // Cross-verified against real nvim: strtrans("\x01") is "^A",
+        // strlen 2; strtrans("\x7f") is "^?", also strlen 2.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transstr_len(b"\x01\0", true) }, 2);
+        assert_eq!(unsafe { transstr_len(b"\x7f\0", true) }, 2);
+    }
+
+    #[test]
+    fn transstr_len_untab_controls_how_a_tab_is_counted() {
+        // Cross-verified against real nvim: strtrans("a\tb") has
+        // strlen 4, i.e. the TAB becomes the two-cell "^I". That is
+        // the untab == true case. With untab == false the TAB is kept
+        // as a single character instead.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transstr_len(b"a\tb\0", true) }, 4);
+        assert_eq!(unsafe { transstr_len(b"a\tb\0", false) }, 3);
+    }
+
+    #[test]
+    fn transstr_len_keeps_a_printable_multibyte_character_whole() {
+        // Cross-verified against real nvim: strtrans("é") has strlen
+        // 2 - the character is printable, so its own byte length is
+        // used rather than a hex escape.
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transstr_len("é\0".as_bytes(), true) }, 2);
+    }
+
+    #[test]
+    fn transstr_len_of_an_empty_string_is_zero() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { transstr_len(b"\0", true) }, 0);
     }
 
     #[test]
