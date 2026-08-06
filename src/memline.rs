@@ -2969,6 +2969,151 @@ pub unsafe fn decl(lp: &mut crate::pos_defs::PosT) -> i32 {
     r
 }
 
+/// Clear all lines marked for the `:global` command in the current
+/// buffer (`ml_clearmarked`).
+///
+/// The scan starts at `LOWEST_MARKED` (the lowest line number a mark
+/// can still be at, maintained by `ml_append_int`/`ml_delete_int`) and
+/// walks forward one data block at a time, clearing every
+/// `DB_MARKED` bit it finds. `LOWEST_MARKED` is reset to 0
+/// afterwards, recording that no marks remain.
+///
+/// The original's own "give error message?" comment marks the
+/// `ml_find_line` failure path as a bail-out with no message, which
+/// is exactly what this translation does.
+///
+/// # A narrow, deliberate divergence from an upstream UB path
+/// `LOWEST_MARKED`'s own documented contract is that 0 means "there
+/// are no marks at all", but the original guards its loop only with
+/// `lnum <= ml_line_count` - so a 0 start genuinely walks into
+/// `db_index[-1]`, an out-of-bounds read. That is unreachable in real
+/// use (`:global` only calls these after `ml_setmarked` has set
+/// `LOWEST_MARKED >= 1`), and there is no sound way to reproduce an
+/// out-of-bounds read in Rust, so this translation starts the scan at
+/// line 1 instead. For every legitimate input the two are identical;
+/// for a 0 start this simply finds no marks, which is exactly what
+/// the contract says a 0 means.
+///
+/// # Safety
+/// `GLOBALS.curbuf` must be null or point at a valid, live [`BufT`],
+/// and its memline (if it has one) must be consistent - i.e. every
+/// precondition `ml_find_line` itself already requires.
+pub unsafe fn ml_clearmarked() {
+    // SAFETY: touches the GLOBALS singleton - no overlapping live
+    // access (matches every other function that does so).
+    let buf = unsafe { GLOBALS.get_mut() }.curbuf;
+    if buf.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*buf).b_ml.ml_mfp.is_null() } {
+        return; // nothing to do
+    }
+
+    // The search starts with line LOWEST_MARKED (see the "narrow,
+    // deliberate divergence" section above for the .max(1) clamp).
+    // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>, matching the
+    // original's own single-threaded-editor assumption.
+    let mut lnum = (*unsafe { LOWEST_MARKED.get_mut() }).max(1);
+    // SAFETY: forwarded from this function's own safety doc.
+    while lnum <= unsafe { (*buf).b_ml.ml_line_count } {
+        // Find the data block containing the line. This also fills the
+        // stack with the blocks from the root to the data block and
+        // releases any locked block.
+        // SAFETY: forwarded from this function's own safety doc; the
+        // &mut BufT is re-derived fresh here and never held across
+        // another call that reborrows the same pointer.
+        let hp = unsafe { ml_find_line(&mut *buf, lnum, ML_FIND) };
+        if hp.is_null() {
+            return; // give error message?
+        }
+        // SAFETY: ml_find_line returned a valid, locked block header.
+        let data = unsafe { (*hp).bh_data.as_data_mut() };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let (low, high) = unsafe { ((*buf).b_ml.ml_locked_low, (*buf).b_ml.ml_locked_high) };
+        let mut i = (lnum - low) as usize;
+        while lnum <= high {
+            let idx = db_index(data, i);
+            if idx & DB_MARKED != 0 {
+                set_db_index(data, i, idx & DB_INDEX_MASK);
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (*buf).b_ml.ml_flags |= ML_LOCKED_DIRTY };
+            }
+            i += 1;
+            lnum += 1;
+        }
+    }
+
+    // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>, matching the
+    // original's own single-threaded-editor assumption.
+    *unsafe { LOWEST_MARKED.get_mut() } = 0;
+}
+
+/// Return the line number of the first line marked for the `:global`
+/// command in the current buffer, clearing that one mark as a side
+/// effect; 0 when no marked line is left (`ml_firstmarked`).
+///
+/// Repeated calls therefore walk every marked line in turn, which is
+/// exactly how the original's own `:global` execution loop consumes
+/// them. `LOWEST_MARKED` is advanced past each returned line so the
+/// next call resumes from the right place.
+///
+/// # Safety
+/// Same as [`ml_clearmarked`].
+pub unsafe fn ml_firstmarked() -> LinenrT {
+    // SAFETY: touches the GLOBALS singleton - no overlapping live
+    // access (matches every other function that does so).
+    let buf = unsafe { GLOBALS.get_mut() }.curbuf;
+    if buf.is_null() {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*buf).b_ml.ml_mfp.is_null() } {
+        return 0;
+    }
+
+    // The search starts with the LOWEST_MARKED line. This is the last
+    // line where a mark was found, adjusted by inserting/deleting
+    // lines. (See ml_clearmarked's own doc for the .max(1) clamp.)
+    // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>, matching the
+    // original's own single-threaded-editor assumption.
+    let mut lnum = (*unsafe { LOWEST_MARKED.get_mut() }).max(1);
+    // SAFETY: forwarded from this function's own safety doc.
+    while lnum <= unsafe { (*buf).b_ml.ml_line_count } {
+        // SAFETY: forwarded from this function's own safety doc; the
+        // &mut BufT is re-derived fresh here and never held across
+        // another call that reborrows the same pointer.
+        let hp = unsafe { ml_find_line(&mut *buf, lnum, ML_FIND) };
+        if hp.is_null() {
+            return 0; // give error message?
+        }
+        // SAFETY: ml_find_line returned a valid, locked block header.
+        let data = unsafe { (*hp).bh_data.as_data_mut() };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let (low, high) = unsafe { ((*buf).b_ml.ml_locked_low, (*buf).b_ml.ml_locked_high) };
+        let mut i = (lnum - low) as usize;
+        while lnum <= high {
+            let idx = db_index(data, i);
+            if idx & DB_MARKED != 0 {
+                set_db_index(data, i, idx & DB_INDEX_MASK);
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { (*buf).b_ml.ml_flags |= ML_LOCKED_DIRTY };
+                // SAFETY: LOWEST_MARKED is a plain GlobalCell<i32>,
+                // matching the original's own single-threaded-editor
+                // assumption.
+                *unsafe { LOWEST_MARKED.get_mut() } = lnum + 1;
+                return lnum;
+            }
+            i += 1;
+            lnum += 1;
+        }
+    }
+
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4383,6 +4528,214 @@ mod tests {
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 });
 
             GLOBALS.get_mut().curbuf = prev_curbuf;
+        }
+
+        close_test_memline(buf);
+    }
+
+    /// Sets the [`DB_MARKED`] bit on `lnum`'s own `db_index` entry,
+    /// mirroring exactly what `ml_setmarked` (not translated - it has
+    /// no real caller yet, since `:global` itself isn't translated)
+    /// does for one line, so the two consuming functions can be
+    /// exercised against a genuinely marked memline.
+    unsafe fn mark_line_for_test(buf: *mut BufT, lnum: LinenrT) {
+        unsafe {
+            let hp = ml_find_line(&mut *buf, lnum, ML_FIND);
+            assert!(!hp.is_null(), "line {lnum} should be findable");
+            let low = (*buf).b_ml.ml_locked_low;
+            let data = (*hp).bh_data.as_data_mut();
+            let i = (lnum - low) as usize;
+            let idx = db_index(data, i);
+            set_db_index(data, i, idx | DB_MARKED);
+            (*buf).b_ml.ml_flags |= ML_LOCKED_DIRTY;
+        }
+    }
+
+    /// Reads whether `lnum`'s own `db_index` entry still has
+    /// [`DB_MARKED`] set.
+    unsafe fn line_is_marked(buf: *mut BufT, lnum: LinenrT) -> bool {
+        unsafe {
+            let hp = ml_find_line(&mut *buf, lnum, ML_FIND);
+            assert!(!hp.is_null());
+            let low = (*buf).b_ml.ml_locked_low;
+            let data = (*hp).bh_data.as_data();
+            db_index(data, (lnum - low) as usize) & DB_MARKED != 0
+        }
+    }
+
+    /// Builds a 4-line memline, installs it as `curbuf`, and returns
+    /// the previous `curbuf` so the caller can restore it.
+    ///
+    /// The caller must already hold `global_state_test_lock()` (this
+    /// touches `GLOBALS.curbuf` and `LOWEST_MARKED`).
+    unsafe fn marked_fixture(buf: &mut BufT) -> *mut BufT {
+        unsafe {
+            assert_eq!(ml_open(buf), OK);
+            let buf_ptr = buf as *mut BufT;
+            let prev = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = buf_ptr;
+            // ml_append operates on curbuf, so install it first.
+            for (i, text) in [b"one".as_ref(), b"two", b"three"].iter().enumerate() {
+                assert_eq!(ml_append(i as LinenrT, text, 0, false), OK);
+            }
+            assert_eq!((*buf_ptr).b_ml.ml_line_count, 4);
+            prev
+        }
+    }
+
+    #[test]
+    fn ml_firstmarked_returns_zero_when_no_memline_exists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            // ml_mfp is null on a buffer that never had ml_open called.
+            assert_eq!(ml_firstmarked(), 0);
+            ml_clearmarked(); // must not crash either
+            GLOBALS.get_mut().curbuf = prev;
+        }
+    }
+
+    #[test]
+    fn ml_firstmarked_returns_zero_when_curbuf_is_null() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev = GLOBALS.get_mut().curbuf;
+            GLOBALS.get_mut().curbuf = std::ptr::null_mut();
+            assert_eq!(ml_firstmarked(), 0);
+            ml_clearmarked();
+            GLOBALS.get_mut().curbuf = prev;
+        }
+    }
+
+    #[test]
+    fn ml_firstmarked_walks_every_marked_line_in_order_then_reports_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            let buf_ptr = &mut buf as *mut BufT;
+
+            mark_line_for_test(buf_ptr, 2);
+            mark_line_for_test(buf_ptr, 4);
+            *LOWEST_MARKED.get_mut() = 1;
+
+            // Each call consumes exactly one mark, lowest first.
+            assert_eq!(ml_firstmarked(), 2);
+            assert!(!line_is_marked(buf_ptr, 2), "the mark must be cleared");
+            assert_eq!(*LOWEST_MARKED.get_mut(), 3);
+
+            assert_eq!(ml_firstmarked(), 4);
+            assert!(!line_is_marked(buf_ptr, 4));
+            assert_eq!(*LOWEST_MARKED.get_mut(), 5);
+
+            // No marks left: the scan runs off the end of the buffer.
+            assert_eq!(ml_firstmarked(), 0);
+
+            *LOWEST_MARKED.get_mut() = 0;
+            GLOBALS.get_mut().curbuf = prev;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_firstmarked_starts_at_lowest_marked_and_skips_earlier_marks() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            let buf_ptr = &mut buf as *mut BufT;
+
+            mark_line_for_test(buf_ptr, 1);
+            mark_line_for_test(buf_ptr, 3);
+            // Starting the scan past line 1 means line 1's own mark is
+            // never even looked at - matching the original's own
+            // "lowest_marked is where the search starts" contract.
+            *LOWEST_MARKED.get_mut() = 2;
+
+            assert_eq!(ml_firstmarked(), 3);
+            assert!(line_is_marked(buf_ptr, 1), "line 1 was never scanned");
+
+            *LOWEST_MARKED.get_mut() = 0;
+            GLOBALS.get_mut().curbuf = prev;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_clearmarked_clears_every_mark_and_resets_lowest_marked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            let buf_ptr = &mut buf as *mut BufT;
+
+            for lnum in [1, 2, 4] {
+                mark_line_for_test(buf_ptr, lnum);
+            }
+            *LOWEST_MARKED.get_mut() = 1;
+
+            ml_clearmarked();
+
+            for lnum in 1..=4 {
+                assert!(!line_is_marked(buf_ptr, lnum), "line {lnum} still marked");
+            }
+            assert_eq!(*LOWEST_MARKED.get_mut(), 0);
+            // Nothing is left for ml_firstmarked to find.
+            assert_eq!(ml_firstmarked(), 0);
+
+            GLOBALS.get_mut().curbuf = prev;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_clearmarked_leaves_marks_below_lowest_marked_untouched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            let buf_ptr = &mut buf as *mut BufT;
+
+            mark_line_for_test(buf_ptr, 1);
+            mark_line_for_test(buf_ptr, 3);
+            *LOWEST_MARKED.get_mut() = 3;
+
+            ml_clearmarked();
+
+            // Same "the scan starts at lowest_marked" contract as
+            // ml_firstmarked - line 1 is simply never visited.
+            assert!(line_is_marked(buf_ptr, 1));
+            assert!(!line_is_marked(buf_ptr, 3));
+            assert_eq!(*LOWEST_MARKED.get_mut(), 0);
+
+            GLOBALS.get_mut().curbuf = prev;
+        }
+        close_test_memline(buf);
+    }
+
+    #[test]
+    fn ml_firstmarked_sets_the_locked_dirty_flag_when_it_clears_a_mark() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            let buf_ptr = &mut buf as *mut BufT;
+
+            mark_line_for_test(buf_ptr, 2);
+            *LOWEST_MARKED.get_mut() = 1;
+            (*buf_ptr).b_ml.ml_flags &= !ML_LOCKED_DIRTY;
+
+            assert_eq!(ml_firstmarked(), 2);
+            assert_ne!(
+                (*buf_ptr).b_ml.ml_flags & ML_LOCKED_DIRTY,
+                0,
+                "clearing a mark writes to the block, so it must be marked dirty"
+            );
+
+            *LOWEST_MARKED.get_mut() = 0;
+            GLOBALS.get_mut().curbuf = prev;
         }
         close_test_memline(buf);
     }
