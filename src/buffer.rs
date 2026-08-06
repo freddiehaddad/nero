@@ -419,6 +419,23 @@ pub fn buf_meta_total(buf: &BufT, m: crate::marktree_defs::MetaIndex) -> u32 {
     buf.b_marktree.meta_root[m as usize]
 }
 
+/// Compare two buffers by when they were last used
+/// (`buf_time_compare`), the original's `qsort` comparator for
+/// `:buffers` completion.
+///
+/// Orders the MOST recently used first, so this is a descending sort
+/// on `b_last_used` rather than the usual ascending one - the
+/// original returns `-1` when `buf1` is the newer of the two, which is
+/// easy to invert when reading it as an ordinary comparator.
+///
+/// Returns [`std::cmp::Ordering`] rather than a C comparator's
+/// negative/zero/positive `int`, so it drops straight into Rust's own
+/// `sort_by` (the shape already used for `fuzzy.rs`'s comparators).
+#[must_use]
+pub fn buf_time_compare(buf1: &BufT, buf2: &BufT) -> std::cmp::Ordering {
+    buf2.b_last_used.cmp(&buf1.b_last_used)
+}
+
 /// Whether `buf` has any signs placed (`buf_has_signs`, `sign.c`).
 ///
 /// Nothing translated in this crate can currently place a sign (no
@@ -733,6 +750,36 @@ pub unsafe fn set_buflisted(on: bool) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn buf_time_compare_orders_most_recently_used_first() {
+        use std::cmp::Ordering;
+        let older = BufT { b_last_used: 100, ..Default::default() };
+        let newer = BufT { b_last_used: 200, ..Default::default() };
+
+        // Descending: the newer buffer sorts BEFORE the older one.
+        assert_eq!(buf_time_compare(&newer, &older), Ordering::Less);
+        assert_eq!(buf_time_compare(&older, &newer), Ordering::Greater);
+    }
+
+    #[test]
+    fn buf_time_compare_treats_equal_timestamps_as_equal() {
+        let a = BufT { b_last_used: 42, ..Default::default() };
+        let b = BufT { b_last_used: 42, ..Default::default() };
+        assert_eq!(buf_time_compare(&a, &b), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn buf_time_compare_sorts_a_list_newest_first() {
+        let mut bufs = [
+            BufT { b_last_used: 1, ..Default::default() },
+            BufT { b_last_used: 3, ..Default::default() },
+            BufT { b_last_used: 2, ..Default::default() },
+        ];
+        bufs.sort_by(buf_time_compare);
+        let order: Vec<_> = bufs.iter().map(|b| b.b_last_used).collect();
+        assert_eq!(order, vec![3, 2, 1]);
+    }
 
     #[test]
     fn buf_get_changedtick_defaults_to_zero_before_init() {
