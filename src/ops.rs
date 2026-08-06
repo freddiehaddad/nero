@@ -814,6 +814,128 @@ fn line_count_info(line: &[u8], wc: &mut i64, cc: &mut i64, limit: i64, eol_size
     i
 }
 
+/// Replace the single byte at `lp` with `c` (`pbyte`).
+///
+/// The column is clamped when it lies past the end of the line, so a
+/// stale position cannot write out of bounds.
+///
+/// # Adaptation
+///
+/// The original writes straight through the `char *` that
+/// `ml_get_buf_mut` hands back. In this crate `ml_get_buf_mut` returns
+/// an owned copy rather than a live pointer into the memline, so the
+/// byte is changed in that copy and stored back with
+/// `ml_replace_buf_len`. Same observable result, and the same forced
+/// adaptation already documented for `change::del_bytes`.
+///
+/// # Safety
+/// `GLOBALS.curbuf` must be valid, with a live memline holding
+/// `lp.lnum`.
+pub unsafe fn pbyte(mut lp: crate::pos_defs::PosT, c: i32) {
+    debug_assert!(c <= i32::from(u8::MAX));
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut p = unsafe { crate::memline::ml_get_buf_mut(&mut *curbuf, lp.lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { &*curbuf }.b_ml.ml_line_textlen;
+
+    // Safety check.
+    if lp.col >= len {
+        lp.col = if len > 1 { len - 2 } else { 0 };
+    }
+    if let Some(slot) = p.get_mut(lp.col as usize) {
+        *slot = c as u8;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace_buf_len(&mut *curbuf, lp.lnum, &p) };
+
+    // SAFETY: reading a plain scalar global.
+    if *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() } == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::extmark::extmark_splice_cols(
+                &mut *curbuf,
+                lp.lnum - 1,
+                lp.col,
+                1,
+                1,
+                crate::extmark_defs::ExtmarkOp::Undo,
+            );
+        }
+    }
+}
+
+/// Swap the case of, or rot13, the character at `pos`, according to
+/// `op_type` (`swapchar`).
+///
+/// Returns `true` when the character actually changed. Only ASCII is
+/// rot13'd; a non-ASCII character is left alone for that operator.
+///
+/// # Safety
+/// Same as [`pbyte`], plus `crate::change::del_bytes`'s own.
+pub unsafe fn swapchar(op_type: OpType, pos: &crate::pos_defs::PosT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let c = unsafe { crate::memline::gchar_pos(pos) };
+
+    // Only do rot13 encoding for ASCII characters.
+    if c >= 0x80 && op_type == OpType::Rot13 {
+        return false;
+    }
+
+    /// `ROT13(c, a)` from `ops.c`.
+    fn rot13(c: i32, a: i32) -> i32 {
+        ((c - a) + 13) % 26 + a
+    }
+
+    let mut nc = c;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::mbyte::mb_islower(c) } {
+        if op_type == OpType::Rot13 {
+            nc = rot13(c, i32::from(b'a'));
+        } else if op_type != OpType::Lower {
+            // SAFETY: forwarded from this function's own safety doc.
+            nc = unsafe { crate::mbyte::mb_toupper(c) };
+        }
+    // SAFETY: forwarded from this function's own safety doc.
+    } else if unsafe { crate::mbyte::mb_isupper(c) } {
+        if op_type == OpType::Rot13 {
+            nc = rot13(c, i32::from(b'A'));
+        } else if op_type != OpType::Upper {
+            // SAFETY: forwarded from this function's own safety doc.
+            nc = unsafe { crate::mbyte::mb_tolower(c) };
+        }
+    }
+
+    if nc == c {
+        return false;
+    }
+
+    if c >= 0x80 || nc >= 0x80 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        let sp = unsafe { &*curwin }.w_cursor;
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_cursor = *pos;
+        // Don't use del_char(): it also removes composing chars.
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { crate::cursor::get_cursor_pos_ptr() };
+        let n = crate::mbyte::utf_ptr2len(&p);
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::change::del_bytes(n, false, false) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::change::ins_char(nc) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_cursor = sp;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { pbyte(*pos, nc) };
+    }
+    true
+}
+
 /// Get the byte count of a buffer region, end-exclusive
 /// (`get_region_bytecount`).
 ///
@@ -1228,6 +1350,125 @@ mod tests {
     /// `CursorTestGuard` precedent (needed since `ml_open`, used to
     /// build the test memline below, touches shared `GLOBALS.got_int`
     /// internally).
+    #[test]
+    fn pbyte_replaces_one_byte_in_place() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"abc\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        unsafe { pbyte(crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 }, i32::from(b'X')) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"aXc\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn pbyte_clamps_a_column_past_the_end_of_the_line() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"abc\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        // textlen is 4 (including the NUL), so a column of 99 clamps
+        // to len - 2 == 2, the last real character.
+        unsafe { pbyte(crate::pos_defs::PosT { lnum: 1, col: 99, coladd: 0 }, i32::from(b'Z')) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abZ\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchar_toggles_ascii_case() {
+        // Cross-verified against real nvim: "aB" with "g~~" becomes
+        // "Ab", so each character's case is toggled independently.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"aB\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        let p0 = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let p1 = crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 };
+        assert!(unsafe { swapchar(OpType::Tilde, &p0) });
+        assert!(unsafe { swapchar(OpType::Tilde, &p1) });
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"Ab\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchar_rot13_rotates_ascii_letters() {
+        // Cross-verified against real nvim: "abn" with "g??" becomes
+        // "noa" - a->n, b->o and n wraps back round to a.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"abn\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        for col in 0..3 {
+            let p = crate::pos_defs::PosT { lnum: 1, col, coladd: 0 };
+            assert!(unsafe { swapchar(OpType::Rot13, &p) });
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"noa\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchar_respects_the_upper_and_lower_operators() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"aB\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        let p0 = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        let p1 = crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 };
+        // gU only uppercases: 'a' changes, the already-upper 'B' does not.
+        assert!(unsafe { swapchar(OpType::Upper, &p0) });
+        assert!(!unsafe { swapchar(OpType::Upper, &p1) });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"AB\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchar_leaves_non_letters_alone() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"1-2\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        for col in 0..3 {
+            let p = crate::pos_defs::PosT { lnum: 1, col, coladd: 0 };
+            assert!(!unsafe { swapchar(OpType::Tilde, &p) }, "col {col}");
+        }
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"1-2\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
     struct CursorTestGuard {
         prev_curwin: *mut WinT,
         prev_curbuf: *mut crate::buffer_defs::BufT,
