@@ -67,6 +67,102 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Move backward `count` words (`bck_word`).
+///
+/// With `bigword`, punctuation and keyword characters are treated
+/// alike (the `B` motion). With `stop`, being already at the start of
+/// a word moves one word less.
+///
+/// Returns `FAIL` when the top of the file was reached.
+///
+/// # Safety
+/// Same as [`fwd_word`].
+pub unsafe fn bck_word(count: i32, bigword: bool, stop: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_cursor.coladd = 0;
+    // SAFETY: writing a plain `bool` global.
+    unsafe { *CLS_BIGWORD.get_mut() = bigword };
+
+    let mut stop = stop;
+    let mut count = count;
+    while {
+        count -= 1;
+        count >= 0
+    } {
+        // When inside a range of folded lines, move to the first char
+        // of the first line.
+        // SAFETY: forwarded from this function's own safety doc.
+        let lnum = unsafe { &*curwin }.w_cursor.lnum;
+        let mut first = lnum;
+        // SAFETY: forwarded from this function's own safety doc.
+        let folded =
+            unsafe { crate::fold::has_folding(&mut *curwin, lnum, Some(&mut first), None) };
+        if folded {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *curwin };
+            w.w_cursor.lnum = first;
+            w.w_cursor.col = 0;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let sclass = unsafe { cls() };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::cursor::dec_cursor() } == -1 {
+            // Started at the start of the file.
+            return crate::vim_defs::FAIL;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if !stop || sclass == unsafe { cls() } || sclass == 0 {
+            // Skip the white space before the word, stopping on an
+            // empty line.
+            let mut finished = false;
+            // SAFETY: forwarded from this function's own safety doc.
+            while unsafe { cls() } == 0 {
+                // `LINEEMPTY(lnum)` in the original.
+                // SAFETY: forwarded from this function's own safety doc.
+                let empty_line = unsafe { crate::cursor::get_cursor_line_ptr() }
+                    .first()
+                    .copied()
+                    .unwrap_or(0)
+                    == 0;
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { &*curwin }.w_cursor.col == 0 && empty_line {
+                    finished = true;
+                    break;
+                }
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { crate::cursor::dec_cursor() } == -1 {
+                    // Hit the start of the file, so stop here.
+                    return crate::vim_defs::OK;
+                }
+            }
+
+            if !finished {
+                // Move backward to the start of this word.
+                // SAFETY: forwarded from this function's own safety doc.
+                let cclass = unsafe { cls() };
+                // SAFETY: forwarded from this function's own safety doc.
+                if unsafe { skip_chars(cclass, crate::vim_defs::Direction::Backward) } {
+                    return crate::vim_defs::OK;
+                }
+                // Overshot, so go forward one.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::cursor::inc_cursor() };
+            }
+        } else {
+            // Overshot, so go forward one.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::inc_cursor() };
+        }
+        stop = false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::adjust_skipcol() };
+    crate::vim_defs::OK
+}
+
 /// Move forward `count` words (`fwd_word`).
 ///
 /// With `bigword`, punctuation and keyword characters are treated
@@ -726,6 +822,75 @@ mod tests {
             ..Default::default()
         });
         (buf, win)
+    }
+
+    #[test]
+    fn bck_word_stops_at_the_previous_word_start() {
+        // Cross-verified against real nvim: on "foo,bar baz" with the
+        // cursor at column 9 (1-based, the 'b' of "baz"), "b" lands on
+        // column 5 - the 'b' of "bar".
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(unsafe { bck_word(1, false, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 4);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bck_word_repeats_for_a_count() {
+        // Cross-verified against real nvim: "2b" from the same start
+        // lands on column 4 (1-based), the comma.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(unsafe { bck_word(2, false, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bck_word_bigword_skips_back_past_punctuation() {
+        // Cross-verified against real nvim: "B" from the same start
+        // lands on column 1 (1-based) - the whole of "foo,bar" is one
+        // WORD, so it goes all the way to the 'f'.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+        let prev = *unsafe { CLS_BIGWORD.get_mut() };
+
+        assert_eq!(unsafe { bck_word(1, true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        unsafe { *CLS_BIGWORD.get_mut() = prev };
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bck_word_fails_at_the_start_of_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"abc", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(unsafe { bck_word(1, false, false) }, crate::vim_defs::FAIL);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
     }
 
     #[test]
