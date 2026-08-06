@@ -67,6 +67,89 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Set while a word motion should treat every non-blank as one class
+/// (`cls_bigword`), i.e. for the `W`/`E`/`B` motions.
+static CLS_BIGWORD: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Classify the character under the cursor for word motions (`cls`).
+///
+/// Returns `0` for whitespace and the end of the line, and otherwise
+/// the character's own class - collapsed to `1` for every non-blank
+/// while `CLS_BIGWORD` is set, which is what makes `W`/`E`/`B` treat
+/// punctuation and keyword characters alike.
+///
+/// # Safety
+/// Same as [`crate::cursor::gchar_cursor`].
+#[must_use]
+pub unsafe fn cls() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let c = unsafe { crate::cursor::gchar_cursor() };
+    if c == i32::from(b' ') || c == i32::from(crate::ascii_defs::TAB) || c == 0 {
+        return 0;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let c = unsafe { crate::mbyte::utf_class(c) };
+
+    // If cls_bigword is set, report all non-blanks as class 1.
+    // SAFETY: reading a plain `bool` global.
+    if c != 0 && *unsafe { CLS_BIGWORD.get_mut() } {
+        return 1;
+    }
+    c
+}
+
+/// Move the cursor over every consecutive character of class `cclass`
+/// in direction `dir` (`skip_chars`).
+///
+/// Returns `true` when the start or end of the file was reached.
+///
+/// # Safety
+/// Same as [`cls`].
+pub unsafe fn skip_chars(cclass: i32, dir: crate::vim_defs::Direction) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    while unsafe { cls() } == cclass {
+        // SAFETY: forwarded from this function's own safety doc.
+        let moved = if dir == crate::vim_defs::Direction::Forward {
+            unsafe { crate::cursor::inc_cursor() }
+        } else {
+            unsafe { crate::cursor::dec_cursor() }
+        };
+        if moved == -1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Go back to the start of the word, or the start of the run of white
+/// space, under the cursor (`back_in_line`).
+///
+/// # Safety
+/// Same as [`cls`].
+pub unsafe fn back_in_line() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sclass = unsafe { cls() }; // Starting class.
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*curwin }.w_cursor.col == 0 {
+            // Stop at the start of the line.
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::dec_cursor() };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { cls() } != sclass {
+            // Stop at the start of the word.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::inc_cursor() };
+            break;
+        }
+    }
+}
+
 /// Find the next occurrence of `quotechar` in `line`, starting at
 /// `col` (`find_next_quote`).
 ///
@@ -522,6 +605,144 @@ pub unsafe fn findsent(dir: Direction, mut count: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Installs a real memline holding `line`, with the cursor at
+    /// `col`, for the [`cls`]/[`skip_chars`]/[`back_in_line`] tests.
+    fn cls_fixture(
+        line: &[u8],
+        col: crate::pos_defs::ColnrT,
+    ) -> (Box<crate::buffer_defs::BufT>, Box<WinT>) {
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        let mut owned = line.to_vec();
+        owned.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &owned) },
+            crate::vim_defs::OK
+        );
+        let win = Box::new(WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col, coladd: 0 },
+            ..Default::default()
+        });
+        (buf, win)
+    }
+
+    #[test]
+    fn cls_reports_zero_for_whitespace_and_end_of_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a b", 1);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        // Column 1 is the space.
+        assert_eq!(unsafe { cls() }, 0);
+        // Column 3 is the NUL past the end of the line.
+        unsafe { (*win_ptr).w_cursor.col = 3 };
+        assert_eq!(unsafe { cls() }, 0);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn cls_separates_keyword_from_punctuation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a,b", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        let letter = unsafe { cls() };
+        unsafe { (*win_ptr).w_cursor.col = 1 };
+        let comma = unsafe { cls() };
+
+        assert_ne!(letter, 0, "a letter is not whitespace");
+        assert_ne!(comma, 0, "punctuation is not whitespace");
+        assert_ne!(letter, comma, "they are in different classes");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn cls_collapses_every_non_blank_when_bigword_is_set() {
+        // This is what makes W/E/B step over punctuation and keyword
+        // characters alike.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a,b", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+        let prev = *unsafe { CLS_BIGWORD.get_mut() };
+        unsafe { *CLS_BIGWORD.get_mut() = true };
+
+        assert_eq!(unsafe { cls() }, 1);
+        unsafe { (*win_ptr).w_cursor.col = 1 };
+        assert_eq!(unsafe { cls() }, 1, "punctuation collapses too");
+
+        unsafe { *CLS_BIGWORD.get_mut() = prev };
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn skip_chars_walks_over_a_run_of_one_class() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"abc def", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        let start_class = unsafe { cls() };
+        let hit_end = unsafe { skip_chars(start_class, crate::vim_defs::Direction::Forward) };
+
+        assert!(!hit_end, "stopped at the space, not the end of the file");
+        assert_eq!(
+            unsafe { (*win_ptr).w_cursor.col },
+            3,
+            "landed on the space after abc"
+        );
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn back_in_line_returns_to_the_start_of_the_word() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo bar", 5);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        // Starting inside "bar", at its second character.
+        unsafe { back_in_line() };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 4, "start of bar");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn back_in_line_stops_at_the_start_of_the_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo", 2);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { back_in_line() };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
 
     #[test]
     fn find_next_quote_finds_the_first_unescaped_quote() {
