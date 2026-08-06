@@ -1297,6 +1297,54 @@ fn nr2hex(n: u32) -> u8 {
     }
 }
 
+/// Translate any unprintable characters in `buf` into a printable
+/// representation, in place (`trans_characters`).
+///
+/// `bufsize` is the total capacity available, including room for the
+/// terminating NUL; translation stops early rather than overflowing
+/// it. Multi-byte characters are assumed not to need translating.
+///
+/// # Safety
+/// Same as [`transchar_byte`].
+pub unsafe fn trans_characters(buf: &mut [u8], bufsize: i32) {
+    // Length of the string needing translation.
+    let mut len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len()) as i32;
+    // Room in the buffer after the string.
+    let mut room = bufsize - len;
+    let mut pos = 0usize;
+
+    while buf.get(pos).copied().unwrap_or(0) != 0 {
+        // Assume a multi-byte character doesn't need translation.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut trs_len = unsafe { crate::mbyte::utfc_ptr2len(&buf[pos..]) };
+        if trs_len > 1 {
+            len -= trs_len;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let trs = unsafe { transchar_byte(i32::from(buf[pos])) };
+            let trs_end = trs.iter().position(|&b| b == 0).unwrap_or(trs.len());
+            trs_len = trs_end as i32;
+
+            if trs_len > 1 {
+                room -= trs_len - 1;
+                if room <= 0 {
+                    return;
+                }
+                // Shift the rest of the string right to make room for
+                // the longer replacement.
+                let src = pos + 1;
+                let dst = pos + trs_len as usize;
+                let n = (len.max(0) as usize).min(buf.len().saturating_sub(dst));
+                buf.copy_within(src..src + n, dst);
+            }
+            let n = trs_end.min(buf.len().saturating_sub(pos));
+            buf[pos..pos + n].copy_from_slice(&trs[..n]);
+            len -= 1;
+        }
+        pos += trs_len.max(1) as usize;
+    }
+}
+
 /// Translate a string into `buf`, replacing unprintable characters
 /// with a printable representation (`transstr_buf`).
 ///
@@ -2483,6 +2531,68 @@ mod tests {
         assert_eq!(unsafe { char2cells(0x4e00) }, unsafe {
             crate::mbyte::utf_char2cells(0x4e00)
         });
+    }
+
+    #[test]
+    fn trans_characters_expands_a_control_char_in_place() {
+        // "a\x01b" becomes "a^Ab": the control character expands from
+        // one byte to two and the tail shifts right to make room.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(b"a\x01b\0");
+
+        unsafe { trans_characters(&mut buf, 16) };
+
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&buf[..end], b"a^Ab");
+    }
+
+    #[test]
+    fn trans_characters_leaves_printable_ascii_alone() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 16];
+        buf[..4].copy_from_slice(b"abc\0");
+
+        unsafe { trans_characters(&mut buf, 16) };
+
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&buf[..end], b"abc");
+    }
+
+    #[test]
+    fn trans_characters_leaves_a_multibyte_character_alone() {
+        // Multi-byte characters are assumed not to need translating,
+        // so they are stepped over whole.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 16];
+        let src = "aéb\0".as_bytes();
+        buf[..src.len()].copy_from_slice(src);
+
+        unsafe { trans_characters(&mut buf, 16) };
+
+        let end = buf.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&buf[..end], "aéb".as_bytes());
+    }
+
+    #[test]
+    fn trans_characters_stops_rather_than_overflowing() {
+        // Only one spare byte, so the first expansion fits and the
+        // second cannot - translation stops instead of overrunning.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 16];
+        buf[..3].copy_from_slice(b"\x01\x01\0");
+
+        // bufsize 4: len 2, so room is 2; the first expansion costs 1,
+        // the second would cost the last one and hit the `room <= 0`
+        // guard.
+        unsafe { trans_characters(&mut buf, 4) };
+
+        // Whatever it produced, it stayed inside the stated capacity.
+        assert_eq!(buf[4..], [0u8; 12], "nothing written past bufsize");
     }
 
     #[test]
