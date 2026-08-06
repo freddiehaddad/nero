@@ -256,6 +256,50 @@ pub fn tabstop_copy(oldts: Option<&[ColnrT]>) -> Option<Vec<ColnrT>> {
     oldts.map(<[ColnrT]>::to_vec)
 }
 
+/// Whether the word at `p` is one of the `'lispwords'`
+/// (`lisp_match`).
+///
+/// The buffer-local `'lispwords'` takes precedence over the global one
+/// when it is non-empty. A word matches only when the text at `p`
+/// starts with it AND the next character is whitespace or the end of
+/// the line, so a longer identifier with the same prefix does not
+/// match.
+///
+/// # Safety
+/// Same as [`may_do_si`].
+#[must_use]
+pub unsafe fn lisp_match(p: &[u8]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    let local = curbuf.b_p_lw.clone().unwrap_or_default();
+    let words = if local.is_empty() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_lispwords
+            .clone()
+            .unwrap_or_default()
+    } else {
+        local
+    };
+
+    // The original's `buf[512]` is a fixed scratch buffer; here
+    // `copy_option_part` hands back an owned part instead, so the same
+    // cap is passed through for faithfulness rather than necessity.
+    let mut idx = 0usize;
+    while idx < words.len() && words[idx] != 0 {
+        let (part, next) = crate::option::copy_option_part(&words, idx, 512, b",");
+        idx = next;
+        let len = part.len();
+        if p.len() >= len
+            && p[..len] == part[..]
+            && crate::ascii_defs::ascii_iswhite_or_nul(i32::from(p.get(len).copied().unwrap_or(0)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether preprocessor lines are left alone when indenting
 /// (`preprocs_left`).
 ///
@@ -1943,6 +1987,76 @@ mod tests {
 
         drop(guard);
         close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn lisp_match_finds_a_word_from_the_global_lispwords() {
+        let mut buf = BufT { b_p_lw: None, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_lispwords
+            .clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords =
+            Some(b"defun,let,if".to_vec());
+
+        assert!(unsafe { lisp_match(b"defun foo") });
+        assert!(unsafe { lisp_match(b"let x") });
+        assert!(!unsafe { lisp_match(b"lambda x") });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords = prev;
+    }
+
+    #[test]
+    fn lisp_match_requires_a_whitespace_or_nul_boundary() {
+        // A longer identifier sharing a prefix must NOT match.
+        let mut buf = BufT { b_p_lw: None, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_lispwords
+            .clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords =
+            Some(b"let".to_vec());
+
+        assert!(!unsafe { lisp_match(b"letter x") });
+        assert!(unsafe { lisp_match(b"let\0") }, "NUL counts as a boundary");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords = prev;
+    }
+
+    #[test]
+    fn lisp_match_prefers_the_buffer_local_lispwords() {
+        let mut buf = BufT {
+            b_p_lw: Some(b"local".to_vec()),
+            ..Default::default()
+        };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_lispwords
+            .clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords =
+            Some(b"global".to_vec());
+
+        assert!(unsafe { lisp_match(b"local x") });
+        assert!(
+            !unsafe { lisp_match(b"global x") },
+            "the local option shadows the global one entirely"
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords = prev;
+    }
+
+    #[test]
+    fn lisp_match_false_when_no_lispwords_are_set() {
+        let mut buf = BufT { b_p_lw: None, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_lispwords
+            .clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords = None;
+
+        assert!(!unsafe { lisp_match(b"defun foo") });
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lispwords = prev;
     }
 
     #[test]
