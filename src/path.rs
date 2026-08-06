@@ -1829,6 +1829,15 @@ mod tests {
     #[test]
     fn path_fnamencmp_windows_matches_explicit_and_implicit_drive_when_current() {
         let _guard = crate::globals::global_state_test_lock();
+        // Also hold the CWD lock: this test reads the process current
+        // working DRIVE, which is OS-level global state that
+        // global_state_test_lock() does not cover (it only guards this
+        // crate's own GlobalCell state). os::fs's own chdir test
+        // mutates the process CWD under cwd_test_lock() alone, so
+        // without this second lock that test can move the drive out
+        // from under us between win32_getdrive() below and
+        // path_fnamencmp's own internal lookup.
+        let _cwd_guard = crate::os::fs::cwd_test_lock();
         // win32_getdrive() returns the CWD's drive; build an explicit
         // path using that same drive letter so it should compare equal
         // to the implicit-drive form.
