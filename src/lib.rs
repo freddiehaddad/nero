@@ -54,6 +54,7 @@ pub mod ex_getln;
 pub mod ex_eval;
 pub mod ex_eval_defs;
 pub mod ex_session;
+pub mod extmark;
 pub mod extmark_defs;
 pub mod file_search;
 pub mod fileio;
