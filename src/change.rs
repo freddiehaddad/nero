@@ -218,6 +218,49 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Delete from the cursor position to the end of the line
+/// (`truncate_line`).
+///
+/// With `fixpos`, the cursor is stepped back so it does not end up on
+/// the trailing NUL.
+///
+/// # Safety
+/// Same as [`del_bytes`].
+pub unsafe fn truncate_line(fixpos: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    let col = unsafe { &*curwin }.w_cursor.col;
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_line = unsafe { crate::memline::ml_get(lnum) };
+    // The original builds either an empty string or the first `col`
+    // bytes; both need their own trailing NUL, which `ml_replace`
+    // expects to be part of the slice in this crate.
+    let mut newp = Vec::with_capacity(col as usize + 1);
+    if col > 0 {
+        newp.extend_from_slice(&old_line[..col as usize]);
+    }
+    newp.push(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let deleted = unsafe { crate::memline::ml_get_len(lnum) } - col;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace(lnum, &newp) };
+
+    // Mark the buffer as changed and prepare for displaying.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { inserted_bytes(lnum, col, deleted, 0) };
+
+    // If "fixpos" is true we don't want to end up positioned at the NUL.
+    // SAFETY: forwarded from this function's own safety doc.
+    let w = unsafe { &mut *curwin };
+    if fixpos && w.w_cursor.col > 0 {
+        w.w_cursor.col -= 1;
+    }
+}
+
 /// Delete one character under the cursor (`del_char`).
 ///
 /// Returns `FAIL` when the cursor sits on the NUL past the end of the
@@ -1912,6 +1955,61 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn truncate_line_cuts_from_the_cursor_to_the_end() {
+        // Cross-verified against real nvim: "abcdef" with the cursor
+        // on column 3 (1-based) and "D" yields "ab" with the cursor
+        // pulled back to column 2.
+        let (mut buf, mut win) = del_fixture(b"abcdef", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { truncate_line(true) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1, "fixpos stepped back");
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn truncate_line_at_column_zero_empties_the_line() {
+        // Cross-verified against real nvim: "abcdef" with the cursor
+        // on column 1 and "D" empties the line, leaving the cursor on
+        // column 1 - fixpos cannot step back past zero.
+        let (mut buf, mut win) = del_fixture(b"abcdef", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { truncate_line(true) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn truncate_line_without_fixpos_leaves_the_cursor_alone() {
+        let (mut buf, mut win) = del_fixture(b"abcdef", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { truncate_line(false) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 2, "left on the NUL");
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
