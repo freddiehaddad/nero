@@ -356,23 +356,21 @@ pub unsafe fn line_folded(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> boo
 /// means the ORIGINAL's own `if (invalid_top == 0) { checkupdate(...);
 /// }` branch (not the two `else if`s) is unconditionally taken every
 /// time - exactly what calling [`checkupdate`] unconditionally here
-/// already achieves. `_lnum` is accepted (matching this module's own
-/// `has_folding_win`-family precedent for signature fidelity) but
-/// genuinely unused on this fast path - the real fold-tree level
-/// search past `hasAnyFolding` needs `lnum` for real, but that whole
-/// branch is `unimplemented!()` here.
+/// already achieves.
 ///
 /// # Safety
 /// Same as [`has_any_folding`].
 #[must_use]
-pub unsafe fn fold_level(wp: &mut WinT, _lnum: crate::pos_defs::LinenrT) -> i32 {
+pub unsafe fn fold_level(wp: &mut WinT, lnum: crate::pos_defs::LinenrT) -> i32 {
     checkupdate(wp);
 
+    // Return quickly when there is no folding at all in this window.
     // SAFETY: forwarded from this function's own safety doc.
     if !unsafe { has_any_folding(wp) } {
         return 0;
     }
-    unimplemented!("fold::fold_level: the real fold-tree level search is not yet translated");
+
+    fold_level_win(wp, lnum)
 }
 
 /// Find an entry in `win.w_lines` for buffer line `lnum`. Only valid
@@ -1037,9 +1035,51 @@ mod tests {
             w_foldinvalid: false,
             ..Default::default()
         };
-        // _lnum is genuinely unused on this fast path (see fold_level's
-        // own doc comment) - any value yields the same 0 result.
+        // has_any_folding's fast path returns 0 before lnum is ever
+        // used, so any value yields the same result.
         assert_eq!(unsafe { fold_level(&mut win, 9999) }, 0);
+    }
+
+    #[test]
+    fn fold_level_reports_real_levels_once_folds_exist() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            // Same layout cross-verified against real nvim below.
+            w_folds: nested_outer_inner(),
+            ..Default::default()
+        };
+        // Past has_any_folding now that w_folds is non-empty, so this
+        // exercises the real fold_level_win descent.
+        assert_eq!(unsafe { fold_level(&mut win, 5) }, 0);
+        assert_eq!(unsafe { fold_level(&mut win, 12) }, 1);
+        assert_eq!(unsafe { fold_level(&mut win, 16) }, 2);
+        assert_eq!(unsafe { fold_level(&mut win, 25) }, 0);
+    }
+
+    #[test]
+    fn fold_level_is_zero_when_foldenable_is_off_even_with_folds() {
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                // 'nofoldenable' makes has_any_folding false, so the
+                // fast path wins before any descent happens.
+                wo_fen: 0,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: nested_outer_inner(),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { fold_level(&mut win, 16) }, 0);
     }
 
     /// Builds a `WlineT` for `find_wl_entry` tests.
