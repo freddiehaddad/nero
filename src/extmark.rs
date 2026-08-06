@@ -36,6 +36,11 @@ use crate::marktree_defs::MarkTreeIter;
 use crate::pos_defs::ColnrT;
 use crate::types_defs::TriState;
 
+/// Non-zero while a caller will perform its own extmark splice, so
+/// `inserted_bytes` must not do one itself (`curbuf_splice_pending`).
+pub static CURBUF_SPLICE_PENDING: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
 /// Invalidate extmarks between a range and copy them to the undo
 /// header (`extmark_splice_delete`).
 ///

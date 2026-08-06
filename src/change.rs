@@ -218,6 +218,175 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Insert or delete bytes at a column (`inserted_bytes`).
+///
+/// Like [`changed_bytes`], but also adjusts extmarks for the "new"
+/// bytes.
+///
+/// # Safety
+/// Same as `changed_common`.
+pub unsafe fn inserted_bytes(lnum: LinenrT, start_col: ColnrT, old_col: i32, new_col: i32) {
+    // SAFETY: reading a plain scalar global.
+    if *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() } == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::extmark::extmark_splice_cols(
+                &mut *curbuf,
+                lnum - 1,
+                start_col,
+                old_col,
+                new_col,
+                crate::extmark_defs::ExtmarkOp::Undo,
+            );
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_bytes(lnum, start_col) };
+}
+
+/// Changed lines of a buffer (`changed_lines`).
+///
+/// Must be called AFTER the change and after `mark_adjust()`. `lnum`
+/// is the first line that needs displaying, `lnume` the first line
+/// below the changed lines (BEFORE the change); when only inserting
+/// lines the two are equal. Careful: may trigger autocommands that
+/// reload the buffer.
+///
+/// # Safety
+/// Same as `changed_common`.
+pub unsafe fn changed_lines(
+    buf: *mut BufT,
+    lnum: LinenrT,
+    col: ColnrT,
+    lnume: LinenrT,
+    xtra: LinenrT,
+    do_buf_event: bool,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines_redraw_buf(buf, lnum, lnume, xtra) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur = unsafe { &*curwin };
+    if xtra == 0
+        && cur.w_onebuf_opt.wo_diff != 0
+        && cur.w_buffer == buf
+        && !crate::diff::diff_internal()
+    {
+        // When the number of lines doesn't change then mark_adjust()
+        // isn't called, and other diff buffers still need to be marked
+        // for displaying.
+        let mut wp = g.firstwin;
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &*wp };
+            let next = w.w_next;
+            if w.w_onebuf_opt.wo_diff != 0 && wp != curwin {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_VALID) };
+                // SAFETY: forwarded from this function's own safety doc.
+                let wlnum = unsafe { crate::diff::diff_lnum_win(lnum, wp) };
+                if wlnum > 0 {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe {
+                        changed_lines_redraw_buf(w.w_buffer, wlnum, lnume - lnum + wlnum, 0);
+                    }
+                }
+            }
+            wp = next;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_common(buf, lnum, col, lnume, xtra) };
+
+    if do_buf_event {
+        let num_added = i64::from(lnume + xtra - lnum);
+        let num_removed = i64::from(lnume - lnum);
+        // SAFETY: forwarded from this function's own safety doc.
+        crate::buffer_updates::buf_updates_send_changes(
+            unsafe { &mut *buf },
+            lnum,
+            num_added,
+            num_removed,
+        );
+    }
+}
+
+/// Appended `count` lines below line `lnum` in `buf`
+/// (`appended_lines_buf`).
+///
+/// Must be called AFTER the change and after `mark_adjust()`.
+///
+/// # Safety
+/// Same as [`changed_lines`].
+pub unsafe fn appended_lines_buf(buf: *mut BufT, lnum: LinenrT, count: LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines(buf, lnum + 1, 0, lnum + 1, count, true) };
+}
+
+/// Appended `count` lines below line `lnum` in the current buffer
+/// (`appended_lines`).
+///
+/// # Safety
+/// Same as [`changed_lines`].
+pub unsafe fn appended_lines(lnum: LinenrT, count: LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { appended_lines_buf(curbuf, lnum, count) };
+}
+
+/// Like [`appended_lines`], but adjusts marks first
+/// (`appended_lines_mark`).
+///
+/// # Safety
+/// Same as [`changed_lines`], plus `crate::mark::mark_adjust`'s own.
+pub unsafe fn appended_lines_mark(lnum: LinenrT, count: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::mark::mark_adjust(
+            lnum + 1,
+            crate::pos_defs::MAXLNUM,
+            count,
+            0,
+            crate::extmark_defs::ExtmarkOp::Undo,
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines(curbuf, lnum + 1, 0, lnum + 1, count, true) };
+}
+
+/// Deleted `count` lines at line `lnum` in `buf` (`deleted_lines_buf`).
+///
+/// Must be called AFTER the change and after `mark_adjust()`.
+///
+/// # Safety
+/// Same as [`changed_lines`].
+pub unsafe fn deleted_lines_buf(buf: *mut BufT, lnum: LinenrT, count: LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines(buf, lnum, 0, lnum + count, -count, true) };
+}
+
+/// Deleted `count` lines at line `lnum` in the current buffer
+/// (`deleted_lines`).
+///
+/// # Safety
+/// Same as [`changed_lines`].
+pub unsafe fn deleted_lines(lnum: LinenrT, count: LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { deleted_lines_buf(curbuf, lnum, count) };
+}
+
 /// Changed bytes within a single line of the current buffer
 /// (`changed_bytes`).
 ///
@@ -1464,6 +1633,131 @@ mod tests {
         win.w_buffer = buf_ptr;
         let win_ptr: *mut WinT = win;
         (buf_ptr, win_ptr)
+    }
+
+    #[test]
+    fn inserted_bytes_records_an_extmark_splice_and_marks_the_change() {
+        let (mut buf, mut win) = changed_fixture();
+        // A real undo header, so u_force_get_undo_header hands one
+        // back instead of trying to create one (which would need a
+        // live memline this fixture deliberately doesn't build).
+        let uhp = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        buf.b_u_curhead = uhp;
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+        let prev_pending = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 0 };
+
+        unsafe { inserted_bytes(3, 2, 0, 4) };
+
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 3);
+        assert_eq!(unsafe { (*buf_ptr).b_last_change.mark.col }, 2);
+        // The splice really happened: it was recorded for undo.
+        assert_eq!(unsafe { &(*uhp).uh_extmark }.len(), 1);
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        unsafe { (*buf_ptr).b_u_curhead = std::ptr::null_mut() };
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    #[test]
+    fn inserted_bytes_skips_the_splice_when_one_is_already_pending() {
+        let (mut buf, mut win) = changed_fixture();
+        let uhp = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        buf.b_u_curhead = uhp;
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+        let prev_pending = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        // The caller will do its own splice, so only the
+        // changed_bytes half runs.
+        unsafe { inserted_bytes(3, 2, 0, 4) };
+
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 3);
+        assert!(
+            unsafe { &(*uhp).uh_extmark }.is_empty(),
+            "no splice recorded when one is already pending"
+        );
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        unsafe { (*buf_ptr).b_u_curhead = std::ptr::null_mut() };
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    #[test]
+    fn changed_lines_records_the_region_and_marks_the_buffer() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { changed_lines(buf_ptr, 2, 0, 5, 0, true) };
+
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 2);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_bot }, 5);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, 0);
+    }
+
+    #[test]
+    fn appended_lines_buf_records_lines_added_below_lnum() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        // 3 lines appended below line 4.
+        unsafe { appended_lines_buf(buf_ptr, 4, 3) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 5);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_bot }, 8);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, 3);
+    }
+
+    #[test]
+    fn appended_lines_uses_the_current_buffer() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { appended_lines(4, 3) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 5);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, 3);
+    }
+
+    #[test]
+    fn deleted_lines_buf_records_a_negative_xtra() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        // 2 lines deleted at line 4.
+        unsafe { deleted_lines_buf(buf_ptr, 4, 2) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 4);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_bot }, 4, "lnume(6) + xtra(-2)");
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, -2);
+    }
+
+    #[test]
+    fn deleted_lines_uses_the_current_buffer() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { deleted_lines(4, 2) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 4);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, -2);
     }
 
     #[test]
