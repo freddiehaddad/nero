@@ -936,6 +936,42 @@ pub unsafe fn swapchar(op_type: OpType, pos: &crate::pos_defs::PosT) -> bool {
     true
 }
 
+/// Swap the case of, or rot13, `length` bytes starting at `pos`
+/// (`swapchars`).
+///
+/// Returns `true` when any character actually changed. `length` counts
+/// bytes, not characters, so a multi-byte character consumes its whole
+/// width from the budget.
+///
+/// # Safety
+/// Same as [`swapchar`].
+pub unsafe fn swapchars(op_type: OpType, pos: &mut crate::pos_defs::PosT, length: i32) -> bool {
+    let mut did_change = false;
+
+    let mut todo = length;
+    while todo > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let p = unsafe { crate::memline::ml_get_pos(pos) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&p) };
+
+        // We're counting bytes, not characters.
+        if len > 0 {
+            todo -= len - 1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        did_change |= unsafe { swapchar(op_type, pos) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::memline::inc(pos) } == -1 {
+            // At the end of the file.
+            break;
+        }
+        todo -= 1;
+    }
+
+    did_change
+}
+
 /// Get the byte count of a buffer region, end-exclusive
 /// (`get_region_bytecount`).
 ///
@@ -1350,6 +1386,66 @@ mod tests {
     /// `CursorTestGuard` precedent (needed since `ml_open`, used to
     /// build the test memline below, touches shared `GLOBALS.got_int`
     /// internally).
+    #[test]
+    fn swapchars_walks_a_byte_budget_across_characters() {
+        // Cross-verified against real nvim: "aéb" with "g~~" becomes
+        // "AÉB". The é is 2 bytes, so a 4-byte budget covers all three
+        // characters exactly.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, "aéb\0".as_bytes());
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        let mut p = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        assert!(unsafe { swapchars(OpType::Tilde, &mut p, 4) });
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, "AÉB\0".as_bytes());
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchars_stops_at_the_byte_budget() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"abcd\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        let mut p = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        assert!(unsafe { swapchars(OpType::Upper, &mut p, 2) });
+
+        assert_eq!(
+            unsafe { crate::memline::ml_get(1) },
+            b"ABcd\0",
+            "only the first two bytes were touched"
+        );
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn swapchars_reports_false_when_nothing_changed() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"123\0");
+        let prev = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        let mut p = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        assert!(!unsafe { swapchars(OpType::Tilde, &mut p, 3) });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"123\0");
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
     #[test]
     fn pbyte_replaces_one_byte_in_place() {
         let mut buf = crate::buffer_defs::BufT::default();
