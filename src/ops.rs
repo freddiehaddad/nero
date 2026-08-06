@@ -305,6 +305,27 @@ pub fn clear_oparg(oap: &mut crate::normal_defs::OpargT) {
 static OPFUNC_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
 
+/// Release the global `'operatorfunc'` callback
+/// (`free_operatorfunc_option`).
+///
+/// The original guards this in `#ifdef EXITFREE`, i.e. it exists only
+/// to hand memory back cleanly on exit so leak checkers stay quiet.
+/// `OPFUNC_CB` is `Callback::None` in every session this crate can
+/// currently build (see its own doc comment), so today this is a
+/// well-defined no-op - but it is translated in full rather than
+/// stubbed, so it already does the right thing the moment
+/// `'operatorfunc'` becomes settable.
+///
+/// # Safety
+/// Same as [`crate::eval::typval::callback_free`]: `OPFUNC_CB` must
+/// hold a callback whose referent is still live and not aliased.
+pub unsafe fn free_operatorfunc_option() {
+    // SAFETY: forwarded from this function's own safety doc - the
+    // GlobalCell is not aliased across this call.
+    let cb = unsafe { OPFUNC_CB.get_mut() };
+    crate::eval::typval::callback_free(cb);
+}
+
 /// Mark the global `'operatorfunc'` callback with `copy_id` so that it
 /// is not garbage collected (`set_ref_in_opfunc`).
 ///
@@ -1316,6 +1337,19 @@ mod tests {
         // Nothing in this crate can populate OPFUNC_CB with a real
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
+        assert!(!unsafe { set_ref_in_opfunc(1) });
+    }
+
+    #[test]
+    fn free_operatorfunc_option_is_a_noop_while_opfunc_cb_stays_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Same reasoning as the test above: OPFUNC_CB is Callback::None
+        // in every session this crate can build, so freeing it must be
+        // well defined and leave it None - including when called twice,
+        // as an exit path may well do.
+        unsafe { free_operatorfunc_option() };
+        unsafe { free_operatorfunc_option() };
+        // Still None, so it still has nothing for the GC to mark.
         assert!(!unsafe { set_ref_in_opfunc(1) });
     }
 
