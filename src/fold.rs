@@ -892,6 +892,104 @@ pub fn check_close_rec(gap: &mut [FoldT], lnum: crate::pos_defs::LinenrT, level:
     retval
 }
 
+/// Update the `fd_small` field of fold `fp` (`checkSmall`).
+///
+/// A fold is "small" when it covers fewer screen lines than
+/// `'foldminlines'`, in which case it is not worth closing. Folds
+/// longer than that in buffer lines cannot possibly be small, which
+/// is the cheap early test; otherwise the screen lines are counted
+/// and the count stops as soon as it exceeds the limit.
+///
+/// `lnum_off` offsets `fp.fd_top`, since a nested fold stores it
+/// relative to its parent.
+///
+/// Does nothing when the smallness is already known.
+///
+/// # Safety
+/// Same as [`crate::plines::plines_win_nofold`], which this calls for
+/// each line of the fold.
+pub unsafe fn check_small(wp: *mut WinT, fp: &mut FoldT, lnum_off: crate::pos_defs::LinenrT) {
+    if fp.fd_small != crate::types_defs::TriState::None {
+        return;
+    }
+
+    // Mark any nested folds to maybe-small.
+    set_small_maybe(&mut fp.fd_nested);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fml = unsafe { (*wp).w_onebuf_opt.wo_fml };
+    if crate::types_defs::OptInt::from(fp.fd_len) > fml {
+        fp.fd_small = crate::types_defs::TriState::False;
+    } else {
+        let mut count: crate::types_defs::OptInt = 0;
+        for n in 0..fp.fd_len {
+            // SAFETY: forwarded from this function's own safety doc.
+            count += crate::types_defs::OptInt::from(unsafe {
+                crate::plines::plines_win_nofold(wp, fp.fd_top + lnum_off + n)
+            });
+            if count > fml {
+                fp.fd_small = crate::types_defs::TriState::False;
+                return;
+            }
+        }
+        fp.fd_small = crate::types_defs::TriState::True;
+    }
+}
+
+/// Whether fold `fp` is closed, updating the state needed to check
+/// folds nested inside it (`check_closed`).
+///
+/// `use_levelp` carries "an enclosing fold had [`fd_flags::FD_LEVEL`]"
+/// down the tree: once set, this fold and everything inside it are
+/// governed by `'foldlevel'` rather than their own flag.
+/// `maybe_smallp` likewise carries an as-yet-unknown smallness down,
+/// since [`crate::types_defs::TriState::None`] applies to nested folds
+/// too.
+///
+/// A small fold is never actually closed, so the smallness is
+/// resolved before answering.
+///
+/// # Safety
+/// Same as [`check_small`].
+pub unsafe fn check_closed(
+    wp: *mut WinT,
+    fp: &mut FoldT,
+    use_levelp: &mut bool,
+    level: i32,
+    maybe_smallp: &mut bool,
+    lnum_off: crate::pos_defs::LinenrT,
+) -> bool {
+    let mut closed = false;
+
+    // Check if this fold is closed. If the flag is FD_LEVEL this fold
+    // and all folds it contains depend on 'foldlevel'.
+    if *use_levelp || fp.fd_flags == fd_flags::FD_LEVEL {
+        *use_levelp = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        if crate::types_defs::OptInt::from(level) >= unsafe { (*wp).w_onebuf_opt.wo_fdl } {
+            closed = true;
+        }
+    } else if fp.fd_flags == fd_flags::FD_CLOSED {
+        closed = true;
+    }
+
+    // Small fold isn't closed anyway.
+    if fp.fd_small == crate::types_defs::TriState::None {
+        *maybe_smallp = true;
+    }
+    if closed {
+        if *maybe_smallp {
+            fp.fd_small = crate::types_defs::TriState::None;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { check_small(wp, fp, lnum_off) };
+        if fp.fd_small == crate::types_defs::TriState::True {
+            closed = false;
+        }
+    }
+    closed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1716,6 +1814,174 @@ mod tests {
     #[test]
     fn check_close_rec_on_an_empty_array_reports_nothing_closed() {
         assert!(!check_close_rec(&mut [], 5, 0));
+    }
+
+    /// A window whose buffer has `lines` single-screen-line lines, so
+    /// `plines_win_nofold` reports 1 per buffer line and `check_small`
+    /// can count real screen lines.
+    fn small_check_win(fml: crate::types_defs::OptInt, fdl: crate::types_defs::OptInt) -> (BufT, WinT) {
+        let buf = BufT::default();
+        let win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fml: fml,
+                wo_fdl: fdl,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (buf, win)
+    }
+
+    #[test]
+    fn check_small_marks_a_long_fold_as_not_small_without_counting() {
+        let (mut buf, mut win) = small_check_win(3, 0);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+        // fd_len 5 > foldminlines 3, so the cheap early test settles
+        // it and no screen lines are counted at all.
+        let mut fp = FoldT {
+            fd_top: 20,
+            fd_len: 5,
+            ..Default::default()
+        };
+        unsafe { check_small(win_ptr, &mut fp, 0) };
+        assert_eq!(fp.fd_small, crate::types_defs::TriState::False);
+    }
+
+    #[test]
+    fn check_small_leaves_an_already_known_smallness_alone() {
+        let (mut buf, mut win) = small_check_win(3, 0);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+        for known in [crate::types_defs::TriState::True, crate::types_defs::TriState::False] {
+            let mut fp = FoldT {
+                fd_top: 20,
+                fd_len: 99,
+                fd_small: known,
+                ..Default::default()
+            };
+            unsafe { check_small(win_ptr, &mut fp, 0) };
+            assert_eq!(fp.fd_small, known);
+        }
+    }
+
+    #[test]
+    fn check_small_marks_nested_folds_maybe_small() {
+        let (mut buf, mut win) = small_check_win(3, 0);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+        let mut fp = FoldT {
+            fd_top: 20,
+            fd_len: 5,
+            fd_nested: vec![FoldT {
+                fd_small: crate::types_defs::TriState::True,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        unsafe { check_small(win_ptr, &mut fp, 0) };
+        // The parent's smallness changed, so its children's cached
+        // answers are no longer trustworthy.
+        assert_eq!(
+            fp.fd_nested[0].fd_small,
+            crate::types_defs::TriState::None
+        );
+    }
+
+    #[test]
+    fn check_closed_honours_fd_closed_and_fd_open() {
+        let (mut buf, mut win) = small_check_win(0, 0);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+
+        let mut closed_fold = FoldT {
+            fd_top: 20,
+            fd_len: 5,
+            fd_flags: fd_flags::FD_CLOSED,
+            // Known not-small, so smallness cannot reopen it.
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        };
+        let (mut use_level, mut maybe_small) = (false, false);
+        assert!(unsafe {
+            check_closed(win_ptr, &mut closed_fold, &mut use_level, 0, &mut maybe_small, 0)
+        });
+        assert!(!use_level, "FD_CLOSED does not switch to level mode");
+
+        let mut open_fold = FoldT {
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        };
+        let (mut use_level, mut maybe_small) = (false, false);
+        assert!(!unsafe {
+            check_closed(win_ptr, &mut open_fold, &mut use_level, 0, &mut maybe_small, 0)
+        });
+    }
+
+    #[test]
+    fn check_closed_uses_foldlevel_once_fd_level_is_seen() {
+        let (mut buf, mut win) = small_check_win(0, 2);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+
+        let mut fp = FoldT {
+            fd_flags: fd_flags::FD_LEVEL,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        };
+        // level 1 < 'foldlevel' 2: stays open, but use_level is now
+        // set so nested folds inherit level control.
+        let (mut use_level, mut maybe_small) = (false, false);
+        assert!(!unsafe {
+            check_closed(win_ptr, &mut fp, &mut use_level, 1, &mut maybe_small, 0)
+        });
+        assert!(use_level);
+
+        // level 2 >= 'foldlevel' 2: closed.
+        let (mut use_level, mut maybe_small) = (false, false);
+        assert!(unsafe {
+            check_closed(win_ptr, &mut fp, &mut use_level, 2, &mut maybe_small, 0)
+        });
+    }
+
+    #[test]
+    fn check_closed_inherits_level_mode_from_an_enclosing_fold() {
+        let (mut buf, mut win) = small_check_win(0, 5);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+
+        // FD_CLOSED would normally close this fold outright, but an
+        // enclosing FD_LEVEL fold means 'foldlevel' decides instead -
+        // and level 1 is below 'foldlevel' 5, so it stays open.
+        let mut fp = FoldT {
+            fd_flags: fd_flags::FD_CLOSED,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        };
+        let (mut use_level, mut maybe_small) = (true, false);
+        assert!(!unsafe {
+            check_closed(win_ptr, &mut fp, &mut use_level, 1, &mut maybe_small, 0)
+        });
+    }
+
+    #[test]
+    fn check_closed_reports_an_unknown_smallness_upward() {
+        let (mut buf, mut win) = small_check_win(0, 0);
+        win.w_buffer = &mut buf as *mut BufT;
+        let win_ptr = &mut win as *mut WinT;
+
+        let mut fp = FoldT {
+            fd_top: 20,
+            fd_len: 5,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::None,
+            ..Default::default()
+        };
+        let (mut use_level, mut maybe_small) = (false, false);
+        let _ = unsafe { check_closed(win_ptr, &mut fp, &mut use_level, 0, &mut maybe_small, 0) };
+        // kNone applies to nested folds too, so it must propagate.
+        assert!(maybe_small);
     }
 
     /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
