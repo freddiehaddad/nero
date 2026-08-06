@@ -27,6 +27,63 @@ use crate::ascii_defs::ascii_iswhite;
 use crate::globals::GLOBALS;
 use crate::pos_defs::LinenrT;
 
+/// Whether line `lnum` ends a paragraph for formatting purposes
+/// (`fmt_check_par`).
+///
+/// Reports the line's comment-leader length through `leader_len` and
+/// its `'comments'` flags through `leader_flags`. A line counts as a
+/// paragraph boundary when it holds nothing but its leader, when that
+/// leader carries the `e` (end) flag, or when it starts a section or
+/// paragraph per `'sections'`/`'paragraphs'`.
+///
+/// # Safety
+/// Same as [`same_leader`].
+pub unsafe fn fmt_check_par(
+    lnum: LinenrT,
+    leader_len: &mut i32,
+    leader_flags: &mut Option<Vec<u8>>,
+    do_comments: bool,
+) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ptr = unsafe { crate::memline::ml_get(lnum) };
+    if do_comments {
+        let mut flags_idx = 0usize;
+        // SAFETY: forwarded from this function's own safety doc.
+        let len =
+            unsafe { crate::change::get_leader_len(&ptr, Some(&mut flags_idx), false, true) };
+        *leader_len = len as i32;
+        // `get_leader_len` reports the flags as an index into the
+        // `'comments'` option's own text, which this crate's caller
+        // needs as an owned slice.
+        *leader_flags = if len > 0 {
+            Some(ptr[flags_idx.min(ptr.len())..].to_vec())
+        } else {
+            None
+        };
+    } else {
+        *leader_len = 0;
+        *leader_flags = None;
+    }
+
+    // Search for the 'e' flag in the comment leader's flags.
+    let mut ends_comment = false;
+    if *leader_len > 0
+        && let Some(flags) = leader_flags.as_deref()
+    {
+        ends_comment = flags
+            .iter()
+            .take_while(|&&c| c != 0 && c != b':')
+            .any(|&c| c == crate::option_vars::COM_END);
+    }
+
+    let after_leader = &ptr[(*leader_len as usize).min(ptr.len())..];
+    let rest = &after_leader[crate::charset::skipwhite(after_leader).min(after_leader.len())..];
+    rest.first().copied().unwrap_or(0) == 0
+        || ends_comment
+        // SAFETY: forwarded from this function's own safety doc.
+        || unsafe { crate::textobject::start_ps(lnum, 0, false) }
+}
+
 /// Whether the comment leader of line `lnum + 1` matches the one of
 /// line `lnum`, so the two lines may be joined when formatting
 /// (`same_leader`).
@@ -342,6 +399,99 @@ mod tests {
             }
         }
         guard
+    }
+
+    #[test]
+    fn fmt_check_par_true_for_an_empty_line() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"", b"text"]);
+
+        let mut len = 0;
+        let mut flags = None;
+        assert!(unsafe { fmt_check_par(1, &mut len, &mut flags, false) });
+        assert_eq!(len, 0);
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn fmt_check_par_false_for_a_line_with_text() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"some text", b"more"]);
+
+        let mut len = 0;
+        let mut flags = None;
+        assert!(!unsafe { fmt_check_par(1, &mut len, &mut flags, false) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn fmt_check_par_true_for_a_whitespace_only_line() {
+        // Everything after the (absent) leader is whitespace, so the
+        // skipwhite lands on the NUL.
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"   \t  ", b"more"]);
+
+        let mut len = 0;
+        let mut flags = None;
+        assert!(unsafe { fmt_check_par(1, &mut len, &mut flags, false) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn fmt_check_par_reports_the_comment_leader_when_asked() {
+        // 'comments' defaults include "://", so "// x" has a 3-byte
+        // leader once the trailing space is included.
+        let mut buf = BufT {
+            b_p_com: Some(b"://".to_vec()),
+            ..Default::default()
+        };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"// x", b"more"]);
+
+        let mut len = 0;
+        let mut flags = None;
+        let boundary = unsafe { fmt_check_par(1, &mut len, &mut flags, true) };
+        assert_eq!(len, 3, "leader plus its trailing space");
+        assert!(!boundary, "there is still text after the leader");
+
+        // With do_comments false the leader is not looked for at all.
+        let mut len2 = 0;
+        let mut flags2 = None;
+        assert!(!unsafe { fmt_check_par(1, &mut len2, &mut flags2, false) });
+        assert_eq!(len2, 0);
+        assert!(flags2.is_none());
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn fmt_check_par_true_for_a_leader_only_line() {
+        let mut buf = BufT {
+            b_p_com: Some(b"://".to_vec()),
+            ..Default::default()
+        };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"//", b"more"]);
+
+        let mut len = 0;
+        let mut flags = None;
+        assert!(
+            unsafe { fmt_check_par(1, &mut len, &mut flags, true) },
+            "nothing but the leader ends the paragraph"
+        );
+
+        drop(guard);
+        close_buf_with_memline(buf);
     }
 
     #[test]

@@ -76,7 +76,7 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
 /// non-null pointer to a live buffer whose own memline is in a
 /// well-formed state).
 #[must_use]
-unsafe fn start_ps(lnum: LinenrT, para: i32, both: bool) -> bool {
+pub unsafe fn start_ps(lnum: LinenrT, para: i32, both: bool) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     let s = unsafe { crate::memline::ml_get(lnum) };
     let c0 = s.first().copied().unwrap_or(0);
