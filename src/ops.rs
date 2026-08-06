@@ -936,6 +936,71 @@ pub unsafe fn swapchar(op_type: OpType, pos: &crate::pos_defs::PosT) -> bool {
     true
 }
 
+/// Shift the current line one `'shiftwidth'` right or left
+/// (`shift_line`).
+///
+/// The shift size comes from `'shiftwidth'`, falling back to
+/// `'tabstop'` when that is zero, or to `'vartabstop'` when that is
+/// defined too.
+///
+/// # Scope
+///
+/// The `State & VREPLACE_FLAG` branch is `unimplemented!()`, behind a
+/// real guard that is unreachable today: it needs `indent.c`'s
+/// `change_indent`, and nothing translated can enter virtual Replace
+/// mode - there is no `edit()` loop yet - so `State` never carries
+/// that flag in a real session.
+///
+/// # Safety
+/// Same as [`crate::indent::set_indent`].
+pub unsafe fn shift_line(left: bool, round: bool, amount: i32, call_changed_bytes: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (sw_val, ts_val, vts) = {
+        let b = unsafe { &*curbuf };
+        (b.b_p_sw, b.b_p_ts, b.b_p_vts_array.clone())
+    };
+    let vts = vts.as_deref();
+
+    let count = if sw_val != 0 {
+        // 'shiftwidth' is not zero; use it as the shift size.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { get_new_sw_indent(left, round, i64::from(amount), sw_val) }
+    } else if vts.is_none_or(<[crate::pos_defs::ColnrT]>::is_empty) {
+        // 'shiftwidth' is zero and 'vartabstop' is empty; use
+        // 'tabstop' as the shift size.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { get_new_sw_indent(left, round, i64::from(amount), ts_val) }
+    } else {
+        // 'shiftwidth' is zero and 'vartabstop' is defined; use
+        // 'vartabstop' to determine the new indent.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { get_new_vts_indent(left, round, amount, vts.unwrap_or(&[])) }
+    };
+
+    // Set the new indent.
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    if state & crate::state_defs::mode::VREPLACE_FLAG != 0 {
+        unimplemented!(
+            "virtual Replace mode needs indent.c's change_indent, not yet translated; \
+             unreachable while nothing can enter Replace mode"
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::indent::set_indent(
+            crate::math::trim_to_int(count),
+            if call_changed_bytes {
+                crate::indent::sin_flag::CHANGED
+            } else {
+                0
+            },
+        );
+    }
+}
+
 /// Swap the case of, or rot13, `length` bytes starting at `pos`
 /// (`swapchars`).
 ///
@@ -1386,6 +1451,103 @@ mod tests {
     /// `CursorTestGuard` precedent (needed since `ml_open`, used to
     /// build the test memline below, touches shared `GLOBALS.got_int`
     /// internally).
+    #[test]
+    fn shift_line_right_adds_one_shiftwidth() {
+        // Cross-verified against real nvim: with expandtab, ts=8 and
+        // sw=4, ">>" on a line indented 4 columns yields 8.
+        let (mut buf, mut win) = shift_fixture(4, b"    abc");
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { shift_line(false, false, 1, false) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"        abc\0");
+
+        drop(_guard);
+        close_shift_fixture(buf);
+    }
+
+    #[test]
+    fn shift_line_left_removes_one_shiftwidth() {
+        // Cross-verified against real nvim: the same setup with "<<"
+        // removes the indent entirely.
+        let (mut buf, mut win) = shift_fixture(4, b"    abc");
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { shift_line(true, false, 1, false) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abc\0");
+
+        drop(_guard);
+        close_shift_fixture(buf);
+    }
+
+    #[test]
+    fn shift_line_falls_back_to_tabstop_when_shiftwidth_is_zero() {
+        // 'shiftwidth' zero and no 'vartabstop': the shift size comes
+        // from 'tabstop' instead.
+        let (mut buf, mut win) = shift_fixture(0, b"abc");
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        unsafe { shift_line(false, false, 1, false) };
+
+        assert_eq!(
+            unsafe { crate::memline::ml_get(1) },
+            b"        abc\0",
+            "shifted by ts=8"
+        );
+
+        drop(_guard);
+        close_shift_fixture(buf);
+    }
+
+    /// Builds a fixture for the [`shift_line`] tests. As for
+    /// `indent.rs`'s own `set_indent` fixture, a real undo header is
+    /// installed so `extmark_splice_cols` does not have to create one.
+    fn shift_fixture(
+        sw: crate::types_defs::OptInt,
+        line: &[u8],
+    ) -> (Box<crate::buffer_defs::BufT>, Box<WinT>) {
+        let mut buf = Box::new(crate::buffer_defs::BufT {
+            b_p_et: 1,
+            b_p_ts: 8,
+            b_p_sw: sw,
+            b_u_curhead: Box::into_raw(Box::new(crate::undo_defs::UHeader::default())),
+            ..Default::default()
+        });
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        let mut owned = line.to_vec();
+        owned.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &owned) },
+            crate::vim_defs::OK
+        );
+        let win = Box::new(WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        });
+        (buf, win)
+    }
+
+    fn close_shift_fixture(mut buf: Box<crate::buffer_defs::BufT>) {
+        unsafe {
+            if !buf.b_u_curhead.is_null() {
+                drop(Box::from_raw(buf.b_u_curhead));
+                buf.b_u_curhead = std::ptr::null_mut();
+            }
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
     #[test]
     fn swapchars_walks_a_byte_budget_across_characters() {
         // Cross-verified against real nvim: "aéb" with "g~~" becomes
