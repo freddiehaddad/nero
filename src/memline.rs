@@ -3050,6 +3050,59 @@ pub unsafe fn ml_clearmarked() {
     *unsafe { LOWEST_MARKED.get_mut() } = 0;
 }
 
+/// Close a memline: write out and close its memfile, release the
+/// cached line, the block stack and the chunk sizes, and mark the
+/// buffer as having no memline (`ml_close`).
+///
+/// `del_file` is passed straight through to `mf_close`, deciding
+/// whether the swap file is deleted rather than kept for recovery.
+///
+/// Calling this on a buffer that has no memline is a no-op, exactly
+/// as in the original.
+///
+/// # Translation note
+/// The original frees `ml_line_ptr` only when the cached line is
+/// genuinely owned (`ML_LINE_DIRTY | ML_ALLOCATED`), because
+/// otherwise it points into a data block it does not own. Here
+/// `ml_line_ptr` is an `Option<Vec<u8>>` that always owns its bytes,
+/// so ownership is settled by the type and the cached line is simply
+/// dropped. Likewise `ml_stack`/`ml_chunksize` are owned `Vec`s, so
+/// the original's `xfree`/`XFREE_CLEAR` become clearing them - and
+/// because a `Vec`'s length is its real allocation (unlike C, where
+/// `ml_stack_size` is left describing freed memory), the stack
+/// counters are reset to match so they cannot disagree with it.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp` must be null, or a pointer obtained from
+/// `Box::into_raw` that is still live and not aliased elsewhere -
+/// this takes ownership of it.
+pub unsafe fn ml_close(buf: &mut BufT, del_file: bool) {
+    if buf.b_ml.ml_mfp.is_null() {
+        return; // not open
+    }
+
+    // Close the .swp file.
+    // SAFETY: forwarded from this function's own safety doc - the
+    // pointer came from Box::into_raw and is taken over here.
+    let mfp = unsafe { Box::from_raw(buf.b_ml.ml_mfp) };
+    // SAFETY: forwarded from this function's own safety doc - the
+    // memfile was just taken out of the Box and is not aliased.
+    unsafe { crate::memfile::mf_close(*mfp, del_file) };
+    // The cached line, the block stack and the chunk sizes are all
+    // owned here (see the translation note above).
+    buf.b_ml.ml_line_ptr = None;
+    buf.b_ml.ml_stack = Vec::new();
+    buf.b_ml.ml_stack_size = 0;
+    buf.b_ml.ml_stack_top = 0;
+    buf.b_ml.ml_chunksize = Vec::new();
+    buf.b_ml.ml_usedchunks = 0;
+    buf.b_ml.ml_mfp = std::ptr::null_mut();
+
+    // Reset the "recovered" flag, give the ATTENTION prompt the next
+    // time this buffer is loaded.
+    buf.b_flags &= !(crate::buffer_defs::b_flags::BF_RECOVERED as i32);
+}
+
 /// Set the `DB_MARKED` flag for line `lnum` in the current buffer,
 /// registering it with the `:global` command's mark set
 /// (`ml_setmarked`).
@@ -4006,11 +4059,12 @@ mod tests {
         buf
     }
 
-    fn close_test_memline(buf: BufT) {
-        unsafe {
-            let mfp_owned = Box::from_raw(buf.b_ml.ml_mfp);
-            crate::memfile::mf_close(*mfp_owned, false);
-        }
+    fn close_test_memline(mut buf: BufT) {
+        // Exercises the real ml_close rather than tearing the memfile
+        // down by hand, so every memline test doubles as coverage for
+        // it.
+        unsafe { ml_close(&mut buf, false) };
+        assert!(buf.b_ml.ml_mfp.is_null());
     }
 
     #[test]
@@ -4632,6 +4686,99 @@ mod tests {
             assert_eq!((*buf_ptr).b_ml.ml_line_count, 4);
             prev
         }
+    }
+
+    #[test]
+    fn ml_close_releases_the_memfile_and_marks_the_buffer_unloaded() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            assert!(!buf.b_ml.ml_mfp.is_null());
+
+            ml_close(&mut buf, false);
+
+            assert!(buf.b_ml.ml_mfp.is_null(), "the memline must read as closed");
+            assert!(buf.b_ml.ml_line_ptr.is_none());
+            assert!(buf.b_ml.ml_stack.is_empty());
+            assert_eq!(buf.b_ml.ml_stack_size, 0);
+            assert_eq!(buf.b_ml.ml_stack_top, 0);
+            assert!(buf.b_ml.ml_chunksize.is_empty());
+            assert_eq!(buf.b_ml.ml_usedchunks, 0);
+        }
+    }
+
+    #[test]
+    fn ml_close_is_a_noop_on_a_buffer_that_was_never_opened() {
+        let mut buf = test_buf();
+        assert!(buf.b_ml.ml_mfp.is_null());
+        // Must not try to free a null memfile.
+        unsafe { ml_close(&mut buf, false) };
+        assert!(buf.b_ml.ml_mfp.is_null());
+        // And calling it twice on a closed memline is equally safe.
+        unsafe { ml_close(&mut buf, true) };
+        assert!(buf.b_ml.ml_mfp.is_null());
+    }
+
+    #[test]
+    fn ml_close_clears_the_recovered_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            buf.b_flags |= crate::buffer_defs::b_flags::BF_RECOVERED as i32;
+            // Other b_flags bits must survive untouched.
+            buf.b_flags |= crate::buffer_defs::b_flags::BF_NEW as i32;
+
+            ml_close(&mut buf, false);
+
+            assert_eq!(
+                buf.b_flags & crate::buffer_defs::b_flags::BF_RECOVERED as i32,
+                0,
+                "BF_RECOVERED must be reset so the ATTENTION prompt comes back"
+            );
+            assert_ne!(buf.b_flags & crate::buffer_defs::b_flags::BF_NEW as i32, 0);
+        }
+    }
+
+    #[test]
+    fn ml_close_drops_a_dirty_cached_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+
+            // Reading a line populates the ml_line_ptr cache, which
+            // ml_close has to release.
+            assert_eq!(ml_get_buf(&mut buf, 2), b"two");
+            assert!(buf.b_ml.ml_line_ptr.is_some());
+            assert_ne!(buf.b_ml.ml_line_lnum, 0);
+
+            GLOBALS.get_mut().curbuf = prev;
+            ml_close(&mut buf, false);
+            assert!(buf.b_ml.ml_line_ptr.is_none());
+        }
+    }
+
+    #[test]
+    fn ml_close_leaves_a_buffer_reopenable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        unsafe {
+            let prev = marked_fixture(&mut buf);
+            assert_eq!(buf.b_ml.ml_line_count, 4);
+            GLOBALS.get_mut().curbuf = prev;
+
+            ml_close(&mut buf, true);
+
+            // A closed memline is a blank slate: ml_open starts over
+            // with the single empty line it always creates.
+            assert_eq!(ml_open(&mut buf), OK);
+            assert!(!buf.b_ml.ml_mfp.is_null());
+            assert_eq!(buf.b_ml.ml_line_count, 1);
+            assert_eq!(buf.b_ml.ml_flags, ML_EMPTY);
+        }
+        close_test_memline(buf);
     }
 
     #[test]
