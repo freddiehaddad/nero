@@ -7,7 +7,11 @@
 //! translated yet. Translated: the read-only tag-stack introspection
 //! needed by the `gettagstack()` builtin (`get_tag_details`/
 //! [`get_tagstack`]), plus [`tag_strnicmp`] (a small, pure,
-//! case-insensitive comparator used for tag sorting).
+//! case-insensitive comparator used for tag sorting) and
+//! [`matching_line_len`] (walks a matching tag line's two consecutive
+//! NUL-terminated strings; clamped to the slice length so a buffer
+//! missing a terminator cannot report a length past its own end, which
+//! the original's raw pointer arithmetic would).
 //!
 //! `tag.c`'s own `tagstack_clear_entry` was already translated in an
 //! earlier session, hosted in `mark.rs` alongside its only real
@@ -102,6 +106,39 @@ pub unsafe fn get_tagstack(wp: &WinT, retdict: *mut crate::eval::typval_defs::Di
         // yet shared beyond `l`.
         get_tag_details(&wp.w_tagstack[i], unsafe { &mut *d });
     }
+}
+
+/// The length of a matching tag line (`matching_line_len`).
+///
+/// The buffer holds a leading flag byte followed by TWO consecutive
+/// NUL-terminated strings, so this walks past the first string's
+/// terminator and then adds the second string's own length. The
+/// result therefore covers both strings and the separator between
+/// them, but NOT the final terminator.
+///
+/// The original does this with pointer arithmetic over a real
+/// NUL-terminated buffer; here the terminators are located by
+/// searching, and the result is clamped to the slice length, so a
+/// buffer missing a terminator can never report a length past its own
+/// end.
+#[must_use]
+pub fn matching_line_len(lbuf: &[u8]) -> usize {
+    // Skip the leading flag byte.
+    let first = lbuf.get(1..).unwrap_or(&[]);
+    let first_len = first
+        .iter()
+        .position(|&c| c == crate::ascii_defs::NUL)
+        .unwrap_or(first.len());
+
+    // Past the first string and its terminator.
+    let second_start = 1 + first_len + 1;
+    let second = lbuf.get(second_start..).unwrap_or(&[]);
+    let second_len = second
+        .iter()
+        .position(|&c| c == crate::ascii_defs::NUL)
+        .unwrap_or(second.len());
+
+    (second_start + second_len).min(lbuf.len())
 }
 
 /// Compares `s1`/`s2` for `len` bytes, ignoring ASCII case (folding to
@@ -360,6 +397,37 @@ pub unsafe fn set_tagstack(wp: &mut WinT, d: *mut crate::eval::typval_defs::Dict
 mod tests {
     use super::*;
     use crate::eval::typval_defs::{DictitemT, TypvalT, TypvalValue};
+
+    #[test]
+    fn matching_line_len_spans_both_strings_and_the_separator() {
+        // A flag byte, then two NUL-terminated strings. The result
+        // covers both plus the separator, but not the final NUL.
+        let lbuf = b"\x01abc\0def\0";
+        assert_eq!(matching_line_len(lbuf), 8);
+    }
+
+    #[test]
+    fn matching_line_len_handles_an_empty_first_string() {
+        let lbuf = b"\x01\0def\0";
+        assert_eq!(matching_line_len(lbuf), 5);
+    }
+
+    #[test]
+    fn matching_line_len_handles_an_empty_second_string() {
+        let lbuf = b"\x01abc\0\0";
+        assert_eq!(matching_line_len(lbuf), 5);
+    }
+
+    #[test]
+    fn matching_line_len_clamps_when_a_terminator_is_missing() {
+        // The original walks a real NUL-terminated buffer, so a slice
+        // without one has no defined answer. Clamping to the slice
+        // length keeps the result from exceeding the input, which the
+        // raw pointer arithmetic would otherwise do.
+        assert_eq!(matching_line_len(b"\x01abc"), 4);
+        assert_eq!(matching_line_len(b"\x01"), 1);
+        assert_eq!(matching_line_len(b""), 0);
+    }
 
     fn dict_get<'a>(d: &'a crate::eval::typval_defs::DictT, key: &[u8]) -> Option<&'a TypvalT> {
         // SAFETY: `d.dv_index` only ever holds still-live `DictitemT`
