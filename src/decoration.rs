@@ -34,8 +34,11 @@
 //! highlight/conceal rendering, needing the marktree query machinery
 //! and decoration-provider Lua callbacks, neither translated.
 
+use crate::buffer::buf_meta_total;
+use crate::buffer_defs::BufT;
 use crate::buffer_defs::WinT;
 use crate::decoration_defs::VirtLines;
+use crate::types_defs::TriState;
 use crate::marktree_defs::MetaIndex;
 
 /// Called by draw, move and plines code to determine whether a line
@@ -112,10 +115,81 @@ pub unsafe fn win_lines_concealed(wp: &WinT) -> bool {
     (unsafe { crate::fold::has_any_folding(wp) }) || wp.w_onebuf_opt.wo_cole >= 2
 }
 
+/// Count the number of signs in a range after adding or removing a
+/// sign, or to (re-)initialize a range in `buf.b_signcols.count`
+/// (`buf_signcols_count_range`).
+///
+/// `add` is `1`, `-1` or `0` for an added, deleted or initialized
+/// range. `clear` is `False`, `True` or `None` for an added/deleted,
+/// cleared, or initialized range.
+///
+/// # Scope
+///
+/// The guard is translated in full and is always taken today, so this
+/// function is complete as written for every reachable call.
+///
+/// Its `!buf_meta_total(buf, MetaIndex::SignText)` operand is always
+/// true, because nothing translated can attach a sign-text extmark to
+/// any buffer yet - the same real "nothing has been registered"
+/// condition [`decor_virt_lines`] relies on just above. The
+/// `!buf.b_signcols.autom` operand is likewise true for every buffer
+/// this crate can build, and `||` short-circuits before either of the
+/// later operands is even evaluated.
+///
+/// The counting body behind that guard is `unimplemented!()`: it needs
+/// `marktree_itr_get_overlap`, `marktree_itr_step_overlap` and
+/// `marktree_itr_step_out_filter`, none of which are translated (the
+/// overlap-iterator variants deferred in `marktree.rs`). It is
+/// unreachable while no sign-text extmark can exist.
+pub fn buf_signcols_count_range(buf: &mut BufT, row1: i32, row2: i32, add: i32, clear: TriState) {
+    if !buf.b_signcols.autom || row2 < row1 || buf_meta_total(buf, MetaIndex::SignText) == 0 {
+        return;
+    }
+
+    let _ = (add, clear);
+    unimplemented!(
+        "sign counting needs marktree_itr_get_overlap/_step_overlap/_step_out_filter, \
+         not yet translated; unreachable while no sign-text extmark can exist"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, WinoptT};
+
+    /// The default buffer has `autom == false`, so the guard's very
+    /// first operand already ends the call - this is the shape every
+    /// currently-reachable call takes.
+    #[test]
+    fn signcols_count_range_returns_early_without_auto_signcolumn() {
+        let mut buf = BufT::default();
+        assert!(!buf.b_signcols.autom);
+        buf_signcols_count_range(&mut buf, 0, 5, 1, TriState::False);
+        assert_eq!(buf.b_signcols.max, 0);
+        assert_eq!(buf.b_signcols.count[0], 0);
+    }
+
+    /// With `autom` forced on, an inverted range still returns before
+    /// the marktree is consulted.
+    #[test]
+    fn signcols_count_range_returns_early_for_an_inverted_range() {
+        let mut buf = BufT::default();
+        buf.b_signcols.autom = true;
+        buf_signcols_count_range(&mut buf, 7, 3, 1, TriState::None);
+        assert_eq!(buf.b_signcols.max, 0);
+    }
+
+    /// The operand that stays true for real sessions until an extmark
+    /// API exists: a buffer with no sign-text mark at all.
+    #[test]
+    fn signcols_count_range_returns_early_without_any_sign_text_mark() {
+        let mut buf = BufT::default();
+        buf.b_signcols.autom = true;
+        assert_eq!(buf_meta_total(&buf, MetaIndex::SignText), 0);
+        buf_signcols_count_range(&mut buf, 0, 0, -1, TriState::True);
+        assert_eq!(buf.b_signcols.max, 0);
+    }
 
     fn win_with_cole(cole: crate::types_defs::OptInt, buf: *mut BufT) -> WinT {
         WinT { w_onebuf_opt: WinoptT { wo_cole: cole, ..Default::default() }, w_buffer: buf, ..Default::default() }
