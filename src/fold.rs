@@ -608,6 +608,46 @@ pub fn clone_fold_grow_array(from: &[FoldT]) -> Vec<FoldT> {
     from.to_vec()
 }
 
+/// Free a fold array and every fold nested beneath it
+/// (`deleteFoldRecurse`).
+///
+/// # Translation note
+/// The original is a single `GA_DEEP_CLEAR` whose per-item hook
+/// recurses into `fd_nested`: it exists purely because C has to walk
+/// the tree by hand to free each nested `garray_T` before freeing its
+/// parent. Clearing a `Vec<FoldT>` already drops every element, and
+/// each element's own `Vec<FoldT>` in turn, so the recursion is
+/// generated rather than hand-written - the same "Rust's ownership
+/// model already does the C free dance automatically" pattern this
+/// crate uses elsewhere (see `buffer_updates.rs`'s own
+/// `buf_free_callbacks` note).
+///
+/// The original's `buf_T *bp` parameter is unused by the free itself
+/// (it is threaded through only for the macro's signature), so it has
+/// no counterpart here.
+pub fn delete_fold_recurse(gap: &mut Vec<FoldT>) {
+    gap.clear();
+}
+
+/// Remove all folding for window `win` (`clearFolding`).
+pub fn clear_folding(win: &mut WinT) {
+    delete_fold_recurse(&mut win.w_folds);
+    win.w_foldinvalid = false;
+}
+
+/// Mark every fold in `gap` as maybe-small (`setSmallMaybe`).
+///
+/// [`crate::types_defs::TriState::None`] is the "not known yet, and
+/// this applies to nested folds too" state, so marking a fold is
+/// enough to invalidate the smallness of everything beneath it -
+/// which is why this only walks one level, exactly as the original
+/// does.
+pub fn set_small_maybe(gap: &mut [FoldT]) {
+    for fp in gap {
+        fp.fd_small = crate::types_defs::TriState::None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,5 +1341,63 @@ mod tests {
         // destination as ga_init left it, i.e. empty.
         let from: Vec<FoldT> = Vec::new();
         assert!(clone_fold_grow_array(&from).is_empty());
+    }
+
+    #[test]
+    fn delete_fold_recurse_empties_the_whole_tree() {
+        let mut gap = nested_fold_tree();
+        assert!(!gap.is_empty());
+        delete_fold_recurse(&mut gap);
+        assert!(gap.is_empty());
+        // Idempotent, like the original on an already-cleared array.
+        delete_fold_recurse(&mut gap);
+        assert!(gap.is_empty());
+    }
+
+    #[test]
+    fn clear_folding_removes_every_fold_and_revalidates_the_window() {
+        let mut win = WinT {
+            w_folds: nested_fold_tree(),
+            w_foldinvalid: true,
+            ..Default::default()
+        };
+        clear_folding(&mut win);
+        assert!(win.w_folds.is_empty());
+        assert!(!win.w_foldinvalid, "the fold state is valid once empty");
+    }
+
+    #[test]
+    fn clear_folding_on_a_window_with_no_folds_still_clears_foldinvalid() {
+        let mut win = WinT {
+            w_foldinvalid: true,
+            ..Default::default()
+        };
+        clear_folding(&mut win);
+        assert!(win.w_folds.is_empty());
+        assert!(!win.w_foldinvalid);
+    }
+
+    #[test]
+    fn set_small_maybe_resets_only_the_top_level() {
+        let mut gap = nested_fold_tree();
+        gap[0].fd_small = crate::types_defs::TriState::True;
+        gap[0].fd_nested[0].fd_small = crate::types_defs::TriState::False;
+
+        set_small_maybe(&mut gap);
+
+        assert_eq!(gap[0].fd_small, crate::types_defs::TriState::None);
+        // kNone already means "applies to nested folds too", so the
+        // original deliberately does not walk into them.
+        assert_eq!(
+            gap[0].fd_nested[0].fd_small,
+            crate::types_defs::TriState::False
+        );
+    }
+
+    #[test]
+    fn set_small_maybe_on_an_empty_array_is_a_noop() {
+        let mut gap: Vec<FoldT> = Vec::new();
+        set_small_maybe(&mut gap);
+        assert!(gap.is_empty());
     }
 }
