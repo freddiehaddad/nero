@@ -25,12 +25,12 @@
 //! crate (e.g. `stl_clear_click_defs`).
 //!
 //! Deferred: everything else in the file - `buf_updates_register`/
-//! `_unregister`/`_send_end`/`_send_changes`/
-//! `_changedtick(_single)`/`_unload` all need the channel/Lua
-//! callback-dispatch machinery above. [`buf_updates_send_splice`] is
-//! translated only as far as its own guard reaches: both halves of
-//! that guard are real, and the dispatch loop behind them is
-//! `unimplemented!()` since nothing can subscribe yet.
+//! `_send_end`/`_changedtick(_single)`/`_unload` all need the
+//! channel/Lua callback-dispatch machinery above.
+//! [`buf_updates_send_splice`] and [`buf_updates_unregister`] are
+//! translated only as far as their own guards reach: those guards are
+//! real, and the dispatch behind them is `unimplemented!()` since
+//! nothing can subscribe yet.
 
 use crate::buffer_defs::BufT;
 
@@ -39,6 +39,47 @@ use crate::buffer_defs::BufT;
 #[must_use]
 pub fn buf_updates_active(buf: &BufT) -> bool {
     !buf.update_channels.is_empty() || !buf.update_callbacks.is_empty()
+}
+
+/// Remove `channelid` from `buf`'s live-update subscribers
+/// (`buf_updates_unregister`).
+///
+/// Every occurrence is removed, though a channel should never appear
+/// more than once. When nothing was removed the buffer is left
+/// untouched and no notification is sent.
+///
+/// # Translation note
+/// The original compacts the kvec in place, shrinks `size` by the
+/// number found, and separately `kv_destroy`/`kv_init`s when the last
+/// subscriber goes - all of which is `Vec::retain` here, since a
+/// `Vec` that has been emptied is already in exactly the state a
+/// fresh `kv_init` leaves behind.
+///
+/// # Deferred boundary
+/// Telling the removed channel the stream has ended
+/// (`buf_updates_send_end`) needs the msgpack-RPC channel layer
+/// (`rpc_send_event`), which is not translated - see this module's
+/// own doc comment. The guard around it is real and faithful: it
+/// fires only when a channel was actually removed, which cannot
+/// happen today because nothing translated can register one, so
+/// `update_channels` is always empty and the early return above
+/// always wins.
+pub fn buf_updates_unregister(buf: &mut BufT, channelid: u64) {
+    if buf.update_channels.is_empty() {
+        return;
+    }
+
+    let before = buf.update_channels.len();
+    buf.update_channels.retain(|&id| id != channelid);
+    let found = before - buf.update_channels.len();
+
+    if found != 0 {
+        unimplemented!(
+            "buf_updates_unregister: buf_updates_send_end needs the \
+             msgpack-RPC channel layer (rpc_send_event), not translated - \
+             unreachable while nothing can register a channel"
+        );
+    }
 }
 
 /// Notify live update subscribers that lines changed
@@ -148,6 +189,47 @@ mod tests {
         let mut buf = BufT::default();
         buf.update_callbacks.push(BufUpdateCallbacks::default());
         buf_updates_send_splice(&buf, 0, 0, 0, 0, 1, 1, 0, 2, 2);
+    }
+
+    #[test]
+    fn unregister_on_a_buffer_with_no_channels_is_a_noop() {
+        let mut buf = BufT::default();
+        // The early return is what keeps the deferred send_end path
+        // unreachable, so it is worth asserting directly.
+        buf_updates_unregister(&mut buf, 7);
+        assert!(buf.update_channels.is_empty());
+
+        // A buffer with only Lua callbacks still has no channels, so
+        // it takes the same early return.
+        buf.update_callbacks.push(BufUpdateCallbacks::default());
+        buf_updates_unregister(&mut buf, 7);
+        assert!(buf.update_channels.is_empty());
+        assert_eq!(buf.update_callbacks.len(), 1, "callbacks are untouched");
+    }
+
+    #[test]
+    fn unregister_of_an_absent_channel_leaves_the_list_alone() {
+        let mut buf = BufT {
+            update_channels: vec![1, 2, 3],
+            ..Default::default()
+        };
+        // Nothing found means nothing removed and, crucially, no
+        // notification - so this must not hit the deferred boundary.
+        buf_updates_unregister(&mut buf, 99);
+        assert_eq!(buf.update_channels, vec![1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not translated")]
+    fn unregister_of_a_present_channel_is_unimplemented() {
+        // Documents the boundary: telling the removed channel the
+        // stream ended needs the RPC layer. Only reachable once a
+        // channel can actually be registered.
+        let mut buf = BufT {
+            update_channels: vec![1, 2, 3],
+            ..Default::default()
+        };
+        buf_updates_unregister(&mut buf, 2);
     }
 
     #[test]
