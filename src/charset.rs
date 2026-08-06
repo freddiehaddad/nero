@@ -1297,6 +1297,83 @@ fn nr2hex(n: u32) -> u8 {
     }
 }
 
+/// Translate a string into `buf`, replacing unprintable characters
+/// with a printable representation (`transstr_buf`).
+///
+/// `slen` limits how much of `s` is read; `None` means "until the
+/// NUL", matching the original's negative sentinel. `buflen` is the
+/// capacity of `buf` including room for the terminating NUL.
+///
+/// Returns the length of the resulting string, without that NUL.
+///
+/// # Safety
+/// Same as [`transstr_len`].
+pub unsafe fn transstr_buf(
+    s: &[u8],
+    slen: Option<usize>,
+    buf: &mut [u8],
+    buflen: usize,
+    untab: bool,
+) -> usize {
+    let mut p = 0usize;
+    let mut out = 0usize;
+    // `buf_e` in the original: one before the end, leaving room for
+    // the terminating NUL.
+    let buf_e = buflen.saturating_sub(1).min(buf.len().saturating_sub(1));
+    let at = |i: usize| s.get(i).copied().unwrap_or(0);
+
+    let mut push = |out: &mut usize, bytes: &[u8]| {
+        buf[*out..*out + bytes.len()].copy_from_slice(bytes);
+        *out += bytes.len();
+    };
+
+    while slen.is_none_or(|n| p < n) && at(p) != 0 && out < buf_e {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) } as usize;
+        if l > 1 {
+            if out + l > buf_e {
+                break; // Exceeded `buf` size.
+            }
+
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { vim_isprintc(crate::mbyte::utf_ptr2char(&s[p..])) } {
+                push(&mut out, &s[p..p + l]);
+            } else {
+                let mut off = 0usize;
+                while off < l {
+                    let c = crate::mbyte::utf_ptr2char(&s[p + off..]);
+                    let hex = transchar_hex(c);
+                    // `transchar_hex` owns its trailing NUL here.
+                    let hexlen = hex.len() - 1;
+                    if out + hexlen > buf_e {
+                        break;
+                    }
+                    push(&mut out, &hex[..hexlen]);
+                    off += crate::mbyte::utf_ptr2len(&s[p + off..]) as usize;
+                }
+            }
+            p += l;
+        } else if at(p) == crate::ascii_defs::TAB && !untab {
+            push(&mut out, &[at(p)]);
+            p += 1;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let tb = unsafe { transchar_byte(i32::from(at(p))) };
+            p += 1;
+            let tb_len = tb.iter().position(|&b| b == 0).unwrap_or(tb.len());
+            if out + tb_len > buf_e {
+                break; // Exceeded `buf` size.
+            }
+            push(&mut out, &tb[..tb_len]);
+        }
+    }
+    if let Some(slot) = buf.get_mut(out) {
+        *slot = 0;
+    }
+    debug_assert!(out <= buf_e);
+    out
+}
+
 /// Compute the length of the string that `transstr_buf` would
 /// produce for `s` (`transstr_len`).
 ///
@@ -2406,6 +2483,96 @@ mod tests {
         assert_eq!(unsafe { char2cells(0x4e00) }, unsafe {
             crate::mbyte::utf_char2cells(0x4e00)
         });
+    }
+
+    #[test]
+    fn transstr_buf_writes_plain_ascii_unchanged() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf(b"abc\0", None, &mut buf, 32, true) };
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..n], b"abc");
+        assert_eq!(buf[n], 0, "NUL terminated");
+    }
+
+    #[test]
+    fn transstr_buf_escapes_control_characters() {
+        // Cross-verified against real nvim: strtrans("\x01") is "^A"
+        // and strtrans("\x7f") is "^?".
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf(b"\x01\0", None, &mut buf, 32, true) };
+        assert_eq!(&buf[..n], b"^A");
+        let n = unsafe { transstr_buf(b"\x7f\0", None, &mut buf, 32, true) };
+        assert_eq!(&buf[..n], b"^?");
+    }
+
+    #[test]
+    fn transstr_buf_untab_controls_tab_translation() {
+        // Cross-verified against real nvim: strtrans("a\tb") is "a^Ib"
+        // (strlen 4), the untab == true case. With untab == false the
+        // TAB is written through as itself.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf(b"a\tb\0", None, &mut buf, 32, true) };
+        assert_eq!(&buf[..n], b"a^Ib");
+        let n = unsafe { transstr_buf(b"a\tb\0", None, &mut buf, 32, false) };
+        assert_eq!(&buf[..n], b"a\tb");
+    }
+
+    #[test]
+    fn transstr_buf_keeps_a_printable_multibyte_character() {
+        // Cross-verified against real nvim: strtrans("é") stays 2
+        // bytes, since the character is printable.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf("é\0".as_bytes(), None, &mut buf, 32, true) };
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..n], "é".as_bytes());
+    }
+
+    #[test]
+    fn transstr_buf_respects_slen() {
+        // `slen` limits how much of the source is read, independently
+        // of where its NUL is.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf(b"abcdef\0", Some(3), &mut buf, 32, true) };
+        assert_eq!(&buf[..n], b"abc");
+    }
+
+    #[test]
+    fn transstr_buf_stops_at_the_buffer_capacity() {
+        // The output is truncated rather than overrunning, and is
+        // still NUL terminated within the stated capacity.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 32];
+        let n = unsafe { transstr_buf(b"abcdef\0", None, &mut buf, 4, true) };
+        assert_eq!(n, 3, "3 bytes plus room for the NUL");
+        assert_eq!(&buf[..n], b"abc");
+        assert_eq!(buf[n], 0);
+    }
+
+    #[test]
+    fn transstr_buf_agrees_with_transstr_len() {
+        // The two halves of the family must stay in step: what
+        // transstr_len predicts is what transstr_buf writes.
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut buf = [0u8; 64];
+        for case in [&b"abc\0"[..], b"a\tb\0", b"\x01\x7f\0", "é\0".as_bytes()] {
+            for untab in [true, false] {
+                let predicted = unsafe { transstr_len(case, untab) };
+                let written = unsafe { transstr_buf(case, None, &mut buf, 64, untab) };
+                assert_eq!(predicted, written, "case {case:?} untab={untab}");
+            }
+        }
     }
 
     #[test]
