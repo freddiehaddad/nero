@@ -6,7 +6,9 @@
 //! file holds the editing-side glue that keeps them correct across
 //! splices, and records enough information to undo those adjustments.
 //!
-//! Translated so far: [`extmark_splice_delete`].
+//! Translated so far: [`extmark_splice_delete`],
+//! [`extmark_splice_impl`], [`extmark_splice`],
+//! [`extmark_splice_cols`].
 //!
 //! Deferred, each for a specific reason:
 //!
@@ -22,13 +24,17 @@
 //! the `extmark_set`/`extmark_del` family above.
 
 use crate::buffer_defs::BufT;
-use crate::extmark_defs::{ExtmarkOp, ExtmarkSavePos, ExtmarkUndoObject, ExtmarkUndoVecT};
+use crate::decoration::buf_signcols_count_range;
+use crate::extmark_defs::{
+    BcountT, ExtmarkOp, ExtmarkSavePos, ExtmarkSplice, ExtmarkUndoObject, ExtmarkUndoVecT,
+};
 use crate::marktree::{
-    marktree_get_altpos, marktree_itr_current, marktree_itr_get, marktree_itr_next, mt_end,
-    mt_invalid, mt_invalidate, mt_lookup_key, mt_no_undo, mt_paired, mt_right,
+    marktree_get_altpos, marktree_itr_current, marktree_itr_get, marktree_itr_next, marktree_splice,
+    mt_end, mt_invalid, mt_invalidate, mt_lookup_key, mt_no_undo, mt_paired, mt_right,
 };
 use crate::marktree_defs::MarkTreeIter;
 use crate::pos_defs::ColnrT;
+use crate::types_defs::TriState;
 
 /// Invalidate extmarks between a range and copy them to the undo
 /// header (`extmark_splice_delete`).
@@ -124,9 +130,412 @@ pub unsafe fn extmark_splice_delete(
     }
 }
 
+/// Adjust extmarks for a text edit, given the edit's absolute byte
+/// offset (`extmark_splice_impl`).
+///
+/// The edit replaces the `old_row`/`old_col`-sized extent starting at
+/// `start_row`/`start_col` with a `new_row`/`new_col`-sized one.
+/// `undo` selects whether the adjustment is recorded so it can be
+/// reversed later.
+///
+/// # Scope
+///
+/// Translated in full: the buffer-update notification, the
+/// copy-and-invalidate pass over deleted marks, the sign-count
+/// bracketing around the marktree splice, the splice itself, and the
+/// undo bookkeeping including the original's small same-line
+/// insert/delete merge optimisation.
+///
+/// # Safety
+///
+/// `buf` must be a well-formed buffer with a valid marktree and undo
+/// state, as maintained by `marktree.rs` and `undo.rs`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn extmark_splice_impl(
+    buf: &mut BufT,
+    start_row: i32,
+    start_col: ColnrT,
+    start_byte: BcountT,
+    old_row: i32,
+    old_col: ColnrT,
+    old_byte: BcountT,
+    new_row: i32,
+    new_col: ColnrT,
+    new_byte: BcountT,
+    undo: ExtmarkOp,
+) {
+    buf.deleted_bytes2 = 0;
+    crate::buffer_updates::buf_updates_send_splice(
+        buf, start_row, start_col, start_byte, old_row, old_col, old_byte, new_row, new_col,
+        new_byte,
+    );
+
+    if old_row > 0 || old_col > 0 {
+        // Copy and invalidate marks that would be affected by the delete.
+        let end_row = start_row + old_row;
+        let end_col = if old_row != 0 { 0 } else { start_col } + old_col;
+        // SAFETY: forwarded from this function's own safety doc.
+        let uhp = unsafe { crate::undo::u_force_get_undo_header(buf) };
+        // SAFETY: `uhp` is either null or a live header allocated by
+        // `u_force_get_undo_header`, living in its own allocation
+        // rather than inside `buf`.
+        let uvp: Option<&mut ExtmarkUndoVecT> = if uhp.is_null() {
+            None
+        } else {
+            Some(unsafe { &mut (*uhp).uh_extmark })
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            extmark_splice_delete(buf, start_row, start_col, end_row, end_col, uvp, false, undo);
+        }
+    }
+
+    // Remove signs inside the edited region from `b_signcols.count`,
+    // and add them back after splicing.
+    if old_row > 0 || new_row > 0 {
+        let count = if buf.b_prev_line_count > 0 {
+            buf.b_prev_line_count
+        } else {
+            buf.b_ml.ml_line_count
+        };
+        buf_signcols_count_range(
+            buf,
+            start_row,
+            (count - 1).min(start_row + old_row),
+            0,
+            TriState::True,
+        );
+        buf.b_prev_line_count = 0;
+    }
+
+    marktree_splice(
+        &mut buf.b_marktree,
+        start_row,
+        start_col,
+        old_row,
+        old_col,
+        new_row,
+        new_col,
+    );
+
+    if old_row > 0 || new_row > 0 {
+        let row2 = (buf.b_ml.ml_line_count - 1).min(start_row + new_row);
+        buf_signcols_count_range(buf, start_row, row2, 0, TriState::None);
+    }
+
+    if undo == ExtmarkOp::Undo {
+        // SAFETY: forwarded from this function's own safety doc.
+        let uhp = unsafe { crate::undo::u_force_get_undo_header(buf) };
+        if uhp.is_null() {
+            return;
+        }
+
+        // Merge small (within-line) inserts with each other, and
+        // small deletes with each other. This mirrors the original's
+        // own deliberately rudimentary merge.
+        let mut merged = false;
+        // SAFETY: as above - `uhp` is a live, separately-allocated
+        // header.
+        let uh_extmark = unsafe { &mut (*uhp).uh_extmark };
+        if old_row == 0
+            && new_row == 0
+            && !uh_extmark.is_empty()
+            && let Some(splice) = uh_extmark.last_mut().and_then(ExtmarkUndoObject::as_splice_mut)
+            && splice.start_row == start_row
+            && splice.old_row == 0
+            && splice.new_row == 0
+        {
+            if old_col == 0
+                && start_col >= splice.start_col
+                && start_col <= splice.start_col + splice.new_col
+            {
+                splice.new_col += new_col;
+                splice.new_byte += new_byte;
+                merged = true;
+            } else if new_col == 0 && start_col == splice.start_col + splice.new_col {
+                splice.old_col += old_col;
+                splice.old_byte += old_byte;
+                merged = true;
+            } else if new_col == 0 && start_col + old_col == splice.start_col {
+                splice.start_col = start_col;
+                splice.start_byte = start_byte;
+                splice.old_col += old_col;
+                splice.old_byte += old_byte;
+                merged = true;
+            }
+        }
+
+        if !merged {
+            uh_extmark.push(ExtmarkUndoObject::Splice(ExtmarkSplice {
+                start_row,
+                start_col,
+                start_byte,
+                old_row,
+                old_col,
+                old_byte,
+                new_row,
+                new_col,
+                new_byte,
+            }));
+        }
+    }
+}
+
+/// Adjust extmarks for a text edit, computing the edit's absolute
+/// byte offset from the buffer itself (`extmark_splice`).
+///
+/// # Safety
+///
+/// Same as [`extmark_splice_impl`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn extmark_splice(
+    buf: &mut BufT,
+    start_row: i32,
+    start_col: ColnrT,
+    old_row: i32,
+    old_col: ColnrT,
+    old_byte: BcountT,
+    new_row: i32,
+    new_col: ColnrT,
+    new_byte: BcountT,
+    undo: ExtmarkOp,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut offset = unsafe { crate::memline::ml_find_line_or_offset(buf, start_row + 1, None, true) };
+
+    // On an empty buffer, editing the first line leaves that line
+    // buffered, so the offset comes back negative. The buffer is not
+    // really empty - the buffered line simply has not been flushed
+    // (and should not be) yet - so this call is valid, just an edge
+    // case.
+    if offset < 0 && buf.b_ml.ml_chunksize.is_empty() {
+        offset = 0;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        extmark_splice_impl(
+            buf,
+            start_row,
+            start_col,
+            offset as BcountT + start_col as BcountT,
+            old_row,
+            old_col,
+            old_byte,
+            new_row,
+            new_col,
+            new_byte,
+            undo,
+        );
+    }
+}
+
+/// Adjust extmarks for an edit confined to a single line
+/// (`extmark_splice_cols`).
+///
+/// # Safety
+///
+/// Same as [`extmark_splice_impl`].
+pub unsafe fn extmark_splice_cols(
+    buf: &mut BufT,
+    start_row: i32,
+    start_col: ColnrT,
+    old_col: ColnrT,
+    new_col: ColnrT,
+    undo: ExtmarkOp,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        extmark_splice(
+            buf,
+            start_row,
+            start_col,
+            0,
+            old_col,
+            old_col as BcountT,
+            0,
+            new_col,
+            new_col as BcountT,
+            undo,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::undo_defs::UHeader;
+
+    fn new_header() -> *mut UHeader {
+        Box::into_raw(Box::new(UHeader::default()))
+    }
+
+    /// Build a buffer whose undo header already exists, so
+    /// `u_force_get_undo_header` hands back a real one.
+    fn buf_with_header(uhp: *mut UHeader) -> BufT {
+        BufT {
+            b_u_curhead: uhp,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn splice_impl_records_an_undo_splice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = buf_with_header(uhp);
+
+        unsafe {
+            extmark_splice_impl(&mut buf, 3, 5, 40, 0, 0, 0, 0, 4, 4, ExtmarkOp::Undo);
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.start_row, 3);
+                assert_eq!(s.start_col, 5);
+                assert_eq!(s.start_byte, 40);
+                assert_eq!(s.new_col, 4);
+                assert_eq!(s.new_byte, 4);
+                assert_eq!(s.old_col, 0);
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+        assert_eq!(buf.deleted_bytes2, 0);
+
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    #[test]
+    fn splice_impl_records_nothing_for_a_no_undo_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = buf_with_header(uhp);
+
+        unsafe {
+            extmark_splice_impl(&mut buf, 0, 0, 0, 0, 0, 0, 0, 3, 3, ExtmarkOp::NoUndo);
+        }
+
+        assert!(unsafe { &(*uhp).uh_extmark }.is_empty());
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    /// Two consecutive same-line inserts collapse into one record,
+    /// growing the existing entry rather than appending a new one.
+    #[test]
+    fn splice_impl_merges_a_following_same_line_insert() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = buf_with_header(uhp);
+
+        unsafe {
+            extmark_splice_impl(&mut buf, 1, 2, 10, 0, 0, 0, 0, 3, 3, ExtmarkOp::Undo);
+            // Typing directly after the first insert.
+            extmark_splice_impl(&mut buf, 1, 5, 13, 0, 0, 0, 0, 2, 2, ExtmarkOp::Undo);
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1, "the second insert should have merged");
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.start_col, 2);
+                assert_eq!(s.new_col, 5);
+                assert_eq!(s.new_byte, 5);
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    /// A delete immediately after the merged insert extends the same
+    /// record's `old_col`/`old_byte` instead of appending.
+    #[test]
+    fn splice_impl_merges_a_following_same_line_delete() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = buf_with_header(uhp);
+
+        unsafe {
+            extmark_splice_impl(&mut buf, 0, 4, 4, 0, 0, 0, 0, 3, 3, ExtmarkOp::Undo);
+            // Deleting at exactly the end of the inserted text.
+            extmark_splice_impl(&mut buf, 0, 7, 7, 0, 2, 2, 0, 0, 0, ExtmarkOp::Undo);
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1, "the delete should have merged");
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.old_col, 2);
+                assert_eq!(s.old_byte, 2);
+                assert_eq!(s.new_col, 3);
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    /// A different row cannot merge, so a second record is appended.
+    #[test]
+    fn splice_impl_does_not_merge_across_rows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = buf_with_header(uhp);
+
+        unsafe {
+            extmark_splice_impl(&mut buf, 0, 0, 0, 0, 0, 0, 0, 2, 2, ExtmarkOp::Undo);
+            extmark_splice_impl(&mut buf, 4, 0, 30, 0, 0, 0, 0, 2, 2, ExtmarkOp::Undo);
+        }
+
+        assert_eq!(unsafe { &(*uhp).uh_extmark }.len(), 2);
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    /// `extmark_splice` derives the byte offset itself. With no
+    /// memline flushed yet the lookup reports a negative offset, and
+    /// the documented empty-chunk-cache edge case clamps it to 0.
+    #[test]
+    fn splice_cols_delegates_with_zero_row_extents() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = Box::new(buf_with_header(uhp));
+        // Derive the pointer exactly once and reuse it, so the
+        // reference the callee builds and the one stored in `GLOBALS`
+        // share a single provenance.
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        // `ml_find_line_or_offset` flushes through the global
+        // `curbuf`, so it must point somewhere real.
+        let saved = {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let saved = g.curbuf;
+            g.curbuf = buf_ptr;
+            saved
+        };
+
+        unsafe {
+            extmark_splice_cols(&mut *buf_ptr, 0, 6, 0, 3, ExtmarkOp::Undo);
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.old_row, 0);
+                assert_eq!(s.new_row, 0);
+                assert_eq!(s.start_col, 6);
+                assert_eq!(s.start_byte, 6, "offset clamped to 0, plus start_col");
+                assert_eq!(s.new_col, 3);
+                assert_eq!(s.new_byte, 3, "byte count mirrors the column count");
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = saved;
+        drop(unsafe { Box::from_raw(uhp) });
+    }
 
     /// An empty marktree makes `marktree_itr_get` leave the iterator
     /// pointing at nothing, so the very first `pos.row < 0` check
