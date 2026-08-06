@@ -123,6 +123,17 @@ static AUTOCMDS: LazyLock<GlobalCell<[AutoCmdVec; NUM_EVENTS]>> =
 /// crate's first real reader of this global) tractable today.
 pub static AUTOCMD_BUSY: GlobalCell<bool> = GlobalCell::new(false);
 
+/// The window the last `CursorMoved` event was reported for
+/// (`last_cursormoved_win`).
+pub static LAST_CURSORMOVED_WIN: GlobalCell<*mut crate::buffer_defs::WinT> =
+    GlobalCell::new(std::ptr::null_mut());
+
+/// The cursor position the last `CursorMoved` event was reported for
+/// (`last_cursormoved`). Only meaningful while
+/// [`LAST_CURSORMOVED_WIN`] equals `curwin`.
+pub static LAST_CURSORMOVED: GlobalCell<crate::pos_defs::PosT> =
+    GlobalCell::new(crate::pos_defs::PosT { lnum: 0, col: 0, coladd: 0 });
+
 /// `au_need_clean` - whether [`au_cleanup`] has real work to do.
 /// Starts `false`; only ever set by code inside [`aubuflocal_remove`]'s
 /// own (always zero-iteration today) loop, so stays `false` forever

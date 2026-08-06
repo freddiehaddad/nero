@@ -231,6 +231,23 @@ pub fn clear_fmark(fm: &mut FmarkT, timestamp: Timestamp) {
     };
 }
 
+/// Set `fmark_T` item to the given position, discarding whatever it
+/// held before (`SET_FMARK`/`RESET_FMARK` from `mark.h`).
+///
+/// The original's two macros differ only in that `RESET_FMARK` first
+/// calls `free_fmark` on the old value; here the assignment drops the
+/// previous `additional_data` on its own, so a single function covers
+/// both. Does not trigger a `"MarkSet"` event.
+pub fn reset_fmark(fm: &mut FmarkT, mark: PosT, fnum: i32, view: FmarkvT) {
+    *fm = FmarkT {
+        mark,
+        fnum,
+        timestamp: os_time(),
+        view,
+        additional_data: None,
+    };
+}
+
 /// Set a global (file) mark (`mark_set_global`). Returns `false` when
 /// `name` isn't a valid global-mark name, or when `update` is set and
 /// `fm`'s own timestamp isn't newer than the existing mark's.

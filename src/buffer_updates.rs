@@ -41,6 +41,41 @@ pub fn buf_updates_active(buf: &BufT) -> bool {
     !buf.update_channels.is_empty() || !buf.update_callbacks.is_empty()
 }
 
+/// Notify live update subscribers that lines changed
+/// (`buf_updates_send_changes`).
+///
+/// # Scope
+///
+/// The `ml_flush_deleted_bytes` call happens BEFORE the subscriber
+/// check in the original, so it is a real, unconditional side effect
+/// and is translated as such: the deleted-byte counters are reset on
+/// every call regardless of whether anything is listening.
+///
+/// The notification itself is `unimplemented!()`. Its guard,
+/// [`buf_updates_active`], is genuinely always `false` today because
+/// nothing translated can register an RPC channel or Lua callback
+/// yet, which is the same real, always-taken early return
+/// [`buf_updates_send_splice`] relies on.
+pub fn buf_updates_send_changes(
+    buf: &mut BufT,
+    firstline: crate::pos_defs::LinenrT,
+    num_added: i64,
+    num_removed: i64,
+) {
+    // Unconditional in the original, ahead of the subscriber check.
+    let _deleted = crate::memline::ml_flush_deleted_bytes(buf);
+
+    if !buf_updates_active(buf) {
+        return;
+    }
+
+    let _ = (firstline, num_added, num_removed);
+    unimplemented!(
+        "buffer-update dispatch needs the channel/Lua callback machinery, not yet \
+         translated; unreachable while nothing can subscribe"
+    );
+}
+
 /// Notify live update subscribers of a byte-level splice
 /// (`buf_updates_send_splice`).
 ///

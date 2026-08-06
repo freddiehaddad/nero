@@ -56,6 +56,10 @@ pub const UPD_CLEAR: i32 = 50;
 /// `w_redr_type` or `must_redraw` to be set (`redraw_not_allowed`).
 pub static REDRAW_NOT_ALLOWED: GlobalCell<bool> = GlobalCell::new(false);
 
+/// The line the `'hlsearch'` highlight currently reports the cursor
+/// on (`search_hl_has_cursor_lnum`).
+pub static SEARCH_HL_HAS_CURSOR_LNUM: GlobalCell<LinenrT> = GlobalCell::new(0);
+
 /// Return the required width for the `'number'`/`'relativenumber'`
 /// column in `wp`, caching the result until the relevant line count
 /// changes (`number_width`).

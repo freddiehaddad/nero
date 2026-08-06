@@ -218,6 +218,389 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Changed bytes within a single line of the current buffer
+/// (`changed_bytes`).
+///
+/// Marks the windows on this buffer to be redisplayed, marks the
+/// buffer changed via [`changed`], and invalidates cached values.
+/// Careful: may trigger autocommands that reload the buffer.
+///
+/// # Safety
+/// Same as `changed_common`.
+pub unsafe fn changed_bytes(lnum: LinenrT, col: ColnrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curbuf = g.curbuf;
+    let curwin = g.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines_redraw_buf(curbuf, lnum, lnum + 1, 0) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_common(curbuf, lnum, col, lnum + 1, 0) };
+
+    // When text has been changed at the end of the line, possibly the
+    // start of the next line may have SpellCap that should be removed,
+    // or it needs to be displayed. Schedule the next line for
+    // redrawing just in case. Don't do this when displaying '$' at the
+    // end of changed text.
+    // SAFETY: forwarded from this function's own safety doc.
+    let spell = unsafe { crate::spell::spell_check_window(&*curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*curbuf }.b_ml.ml_line_count;
+    if spell && lnum < line_count {
+        // SAFETY: reading `'cpoptions'`, matching this crate's
+        // established `GlobalCell::get_mut` convention.
+        let cpo = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo.clone();
+        let has_dollar = cpo.as_deref().is_some_and(|c| {
+            vim_strchr(c, i32::from(crate::option_vars::CPO_DOLLAR)).is_some()
+        });
+        if !has_dollar {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::drawscreen::redraw_win_line(curwin, lnum + 1) };
+        }
+    }
+
+    // Notify any channels that are watching.
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::buffer_updates::buf_updates_send_changes(unsafe { &mut *curbuf }, lnum, 1, 1);
+
+    // Diff highlighting in other diff windows may need updating too.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*curwin }.w_onebuf_opt.wo_diff == 0 {
+        return;
+    }
+    let mut wp = g.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        let next = w.w_next;
+        if w.w_onebuf_opt.wo_diff != 0 && wp != curwin {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_VALID) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let wlnum = unsafe { crate::diff::diff_lnum_win(lnum, wp) };
+            if wlnum > 0 {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { changed_lines_redraw_buf(w.w_buffer, wlnum, wlnum + 1, 0) };
+            }
+        }
+        wp = next;
+    }
+}
+
+/// Common code for when a change was made (`changed_common`).
+///
+/// See `changed_lines()` for the arguments. Careful: may trigger
+/// autocommands that reload the buffer.
+///
+/// # Scope
+///
+/// Translated in full. Every dependency is real: `diff_internal`,
+/// `diff_update_line`, `mark_view_make`, `comp_textwidth`,
+/// `check_visual_pos`, `linetabsize_eol`, `sms_marker_overlap`,
+/// `fold_update`, `has_folding_win`, `has_any_folding`, `set_topline`,
+/// `redraw_later`, `set_must_redraw` and
+/// [`changed_lines_invalidate_win`].
+///
+/// The original's `FOR_ALL_WINDOWS_IN_TAB`/`FOR_ALL_TAB_WINDOWS`
+/// macros both walk `GLOBALS.firstwin`/`w_next` here, matching the
+/// precedent already set by `drawscreen.rs`'s own
+/// `redraw_buf_status_later`.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT`, and
+/// `GLOBALS.firstwin`'s own `w_next` chain, `GLOBALS.curwin` and
+/// `GLOBALS.curtab` must all be valid.
+unsafe fn changed_common(
+    buf: *mut BufT,
+    lnum: LinenrT,
+    col: ColnrT,
+    lnume: LinenrT,
+    xtra: LinenrT,
+) {
+    // Mark the buffer as modified.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed(buf) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    let curtab = g.curtab;
+    let firstwin = g.firstwin;
+
+    let mut wp = firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        let next = w.w_next;
+        if w.w_buffer == buf && w.w_onebuf_opt.wo_diff != 0 && crate::diff::diff_internal() {
+            // SAFETY: forwarded from this function's own safety doc.
+            // (`tp_diff_update` is an `int` in the original, so this
+            // assigns 1 rather than a `bool`.)
+            unsafe { &mut *curtab }.tp_diff_update = 1;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::diff::diff_update_line(lnum) };
+        }
+        wp = next;
+    }
+
+    // Set the '. mark.
+    if g.cmdmod.cmod_flags & crate::ex_cmds_defs::cmod::KEEPJUMPS == 0 {
+        // Set the mark view only if lnum is visible, since changes
+        // might be made outside of the current window's view.
+        let mut view = crate::mark_defs::FmarkvT::default();
+        // SAFETY: forwarded from this function's own safety doc.
+        let cur = unsafe { &*curwin };
+        if cur.w_buffer == buf && lnum >= cur.w_topline && lnum <= cur.w_botline {
+            view = crate::mark::mark_view_make(cur, cur.w_cursor);
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let b = unsafe { &mut *buf };
+        let handle = b.handle;
+        crate::mark::reset_fmark(
+            &mut b.b_last_change,
+            crate::pos_defs::PosT { lnum, col, coladd: 0 },
+            handle,
+            view,
+        );
+
+        // Create a new entry if a new undo-able change was started, or
+        // if we don't have an entry yet.
+        if b.b_new_change || b.b_changelistlen == 0 {
+            let add = if b.b_changelistlen == 0 {
+                true
+            } else {
+                // Don't create a new entry when the line number is the
+                // same as the last one and the column is not too far
+                // away. Avoids creating many entries for typing
+                // "xxxxx".
+                let p = b.b_changelist[(b.b_changelistlen - 1) as usize].mark;
+                if p.lnum != lnum {
+                    true
+                } else {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let mut cols = unsafe { crate::textformat::comp_textwidth(false) };
+                    if cols == 0 {
+                        cols = 79;
+                    }
+                    p.col + cols < col || col + cols < p.col
+                }
+            };
+            if add {
+                // This is the first of a new sequence of undo-able
+                // changes and it's at some distance from the last
+                // change, so use a new position in the changelist.
+                b.b_new_change = false;
+
+                if b.b_changelistlen == crate::mark_defs::JUMPLISTSIZE {
+                    // Changelist is full: remove the oldest entry.
+                    b.b_changelistlen = crate::mark_defs::JUMPLISTSIZE - 1;
+                    b.b_changelist.rotate_left(1);
+                    let mut wp = firstwin;
+                    while !wp.is_null() {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        let w = unsafe { &mut *wp };
+                        // Correct the position in the changelist for
+                        // other windows on this buffer.
+                        if w.w_buffer == buf && w.w_changelistidx > 0 {
+                            w.w_changelistidx -= 1;
+                        }
+                        wp = w.w_next;
+                    }
+                }
+                let mut wp = firstwin;
+                while !wp.is_null() {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let w = unsafe { &mut *wp };
+                    // For other windows, if the position in the
+                    // changelist is at the end it stays at the end.
+                    if w.w_buffer == buf && w.w_changelistidx == b.b_changelistlen {
+                        w.w_changelistidx += 1;
+                    }
+                    wp = w.w_next;
+                }
+                b.b_changelistlen += 1;
+            }
+        }
+        b.b_changelist[(b.b_changelistlen - 1) as usize] = b.b_last_change.clone();
+        // The current window is always after the last change, so that
+        // "g," takes you back to it.
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*curwin }.w_buffer == buf {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *curwin }.w_changelistidx = b.b_changelistlen;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { &*curwin }.w_buffer == buf && g.Visual.active {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::check_visual_pos() };
+    }
+
+    let mut wp = firstwin;
+    while !wp.is_null() {
+        // Each `&mut *wp` below is deliberately short-lived and
+        // re-derived after every call that itself reborrows `wp`.
+        // Holding one long-lived `w` across such a call would
+        // invalidate it under Tree Borrows, which Miri rejects.
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { &*wp }.w_next;
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*wp }.w_buffer != buf {
+            wp = next;
+            continue;
+        }
+
+        // Mark this window to be redrawn later.
+        // SAFETY: reading a plain `bool` global.
+        let not_allowed = *unsafe { crate::drawscreen::REDRAW_NOT_ALLOWED.get_mut() };
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            if !not_allowed && w.w_redr_type < crate::drawscreen::UPD_VALID {
+                w.w_redr_type = crate::drawscreen::UPD_VALID;
+            }
+        }
+
+        // When inserting/deleting lines and the window has specific
+        // lines to be redrawn, w_redraw_top and w_redraw_bot may now
+        // be invalid, so just redraw everything.
+        // SAFETY: forwarded from this function's own safety doc.
+        if xtra != 0 && unsafe { &*wp }.w_redraw_top != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_NOT_VALID) };
+        }
+
+        // Last line after the change.
+        let mut last = lnume + xtra - 1;
+
+        // Reset "w_skipcol" if the topline length has become so much
+        // smaller that nothing will be visible anymore, accounting for
+        // 'smoothscroll' <<< or the 'listchars' "precedes" marker.
+        // SAFETY: forwarded from this function's own safety doc.
+        let (skipcol, topline) = {
+            let w = unsafe { &*wp };
+            (w.w_skipcol, w.w_topline)
+        };
+        if skipcol > 0 {
+            let topline_shrank = last < topline || {
+                if topline >= lnum && topline < lnume {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let width = unsafe { crate::plines::linetabsize_eol(wp, topline) };
+                    // SAFETY: forwarded from this function's own safety doc.
+                    let overlap = unsafe { crate::r#move::sms_marker_overlap(&mut *wp, -1) };
+                    width <= skipcol + overlap
+                } else {
+                    false
+                }
+            };
+            if topline_shrank {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { &mut *wp }.w_skipcol = 0;
+            }
+        }
+
+        // Check if a change in the buffer has invalidated the cached
+        // values for the cursor, and update the folds for this window.
+        // Can't postpone this, because a following operator might work
+        // on the whole fold: ">>dd".
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_update(&mut *wp, lnum, last) };
+
+        // The change may cause lines above or below it to become
+        // included in a fold. Set lnum/lnume to the first/last line
+        // that might be displayed differently. Setting w_cline_folded
+        // here is an efficient way to update it when inserting lines
+        // just above a closed fold.
+        let mut lnum = lnum;
+        // SAFETY: forwarded from this function's own safety doc.
+        let folded = unsafe {
+            crate::fold::has_folding_win(&mut *wp, lnum, Some(&mut lnum), None, false, None)
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*wp }.w_cursor.lnum == lnum {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *wp }.w_cline_folded = folded;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let folded = unsafe {
+            crate::fold::has_folding_win(&mut *wp, last, None, Some(&mut last), false, None)
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*wp }.w_cursor.lnum == last {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &mut *wp }.w_cline_folded = folded;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { changed_lines_invalidate_win(wp, lnum, col, lnume, xtra) };
+
+        // Take care of side effects for setting w_topline when folds
+        // have changed. Especially when the buffer was changed in
+        // another window.
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::fold::has_any_folding(&*wp) } {
+            // SAFETY: forwarded from this function's own safety doc.
+            let topline = unsafe { &*wp }.w_topline;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::set_topline(wp, topline) };
+        }
+
+        {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+
+            // If lines have been added or removed, relative numbering
+            // always requires an update even if the cursor didn't move.
+            if w.w_onebuf_opt.wo_rnu != 0 && xtra != 0 {
+                w.w_last_cursor_lnum_rnu = 0;
+            }
+
+            if w.w_onebuf_opt.wo_cul != 0 && w.w_last_cursorline >= lnum {
+                if w.w_last_cursorline < lnume {
+                    // If 'cursorline' was inside the change, it has
+                    // already been invalidated in w_lines[] by the
+                    // loop above.
+                    w.w_last_cursorline = 0;
+                } else {
+                    // If 'cursorline' was below the change, adjust its
+                    // lnum.
+                    w.w_last_cursorline += xtra;
+                }
+            }
+        }
+
+        if wp == curwin && xtra != 0 {
+            // SAFETY: reading a plain scalar global.
+            let has = unsafe { crate::drawscreen::SEARCH_HL_HAS_CURSOR_LNUM.get_mut() };
+            if *has >= lnum {
+                *has += xtra;
+            }
+        }
+
+        wp = next;
+    }
+
+    // Call update_screen() later, which checks out what needs to be
+    // redrawn, since it notices b_mod_set and then uses b_mod_*.
+    crate::drawscreen::set_must_redraw(crate::drawscreen::UPD_VALID);
+
+    // When the cursor line is changed always trigger CursorMoved.
+    // SAFETY: reading a plain pointer global.
+    let last_win = *unsafe { crate::autocmd::LAST_CURSORMOVED_WIN.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let cur = unsafe { &*curwin };
+    if last_win == curwin
+        && cur.w_buffer == buf
+        && lnum <= cur.w_cursor.lnum
+        && lnume + xtra.abs() > cur.w_cursor.lnum
+    {
+        // SAFETY: as above.
+        unsafe { crate::autocmd::LAST_CURSORMOVED.get_mut() }.lnum = 0;
+    }
+}
+
 /// Record that lines `lnum..lnume` of `buf` changed, so that
 /// `win_update()` redisplays them (`changed_lines_redraw_buf`).
 ///
@@ -1000,6 +1383,219 @@ mod tests {
             w_lines: lines,
             ..Default::default()
         }
+    }
+
+    /// RAII guard installing a window/buffer/tabpage chain for the
+    /// `changed_bytes`/`changed_common` tests, restoring every global
+    /// they touch on drop (even on panic). Self-locking, matching this
+    /// crate's established per-file test-guard convention.
+    struct ChangedGuard {
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
+        prev_firstwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_state: i32,
+        prev_must_redraw: i32,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ChangedGuard {
+        fn set(
+            win: *mut WinT,
+            buf: *mut BufT,
+            tab: *mut crate::buffer_defs::TabpageT,
+        ) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = ChangedGuard {
+                prev_curwin: g.curwin,
+                prev_curbuf: g.curbuf,
+                prev_firstwin: g.firstwin,
+                prev_curtab: g.curtab,
+                prev_state: g.State,
+                prev_must_redraw: g.must_redraw,
+                _lock,
+            };
+            g.curwin = win;
+            g.curbuf = buf;
+            g.firstwin = win;
+            g.curtab = tab;
+            g.State = crate::state_defs::mode::NORMAL as i32;
+            g.must_redraw = 0;
+            g.cmdmod.cmod_flags = 0;
+            guard
+        }
+    }
+
+    impl Drop for ChangedGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curwin = self.prev_curwin;
+            g.curbuf = self.prev_curbuf;
+            g.firstwin = self.prev_firstwin;
+            g.curtab = self.prev_curtab;
+            g.State = self.prev_state;
+            g.must_redraw = self.prev_must_redraw;
+        }
+    }
+
+    /// Builds a boxed buffer/window pair. The caller derives the raw
+    /// pointers AFTER this returns, via [`fixture_ptrs`], because
+    /// moving the `Box`es out of here invalidates any pointer derived
+    /// inside - Tree Borrows tracks the borrow lineage, not just the
+    /// address.
+    fn changed_fixture() -> (Box<BufT>, Box<WinT>) {
+        let buf = Box::new(BufT {
+            b_ml: crate::memline_defs::MemlineT {
+                ml_line_count: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let win = Box::new(win_with_line_cache(std::ptr::null_mut(), 1));
+        (buf, win)
+    }
+
+    /// Wires the pair together through ONE derived pointer each, so
+    /// the reference a callee reborrows through `GLOBALS` shares a
+    /// single provenance with the one stored in `w_buffer`.
+    fn fixture_ptrs(buf: &mut BufT, win: &mut WinT) -> (*mut BufT, *mut WinT) {
+        let buf_ptr: *mut BufT = buf;
+        win.w_buffer = buf_ptr;
+        let win_ptr: *mut WinT = win;
+        (buf_ptr, win_ptr)
+    }
+
+    #[test]
+    fn changed_bytes_marks_the_buffer_and_schedules_a_redraw() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { (*buf_ptr).b_changed }, 0);
+        unsafe { changed_bytes(3, 2) };
+
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0, "buffer marked modified");
+        assert!(unsafe { (*buf_ptr).b_mod_set }, "a redraw region was recorded");
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 3);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_bot }, 4);
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.must_redraw,
+            crate::drawscreen::UPD_VALID
+        );
+    }
+
+    #[test]
+    fn changed_bytes_sets_the_last_change_mark_and_changelist() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { changed_bytes(3, 7) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_last_change.mark.lnum }, 3);
+        assert_eq!(unsafe { (*buf_ptr).b_last_change.mark.col }, 7);
+        assert_eq!(
+            unsafe { (*buf_ptr).b_changelistlen },
+            1,
+            "first change starts the list"
+        );
+        assert_eq!(unsafe { (*buf_ptr).b_changelist[0].mark.lnum }, 3);
+        assert_eq!(
+            unsafe { (*win_ptr).w_changelistidx },
+            1,
+            "current window sits after the last change"
+        );
+    }
+
+    #[test]
+    fn changed_bytes_respects_keepjumps() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdmod.cmod_flags =
+            crate::ex_cmds_defs::cmod::KEEPJUMPS;
+
+        unsafe { changed_bytes(3, 2) };
+
+        assert_eq!(
+            unsafe { (*buf_ptr).b_last_change.mark.lnum },
+            0,
+            "'. mark left alone"
+        );
+        assert_eq!(
+            unsafe { (*buf_ptr).b_changelistlen },
+            0,
+            "changelist left alone"
+        );
+        assert_ne!(
+            unsafe { (*buf_ptr).b_changed },
+            0,
+            "but the buffer is still modified"
+        );
+    }
+
+    #[test]
+    fn changed_bytes_does_not_add_a_second_nearby_changelist_entry() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { changed_bytes(3, 2) };
+        assert_eq!(unsafe { (*buf_ptr).b_changelistlen }, 1);
+
+        // A new undo-able change on the SAME line, a short distance
+        // away, overwrites the entry rather than adding one - this is
+        // what stops typing "xxxxx" from filling the changelist.
+        unsafe { (*buf_ptr).b_new_change = true };
+        unsafe { changed_bytes(3, 4) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_changelistlen }, 1);
+        assert_eq!(unsafe { (*buf_ptr).b_changelist[0].mark.col }, 4);
+    }
+
+    #[test]
+    fn changed_bytes_adds_an_entry_for_a_change_on_another_line() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { changed_bytes(3, 2) };
+        unsafe { (*buf_ptr).b_new_change = true };
+        unsafe { changed_bytes(8, 0) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_changelistlen }, 2);
+        assert_eq!(unsafe { (*buf_ptr).b_changelist[0].mark.lnum }, 3);
+        assert_eq!(unsafe { (*buf_ptr).b_changelist[1].mark.lnum }, 8);
+        assert_eq!(unsafe { (*win_ptr).w_changelistidx }, 2);
+    }
+
+    #[test]
+    fn changed_bytes_invalidates_the_line_cache() {
+        let (mut buf, mut win) = changed_fixture();
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { changed_bytes(3, 0) };
+
+        assert!(
+            !unsafe { &(*win_ptr).w_lines }[2].wl_valid,
+            "changed line invalidated"
+        );
+        assert!(
+            unsafe { &(*win_ptr).w_lines }[0].wl_valid,
+            "line above untouched"
+        );
+        assert_eq!(
+            unsafe { (*win_ptr).w_redr_type },
+            crate::drawscreen::UPD_VALID
+        );
     }
 
     #[test]

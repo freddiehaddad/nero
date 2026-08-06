@@ -802,6 +802,21 @@ pub fn ml_add_deleted_len(ptr: &[u8], len: Option<usize>) {
     ml_add_deleted_len_buf(curbuf, ptr, len);
 }
 
+/// Return the number of deleted bytes recorded since the last call,
+/// resetting the counters (`ml_flush_deleted_bytes`).
+///
+/// Also reports the deleted codepoint and UTF-16 code-unit counts,
+/// which the original returns through out-parameters.
+pub fn ml_flush_deleted_bytes(buf: &mut BufT) -> (usize, usize, usize) {
+    let ret = buf.deleted_bytes;
+    let codepoints = buf.deleted_codepoints;
+    let codeunits = buf.deleted_codeunits;
+    buf.deleted_bytes = 0;
+    buf.deleted_codepoints = 0;
+    buf.deleted_codeunits = 0;
+    (ret, codepoints, codeunits)
+}
+
 /// Sets `buf.deleted_bytes`/`deleted_bytes2` bookkeeping for text about
 /// to be deleted (`ml_add_deleted_len_buf`).
 ///
