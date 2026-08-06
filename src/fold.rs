@@ -648,6 +648,50 @@ pub fn set_small_maybe(gap: &mut [FoldT]) {
     }
 }
 
+/// Search for line `lnum` in the fold array `gap` (`foldFind`).
+///
+/// Returns `(found, idx)`. When `found` is true, `idx` is the fold
+/// containing `lnum`. When it is false, `idx` is the first fold below
+/// `lnum`, which - exactly as the original's own doc comment warns -
+/// **can be one past the end of the array**; callers rely on that as
+/// the insertion point.
+///
+/// # Translation note
+/// The original hands back a `fold_T *` through an out-parameter,
+/// including the deliberately one-past-the-end pointer on the
+/// not-found path. Returning an index instead keeps that contract
+/// exactly (`idx == gap.len()` is the one-past-the-end case) while
+/// staying inside what a safe Rust reference may express - the same
+/// choice `find_wl_entry` already makes in this file, returning an
+/// index rather than the original's `-1` sentinel.
+#[must_use]
+pub fn fold_find(gap: &[FoldT], lnum: crate::pos_defs::LinenrT) -> (bool, usize) {
+    if gap.is_empty() {
+        return (false, 0);
+    }
+
+    // Perform a binary search.
+    // "low" is lowest index of possible match.
+    // "high" is highest index of possible match.
+    let mut low: i64 = 0;
+    let mut high: i64 = gap.len() as i64 - 1;
+    while low <= high {
+        let i = (low + high) / 2;
+        let fp = &gap[i as usize];
+        if fp.fd_top > lnum {
+            // Fold below lnum, adjust high.
+            high = i - 1;
+        } else if fp.fd_top + fp.fd_len <= lnum {
+            // Fold above lnum, adjust low.
+            low = i + 1;
+        } else {
+            // lnum is inside this fold.
+            return (true, i as usize);
+        }
+    }
+    (false, low as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,5 +1443,90 @@ mod tests {
         let mut gap: Vec<FoldT> = Vec::new();
         set_small_maybe(&mut gap);
         assert!(gap.is_empty());
+    }
+
+    /// Three sibling folds covering lines 10-14, 20-24 and 30-34,
+    /// with the gaps between them deliberately left unfolded.
+    fn sibling_folds() -> Vec<FoldT> {
+        vec![
+            FoldT {
+                fd_top: 10,
+                fd_len: 5,
+                ..Default::default()
+            },
+            FoldT {
+                fd_top: 20,
+                fd_len: 5,
+                ..Default::default()
+            },
+            FoldT {
+                fd_top: 30,
+                fd_len: 5,
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn fold_find_on_an_empty_array_finds_nothing_at_index_zero() {
+        assert_eq!(fold_find(&[], 5), (false, 0));
+    }
+
+    #[test]
+    fn fold_find_locates_the_fold_containing_a_line() {
+        let gap = sibling_folds();
+        // First and last line of each fold, plus one in the middle.
+        assert_eq!(fold_find(&gap, 10), (true, 0));
+        assert_eq!(fold_find(&gap, 14), (true, 0));
+        assert_eq!(fold_find(&gap, 22), (true, 1));
+        assert_eq!(fold_find(&gap, 30), (true, 2));
+        assert_eq!(fold_find(&gap, 34), (true, 2));
+    }
+
+    #[test]
+    fn fold_find_reports_the_next_fold_below_an_unfolded_line() {
+        let gap = sibling_folds();
+        // Before every fold.
+        assert_eq!(fold_find(&gap, 1), (false, 0));
+        // fd_top + fd_len is exclusive, so 15 is past the first fold.
+        assert_eq!(fold_find(&gap, 15), (false, 1));
+        assert_eq!(fold_find(&gap, 19), (false, 1));
+        assert_eq!(fold_find(&gap, 25), (false, 2));
+    }
+
+    #[test]
+    fn fold_find_reports_one_past_the_end_below_the_last_fold() {
+        let gap = sibling_folds();
+        // The original's own doc comment warns this index "can be
+        // beyond the end of the array"; callers use it as the
+        // insertion point, so it must be exactly len.
+        assert_eq!(fold_find(&gap, 35), (false, 3));
+        assert_eq!(fold_find(&gap, 9999), (false, 3));
+        assert_eq!(gap.len(), 3);
+    }
+
+    #[test]
+    fn fold_find_handles_a_single_fold_on_every_side() {
+        let gap = vec![FoldT {
+            fd_top: 5,
+            fd_len: 2,
+            ..Default::default()
+        }];
+        assert_eq!(fold_find(&gap, 4), (false, 0));
+        assert_eq!(fold_find(&gap, 5), (true, 0));
+        assert_eq!(fold_find(&gap, 6), (true, 0));
+        assert_eq!(fold_find(&gap, 7), (false, 1));
+    }
+
+    #[test]
+    fn fold_find_skips_zero_length_folds() {
+        // fd_top + fd_len <= lnum is the "fold above lnum" test, so a
+        // zero-length fold can never contain anything.
+        let gap = vec![FoldT {
+            fd_top: 5,
+            fd_len: 0,
+            ..Default::default()
+        }];
+        assert_eq!(fold_find(&gap, 5), (false, 1));
     }
 }
