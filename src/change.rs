@@ -218,6 +218,53 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Insert the bytes of `s` at the cursor position (`ins_str`).
+///
+/// The cursor is advanced past the inserted text.
+///
+/// # Safety
+/// Same as [`del_bytes`].
+pub unsafe fn ins_str(s: &[u8]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::state::virtual_active(unsafe { &*curwin }) && unsafe { &*curwin }.w_cursor.coladd > 0
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let vis = unsafe { crate::cursor::getviscol() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance_force(vis) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let col = unsafe { &*curwin }.w_cursor.col;
+    // SAFETY: forwarded from this function's own safety doc.
+    let oldp = unsafe { crate::memline::ml_get(lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let oldlen = unsafe { crate::memline::ml_get_len(lnum) };
+
+    let slen = s.len();
+    let mut newp = Vec::with_capacity(oldlen as usize + slen + 1);
+    if col > 0 {
+        newp.extend_from_slice(&oldp[..col as usize]);
+    }
+    newp.extend_from_slice(s);
+    // `bytes` covers the rest of the line INCLUDING its trailing NUL.
+    let bytes = oldlen - col + 1;
+    debug_assert!(bytes >= 0);
+    newp.extend_from_slice(&oldp[col as usize..(col + bytes) as usize]);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace(lnum, &newp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { inserted_bytes(lnum, col, 0, slen as i32) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_cursor.col += slen as ColnrT;
+}
+
 /// Delete from the cursor position to the end of the line
 /// (`truncate_line`).
 ///
@@ -1955,6 +2002,60 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn ins_str_inserts_at_the_cursor_and_advances_it() {
+        // Cross-verified against real nvim: "abef" with the cursor on
+        // column 3 (1-based) and inserting "cd" yields "abcdef".
+        // ins_str advances the cursor past what it inserted, so the
+        // 0-based column goes 2 -> 4 (nvim then reports column 4
+        // 1-based once <Esc> steps back one).
+        let (mut buf, mut win) = del_fixture(b"abef", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_str(b"cd") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcdef\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 4);
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_str_at_column_zero_prepends() {
+        let (mut buf, mut win) = del_fixture(b"cd", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_str(b"ab") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcd\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 2);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_str_at_the_end_appends() {
+        let (mut buf, mut win) = del_fixture(b"ab", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_str(b"cd") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcd\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 4);
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
