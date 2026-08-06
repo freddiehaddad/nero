@@ -52,11 +52,8 @@
 //! entry scan, needing only the already-real `WlineT`/`w_lines_valid`
 //! fields - returns `Option<usize>` in place of the original's own
 //! `-1` sentinel); `getDeepestNesting` (+ its own
-//! `getDeepestNestingRecurse` helper) - the real recursive-descent-
-//! into-nested-folds body is `unimplemented!()` (it needs the
-//! fold-level machinery), but the "no folds at all"
-//! fast path (`w_folds` empty) is real and exact, covering every
-//! currently-reachable case; `foldAdjustCursor` (as
+//! `getDeepestNestingRecurse` helper), fully translated now that
+//! `FoldT` exists; `foldAdjustCursor` (as
 //! [`fold_adjust_cursor`]) - currently always a no-op, since
 //! [`has_folding`] can only ever return `false` or panic today, never
 //! `true` (see [`fold_adjust_cursor`]'s own doc comment).
@@ -408,23 +405,16 @@ pub unsafe fn get_deepest_nesting(wp: &mut WinT) -> i32 {
 /// Recursive per-fold-array step of [`get_deepest_nesting`]
 /// (`getDeepestNestingRecurse`).
 ///
-/// The real recursive-descent-into-nested-folds body is
-/// `unimplemented!()` - nothing translated can create a fold yet, so
-/// `w_folds` is always empty in practice, matching
-/// [`has_any_folding`]'s own established reasoning - but the "no
-/// folds at all" fast path (an empty `gap`) is real and exact: the
-/// original's own `for` loop over `gap->ga_len` entries simply never
-/// executes for an empty array, returning `maxlevel`'s untouched
-/// initial value of `0`.
+/// Returns the depth of the deepest chain of nested folds in `gap`:
+/// 0 for an empty array, 1 for folds with no children, and so on.
 #[must_use]
 fn get_deepest_nesting_recurse(gap: &[FoldT]) -> i32 {
-    if gap.is_empty() {
-        return 0;
+    let mut maxlevel = 0;
+    for fp in gap {
+        let level = get_deepest_nesting_recurse(&fp.fd_nested) + 1;
+        maxlevel = maxlevel.max(level);
     }
-    unimplemented!(
-        "fold::get_deepest_nesting_recurse: recursing into nested folds needs the fold-level \
-         machinery, not yet translated"
-    );
+    maxlevel
 }
 
 /// Move the cursor to the first line of a closed fold (`foldAdjustCursor`).
@@ -1166,16 +1156,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "needs the fold-level machinery")]
-    fn get_deepest_nesting_panics_once_a_fold_actually_exists() {
+    fn get_deepest_nesting_counts_the_deepest_chain() {
         let mut buf = BufT::default();
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
             w_foldinvalid: false,
+            // A single childless fold is one level deep.
             w_folds: vec![crate::fold::FoldT::default()],
             ..Default::default()
         };
-        let _ = unsafe { get_deepest_nesting(&mut win) };
+        assert_eq!(unsafe { get_deepest_nesting(&mut win) }, 1);
+
+        // nested_fold_tree's deepest chain is outer -> second nested
+        // -> its own child, i.e. three levels.
+        win.w_folds = nested_fold_tree();
+        assert_eq!(unsafe { get_deepest_nesting(&mut win) }, 3);
+    }
+
+    #[test]
+    fn get_deepest_nesting_recurse_measures_each_branch_independently() {
+        // A shallow branch alongside a deep one: the deepest wins,
+        // matching the original's own MAX over every sibling.
+        let gap = vec![
+            FoldT::default(),
+            FoldT {
+                fd_nested: vec![FoldT {
+                    fd_nested: vec![FoldT::default()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        assert_eq!(get_deepest_nesting_recurse(&gap), 3);
+        assert_eq!(get_deepest_nesting_recurse(&[]), 0);
     }
 
     #[test]
