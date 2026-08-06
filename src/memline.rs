@@ -16,8 +16,8 @@
 //! instance - see `ml_setflags`'s own doc comment), `long_to_char`/
 //! `char_to_long`, `ml_add_stack`,
 //! `ml_lineadd`, `ml_add_deleted_len`/`ml_add_deleted_len_buf` (the
-//! common, non-`update_need_codepoints` path), `ml_updatechunk` (a
-//! no-op stub - see below), **`ml_find_line`** (the real B-tree
+//! common, non-`update_need_codepoints` path), `ml_updatechunk` (the
+//! real chunk cache - see below), **`ml_find_line`** (the real B-tree
 //! traversal: the "is the wanted line in the already-locked block"
 //! fast path, the `ML_FIND` stack-reuse search, and the full downward
 //! walk through pointer blocks to a data block, including
@@ -146,9 +146,11 @@
 //! realistic page size (80 bytes, `pb_count_max == 3`) instead.
 //!
 //! `ml_updatechunk` (the `line2byte()`/`byte2line()` fast-lookup chunk
-//! cache) is a no-op stub: a pure performance optimization with its
-//! own nontrivial chunk-splitting logic, and neither `line2byte`/
-//! `byte2line` is translated yet to observe its absence.
+//! cache) IS now implemented, along with [`ml_find_line_or_offset`]
+//! which reads it. The original keeps an `ml_numchunks`-capacity array
+//! with `ml_usedchunks` live entries and shifts it with `memmove`;
+//! here the `Vec`'s length IS the live count, so those shifts become
+//! `insert`/`remove` and `ml_numchunks` has no counterpart.
 //!
 //! Deferred (each needs another not-yet-translated subsystem):
 //! - `set_b0_fname`'s `buf.b_ffname.is_some()` branch: needs
@@ -824,18 +826,247 @@ pub fn ml_add_deleted_len_buf(buf: &mut BufT, ptr: &[u8], len: Option<usize>) {
     // (buf.update_need_codepoints branch deferred - see doc comment.)
 }
 
+/// Max number of lines in a chunk (`MLCS_MAXL`).
+const MLCS_MAXL: i32 = 800;
+/// Target number of lines when splitting a chunk (`MLCS_MINL`), half
+/// of [`MLCS_MAXL`].
+const MLCS_MINL: i32 = 400;
+
+/// The `ml_upd_last*` file-statics caching where the previous
+/// [`ml_updatechunk`] call left off, so a sequential append does not
+/// re-walk the chunk list every line.
+///
+/// Bundled into one struct behind one cell rather than four separate
+/// statics, matching this crate's established precedent for a group of
+/// related file-statics (`search.rs`'s `LastCsearch`).
+struct MlUpdCache {
+    lastbuf: *mut BufT,
+    lastline: LinenrT,
+    lastcurline: LinenrT,
+    lastcurix: i32,
+}
+
+static ML_UPD_CACHE: crate::globals::GlobalCell<MlUpdCache> =
+    crate::globals::GlobalCell::new(MlUpdCache {
+        lastbuf: std::ptr::null_mut(),
+        lastline: 0,
+        lastcurline: 0,
+        lastcurix: 0,
+    });
+
 /// Keep information for finding the byte offset of a line
 /// (`ml_updatechunk`).
 ///
-/// Deferred entirely (a no-op stub): this is a pure performance cache
-/// for `line2byte()`/`byte2line()` (neither translated yet, so nothing
-/// can observe its absence), with its own nontrivial chunk-splitting
-/// logic (`MLCS_MAXL`/`MLCS_MINL`). `buf.b_ml.ml_usedchunks` simply
-/// stays at its `Default`-initialized `0` forever, which is a
-/// different (but equally inert) sentinel from the original's `-1`
-/// "disabled" state - fine since nothing reads `ml_usedchunks`/
-/// `ml_chunksize` yet either.
-fn ml_updatechunk(_buf: &mut BufT, _line: LinenrT, _len: i32, _updtype: i32) {}
+/// Maintains the chunk cache that [`ml_find_line_or_offset`] walks:
+/// each chunk records how many lines it covers and their total byte
+/// size, so a byte offset can be found without scanning every line.
+///
+/// The original keeps a `ml_numchunks`-capacity array with
+/// `ml_usedchunks` live entries and shifts it with `memmove`. Here the
+/// `Vec`'s length IS the live count, so those shifts become
+/// `insert`/`remove` and `ml_numchunks` has no counterpart - a `Vec`
+/// manages its own capacity. `ml_usedchunks` is still kept in sync
+/// because `-1` remains its "disabled" sentinel.
+///
+/// # Safety
+/// Forwarded from [`ml_find_line`]; must not run concurrently with
+/// any other access to `ML_UPD_CACHE`.
+unsafe fn ml_updatechunk(buf: &mut BufT, line: LinenrT, len: i32, updtype: i32) {
+    if buf.b_ml.ml_usedchunks == -1 || len == 0 {
+        return;
+    }
+
+    if buf.b_ml.ml_chunksize.is_empty() {
+        buf.b_ml.ml_chunksize.push(crate::memline_defs::ChunksizeT {
+            mlcs_numlines: 1,
+            mlcs_totalsize: 1,
+        });
+        buf.b_ml.ml_usedchunks = 1;
+    }
+
+    if updtype == crate::memline_defs::ML_CHNK_UPDLINE && buf.b_ml.ml_line_count == 1 {
+        // First line in an empty buffer, from ml_flush_line: reset.
+        buf.b_ml.ml_chunksize.truncate(1);
+        buf.b_ml.ml_usedchunks = 1;
+        buf.b_ml.ml_chunksize[0].mlcs_numlines = 1;
+        buf.b_ml.ml_chunksize[0].mlcs_totalsize =
+            buf.b_ml.ml_line_textlen;
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cache = unsafe { ML_UPD_CACHE.get_mut() };
+    let mut curline = cache.lastcurline;
+    let mut curix = cache.lastcurix;
+
+    // Find the chunk our line belongs to; `curline` ends up at the
+    // start of that chunk.
+    if !std::ptr::eq(cache.lastbuf, buf)
+        || line != cache.lastline + 1
+        || updtype != crate::memline_defs::ML_CHNK_ADDLINE
+    {
+        curline = 1;
+        curix = 0;
+        while curix < buf.b_ml.ml_usedchunks - 1
+            && line
+                >= curline
+                    + buf.b_ml.ml_chunksize[usize::try_from(curix).unwrap_or(0)].mlcs_numlines
+        {
+            curline += buf.b_ml.ml_chunksize[usize::try_from(curix).unwrap_or(0)].mlcs_numlines;
+            curix += 1;
+        }
+    } else if curix < buf.b_ml.ml_usedchunks - 1
+        && line
+            >= curline + buf.b_ml.ml_chunksize[usize::try_from(curix).unwrap_or(0)].mlcs_numlines
+    {
+        // Adjust the cached curix/curline by one chunk.
+        curline += buf.b_ml.ml_chunksize[usize::try_from(curix).unwrap_or(0)].mlcs_numlines;
+        curix += 1;
+    }
+
+    let mut cur = usize::try_from(curix).unwrap_or(0);
+    let signed_len = if updtype == crate::memline_defs::ML_CHNK_DELLINE { -len } else { len };
+    buf.b_ml.ml_chunksize[cur].mlcs_totalsize += signed_len;
+
+    if updtype == crate::memline_defs::ML_CHNK_ADDLINE {
+        buf.b_ml.ml_chunksize[cur].mlcs_numlines += 1;
+
+        if buf.b_ml.ml_chunksize[cur].mlcs_numlines >= MLCS_MAXL {
+            // Split this chunk: duplicate it, then move the first
+            // MLCS_MINL lines' worth into the earlier half.
+            let dup = buf.b_ml.ml_chunksize[cur];
+            buf.b_ml.ml_chunksize.insert(cur, dup);
+
+            let mut size = 0i32;
+            let mut linecnt = 0i32;
+            while curline < buf.b_ml.ml_line_count && linecnt < MLCS_MINL {
+                // SAFETY: forwarded from this function's own safety doc.
+                let hp = unsafe { ml_find_line(buf, curline, ML_FIND) };
+                if hp.is_null() {
+                    buf.b_ml.ml_usedchunks = -1;
+                    return;
+                }
+                // SAFETY: `ml_find_line` returned a live, locked block.
+                let data = unsafe { (*hp).bh_data.as_data_mut() };
+                let count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low + 1;
+                let idx = curline - buf.b_ml.ml_locked_low;
+                curline = buf.b_ml.ml_locked_high + 1;
+
+                // Index of the last line to use from this block.
+                let rest = count - idx;
+                let end_idx = if linecnt + rest > MLCS_MINL {
+                    let e = idx + MLCS_MINL - linecnt - 1;
+                    linecnt = MLCS_MINL;
+                    e
+                } else {
+                    linecnt += rest;
+                    count - 1
+                };
+
+                let text_end = if idx == 0 {
+                    // First line in the block: text sits at the end.
+                    i32::try_from(db_txt_end(data)).unwrap_or(i32::MAX)
+                } else {
+                    i32::try_from(
+                        db_index(data, usize::try_from(idx - 1).unwrap_or(0)) & DB_INDEX_MASK,
+                    )
+                    .unwrap_or(i32::MAX)
+                };
+                let end_entry = i32::try_from(
+                    db_index(data, usize::try_from(end_idx).unwrap_or(0)) & DB_INDEX_MASK,
+                )
+                .unwrap_or(i32::MAX);
+                size += text_end - end_entry;
+            }
+
+            buf.b_ml.ml_chunksize[cur].mlcs_numlines = linecnt;
+            buf.b_ml.ml_chunksize[cur + 1].mlcs_numlines -= linecnt;
+            buf.b_ml.ml_chunksize[cur].mlcs_totalsize = size;
+            buf.b_ml.ml_chunksize[cur + 1].mlcs_totalsize -= size;
+            buf.b_ml.ml_usedchunks += 1;
+            // Force a recalculation of curix/curline next time.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { ML_UPD_CACHE.get_mut() }.lastbuf = std::ptr::null_mut();
+            return;
+        } else if buf.b_ml.ml_chunksize[cur].mlcs_numlines >= MLCS_MINL
+            && curix == buf.b_ml.ml_usedchunks - 1
+            && buf.b_ml.ml_line_count - line <= 1
+        {
+            // Last chunk, and cheap to start a new one after it - do
+            // it now to avoid the search loop above next time.
+            let mut new_chunk =
+                crate::memline_defs::ChunksizeT { mlcs_numlines: 0, mlcs_totalsize: 0 };
+            if line != buf.b_ml.ml_line_count {
+                // The line is just before the last one: move the last
+                // line's count across. This is the common case while
+                // loading a new file.
+                // SAFETY: forwarded from this function's own safety doc.
+                let hp = unsafe { ml_find_line(buf, buf.b_ml.ml_line_count, ML_FIND) };
+                if hp.is_null() {
+                    buf.b_ml.ml_usedchunks = -1;
+                    return;
+                }
+                // SAFETY: `ml_find_line` returned a live, locked block.
+                let data = unsafe { (*hp).bh_data.as_data_mut() };
+                let line_count = db_line_count(data);
+                let txt_start = i32::try_from(db_txt_start(data)).unwrap_or(i32::MAX);
+                let rest = if line_count == 1 {
+                    i32::try_from(db_txt_end(data)).unwrap_or(i32::MAX) - txt_start
+                } else {
+                    let i = usize::try_from(line_count - 2).unwrap_or(0);
+                    i32::try_from(db_index(data, i) & DB_INDEX_MASK).unwrap_or(i32::MAX) - txt_start
+                };
+                new_chunk.mlcs_totalsize = rest;
+                new_chunk.mlcs_numlines = 1;
+                buf.b_ml.ml_chunksize[cur].mlcs_totalsize -= rest;
+                buf.b_ml.ml_chunksize[cur].mlcs_numlines -= 1;
+            }
+            buf.b_ml.ml_chunksize.insert(cur + 1, new_chunk);
+            buf.b_ml.ml_usedchunks += 1;
+        }
+    } else if updtype == crate::memline_defs::ML_CHNK_DELLINE {
+        buf.b_ml.ml_chunksize[cur].mlcs_numlines -= 1;
+        // Force a recalculation of curix/curline next time.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { ML_UPD_CACHE.get_mut() }.lastbuf = std::ptr::null_mut();
+
+        if curix < buf.b_ml.ml_usedchunks - 1
+            && (buf.b_ml.ml_chunksize[cur].mlcs_numlines
+                + buf.b_ml.ml_chunksize[cur + 1].mlcs_numlines)
+                <= MLCS_MINL
+        {
+            // `curix` is not read again on this path; only `cur`
+            // selects the chunk that gets collapsed below.
+            cur += 1;
+        } else if curix == 0 && buf.b_ml.ml_chunksize[cur].mlcs_numlines <= 0 {
+            buf.b_ml.ml_usedchunks -= 1;
+            buf.b_ml.ml_chunksize.remove(0);
+            return;
+        } else if curix == 0
+            || (buf.b_ml.ml_chunksize[cur].mlcs_numlines > 10
+                && (buf.b_ml.ml_chunksize[cur].mlcs_numlines
+                    + buf.b_ml.ml_chunksize[cur - 1].mlcs_numlines)
+                    > MLCS_MINL)
+        {
+            return;
+        }
+
+        // Collapse this chunk into the previous one.
+        let merged = buf.b_ml.ml_chunksize[cur];
+        buf.b_ml.ml_chunksize[cur - 1].mlcs_numlines += merged.mlcs_numlines;
+        buf.b_ml.ml_chunksize[cur - 1].mlcs_totalsize += merged.mlcs_totalsize;
+        buf.b_ml.ml_usedchunks -= 1;
+        buf.b_ml.ml_chunksize.remove(cur);
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cache = unsafe { ML_UPD_CACHE.get_mut() };
+    cache.lastbuf = buf;
+    cache.lastline = line;
+    cache.lastcurline = curline;
+    cache.lastcurix = curix;
+}
 
 /// Append a line after `lnum` (`lnum` can be 0) (`ml_append_int`).
 ///
@@ -1388,7 +1619,8 @@ unsafe fn ml_append_int(buf: &mut BufT, lnum: LinenrT, line: &[u8], len_arg: i32
     }
 
     // The line was inserted below 'lnum'.
-    ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_updatechunk(buf, lnum + 1, len, ML_CHNK_ADDLINE) };
     OK
 }
 
@@ -1607,7 +1839,8 @@ unsafe fn ml_flush_line(buf: &mut BufT, _noalloc: bool) {
                 buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
                 // The else case is already covered by the insert and delete.
                 if extra != 0 {
-                    ml_updatechunk(buf, lnum, extra, ML_CHNK_UPDLINE);
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { ml_updatechunk(buf, lnum, extra, ML_CHNK_UPDLINE) };
                 }
             } else {
                 // Cannot do it in one data block: Delete and append.
@@ -1879,7 +2112,8 @@ unsafe fn ml_delete_int(buf: &mut BufT, lnum: LinenrT, flags: i32) -> i32 {
         buf.b_ml.ml_flags |= ML_LOCKED_DIRTY | ML_LOCKED_POS;
     }
 
-    ml_updatechunk(buf, lnum, line_size, ML_CHNK_DELLINE);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_updatechunk(buf, lnum, line_size, ML_CHNK_DELLINE) };
     OK
 }
 
@@ -2237,6 +2471,198 @@ unsafe fn ml_get_buf_impl(buf: &mut BufT, lnum: LinenrT, will_change: bool) -> V
 pub unsafe fn ml_get_buf_mut(buf: &mut BufT, lnum: LinenrT) -> Vec<u8> {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { ml_get_buf_impl(buf, lnum, true) }
+}
+
+/// Convert between a line number and a byte offset
+/// (`ml_find_line_or_offset`).
+///
+/// With `lnum > 0`, returns the byte offset of that line. With
+/// `lnum == 0`, returns the line containing byte offset `*offp` and
+/// overwrites `offp` with the remaining column offset. `no_ff`
+/// ignores `'fileformat'`, always counting one byte per line break.
+///
+/// Returns `-1` when the information is not available.
+///
+/// Note the original flushes the CURRENT buffer's pending line rather
+/// than `buf`'s (`ml_flush_line(curbuf, false)`) even though every
+/// other access here is through `buf`. That is preserved as-is: it is
+/// observable whenever the two differ, so "fixing" it would be a
+/// behaviour change rather than a translation.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp` must be valid when non-null, and
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// (forwarded from ml_find_line/ml_flush_line).
+pub unsafe fn ml_find_line_or_offset(
+    buf: &mut BufT,
+    lnum: LinenrT,
+    mut offp: Option<&mut i32>,
+    no_ff: bool,
+) -> i32 {
+    let ffdos = i32::from(!no_ff && get_fileformat(buf) == crate::option_vars::EOL_DOS);
+
+    // Take care of the cached line first, but only when it is before
+    // the requested line. Caching does not work with 'fileformat',
+    // which is fine for byte tracking since that ignores it.
+    let can_cache = lnum != 0 && ffdos == 0 && buf.b_ml.ml_line_lnum == lnum;
+    if lnum == 0 || buf.b_ml.ml_line_lnum < lnum || !no_ff {
+        // The original flushes `curbuf`, not `buf`. When they are the
+        // same buffer - the overwhelmingly common case - going through
+        // the global pointer as well would create a second live `&mut`
+        // to it, which is fine for C's raw pointers but is aliasing UB
+        // in Rust. So flush through `buf` directly in that case and
+        // only take the global reference when they genuinely differ.
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        if std::ptr::eq(curbuf_ptr, buf) {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { ml_flush_line(buf, false) };
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curbuf = unsafe { &mut *curbuf_ptr };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { ml_flush_line(curbuf, false) };
+        }
+    } else if can_cache && buf.b_ml.ml_line_offset > 0 {
+        return i32::try_from(buf.b_ml.ml_line_offset).unwrap_or(i32::MAX);
+    }
+
+    if buf.b_ml.ml_usedchunks == -1 || buf.b_ml.ml_chunksize.is_empty() || lnum < 0 {
+        // The memline is empty. If it is loaded it still behaves as
+        // though it holds one empty line.
+        if no_ff && !buf.b_ml.ml_mfp.is_null() && (lnum == 1 || lnum == 2) {
+            return lnum - 1;
+        }
+        return -1;
+    }
+
+    let offset = offp.as_deref().copied().unwrap_or(0);
+    if lnum == 0 && offset <= 0 {
+        // Offset 0 must be in line 1, and this is not a "find offset".
+        return 1;
+    }
+
+    // Find the last chunk before the one holding our line. The last
+    // chunk is special: it never qualifies.
+    let mut curline: LinenrT = 1;
+    let mut curix = 0usize;
+    let mut size = 0i32;
+    while curix + 1 < usize::try_from(buf.b_ml.ml_usedchunks).unwrap_or(0)
+        && ((lnum != 0 && lnum >= curline + buf.b_ml.ml_chunksize[curix].mlcs_numlines)
+            || (offset != 0
+                && offset
+                    > size
+                        + buf.b_ml.ml_chunksize[curix].mlcs_totalsize
+                        + ffdos * buf.b_ml.ml_chunksize[curix].mlcs_numlines))
+    {
+        curline += buf.b_ml.ml_chunksize[curix].mlcs_numlines;
+        size += buf.b_ml.ml_chunksize[curix].mlcs_totalsize;
+        if offset != 0 && ffdos != 0 {
+            size += buf.b_ml.ml_chunksize[curix].mlcs_numlines;
+        }
+        curix += 1;
+    }
+
+    let mut extra = 0i32;
+    while (lnum != 0 && curline < lnum) || (offset != 0 && size < offset) {
+        if curline > buf.b_ml.ml_line_count {
+            return -1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let hp = unsafe { ml_find_line(buf, curline, ML_FIND) };
+        if hp.is_null() {
+            return -1;
+        }
+        // SAFETY: `ml_find_line` returned a live, locked block.
+        let data = unsafe { (*hp).bh_data.as_data_mut() };
+        // Number of entries in this block.
+        let count = buf.b_ml.ml_locked_high - buf.b_ml.ml_locked_low + 1;
+        let start_idx = curline - buf.b_ml.ml_locked_low;
+        let mut idx = start_idx;
+
+        let text_end = if idx == 0 {
+            // First line in the block: its text sits at the very end.
+            i32::try_from(db_txt_end(data)).unwrap_or(i32::MAX)
+        } else {
+            i32::try_from(db_index(data, usize::try_from(idx - 1).unwrap_or(0)) & DB_INDEX_MASK)
+                .unwrap_or(i32::MAX)
+        };
+
+        if lnum != 0 {
+            if curline + (count - idx) >= lnum {
+                idx += lnum - curline - 1;
+            } else {
+                idx = count - 1;
+            }
+        } else {
+            extra = 0;
+            loop {
+                let entry =
+                    i32::try_from(db_index(data, usize::try_from(idx).unwrap_or(0)) & DB_INDEX_MASK)
+                        .unwrap_or(i32::MAX);
+                if offset < size + text_end - entry + ffdos {
+                    break;
+                }
+                if ffdos != 0 {
+                    size += 1;
+                }
+                if idx == count - 1 {
+                    extra = 1;
+                    break;
+                }
+                idx += 1;
+            }
+        }
+
+        let entry = i32::try_from(db_index(data, usize::try_from(idx).unwrap_or(0)) & DB_INDEX_MASK)
+            .unwrap_or(i32::MAX);
+        let len = text_end - entry;
+        size += len;
+        if offset != 0 && size >= offset {
+            if let Some(offp) = offp.as_deref_mut() {
+                if size + ffdos == offset {
+                    *offp = 0;
+                } else if idx == start_idx {
+                    *offp = offset - size + len;
+                } else {
+                    let prev = i32::try_from(
+                        db_index(data, usize::try_from(idx - 1).unwrap_or(0)) & DB_INDEX_MASK,
+                    )
+                    .unwrap_or(i32::MAX);
+                    *offp = offset - size + len - (text_end - prev);
+                }
+            }
+            curline += idx - start_idx + extra;
+            if curline > buf.b_ml.ml_line_count {
+                // Exactly one byte beyond the end.
+                return -1;
+            }
+            return curline;
+        }
+        curline = buf.b_ml.ml_locked_high + 1;
+    }
+
+    if lnum != 0 {
+        // Count the extra CR characters.
+        if ffdos != 0 {
+            size += lnum - 1;
+        }
+
+        // Don't count the last line break with 'noeol' and either
+        // 'bin' or 'nofixeol'.
+        if (buf.b_p_fixeol == 0 || buf.b_p_bin != 0)
+            && buf.b_p_eol == 0
+            && lnum > buf.b_ml.ml_line_count
+        {
+            size -= ffdos + 1;
+        }
+    }
+
+    if can_cache && size > 0 {
+        buf.b_ml.ml_line_offset = usize::try_from(size).unwrap_or(0);
+    }
+
+    size
 }
 
 /// Whether the line most recently returned by [`ml_get`] lives in
@@ -2787,6 +3213,166 @@ mod tests {
     }
 
 
+    #[test]
+    fn ml_find_line_or_offset_matches_real_nvim_line2byte() {
+        // Ground truth read out of a real nvim with lines "abc", "de",
+        // "fghi" and ff=unix: line2byte() reports 1, 5, 8, 13 and -1
+        // past the end. line2byte is this function's result plus one,
+        // so the offsets expected here are 0, 4, 7, 12.
+        //
+        // 'fileformat' must be set explicitly: it defaults to "dos" on
+        // Windows, which counts an extra byte per line.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        buf.b_p_ff = Some(b"unix".to_vec());
+        // Match nvim's real defaults: 'fixeol' and 'eol' are on, so
+        // the final line break IS counted.
+        buf.b_p_fixeol = 1;
+        buf.b_p_eol = 1;
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            // This function flushes through the GLOBAL curbuf, so it
+            // has to point at the buffer under test.
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev = globals.curbuf;
+            globals.curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
+            assert_eq!(ml_append_buf(&mut buf, 2, b"fghi\0", 5, false), OK);
+            assert_eq!(buf.b_ml.ml_line_count, 3);
+
+            assert_eq!(ml_find_line_or_offset(&mut buf, 1, None, false), 0);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 2, None, false), 4);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 3, None, false), 7);
+            // One past the last line is the buffer's total size.
+            assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, false), 12);
+            // Two past is not available at all.
+            assert_eq!(ml_find_line_or_offset(&mut buf, 5, None, false), -1);
+
+            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_find_line_or_offset_counts_an_extra_byte_per_line_for_dos() {
+        // Same buffer with ff=dos: real nvim reports line2byte() as
+        // 1, 6, 10, 16 - one extra byte per preceding line for the CR.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        buf.b_p_ff = Some(b"dos".to_vec());
+        buf.b_p_fixeol = 1;
+        buf.b_p_eol = 1;
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev = globals.curbuf;
+            globals.curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
+            assert_eq!(ml_append_buf(&mut buf, 2, b"fghi\0", 5, false), OK);
+
+            assert_eq!(ml_find_line_or_offset(&mut buf, 1, None, false), 0);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 2, None, false), 5);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 3, None, false), 9);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, false), 15);
+
+            // `no_ff` ignores 'fileformat' entirely, giving the unix
+            // answers again - which is what byte tracking relies on.
+            assert_eq!(ml_find_line_or_offset(&mut buf, 2, None, true), 4);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, true), 12);
+
+            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_find_line_or_offset_finds_the_line_for_a_byte_offset() {
+        // Real nvim with ff=unix: byte2line(1)=1, (5)=2, (8)=3.
+        // byte2line passes offset-1, so offsets 4 and 7 map to 2 and 3.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        buf.b_p_ff = Some(b"unix".to_vec());
+        // Match nvim's real defaults: 'fixeol' and 'eol' are on, so
+        // the final line break IS counted.
+        buf.b_p_fixeol = 1;
+        buf.b_p_eol = 1;
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev = globals.curbuf;
+            globals.curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
+            assert_eq!(ml_append_buf(&mut buf, 2, b"fghi\0", 5, false), OK);
+
+            let mut off = 4;
+            assert_eq!(ml_find_line_or_offset(&mut buf, 0, Some(&mut off), false), 2);
+            let mut off = 7;
+            assert_eq!(ml_find_line_or_offset(&mut buf, 0, Some(&mut off), false), 3);
+
+            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_find_line_or_offset_skips_the_last_break_with_noeol() {
+        // Real nvim with ff=unix and `setlocal noeol nofixeol` reports
+        // line2byte(4) as 12 rather than 13 - the final line break is
+        // not counted. That is offset 11 here.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        buf.b_p_ff = Some(b"unix".to_vec());
+        // 'nofixeol' plus 'noeol' is what triggers the adjustment.
+        buf.b_p_fixeol = 0;
+        buf.b_p_eol = 0;
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev = globals.curbuf;
+            globals.curbuf = &mut buf as *mut BufT;
+
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
+            assert_eq!(ml_append_buf(&mut buf, 2, b"fghi\0", 5, false), OK);
+
+            // Only the past-the-end query is affected; the lines
+            // themselves keep their ordinary offsets.
+            assert_eq!(ml_find_line_or_offset(&mut buf, 3, None, false), 7);
+            assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, false), 11);
+
+            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_find_line_or_offset_reports_minus_one_on_an_unloaded_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf();
+        // curbuf must be valid: this function flushes through it.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = globals.curbuf;
+        globals.curbuf = &mut buf as *mut BufT;
+
+        // No ml_open, so ml_chunksize is empty and ml_mfp is null.
+        assert_eq!(unsafe { ml_find_line_or_offset(&mut buf, 1, None, false) }, -1);
+        // With no_ff a loaded-but-empty memline still answers for lines
+        // 1 and 2, but ml_mfp is null here, so this is -1 too.
+        assert_eq!(unsafe { ml_find_line_or_offset(&mut buf, 1, None, true) }, -1);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
     fn test_buf() -> BufT {
         BufT::default()
     }
@@ -2888,6 +3474,10 @@ mod tests {
             assert_eq!(ml_open(&mut buf), OK);
             buf.b_p_fenc = Some(b"utf-8".to_vec());
             buf.b_p_ff = Some(b"unix".to_vec());
+        // Match nvim's real defaults: 'fixeol' and 'eol' are on, so
+        // the final line break IS counted.
+        buf.b_p_fixeol = 1;
+        buf.b_p_eol = 1;
             ml_setflags(&mut buf);
             let zb = read_block0_fname(&mut buf);
             assert_eq!(zb.b0_flags() & B0_FF_MASK, (get_fileformat(&buf) + 1) as u8);
@@ -2900,6 +3490,8 @@ mod tests {
             // Now switch to "dos" and verify the ff bits actually
             // changed to match.
             buf.b_p_ff = Some(b"dos".to_vec());
+        buf.b_p_fixeol = 1;
+        buf.b_p_eol = 1;
             ml_setflags(&mut buf);
             let zb2 = read_block0_fname(&mut buf);
             assert_eq!(zb2.b0_flags() & B0_FF_MASK, (get_fileformat(&buf) + 1) as u8);
