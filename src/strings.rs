@@ -46,6 +46,14 @@
 //! earlier session's own deferral note claiming otherwise (corrected
 //! here after re-reading each real function body directly).
 //!
+//! Also translated: [`KeyvalueT`] and its four comparators
+//! [`cmp_keyvalue_value`]/[`cmp_keyvalue_value_n`]/
+//! [`cmp_keyvalue_value_i`]/[`cmp_keyvalue_value_ni`]. The `_n`/`_ni`
+//! pair bound by the LONGER of the two lengths, not the shorter -
+//! bounding by the shorter would report a prefix as equal to the
+//! longer string. `length` becomes a method over the stored bytes
+//! rather than a field maintained in parallel with them.
+//!
 //! Deferred:
 //! - `vim_snprintf`/`vim_vsnprintf`/`kv_do_printf` and the whole custom
 //!   positional-argument printf machinery: Rust's native `format!`/
@@ -209,6 +217,86 @@ pub fn vim_strnicmp_asc(s1: &[u8], s2: &[u8], len: usize) -> i32 {
         }
     }
     i
+}
+
+/// A key/value pair (`keyvalue_T`), used for the small lookup tables
+/// this file's comparators sort and search.
+///
+/// The original keeps `length` alongside `value` because `value` is a
+/// bare `char *`; here it is derived from the stored bytes, so the two
+/// cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyvalueT {
+    /// the key
+    pub key: i32,
+    /// the value string
+    pub value: Vec<u8>,
+}
+
+impl KeyvalueT {
+    /// `KEYVALUE_ENTRY(k, v)`
+    #[must_use]
+    pub fn new(key: i32, value: &[u8]) -> Self {
+        Self { key, value: value.to_vec() }
+    }
+
+    /// Length of the value string (`length`).
+    #[must_use]
+    pub fn length(&self) -> usize {
+        self.value.len()
+    }
+}
+
+/// Compare two [`KeyvalueT`]s by value (`cmp_keyvalue_value`).
+///
+/// Returns [`std::cmp::Ordering`] rather than a C comparator's
+/// negative/zero/positive `int`, so it drops straight into `sort_by`.
+#[must_use]
+pub fn cmp_keyvalue_value(kv1: &KeyvalueT, kv2: &KeyvalueT) -> std::cmp::Ordering {
+    kv1.value.cmp(&kv2.value)
+}
+
+/// Compare two [`KeyvalueT`]s by value, bounded by the LONGER of the
+/// two lengths (`cmp_keyvalue_value_n`).
+///
+/// Note the bound is `MAX`, not `MIN`: comparing only the shorter
+/// length would report a prefix as equal to the longer string, so the
+/// longer one is what decides.
+#[must_use]
+pub fn cmp_keyvalue_value_n(kv1: &KeyvalueT, kv2: &KeyvalueT) -> std::cmp::Ordering {
+    let n = kv1.length().max(kv2.length());
+    strncmp_bytes(&kv1.value, &kv2.value, n).cmp(&0)
+}
+
+/// Compare two [`KeyvalueT`]s by value, ignoring case
+/// (`cmp_keyvalue_value_i`).
+#[must_use]
+pub fn cmp_keyvalue_value_i(kv1: &KeyvalueT, kv2: &KeyvalueT) -> std::cmp::Ordering {
+    vim_stricmp(&kv1.value, &kv2.value).cmp(&0)
+}
+
+/// Compare two [`KeyvalueT`]s by value, ignoring case and bounded by
+/// the LONGER of the two lengths (`cmp_keyvalue_value_ni`).
+#[must_use]
+pub fn cmp_keyvalue_value_ni(kv1: &KeyvalueT, kv2: &KeyvalueT) -> std::cmp::Ordering {
+    let n = kv1.length().max(kv2.length());
+    vim_strnicmp(&kv1.value, &kv2.value, n).cmp(&0)
+}
+
+/// `strncmp` over byte slices, treating a byte past either slice's own
+/// end as the NUL a real C string would have there.
+fn strncmp_bytes(s1: &[u8], s2: &[u8], n: usize) -> i32 {
+    for i in 0..n {
+        let c1 = s1.get(i).copied().unwrap_or(0);
+        let c2 = s2.get(i).copied().unwrap_or(0);
+        if c1 != c2 {
+            return i32::from(c1) - i32::from(c2);
+        }
+        if c1 == 0 {
+            break;
+        }
+    }
+    0
 }
 
 /// Sort an array of strings (`sort_strings`). The original sorts in place
@@ -584,6 +672,78 @@ pub unsafe fn vim_strsave_shellescape(string: &[u8], do_special: bool, do_newlin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmp_keyvalue_value_orders_by_the_value_bytes() {
+        use std::cmp::Ordering;
+        let a = KeyvalueT::new(1, b"apple");
+        let b = KeyvalueT::new(2, b"banana");
+        assert_eq!(cmp_keyvalue_value(&a, &b), Ordering::Less);
+        assert_eq!(cmp_keyvalue_value(&b, &a), Ordering::Greater);
+        assert_eq!(cmp_keyvalue_value(&a, &a.clone()), Ordering::Equal);
+        // The key plays no part in the ordering.
+        assert_eq!(
+            cmp_keyvalue_value(&KeyvalueT::new(99, b"apple"), &a),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn cmp_keyvalue_value_n_bounds_by_the_longer_length() {
+        use std::cmp::Ordering;
+        // The bound is MAX, not MIN: bounding by the shorter length
+        // would call a prefix equal to the longer string.
+        let short = KeyvalueT::new(1, b"ab");
+        let long = KeyvalueT::new(2, b"abc");
+        assert_eq!(cmp_keyvalue_value_n(&short, &long), Ordering::Less);
+        assert_eq!(cmp_keyvalue_value_n(&long, &short), Ordering::Greater);
+        assert_eq!(cmp_keyvalue_value_n(&long, &long.clone()), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_keyvalue_value_i_ignores_case() {
+        use std::cmp::Ordering;
+        let lower = KeyvalueT::new(1, b"abc");
+        let upper = KeyvalueT::new(2, b"ABC");
+        assert_eq!(cmp_keyvalue_value_i(&lower, &upper), Ordering::Equal);
+        // ...but a genuine difference still orders.
+        assert_eq!(
+            cmp_keyvalue_value_i(&lower, &KeyvalueT::new(3, b"ABD")),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn cmp_keyvalue_value_ni_ignores_case_and_bounds_by_the_longer() {
+        use std::cmp::Ordering;
+        let short = KeyvalueT::new(1, b"AB");
+        let long = KeyvalueT::new(2, b"abc");
+        assert_eq!(cmp_keyvalue_value_ni(&short, &long), Ordering::Less);
+        assert_eq!(
+            cmp_keyvalue_value_ni(&KeyvalueT::new(1, b"ABC"), &long),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn keyvalue_length_tracks_the_stored_value() {
+        // The original carries `length` as its own field; here it is
+        // derived, so it cannot disagree with the value.
+        assert_eq!(KeyvalueT::new(1, b"abcd").length(), 4);
+        assert_eq!(KeyvalueT::new(1, b"").length(), 0);
+    }
+
+    #[test]
+    fn cmp_keyvalue_value_sorts_a_table() {
+        let mut table = [
+            KeyvalueT::new(1, b"cherry"),
+            KeyvalueT::new(2, b"apple"),
+            KeyvalueT::new(3, b"banana"),
+        ];
+        table.sort_by(cmp_keyvalue_value);
+        let values: Vec<&[u8]> = table.iter().map(|kv| kv.value.as_slice()).collect();
+        assert_eq!(values, vec![&b"apple"[..], &b"banana"[..], &b"cherry"[..]]);
+    }
 
     #[test]
     fn xstrnsave_pads_short_strings_and_truncates_long_ones() {
