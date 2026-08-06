@@ -448,19 +448,14 @@ pub unsafe fn fold_adjust_cursor(wp: &mut WinT) {
 /// line count (matching `mark_adjust_buf`'s own doc comment, its one
 /// real caller).
 ///
-/// Only ever reaches `fold_mark_adjust_recurse`'s "no folds at all"
-/// fast path today (an empty `wp.w_folds`), for the same reason
-/// [`get_deepest_nesting`]'s own doc comment already explains: nothing
-/// in this crate can currently create a fold. The `line1`/`line2`
-/// adjustment computed here is real and exact regardless (it's pure
-/// arithmetic on the function's own parameters, no fold-tree access
-/// involved) - only the final recursive step is limited to the empty
-/// case.
+/// The `line1`/`line2` adjustment computed here is pure arithmetic on
+/// the function's own parameters; the per-fold work is
+/// `fold_mark_adjust_recurse`.
 ///
 /// # Safety
 /// Same as [`has_any_folding`].
 pub unsafe fn fold_mark_adjust(
-    wp: &WinT,
+    wp: &mut WinT,
     line1: crate::pos_defs::LinenrT,
     line2: crate::pos_defs::LinenrT,
     amount: crate::pos_defs::LinenrT,
@@ -470,7 +465,14 @@ pub unsafe fn fold_mark_adjust(
     let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
     let insert_mode = (state & crate::state_defs::mode::INSERT as i32) != 0;
     let (line1, line2) = fold_mark_adjust_effective_range(line1, line2, amount, amount_after, insert_mode);
-    fold_mark_adjust_recurse(&wp.w_folds, line1, line2, amount, amount_after);
+    fold_mark_adjust_recurse(
+        &mut wp.w_folds,
+        line1,
+        line2,
+        amount,
+        amount_after,
+        insert_mode,
+    );
 }
 
 /// Computes `foldMarkAdjust`'s own local `line1`/`line2` adjustments
@@ -506,26 +508,122 @@ fn fold_mark_adjust_effective_range(
 /// Recursive per-fold-array step of [`fold_mark_adjust`]
 /// (`foldMarkAdjustRecurse`).
 ///
-/// The real recursive line-number-adjustment-within-nested-folds body
-/// is `unimplemented!()` - nothing translated can create a fold yet
-/// (matching [`fold_mark_adjust`]'s own doc comment) - but the "no
-/// folds at all" fast path (an empty `gap`) is real and exact: the
-/// original's own `if (gap->ga_len == 0) return;` is its own very
-/// first statement, taken unconditionally today.
+/// Walks the folds at or below `line1` and shifts each one according
+/// to how it overlaps the changed range, recursing into nested folds
+/// whenever a fold straddles a boundary. `amount == MAXLNUM` is the
+/// "lines are being deleted" signal, in which case a fold contained
+/// entirely in the range is removed outright rather than moved.
+///
+/// The six cases are the original's own, in its own order: a fold
+/// wholly above the range is untouched; one wholly below it moves by
+/// `amount_after`; one wholly inside it is deleted or moved; and the
+/// three straddling cases correct their nested folds first, with the
+/// line numbers rebased onto the fold, before adjusting themselves.
+///
+/// `insert_mode` stands in for the original's own `State & MODE_INSERT`
+/// read, which its caller has already performed - an inserted line at
+/// the top of a fold counts as part of the fold in Insert mode, and
+/// does not otherwise.
 fn fold_mark_adjust_recurse(
-    gap: &[FoldT],
-    _line1: crate::pos_defs::LinenrT,
-    _line2: crate::pos_defs::LinenrT,
-    _amount: crate::pos_defs::LinenrT,
-    _amount_after: crate::pos_defs::LinenrT,
+    gap: &mut Vec<FoldT>,
+    line1: crate::pos_defs::LinenrT,
+    line2: crate::pos_defs::LinenrT,
+    amount: crate::pos_defs::LinenrT,
+    amount_after: crate::pos_defs::LinenrT,
+    insert_mode: bool,
 ) {
     if gap.is_empty() {
         return;
     }
-    unimplemented!(
-        "fold::fold_mark_adjust_recurse: recursing into nested folds needs the fold-tree \
-         machinery, not yet translated"
-    );
+    let maxlnum = crate::pos_defs::MAXLNUM;
+
+    // In Insert mode an inserted line at the top of a fold is
+    // considered part of the fold, otherwise it isn't.
+    let top = if insert_mode && amount == 1 && line2 == maxlnum {
+        line1 + 1
+    } else {
+        line1
+    };
+
+    // Find the fold containing or just below "line1".
+    let (_, start) = fold_find(gap, line1);
+
+    // Adjust all folds below "line1" that are affected.
+    let mut i = start;
+    while i < gap.len() {
+        let (fd_top, fd_len) = (gap[i].fd_top, gap[i].fd_len);
+        let last = fd_top + fd_len - 1; // last line of fold
+
+        // 1. Fold completely above line1: nothing to do.
+        if last < line1 {
+            i += 1;
+            continue;
+        }
+
+        if fd_top > line2 {
+            // 6. Fold below line2: only adjust for amount_after.
+            if amount_after == 0 {
+                break;
+            }
+            gap[i].fd_top += amount_after;
+        } else if fd_top >= top && last <= line2 {
+            // 4. Fold completely contained in range.
+            if amount == maxlnum {
+                // Deleting lines: delete the fold completely.
+                delete_fold_entry(gap, i, true);
+                continue; // the next fold has shifted into this slot
+            }
+            gap[i].fd_top += amount;
+        } else if fd_top < top {
+            // 2 or 3: need to correct nested folds too.
+            fold_mark_adjust_recurse(
+                &mut gap[i].fd_nested,
+                line1 - fd_top,
+                line2 - fd_top,
+                amount,
+                amount_after,
+                insert_mode,
+            );
+            if last <= line2 {
+                // 2. Fold contains line1, line2 is below fold.
+                if amount == maxlnum {
+                    gap[i].fd_len = line1 - fd_top;
+                } else {
+                    gap[i].fd_len += amount;
+                }
+            } else {
+                // 3. Fold contains line1 and line2.
+                gap[i].fd_len += amount_after;
+            }
+        } else {
+            // 5. Fold is below line1 and contains line2; need to
+            // correct nested folds too.
+            if amount == maxlnum {
+                fold_mark_adjust_recurse(
+                    &mut gap[i].fd_nested,
+                    0,
+                    line2 - fd_top,
+                    amount,
+                    amount_after + (fd_top - top),
+                    insert_mode,
+                );
+                gap[i].fd_len -= line2 - fd_top + 1;
+                gap[i].fd_top = line1;
+            } else {
+                fold_mark_adjust_recurse(
+                    &mut gap[i].fd_nested,
+                    0,
+                    line2 - fd_top,
+                    amount,
+                    amount_after - amount,
+                    insert_mode,
+                );
+                gap[i].fd_len += amount_after - amount;
+                gap[i].fd_top += amount;
+            }
+        }
+        i += 1;
+    }
 }
 
 /// A single fold (`fold_T`, defined in `fold.c` itself rather than
@@ -1332,40 +1430,139 @@ mod tests {
 
     #[test]
     fn fold_mark_adjust_recurse_is_a_no_op_when_gap_is_empty() {
-        let gap: Vec<FoldT> = Vec::new();
-        fold_mark_adjust_recurse(&gap, 1, 5, 2, 0); // must not panic
+        let mut gap: Vec<FoldT> = Vec::new();
+        fold_mark_adjust_recurse(&mut gap, 1, 5, 2, 0, false); // must not panic
+        assert!(gap.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "needs the fold-tree machinery")]
-    fn fold_mark_adjust_recurse_panics_when_gap_is_non_empty() {
-        let gap = vec![crate::fold::FoldT::default()];
-        fold_mark_adjust_recurse(&gap, 1, 5, 2, 0);
+    fn fold_mark_adjust_recurse_leaves_folds_above_the_range_alone() {
+        // Case 1: a fold wholly above line1 is untouched.
+        let mut gap = sibling_folds();
+        fold_mark_adjust_recurse(&mut gap, 25, 28, 3, 0, false);
+        assert_eq!(gap[0].fd_top, 10);
+        assert_eq!(gap[1].fd_top, 20);
+        // Case 4: the fold at 30 is wholly inside nothing here, but
+        // it IS below line2, so it moves by amount_after (0 = stays).
+        assert_eq!(gap[2].fd_top, 30);
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_shifts_a_fold_inside_the_range() {
+        // Case 4: fold 20-24 lies entirely within 18..26, so it moves
+        // by amount.
+        let mut gap = sibling_folds();
+        fold_mark_adjust_recurse(&mut gap, 18, 26, 3, 0, false);
+        assert_eq!(gap[1].fd_top, 23);
+        assert_eq!(gap[1].fd_len, 5, "its length is unchanged");
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_deletes_a_fold_whose_lines_are_all_gone() {
+        // amount == MAXLNUM means the lines are being deleted, so a
+        // fold contained entirely in the range goes with them.
+        let mut gap = sibling_folds();
+        fold_mark_adjust_recurse(&mut gap, 18, 26, crate::pos_defs::MAXLNUM, 0, false);
+        assert_eq!(gap.len(), 2);
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![10, 30], "only the middle fold is removed");
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_deletes_several_adjacent_folds() {
+        // Deleting a range covering two folds must not skip the
+        // second: removing one shifts the next into the same slot.
+        let mut gap = sibling_folds();
+        fold_mark_adjust_recurse(&mut gap, 8, 26, crate::pos_defs::MAXLNUM, 0, false);
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_top, 30);
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_moves_folds_below_the_range_by_amount_after() {
+        // Case 6: fold 30-34 is below line2, so only amount_after
+        // applies to it.
+        let mut gap = sibling_folds();
+        fold_mark_adjust_recurse(&mut gap, 18, 26, 3, 7, false);
+        assert_eq!(gap[2].fd_top, 37);
+    }
+
+    #[test]
+    fn fold_mark_adjust_recurse_grows_a_fold_that_contains_the_range() {
+        // Case 3: the fold contains both line1 and line2, so it keeps
+        // its top and grows by amount_after.
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            ..Default::default()
+        }];
+        fold_mark_adjust_recurse(&mut gap, 15, 18, 0, 4, false);
+        assert_eq!(gap[0].fd_top, 10, "the fold's start is unaffected");
+        assert_eq!(gap[0].fd_len, 24);
     }
 
     #[test]
     fn fold_mark_adjust_is_a_no_op_when_win_has_no_folds() {
         let _lock = crate::globals::global_state_test_lock();
-        let win = WinT { w_folds: Vec::new(), ..Default::default() };
+        let mut win = WinT { w_folds: Vec::new(), ..Default::default() };
         // A representative spread of amount/line1/line2/amount_after
         // combinations, covering every branch of the internal
         // effective-range computation - none should panic, since
         // `w_folds` stays empty throughout.
-        unsafe { fold_mark_adjust(&win, 5, 8, 2, 0) };
-        unsafe { fold_mark_adjust(&win, 20, 15, 3, 0) };
-        unsafe { fold_mark_adjust(&win, 10, 20, crate::pos_defs::MAXLNUM, -5) };
-        unsafe { fold_mark_adjust(&win, 5, crate::pos_defs::MAXLNUM, 1, 0) };
+        unsafe { fold_mark_adjust(&mut win, 5, 8, 2, 0) };
+        unsafe { fold_mark_adjust(&mut win, 20, 15, 3, 0) };
+        unsafe { fold_mark_adjust(&mut win, 10, 20, crate::pos_defs::MAXLNUM, -5) };
+        unsafe { fold_mark_adjust(&mut win, 5, crate::pos_defs::MAXLNUM, 1, 0) };
+        assert!(win.w_folds.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "needs the fold-tree machinery")]
-    fn fold_mark_adjust_panics_when_win_has_real_folds() {
-        let _lock = crate::globals::global_state_test_lock();
+    fn fold_mark_adjust_recurse_matches_real_nvim_line_deletion() {
+        // Cross-verified against real nvim: with folds at 10-14,
+        // 20-24 and 30-34, deleting lines 18-26 leaves foldlevel()
+        // reporting 1 at lines 10-14 (unmoved), 0 at line 18, and 1 at
+        // lines 21-25 - i.e. the wholly-contained middle fold is gone
+        // and the last fold has shifted down by the 9 deleted lines.
+        let mut gap = sibling_folds();
+        // mark_adjust's own convention for a deletion of lines 18..26:
+        // amount = MAXLNUM, amount_after = -(26 - 18 + 1) = -9.
+        fold_mark_adjust_recurse(
+            &mut gap,
+            18,
+            26,
+            crate::pos_defs::MAXLNUM,
+            -9,
+            false,
+        );
+
+        assert_eq!(gap.len(), 2, "the contained fold is deleted");
+        assert_eq!(gap[0].fd_top, 10, "the fold above is untouched");
+        assert_eq!(gap[0].fd_len, 5);
+        assert_eq!(gap[1].fd_top, 21, "30 - 9 = 21");
+        assert_eq!(gap[1].fd_len, 5);
+
         let win = WinT {
-            w_folds: vec![crate::fold::FoldT::default()],
+            w_folds: gap,
             ..Default::default()
         };
-        unsafe { fold_mark_adjust(&win, 1, 5, 2, 0) };
+        for (lnum, level) in [(10, 1), (12, 1), (14, 1), (18, 0), (21, 1), (25, 1)] {
+            assert_eq!(fold_level_win(&win, lnum), level, "line {lnum}");
+        }
+    }
+
+    #[test]
+    fn fold_mark_adjust_shifts_real_folds_through_the_whole_chain() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        // Fold 20-24 sits entirely inside 18..26, so it moves by
+        // amount; the fold above is untouched and the one below moves
+        // by amount_after.
+        unsafe { fold_mark_adjust(&mut win, 18, 26, 3, 7) };
+        let tops: Vec<_> = win.w_folds.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![10, 23, 37]);
     }
 
     /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,

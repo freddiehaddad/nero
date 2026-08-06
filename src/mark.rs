@@ -2541,7 +2541,7 @@ pub unsafe fn mark_adjust_buf(
 
             if adjust_folds {
                 // SAFETY: forwarded from this function's own safety doc.
-                unsafe { crate::fold::fold_mark_adjust(&*win, line1, line2, amount, amount_after) };
+                unsafe { crate::fold::fold_mark_adjust(&mut *win, line1, line2, amount, amount_after) };
             }
         }
 
@@ -5923,13 +5923,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "needs the fold-tree machinery")]
-    fn mark_adjust_buf_panics_via_fold_mark_adjust_when_adjust_folds_is_true_and_folds_exist() {
+    fn mark_adjust_buf_shifts_folds_when_adjust_folds_is_true() {
         let mut buf = BufT::default();
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: vec![crate::fold::FoldT::default()],
+            w_folds: vec![crate::fold::FoldT {
+                fd_top: 20,
+                fd_len: 5,
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;
@@ -5937,9 +5940,10 @@ mod tests {
         let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
         let _firstwin_guard = FirstwinGuard::set(win_ptr);
 
-        // adjust_folds = true: fold_mark_adjust IS called, and panics
-        // since w_folds is non-empty.
-        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 0, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+        // adjust_folds = true: fold_mark_adjust IS called, so the fold
+        // below the changed range moves by amount_after.
+        unsafe { mark_adjust_buf(buf_ptr, 5, 8, 2, 3, true, MarkAdjustMode::Normal, ExtmarkOp::Noop) };
+        assert_eq!(unsafe { (&(*win_ptr).w_folds)[0].fd_top }, 23);
     }
 
     #[test]
@@ -5983,13 +5987,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "needs the fold-tree machinery")]
     fn mark_adjust_enables_fold_adjustment_unlike_mark_adjust_nofold() {
         let mut buf = BufT::default();
         let buf_ptr = &mut buf as *mut BufT;
         let mut win = WinT {
             w_buffer: buf_ptr,
-            w_folds: vec![crate::fold::FoldT::default()],
+            w_folds: vec![crate::fold::FoldT {
+                fd_top: 20,
+                fd_len: 5,
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let win_ptr = &mut win as *mut WinT;
@@ -5997,7 +6004,11 @@ mod tests {
         let _guard = MarkTestGuard::set(win_ptr, buf_ptr);
         let _firstwin_guard = FirstwinGuard::set(win_ptr);
 
-        unsafe { mark_adjust(5, 8, 2, 0, ExtmarkOp::Noop) };
+        // mark_adjust passes adjust_folds = true, so the fold below
+        // the changed range moves - the difference from
+        // mark_adjust_nofold, asserted in the test below.
+        unsafe { mark_adjust(5, 8, 2, 3, ExtmarkOp::Noop) };
+        assert_eq!(unsafe { (&(*win_ptr).w_folds)[0].fd_top }, 23);
     }
 
     #[test]
