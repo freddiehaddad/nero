@@ -46,9 +46,11 @@
 //! are modeled (the same still-deferred decision as `os_getperm`
 //! below) - `getfperm()`/`eval/fs.c`'s own caller of those bits
 //! remains deferred. `os_fileinfo_hardlinks`/`os_fileinfo_blksize`/
-//! `os_fileinfo_id`/`os_fileinfo_inode`/`os_fileid*` remain deferred
+//! `os_fileinfo_id`/`os_fileinfo_inode`/`os_fileid` remain deferred
 //! too (no real caller yet needing the fields `std::fs::Metadata`
-//! doesn't portably expose).
+//! doesn't portably expose). [`os_fileid_equal`] IS translated: it is
+//! a pure comparison over the already-existing `FileID` struct, so it
+//! does not depend on those raw fields at all.
 //!
 //! `os_set_cloexec` is intentionally NOT translated (not merely
 //! deferred): `std::fs::File`/`OpenOptions` already open every file
@@ -329,6 +331,24 @@ pub fn os_fileinfo(path: &Path) -> Option<FileInfoT> {
 #[must_use]
 pub fn os_fileinfo_link(path: &Path) -> Option<FileInfoT> {
     std::fs::symlink_metadata(path).ok().map(|metadata| FileInfoT { metadata })
+}
+
+/// Whether two [`crate::os::fs_defs::FileID`]s refer to the same file
+/// (`os_fileid_equal`).
+///
+/// Compares BOTH the inode and the device id: an inode number is only
+/// unique within one filesystem, so two files on different devices can
+/// legitimately share one.
+///
+/// This is independent of `os_fileid` itself, which stays deferred -
+/// it needs raw `stat` fields `std::fs::Metadata` does not portably
+/// expose (see this module's own doc comment).
+#[must_use]
+pub fn os_fileid_equal(
+    file_id_1: &crate::os::fs_defs::FileID,
+    file_id_2: &crate::os::fs_defs::FileID,
+) -> bool {
+    file_id_1.inode == file_id_2.inode && file_id_1.device_id == file_id_2.device_id
 }
 
 /// Get the file size from a `FileInfoT` (`os_fileinfo_size`).
@@ -832,6 +852,26 @@ pub(crate) fn cwd_test_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn os_fileid_equal_requires_both_fields_to_match() {
+        use crate::os::fs_defs::FileID;
+        let a = FileID { inode: 42, device_id: 7 };
+        assert!(os_fileid_equal(&a, &FileID { inode: 42, device_id: 7 }));
+
+        // An inode number is only unique within one filesystem, so a
+        // matching inode on a different device is NOT the same file.
+        assert!(!os_fileid_equal(&a, &FileID { inode: 42, device_id: 8 }));
+        // ...and likewise for a differing inode on the same device.
+        assert!(!os_fileid_equal(&a, &FileID { inode: 43, device_id: 7 }));
+    }
+
+    #[test]
+    fn os_fileid_equal_matches_the_empty_sentinel_against_itself() {
+        use crate::os::fs_defs::FileID;
+        assert!(os_fileid_equal(&FileID::empty(), &FileID::empty()));
+        assert!(!os_fileid_equal(&FileID::empty(), &FileID { inode: 1, device_id: 0 }));
+    }
 
     /// A unique-per-test scratch directory under the system temp dir,
     /// removed on drop even if the test panics (RAII), so concurrently
