@@ -218,6 +218,48 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Delete one character under the cursor (`del_char`).
+///
+/// Returns `FAIL` when the cursor sits on the NUL past the end of the
+/// line. Caller must have prepared for undo.
+///
+/// # Safety
+/// Same as [`del_bytes`].
+pub unsafe fn del_char(fixpos: bool) -> i32 {
+    // Make sure the cursor is at the start of a character.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let p = unsafe { crate::cursor::get_cursor_pos_ptr() };
+    if p.first().copied().unwrap_or(0) == 0 {
+        return crate::vim_defs::FAIL;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { del_chars(1, fixpos) }
+}
+
+/// Like [`del_bytes`], but deletes characters instead of bytes
+/// (`del_chars`).
+///
+/// # Safety
+/// Same as [`del_bytes`].
+pub unsafe fn del_chars(count: i32, fixpos: bool) -> i32 {
+    let mut bytes = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let p = unsafe { crate::cursor::get_cursor_pos_ptr() };
+    let mut idx = 0usize;
+    let mut i = 0;
+    while i < count && p.get(idx).copied().unwrap_or(0) != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = unsafe { crate::mbyte::utfc_ptr2len(&p[idx..]) };
+        bytes += l;
+        idx += l as usize;
+        i += 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { del_bytes(bytes, fixpos, true) }
+}
+
 /// Delete `count` bytes at the cursor position (`del_bytes`).
 ///
 /// Returns `FAIL` when the cursor sits on the NUL past the end of the
@@ -1870,6 +1912,75 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn del_char_removes_one_whole_multibyte_character() {
+        // Cross-verified against real nvim: "aébc" with the cursor on
+        // column 2 (1-based, the 2-byte é) and "x" yields "abc" with
+        // the cursor still on column 2.
+        let (mut buf, mut win) = del_fixture("aébc".as_bytes(), 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_char(true) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abc\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_chars_counts_characters_not_bytes() {
+        // Cross-verified against real nvim: "aébcd" with the cursor on
+        // column 2 and "3x" deletes é, b and c, yielding "ad" with the
+        // cursor still on column 2.
+        let (mut buf, mut win) = del_fixture("aébcd".as_bytes(), 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_chars(3, true) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ad\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_char_fails_on_the_nul_past_the_end() {
+        let (mut buf, mut win) = del_fixture(b"ab", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_char(true) }, crate::vim_defs::FAIL);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_chars_stops_at_the_end_of_the_line() {
+        // Asking for more characters than remain deletes only what is
+        // there - the loop's own `*p != NUL` guard.
+        let (mut buf, mut win) = del_fixture(b"abc", 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        assert_eq!(unsafe { del_chars(99, true) }, crate::vim_defs::OK);
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"a\0");
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
