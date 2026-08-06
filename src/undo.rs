@@ -83,6 +83,14 @@
 //! directory-creation-failure `emsg("E5003: ...")` has its display
 //! skipped, matching this file's own established policy (see below).
 //!
+//! [`u_force_get_undo_header`] is translated too: it returns the
+//! buffer's current undo header, creating one via [`u_savecommon`] if
+//! none exists, and null when undo is disabled. The original's
+//! `abort()` on "no header despite `'undolevels'` > 0" is an
+//! internal-consistency assert rather than a recoverable case, so it
+//! becomes a `debug_assert!` - a release build degrades to returning
+//! null instead of aborting.
+//!
 //! Deferred (each needs a not-yet-translated subsystem):
 //! - `u_check_tree`/`u_check`: `#ifdef U_DEBUG`-only consistency
 //!   checkers, need `emsg`/`smsg`/`semsg` (`message.c`) and the
@@ -656,6 +664,45 @@ fn u_getbot(buf: &mut BufT) {
     }
 
     buf.b_u_synced = true;
+}
+
+/// Get the buffer's current undo header, creating one if none is set
+/// (`u_force_get_undo_header`).
+///
+/// Returns null when undo is disabled (`'undolevels'` of `-1`), which
+/// callers must treat as "nothing to record" rather than an error.
+///
+/// The original aborts if no header exists after `u_savecommon` even
+/// though `'undolevels'` is positive - an internal-consistency assert,
+/// not a recoverable case. That is left as a `debug_assert!` here so a
+/// release build degrades to returning null rather than aborting.
+///
+/// # Safety
+/// Forwarded from [`u_savecommon`].
+pub unsafe fn u_force_get_undo_header(buf: &mut BufT) -> *mut UHeader {
+    let mut uhp: *mut UHeader = std::ptr::null_mut();
+    if !buf.b_u_curhead.is_null() {
+        uhp = buf.b_u_curhead;
+    } else if !buf.b_u_newhead.is_null() {
+        uhp = buf.b_u_newhead;
+    }
+
+    if uhp.is_null() {
+        // Replace an empty range by an empty range, purely to force a
+        // header into existence.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { u_savecommon(buf, 0, 1, 1, true) };
+
+        uhp = buf.b_u_curhead;
+        if uhp.is_null() {
+            uhp = buf.b_u_newhead;
+            debug_assert!(
+                !(get_undolevel(buf) > 0 && uhp.is_null()),
+                "u_force_get_undo_header: no undo header despite undolevels > 0"
+            );
+        }
+    }
+    uhp
 }
 
 /// Stop adding to the current entry list (`u_sync`).
@@ -1471,6 +1518,53 @@ mod tests {
     use super::*;
     use crate::pos_defs::PosT;
     use crate::undo_defs::UEntry;
+
+    #[test]
+    fn u_force_get_undo_header_prefers_curhead() {
+        let _lock = crate::globals::global_state_test_lock();
+        let curhead = new_header();
+        let newhead = new_header();
+        let mut buf = BufT {
+            b_u_curhead: curhead,
+            b_u_newhead: newhead,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { u_force_get_undo_header(&mut buf) }, curhead);
+
+        drop(unsafe { Box::from_raw(curhead) });
+        drop(unsafe { Box::from_raw(newhead) });
+    }
+
+    #[test]
+    fn u_force_get_undo_header_falls_back_to_newhead() {
+        let _lock = crate::globals::global_state_test_lock();
+        let newhead = new_header();
+        let mut buf = BufT {
+            b_u_curhead: std::ptr::null_mut(),
+            b_u_newhead: newhead,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { u_force_get_undo_header(&mut buf) }, newhead);
+
+        drop(unsafe { Box::from_raw(newhead) });
+    }
+
+    #[test]
+    fn u_force_get_undo_header_is_null_when_undo_is_disabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_ul = opts.p_ul;
+        opts.p_ul = -1;
+
+        // With undo disabled there is no header to create, so callers
+        // get null rather than an error - "nothing to record".
+        let mut buf = BufT { b_p_ul: -1, ..Default::default() };
+        assert!(unsafe { u_force_get_undo_header(&mut buf) }.is_null());
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = prev_ul;
+    }
 
     /// Allocates a new, `Box::into_raw`-owned `UHeader`, matching the
     /// original's `xmalloc(sizeof(u_header_T))` allocation style.
