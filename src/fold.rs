@@ -853,6 +853,45 @@ pub fn delete_fold_entry(gap: &mut Vec<FoldT>, idx: usize, recursive: bool) {
     gap.splice(idx..idx, nested);
 }
 
+/// Open every fold nested inside `fpr` (`foldOpenNested`).
+///
+/// Only the nested folds are opened; `fpr` itself is left alone,
+/// exactly as the original does - its callers set its own flag.
+pub fn fold_open_nested(fpr: &mut FoldT) {
+    for fp in &mut fpr.fd_nested {
+        fold_open_nested(fp);
+        fp.fd_flags = fd_flags::FD_OPEN;
+    }
+}
+
+/// Close manually-opened folds that no longer contain `lnum`
+/// (`checkCloseRec`).
+///
+/// Only folds that were opened by hand ([`fd_flags::FD_OPEN`]) are
+/// candidates: once `level` runs out, any such fold that does not
+/// contain the line is handed back to `'foldlevel'` control by
+/// setting [`fd_flags::FD_LEVEL`]. A fold that still contains the
+/// line is recursed into instead, with the line number rebased onto
+/// it since nested folds store `fd_top` relative to their parent.
+///
+/// Returns whether anything was actually closed.
+pub fn check_close_rec(gap: &mut [FoldT], lnum: crate::pos_defs::LinenrT, level: i32) -> bool {
+    let mut retval = false;
+    for fp in gap {
+        // Only manually opened folds may need to be closed.
+        if fp.fd_flags == fd_flags::FD_OPEN {
+            if level <= 0 && (lnum < fp.fd_top || lnum >= fp.fd_top + fp.fd_len) {
+                fp.fd_flags = fd_flags::FD_LEVEL;
+                retval = true;
+            } else {
+                let top = fp.fd_top;
+                retval |= check_close_rec(&mut fp.fd_nested, lnum - top, level - 1);
+            }
+        }
+    }
+    retval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1563,6 +1602,120 @@ mod tests {
         unsafe { fold_mark_adjust(&mut win, 18, 26, 3, 7) };
         let tops: Vec<_> = win.w_folds.iter().map(|f| f.fd_top).collect();
         assert_eq!(tops, vec![10, 23, 37]);
+    }
+
+    #[test]
+    fn fold_open_nested_opens_children_but_not_the_fold_itself() {
+        let mut fpr = FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_CLOSED,
+            fd_nested: vec![
+                FoldT {
+                    fd_flags: fd_flags::FD_CLOSED,
+                    ..Default::default()
+                },
+                FoldT {
+                    fd_flags: fd_flags::FD_LEVEL,
+                    fd_nested: vec![FoldT {
+                        fd_flags: fd_flags::FD_CLOSED,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        fold_open_nested(&mut fpr);
+
+        // The original leaves the fold's own flag to its callers.
+        assert_eq!(fpr.fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(fpr.fd_nested[0].fd_flags, fd_flags::FD_OPEN);
+        assert_eq!(fpr.fd_nested[1].fd_flags, fd_flags::FD_OPEN);
+        // Every depth is opened, not just the first.
+        assert_eq!(fpr.fd_nested[1].fd_nested[0].fd_flags, fd_flags::FD_OPEN);
+    }
+
+    #[test]
+    fn fold_open_nested_on_a_childless_fold_is_a_noop() {
+        let mut fpr = FoldT {
+            fd_flags: fd_flags::FD_CLOSED,
+            ..Default::default()
+        };
+        fold_open_nested(&mut fpr);
+        assert_eq!(fpr.fd_flags, fd_flags::FD_CLOSED);
+        assert!(fpr.fd_nested.is_empty());
+    }
+
+    #[test]
+    fn check_close_rec_closes_a_manually_opened_fold_not_containing_the_line() {
+        let mut gap = sibling_folds();
+        for fp in &mut gap {
+            fp.fd_flags = fd_flags::FD_OPEN;
+        }
+        // Line 22 is inside the middle fold only, so the other two
+        // are handed back to 'foldlevel' control.
+        assert!(check_close_rec(&mut gap, 22, 0));
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_LEVEL);
+        assert_eq!(gap[1].fd_flags, fd_flags::FD_OPEN, "still contains 22");
+        assert_eq!(gap[2].fd_flags, fd_flags::FD_LEVEL);
+    }
+
+    #[test]
+    fn check_close_rec_ignores_folds_that_were_not_manually_opened() {
+        let mut gap = sibling_folds();
+        gap[0].fd_flags = fd_flags::FD_CLOSED;
+        gap[1].fd_flags = fd_flags::FD_LEVEL;
+        gap[2].fd_flags = fd_flags::FD_CLOSED;
+
+        assert!(!check_close_rec(&mut gap, 22, 0), "nothing was closed");
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(gap[1].fd_flags, fd_flags::FD_LEVEL);
+        assert_eq!(gap[2].fd_flags, fd_flags::FD_CLOSED);
+    }
+
+    #[test]
+    fn check_close_rec_recurses_with_a_rebased_line_number() {
+        // Outer fold 10-29 open, nested fold at absolute 15-19 open.
+        // Line 25 is inside the outer fold but not the nested one, so
+        // only the nested fold closes - and only if the line number
+        // was correctly rebased by the parent's fd_top.
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_nested: vec![FoldT {
+                fd_top: 5,
+                fd_len: 5,
+                fd_flags: fd_flags::FD_OPEN,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        assert!(check_close_rec(&mut gap, 25, 1));
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_OPEN, "still contains 25");
+        assert_eq!(gap[0].fd_nested[0].fd_flags, fd_flags::FD_LEVEL);
+    }
+
+    #[test]
+    fn check_close_rec_leaves_everything_open_while_level_remains() {
+        let mut gap = sibling_folds();
+        for fp in &mut gap {
+            fp.fd_flags = fd_flags::FD_OPEN;
+        }
+        // A positive level means the folds at this depth are never
+        // closed outright; they are only recursed into.
+        assert!(!check_close_rec(&mut gap, 22, 1));
+        for fp in &gap {
+            assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
+        }
+    }
+
+    #[test]
+    fn check_close_rec_on_an_empty_array_reports_nothing_closed() {
+        assert!(!check_close_rec(&mut [], 5, 0));
     }
 
     /// Points `GLOBALS.curwin` at `win` for the guard's lifetime,
