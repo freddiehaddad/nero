@@ -7,6 +7,13 @@
 //! `buf->b_signlist`) and/or the Ex-command execution engine, neither
 //! translated.
 //!
+//! Also translated: [`group_get_ns`]/[`buf_findsign`]. Note that the
+//! original's `map_get` yields `0` for a missing key and then maps
+//! that same `0` to `-1`, so a group genuinely registered under
+//! namespace `0` is indistinguishable from an unknown one - which is
+//! why `buf_findsign` rejects a NAMED group resolving to `0` rather
+//! than treating it as the global namespace.
+//!
 //! Translated: `sign_cmd_idx` (find a `":sign"` subcommand's index by
 //! name, via the small, fixed `cmds` table). No real caller yet
 //! (`ex_sign`, its only reader, isn't translated) - translated ahead
@@ -58,6 +65,66 @@ pub const SIGNCMD_LAST: i32 = 6;
 /// portion - this crate's own byte slice already carries its own
 /// bound, so `cmd` is simply the already-isolated subcommand text
 /// directly, with no NUL-poking/restoring needed.
+/// Convert a sign `group` to a namespace filter (`group_get_ns`).
+///
+/// `None` is the global namespace (`0`), `"*"` means every namespace
+/// (`u32::MAX`), and any other name is looked up. An unknown name
+/// yields `-1`, which callers must treat as "no such group" rather
+/// than as a namespace id.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::api::extmark::NAMESPACE_IDS`.
+#[must_use]
+pub unsafe fn group_get_ns(group: Option<&[u8]>) -> i64 {
+    let Some(group) = group else {
+        return 0; // Global namespace
+    };
+    if group == b"*" {
+        return i64::from(u32::MAX); // All namespaces
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let ids = unsafe { crate::api::extmark::NAMESPACE_IDS.get_mut() };
+    // The original's `map_get` yields 0 for a missing key, and it
+    // maps that same 0 to -1 - so a namespace id of 0 is
+    // indistinguishable from "not found" here too, by construction.
+    match ids.get(&group.to_vec()).copied().unwrap_or(0) {
+        0 => -1,
+        ns => i64::from(ns),
+    }
+}
+
+/// Find the line a sign is on (`buf_findsign`), or `0` when there is
+/// no such sign.
+///
+/// Returns a 1-based line number, since `0` is the "not found"
+/// answer.
+///
+/// # Safety
+/// Forwarded from [`group_get_ns`].
+#[must_use]
+pub unsafe fn buf_findsign(
+    buf: &crate::buffer_defs::BufT,
+    id: u32,
+    group: Option<&[u8]>,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ns = unsafe { group_get_ns(group) };
+    // A named group that resolved to the global namespace is not a
+    // real match, so it is rejected alongside an unknown group.
+    if ns < 0 || (group.is_some() && ns == 0) {
+        return 0;
+    }
+    let key = crate::marktree::marktree_lookup_ns(
+        &buf.b_marktree,
+        u32::try_from(ns).unwrap_or(0),
+        id,
+        false,
+        None,
+    );
+    key.pos.row + 1
+}
+
 #[must_use]
 pub fn sign_cmd_idx(cmd: &[u8]) -> i32 {
     for (idx, name) in CMDS.iter().enumerate() {
@@ -188,6 +255,96 @@ pub unsafe fn init_sign_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Removes the namespace names a test inserted, so the shared
+    /// table is left as it was found. Cloning the whole map is not an
+    /// option: `Map` is not `Clone`.
+    struct NamespaceIdsGuard {
+        inserted: Vec<Vec<u8>>,
+    }
+
+    impl NamespaceIdsGuard {
+        fn new() -> Self {
+            Self { inserted: Vec::new() }
+        }
+
+        fn insert(&mut self, name: &[u8], id: i32) {
+            unsafe { crate::api::extmark::NAMESPACE_IDS.get_mut() }.insert(name.to_vec(), id);
+            self.inserted.push(name.to_vec());
+        }
+    }
+
+    impl Drop for NamespaceIdsGuard {
+        fn drop(&mut self) {
+            let ids = unsafe { crate::api::extmark::NAMESPACE_IDS.get_mut() };
+            for name in &self.inserted {
+                ids.remove(name);
+            }
+        }
+    }
+
+    #[test]
+    fn group_get_ns_maps_none_to_the_global_namespace() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { group_get_ns(None) }, 0);
+    }
+
+    #[test]
+    fn group_get_ns_maps_star_to_all_namespaces() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { group_get_ns(Some(b"*")) }, i64::from(u32::MAX));
+    }
+
+    #[test]
+    fn group_get_ns_looks_up_a_named_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut guard = NamespaceIdsGuard::new();
+        guard.insert(b"mygroup", 7);
+
+        assert_eq!(unsafe { group_get_ns(Some(b"mygroup")) }, 7);
+    }
+
+    #[test]
+    fn group_get_ns_reports_minus_one_for_an_unknown_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = NamespaceIdsGuard::new();
+        // -1 is "no such group", which is NOT a namespace id - callers
+        // have to reject it rather than pass it through.
+        assert_eq!(unsafe { group_get_ns(Some(b"nope")) }, -1);
+    }
+
+    #[test]
+    fn buf_findsign_returns_zero_for_an_unknown_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = NamespaceIdsGuard::new();
+        let buf = crate::buffer_defs::BufT::default();
+
+        assert_eq!(unsafe { buf_findsign(&buf, 1, Some(b"nope")) }, 0);
+    }
+
+    #[test]
+    fn buf_findsign_rejects_a_named_group_resolving_to_global() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut guard = NamespaceIdsGuard::new();
+        // A group explicitly mapped to namespace 0 is indistinguishable
+        // from "not found" in the original's map_get, so it is
+        // rejected rather than treated as the global namespace.
+        guard.insert(b"zero", 0);
+        let buf = crate::buffer_defs::BufT::default();
+
+        assert_eq!(unsafe { buf_findsign(&buf, 1, Some(b"zero")) }, 0);
+    }
+
+    #[test]
+    fn buf_findsign_finds_nothing_in_an_empty_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = NamespaceIdsGuard::new();
+        let buf = crate::buffer_defs::BufT::default();
+
+        // The global namespace is allowed through, but there is no
+        // such mark, so the lookup reports row -1 -> line 0.
+        assert_eq!(unsafe { buf_findsign(&buf, 1, None) }, 0);
+    }
 
     // ---- describe_sign_text / init_sign_text ----
 
