@@ -85,6 +85,14 @@
 
 use crate::buffer_defs::WinT;
 
+/// Non-zero while fold updates are suppressed (`disable_fold_update`).
+///
+/// Set around operations that would otherwise trigger a fold
+/// recomputation at a point where the buffer is in an inconsistent
+/// state.
+pub static DISABLE_FOLD_UPDATE: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
 /// @return true if `'foldmethod'` is "manual" (`foldmethodIsManual`).
 #[must_use]
 pub fn foldmethod_is_manual(wp: &WinT) -> bool {
@@ -119,6 +127,70 @@ pub fn foldmethod_is_syntax(wp: &WinT) -> bool {
 #[must_use]
 pub fn foldmethod_is_diff(wp: &WinT) -> bool {
     wp.w_onebuf_opt.wo_fdm.as_deref().is_some_and(|s| s.first() == Some(&b'd'))
+}
+
+/// Update the folds of window `wp` for the line range `top..bot`
+/// (`foldUpdate`).
+///
+/// # Scope
+///
+/// Every guard is real and translated: the `disable_fold_update`
+/// suppression, the Insert-mode skip for non-`"indent"` fold methods,
+/// the pending-diff-redraw skip, the "mark existing folds in range as
+/// maybe-small" pass, and the fold-method dispatch.
+///
+/// Two branches behind those guards are `unimplemented!()`, and both
+/// are unreachable today:
+///
+/// The maybe-small pass needs `foldFind` plus a real `fold_T` array
+/// view over `w_folds`; `w_folds.ga_len` is always `0`, because
+/// nothing translated can create a fold yet.
+///
+/// `foldUpdateIEMS` is only reached when `'foldmethod'` is one of
+/// `"indent"`/`"expr"`/`"marker"`/`"diff"`/`"syntax"`. `wo_fdm` is
+/// `None` for every window this crate can build, so all five
+/// predicates are false and the real default, `"manual"`, applies.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (for the current editor mode).
+pub unsafe fn fold_update(wp: &mut WinT, top: crate::pos_defs::LinenrT, bot: crate::pos_defs::LinenrT) {
+    // SAFETY: reading plain scalar globals, matching this crate's
+    // established `GlobalCell::get_mut` convention.
+    let disabled = *unsafe { DISABLE_FOLD_UPDATE.get_mut() } != 0;
+    // SAFETY: as above.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    if disabled || (state & crate::state_defs::mode::INSERT != 0 && !foldmethod_is_indent(wp)) {
+        return;
+    }
+
+    // SAFETY: as above.
+    if *unsafe { crate::diff::NEED_DIFF_REDRAW.get_mut() } {
+        // Will be updated later.
+        return;
+    }
+
+    if wp.w_folds.ga_len > 0 {
+        // Mark all folds from top to bot (or bot to top) as
+        // maybe-small.
+        unimplemented!(
+            "marking folds maybe-small needs foldFind and a fold_T view over w_folds, \
+             not yet translated; unreachable while no fold can be created"
+        );
+    }
+
+    if foldmethod_is_indent(wp)
+        || foldmethod_is_expr(wp)
+        || foldmethod_is_marker(wp)
+        || foldmethod_is_diff(wp)
+        || foldmethod_is_syntax(wp)
+    {
+        unimplemented!(
+            "foldUpdateIEMS is not yet translated; unreachable while 'foldmethod' \
+             cannot be set away from its real default of \"manual\""
+        );
+    }
+
+    let _ = (top, bot);
 }
 
 /// Returns `true` if creating/deleting a manual fold is allowed with
@@ -508,9 +580,98 @@ mod tests {
         }
     }
 
+    /// A window with `'foldmethod'` left at its real default. `wo_fdm`
+    /// is `None` for every window this crate can build, which is what
+    /// makes `fold_update`'s dispatch branch unreachable.
+    fn win_default_fdm() -> WinT {
+        WinT::default()
+    }
+
+    /// Save/restore the globals `fold_update` reads, so these tests
+    /// cannot leak state into others.
+    struct FoldUpdateGuard {
+        prev_disable: i32,
+        prev_need_redraw: bool,
+        prev_state: i32,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FoldUpdateGuard {
+        fn set() -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = FoldUpdateGuard {
+                prev_disable: *unsafe { DISABLE_FOLD_UPDATE.get_mut() },
+                prev_need_redraw: *unsafe { crate::diff::NEED_DIFF_REDRAW.get_mut() },
+                prev_state: g.State,
+                _lock,
+            };
+            unsafe { *DISABLE_FOLD_UPDATE.get_mut() = 0 };
+            unsafe { *crate::diff::NEED_DIFF_REDRAW.get_mut() = false };
+            g.State = crate::state_defs::mode::NORMAL as i32;
+            guard
+        }
+    }
+
+    impl Drop for FoldUpdateGuard {
+        fn drop(&mut self) {
+            unsafe { *DISABLE_FOLD_UPDATE.get_mut() = self.prev_disable };
+            unsafe { *crate::diff::NEED_DIFF_REDRAW.get_mut() = self.prev_need_redraw };
+            unsafe { crate::globals::GLOBALS.get_mut() }.State = self.prev_state;
+        }
+    }
+
     #[test]
-    fn foldmethod_is_expr_true_only_for_expr() {
-        assert!(foldmethod_is_expr(&win_with_fdm(b"expr")));
+    fn fold_update_is_a_noop_with_the_default_foldmethod() {
+        // 'foldmethod' defaults to "manual" and no fold exists, so
+        // every dispatch predicate is false and the call completes
+        // without reaching either deferred branch.
+        let _guard = FoldUpdateGuard::set();
+        let mut win = win_default_fdm();
+        unsafe { fold_update(&mut win, 1, 10) };
+    }
+
+    #[test]
+    fn fold_update_returns_early_when_disabled() {
+        let _guard = FoldUpdateGuard::set();
+        unsafe { *DISABLE_FOLD_UPDATE.get_mut() = 1 };
+        // "indent" would otherwise reach the deferred dispatch.
+        let mut win = win_with_fdm(b"indent");
+        unsafe { fold_update(&mut win, 1, 10) };
+    }
+
+    #[test]
+    fn fold_update_returns_early_in_insert_mode_for_non_indent_methods() {
+        let _guard = FoldUpdateGuard::set();
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::INSERT as i32;
+        // "marker" would otherwise reach the deferred dispatch, but
+        // Insert mode skips every method except "indent".
+        let mut win = win_with_fdm(b"marker");
+        unsafe { fold_update(&mut win, 1, 10) };
+    }
+
+    #[test]
+    fn fold_update_returns_early_when_a_diff_redraw_is_pending() {
+        let _guard = FoldUpdateGuard::set();
+        unsafe { *crate::diff::NEED_DIFF_REDRAW.get_mut() = true };
+        let mut win = win_with_fdm(b"expr");
+        unsafe { fold_update(&mut win, 1, 10) };
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdateIEMS")]
+    fn fold_update_dispatch_is_unreachable_but_documented() {
+        // Proves the dispatch guard really is driven by 'foldmethod'
+        // rather than hardcoded away: forcing a value nothing in this
+        // crate can currently produce reaches the deferred branch.
+        let _guard = FoldUpdateGuard::set();
+        let mut win = win_with_fdm(b"indent");
+        unsafe { fold_update(&mut win, 1, 10) };
+    }
+
+    #[test]
+    fn foldmethod_is_expr_true_only_for_expr() {        assert!(foldmethod_is_expr(&win_with_fdm(b"expr")));
         assert!(!foldmethod_is_expr(&win_with_fdm(b"manual")));
         assert!(!foldmethod_is_expr(&win_with_fdm(b"indent")));
         assert!(!foldmethod_is_expr(&win_with_fdm(b"marker")));

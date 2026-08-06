@@ -133,6 +133,14 @@ pub static DIFF_FLAGS: crate::globals::GlobalCell<i32> = crate::globals::GlobalC
         | diff_flag::INLINE_CHAR,
 );
 
+/// Set when `diff_redraw()` still needs to be called
+/// (`need_diff_redraw`).
+///
+/// While this is set, fold updates are postponed, since the diff
+/// itself is about to be recomputed anyway.
+pub static NEED_DIFF_REDRAW: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
 /// Free one diff block (`clear_diffblock`).
 ///
 /// # Safety
