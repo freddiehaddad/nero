@@ -3103,6 +3103,34 @@ pub unsafe fn ml_close(buf: &mut BufT, del_file: bool) {
     buf.b_flags &= !(crate::buffer_defs::b_flags::BF_RECOVERED as i32);
 }
 
+/// Close the memfiles of every unmodified buffer, deleting their swap
+/// files (`ml_close_notmod`).
+///
+/// Only for use just before exiting: a modified buffer keeps its swap
+/// file so its changes can still be recovered, while an unmodified
+/// one has nothing worth recovering and is torn down.
+///
+/// # Safety
+/// Walks the real `GLOBALS.firstbuf`/`b_next` linked list - same
+/// requirement as [`crate::undo::any_buf_is_changed`]. Every buffer
+/// on it must additionally satisfy [`ml_close`]'s own requirement on
+/// `b_ml.ml_mfp`.
+pub unsafe fn ml_close_notmod() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut bp = unsafe { GLOBALS.get_mut() }.firstbuf;
+    while !bp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &mut *bp };
+        let next = buf.b_next;
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { crate::undo::buf_is_changed(buf) } {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { ml_close(buf, true) }; // close all not-modified buffers
+        }
+        bp = next;
+    }
+}
+
 /// Set the `DB_MARKED` flag for line `lnum` in the current buffer,
 /// registering it with the `:global` command's mark set
 /// (`ml_setmarked`).
@@ -4685,6 +4713,112 @@ mod tests {
             }
             assert_eq!((*buf_ptr).b_ml.ml_line_count, 4);
             prev
+        }
+    }
+
+    #[test]
+    fn ml_close_notmod_closes_unmodified_buffers_and_spares_modified_ones() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut clean = test_buf();
+        let mut dirty = test_buf();
+        unsafe {
+            assert_eq!(ml_open(&mut clean), OK);
+            assert_eq!(ml_open(&mut dirty), OK);
+            dirty.b_changed = 1;
+
+            // Link them into the real buffer list: dirty -> clean.
+            // Each buffer is written in full BEFORE a pointer to it is
+            // taken, so the direct writes cannot invalidate a pointer
+            // the list walk later reborrows (Tree Borrows).
+            clean.b_next = std::ptr::null_mut();
+            dirty.b_next = &mut clean;
+            let g = GLOBALS.get_mut();
+            let previous = g.firstbuf;
+            g.firstbuf = &mut dirty;
+
+            ml_close_notmod();
+
+            GLOBALS.get_mut().firstbuf = previous;
+
+            assert!(
+                clean.b_ml.ml_mfp.is_null(),
+                "an unmodified buffer has nothing to recover, so it is closed"
+            );
+            assert!(
+                !dirty.b_ml.ml_mfp.is_null(),
+                "a modified buffer keeps its swap file for recovery"
+            );
+        }
+        close_test_memline(dirty);
+    }
+
+    #[test]
+    fn ml_close_notmod_walks_the_whole_buffer_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut third = test_buf();
+        let mut second = test_buf();
+        let mut first = test_buf();
+        unsafe {
+            for b in [&mut first, &mut second, &mut third] {
+                assert_eq!(ml_open(b), OK);
+            }
+            // The buffer in the middle is the modified one, so the
+            // walk has to continue past a buffer it does not close.
+            second.b_changed = 1;
+
+            // Written tail-first so each buffer is complete before a
+            // pointer to it is taken (see the note above).
+            third.b_next = std::ptr::null_mut();
+            second.b_next = &mut third;
+            first.b_next = &mut second;
+            let g = GLOBALS.get_mut();
+            let previous = g.firstbuf;
+            g.firstbuf = &mut first;
+
+            ml_close_notmod();
+
+            GLOBALS.get_mut().firstbuf = previous;
+
+            assert!(first.b_ml.ml_mfp.is_null());
+            assert!(!second.b_ml.ml_mfp.is_null());
+            assert!(third.b_ml.ml_mfp.is_null(), "the walk must reach the tail");
+        }
+        close_test_memline(second);
+    }
+
+    #[test]
+    fn ml_close_notmod_tolerates_buffers_with_no_memline() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Neither buffer ever had ml_open called, so ml_close's own
+        // null-memfile early exit is what keeps this safe.
+        let mut tail = test_buf();
+        let mut head = test_buf();
+        unsafe {
+            // Written tail-first so each buffer is complete before a
+            // pointer to it is taken (see the note above).
+            tail.b_next = std::ptr::null_mut();
+            head.b_next = &mut tail;
+            let g = GLOBALS.get_mut();
+            let previous = g.firstbuf;
+            g.firstbuf = &mut head;
+
+            ml_close_notmod();
+
+            GLOBALS.get_mut().firstbuf = previous;
+            assert!(head.b_ml.ml_mfp.is_null());
+            assert!(tail.b_ml.ml_mfp.is_null());
+        }
+    }
+
+    #[test]
+    fn ml_close_notmod_on_an_empty_buffer_list_is_a_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let g = GLOBALS.get_mut();
+            let previous = g.firstbuf;
+            g.firstbuf = std::ptr::null_mut();
+            ml_close_notmod();
+            GLOBALS.get_mut().firstbuf = previous;
         }
     }
 
