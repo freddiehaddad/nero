@@ -873,6 +873,61 @@ pub unsafe fn mf_close(mut mfp: MemfileT, del_file: bool) {
     // original's `xfree(mfp)`.
 }
 
+/// Close the swap file of a buffer's memfile and delete it, while
+/// keeping the memfile itself alive in memory (`mf_close_file`).
+///
+/// With `getlines` set, every line is read first so the whole buffer
+/// is resident in memory before the file backing it goes away - the
+/// original's own "clumsy!" comment marks this as deliberate.
+///
+/// Does nothing when there is no memfile or it has no open file.
+///
+/// # Translation note
+/// `mf_fd` is an `Option<std::fs::File>` here, so the original's
+/// `close(mfp->mf_fd)` is dropping the `File` and its `mf_fd = -1` is
+/// setting it to `None` - one step in Rust. The `emsg(e_swapclose)`
+/// on a failing `close()` is omitted under this module's own
+/// established policy for message display (see the module doc): it
+/// changes no control flow, and `std::fs::File`'s own drop has no
+/// failure path to observe in the first place.
+///
+/// # Safety
+/// Same as [`crate::memline::ml_get_buf`], which this calls for every
+/// line when `getlines` is set.
+pub unsafe fn mf_close_file(buf: &mut crate::buffer_defs::BufT, getlines: bool) {
+    if buf.b_ml.ml_mfp.is_null() {
+        return; // nothing to close
+    }
+    // SAFETY: ml_mfp is non-null, so it points at this buffer's live
+    // memfile - the same invariant every other ml_mfp user relies on.
+    if unsafe { (*buf.b_ml.ml_mfp).mf_fd.is_none() } {
+        return; // nothing to close
+    }
+
+    if getlines {
+        // Get all blocks in memory by accessing all lines (clumsy!)
+        for lnum in 1..=buf.b_ml.ml_line_count {
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { crate::memline::ml_get_buf(buf, lnum) };
+        }
+    }
+
+    // SAFETY: as above - and re-derived here rather than held across
+    // the ml_get_buf loop, which reborrows the same buffer.
+    let mfp = unsafe { &mut *buf.b_ml.ml_mfp };
+    mfp.mf_fd = None; // close the file
+
+    if let Some(fname) = &mfp.mf_fname
+        && let Ok(fname_str) = std::str::from_utf8(fname)
+    {
+        // Delete the swap file.
+        crate::os::fs::os_remove(std::path::Path::new(fname_str));
+    }
+    if mfp.mf_fname.is_some() {
+        mf_free_fnames(mfp);
+    }
+}
+
 /// Frees `mf_fname` and `mf_ffname` (`mf_free_fnames`).
 pub fn mf_free_fnames(mfp: &mut MemfileT) {
     mfp.mf_fname = None;
@@ -1640,6 +1695,83 @@ mod tests {
             mf_free(&mut mfp, neg);
             drain_free_list(&mut mfp);
         }
+    }
+
+    #[test]
+    fn mf_close_file_is_a_noop_without_a_memfile() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert!(buf.b_ml.ml_mfp.is_null());
+        // Must not dereference a null memfile.
+        unsafe { mf_close_file(&mut buf, false) };
+        unsafe { mf_close_file(&mut buf, true) };
+        assert!(buf.b_ml.ml_mfp.is_null());
+    }
+
+    #[test]
+    fn mf_close_file_is_a_noop_when_the_memfile_has_no_open_file() {
+        let mut mfp = test_mfp();
+        mfp.mf_fname = Some(b"kept.swp".to_vec());
+        mfp.mf_ffname = Some(b"/full/kept.swp".to_vec());
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
+
+        unsafe { mf_close_file(&mut buf, false) };
+
+        // The early return happens before the names are touched, so a
+        // memfile that never opened a file keeps them.
+        let owned = unsafe { Box::from_raw(buf.b_ml.ml_mfp) };
+        assert_eq!(owned.mf_fname.as_deref(), Some(b"kept.swp".as_ref()));
+        assert_eq!(owned.mf_ffname.as_deref(), Some(b"/full/kept.swp".as_ref()));
+    }
+
+    #[test]
+    fn mf_close_file_closes_the_fd_deletes_the_swapfile_and_clears_the_names() {
+        let tmp = TempFilePath::new("close_file");
+        std::fs::write(&tmp.path, b"swap contents").expect("temp swap file");
+        assert!(tmp.path.exists());
+
+        let mut mfp = test_mfp();
+        mfp.mf_fd = Some(std::fs::File::open(&tmp.path).expect("open swap file"));
+        let fname = tmp.path.to_str().expect("utf-8 temp path").as_bytes().to_vec();
+        mfp.mf_fname = Some(fname);
+        mfp.mf_ffname = Some(b"/full/path".to_vec());
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
+
+        unsafe { mf_close_file(&mut buf, false) };
+
+        let owned = unsafe { Box::from_raw(buf.b_ml.ml_mfp) };
+        assert!(owned.mf_fd.is_none(), "the file must be closed");
+        assert!(owned.mf_fname.is_none(), "both names are freed");
+        assert!(owned.mf_ffname.is_none());
+        assert!(!tmp.path.exists(), "the swap file must be deleted");
+    }
+
+    #[test]
+    fn mf_close_file_keeps_the_memfile_itself_alive() {
+        let tmp = TempFilePath::new("close_file_alive");
+        std::fs::write(&tmp.path, b"x").expect("temp swap file");
+
+        let mut mfp = test_mfp();
+        mfp.mf_fd = Some(std::fs::File::open(&tmp.path).expect("open swap file"));
+        mfp.mf_fname = Some(tmp.path.to_str().expect("utf-8").as_bytes().to_vec());
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_mfp = Box::into_raw(Box::new(mfp));
+
+        unsafe { mf_close_file(&mut buf, false) };
+
+        // Unlike mf_close, this leaves the memfile in place - only the
+        // file backing it goes away.
+        assert!(!buf.b_ml.ml_mfp.is_null());
+        let owned = unsafe { Box::from_raw(buf.b_ml.ml_mfp) };
+        assert_eq!(owned.mf_page_size, 4096, "the memfile is still usable");
+
+        // A second call now takes the no-open-file early return.
+        let mut buf2 = crate::buffer_defs::BufT::default();
+        buf2.b_ml.ml_mfp = Box::into_raw(Box::new(*owned));
+        unsafe { mf_close_file(&mut buf2, false) };
+        drop(unsafe { Box::from_raw(buf2.b_ml.ml_mfp) });
     }
 
     #[test]
