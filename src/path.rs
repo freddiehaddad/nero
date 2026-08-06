@@ -90,6 +90,12 @@
 //! longer deferred as a whole subsystem: this one real consumer of
 //! it is translated.
 //!
+//! Also translated: [`pstrcmp`] (the `qsort` comparator over path
+//! strings, returning `Ordering` rather than a C comparator's `int`)
+//! and [`has_env_var`]. Note the latter's escaping rule: a backslash
+//! escapes only the byte immediately after it, and a trailing
+//! backslash escapes nothing at all.
+//!
 //! Deferred: everything else requiring the general wildcard/glob
 //! expansion machinery (`path_expand`/`gen_expand_wildcards`/
 //! `expand_path_option`/etc., needing `'wildignore'`/`'path'` parsing
@@ -955,6 +961,48 @@ pub unsafe fn pathcmp(p: &[u8], q: &[u8], maxlen: Option<usize>) -> i32 {
     1
 }
 
+/// Comparator for sorting path strings (`pstrcmp`), the original's
+/// `qsort` callback over an array of `char *`.
+///
+/// Returns [`std::cmp::Ordering`] rather than a C comparator's
+/// negative/zero/positive `int`, so it drops straight into Rust's own
+/// `sort_by` - the shape already used for `fuzzy.rs`'s comparators.
+/// The `-1` maxlen becomes `None`, i.e. compare the whole paths.
+///
+/// # Safety
+/// Forwarded from [`pathcmp`].
+#[must_use]
+pub unsafe fn pstrcmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { pathcmp(a, b, None) }.cmp(&0)
+}
+
+/// Whether `p` contains what looks like an environment variable
+/// (`has_env_var`), allowing for escaping.
+///
+/// A backslash escapes the FOLLOWING byte, so `\$` is not a variable.
+/// A trailing backslash at the very end escapes nothing and is simply
+/// skipped over.
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::utfc_ptr2len`].
+#[must_use]
+pub unsafe fn has_env_var(p: &[u8]) -> bool {
+    let mut i = 0usize;
+    while !matches!(p.get(i), None | Some(&crate::ascii_defs::NUL)) {
+        if p[i] == b'\\' && !matches!(p.get(i + 1), None | Some(&crate::ascii_defs::NUL)) {
+            // Skip the escaped byte along with the backslash.
+            i += 1;
+        } else if p[i] == b'$' {
+            return true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::mbyte::utfc_ptr2len(&p[i..]) };
+        i += usize::try_from(len).unwrap_or(1).max(1);
+    }
+    false
+}
+
 /// True if file names `f1` and `f2` are in the same directory
 /// (`same_directory`). `f1` may be a short name, `f2` must be a full
 /// path.
@@ -1366,6 +1414,46 @@ pub fn concat_fnames(fname1: &[u8], fname2: &[u8], sep: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_env_var_finds_a_dollar_sign() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { has_env_var(b"$HOME/foo") });
+        assert!(unsafe { has_env_var(b"foo/$BAR") });
+        assert!(!unsafe { has_env_var(b"plain/path") });
+        assert!(!unsafe { has_env_var(b"") });
+    }
+
+    #[test]
+    fn has_env_var_respects_backslash_escaping() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The backslash escapes the '$', so this is not a variable.
+        assert!(!unsafe { has_env_var(b"\\$HOME") });
+        // ...but only the immediately following byte is escaped.
+        assert!(unsafe { has_env_var(b"\\a$HOME") });
+    }
+
+    #[test]
+    fn has_env_var_ignores_a_trailing_backslash() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A backslash at the very end escapes nothing, so the scan
+        // must not run past the end looking for its victim.
+        assert!(!unsafe { has_env_var(b"foo\\") });
+        assert!(!unsafe { has_env_var(b"\\") });
+    }
+
+    #[test]
+    fn pstrcmp_orders_paths_and_sorts_a_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        use std::cmp::Ordering;
+        assert_eq!(unsafe { pstrcmp(b"a/b", b"a/b") }, Ordering::Equal);
+        assert_eq!(unsafe { pstrcmp(b"a/a", b"a/b") }, Ordering::Less);
+        assert_eq!(unsafe { pstrcmp(b"a/b", b"a/a") }, Ordering::Greater);
+
+        let mut paths: [&[u8]; 3] = [b"c/x", b"a/x", b"b/x"];
+        paths.sort_by(|a, b| unsafe { pstrcmp(a, b) });
+        assert_eq!(paths, [&b"a/x"[..], &b"b/x"[..], &b"c/x"[..]]);
+    }
 
     #[test]
     fn ispathsep_recognizes_forward_slash_everywhere() {
