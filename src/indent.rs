@@ -216,6 +216,46 @@ pub fn tabstop_set(var: &[u8]) -> Result<Option<Vec<ColnrT>>, ()> {
     Ok(Some(array))
 }
 
+/// Return a count of the number of tabstops (`tabstop_count`).
+///
+/// See this module's own doc comment for how `ts` differs from the
+/// original's raw, self-counting `colnr_T *` array: the count lives in
+/// the slice's own length rather than in a leading element.
+#[must_use]
+pub fn tabstop_count(ts: Option<&[ColnrT]>) -> i32 {
+    ts.map_or(0, |t| t.len() as i32)
+}
+
+/// Return the first tabstop, or `8` if there are no tabstops defined
+/// (`tabstop_first`).
+///
+/// See [`tabstop_count`] for the representation note.
+#[must_use]
+pub fn tabstop_first(ts: Option<&[ColnrT]>) -> i32 {
+    ts.and_then(|t| t.first().copied()).unwrap_or(8)
+}
+
+/// Whether two tabstop arrays hold the same widths (`tabstop_eq`).
+///
+/// See [`tabstop_count`] for the representation note. The original
+/// compares the leading count element and then each width in turn;
+/// with the count carried by the slice itself, that is exactly slice
+/// equality.
+#[must_use]
+pub fn tabstop_eq(ts1: Option<&[ColnrT]>, ts2: Option<&[ColnrT]>) -> bool {
+    ts1 == ts2
+}
+
+/// Copy a tabstop array (`tabstop_copy`).
+///
+/// See [`tabstop_count`] for the representation note. The original
+/// hands back an `xmalloc`ed array the caller must free; an owned
+/// `Vec` carries the same ownership without the manual free.
+#[must_use]
+pub fn tabstop_copy(oldts: Option<&[ColnrT]>) -> Option<Vec<ColnrT>> {
+    oldts.map(<[ColnrT]>::to_vec)
+}
+
 /// Calculate the number of screen spaces a tab will occupy. If `vts`
 /// is set then the tab widths are taken from that slice, otherwise
 /// the value of `ts_arg` is used (`tabstop_padding`).
@@ -978,6 +1018,47 @@ pub unsafe fn get_breakindent_win(wp: &mut WinT, line: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn tabstop_count_reports_the_number_of_stops() {
+        assert_eq!(tabstop_count(None), 0);
+        assert_eq!(tabstop_count(Some(&[])), 0);
+        assert_eq!(tabstop_count(Some(&[4, 8, 12])), 3);
+    }
+
+    #[test]
+    fn tabstop_first_falls_back_to_eight() {
+        // The original returns 8 when there are no tabstops at all,
+        // matching 'tabstop's own default.
+        assert_eq!(tabstop_first(None), 8);
+        assert_eq!(tabstop_first(Some(&[])), 8);
+        assert_eq!(tabstop_first(Some(&[4, 8, 12])), 4);
+    }
+
+    #[test]
+    fn tabstop_eq_compares_widths() {
+        assert!(tabstop_eq(None, None));
+        assert!(tabstop_eq(Some(&[4, 8]), Some(&[4, 8])));
+        // One set but not the other.
+        assert!(!tabstop_eq(None, Some(&[4])));
+        assert!(!tabstop_eq(Some(&[4]), None));
+        // Same length, different widths.
+        assert!(!tabstop_eq(Some(&[4, 8]), Some(&[4, 9])));
+        // Different lengths - the original's own leading-count check.
+        assert!(!tabstop_eq(Some(&[4, 8]), Some(&[4, 8, 12])));
+    }
+
+    #[test]
+    fn tabstop_copy_produces_an_independent_array() {
+        assert_eq!(tabstop_copy(None), None);
+        let src = [4, 8, 12];
+        let copy = tabstop_copy(Some(&src)).expect("Some in, Some out");
+        assert_eq!(copy, vec![4, 8, 12]);
+        // Owned, so mutating the copy cannot touch the original.
+        let mut copy = copy;
+        copy[0] = 99;
+        assert_eq!(src[0], 4);
+    }
 
     /// Installs `buf` as `curbuf`, restoring the previous one on drop.
     struct CurbufGuard {
