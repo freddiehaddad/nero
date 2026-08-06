@@ -71,6 +71,12 @@
 //! `ml_open_file`, real swap-file creation, plus the message-display
 //! pipeline).
 //!
+//! Also translated: [`changed_lines_redraw_buf`] - maintains the
+//! `b_mod_*` "region that must be redisplayed" bookkeeping, widening
+//! it across repeated changes. Fully faithful: it touches only
+//! already-real `BufT` fields plus `buf_meta_total`, so it needs none
+//! of the display pipeline (which only later reads `b_mod_*`).
+//!
 //! Deferred: everything else in the file - each is its own substantial
 //! undertaking blocked on subsystems not yet translated (the display
 //! pipeline, the fold/diff subsystems, etc. - see above).
@@ -78,7 +84,58 @@
 use crate::ascii_defs::ascii_iswhite;
 use crate::buffer_defs::{b_flags, BufT};
 use crate::option::copy_option_part;
+use crate::pos_defs::LinenrT;
 use crate::strings::vim_strchr;
+
+/// Record that lines `lnum..lnume` of `buf` changed, so that
+/// `win_update()` redisplays them (`changed_lines_redraw_buf`).
+///
+/// `xtra` is the number of lines added (positive) or removed
+/// (negative) by the change. Repeated calls widen the pending
+/// `b_mod_*` region rather than replacing it.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT` whose
+/// marktree is well-formed.
+pub unsafe fn changed_lines_redraw_buf(
+    buf: *mut BufT,
+    lnum: LinenrT,
+    lnume: LinenrT,
+    xtra: LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let b = unsafe { &mut *buf };
+    let mut lnume = lnume;
+
+    // If lines have been deleted and there may be decorations in the
+    // buffer, ensure win_update() calculates the height of, and
+    // redraws, the line to which (or whence) a mark may have moved.
+    // When lines are deleted a virt_line mark may be drawn two lines
+    // below, so increase by one more.
+    if xtra != 0 && b.b_marktree.n_keys > 0 {
+        let has_virt_lines =
+            xtra < 0 && crate::buffer::buf_meta_total(b, crate::marktree_defs::MetaIndex::Lines) != 0;
+        lnume += 1 + LinenrT::from(has_virt_lines);
+    }
+
+    if b.b_mod_set {
+        // Find the maximum area that must be redisplayed.
+        b.b_mod_top = b.b_mod_top.min(lnum);
+        if lnum < b.b_mod_bot {
+            // Adjust the old bottom position for the extra lines.
+            b.b_mod_bot += xtra;
+            b.b_mod_bot = b.b_mod_bot.max(lnum);
+        }
+        b.b_mod_bot = b.b_mod_bot.max(lnume + xtra);
+        b.b_mod_xlines += xtra;
+    } else {
+        // Set the area that must be redisplayed.
+        b.b_mod_set = true;
+        b.b_mod_top = lnum;
+        b.b_mod_bot = lnume + xtra;
+        b.b_mod_xlines = xtra;
+    }
+}
 
 /// Call this function when something in a buffer is changed (`changed`).
 /// Most often called through `changed_bytes()`/`changed_lines()` (both
@@ -787,6 +844,85 @@ pub unsafe fn get_last_leader_offset(line: &[u8], mut flags: Option<&mut usize>)
 mod tests {
     use super::*;
     use crate::buffer::buf_get_changedtick;
+
+    #[test]
+    fn changed_lines_redraw_buf_sets_a_fresh_region() {
+        let mut buf = BufT::default();
+        assert!(!buf.b_mod_set);
+
+        unsafe { changed_lines_redraw_buf(&mut buf, 5, 8, 0) };
+
+        assert!(buf.b_mod_set);
+        assert_eq!(buf.b_mod_top, 5);
+        assert_eq!(buf.b_mod_bot, 8);
+        assert_eq!(buf.b_mod_xlines, 0);
+    }
+
+    #[test]
+    fn changed_lines_redraw_buf_adds_xtra_to_a_fresh_region() {
+        let mut buf = BufT::default();
+
+        // Three lines inserted at line 4.
+        unsafe { changed_lines_redraw_buf(&mut buf, 4, 4, 3) };
+
+        assert_eq!(buf.b_mod_top, 4);
+        assert_eq!(buf.b_mod_bot, 7, "bottom accounts for the added lines");
+        assert_eq!(buf.b_mod_xlines, 3);
+    }
+
+    #[test]
+    fn changed_lines_redraw_buf_widens_an_existing_region() {
+        let mut buf = BufT::default();
+        unsafe { changed_lines_redraw_buf(&mut buf, 10, 12, 0) };
+
+        // A second change above the first extends the top, and the
+        // bottom is kept at the widest point seen.
+        unsafe { changed_lines_redraw_buf(&mut buf, 3, 4, 0) };
+
+        assert_eq!(buf.b_mod_top, 3);
+        assert_eq!(buf.b_mod_bot, 12);
+        assert_eq!(buf.b_mod_xlines, 0);
+    }
+
+    #[test]
+    fn changed_lines_redraw_buf_shifts_the_old_bottom_by_xtra() {
+        let mut buf = BufT::default();
+        unsafe { changed_lines_redraw_buf(&mut buf, 10, 20, 0) };
+
+        // A change at line 2 that deletes 3 lines: the pending bottom
+        // was below it, so it slides up by xtra, and xlines accumulates.
+        unsafe { changed_lines_redraw_buf(&mut buf, 2, 5, -3) };
+
+        assert_eq!(buf.b_mod_top, 2);
+        assert_eq!(buf.b_mod_bot, 17, "old bottom 20 shifted by -3");
+        assert_eq!(buf.b_mod_xlines, -3);
+    }
+
+    #[test]
+    fn changed_lines_redraw_buf_clamps_a_shifted_bottom_to_lnum() {
+        let mut buf = BufT::default();
+        unsafe { changed_lines_redraw_buf(&mut buf, 4, 5, 0) };
+
+        // Deleting far more lines than the region spans would push the
+        // adjusted bottom above lnum; it is clamped to lnum instead.
+        unsafe { changed_lines_redraw_buf(&mut buf, 4, 4, -50) };
+
+        assert_eq!(buf.b_mod_top, 4);
+        assert_eq!(buf.b_mod_bot, 4);
+        assert_eq!(buf.b_mod_xlines, -50);
+    }
+
+    #[test]
+    fn changed_lines_redraw_buf_leaves_lnume_alone_without_marks() {
+        let mut buf = BufT::default();
+        assert_eq!(buf.b_marktree.n_keys, 0);
+
+        // xtra != 0, but an empty marktree means no decoration
+        // adjustment, so lnume is used as given.
+        unsafe { changed_lines_redraw_buf(&mut buf, 1, 3, 2) };
+
+        assert_eq!(buf.b_mod_bot, 5, "lnume(3) + xtra(2), not widened");
+    }
 
     #[test]
     fn file_ff_differs_false_for_never_loaded_buffer() {
