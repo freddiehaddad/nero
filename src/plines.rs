@@ -2920,6 +2920,14 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut tp = crate::buffer_defs::TabpageT::default();
         let _guard = CurtabGuard::set(&mut tp as *mut crate::buffer_defs::TabpageT);
+        // The TAB adjustment above is gated on being in Normal mode,
+        // so this test must establish that itself rather than relying
+        // on `GLOBALS.State` still holding its default. Other tests
+        // legitimately leave it in Insert mode, which silently turned
+        // the expected 2 into a 1 (~3% of full-suite runs).
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::NORMAL as i32;
         unsafe {
             let mut buf = buf_with_line(b"\t\0");
             let mut win = WinT {
@@ -2931,6 +2939,7 @@ mod tests {
             assert_eq!(plines_win_col(&mut win as *mut WinT, 1, 0), 2);
             close_buf(buf);
         }
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
     }
 
     /// Opens `buf` (via [`buf_with_line`]) with `first_line` as line 1,

@@ -284,9 +284,14 @@ mod tests {
     fn virtual_active_true_in_terminal_mode() {
         let _lock = global_state_test_lock();
         let win = default_win();
+        // Save and restore the real previous value: `State`'s default
+        // is `mode::NORMAL`, not 0, so writing 0 back here would leave
+        // the NORMAL bit clear for every later test that relies on the
+        // default (e.g. plines.rs's TAB-at-wrap-boundary case).
+        let prev_state = unsafe { GLOBALS.get_mut() }.State;
         unsafe { GLOBALS.get_mut() }.State = mode::TERMINAL as i32;
         assert!(virtual_active(&win));
-        unsafe { GLOBALS.get_mut() }.State = 0;
+        unsafe { GLOBALS.get_mut() }.State = prev_state;
     }
 
     #[test]
@@ -311,9 +316,11 @@ mod tests {
         let _lock = global_state_test_lock();
         let mut win = default_win();
         win.w_onebuf_opt.wo_ve_flags = crate::option_vars::opt_ve_flag::INSERT;
+        // As above: restore the real previous value, not 0.
+        let prev_state = unsafe { GLOBALS.get_mut() }.State;
         unsafe { GLOBALS.get_mut() }.State = mode::INSERT as i32;
         assert!(virtual_active(&win));
-        unsafe { GLOBALS.get_mut() }.State = 0;
+        unsafe { GLOBALS.get_mut() }.State = prev_state;
     }
 
     #[test]
@@ -422,9 +429,11 @@ mod tests {
     #[test]
     fn get_real_state_passes_through_non_normal_state() {
         let _lock = global_state_test_lock();
+        // As above: restore the real previous value, not 0.
+        let prev_state = unsafe { GLOBALS.get_mut() }.State;
         unsafe { GLOBALS.get_mut() }.State = mode::INSERT as i32;
         assert_eq!(get_real_state(), mode::INSERT as i32);
-        unsafe { GLOBALS.get_mut() }.State = 0;
+        unsafe { GLOBALS.get_mut() }.State = prev_state;
     }
 
     /// RAII guard temporarily installing a real `GLOBALS.curbuf`
