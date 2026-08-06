@@ -545,6 +545,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"nextnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_nextnonblank });
         m.insert(&b"prevnonblank"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_prevnonblank });
         m.insert(&b"line"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_line });
+        m.insert(&b"line2byte"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_line2byte });
+        m.insert(&b"byte2line"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_byte2line });
         m.insert(&b"col"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_col });
         m.insert(&b"charcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: f_charcol });
         m.insert(&b"virtcol"[..], EvalFuncDefT { min_argc: 1, max_argc: 3, base_arg: 1, func: f_virtcol });
@@ -6201,6 +6203,61 @@ unsafe fn f_prevnonblank(argvars: &[TypvalT], rettv: &mut TypvalT) {
 ///
 /// # Safety
 /// Forwarded from [`crate::eval::eval::var2fpos`]'s own safety doc.
+/// `line2byte({lnum})` - the byte index of the first character of line
+/// `{lnum}` (`f_line2byte`, `funcs.c`).
+///
+/// Returns `-1` for a line number outside the buffer. One past the
+/// last line is deliberately allowed: that reports the buffer's total
+/// size. The result is 1-based, so the raw offset gets one added -
+/// but only when it is not already the `-1` failure value.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// (forwarded from `crate::memline::ml_find_line_or_offset`).
+unsafe fn f_line2byte(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+
+    let mut n = if lnum < 1 || lnum > curbuf.b_ml.ml_line_count + 1 {
+        -1
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::memline::ml_find_line_or_offset(curbuf, lnum, None, false) }
+    };
+    if n >= 0 {
+        n += 1;
+    }
+    rettv.value = TypvalValue::Number(i64::from(n));
+}
+
+/// `byte2line({byte})` - the line number containing byte `{byte}`
+/// (`f_byte2line`, `funcs.c`).
+///
+/// `{byte}` is 1-based, so one is subtracted before the lookup; a
+/// value below 1 yields `-1`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// (forwarded from `crate::memline::ml_find_line_or_offset`).
+unsafe fn f_byte2line(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut boff = i32::try_from(crate::eval::typval::tv_get_number(&argvars[0]))
+        .unwrap_or(i32::MAX)
+        .saturating_sub(1);
+
+    let n = if boff < 0 {
+        -1
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::memline::ml_find_line_or_offset(curbuf, 0, Some(&mut boff), false) }
+    };
+    rettv.value = TypvalValue::Number(i64::from(n));
+}
+
 unsafe fn f_line(argvars: &[TypvalT], rettv: &mut TypvalT) {
     if argvars.len() > 1 {
         unimplemented!("f_line: the {{winid}} form needs win_id2wp_tp, not yet translated");
@@ -16049,6 +16106,74 @@ mod tests {
         // between the two. See the loclist test below for the other
         // branch.
         assert_eq!(rettv.value, TypvalValue::String(Some(b"quickfix".to_vec())));
+    }
+
+    #[test]
+    fn line2byte_and_byte2line_match_real_nvim() {
+        // Ground truth from a real nvim with lines "abc", "de", "fghi"
+        // and ff=unix: line2byte() is 1, 5, 8, 13 and -1 past the end;
+        // byte2line() is 1, 2, 3 for bytes 1, 5, 8.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_ff: Some(b"unix".to_vec()),
+            b_p_fixeol: 1,
+            b_p_eol: 1,
+            ..Default::default()
+        };
+        unsafe {
+            assert_eq!(crate::memline::ml_open(&mut buf), crate::vim_defs::OK);
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev = globals.curbuf;
+            globals.curbuf = &mut buf as *mut crate::buffer_defs::BufT;
+
+            assert_eq!(
+                crate::memline::ml_replace_buf_len(&mut buf, 1, b"abc\0"),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 1, b"de\0", 3, false),
+                crate::vim_defs::OK
+            );
+            assert_eq!(
+                crate::memline::ml_append_buf(&mut buf, 2, b"fghi\0", 5, false),
+                crate::vim_defs::OK
+            );
+
+            let l2b = |n: i64| {
+                let mut rettv = TypvalT::default();
+                f_line2byte(&[TypvalT { value: TypvalValue::Number(n), ..Default::default() }], &mut rettv);
+                match rettv.value {
+                    TypvalValue::Number(v) => v,
+                    _ => panic!("expected a number"),
+                }
+            };
+            assert_eq!(l2b(1), 1);
+            assert_eq!(l2b(2), 5);
+            assert_eq!(l2b(3), 8);
+            // One past the last line reports the buffer's total size.
+            assert_eq!(l2b(4), 13);
+            // Further past that is rejected outright.
+            assert_eq!(l2b(5), -1);
+            assert_eq!(l2b(0), -1);
+
+            let b2l = |n: i64| {
+                let mut rettv = TypvalT::default();
+                f_byte2line(&[TypvalT { value: TypvalValue::Number(n), ..Default::default() }], &mut rettv);
+                match rettv.value {
+                    TypvalValue::Number(v) => v,
+                    _ => panic!("expected a number"),
+                }
+            };
+            assert_eq!(b2l(1), 1);
+            assert_eq!(b2l(5), 2);
+            assert_eq!(b2l(8), 3);
+            // A byte index below 1 is invalid: the argument is 1-based.
+            assert_eq!(b2l(0), -1);
+
+            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
     }
 
     #[test]
