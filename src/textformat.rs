@@ -27,6 +27,71 @@ use crate::ascii_defs::ascii_iswhite;
 use crate::globals::GLOBALS;
 use crate::pos_defs::LinenrT;
 
+/// Set when `auto_format()` added an extra space under the cursor
+/// (`did_add_space`).
+pub static DID_ADD_SPACE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// `WHITECHAR(cc)` from `textformat.c`: `cc` is whitespace, and the
+/// character just after the cursor is not a composing character (so
+/// the space really is a separator rather than the base of a
+/// grapheme).
+///
+/// # Safety
+/// `GLOBALS.curwin`/`curbuf` must be valid, with a live memline.
+unsafe fn whitechar(cc: i32) -> bool {
+    if !ascii_iswhite(cc) {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let p = unsafe { crate::cursor::get_cursor_pos_ptr() };
+    let next = if p.len() > 1 {
+        crate::mbyte::utf_ptr2char(&p[1..])
+    } else {
+        0
+    };
+    !crate::mbyte::utf_iscomposing_first(next)
+}
+
+/// Remove the space `auto_format()` added under the cursor, if it is
+/// no longer at the end of the line (`check_auto_format`).
+///
+/// # Safety
+/// Same as `whitechar`, plus `crate::change::del_char`'s own.
+pub unsafe fn check_auto_format(end_insert: bool) {
+    // SAFETY: reading a plain `bool` global.
+    if !*unsafe { DID_ADD_SPACE.get_mut() } {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cc = unsafe { crate::cursor::gchar_cursor() };
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { whitechar(cc) } {
+        // Somehow the space was removed already.
+        // SAFETY: as above.
+        unsafe { *DID_ADD_SPACE.get_mut() = false };
+    } else {
+        let mut c = i32::from(b' ');
+        if !end_insert {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::inc_cursor() };
+            // SAFETY: forwarded from this function's own safety doc.
+            c = unsafe { crate::cursor::gchar_cursor() };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::dec_cursor() };
+        }
+        if c != 0 {
+            // The space is no longer at the end of the line, so
+            // delete it.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::change::del_char(false) };
+            // SAFETY: as above.
+            unsafe { *DID_ADD_SPACE.get_mut() = false };
+        }
+    }
+}
+
 /// Whether format option `x` is currently in effect for `curbuf` -
 /// always `false` while `'paste'` is set (`has_format_option`).
 ///
@@ -160,6 +225,83 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn check_auto_format_is_a_noop_when_no_space_was_added() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"a b");
+        let prev = *unsafe { DID_ADD_SPACE.get_mut() };
+        unsafe { *DID_ADD_SPACE.get_mut() = false };
+
+        unsafe { check_auto_format(true) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"a b\0");
+
+        unsafe { *DID_ADD_SPACE.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_auto_format_clears_the_flag_when_the_space_is_already_gone() {
+        // The cursor is on 'b', not whitespace, so the space this
+        // would have removed was clearly removed by something else.
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 2, coladd: 0 },
+            ..Default::default()
+        };
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"a b");
+        let prev = *unsafe { DID_ADD_SPACE.get_mut() };
+        unsafe { *DID_ADD_SPACE.get_mut() = true };
+
+        unsafe { check_auto_format(true) };
+
+        assert!(!*unsafe { DID_ADD_SPACE.get_mut() }, "flag cleared");
+        assert_eq!(
+            unsafe { crate::memline::ml_get(1) },
+            b"a b\0",
+            "line untouched"
+        );
+
+        unsafe { *DID_ADD_SPACE.get_mut() = prev };
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn check_auto_format_keeps_a_trailing_space_at_end_insert() {
+        // With end_insert, `c` stays ' ' (never NUL), so the space is
+        // deleted - this is the "still at the end of the line" case
+        // the original handles by NOT consulting the next character.
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 },
+            ..Default::default()
+        };
+        buf.b_u_curhead = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"a b");
+        let prev = *unsafe { DID_ADD_SPACE.get_mut() };
+        unsafe { *DID_ADD_SPACE.get_mut() = true };
+
+        unsafe { check_auto_format(true) };
+
+        assert!(!*unsafe { DID_ADD_SPACE.get_mut() });
+        assert_eq!(
+            unsafe { crate::memline::ml_get(1) },
+            b"ab\0",
+            "the added space was removed"
+        );
+
+        unsafe { *DID_ADD_SPACE.get_mut() = prev };
+        drop(guard);
+        unsafe {
+            drop(Box::from_raw(buf.b_u_curhead));
+            buf.b_u_curhead = std::ptr::null_mut();
+        }
+        close_buf_with_memline(buf);
     }
 
     #[test]
