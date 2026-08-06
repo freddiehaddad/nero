@@ -218,6 +218,132 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Insert the character `c` at the cursor position (`ins_char`).
+///
+/// # Safety
+/// Same as [`ins_char_bytes`].
+pub unsafe fn ins_char(c: i32) {
+    let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+    let n = crate::mbyte::utf_char2bytes(c, &mut buf) as usize;
+
+    // When "c" is 0x100, 0x200, etc. we don't want to insert a NUL
+    // byte. Happens for CTRL-Vu9900.
+    if buf[0] == 0 {
+        buf[0] = b'\n';
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ins_char_bytes(&buf[..n]) };
+}
+
+/// Insert (or, in Replace mode, overwrite with) the character whose
+/// bytes are `buf`, at the cursor position (`ins_char_bytes`).
+///
+/// # Scope
+///
+/// The insert path is translated in full. Two branches are
+/// `unimplemented!()`, both behind real guards that are unreachable
+/// today rather than hardcoded away:
+///
+/// The `State & REPLACE_FLAG` block needs `replace_push`/
+/// `replace_push_nul` (the Replace-mode undo stack) and, for
+/// `VREPLACE_FLAG`, the virtual-replace column accounting. Nothing
+/// translated can enter Replace mode - there is no `edit()` loop yet -
+/// so `State` never carries that flag in a real session.
+///
+/// The `'showmatch'` block needs `showmatch` (a `search.c` display
+/// routine). `p_sm` is `0` for every session this crate can build, so
+/// the guard's own first operand is false.
+///
+/// # Safety
+/// Same as [`ins_str`].
+pub unsafe fn ins_char_bytes(buf: &[u8]) {
+    let charlen = buf.len();
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // Break tabs if needed.
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::state::virtual_active(unsafe { &*curwin }) && unsafe { &*curwin }.w_cursor.coladd > 0
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let vis = unsafe { crate::cursor::getviscol() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance_force(vis) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let col = unsafe { &*curwin }.w_cursor.col as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    let oldp = unsafe { crate::memline::ml_get(lnum) };
+    // Length of the old line, including its NUL.
+    // SAFETY: forwarded from this function's own safety doc.
+    let linelen = unsafe { crate::memline::ml_get_len(lnum) } as usize + 1;
+
+    // The lengths default to the values for when not replacing:
+    // `oldlen` bytes deleted (0), `newlen` bytes inserted.
+    let oldlen = 0usize;
+    let newlen = charlen;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    if state & crate::state_defs::mode::REPLACE_FLAG != 0 {
+        unimplemented!(
+            "Replace mode needs replace_push/replace_push_nul, not yet translated; \
+             unreachable while nothing can enter Replace mode"
+        );
+    }
+
+    let mut newp = Vec::with_capacity(linelen + newlen - oldlen);
+    // Copy bytes before the cursor.
+    if col > 0 {
+        newp.extend_from_slice(&oldp[..col]);
+    }
+    // Insert or overwrite the new character.
+    newp.extend_from_slice(buf);
+    // Fill with spaces when necessary (only ever in Replace mode).
+    newp.resize(newp.len() + newlen.saturating_sub(charlen), b' ');
+    // Copy the bytes after the changed character(s).
+    if linelen > col + oldlen {
+        newp.extend_from_slice(&oldp[col + oldlen..linelen]);
+    }
+
+    // Replace the line in the buffer.
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace(lnum, &newp) };
+
+    // Mark the buffer as changed and prepare for displaying.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { inserted_bytes(lnum, col as ColnrT, oldlen as i32, newlen as i32) };
+
+    // If we're in Insert or Replace mode and 'showmatch' is set, then
+    // briefly show the match for right parens and braces.
+    // SAFETY: reading `'showmatch'`.
+    let sm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sm;
+    // SAFETY: forwarded from this function's own safety doc.
+    let msg_silent = unsafe { crate::globals::GLOBALS.get_mut() }.msg_silent;
+    if sm != 0
+        && state & crate::state_defs::mode::INSERT != 0
+        && msg_silent == 0
+        // SAFETY: forwarded from this function's own safety doc.
+        && !unsafe { crate::insexpand::ins_compl_active() }
+    {
+        unimplemented!(
+            "'showmatch' needs search.c's showmatch, not yet translated; \
+             unreachable while 'showmatch' is off"
+        );
+    }
+
+    // SAFETY: reading `'revins'`.
+    let ri = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ri;
+    if ri == 0 || state & crate::state_defs::mode::REPLACE_FLAG != 0 {
+        // Normal insert: move the cursor right.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *curwin }.w_cursor.col += charlen as ColnrT;
+    }
+}
+
 /// Insert the bytes of `s` at the cursor position (`ins_str`).
 ///
 /// The cursor is advanced past the inserted text.
@@ -2002,6 +2128,83 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn ins_char_inserts_a_single_byte_character() {
+        // Cross-verified against real nvim: "abd" with the cursor on
+        // column 3 (1-based) and inserting 'c' yields "abcd".
+        let (mut buf, mut win) = del_fixture(b"abd", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_char(i32::from(b'c')) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abcd\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3, "advanced by one");
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_char_inserts_a_whole_multibyte_character() {
+        // Cross-verified against real nvim: "ab" with the cursor on
+        // column 1 and inserting 'é' yields "éab" with strlen 4, so
+        // the 2-byte encoding is stored whole and the cursor advances
+        // by both bytes.
+        let (mut buf, mut win) = del_fixture(b"ab", 0);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_char(0xE9) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, "éab\0".as_bytes());
+        assert_eq!(unsafe { crate::memline::ml_get_len(1) }, 4);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 2, "advanced by two");
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_char_bytes_appends_at_the_end_of_the_line() {
+        let (mut buf, mut win) = del_fixture(b"ab", 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { ins_char_bytes(b"c") };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"abc\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn ins_char_with_revins_set_leaves_the_cursor_put() {
+        // 'revins' suppresses the cursor advance outside Replace mode
+        // - the real `!p_ri || (State & REPLACE_FLAG)` condition.
+        let (mut buf, mut win) = del_fixture(b"ab", 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+        let prev_ri = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ri;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ri = 1;
+
+        unsafe { ins_char(i32::from(b'X')) };
+
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"aXb\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1, "cursor not advanced");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ri = prev_ri;
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
