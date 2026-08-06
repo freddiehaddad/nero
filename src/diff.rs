@@ -196,6 +196,20 @@ pub fn diffopt_filler() -> bool {
     (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::FILLER != 0
 }
 
+/// Return `true` when the internal xdiff algorithm should be used
+/// rather than an external `diff` command (`diff_internal`).
+///
+/// That is the case when `'diffopt'` contains `"internal"` and
+/// `'diffexpr'` is empty.
+#[must_use]
+pub fn diff_internal() -> bool {
+    (unsafe { *DIFF_FLAGS.get_mut() }) & diff_flag::INTERNAL != 0
+        && unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_dex
+            .as_deref()
+            .is_none_or(<[u8]>::is_empty)
+}
+
 /// Return `true` if `'diffopt'` contains `"horizontal"`
 /// (`diffopt_horizontal`).
 #[must_use]
@@ -755,6 +769,40 @@ mod tests {
         unsafe { *DIFF_FLAGS.get_mut() &= !diff_flag::FILLER };
         assert!(!diffopt_filler());
         unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    #[test]
+    fn diff_internal_true_by_default() {
+        // 'diffopt' defaults to including "internal", and 'diffexpr'
+        // defaults to empty, so the internal algorithm is used.
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(diff_internal());
+    }
+
+    #[test]
+    fn diff_internal_false_without_the_internal_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { *DIFF_FLAGS.get_mut() };
+        unsafe { *DIFF_FLAGS.get_mut() &= !diff_flag::INTERNAL };
+        assert!(!diff_internal());
+        unsafe { *DIFF_FLAGS.get_mut() = prev };
+    }
+
+    #[test]
+    fn diff_internal_false_when_diffexpr_is_set() {
+        // A non-empty 'diffexpr' means the user wants their own
+        // command run instead, even with "internal" still listed.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_dex.clone();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_dex = Some(b"MyDiff()".to_vec());
+        assert!(!diff_internal());
+
+        // An empty string counts as unset, same as the original's
+        // own `*p_dex == NUL` check.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_dex = Some(Vec::new());
+        assert!(diff_internal());
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_dex = prev;
     }
 
     #[test]
