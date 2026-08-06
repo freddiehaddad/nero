@@ -256,6 +256,20 @@ fn open_sink(path: Option<&std::path::Path>) -> LogSink {
 mod tests {
     use super::*;
 
+    /// Serializes every test that touches the shared logging globals
+    /// (`LOG_STATE.file_path` and the minimum log level).
+    ///
+    /// `LOG_STATE`'s own mutex is taken and released around each
+    /// individual field access, so it does NOT keep a save/set/use/
+    /// restore sequence atomic. Without this second lock, one test can
+    /// clear `file_path` while another has just pointed it at a real
+    /// file, making that one observe `LogSink::Stderr` instead of
+    /// `LogSink::File` (observed ~0.5% of full-suite runs).
+    fn log_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn log_try_create_rejects_an_absent_or_empty_path() {
         assert!(!log_try_create(None));
@@ -294,6 +308,7 @@ mod tests {
 
     #[test]
     fn open_log_file_returns_the_file_when_the_path_is_usable() {
+        let _lock = log_test_lock();
         let path = std::env::temp_dir()
             .join(format!("nero_open_log_{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -308,6 +323,7 @@ mod tests {
 
     #[test]
     fn open_log_file_falls_back_to_stderr_without_a_path() {
+        let _lock = log_test_lock();
         let saved = LOG_STATE.lock().unwrap().file_path.clone();
         LOG_STATE.lock().unwrap().file_path = None;
 
@@ -318,6 +334,7 @@ mod tests {
 
     #[test]
     fn open_log_file_falls_back_to_stderr_for_an_unusable_path() {
+        let _lock = log_test_lock();
         let path = std::env::temp_dir()
             .join(format!("nero_bad_log_dir_{}", std::process::id()))
             .join("nested")
@@ -332,6 +349,7 @@ mod tests {
 
     #[test]
     fn respects_min_log_level_filter() {
+        let _lock = log_test_lock();
         set_min_log_level(LOGLVL_ERR);
         assert!(!logmsg(LOGLVL_WRN, None, None, None, true, "should be filtered"));
         set_min_log_level(LOGLVL_WRN); // restore default for other tests
@@ -339,6 +357,7 @@ mod tests {
 
     #[test]
     fn writes_to_a_configured_file() {
+        let _lock = log_test_lock();
         log_init();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("nero_log_test_{}.log", std::process::id()));
@@ -352,6 +371,7 @@ mod tests {
 
     #[test]
     fn returns_false_before_init_when_never_initialized_path_used_directly() {
+        let _lock = log_test_lock();
         // Uses a fresh, unshared piece of state to avoid interfering with
         // other tests that call log_init(): directly exercises the
         // "log_level < min_log_level" filter path returning false without
