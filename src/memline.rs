@@ -151,6 +151,7 @@
 //! with `ml_usedchunks` live entries and shifts it with `memmove`;
 //! here the `Vec`'s length IS the live count, so those shifts become
 //! `insert`/`remove` and `ml_numchunks` has no counterpart.
+//! [`goto_byte`] is translated on top of them.
 //!
 //! Deferred (each needs another not-yet-translated subsystem):
 //! - `set_b0_fname`'s `buf.b_ffname.is_some()` branch: needs
@@ -2665,6 +2666,59 @@ pub unsafe fn ml_find_line_or_offset(
     size
 }
 
+/// Move the cursor to byte offset `cnt` in the buffer (`goto_byte`).
+///
+/// `cnt` is 1-based, so one is subtracted before the lookup. Past the
+/// end of the buffer the cursor lands on the last line's end rather
+/// than failing.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf`/`curwin` must be valid, non-null
+/// pointers (forwarded from [`ml_find_line_or_offset`]/
+/// `crate::cursor::coladvance`/`crate::cursor::check_cursor`).
+pub unsafe fn goto_byte(cnt: i32) {
+    let mut boff = cnt;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf_ptr = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // The cached line may be dirty.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_flush_line(&mut *curbuf_ptr, false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::setpcmark() };
+    if boff != 0 {
+        boff -= 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { ml_find_line_or_offset(&mut *curbuf_ptr, 0, Some(&mut boff), false) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *curwin };
+    if lnum < 1 {
+        // Past the end: settle on the last line.
+        // SAFETY: forwarded from this function's own safety doc.
+        win.w_cursor.lnum = unsafe { (*curbuf_ptr).b_ml.ml_line_count };
+        win.w_curswant = crate::pos_defs::MAXCOL;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(curwin, crate::pos_defs::MAXCOL) };
+    } else {
+        win.w_cursor.lnum = lnum;
+        win.w_cursor.col = boff;
+        win.w_cursor.coladd = 0;
+        win.w_set_curswant = true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::check_cursor(curwin) };
+
+    // Make sure the cursor sits on the first byte of a multi-byte
+    // character.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+}
+
 /// Whether the line most recently returned by [`ml_get`] lives in
 /// allocated memory (`ml_line_alloced`).
 ///
@@ -3212,6 +3266,56 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn goto_byte_matches_real_nvim() {
+        // Ground truth from a real nvim with lines "abc", "de", "fghi",
+        // ff=unix, fixeol+eol: `:goto N` lands at (line, col) of
+        // 1->(1,1), 3->(1,3), 5->(2,1), 8->(3,1), 12->(3,4) and
+        // 99->(3,4). col() is 1-based, so w_cursor.col is one less.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_p_ff: Some(b"unix".to_vec()),
+            b_p_fixeol: 1,
+            b_p_eol: 1,
+            ..Default::default()
+        };
+        unsafe {
+            assert_eq!(ml_open(&mut buf), OK);
+            let mut win = crate::buffer_defs::WinT {
+                w_buffer: &mut buf as *mut BufT,
+                ..Default::default()
+            };
+            let globals = crate::globals::GLOBALS.get_mut();
+            let prev_buf = globals.curbuf;
+            let prev_win = globals.curwin;
+            globals.curbuf = &mut buf as *mut BufT;
+            globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+
+            assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
+            assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
+            assert_eq!(ml_append_buf(&mut buf, 2, b"fghi\0", 5, false), OK);
+
+            for (byte, lnum, col) in [(1, 1, 0), (3, 1, 2), (5, 2, 0), (8, 3, 0), (12, 3, 3)] {
+                goto_byte(byte);
+                let w = &*crate::globals::GLOBALS.get_mut().curwin;
+                assert_eq!(w.w_cursor.lnum, lnum, "goto {byte} line");
+                assert_eq!(w.w_cursor.col, col, "goto {byte} col");
+            }
+
+            // Past the end clamps to the last line rather than failing.
+            goto_byte(99);
+            let w = &*crate::globals::GLOBALS.get_mut().curwin;
+            assert_eq!(w.w_cursor.lnum, 3);
+            assert_eq!(w.w_cursor.col, 3);
+
+            let globals = crate::globals::GLOBALS.get_mut();
+            globals.curbuf = prev_buf;
+            globals.curwin = prev_win;
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
 
     #[test]
     fn ml_find_line_or_offset_matches_real_nvim_line2byte() {
