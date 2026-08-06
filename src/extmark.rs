@@ -8,7 +8,7 @@
 //!
 //! Translated so far: [`extmark_splice_delete`],
 //! [`extmark_splice_impl`], [`extmark_splice`],
-//! [`extmark_splice_cols`].
+//! [`extmark_splice_cols`], [`extmark_adjust`].
 //!
 //! Deferred, each for a specific reason:
 //!
@@ -20,8 +20,8 @@
 //! `buf_signcols_count_range` (`decoration.c`) in addition to this
 //! file's own pieces.
 //!
-//! `extmark_apply_undo`/`extmark_adjust`/`extmark_move_region` need
-//! the `extmark_set`/`extmark_del` family above.
+//! `extmark_apply_undo`/`extmark_move_region` need the
+//! `extmark_set`/`extmark_del` family above.
 
 use crate::buffer_defs::BufT;
 use crate::decoration::buf_signcols_count_range;
@@ -33,7 +33,7 @@ use crate::marktree::{
     mt_end, mt_invalid, mt_invalidate, mt_lookup_key, mt_no_undo, mt_paired, mt_right,
 };
 use crate::marktree_defs::MarkTreeIter;
-use crate::pos_defs::ColnrT;
+use crate::pos_defs::{ColnrT, LinenrT};
 use crate::types_defs::TriState;
 
 /// Non-zero while a caller will perform its own extmark splice, so
@@ -132,6 +132,68 @@ pub unsafe fn extmark_splice_delete(
         }
 
         marktree_itr_next(&buf.b_marktree, &mut itr);
+    }
+}
+
+/// Adjust extmarks for lines added or deleted in a range
+/// (`extmark_adjust`).
+///
+/// A region is either deleted (`amount == MAXLNUM`) or added
+/// (`line2 == MAXLNUM`); the only other case, `:move`, is handled by
+/// its own entry point, `extmark_move_region`.
+///
+/// # Safety
+/// Same as [`extmark_splice_impl`].
+pub unsafe fn extmark_adjust(
+    buf: &mut BufT,
+    line1: LinenrT,
+    line2: LinenrT,
+    amount: LinenrT,
+    amount_after: LinenrT,
+    undo: ExtmarkOp,
+) {
+    // SAFETY: reading a plain scalar global.
+    if *unsafe { CURBUF_SPLICE_PENDING.get_mut() } != 0 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let start_byte =
+        unsafe { crate::memline::ml_find_line_or_offset(buf, line1, None, true) } as BcountT;
+    let mut old_byte: BcountT = 0;
+    let mut new_byte: BcountT = 0;
+    let old_row;
+    let new_row;
+    if amount == crate::pos_defs::MAXLNUM {
+        old_row = line2 - line1 + 1;
+        old_byte = buf.deleted_bytes2 as BcountT;
+        new_row = amount_after + old_row;
+    } else {
+        debug_assert_eq!(line2, crate::pos_defs::MAXLNUM);
+        old_row = 0;
+        new_row = amount;
+    }
+    if new_row > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let end = unsafe {
+            crate::memline::ml_find_line_or_offset(buf, line1 + new_row, None, true)
+        };
+        new_byte = end as BcountT - start_byte;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        extmark_splice_impl(
+            buf,
+            line1 - 1,
+            0,
+            start_byte,
+            old_row,
+            0,
+            old_byte,
+            new_row,
+            0,
+            new_byte,
+            undo,
+        );
     }
 }
 
@@ -382,6 +444,121 @@ mod tests {
             b_u_curhead: uhp,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn adjust_records_added_lines_as_a_splice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = Box::new(buf_with_header(uhp));
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        let saved = {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let saved = g.curbuf;
+            g.curbuf = buf_ptr;
+            saved
+        };
+        let prev_pending = *unsafe { CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = 0 };
+
+        // Adding a region: line2 == MAXLNUM, amount is the row count.
+        unsafe {
+            extmark_adjust(
+                &mut *buf_ptr,
+                3,
+                crate::pos_defs::MAXLNUM,
+                2,
+                0,
+                ExtmarkOp::Undo,
+            );
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.start_row, 2, "line1 - 1");
+                assert_eq!(s.old_row, 0, "nothing removed");
+                assert_eq!(s.new_row, 2);
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = saved;
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    #[test]
+    fn adjust_records_deleted_lines_as_a_splice() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = Box::new(buf_with_header(uhp));
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        let saved = {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let saved = g.curbuf;
+            g.curbuf = buf_ptr;
+            saved
+        };
+        let prev_pending = *unsafe { CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = 0 };
+
+        // Deleting lines 3..=5: amount == MAXLNUM, amount_after is
+        // the negated count.
+        unsafe {
+            extmark_adjust(
+                &mut *buf_ptr,
+                3,
+                5,
+                crate::pos_defs::MAXLNUM,
+                -3,
+                ExtmarkOp::Undo,
+            );
+        }
+
+        let recorded = unsafe { &(*uhp).uh_extmark };
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0] {
+            ExtmarkUndoObject::Splice(s) => {
+                assert_eq!(s.start_row, 2, "line1 - 1");
+                assert_eq!(s.old_row, 3, "line2 - line1 + 1");
+                assert_eq!(s.new_row, 0, "amount_after + old_row");
+            }
+            other => panic!("expected a splice record, got {other:?}"),
+        }
+
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = saved;
+        drop(unsafe { Box::from_raw(uhp) });
+    }
+
+    #[test]
+    fn adjust_is_a_noop_while_a_splice_is_pending() {
+        let _lock = crate::globals::global_state_test_lock();
+        let uhp = new_header();
+        let mut buf = Box::new(buf_with_header(uhp));
+        let buf_ptr: *mut BufT = &mut *buf;
+        let prev_pending = *unsafe { CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = 1 };
+
+        unsafe {
+            extmark_adjust(
+                &mut *buf_ptr,
+                3,
+                crate::pos_defs::MAXLNUM,
+                2,
+                0,
+                ExtmarkOp::Undo,
+            );
+        }
+
+        assert!(unsafe { &(*uhp).uh_extmark }.is_empty());
+
+        unsafe { *CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        drop(unsafe { Box::from_raw(uhp) });
     }
 
     #[test]

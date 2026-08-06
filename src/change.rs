@@ -387,6 +387,49 @@ pub unsafe fn deleted_lines(lnum: LinenrT, count: LinenrT) {
     unsafe { deleted_lines_buf(curbuf, lnum, count) };
 }
 
+/// Like [`deleted_lines`], but adjusts marks first
+/// (`deleted_lines_mark`).
+///
+/// Make sure the cursor is on a valid line before calling: a GUI
+/// callback may be triggered to display the cursor.
+///
+/// # Safety
+/// Same as [`changed_lines`], plus `crate::mark::mark_adjust`'s and
+/// `crate::extmark::extmark_adjust`'s own.
+pub unsafe fn deleted_lines_mark(lnum: LinenrT, count: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let made_empty =
+        count > 0 && unsafe { &*curbuf }.b_ml.ml_flags & crate::memline_defs::ML_EMPTY != 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::mark::mark_adjust(
+            lnum,
+            lnum + count - 1,
+            crate::pos_defs::MAXLNUM,
+            -count,
+            crate::extmark_defs::ExtmarkOp::Noop,
+        );
+    }
+    // If we deleted the entire buffer we need to implicitly add a new
+    // empty line.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        crate::extmark::extmark_adjust(
+            &mut *curbuf,
+            lnum,
+            lnum + count - 1,
+            crate::pos_defs::MAXLNUM,
+            -count + i32::from(made_empty),
+            crate::extmark_defs::ExtmarkOp::Undo,
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { changed_lines(curbuf, lnum, 0, lnum + count, -count, true) };
+}
+
 /// Changed bytes within a single line of the current buffer
 /// (`changed_bytes`).
 ///
@@ -1758,6 +1801,31 @@ mod tests {
 
         assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 4);
         assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, -2);
+    }
+
+    #[test]
+    fn deleted_lines_mark_adjusts_extmarks_then_records_the_change() {
+        let (mut buf, mut win) = changed_fixture();
+        let uhp = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        buf.b_u_curhead = uhp;
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+        let prev_pending = *unsafe { crate::extmark::CURBUF_SPLICE_PENDING.get_mut() };
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = 0 };
+
+        // 2 lines deleted at line 4.
+        unsafe { deleted_lines_mark(4, 2) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_mod_top }, 4);
+        assert_eq!(unsafe { (*buf_ptr).b_mod_xlines }, -2);
+        assert_ne!(unsafe { (*buf_ptr).b_changed }, 0);
+        // The deletion was recorded for undo by extmark_adjust.
+        assert_eq!(unsafe { &(*uhp).uh_extmark }.len(), 1);
+
+        unsafe { *crate::extmark::CURBUF_SPLICE_PENDING.get_mut() = prev_pending };
+        unsafe { (*buf_ptr).b_u_curhead = std::ptr::null_mut() };
+        drop(unsafe { Box::from_raw(uhp) });
     }
 
     #[test]
