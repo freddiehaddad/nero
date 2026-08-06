@@ -27,6 +27,88 @@ use crate::ascii_defs::ascii_iswhite;
 use crate::globals::GLOBALS;
 use crate::pos_defs::LinenrT;
 
+/// Whether the comment leader of line `lnum + 1` matches the one of
+/// line `lnum`, so the two lines may be joined when formatting
+/// (`same_leader`).
+///
+/// The `'comments'` flags of each leader decide this before the text
+/// is even compared: `f` (first-line-only) allows joining only when
+/// the second line has no leader at all, `e` (end) never allows it,
+/// and `s` (start) allows it only when there is text after the leader
+/// and the second line carries the `m` (middle) flag.
+///
+/// # Safety
+/// `GLOBALS.curbuf` must be valid, with a live memline holding both
+/// `lnum` and `lnum + 1`.
+pub unsafe fn same_leader(
+    lnum: LinenrT,
+    leader1_len: i32,
+    leader1_flags: Option<&[u8]>,
+    leader2_len: i32,
+    leader2_flags: Option<&[u8]>,
+) -> bool {
+    if leader1_len == 0 {
+        return leader2_len == 0;
+    }
+
+    if let Some(flags1) = leader1_flags {
+        for &p in flags1.iter().take_while(|&&c| c != 0 && c != b':') {
+            if p == crate::option_vars::COM_FIRST {
+                return leader2_len == 0;
+            }
+            if p == crate::option_vars::COM_END {
+                return false;
+            }
+            if p == crate::option_vars::COM_START {
+                // SAFETY: forwarded from this function's own safety doc.
+                let line_len = unsafe { crate::memline::ml_get_len(lnum) };
+                if line_len <= leader1_len {
+                    return false;
+                }
+                let Some(flags2) = leader2_flags else {
+                    return false;
+                };
+                if leader2_len == 0 {
+                    return false;
+                }
+                return flags2
+                    .iter()
+                    .take_while(|&&c| c != 0 && c != b':')
+                    .any(|&c| c == crate::option_vars::COM_MIDDLE);
+            }
+        }
+    }
+
+    // Get the current line and the next one, then compare the leaders.
+    // SAFETY: forwarded from this function's own safety doc.
+    let line1 = unsafe { crate::memline::ml_get(lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line2 = unsafe { crate::memline::ml_get(lnum + 1) };
+
+    let mut idx1 = 0usize;
+    while ascii_iswhite(i32::from(line1.get(idx1).copied().unwrap_or(0))) {
+        idx1 += 1;
+    }
+    let mut idx2 = 0i32;
+    while idx2 < leader2_len {
+        let c2 = line2.get(idx2 as usize).copied().unwrap_or(0);
+        if ascii_iswhite(i32::from(c2)) {
+            while ascii_iswhite(i32::from(line1.get(idx1).copied().unwrap_or(0))) {
+                idx1 += 1;
+            }
+        } else {
+            let c1 = line1.get(idx1).copied().unwrap_or(0);
+            idx1 += 1;
+            if c1 != c2 {
+                break;
+            }
+        }
+        idx2 += 1;
+    }
+
+    idx2 == leader2_len && idx1 == leader1_len as usize
+}
+
 /// Set when `auto_format()` added an extra space under the cursor
 /// (`did_add_space`).
 pub static DID_ADD_SPACE: crate::globals::GlobalCell<bool> =
@@ -225,6 +307,134 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    /// Like [`open_and_set_test_buf`], but builds several lines, which
+    /// `same_leader` needs since it compares line `lnum` with `lnum + 1`.
+    fn open_and_set_test_buf_lines(
+        win: &mut WinT,
+        buf: &mut BufT,
+        lines: &[&[u8]],
+    ) -> CurbufWinGuard {
+        let guard = CurbufWinGuard::set(win as *mut WinT, buf as *mut BufT);
+        assert_eq!(unsafe { crate::memline::ml_open(buf) }, crate::vim_defs::OK);
+        for (i, line) in lines.iter().enumerate() {
+            let mut with_nul = line.to_vec();
+            with_nul.push(0);
+            if i == 0 {
+                assert_eq!(
+                    unsafe { crate::memline::ml_replace_buf_len(buf, 1, &with_nul) },
+                    crate::vim_defs::OK
+                );
+            } else {
+                assert_eq!(
+                    unsafe {
+                        crate::memline::ml_append_buf(
+                            buf,
+                            i as LinenrT,
+                            &with_nul,
+                            with_nul.len() as i32,
+                            false,
+                        )
+                    },
+                    crate::vim_defs::OK
+                );
+            }
+        }
+        guard
+    }
+
+    #[test]
+    fn same_leader_with_no_first_leader_requires_no_second_one() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"a", b"b"]);
+
+        assert!(unsafe { same_leader(1, 0, None, 0, None) });
+        assert!(!unsafe { same_leader(1, 0, None, 2, Some(b"m")) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn same_leader_first_flag_requires_no_second_leader() {
+        // 'f' means the leader only appears on the first line, so the
+        // lines can be joined only if the second has no leader.
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"// a", b"// b"]);
+
+        assert!(unsafe { same_leader(1, 2, Some(b"f"), 0, None) });
+        assert!(!unsafe { same_leader(1, 2, Some(b"f"), 2, Some(b"f")) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn same_leader_end_flag_never_joins() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"*/", b"*/"]);
+
+        assert!(!unsafe { same_leader(1, 2, Some(b"e"), 2, Some(b"e")) });
+        assert!(!unsafe { same_leader(1, 2, Some(b"e"), 0, None) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn same_leader_start_flag_needs_text_and_a_middle_second_leader() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        // Line 1 is longer than its 2-byte leader, so there IS text
+        // after it.
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"/* x", b" * y"]);
+
+        assert!(unsafe { same_leader(1, 2, Some(b"s"), 2, Some(b"m")) });
+        // No 'm' flag on the second leader.
+        assert!(!unsafe { same_leader(1, 2, Some(b"s"), 2, Some(b"e")) });
+        // No second leader at all.
+        assert!(!unsafe { same_leader(1, 2, Some(b"s"), 0, None) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn same_leader_start_flag_rejects_a_leader_only_line() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        // Line 1 is exactly its own leader, so there is no text after
+        // it and the lines cannot be joined.
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"/*", b" * y"]);
+
+        assert!(!unsafe { same_leader(1, 2, Some(b"s"), 2, Some(b"m")) });
+
+        drop(guard);
+        close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn same_leader_compares_the_leader_text_when_no_flag_decides() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf_lines(&mut win, &mut buf, &[b"# a", b"# b"]);
+
+        // Matching one-byte leaders.
+        assert!(unsafe { same_leader(1, 1, Some(b""), 1, Some(b"")) });
+        // The second line's leader text differs from the first's.
+        let mut buf2 = BufT::default();
+        let mut win2 = WinT::default();
+        drop(guard);
+        close_buf_with_memline(buf);
+        let guard2 = open_and_set_test_buf_lines(&mut win2, &mut buf2, &[b"# a", b"; b"]);
+        assert!(!unsafe { same_leader(1, 1, Some(b""), 1, Some(b"")) });
+
+        drop(guard2);
+        close_buf_with_memline(buf2);
     }
 
     #[test]
