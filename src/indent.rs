@@ -256,6 +256,35 @@ pub fn tabstop_copy(oldts: Option<&[ColnrT]>) -> Option<Vec<ColnrT>> {
     oldts.map(<[ColnrT]>::to_vec)
 }
 
+/// Whether preprocessor lines are left alone when indenting
+/// (`preprocs_left`).
+///
+/// # Scope
+///
+/// The guard is real and translated in full, and resolves without
+/// `in_cinkeys` for every buffer this crate can build: `'cindent'`
+/// (`b_p_cin`) is `0` by default, so `&&` short-circuits the second
+/// operand before `in_cinkeys` is reached. That branch is
+/// `unimplemented!()`, needing `indent_c.c`'s own `in_cinkeys`.
+///
+/// # Safety
+/// Same as [`may_do_si`].
+#[must_use]
+pub unsafe fn preprocs_left() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    if curbuf.b_p_si != 0 && curbuf.b_p_cin == 0 {
+        return true;
+    }
+    if curbuf.b_p_cin == 0 {
+        return false;
+    }
+    unimplemented!(
+        "the 'cindent' half needs indent_c.c's in_cinkeys, not yet translated; \
+         unreachable while 'cindent' is off"
+    );
+}
+
 /// Calculate the number of screen spaces a tab will occupy. If `vts`
 /// is set then the tab widths are taken from that slice, otherwise
 /// the value of `ts_arg` is used (`tabstop_padding`).
@@ -1914,6 +1943,31 @@ mod tests {
 
         drop(guard);
         close_buf_with_memline(buf);
+    }
+
+    #[test]
+    fn preprocs_left_true_with_smartindent_and_no_cindent() {
+        let mut buf = BufT { b_p_si: 1, b_p_cin: 0, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(unsafe { preprocs_left() });
+    }
+
+    #[test]
+    fn preprocs_left_false_with_neither_option() {
+        let mut buf = BufT { b_p_si: 0, b_p_cin: 0, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        assert!(!unsafe { preprocs_left() });
+    }
+
+    #[test]
+    #[should_panic(expected = "in_cinkeys")]
+    fn preprocs_left_cindent_branch_is_unreachable_but_documented() {
+        // Proves the guard is really driven by 'cindent' rather than
+        // hardcoded away: forcing a value nothing in this crate can
+        // currently produce reaches the deferred branch.
+        let mut buf = BufT { b_p_si: 0, b_p_cin: 1, ..Default::default() };
+        let _guard = CursorTestGuard::set(std::ptr::null_mut(), &mut buf as *mut BufT);
+        let _ = unsafe { preprocs_left() };
     }
 
     #[test]
