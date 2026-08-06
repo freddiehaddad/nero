@@ -1810,6 +1810,48 @@ pub unsafe fn vim_strnsize(s: &[u8], len: i32) -> i32 {
     size
 }
 
+/// Append the printable translation of `s` onto a
+/// [`crate::types_defs::StringBuilder`], replacing unprintable
+/// characters with a printable representation (`kv_transstr`).
+///
+/// Returns the number of bytes appended, not counting the NUL that
+/// `transstr_buf` writes past them.
+///
+/// # Translation note
+/// `StringBuilder` is a `Vec<u8>` here, so the original's
+/// `kv_ensure_space` becomes a `reserve`. The original then has
+/// `transstr_buf` write straight into the slack past `str->size` and
+/// bumps the size by `len` afterwards, deliberately leaving the
+/// trailing NUL outside the recorded length. A `Vec`'s spare capacity
+/// is not initialised memory a safe `&mut [u8]` may cover, so this
+/// resizes to make that room real, translates into it, and then
+/// truncates the NUL back off - same resulting bytes, same returned
+/// length, without reading uninitialised memory.
+///
+/// # Safety
+/// Same as [`transstr_len`].
+pub unsafe fn kv_transstr(
+    str: &mut crate::types_defs::StringBuilder,
+    s: Option<&[u8]>,
+    untab: bool,
+) -> usize {
+    let Some(s) = s else {
+        return 0;
+    };
+
+    // Compute the length of the result, taking account of unprintable
+    // multi-byte characters.
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { transstr_len(s, untab) };
+    let base = str.len();
+    str.resize(base + len + 1, 0);
+    // SAFETY: forwarded from this function's own safety doc; the
+    // destination has exactly len + 1 bytes, as transstr_buf requires.
+    unsafe { transstr_buf(s, None, &mut str[base..], len + 1, untab) };
+    str.truncate(base + len); // do not include NUL byte
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2593,6 +2635,85 @@ mod tests {
 
         // Whatever it produced, it stayed inside the stated capacity.
         assert_eq!(buf[4..], [0u8; 12], "nothing written past bufsize");
+    }
+
+    #[test]
+    fn kv_transstr_appends_and_reports_the_appended_length() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        // Cross-verified against real nvim: strtrans("abc") is "abc"
+        // and strtrans("a\x01b") is "a^Ab".
+        let mut sb: crate::types_defs::StringBuilder = Vec::new();
+        let n = unsafe { kv_transstr(&mut sb, Some(b"abc\0"), true) };
+        assert_eq!(n, 3);
+        assert_eq!(sb, b"abc", "the NUL must not be part of the length");
+
+        // A second call appends rather than replacing, which is the
+        // whole point of building into a StringBuilder.
+        let n2 = unsafe { kv_transstr(&mut sb, Some(b"a\x01b\0"), true) };
+        assert_eq!(n2, 4);
+        assert_eq!(sb, b"abca^Ab");
+    }
+
+    #[test]
+    fn kv_transstr_returns_zero_for_a_null_string() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        let mut sb: crate::types_defs::StringBuilder = b"kept".to_vec();
+        // The original's `if (!s) return 0;` - the builder is left
+        // exactly as it was.
+        assert_eq!(unsafe { kv_transstr(&mut sb, None, true) }, 0);
+        assert_eq!(sb, b"kept");
+    }
+
+    #[test]
+    fn kv_transstr_appends_nothing_for_an_empty_string() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        // Cross-verified against real nvim: strtrans("") is "".
+        let mut sb: crate::types_defs::StringBuilder = b"pre".to_vec();
+        assert_eq!(unsafe { kv_transstr(&mut sb, Some(b"\0"), true) }, 0);
+        assert_eq!(sb, b"pre", "no NUL may leak into the builder");
+    }
+
+    #[test]
+    fn kv_transstr_escapes_control_characters_like_transstr_does() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        // Cross-verified against real nvim: strtrans("\x01") is "^A".
+        let mut sb: crate::types_defs::StringBuilder = Vec::new();
+        let n = unsafe { kv_transstr(&mut sb, Some(b"\x01\0"), true) };
+        assert_eq!(n, 2);
+        assert_eq!(sb, b"^A");
+    }
+
+    #[test]
+    fn kv_transstr_agrees_with_transstr_apart_from_the_trailing_nul() {
+        let mut curbuf = crate::buffer_defs::BufT::default();
+        let _guard = CurbufGuard::set(&mut curbuf);
+        // Both are transstr_len + transstr_buf over the same input, so
+        // their bytes must never disagree. The one deliberate
+        // difference is the terminating NUL: this crate's `transstr`
+        // owns its own (see its tests, e.g. transstr("hello") is
+        // b"hello\0"), whereas kv_transstr appends only the translated
+        // bytes - the original's own `str->size += len;  // do not
+        // include NUL byte`.
+        for input in [
+            b"plain\0".as_ref(),
+            b"\x01\x02\x7f\0",
+            b"a\tb\0",
+            b"mixed \x01 text\0",
+            b"\0",
+        ] {
+            for untab in [false, true] {
+                let full = unsafe { transstr(input, untab) };
+                let expected = &full[..full.len() - 1];
+                let mut sb: crate::types_defs::StringBuilder = Vec::new();
+                let n = unsafe { kv_transstr(&mut sb, Some(input), untab) };
+                assert_eq!(sb, expected, "input {input:?} untab={untab}");
+                assert_eq!(n, expected.len(), "input {input:?} untab={untab}");
+            }
+        }
     }
 
     #[test]
