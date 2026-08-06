@@ -67,6 +67,78 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Move back to the end of the previous word (`bckend_word`), the
+/// `ge`/`gE` motion.
+///
+/// With `bigword`, punctuation and keyword characters are treated
+/// alike. With `eol`, the motion stops when it crosses a line break.
+///
+/// Returns `FAIL` when the start of the file was reached.
+///
+/// # Safety
+/// Same as [`fwd_word`].
+pub unsafe fn bckend_word(count: i32, bigword: bool, eol: bool) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_cursor.coladd = 0;
+    // SAFETY: writing a plain `bool` global.
+    unsafe { *CLS_BIGWORD.get_mut() = bigword };
+
+    let mut count = count;
+    while {
+        count -= 1;
+        count >= 0
+    } {
+        // SAFETY: forwarded from this function's own safety doc.
+        let sclass = unsafe { cls() }; // Starting class.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut i = unsafe { crate::cursor::dec_cursor() };
+        if i == -1 {
+            return crate::vim_defs::FAIL;
+        }
+        if eol && i == 1 {
+            return crate::vim_defs::OK;
+        }
+
+        // Move backward to before the start of this word.
+        if sclass != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            while unsafe { cls() } == sclass {
+                // SAFETY: forwarded from this function's own safety doc.
+                i = unsafe { crate::cursor::dec_cursor() };
+                if i == -1 || (eol && i == 1) {
+                    return crate::vim_defs::OK;
+                }
+            }
+        }
+
+        // Move backward to the end of the previous word.
+        // SAFETY: forwarded from this function's own safety doc.
+        while unsafe { cls() } == 0 {
+            // `LINEEMPTY(lnum)` in the original.
+            // SAFETY: forwarded from this function's own safety doc.
+            let empty_line = unsafe { crate::cursor::get_cursor_line_ptr() }
+                .first()
+                .copied()
+                .unwrap_or(0)
+                == 0;
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { &*curwin }.w_cursor.col == 0 && empty_line {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            i = unsafe { crate::cursor::dec_cursor() };
+            if i == -1 || (eol && i == 1) {
+                return crate::vim_defs::OK;
+            }
+        }
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::adjust_skipcol() };
+    crate::vim_defs::OK
+}
+
 /// Move to the end of the word (`end_word`), the `e`/`E` motion.
 ///
 /// With `bigword`, punctuation and keyword characters are treated
@@ -945,6 +1017,84 @@ mod tests {
             ..Default::default()
         });
         (buf, win)
+    }
+
+    #[test]
+    fn bckend_word_moves_to_the_end_of_the_previous_word() {
+        // Cross-verified against real nvim: on "foo,bar baz" with the
+        // cursor at column 9 (1-based, the 'b' of "baz"), "ge" lands
+        // on column 7 - the 'r' of "bar".
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(
+            unsafe { bckend_word(1, false, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 6);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bckend_word_repeats_for_a_count() {
+        // Cross-verified against real nvim: "2ge" from the same start
+        // lands on column 4 (1-based), the comma.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(
+            unsafe { bckend_word(2, false, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3);
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bckend_word_bigword_lands_on_the_previous_whole_word() {
+        // Cross-verified against real nvim: "gE" from the same start
+        // also lands on column 7 (1-based) - the end of the single
+        // WORD "foo,bar".
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"foo,bar baz", 8);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+        let prev = *unsafe { CLS_BIGWORD.get_mut() };
+
+        assert_eq!(unsafe { bckend_word(1, true, false) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 6);
+
+        unsafe { *CLS_BIGWORD.get_mut() = prev };
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn bckend_word_fails_at_the_start_of_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"abc", 0);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert_eq!(
+            unsafe { bckend_word(1, false, false) },
+            crate::vim_defs::FAIL
+        );
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
     }
 
     #[test]
