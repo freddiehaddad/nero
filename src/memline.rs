@@ -215,7 +215,7 @@ const ML_APPEND_NEW: i32 = 1; // starting to edit a new file
 const ML_APPEND_MARK: i32 = 2; // mark the new line
 
 // Flags for ml_delete_int() (memline.h's own anonymous `enum`).
-const ML_DEL_MESSAGE: i32 = 1; // may give a "No lines in buffer" message
+pub const ML_DEL_MESSAGE: i32 = 1; // may give a "No lines in buffer" message
                                 // (ML_DEL_UNDO = 2 is commented out/unused upstream too)
 
 /// The line number where the first `:global`-command mark may be. If

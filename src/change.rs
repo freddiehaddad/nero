@@ -218,6 +218,64 @@ pub unsafe fn changed_lines_invalidate_buf(
     }
 }
 
+/// Delete `nlines` lines at the cursor (`del_lines`).
+///
+/// With `undo`, the deleted lines are saved for undo first. Stops
+/// early if the buffer becomes empty or the last line is reached.
+///
+/// # Safety
+/// Same as [`deleted_lines_mark`].
+pub unsafe fn del_lines(nlines: LinenrT, undo: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    let curbuf = g.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let first = unsafe { &*curwin }.w_cursor.lnum;
+
+    if nlines <= 0 {
+        return;
+    }
+
+    // Save the deleted lines for undo.
+    // SAFETY: forwarded from this function's own safety doc.
+    if undo && unsafe { crate::undo::u_savedel(first, nlines) } == crate::vim_defs::FAIL {
+        return;
+    }
+
+    let mut n: LinenrT = 0;
+    while n < nlines {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { &*curbuf }.b_ml.ml_flags & crate::memline_defs::ML_EMPTY != 0 {
+            // Nothing to delete.
+            break;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        // (the original ignores ml_delete_flags's return value here too.)
+        let _ = unsafe { crate::memline::ml_delete_flags(first, crate::memline::ML_DEL_MESSAGE) };
+        n += 1;
+
+        // If we delete the last line in the file, stop.
+        // SAFETY: forwarded from this function's own safety doc.
+        if first > unsafe { &*curbuf }.b_ml.ml_line_count {
+            break;
+        }
+    }
+
+    // Correct the cursor position before calling deleted_lines_mark(),
+    // since it may trigger a callback to display the cursor.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_cursor.col = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::check_cursor_lnum(curwin) };
+
+    // Adjust marks, mark the buffer as changed and prepare for
+    // displaying.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { deleted_lines_mark(first, n) };
+}
+
 /// Insert the NUL-terminated byte string `p` at the cursor position
 /// (`ins_bytes`).
 ///
@@ -2166,6 +2224,104 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    /// Like [`del_fixture`], but builds a buffer with several lines,
+    /// which `del_lines` needs in order to have anything to remove.
+    fn del_fixture_lines(lines: &[&[u8]], lnum: LinenrT) -> (Box<BufT>, Box<WinT>) {
+        let mut buf = Box::new(BufT::default());
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let mut owned = line.to_vec();
+            owned.push(0);
+            if i == 0 {
+                assert_eq!(
+                    unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &owned) },
+                    crate::vim_defs::OK
+                );
+            } else {
+                assert_eq!(
+                    unsafe {
+                        crate::memline::ml_append_buf(
+                            &mut buf,
+                            i as LinenrT,
+                            &owned,
+                            owned.len() as i32,
+                            false,
+                        )
+                    },
+                    crate::vim_defs::OK
+                );
+            }
+        }
+        buf.b_u_curhead = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        let win = Box::new(WinT {
+            w_cursor: PosT { lnum, col: 0, coladd: 0 },
+            w_topline: 1,
+            w_botline: lines.len() as LinenrT + 1,
+            ..Default::default()
+        });
+        (buf, win)
+    }
+
+    #[test]
+    fn del_lines_removes_the_requested_count() {
+        // Cross-verified against real nvim: lines a..e with the cursor
+        // on line 2 and "2dd" leaves "a,d,e" with the cursor on line 2.
+        let (mut buf, mut win) = del_fixture_lines(&[b"a", b"b", b"c", b"d", b"e"], 2);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { del_lines(2, false) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 3);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"a\0");
+        assert_eq!(unsafe { crate::memline::ml_get(2) }, b"d\0");
+        assert_eq!(unsafe { crate::memline::ml_get(3) }, b"e\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 2);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_lines_stops_when_the_buffer_becomes_empty() {
+        // Cross-verified against real nvim: a 2-line buffer with "9dd"
+        // ends up with one empty line, not zero lines.
+        let (mut buf, mut win) = del_fixture_lines(&[b"a", b"b"], 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { del_lines(9, false) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 1);
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 1);
+
+        drop(_guard);
+        close_del_fixture(buf);
+    }
+
+    #[test]
+    fn del_lines_with_a_non_positive_count_is_a_noop() {
+        let (mut buf, mut win) = del_fixture_lines(&[b"a", b"b"], 1);
+        let (buf_ptr, win_ptr) = fixture_ptrs(&mut buf, &mut win);
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let _guard = ChangedGuard::set(win_ptr, buf_ptr, &mut tab);
+
+        unsafe { del_lines(0, false) };
+
+        assert_eq!(unsafe { (*buf_ptr).b_ml.ml_line_count }, 2);
+        assert_eq!(unsafe { (*buf_ptr).b_changed }, 0);
+
+        drop(_guard);
+        close_del_fixture(buf);
     }
 
     #[test]
