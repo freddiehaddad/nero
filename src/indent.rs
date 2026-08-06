@@ -140,6 +140,25 @@ static BREAKINDENT_CACHE: std::sync::LazyLock<GlobalCell<BreakindentCache>> =
 // could for `callback_from_typval` (which had only 2 real outcomes) -
 // a dedicated marker error type would carry no more information than
 // `()` already does.
+/// Whether `'indentexpr'` should be used for Lisp indenting
+/// (`use_indentexpr_for_lisp`).
+///
+/// All three conditions must hold: the buffer is in Lisp mode,
+/// `'indentexpr'` is non-empty, and `'lispoptions'` is exactly
+/// `"expr:1"`. Callers may also want to check `'autoindent'`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn use_indentexpr_for_lisp() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf };
+    curbuf.b_p_lisp != 0
+        && curbuf.b_p_inde.as_deref().is_some_and(|inde| !inde.is_empty())
+        && curbuf.b_p_lop.as_deref() == Some(b"expr:1")
+}
+
 #[allow(clippy::result_unit_err)]
 pub fn tabstop_set(var: &[u8]) -> Result<Option<Vec<ColnrT>>, ()> {
     if var.is_empty() || var == b"0" {
@@ -959,6 +978,80 @@ pub unsafe fn get_breakindent_win(wp: &mut WinT, line: &[u8]) -> i32 {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    /// Installs `buf` as `curbuf`, restoring the previous one on drop.
+    struct CurbufGuard {
+        prev: *mut BufT,
+    }
+
+    impl CurbufGuard {
+        fn set(buf: &mut BufT) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev = globals.curbuf;
+            globals.curbuf = buf as *mut BufT;
+            Self { prev }
+        }
+    }
+
+    impl Drop for CurbufGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = self.prev;
+        }
+    }
+
+    #[test]
+    fn use_indentexpr_for_lisp_needs_all_three_conditions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT {
+            b_p_lisp: 1,
+            b_p_inde: Some(b"MyIndent()".to_vec()),
+            b_p_lop: Some(b"expr:1".to_vec()),
+            ..Default::default()
+        };
+        let _guard = CurbufGuard::set(&mut buf);
+        assert!(unsafe { use_indentexpr_for_lisp() });
+    }
+
+    #[test]
+    fn use_indentexpr_for_lisp_is_false_when_any_condition_fails() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        // Not in Lisp mode.
+        let mut buf = BufT {
+            b_p_lisp: 0,
+            b_p_inde: Some(b"MyIndent()".to_vec()),
+            b_p_lop: Some(b"expr:1".to_vec()),
+            ..Default::default()
+        };
+        {
+            let _guard = CurbufGuard::set(&mut buf);
+            assert!(!unsafe { use_indentexpr_for_lisp() });
+        }
+
+        // 'indentexpr' empty, and absent.
+        for inde in [Some(Vec::new()), None] {
+            let mut buf = BufT {
+                b_p_lisp: 1,
+                b_p_inde: inde,
+                b_p_lop: Some(b"expr:1".to_vec()),
+                ..Default::default()
+            };
+            let _guard = CurbufGuard::set(&mut buf);
+            assert!(!unsafe { use_indentexpr_for_lisp() });
+        }
+
+        // 'lispoptions' must match exactly, not merely start with it.
+        for lop in [Some(b"expr:0".to_vec()), Some(b"expr:10".to_vec()), None] {
+            let mut buf = BufT {
+                b_p_lisp: 1,
+                b_p_inde: Some(b"MyIndent()".to_vec()),
+                b_p_lop: lop,
+                ..Default::default()
+            };
+            let _guard = CurbufGuard::set(&mut buf);
+            assert!(!unsafe { use_indentexpr_for_lisp() });
+        }
+    }
 
     #[test]
     fn get_breakindent_win_plain_indent_no_options() {
