@@ -67,6 +67,99 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Find the next occurrence of `quotechar` in `line`, starting at
+/// `col` (`find_next_quote`).
+///
+/// Returns the column of the quote, or `None` when the end of the
+/// line is reached first. A character listed in `escape` protects the
+/// character after it, so an escaped quote is skipped over.
+///
+/// # Safety
+/// Same as [`crate::mbyte::utfc_ptr2len`].
+#[must_use]
+pub unsafe fn find_next_quote(
+    line: &[u8],
+    col: i32,
+    quotechar: i32,
+    escape: Option<&[u8]>,
+) -> Option<i32> {
+    let mut col = col;
+    let at = |i: i32| {
+        if i < 0 {
+            0
+        } else {
+            line.get(i as usize).copied().unwrap_or(0)
+        }
+    };
+    loop {
+        let c = i32::from(at(col));
+        if c == 0 {
+            return None;
+        } else if escape.is_some_and(|e| crate::strings::vim_strchr(e, c).is_some()) {
+            col += 1;
+            if at(col) == 0 {
+                return None;
+            }
+        } else if c == quotechar {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        col += unsafe { crate::mbyte::utfc_ptr2len(&line[(col.max(0) as usize).min(line.len())..]) };
+    }
+    Some(col)
+}
+
+/// Find the previous occurrence of `quotechar` in `line`, searching
+/// backwards from `col_start` (`find_prev_quote`).
+///
+/// Returns the column of the quote, or `0` when none is found - the
+/// original reports the loop's own end position rather than a
+/// sentinel.
+///
+/// An odd run of `escape` characters immediately before a candidate
+/// means that candidate is escaped, so it is skipped.
+///
+/// # Safety
+/// Same as [`crate::mbyte::utf_head_off`].
+#[must_use]
+pub unsafe fn find_prev_quote(
+    line: &[u8],
+    col_start: i32,
+    quotechar: i32,
+    escape: Option<&[u8]>,
+) -> i32 {
+    let mut col_start = col_start;
+    let at = |i: i32| {
+        if i < 0 {
+            0
+        } else {
+            line.get(i as usize).copied().unwrap_or(0)
+        }
+    };
+    while col_start > 0 {
+        col_start -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        col_start -= unsafe {
+            crate::mbyte::utf_head_off(line, (col_start.max(0) as usize).min(line.len()))
+        };
+        let mut n = 0;
+        if let Some(e) = escape {
+            while col_start - n > 0
+                && crate::strings::vim_strchr(e, i32::from(at(col_start - n - 1))).is_some()
+            {
+                n += 1;
+            }
+        }
+        if n & 1 != 0 {
+            // An uneven number of escape chars, so skip it.
+            col_start -= n;
+        } else if i32::from(at(col_start)) == quotechar {
+            break;
+        }
+    }
+    col_start
+}
+
 /// Return `true` if line `lnum` is the start of a section or paragraph
 /// (`startPS`). If `para` is `'{'`/`'}'` only check for sections. If
 /// `both` is true also stop at `'}'`.
@@ -429,6 +522,82 @@ pub unsafe fn findsent(dir: Direction, mut count: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_next_quote_finds_the_first_unescaped_quote() {
+        let line = b"say \"hi\" now\0";
+        assert_eq!(
+            unsafe { find_next_quote(line, 0, i32::from(b'"'), None) },
+            Some(4)
+        );
+        // Starting past the first quote finds the closing one.
+        assert_eq!(
+            unsafe { find_next_quote(line, 5, i32::from(b'"'), None) },
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn find_next_quote_returns_none_at_the_end_of_the_line() {
+        let line = b"no quotes here\0";
+        assert_eq!(
+            unsafe { find_next_quote(line, 0, i32::from(b'"'), None) },
+            None
+        );
+    }
+
+    #[test]
+    fn find_next_quote_skips_an_escaped_quote() {
+        // The backslash protects the quote after it, so the match is
+        // the LATER one.
+        let line = b"a\\\"b\"c\0";
+        assert_eq!(
+            unsafe { find_next_quote(line, 0, i32::from(b'"'), Some(b"\\")) },
+            Some(4)
+        );
+        // Without an escape list that same quote does match.
+        assert_eq!(
+            unsafe { find_next_quote(line, 0, i32::from(b'"'), None) },
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn find_next_quote_returns_none_when_an_escape_ends_the_line() {
+        let line = b"ab\\\0";
+        assert_eq!(
+            unsafe { find_next_quote(line, 0, i32::from(b'"'), Some(b"\\")) },
+            None
+        );
+    }
+
+    #[test]
+    fn find_prev_quote_searches_backwards() {
+        let line = b"say \"hi\" now\0";
+        // From just past the closing quote, the previous one is it.
+        assert_eq!(unsafe { find_prev_quote(line, 7, i32::from(b'"'), None) }, 4);
+        // From the closing quote itself, the previous is the opening.
+        assert_eq!(unsafe { find_prev_quote(line, 4, i32::from(b'"'), None) }, 0);
+    }
+
+    #[test]
+    fn find_prev_quote_skips_an_escaped_quote() {
+        // col 3 is an escaped quote; searching back from past it lands
+        // on the unescaped one at col 0 instead.
+        let line = b"\"a\\\"b\0";
+        assert_eq!(
+            unsafe { find_prev_quote(line, 4, i32::from(b'"'), Some(b"\\")) },
+            0
+        );
+    }
+
+    #[test]
+    fn find_prev_quote_reports_zero_when_none_is_found() {
+        // The original returns the loop's own end position rather
+        // than a sentinel.
+        let line = b"no quotes\0";
+        assert_eq!(unsafe { find_prev_quote(line, 5, i32::from(b'"'), None) }, 0);
+    }
 
     #[test]
     fn inmacro_matches_exact_pair() {
