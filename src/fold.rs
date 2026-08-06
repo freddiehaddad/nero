@@ -711,6 +711,50 @@ pub fn fold_level_win(wp: &WinT, lnum: crate::pos_defs::LinenrT) -> i32 {
     level
 }
 
+/// Remove the fold at `idx` from `gap` (`deleteFoldEntry`).
+///
+/// With `recursive` set - or when the fold has no children anyway -
+/// the fold and everything nested under it goes. Otherwise the fold
+/// alone is removed and its children are promoted one level up to
+/// take its place, which is why they need their `fd_top` rebased onto
+/// the parent's (nested folds store it relative to their parent).
+///
+/// A promoted child inherits `FD_LEVEL` from its old parent, since
+/// that flag means "depends on `'foldlevel'`" and must keep applying,
+/// and likewise inherits an unknown [`crate::types_defs::TriState::None`]
+/// smallness, which by definition also covers nested folds.
+///
+/// # Translation note
+/// The original does this with `ga_grow` plus three `memmove`s and an
+/// `xfree`, and has to re-derive `fp` afterwards because the array
+/// may have been reallocated. Owning the folds in a `Vec<FoldT>`
+/// turns that into a `remove` followed by a `splice`, with no
+/// reallocation hazard and no manual free of the promoted array.
+pub fn delete_fold_entry(gap: &mut Vec<FoldT>, idx: usize, recursive: bool) {
+    let fp = gap.remove(idx);
+
+    if recursive || fp.fd_nested.is_empty() {
+        // Recursively delete the contained folds - dropping `fp` here
+        // already does exactly that (see [`delete_fold_recurse`]).
+        return;
+    }
+
+    // Move nested folds one level up, to overwrite the fold that is
+    // deleted.
+    let mut nested = fp.fd_nested;
+    for nfp in &mut nested {
+        // Adjust fd_top and fd_flags for the moved folds.
+        nfp.fd_top += fp.fd_top;
+        if fp.fd_flags == fd_flags::FD_LEVEL {
+            nfp.fd_flags = fd_flags::FD_LEVEL;
+        }
+        if fp.fd_small == crate::types_defs::TriState::None {
+            nfp.fd_small = crate::types_defs::TriState::None;
+        }
+    }
+    gap.splice(idx..idx, nested);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1689,5 +1733,137 @@ mod tests {
         assert_eq!(fold_level_win(&win, 19), 3);
         // Past the innermost fold but still inside the middle one.
         assert_eq!(fold_level_win(&win, 23), 2);
+    }
+
+    #[test]
+    fn delete_fold_entry_recursive_removes_the_whole_subtree() {
+        let mut gap = nested_outer_inner();
+        assert_eq!(gap.len(), 1);
+        delete_fold_entry(&mut gap, 0, true);
+        assert!(gap.is_empty(), "the nested fold goes with its parent");
+    }
+
+    #[test]
+    fn delete_fold_entry_promotes_nested_folds_like_real_nvim_zd() {
+        // Cross-verified against real nvim: with :14,18fold then
+        // :10,24fold, pressing zd on line 10 deletes only the outer
+        // fold and foldlevel() then reports 0 on lines 10-13 and
+        // 19-24, but 1 on lines 14-18 - i.e. the nested fold is
+        // promoted and keeps its absolute position.
+        let mut gap = nested_outer_inner();
+        delete_fold_entry(&mut gap, 0, false);
+
+        assert_eq!(gap.len(), 1, "the child is promoted, not deleted");
+        // fd_top was 4 relative to a parent starting at 10, so the
+        // promoted fold must now be at absolute line 14.
+        assert_eq!(gap[0].fd_top, 14);
+        assert_eq!(gap[0].fd_len, 5);
+
+        let win = WinT {
+            w_folds: gap,
+            ..Default::default()
+        };
+        for (lnum, level) in [(10, 0), (12, 0), (14, 1), (16, 1), (18, 1), (19, 0), (24, 0)] {
+            assert_eq!(fold_level_win(&win, lnum), level, "line {lnum}");
+        }
+    }
+
+    #[test]
+    fn delete_fold_entry_of_a_childless_fold_just_removes_it() {
+        let mut gap = sibling_folds();
+        delete_fold_entry(&mut gap, 1, false);
+        assert_eq!(gap.len(), 2);
+        // The surrounding siblings keep their order and positions.
+        assert_eq!(gap[0].fd_top, 10);
+        assert_eq!(gap[1].fd_top, 30);
+    }
+
+    #[test]
+    fn delete_fold_entry_promotes_children_into_the_right_slot() {
+        // A fold with two children, sitting between two siblings: the
+        // children must land exactly where their parent was.
+        let mut gap = vec![
+            FoldT {
+                fd_top: 1,
+                fd_len: 2,
+                ..Default::default()
+            },
+            FoldT {
+                fd_top: 10,
+                fd_len: 20,
+                fd_nested: vec![
+                    FoldT {
+                        fd_top: 2,
+                        fd_len: 3,
+                        ..Default::default()
+                    },
+                    FoldT {
+                        fd_top: 8,
+                        fd_len: 4,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            FoldT {
+                fd_top: 40,
+                fd_len: 5,
+                ..Default::default()
+            },
+        ];
+
+        delete_fold_entry(&mut gap, 1, false);
+
+        assert_eq!(gap.len(), 4);
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        // 2 + 10 = 12 and 8 + 10 = 18, still sorted between 1 and 40.
+        assert_eq!(tops, vec![1, 12, 18, 40]);
+    }
+
+    #[test]
+    fn delete_fold_entry_propagates_fd_level_and_unknown_smallness() {
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_LEVEL,
+            fd_small: crate::types_defs::TriState::None,
+            fd_nested: vec![FoldT {
+                fd_top: 2,
+                fd_len: 3,
+                fd_flags: fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::True,
+                ..Default::default()
+            }],
+        }];
+
+        delete_fold_entry(&mut gap, 0, false);
+
+        // FD_LEVEL means "depends on 'foldlevel'", so it must keep
+        // applying to the promoted child; kNone likewise covers
+        // nested folds by definition.
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_LEVEL);
+        assert_eq!(gap[0].fd_small, crate::types_defs::TriState::None);
+    }
+
+    #[test]
+    fn delete_fold_entry_leaves_child_flags_alone_when_the_parent_is_plain() {
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            fd_nested: vec![FoldT {
+                fd_top: 2,
+                fd_len: 3,
+                fd_flags: fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::True,
+                ..Default::default()
+            }],
+        }];
+
+        delete_fold_entry(&mut gap, 0, false);
+
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(gap[0].fd_small, crate::types_defs::TriState::True);
     }
 }
