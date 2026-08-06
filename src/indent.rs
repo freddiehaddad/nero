@@ -256,6 +256,114 @@ pub fn tabstop_copy(oldts: Option<&[ColnrT]>) -> Option<Vec<ColnrT>> {
     oldts.map(<[ColnrT]>::to_vec)
 }
 
+/// Copy the indent from `src` onto the current line, up to `size`
+/// columns, then append the current line's own text (`copy_indent`).
+///
+/// Used by `'autoindent'` and `'copyindent'`, which reuse the previous
+/// line's exact whitespace characters rather than re-deriving them
+/// from `'expandtab'`/`'tabstop'`.
+///
+/// # Adaptation
+///
+/// The original runs its body twice - round 1 counts the characters
+/// needed so the exact allocation size is known, round 2 copies them
+/// into that buffer. A `Vec` grows on demand, so the count round is
+/// unnecessary here and the characters are emitted in a single pass.
+/// The emitted sequence, and `ind_len`, are identical either way.
+///
+/// # Safety
+/// Same as [`set_indent`].
+pub unsafe fn copy_indent(size: i32, src: &[u8]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    let curbuf = g.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (et, ts, vts) = {
+        let b = unsafe { &*curbuf };
+        (b.b_p_et, b.b_p_ts, b.b_p_vts_array.clone())
+    };
+    let vts = vts.as_deref();
+
+    let mut line: Vec<u8> = Vec::new();
+    let mut todo = size;
+    let mut ind_len = 0;
+    let mut ind_done = 0;
+    let mut ind_col = 0;
+    let mut s = 0usize;
+    let at = |i: usize| src.get(i).copied().unwrap_or(0);
+    let mut tab_pad;
+
+    // Copy the usable portion of the source line.
+    while todo > 0 && crate::ascii_defs::ascii_iswhite(i32::from(at(s))) {
+        if at(s) == crate::ascii_defs::TAB {
+            tab_pad = tabstop_padding(ind_done, ts, vts);
+            // Stop if this tab will overshoot the target.
+            if todo < tab_pad {
+                break;
+            }
+            todo -= tab_pad;
+            ind_done += tab_pad;
+            ind_col += tab_pad;
+        } else {
+            todo -= 1;
+            ind_done += 1;
+            ind_col += 1;
+        }
+        ind_len += 1;
+        line.push(at(s));
+        s += 1;
+    }
+
+    // Fill to the next tabstop with a tab, if possible.
+    tab_pad = tabstop_padding(ind_done, ts, vts);
+    if todo >= tab_pad && et == 0 {
+        todo -= tab_pad;
+        ind_len += 1;
+        ind_col += tab_pad;
+        line.push(crate::ascii_defs::TAB);
+    }
+
+    // Add the tabs required for the indent.
+    if et == 0 {
+        loop {
+            tab_pad = tabstop_padding(ind_col, ts, vts);
+            if todo < tab_pad {
+                break;
+            }
+            todo -= tab_pad;
+            ind_len += 1;
+            ind_col += tab_pad;
+            line.push(crate::ascii_defs::TAB);
+        }
+    }
+
+    // Add the spaces required for the indent.
+    while todo > 0 {
+        todo -= 1;
+        ind_len += 1;
+        line.push(b' ');
+    }
+
+    // Append the original line.
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_len = unsafe { crate::cursor::get_cursor_line_len() } as usize + 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let old = unsafe { crate::cursor::get_cursor_line_ptr() };
+    line.extend_from_slice(&old[..line_len.min(old.len())]);
+
+    // Replace the line.
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { &*curwin }.w_cursor.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace(lnum, &line) };
+
+    // Put the cursor after the indent.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &mut *curwin }.w_cursor.col = ind_len;
+    true
+}
+
 /// Flags for [`set_indent`] (`indent.h`'s own anonymous `enum`).
 pub mod sin_flag {
     /// Call `changed_bytes()` when the line changed (`SIN_CHANGED`).
@@ -1422,6 +1530,91 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    #[test]
+    fn copy_indent_reuses_the_source_characters_verbatim() {
+        // Cross-verified against real nvim: with noexpandtab, ts=8 and
+        // 'autoindent'+'copyindent', opening a line below "\tfoo" and
+        // typing "bar" yields "\tbar" (strlen 4). The TAB is copied
+        // from the source, not re-derived - which is the whole point
+        // of copy_indent as opposed to set_indent.
+        let (mut buf, mut win) = set_indent_fixture(0, b"bar");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { copy_indent(8, b"\tfoo") });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"\tbar\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1, "one TAB copied");
+
+        drop(_guard);
+        close_set_indent_fixture(buf);
+    }
+
+    #[test]
+    fn copy_indent_keeps_a_source_tab_even_with_expandtab() {
+        // The copy loop emits the source's own characters, so a TAB in
+        // the source survives even though 'expandtab' would have made
+        // set_indent use spaces. Only the FILL past the copied portion
+        // honours 'expandtab'.
+        let (mut buf, mut win) = set_indent_fixture(1, b"bar");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { copy_indent(8, b"\tfoo") });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"\tbar\0");
+
+        drop(_guard);
+        close_set_indent_fixture(buf);
+    }
+
+    #[test]
+    fn copy_indent_fills_past_the_source_indent_with_spaces_when_expandtab() {
+        // The source only supplies 2 columns; the remaining 3 are
+        // filled, and with 'expandtab' that fill is spaces.
+        let (mut buf, mut win) = set_indent_fixture(1, b"bar");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { copy_indent(5, b"  foo") });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"     bar\0");
+
+        drop(_guard);
+        close_set_indent_fixture(buf);
+    }
+
+    #[test]
+    fn copy_indent_stops_at_a_tab_that_would_overshoot() {
+        // A TAB worth 8 columns cannot be used when only 3 are wanted,
+        // so it is skipped and the remainder becomes spaces.
+        let (mut buf, mut win) = set_indent_fixture(1, b"bar");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { copy_indent(3, b"\tfoo") });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"   bar\0");
+
+        drop(_guard);
+        close_set_indent_fixture(buf);
+    }
+
+    #[test]
+    fn copy_indent_with_zero_size_just_keeps_the_line() {
+        let (mut buf, mut win) = set_indent_fixture(1, b"bar");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = CursorTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { copy_indent(0, b"\t\tfoo") });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"bar\0");
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0);
+
+        drop(_guard);
+        close_set_indent_fixture(buf);
     }
 
     #[test]
