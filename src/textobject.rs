@@ -67,6 +67,81 @@ fn inmacro(opt: &[u8], s: &[u8]) -> bool {
     }
 }
 
+/// Whether the cursor is inside an HTML tag, and whether that tag is
+/// a closing one (`in_html_tag`).
+///
+/// With `end_tag`, reports `true` only for a closing tag (`</...>`);
+/// otherwise only for an opening tag that is not self-closing.
+///
+/// # Safety
+/// Same as [`crate::memline::ml_get_pos`].
+#[must_use]
+pub unsafe fn in_html_tag(end_tag: bool) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut p = unsafe { &*curwin }.w_cursor.col as usize;
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+
+    // Find a '<' under or before the cursor, stopping at a '>'.
+    while p > 0 {
+        if at(p) == b'<' {
+            break;
+        }
+        // `MB_PTR_BACK(line, p)`: step back one whole character.
+        p -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        p -= unsafe { crate::mbyte::utf_head_off(&line, p) } as usize;
+        if at(p) == b'>' {
+            break;
+        }
+    }
+    if at(p) != b'<' {
+        return false;
+    }
+
+    let mut pos = crate::pos_defs::PosT {
+        // SAFETY: forwarded from this function's own safety doc.
+        lnum: unsafe { &*curwin }.w_cursor.lnum,
+        col: p as crate::pos_defs::ColnrT,
+        coladd: 0,
+    };
+
+    // `MB_PTR_ADV(p)`: step forward one whole character.
+    // SAFETY: forwarded from this function's own safety doc.
+    p += unsafe { crate::mbyte::utfc_ptr2len(&line[p.min(line.len())..]) } as usize;
+    if end_tag {
+        // Check that there is a '/' after the '<'.
+        return at(p) == b'/';
+    }
+
+    // Check that there is no '/' after the '<'.
+    if at(p) == b'/' {
+        return false;
+    }
+
+    // Check that the matching '>' is not preceded by '/'.
+    let mut lc = 0u8;
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::memline::inc(&mut pos) } < 0 {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe { crate::memline::ml_get_pos(&pos) }
+            .first()
+            .copied()
+            .unwrap_or(0);
+        if c == b'>' {
+            break;
+        }
+        lc = c;
+    }
+    lc != b'/'
+}
+
 /// Skip `count`/2 sentences and `count`/2 separating runs of white
 /// space (`findsent_forward`).
 ///
@@ -1072,6 +1147,88 @@ mod tests {
             ..Default::default()
         });
         (buf, win)
+    }
+
+    #[test]
+    fn in_html_tag_recognises_an_opening_tag() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cursor inside "<div>".
+        let (mut buf, mut win) = cls_fixture(b"a<div>b", 3);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { in_html_tag(false) }, "an opening tag");
+        assert!(!unsafe { in_html_tag(true) }, "but not a closing one");
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn in_html_tag_recognises_a_closing_tag() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cursor inside "</div>".
+        let (mut buf, mut win) = cls_fixture(b"a</div>b", 4);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { in_html_tag(true) }, "a closing tag");
+        assert!(
+            !unsafe { in_html_tag(false) },
+            "the '/' rules it out as an opening tag"
+        );
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn in_html_tag_rejects_a_self_closing_tag() {
+        // "<br/>" is neither an opening tag to match nor a closing
+        // one: the '/' before the '>' rules it out.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a<br/>b", 3);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(!unsafe { in_html_tag(false) });
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn in_html_tag_false_outside_any_tag() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cursor after the tag has already closed.
+        let (mut buf, mut win) = cls_fixture(b"<div>abc", 6);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(!unsafe { in_html_tag(false) });
+        assert!(!unsafe { in_html_tag(true) });
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
+    }
+
+    #[test]
+    fn in_html_tag_false_when_the_tag_is_never_closed() {
+        // No '>' on the line at all, so the scan runs off the end.
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut buf, mut win) = cls_fixture(b"a<div", 3);
+        let buf_ptr: *mut crate::buffer_defs::BufT = &mut *buf;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = TextobjectTestGuard::set(win_ptr, buf_ptr);
+
+        assert!(!unsafe { in_html_tag(false) });
+
+        drop(_guard);
+        unsafe { close_buf(*buf) };
     }
 
     #[test]
