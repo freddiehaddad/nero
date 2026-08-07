@@ -125,12 +125,7 @@
 //! own assignment automatically frees the previous
 //! `b_p_vsts_array`/`b_p_vts_array`, matching the original's manual
 //! `xfree(oldarray)`. `did_set_vartabstop`'s own extra
-//! `foldmethodIsIndent`-gated `foldUpdateAll` call panics - a
-//! genuinely REACHABLE gap (`'foldmethod'` is an ordinary string
-//! option that can legitimately be `"indent"` in a real session,
-//! unlike e.g. `AUTOCMDS`'s always-empty-registry precedent) -
-//! `fold.rs`'s own real fold-tree search/update machinery isn't
-//! translated yet.
+//! `foldmethodIsIndent`-gated `foldUpdateAll` call is real.
 //!
 //! Also [`did_set_whichwrap`] - a thin `did_set_option_listflag`
 //! wrapper over `option_vars::WW_ALL` (plus a trailing `,`, since
@@ -164,16 +159,13 @@
 //! matching the original's own two-call `||` condition).
 //!
 //! Also [`did_set_foldignore`] (pure side effect, no validation -
-//! `'foldignore'` accepts any value) and [`did_set_foldmarker`] (the
+//! `'foldignore'` accepts any value), [`did_set_foldmarker`] (the
 //! value must contain a comma with at least one character on either
-//! side of it). Both gate their own real `foldUpdateAll` call behind
-//! a `foldmethodIsIndent`/`foldmethodIsMarker` check, so each panics
-//! only for that specific `'foldmethod'` - every other window is
-//! fully working. `did_set_foldmethod` is deliberately NOT translated
-//! alongside them: it calls `foldUpdateAll` UNCONDITIONALLY, so it
-//! would panic on every single successful call, leaving no working
-//! path at all - deferred until `fold.rs`'s own real fold-tree
-//! update machinery lands.
+//! side of it) and [`did_set_foldmethod`] (delegates to
+//! [`did_set_str_generic`] for the value check, then updates the
+//! folds unconditionally, additionally recomputing the fold levels
+//! when the new method is `"diff"`). Each drives a real
+//! `foldUpdateAll` call.
 //!
 //! Also [`did_set_shortmess`] and [`did_set_cpoptions`] - two more
 //! thin `did_set_option_listflag` wrappers. `'shortmess'` validates
@@ -263,8 +255,7 @@
 //! Also [`did_set_foldexpr`] - delegates to [`did_set_optexpr`] for
 //! the `<SID>`/`s:` expansion (discarding its return value, matching
 //! the original, which likewise ignores it since it never fails),
-//! then updates the folds when `'foldmethod'` is `"expr"`. Only that
-//! `foldmethodIsExpr`-gated `foldUpdateAll` call panics, the same
+//! then updates the folds when `'foldmethod'` is `"expr"`, the same
 //! shape as [`did_set_foldignore`].
 //!
 //! Also [`did_set_winbar`]/[`did_set_tabline`]/
@@ -1547,12 +1538,7 @@ pub unsafe fn did_set_varsofttabstop(args: &mut crate::option_defs::OptsetT) -> 
 ///
 /// Same shape as [`did_set_varsofttabstop`], targeting
 /// `BufT.b_p_vts_array` instead, plus a real `'foldmethod'=="indent"`
-/// check (`foldmethodIsIndent`, already real) whose own real
-/// `foldUpdateAll` call panics - a genuinely REACHABLE gap (unlike
-/// e.g. `AUTOCMDS`'s always-empty-registry precedent, `'foldmethod'`
-/// is an ordinary string option that CAN legitimately be `"indent"`
-/// in a real session) - `fold.rs`'s own real fold-tree
-/// search/update machinery isn't translated yet.
+/// check (`foldmethodIsIndent`) gating a real `foldUpdateAll` call.
 ///
 /// # Safety
 /// `args.os_buf`/`args.os_win` must be valid, non-null pointers to a
@@ -2542,12 +2528,8 @@ pub unsafe fn did_set_optexpr(args: &mut crate::option_defs::OptsetT) -> Option<
 /// Delegates to [`did_set_optexpr`] for the `<SID>`/`s:` expansion
 /// (deliberately discarding its return value, matching the original,
 /// which likewise ignores it - `did_set_optexpr` never fails), then
-/// updates the folds when `'foldmethod'` is `"expr"`.
-///
-/// Only that `foldmethodIsExpr`-gated `foldUpdateAll` call panics
-/// (`fold.rs`'s own real fold-tree update machinery isn't translated
-/// yet), so every window whose `'foldmethod'` isn't `"expr"` is fully
-/// working - the same shape as [`did_set_foldignore`].
+/// updates the folds when `'foldmethod'` is `"expr"` - the same shape
+/// as [`did_set_foldignore`].
 ///
 /// # Safety
 /// `args.os_win` must be a valid, non-null pointer to a live `WinT`
@@ -2951,10 +2933,7 @@ pub fn did_set_breakat() -> Option<&'static [u8]> {
 /// The `'foldignore'` option is changed (`did_set_foldignore`).
 ///
 /// Pure side effect, no validation at all - `'foldignore'` accepts
-/// any value. Only the `foldmethodIsIndent`-gated `foldUpdateAll`
-/// call panics (`fold.rs`'s own real fold-tree update machinery isn't
-/// translated yet), so the common case - any window whose
-/// `'foldmethod'` isn't `"indent"` - is fully working.
+/// any value.
 ///
 /// # Safety
 /// `args.os_win` must be a valid, non-null pointer to a live `WinT`
@@ -3003,6 +2982,38 @@ pub unsafe fn did_set_foldmarker(args: &mut crate::option_defs::OptsetT) -> Opti
         unsafe { crate::fold::fold_update_all(args.os_win as *mut crate::buffer_defs::WinT) };
     }
 
+    None
+}
+
+/// The `'foldmethod'` option is changed (`did_set_foldmethod`).
+///
+/// Validates the new value against the option's own value list via
+/// [`did_set_str_generic`], then - because the whole fold tree was
+/// built by the PREVIOUS method and is now meaningless - invalidates
+/// it unconditionally. When the new method is `"diff"` the fold
+/// levels are recomputed straight away too, since `'diff'` folds get
+/// their level from the diff state rather than from the buffer text.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call, and (when the new method is `"diff"`)
+/// `crate::globals::GLOBALS.curwin` must likewise be valid and
+/// non-null. `args.os_varp` must point to a live `Option<Vec<u8>>`.
+pub unsafe fn did_set_foldmethod(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let errmsg = unsafe { did_set_str_generic(args) };
+    if errmsg.is_some() {
+        return errmsg;
+    }
+
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::fold::fold_update_all(win_ptr) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::fold::foldmethod_is_diff(unsafe { &*win_ptr }) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::new_fold_level() };
+    }
     None
 }
 
@@ -5421,6 +5432,73 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"nocomma".to_vec());
         let mut args = fold_args(&mut win, &mut val);
         assert_eq!(unsafe { did_set_foldmarker(&mut args) }, Some(e_comma_required.as_bytes()));
+    }
+
+    // ---- did_set_foldmethod ----
+
+    fn foldmethod_args(
+        win: &mut crate::buffer_defs::WinT,
+        val: &mut Option<Vec<u8>>,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_idx: OptIndex::Foldmethod,
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            os_varp: val as *mut Option<Vec<u8>> as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_foldmethod_accepts_every_documented_value() {
+        // Cross-verified against real nvim: `set foldmethod=indent`
+        // is accepted and reported back by &foldmethod.
+        for m in [
+            &b"manual"[..],
+            &b"indent"[..],
+            &b"expr"[..],
+            &b"marker"[..],
+            &b"syntax"[..],
+            &b"diff"[..],
+        ] {
+            let mut win = crate::buffer_defs::WinT::default();
+            let mut val: Option<Vec<u8>> = Some(m.to_vec());
+            let mut args = foldmethod_args(&mut win, &mut val);
+            assert_eq!(
+                unsafe { did_set_foldmethod(&mut args) },
+                None,
+                "{} must be accepted",
+                String::from_utf8_lossy(m)
+            );
+        }
+    }
+
+    #[test]
+    fn did_set_foldmethod_invalidates_the_folds_unconditionally() {
+        // Unlike its siblings this one is NOT gated on the method: the
+        // whole tree was built by the previous method, so it always
+        // has to go.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"indent".to_vec());
+        let mut args = foldmethod_args(&mut win, &mut val);
+        assert_eq!(unsafe { did_set_foldmethod(&mut args) }, None);
+        assert!(win.w_foldinvalid, "foldUpdateAll ran");
+    }
+
+    #[test]
+    fn did_set_foldmethod_rejects_an_unknown_value_without_touching_the_folds() {
+        // Cross-verified against real nvim: `set foldmethod=bogus`
+        // leaves the previous value in place.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut val: Option<Vec<u8>> = Some(b"bogus".to_vec());
+        let mut args = foldmethod_args(&mut win, &mut val);
+        assert_eq!(
+            unsafe { did_set_foldmethod(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert!(
+            !win.w_foldinvalid,
+            "a rejected value must not invalidate the fold tree"
+        );
     }
 
     // ---- did_set_shortmess / did_set_cpoptions ----
