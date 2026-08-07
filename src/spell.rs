@@ -33,16 +33,11 @@
 //! [`spell_to_word_end`]. Note `spell_mb_isword_class`'s `b_cjk`
 //! branch REPLACES the default rule rather than narrowing it, so a
 //! class accepted by default can be rejected with CJK on.
-//! `spell_to_word_end` inherits [`spell_iswordp`]'s own
-//! `unimplemented!()` above 255, so it handles single-byte input only
-//! for now.
 //!
 //! Also translated: [`spell_is_upper`] (the `SPELL_ISUPPER` macro) and
 //! [`spell_iswordp_nmw`] (the ASCII/Latin-1 `c <= 255` fast path via
-//! `SPELLTAB`; panics for `c > 255`, which needs `mb_get_class`/
-//! `utf_class`'s own real `curbuf->b_chartab`, still not translated -
-//! the SAME `g_chartab` blocker documented throughout this crate's
-//! `charset.rs`) and [`captype`] (the full two-phase
+//! `SPELLTAB`, plus the `c > 255` branch through `mb_get_class` and
+//! [`spell_mb_isword_class`]) and [`captype`] (the full two-phase
 //! allcap/firstcap/past_second state machine, needing only
 //! `spell_iswordp_nmw` and already-real `mbyte.c` primitives) - all
 //! translated ahead of their own real caller (`find_word`/
@@ -80,8 +75,8 @@
 //! Also translated: [`spell_iswordp`] (the "midword character" variant
 //! of [`spell_iswordp_nmw`] - a `'` mid-word, followed by another word
 //! character, is itself considered a word character, e.g. "they're";
-//! panics for `c > 255` for the same `mb_get_class`/`utf_class`
-//! reason as `spell_iswordp_nmw`) and [`spell_casefold`] (case-folds a
+//! the `c > 255` branch goes through `mb_get_class` the same way as
+//! `spell_iswordp_nmw`) and [`spell_casefold`] (case-folds a
 //! whole word, including the real Greek-sigma `Σ`-at-word-end-vs-
 //! -mid-word special case - `Σ` folds to the medial `σ` unless it's
 //! the LAST character of a word, in which case it folds to the final
@@ -282,22 +277,16 @@ pub fn spell_to_upper(c: i32) -> i32 {
 /// # Safety
 /// `p` must be non-empty and point to a valid, well-formed UTF-8 byte
 /// sequence (forwarded from `crate::mbyte::utf_ptr2char`'s own safety
-/// contract).
-///
-/// The `c > 255` branch is `unimplemented!()` - it needs
-/// `mb_get_class`/`utf_class`, which need the REAL, populated
-/// `curbuf->b_chartab` (the same `g_chartab` blocker documented
-/// throughout `charset.rs` - needs `buf_T` plus real option parsing,
-/// not translated). No current caller in this crate can pass
-/// genuinely non-Latin-1 input yet (this function itself has no real
-/// translated caller today either - see `captype`'s own doc comment).
+/// contract). For the `c > 255` branch `wp.w_s` must be a valid,
+/// non-null pointer to a live synblock, and
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT` (reached through `mb_get_class`).
 #[must_use]
-pub unsafe fn spell_iswordp_nmw(p: &[u8]) -> bool {
+pub unsafe fn spell_iswordp_nmw(p: &[u8], wp: &crate::buffer_defs::WinT) -> bool {
     let c = crate::mbyte::utf_ptr2char(p);
     if c > 255 {
-        unimplemented!(
-            "spell_iswordp_nmw: c > 255 needs mb_get_class/utf_class -> curbuf.b_chartab, not translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { spell_mb_isword_class(crate::mbyte::mb_get_class(p), wp) };
     }
     // SAFETY: a plain read through one shared borrow of this file's
     // own static.
@@ -343,9 +332,8 @@ pub unsafe fn spell_mb_isword_class(cl: i32, wp: &crate::buffer_defs::WinT) -> b
 /// `'iskeyword'`, so this can differ from the ordinary word motions.
 ///
 /// # Safety
-/// Forwarded from [`spell_iswordp`] - which means this inherits that
-/// function's `unimplemented!()` for characters above 255, so only
-/// single-byte input is supported today.
+/// Forwarded from [`spell_iswordp`] - so for non-Latin-1 input
+/// `GLOBALS.curbuf` must also be valid, as `mb_get_class` reads it.
 #[must_use]
 pub unsafe fn spell_to_word_end(start: &[u8], win: &crate::buffer_defs::WinT) -> usize {
     let mut p = 0usize;
@@ -371,10 +359,9 @@ pub unsafe fn spell_to_word_end(start: &[u8], win: &crate::buffer_defs::WinT) ->
 /// `p` must be non-empty and point to a valid, well-formed UTF-8 byte
 /// sequence. `wp.w_s` must be a valid, non-null pointer to a live
 /// `crate::buffer_defs::SynblockT` (same as [`spell_check_window`]).
-///
-/// The `c > 255` branch is `unimplemented!()` - see
-/// [`spell_iswordp_nmw`]'s own doc comment for exactly why (the same
-/// `mb_get_class`/`utf_class` -> `curbuf.b_chartab` blocker).
+/// For the `c > 255` branch `crate::globals::GLOBALS.curbuf` must
+/// also be a valid, non-null pointer to a live `BufT` (reached
+/// through `mb_get_class`).
 #[must_use]
 pub unsafe fn spell_iswordp(p: &[u8], wp: &crate::buffer_defs::WinT) -> bool {
     // SAFETY: forwarded from this function's own safety doc.
@@ -403,9 +390,9 @@ pub unsafe fn spell_iswordp(p: &[u8], wp: &crate::buffer_defs::WinT) -> bool {
     // out-of-bounds `utf_ptr2char` call when `s_off == p.len()`.
     let c = if s_off >= p.len() { 0 } else { crate::mbyte::utf_ptr2char(&p[s_off..]) };
     if c > 255 {
-        unimplemented!(
-            "spell_iswordp: c > 255 needs mb_get_class/utf_class -> curbuf.b_chartab, not translated"
-        );
+        // `c > 255` implies the decode above ran, so `s_off < p.len()`.
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { spell_mb_isword_class(crate::mbyte::mb_get_class(&p[s_off..]), wp) };
     }
     // SAFETY: a plain read through one shared borrow of this file's
     // own static.
@@ -426,10 +413,8 @@ pub unsafe fn spell_iswordp(p: &[u8], wp: &crate::buffer_defs::WinT) -> bool {
 ///
 /// # Safety
 /// Forwards [`spell_iswordp`]'s own safety doc (`wp.w_s` must be
-/// valid) - called for the Greek-sigma special case whenever it is
-/// reached, which panics via `unimplemented!()` if the FOLLOWING
-/// character happens to be non-Latin-1 (`c > 255`), the same narrow,
-/// documented gap as [`spell_iswordp`] itself.
+/// valid, and `GLOBALS.curbuf` too for non-Latin-1 input) - called
+/// for the Greek-sigma special case whenever it is reached.
 pub unsafe fn spell_casefold(wp: &crate::buffer_defs::WinT, s: &[u8]) -> Vec<u8> {
     let mut result = Vec::new();
     let mut p = 0usize;
@@ -467,17 +452,20 @@ pub unsafe fn spell_casefold(wp: &crate::buffer_defs::WinT, s: &[u8]) -> Vec<u8>
 /// `word` must be non-empty and, if `end.is_none()`, NUL-terminated
 /// (this crate's own established line-buffer convention) - forwarded
 /// from [`spell_iswordp_nmw`]'s own safety doc, which this function
-/// calls throughout.
+/// calls throughout. `crate::globals::GLOBALS.curwin` must be a
+/// valid, non-null pointer to a live `WinT` whose own `w_s` is
+/// likewise valid, and (for non-Latin-1 input) `GLOBALS.curbuf` must
+/// be valid too.
 ///
-/// Panics (via [`spell_iswordp_nmw`]) if `word` contains a genuinely
-/// non-Latin-1 (`c > 255`) character before `end` - see that
-/// function's own doc comment. Has no real translated caller itself
-/// yet either (`find_word`, needing `slang_T`'s own spell-file-loaded
-/// state, not translated) - translated ahead of it anyway, matching
-/// this crate's established "small, self-contained, no design freedom
-/// to get wrong" precedent, since the algorithm itself has none.
+/// Has no real translated caller itself yet (`find_word`, needing
+/// `slang_T`'s own spell-file-loaded state, not translated) -
+/// translated ahead of it anyway, matching this crate's established
+/// "small, self-contained, no design freedom to get wrong" precedent,
+/// since the algorithm itself has none.
 #[must_use]
 pub unsafe fn captype(word: &[u8], end: Option<usize>) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     let reached_end = |pos: usize| match end {
         None => pos >= word.len() || word[pos] == 0,
         Some(e) => pos >= e,
@@ -488,7 +476,7 @@ pub unsafe fn captype(word: &[u8], end: Option<usize>) -> i32 {
     loop {
         // SAFETY: forwarded from this function's own safety doc -
         // `pos < word.len()` is an invariant of this loop (see below).
-        if unsafe { spell_iswordp_nmw(&word[pos..]) } {
+        if unsafe { spell_iswordp_nmw(&word[pos..], &*curwin) } {
             break;
         }
         if reached_end(pos) {
@@ -511,7 +499,7 @@ pub unsafe fn captype(word: &[u8], end: Option<usize>) -> i32 {
     // lower. But a word with an upper char only at start is a ONECAP.
     while !reached_end(pos) {
         // SAFETY: forwarded from this function's own safety doc.
-        if unsafe { spell_iswordp_nmw(&word[pos..]) } {
+        if unsafe { spell_iswordp_nmw(&word[pos..], &*curwin) } {
             c = crate::mbyte::utf_ptr2char(&word[pos..]);
             // SAFETY: forwarded from this function's own safety doc.
             if !unsafe { spell_is_upper(c) } {
@@ -934,9 +922,33 @@ mod tests {
     fn spell_iswordp_nmw_letters_and_digits_are_word_chars() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
-        assert!(unsafe { spell_iswordp_nmw(b"a") });
-        assert!(unsafe { spell_iswordp_nmw(b"5") });
-        assert!(!unsafe { spell_iswordp_nmw(b" ") });
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+        assert!(unsafe { spell_iswordp_nmw(b"a", &win) });
+        assert!(unsafe { spell_iswordp_nmw(b"5", &win) });
+        assert!(!unsafe { spell_iswordp_nmw(b" ", &win) });
+    }
+
+    #[test]
+    fn spell_iswordp_nmw_classifies_non_latin1_through_mb_get_class() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        // CJK is class 2 - a word character. Cross-checked against
+        // real nvim, where `w` over "日本 abc" jumps the whole CJK run
+        // as a single word.
+        assert!(unsafe { spell_iswordp_nmw("日".as_bytes(), &win) });
+        // Emoji are class 3, which spell_mb_isword_class excludes.
+        assert!(!unsafe { spell_iswordp_nmw("😀".as_bytes(), &win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
     }
 
     // --- spell_iswordp ---
@@ -1080,15 +1092,67 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "spell_iswordp: c > 255")]
-    fn spell_iswordp_multibyte_non_latin1_panics() {
+    fn spell_iswordp_classifies_non_latin1_through_mb_get_class() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf;
         let mut win = crate::buffer_defs::WinT::default();
         let mut syn = crate::buffer_defs::SynblockT::default();
         win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
-        let word = "日a".as_bytes();
-        let _ = unsafe { spell_iswordp(word, &win) };
+
+        // Leading CJK: no midword skip happens, so the class of the
+        // first character decides - class 2, a word character.
+        assert!(unsafe { spell_iswordp("日a".as_bytes(), &win) });
+        assert!(!unsafe { spell_iswordp("😀a".as_bytes(), &win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn spell_iswordp_non_latin1_after_a_midword_char_uses_the_skipped_position() {
+        // The apostrophe is a midword character, so the class that
+        // decides is the CJK one AFTER it, not the apostrophe's.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        syn.b_spell_ismw[b'\'' as usize] = true;
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(unsafe { spell_iswordp("'日".as_bytes(), &win) });
+        assert!(!unsafe { spell_iswordp("'😀".as_bytes(), &win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn spell_iswordp_cjk_option_changes_which_classes_count() {
+        // With b_cjk set, spell_mb_isword_class accepts ONLY classes 2
+        // and 0x2800, so East Asian characters (which get their own
+        // large script class) stop counting as word characters - the
+        // rule changes rather than merely narrowing.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_spelltab_ascii();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut syn = crate::buffer_defs::SynblockT { b_cjk: 1, ..Default::default() };
+        win.w_s = &mut syn as *mut crate::buffer_defs::SynblockT;
+
+        assert!(!unsafe { spell_iswordp("日".as_bytes(), &win) });
+        assert!(!unsafe { spell_iswordp("😀".as_bytes(), &win) });
+
+        // Without b_cjk the very same character IS a word character.
+        syn.b_cjk = 0;
+        assert!(unsafe { spell_iswordp("日".as_bytes(), &win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
     }
 
     // --- spell_casefold ---
@@ -1162,10 +1226,47 @@ mod tests {
         assert_eq!(unsafe { spell_casefold(&win, word) }, expected);
     }
 
+    /// `captype` reaches `spell_iswordp_nmw`, which needs a live
+    /// `curwin` (and its `w_s`) for the non-Latin-1 branch. Installs
+    /// one and restores the previous pointer on drop.
+    struct CaptypeWin {
+        _win: Box<crate::buffer_defs::WinT>,
+        _syn: Box<crate::buffer_defs::SynblockT>,
+        prev_win: *mut crate::buffer_defs::WinT,
+        prev_buf: *mut crate::buffer_defs::BufT,
+        _buf: Box<crate::buffer_defs::BufT>,
+    }
+
+    impl CaptypeWin {
+        fn set() -> Self {
+            let mut syn = Box::new(crate::buffer_defs::SynblockT::default());
+            let mut buf = Box::new(crate::buffer_defs::BufT::default());
+            let mut win = Box::new(crate::buffer_defs::WinT {
+                w_s: &mut *syn,
+                ..Default::default()
+            });
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_win = g.curwin;
+            let prev_buf = g.curbuf;
+            g.curwin = &mut *win;
+            g.curbuf = &mut *buf;
+            Self { _win: win, _syn: syn, prev_win, prev_buf, _buf: buf }
+        }
+    }
+
+    impl Drop for CaptypeWin {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curwin = self.prev_win;
+            g.curbuf = self.prev_buf;
+        }
+    }
+
     #[test]
     fn captype_all_lowercase_is_plain() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"hello\0", None) }, 0);
     }
 
@@ -1173,6 +1274,7 @@ mod tests {
     fn captype_all_uppercase_is_allcap() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"HELLO\0", None) }, WF_ALLCAP);
     }
 
@@ -1180,6 +1282,7 @@ mod tests {
     fn captype_leading_capital_only_is_onecap() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"Hello\0", None) }, WF_ONECAP);
     }
 
@@ -1192,6 +1295,7 @@ mod tests {
         // `past_second && allcap` -> KEEPCAP.
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"HEllo\0", None) }, WF_KEEPCAP);
     }
 
@@ -1204,6 +1308,7 @@ mod tests {
         // `else if (!allcap)` branch -> KEEPCAP.
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"HeLLo\0", None) }, WF_KEEPCAP);
     }
 
@@ -1211,6 +1316,7 @@ mod tests {
     fn captype_only_non_word_characters_is_zero() {
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"   \0", None) }, 0);
     }
 
@@ -1220,6 +1326,7 @@ mod tests {
         // WF_ALLCAP, ignoring the lowercase "world" that follows.
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"HELLOworld", Some(5)) }, WF_ALLCAP);
     }
 
@@ -1230,6 +1337,7 @@ mod tests {
         // itself, not the punctuation before it.
         let _lock = crate::globals::global_state_test_lock();
         reset_spelltab_ascii();
+        let _win = CaptypeWin::set();
         assert_eq!(unsafe { captype(b"'Hello\0", None) }, WF_ONECAP);
     }
 
