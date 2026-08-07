@@ -233,6 +233,31 @@ impl QfListT {
     }
 }
 
+/// Length of the leading `'errorformat'` part in `efm`, up to (but not
+/// including) the separating comma (`efm_option_part_len`).
+///
+/// A backslash escapes the byte after it, so an escaped comma does NOT
+/// terminate the part. A trailing backslash at the very end does not
+/// escape past the string, matching the original's own `efm[len + 1]
+/// != NUL` guard.
+///
+/// The original relies on the C string's NUL terminator; running out
+/// of the slice ends the scan the same way here.
+#[must_use]
+pub fn efm_option_part_len(efm: &[u8]) -> usize {
+    let mut len = 0usize;
+    while let Some(&c) = efm.get(len) {
+        if c == crate::ascii_defs::NUL || c == b',' {
+            break;
+        }
+        if c == b'\\' && !matches!(efm.get(len + 1), None | Some(&crate::ascii_defs::NUL)) {
+            len += 1;
+        }
+        len += 1;
+    }
+    len
+}
+
 /// Step to the next valid entry at or after the current one
 /// (`get_next_valid_entry`), returning its 1-based index, or `None` if
 /// there is none.
@@ -677,6 +702,41 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- efm_option_part_len ---
+
+    #[test]
+    fn efm_option_part_len_stops_at_the_first_comma() {
+        // Cross-verified against real nvim that 'errorformat' parts
+        // are comma separated.
+        assert_eq!(efm_option_part_len(b"%f:%l:%m,%-G%.%#"), 8);
+        assert_eq!(efm_option_part_len(b"%f:%l:%m"), 8, "no comma: the whole string");
+    }
+
+    #[test]
+    fn efm_option_part_len_treats_an_escaped_comma_as_content() {
+        // A backslash escapes the next byte, so this comma does not
+        // end the part - the whole 5 bytes belong to it.
+        assert_eq!(efm_option_part_len(b"a\\,b"), 4);
+        // The following unescaped comma still does.
+        assert_eq!(efm_option_part_len(b"a\\,b,c"), 4);
+    }
+
+    #[test]
+    fn efm_option_part_len_does_not_escape_past_the_end() {
+        // Matches the original's own `efm[len + 1] != NUL` guard: a
+        // trailing backslash consumes only itself.
+        assert_eq!(efm_option_part_len(b"ab\\"), 3);
+        assert_eq!(efm_option_part_len(b"\\"), 1);
+    }
+
+    #[test]
+    fn efm_option_part_len_handles_empty_and_leading_comma() {
+        assert_eq!(efm_option_part_len(b""), 0);
+        assert_eq!(efm_option_part_len(b",rest"), 0);
+        // A NUL terminator ends the scan just like the end of slice.
+        assert_eq!(efm_option_part_len(b"ab\0cd"), 2);
+    }
 
     /// A stack holding `count` freshly-defaulted lists, with
     /// `qf_listcount` kept consistent with them.
