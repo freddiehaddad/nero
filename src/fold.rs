@@ -2588,6 +2588,8 @@ pub unsafe fn delete_fold(
     let mut maybe_small = false;
     let mut lnum = start;
     let mut did_one = false;
+    let mut first_lnum = crate::pos_defs::MAXLNUM;
+    let mut last_lnum = 0;
 
     // SAFETY: forwarded from this function's own safety doc.
     checkupdate(unsafe { &mut *wp });
@@ -2639,11 +2641,19 @@ pub unsafe fn delete_fold(
                     // SAFETY: forwarded from this function's own safety doc.
                     delete_fold_entry(unsafe { fold_gap_mut(wp, &fpath) }, idx, recursive);
                 } else {
-                    unimplemented!(
-                        "fold::delete_fold: deleting marker-based folds edits the buffer via \
-                         deleteFoldMarkers, which needs the ml_replace_buf path, not yet \
-                         translated"
-                    );
+                    // Marker folds live in the buffer text, so record
+                    // the touched range and rewrite the lines.
+                    first_lnum = first_lnum.min(fp.fd_top + off);
+                    last_lnum = last_lnum.max(lnum);
+                    if !did_one {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { parse_marker(&*wp) };
+                    }
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe {
+                        let fp = &mut fold_gap_mut(wp, &fpath)[idx];
+                        delete_fold_markers(wp, fp, recursive, off);
+                    }
                 }
                 did_one = true;
 
@@ -2671,6 +2681,27 @@ pub unsafe fn delete_fold(
         // Deleting markers may make the cursor column invalid.
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { crate::cursor::check_cursor_col(wp) };
+    }
+
+    if last_lnum > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { (*wp).w_buffer };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::change::changed_lines(buf, first_lnum, 0, last_lnum, 0, false) };
+
+        // Send one buffer-lines event at the end. last_lnum is the
+        // line *after* the last line of the outermost fold that was
+        // modified. Deleting a fold might only require changing its
+        // *first* line, but the notification covers every line that
+        // was part of the fold.
+        let num_changed = i64::from(last_lnum - first_lnum);
+        // SAFETY: forwarded from this function's own safety doc.
+        crate::buffer_updates::buf_updates_send_changes(
+            unsafe { &mut *buf },
+            first_lnum,
+            num_changed,
+            num_changed,
+        );
     }
 }
 
@@ -4475,23 +4506,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "deleteFoldMarkers")]
-    fn delete_fold_with_a_marker_foldmethod_is_unimplemented() {
+    fn delete_fold_with_a_marker_foldmethod_rewrites_the_buffer_lines() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut buf = BufT::default();
-        let mut win = fold_create_win(&mut buf);
-        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
-        win.w_folds = vec![FoldT {
-            fd_top: 10,
-            fd_len: 5,
-            fd_flags: fd_flags::FD_OPEN,
-            fd_small: crate::types_defs::TriState::False,
+        // Marker folds live in the buffer text, so deleting one
+        // strips the markers rather than touching a fold structure.
+        let mut buf = del_marker_fixture(&[b"start {{{", b"middle", b"end }}}"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"marker".to_vec()),
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: vec![FoldT {
+                fd_top: 1,
+                fd_len: 3,
+                fd_flags: fd_flags::FD_OPEN,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
             ..Default::default()
-        }];
+        };
         let win_ptr = &mut win as *mut WinT;
-        let _guard = CurwinGuard::set(win_ptr);
 
-        unsafe { delete_fold(win_ptr, 12, 12, false, false) };
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            delete_fold(win_ptr, 2, 2, false, false);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"start \0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 3) }, b"end \0");
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
     }
 
     /// A window able to hold manual folds, with 'foldlevel' high
