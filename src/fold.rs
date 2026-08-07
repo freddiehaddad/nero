@@ -1334,6 +1334,60 @@ pub unsafe fn fold_remove(
     }
 }
 
+/// Mark every fold in `win` invalid so they are recomputed
+/// (`foldUpdateAll`).
+///
+/// # Safety
+/// Same as [`crate::drawscreen::redraw_later`].
+pub unsafe fn fold_update_all(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*win).w_foldinvalid = true };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::redraw_later(win, crate::drawscreen::UPD_NOT_VALID) };
+}
+
+/// Apply a changed `'foldlevel'` to window `wp` (`newFoldLevelWin`).
+///
+/// Manually created folds are handed back to `'foldlevel'` control by
+/// setting every top-level fold to [`fd_flags::FD_LEVEL`]; a later
+/// manual open or close will change those back to
+/// [`fd_flags::FD_OPEN`]/[`fd_flags::FD_CLOSED`] for the folds that
+/// stop following `'foldlevel'` again.
+///
+/// # Safety
+/// Same as `crate::move::changed_window_setting`.
+pub unsafe fn new_fold_level_win(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *wp };
+    checkupdate(win);
+    if win.w_fold_manual {
+        // Set all flags for the first level of folds to FD_LEVEL.
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_LEVEL;
+        }
+        win.w_fold_manual = false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::changed_window_setting(wp) };
+}
+
+/// Cut fold `fp` short so it ends at `end` (`truncate_fold`).
+///
+/// The original's own comment explains the `end += 1`: it wants to
+/// stop *at* `end`, while [`fold_remove`] stops *above* the line it
+/// is given.
+///
+/// # Safety
+/// Same as [`fold_remove`].
+pub unsafe fn truncate_fold(fp: &mut FoldT, end: crate::pos_defs::LinenrT) {
+    // I want to stop *at here*, fold_remove() stops *above* top.
+    let end = end + 1;
+    let fd_top = fp.fd_top;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_remove(&mut fp.fd_nested, end - fd_top, crate::pos_defs::MAXLNUM) };
+    fp.fd_len = end - fd_top;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2176,6 +2230,106 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_update_all_invalidates_the_window_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_foldinvalid: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        unsafe { fold_update_all(&mut win as *mut WinT) };
+        assert!(win.w_foldinvalid);
+        // The folds themselves are left in place; only the "these
+        // need recomputing" flag changes.
+        assert_eq!(win.w_folds.len(), 3);
+    }
+
+    #[test]
+    fn new_fold_level_win_hands_manual_folds_back_to_foldlevel() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_foldinvalid: false,
+            w_fold_manual: true,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        win.w_folds[0].fd_flags = fd_flags::FD_CLOSED;
+        win.w_folds[1].fd_flags = fd_flags::FD_OPEN;
+        // A nested fold must NOT be touched: only the first level is
+        // handed back.
+        win.w_folds[2].fd_nested = vec![FoldT {
+            fd_flags: fd_flags::FD_CLOSED,
+            ..Default::default()
+        }];
+
+        unsafe { new_fold_level_win(&mut win as *mut WinT) };
+
+        for fp in &win.w_folds {
+            assert_eq!(fp.fd_flags, fd_flags::FD_LEVEL);
+        }
+        assert_eq!(win.w_folds[2].fd_nested[0].fd_flags, fd_flags::FD_CLOSED);
+        assert!(!win.w_fold_manual, "no longer manually controlled");
+    }
+
+    #[test]
+    fn new_fold_level_win_leaves_non_manual_folds_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_foldinvalid: false,
+            w_fold_manual: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        win.w_folds[0].fd_flags = fd_flags::FD_CLOSED;
+
+        unsafe { new_fold_level_win(&mut win as *mut WinT) };
+
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_CLOSED);
+    }
+
+    #[test]
+    fn truncate_fold_cuts_the_fold_to_end_at_the_given_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Fold 10-29 truncated at 19 must cover 10-19 inclusive.
+        let mut fp = FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            ..Default::default()
+        };
+        unsafe { truncate_fold(&mut fp, 19) };
+        assert_eq!(fp.fd_top, 10);
+        assert_eq!(fp.fd_len, 10, "stops at 19, inclusive");
+    }
+
+    #[test]
+    fn truncate_fold_drops_nested_folds_past_the_new_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Nested folds at absolute 12-13 and 25-26; truncating at 19
+        // must keep the first and drop the second.
+        let mut fp = FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_nested: vec![
+                FoldT { fd_top: 2, fd_len: 2, ..Default::default() },
+                FoldT { fd_top: 15, fd_len: 2, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+
+        unsafe { truncate_fold(&mut fp, 19) };
+
+        assert_eq!(fp.fd_len, 10);
+        assert_eq!(fp.fd_nested.len(), 1);
+        assert_eq!(fp.fd_nested[0].fd_top, 2);
     }
 
     #[test]
