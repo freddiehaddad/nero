@@ -138,6 +138,52 @@ static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
 /// File-static in the original.
 static TYPEAHEAD_CHAR: GlobalCell<i32> = GlobalCell::new(0);
 
+/// Remove the last `slen` bytes from `buf` (`delete_buff_tail`).
+///
+/// A no-op when the buffer is empty or its last block is shorter than
+/// `slen`, matching the original's own two guards.
+///
+/// The original edits the current block in place, writing a NUL and
+/// adjusting `b_strlen`/`bh_space`; this crate's `Vec<BuffblockT>`
+/// representation has neither a length tag nor a capacity tag (see
+/// this module's own doc comment), so the equivalent is truncating
+/// the last block.
+pub fn delete_buff_tail(buf: &mut BuffheaderT, slen: usize) {
+    let Some(last) = buf.blocks.last_mut() else {
+        return; // nothing to delete
+    };
+    if last.b_str.len() < slen {
+        return;
+    }
+    let keep = last.b_str.len() - slen;
+    last.b_str.truncate(keep);
+}
+
+/// Rewind the stuff buffers so their contents are read from the start
+/// again (`start_stuff`).
+///
+/// The original resets each buffer's `bh_curr` to the dummy first
+/// block and forces a fresh block on the next append; here the read
+/// position is a plain index, so rewinding is setting it back to `0`.
+/// Empty buffers are left alone, matching the original's own
+/// `bh_first.b_next != NULL` guards.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `READBUF1` or
+/// `READBUF2`.
+pub unsafe fn start_stuff() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let rb1 = unsafe { READBUF1.get_mut() };
+    if !rb1.blocks.is_empty() {
+        rb1.bh_index = 0;
+    }
+    // SAFETY: as above.
+    let rb2 = unsafe { READBUF2.get_mut() };
+    if !rb2.blocks.is_empty() {
+        rb2.bh_index = 0;
+    }
+}
+
 /// Fold a pending CTRL modifier into the character itself where an
 /// equivalent control code exists (`merge_modifiers`).
 ///
@@ -620,6 +666,75 @@ mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
     use crate::input_defs::BuffblockT;
+
+    // --- delete_buff_tail / start_stuff ---
+
+    #[test]
+    fn delete_buff_tail_trims_the_last_block() {
+        let mut buf = BuffheaderT {
+            blocks: vec![
+                BuffblockT { b_str: b"keep".to_vec() },
+                BuffblockT { b_str: b"abcdef".to_vec() },
+            ],
+            bh_index: 0,
+        };
+        delete_buff_tail(&mut buf, 2);
+        assert_eq!(buf.blocks[1].b_str, b"abcd".to_vec());
+        assert_eq!(buf.blocks[0].b_str, b"keep".to_vec(), "earlier blocks untouched");
+    }
+
+    #[test]
+    fn delete_buff_tail_can_empty_the_last_block_exactly() {
+        let mut buf = BuffheaderT {
+            blocks: vec![BuffblockT { b_str: b"abc".to_vec() }],
+            bh_index: 0,
+        };
+        delete_buff_tail(&mut buf, 3);
+        assert!(buf.blocks[0].b_str.is_empty());
+    }
+
+    #[test]
+    fn delete_buff_tail_is_a_noop_when_it_would_overrun() {
+        // Matches the original's own `b_strlen < slen` guard: the
+        // block is left completely alone rather than partly trimmed.
+        let mut buf = BuffheaderT {
+            blocks: vec![BuffblockT { b_str: b"ab".to_vec() }],
+            bh_index: 0,
+        };
+        delete_buff_tail(&mut buf, 5);
+        assert_eq!(buf.blocks[0].b_str, b"ab".to_vec());
+    }
+
+    #[test]
+    fn delete_buff_tail_is_a_noop_on_an_empty_buffer() {
+        let mut buf = BuffheaderT::default();
+        delete_buff_tail(&mut buf, 1);
+        assert!(buf.blocks.is_empty());
+    }
+
+    #[test]
+    fn start_stuff_rewinds_only_non_empty_buffers() {
+        let _lock = global_state_test_lock();
+        unsafe {
+            let rb1 = READBUF1.get_mut();
+            let rb2 = READBUF2.get_mut();
+            let (save1, save2) = (rb1.clone(), rb2.clone());
+
+            rb1.blocks = vec![BuffblockT { b_str: b"x".to_vec() }];
+            rb1.bh_index = 4;
+            // Left empty, so its index must survive untouched.
+            rb2.blocks.clear();
+            rb2.bh_index = 9;
+
+            start_stuff();
+
+            assert_eq!(READBUF1.get_mut().bh_index, 0, "a non-empty buffer rewinds");
+            assert_eq!(READBUF2.get_mut().bh_index, 9, "an empty buffer is left alone");
+
+            *READBUF1.get_mut() = save1;
+            *READBUF2.get_mut() = save2;
+        }
+    }
 
     // --- merge_modifiers ---
 
