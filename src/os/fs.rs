@@ -64,8 +64,11 @@
 //! Deferred (each needs either the `FileInfo`-vs-`std::fs::Metadata`
 //! representation decision, or real byte-level I/O, neither settled
 //! yet):
-//! - `os_getperm`/`os_setperm`/`os_nodetype`/`os_stat` (raw Unix-style
-//!   mode bits - libuv synthesizes these even on Windows for
+//! - `os_setperm`/`os_getperm`: real Unix-style mode bits, reported
+//!   via [`os_fileinfo_mode`] (which synthesizes them on Windows,
+//!   exactly as libuv itself does for compatibility).
+//! - `os_nodetype`/`os_stat` (raw Unix-style mode bits beyond the
+//!   permission set - libuv synthesizes these even on Windows for
 //!   compatibility; needs a real decision on how to model that
 //!   cross-platform rather than rushing it).
 //! - `os_fopen`/`os_close`/`os_read`/`os_readv`/`os_write`/`os_dup*`/
@@ -79,7 +82,7 @@
 //!   logic tied to `'path'`-searching semantics (`path.c`) and exec-bit
 //!   permission checks (`os_getperm`).
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
-//!   `os_file_owned`/`os_chown`/`os_fchown`: platform ACL/xattr/
+//!   `os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
 //! - `os_scandir`/`os_scandir_next`/`os_closedir`: need the `Directory`
 //!   struct (deferred alongside `FileInfo`/`uv_dirent_t`).
@@ -406,6 +409,53 @@ pub fn os_copy(path: &Path, new_path: &Path, flags: i32) -> i32 {
         return -1;
     }
     if std::fs::copy(path, new_path).is_ok() { 0 } else { -1 }
+}
+
+/// Get the permission bits of the file at `path` (`os_getperm`).
+///
+/// @return the file's raw mode bits (`st_mode`) on success, or a
+///         negative value on failure - matching the original, which
+///         returns `statbuf.st_mode` or the negative libuv error code
+///         from its own failed `os_stat`. The exact negative value
+///         differs (this crate has no libuv error codes), but every
+///         real caller only ever tests `< 0`, never a specific code.
+///
+/// Windows has no genuine Unix mode bits; [`os_fileinfo_mode`]
+/// synthesizes them there, exactly as libuv itself does for
+/// compatibility, so this reports the same synthesized value.
+pub fn os_getperm(path: &Path) -> i32 {
+    match os_fileinfo(path) {
+        Some(info) => os_fileinfo_mode(&info),
+        None => -1,
+    }
+}
+
+/// Whether the current user owns the file at `path` (`os_file_owned`).
+///
+/// On Unix both the file itself and, separately, the link at that path
+/// must be owned by the calling user - matching the original's own
+/// `os_fileinfo(...) && os_fileinfo_link(...)` pair, which deliberately
+/// refuses a symlink owned by somebody else even when its target is
+/// ours.
+///
+/// Every non-Unix platform returns `true` unconditionally, preserving
+/// the original's own `// TODO(justinmk): Windows. #8244` stub rather
+/// than inventing an ACL check upstream does not perform.
+pub fn os_file_owned(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid() has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let file_owned = std::fs::metadata(path).is_ok_and(|m| m.uid() == uid);
+        let link_owned = std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == uid);
+        file_owned && link_owned
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Set the permission bits of the file at `path` (`os_setperm`).
@@ -1423,6 +1473,77 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         let fname = blocker.join("child").join("file.txt");
         assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), -1);
+    }
+
+    #[test]
+    fn os_getperm_reports_a_directory_mode_for_a_real_directory() {
+        let scratch = TempScratch::new("getperm_dir");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let mode = os_getperm(&scratch.path);
+        assert!(mode >= 0, "a real directory must report a mode");
+        // Same value os_fileinfo_mode reports, since that is exactly
+        // what the original's own os_stat().st_mode read yields.
+        let info = os_fileinfo(&scratch.path).expect("scratch dir exists");
+        assert_eq!(mode, os_fileinfo_mode(&info));
+    }
+
+    #[test]
+    fn os_getperm_reports_a_file_mode_for_a_real_file() {
+        let scratch = TempScratch::new("getperm_file");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(os_getperm(&path) >= 0);
+    }
+
+    #[test]
+    fn os_getperm_is_negative_for_a_missing_path() {
+        let scratch = TempScratch::new("getperm_missing");
+        // Every real caller only tests `< 0`, never a specific code.
+        assert!(os_getperm(&scratch.path.join("does_not_exist")) < 0);
+    }
+
+    #[test]
+    fn os_getperm_round_trips_with_os_setperm() {
+        let scratch = TempScratch::new("getperm_roundtrip");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        // Owner read+write is the one permission shape both platforms
+        // can genuinely represent (Windows only models the read-only
+        // flag, derived from the owner-write bit).
+        assert_eq!(os_setperm(&path, 0o600), crate::vim_defs::OK);
+        let mode = os_getperm(&path);
+        assert!(mode >= 0);
+        assert_ne!(mode & 0o200, 0, "owner-write must be set");
+    }
+
+    #[test]
+    fn os_file_owned_is_true_for_a_file_this_process_just_created() {
+        let scratch = TempScratch::new("file_owned");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(os_file_owned(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_file_owned_is_false_for_a_missing_path_on_unix() {
+        // Unix genuinely stats the path, so a missing one is not owned.
+        let scratch = TempScratch::new("file_owned_missing");
+        assert!(!os_file_owned(&scratch.path.join("does_not_exist")));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn os_file_owned_is_unconditionally_true_off_unix() {
+        // Preserves the original's own `// TODO(justinmk): Windows.`
+        // stub rather than inventing an ACL check upstream lacks - so
+        // even a path that does not exist reports true here.
+        let scratch = TempScratch::new("file_owned_stub");
+        assert!(os_file_owned(&scratch.path.join("does_not_exist")));
     }
 
     #[test]
