@@ -2675,6 +2675,93 @@ pub unsafe fn delete_fold(
     }
 }
 
+/// Delete a fold marker from the end of line `lnum`, along with the
+/// `'commentstring'` wrapping it when that matches (`foldDelMarker`).
+///
+/// A digit written straight after the marker (the explicit fold level)
+/// is removed with it. When the marker is not found nothing happens
+/// and no error is reported - it may simply be a missing close
+/// marker, which the original tolerates.
+///
+/// # Safety
+/// `buf` must be a valid, live `BufT` with a memline; also forwarded
+/// from [`crate::undo::u_save`] and
+/// [`crate::extmark::extmark_splice_cols`].
+pub unsafe fn fold_del_marker(
+    buf: *mut crate::buffer_defs::BufT,
+    lnum: crate::pos_defs::LinenrT,
+    marker: &[u8],
+) {
+    // The end marker may be missing and the fold extend below the
+    // last line.
+    // SAFETY: forwarded from this function's own safety doc.
+    if lnum > unsafe { (*buf).b_ml.ml_line_count } {
+        return;
+    }
+    if marker.is_empty() {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cms = unsafe { (*buf).b_p_cms.clone() }.unwrap_or_default();
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum) };
+
+    let mut p = 0usize;
+    while p < line.len() && line[p] != 0 {
+        if !line[p..].starts_with(marker) {
+            p += 1;
+            continue;
+        }
+
+        // Found the marker, include a digit if it's there.
+        let mut len = marker.len();
+        if line.get(p + len).is_some_and(u8::is_ascii_digit) {
+            len += 1;
+        }
+
+        let mut start = p;
+        if !cms.is_empty() && cms[0] != 0 {
+            // Also delete 'commentstring' if it matches. It is split
+            // at "%s" into the part before and after the marker.
+            if let Some(pct) = cms.windows(2).position(|w| w == b"%s") {
+                let (before, after) = (&cms[..pct], &cms[pct + 2..]);
+                let after_end = after.iter().position(|&c| c == 0).unwrap_or(after.len());
+                let after = &after[..after_end];
+                if p >= before.len()
+                    && line[p - before.len()..p] == *before
+                    && line[p + len..].starts_with(after)
+                {
+                    start = p - before.len();
+                    len += before.len() + after.len();
+                }
+            }
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::undo::u_save(lnum - 1, lnum + 1) } == crate::vim_defs::OK {
+            // Make the new line: text before the marker, then the
+            // text after it.
+            let mut newline = line[..start].to_vec();
+            newline.extend_from_slice(&line[start + len..]);
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { crate::memline::ml_replace_buf_len(&mut *buf, lnum, &newline) };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::extmark::extmark_splice_cols(
+                    &mut *buf,
+                    lnum - 1,
+                    start as crate::pos_defs::ColnrT,
+                    len as crate::pos_defs::ColnrT,
+                    0,
+                    crate::extmark_defs::ExtmarkOp::Undo,
+                )
+            };
+        }
+        break;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3610,6 +3697,144 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    /// Builds a real memline holding `lines`, plus a buffer with the
+    /// given `'commentstring'` and an undo header so `u_save` works.
+    fn del_marker_fixture(lines: &[&[u8]], cms: &[u8]) -> Box<BufT> {
+        let mut buf = Box::new(BufT {
+            b_p_ts: 8,
+            // undo_allowed refuses to save when 'nomodifiable'.
+            b_p_ma: 1,
+            // The undo code's own invariant is that b_u_newhead is
+            // non-null whenever b_u_synced is false; a fresh buffer
+            // has no newhead, so it must start synced.
+            b_u_synced: true,
+            b_p_cms: Some(cms.to_vec()),
+            b_u_curhead: Box::into_raw(Box::new(crate::undo_defs::UHeader::default())),
+            ..Default::default()
+        });
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        let mut first = lines[0].to_vec();
+        first.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &first) },
+            crate::vim_defs::OK
+        );
+        let buf_ptr: *mut BufT = &mut *buf;
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = buf_ptr;
+        for (i, text) in lines.iter().enumerate().skip(1) {
+            assert_eq!(
+                unsafe { crate::memline::ml_append(i as crate::pos_defs::LinenrT, text, 0, false) },
+                crate::vim_defs::OK
+            );
+        }
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+        buf
+    }
+
+    /// Runs `fold_del_marker` with `curbuf` and `curwin` installed,
+    /// which `u_save` requires, restoring both afterwards.
+    unsafe fn del_marker_with_curbuf(buf: *mut BufT, lnum: crate::pos_defs::LinenrT, marker: &[u8]) {
+        unsafe {
+            let mut win = WinT {
+                w_buffer: buf,
+                ..Default::default()
+            };
+            let g = crate::globals::GLOBALS.get_mut();
+            let (prev_buf, prev_win) = (g.curbuf, g.curwin);
+            g.curbuf = buf;
+            g.curwin = &mut win as *mut WinT;
+            fold_del_marker(buf, lnum, marker);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = prev_buf;
+            g.curwin = prev_win;
+        }
+    }
+
+    #[test]
+    fn fold_del_marker_removes_a_plain_marker() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"code {{{"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"code \0", "ml_get_buf keeps the trailing NUL");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_del_marker_removes_the_level_digit_too() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"numbered {{{3"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"numbered \0", "the explicit level goes with it");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_del_marker_removes_a_matching_commentstring() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"with cms /*{{{*/"], b"/*%s*/");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"with cms \0", "the comment wrapper goes too");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_del_marker_leaves_a_line_without_the_marker_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"plain text"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"plain text\0");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_del_marker_ignores_a_line_past_the_end_of_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"only line {{{"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        // A fold's end marker may be missing with the fold running
+        // past the last line, which the original tolerates.
+        unsafe { del_marker_with_curbuf(buf_ptr, 99, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"only line {{{\0", "untouched");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_del_marker_removes_only_the_first_marker_on_a_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"a {{{ b {{{"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        // The original breaks after the first match.
+        unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) };
+        assert_eq!(line, b"a  b {{{\0");
+        close_indent_level_fixture(buf);
     }
 
     #[test]
