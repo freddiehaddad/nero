@@ -1661,16 +1661,20 @@ pub unsafe fn set_manual_fold_win(
 /// Returns the line number of the next fold to try, as
 /// [`set_manual_fold_win`] does.
 ///
-/// # Deferred boundary
-/// The original also mirrors the operation into other diff-mode
-/// windows, which needs the `'scrollbind'` window option (`w_p_scb`),
-/// not yet a `WinT` field. The guard that reaches it is real and
-/// faithful as far as it goes - `foldmethodIsDiff(curwin)` - and is
-/// unreachable today, since `wo_fdm` is `None` for every window this
-/// crate can build, so `'foldmethod'` is never `"diff"`.
+/// When the current window is in diff mode AND scroll-bound, the same
+/// open/close is applied to every other diff-mode, scroll-bound
+/// window in the tab page first, at the line [`crate::diff::diff_lnum_win`]
+/// maps the cursor onto (skipped when that returns `0`, i.e. the line
+/// has no counterpart there).
+///
+/// As elsewhere in this crate, the original's
+/// `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is walked as
+/// `GLOBALS.firstwin`/`w_next`.
 ///
 /// # Safety
-/// Same as [`set_manual_fold_win`]; also touches `GLOBALS.curwin`.
+/// Same as [`set_manual_fold_win`]; also touches `GLOBALS.curwin` and
+/// `GLOBALS.firstwin`, whose own `w_next` chain must consist of
+/// valid, live `WinT` pointers.
 pub unsafe fn set_manual_fold(
     pos: crate::pos_defs::PosT,
     opening: bool,
@@ -1681,12 +1685,28 @@ pub unsafe fn set_manual_fold(
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
 
     // SAFETY: forwarded from this function's own safety doc.
-    if unsafe { foldmethod_is_diff(&*curwin) } {
-        unimplemented!(
-            "fold::set_manual_fold: mirroring into other diff-mode windows needs the \
-             'scrollbind' window option (w_p_scb), not yet a WinT field - unreachable \
-             while 'foldmethod' can never be \"diff\""
-        );
+    if unsafe { foldmethod_is_diff(&*curwin) } && unsafe { (*curwin).w_onebuf_opt.wo_scb } != 0 {
+        // Do the same operation in other windows in diff mode.
+        // Calculate the line number from the diffs.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let next = unsafe { (*wp).w_next };
+            // SAFETY: forwarded from this function's own safety doc.
+            if wp != curwin
+                && unsafe { foldmethod_is_diff(&*wp) }
+                && unsafe { (*wp).w_onebuf_opt.wo_scb } != 0
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                let dlnum = unsafe { crate::diff::diff_lnum_win((*curwin).w_cursor.lnum, wp) };
+                if dlnum != 0 {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    unsafe { set_manual_fold_win(wp, dlnum, opening, recurse, None) };
+                }
+            }
+            wp = next;
+        }
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -7024,6 +7044,75 @@ mod tests {
         for fp in unsafe { &(*win_ptr).w_folds } {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn set_manual_fold_mirrors_into_other_diff_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        // diff_lnum_win maps the cursor onto the other window; today
+        // it always answers 0 (no diff buffer can be registered), so
+        // the original's own `dlnum != 0` guard skips the mirrored
+        // call and only curwin's fold is touched. This test pins that
+        // whole path: the walk runs, the guard holds, and curwin's
+        // own fold still opens exactly as it would without diff mode.
+        let mut buf = BufT::default();
+        let mut other = manual_fold_win(&mut buf);
+        other.w_onebuf_opt.wo_fdm = Some(b"diff".to_vec());
+        other.w_onebuf_opt.wo_scb = 1;
+        let other_ptr: *mut WinT = &mut other;
+
+        let mut win = manual_fold_win(&mut buf);
+        win.w_onebuf_opt.wo_fdm = Some(b"diff".to_vec());
+        win.w_onebuf_opt.wo_scb = 1;
+        win.w_next = other_ptr;
+        let win_ptr: *mut WinT = &mut win;
+        let _guard = CurwinGuard::set(win_ptr);
+        let prev_first = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+        // diff_lnum_win reaches curtab (to look the buffer up in
+        // tp_diffbuf) and curbuf, so both have to be real here.
+        let mut tab = crate::buffer_defs::TabpageT::default();
+        let prev_tab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        let prev_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = &mut tab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut buf;
+
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+        unsafe { set_manual_fold(pos, true, false, None) };
+
+        assert_eq!(
+            unsafe { (&(*win_ptr).w_folds)[0].fd_flags },
+            fd_flags::FD_OPEN,
+            "curwin's own fold still opens"
+        );
+        assert_eq!(
+            unsafe { (&(*other_ptr).w_folds)[0].fd_flags },
+            fd_flags::FD_CLOSED,
+            "diff_lnum_win answers 0 today, so the mirrored call is skipped"
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_first;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_tab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_buf;
+    }
+
+    #[test]
+    fn set_manual_fold_skips_the_mirroring_walk_entirely_without_scrollbind() {
+        let _lock = crate::globals::global_state_test_lock();
+        // 'foldmethod' is "manual" here, so the outer guard is false
+        // and the window list is never walked - the ordinary case.
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let win_ptr: *mut WinT = &mut win;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+        unsafe { set_manual_fold(pos, true, false, None) };
+
+        assert_eq!(
+            unsafe { (&(*win_ptr).w_folds)[0].fd_flags },
+            fd_flags::FD_OPEN
+        );
     }
 
     #[test]
