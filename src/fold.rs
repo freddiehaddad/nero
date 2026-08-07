@@ -1977,6 +1977,20 @@ pub unsafe fn foldlevel_indent(flp: &mut FlineT) {
     flp.lvl = flp.lvl.min(0.max(fdn as i32));
 }
 
+/// Fold level for the `"diff"` method (`foldlevelDiff`).
+///
+/// Lines that diff mode folds away are level 1; everything else is
+/// level 0, so a diff view collapses to just the changed regions.
+///
+/// # Safety
+/// Same as [`crate::diff::diff_infold`]; `flp.wp` must be a valid,
+/// live [`WinT`].
+pub unsafe fn foldlevel_diff(flp: &mut FlineT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let infold = unsafe { crate::diff::diff_infold(&*flp.wp, flp.lnum + flp.off) };
+    flp.lvl = i32::from(infold);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2912,6 +2926,51 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    #[test]
+    fn foldlevel_diff_is_zero_when_diff_is_off() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                // 'nodiff' is diff_infold's own first early return, so
+                // nothing is ever folded away.
+                wo_diff: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        for lnum in [1, 5, 100] {
+            let mut flp = FlineT { wp: win_ptr, lnum, ..Default::default() };
+            unsafe { foldlevel_diff(&mut flp) };
+            assert_eq!(flp.lvl, 0, "line {lnum}");
+        }
+    }
+
+    #[test]
+    fn foldlevel_diff_applies_the_line_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_diff: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        // lnum + off names the real line, exactly as in
+        // foldlevel_indent; with 'nodiff' the answer is 0 either way,
+        // but the resolution itself must still happen.
+        let mut flp = FlineT { wp: win_ptr, lnum: 3, off: 7, ..Default::default() };
+        unsafe { foldlevel_diff(&mut flp) };
+        assert_eq!(flp.lvl, 0);
     }
 
     #[test]
