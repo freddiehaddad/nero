@@ -1876,6 +1876,35 @@ pub unsafe fn fold_update_after_insert() {
     unsafe { fold_open_cursor() };
 }
 
+/// Apply a changed `'foldlevel'` to the current window
+/// (`newFoldLevel`).
+///
+/// # Deferred boundary
+/// The original also propagates the level to other diff-mode windows,
+/// which needs the `'scrollbind'` window option (`w_p_scb`), not yet
+/// a `WinT` field - the same gap [`set_manual_fold`] documents. The
+/// guard reaching it, `foldmethodIsDiff(curwin)`, is real and
+/// unreachable today, since `wo_fdm` is `None` for every window this
+/// crate can build.
+///
+/// # Safety
+/// Same as [`new_fold_level_win`]; also touches `GLOBALS.curwin`.
+pub unsafe fn new_fold_level() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { new_fold_level_win(curwin) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { foldmethod_is_diff(&*curwin) } {
+        unimplemented!(
+            "fold::new_fold_level: propagating 'foldlevel' to other diff-mode windows needs \
+             the 'scrollbind' window option (w_p_scb), not yet a WinT field - unreachable \
+             while 'foldmethod' can never be \"diff\""
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2752,6 +2781,56 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn new_fold_level_hands_manual_folds_back_via_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_fold_manual: true,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        win.w_folds[0].fd_flags = fd_flags::FD_CLOSED;
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { new_fold_level() };
+
+        // 'foldmethod' is "manual", so the diff branch is not reached.
+        for fp in unsafe { &(*win_ptr).w_folds } {
+            assert_eq!(fp.fd_flags, fd_flags::FD_LEVEL);
+        }
+        assert!(!unsafe { (*win_ptr).w_fold_manual });
+    }
+
+    #[test]
+    #[should_panic(expected = "scrollbind")]
+    fn new_fold_level_reaches_the_diff_mirroring_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"diff".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { new_fold_level() };
     }
 
     #[test]
