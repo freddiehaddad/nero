@@ -6480,6 +6480,44 @@ mod did_set_option_tests {
     }
 }
 
+/// Remove the comma-separated item at `[item, item + item_len)` from
+/// `str` (`remove_comma_item`).
+///
+/// Exactly one separating comma goes with the item, so the result is
+/// never left with a doubled or dangling comma:
+/// - a following comma is taken with the item;
+/// - otherwise a preceding comma is taken instead;
+/// - a lone item leaves an empty string.
+///
+/// The original mutates a C buffer in place via `STRMOVE` and relies
+/// on a trailing NUL; a `Vec<u8>` carries its own length, so the item
+/// is simply drained out.
+pub fn remove_comma_item(s: &mut Vec<u8>, item: usize, item_len: usize) {
+    let after = item + item_len;
+    if s.get(after) == Some(&b',') {
+        // Remove item and trailing comma.
+        s.drain(item..after + 1);
+    } else if item > 0 && s[item - 1] == b',' {
+        // Last item: remove leading comma and item.
+        s.drain(item - 1..after);
+    } else {
+        // Only item.
+        s.truncate(item);
+    }
+}
+
+/// Append a comma-separated item to the end of `str`
+/// (`append_item`).
+///
+/// A comma is added before the item only when `str` is not already
+/// empty, so the result never opens with a stray separator.
+pub fn append_item(s: &mut Vec<u8>, item: &[u8]) {
+    if !s.is_empty() {
+        s.push(b',');
+    }
+    s.extend_from_slice(item);
+}
+
 /// Recognize the `:set` operator prefixing `arg`'s `=`
 /// (`get_op`).
 ///
@@ -6809,6 +6847,64 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn remove_comma_item_takes_the_trailing_comma_with_a_middle_item() {
+        // Cross-verified against real nvim:
+        //   set path=/a,/b,/c | set path-=/b  ->  /a,/c
+        let mut s = b"/a,/b,/c".to_vec();
+        remove_comma_item(&mut s, 3, 2);
+        assert_eq!(s, b"/a,/c");
+    }
+
+    #[test]
+    fn remove_comma_item_takes_the_leading_comma_with_the_last_item() {
+        // Cross-verified: set path=/a,/b | set path-=/b  ->  /a
+        let mut s = b"/a,/b".to_vec();
+        remove_comma_item(&mut s, 3, 2);
+        assert_eq!(s, b"/a");
+    }
+
+    #[test]
+    fn remove_comma_item_of_the_only_item_leaves_it_empty() {
+        // Cross-verified: set path=/a | set path-=/a  ->  ""
+        let mut s = b"/a".to_vec();
+        remove_comma_item(&mut s, 0, 2);
+        assert_eq!(s, b"");
+    }
+
+    #[test]
+    fn remove_comma_item_of_the_first_of_several_keeps_the_rest_joined() {
+        // The trailing-comma branch, taken at offset 0.
+        let mut s = b"/a,/b,/c".to_vec();
+        remove_comma_item(&mut s, 0, 2);
+        assert_eq!(s, b"/b,/c");
+    }
+
+    #[test]
+    fn append_item_does_not_lead_with_a_separator() {
+        // Cross-verified: set path= | set path+=/x  ->  /x
+        let mut s = Vec::new();
+        append_item(&mut s, b"/x");
+        assert_eq!(s, b"/x");
+
+        // Cross-verified: a second append then separates with a comma.
+        append_item(&mut s, b"/y");
+        assert_eq!(s, b"/x,/y");
+    }
+
+    #[test]
+    fn append_then_remove_round_trips() {
+        // Removing what was just appended must restore the original,
+        // with no doubled or dangling comma left behind.
+        let mut s = b"/a,/b".to_vec();
+        let before = s.clone();
+        let at = s.len() + 1;
+        append_item(&mut s, b"/c");
+        assert_eq!(s, b"/a,/b,/c");
+        remove_comma_item(&mut s, at, 2);
+        assert_eq!(s, before);
     }
 
     #[test]
