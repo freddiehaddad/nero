@@ -1258,6 +1258,82 @@ pub fn fold_merge(fp1: &mut FoldT, gap: &mut Vec<FoldT>, i2: usize) {
     *unsafe { FOLD_CHANGED.get_mut() } = true;
 }
 
+/// Remove folds within the range `top` to `bot` inclusive
+/// (`foldRemove`).
+///
+/// Folds are handled by how they overlap the range: one starting
+/// above `top` is truncated there, or split in two when it also ends
+/// below `bot`; one contained entirely in the range is deleted; one
+/// that starts inside but ends below `bot` is moved to start at
+/// `bot + 1`; and the walk stops at the first fold entirely below
+/// `bot`. Nested folds are handled recursively first, with the range
+/// rebased onto their parent.
+///
+/// # Safety
+/// Reads `GLOBALS.State` (for the Insert-mode test that
+/// `fold_mark_adjust_recurse` needs), which the original performs
+/// inside that same function.
+pub unsafe fn fold_remove(
+    gap: &mut Vec<FoldT>,
+    top: crate::pos_defs::LinenrT,
+    bot: crate::pos_defs::LinenrT,
+) {
+    if bot < top {
+        return; // nothing to do
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    let insert_mode = (state & crate::state_defs::mode::INSERT as i32) != 0;
+
+    while !gap.is_empty() {
+        // Find fold that includes top or a following one.
+        let (found, idx) = fold_find(gap, top);
+        if found && gap[idx].fd_top < top {
+            // 2: or 3: need to delete nested folds.
+            let fd_top = gap[idx].fd_top;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { fold_remove(&mut gap[idx].fd_nested, top - fd_top, bot - fd_top) };
+            if fd_top + gap[idx].fd_len - 1 > bot {
+                // 3: need to split it.
+                fold_split(gap, idx, top, bot);
+            } else {
+                // 2: truncate fold at "top".
+                gap[idx].fd_len = top - fd_top;
+            }
+            // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+            *unsafe { FOLD_CHANGED.get_mut() } = true;
+            continue;
+        }
+        if idx >= gap.len() || gap[idx].fd_top > bot {
+            // 6: Found a fold below bot, can stop looking.
+            break;
+        }
+        if gap[idx].fd_top >= top {
+            // Found an entry below top.
+            // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+            *unsafe { FOLD_CHANGED.get_mut() } = true;
+            let fd_top = gap[idx].fd_top;
+            if fd_top + gap[idx].fd_len - 1 > bot {
+                // 5: Make fold that includes bot start below bot.
+                fold_mark_adjust_recurse(
+                    &mut gap[idx].fd_nested,
+                    0,
+                    bot - fd_top,
+                    crate::pos_defs::MAXLNUM,
+                    fd_top - bot - 1,
+                    insert_mode,
+                );
+                gap[idx].fd_len -= bot - fd_top + 1;
+                gap[idx].fd_top = bot + 1;
+                break;
+            }
+
+            // 4: Delete completely contained fold.
+            delete_fold_entry(gap, idx, true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2100,6 +2176,96 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_remove_is_a_noop_for_a_reversed_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gap = sibling_folds();
+        let before = gap.clone();
+        unsafe { fold_remove(&mut gap, 20, 10) };
+        assert_eq!(gap, before);
+    }
+
+    #[test]
+    fn fold_remove_deletes_folds_contained_in_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Case 4: fold 20-24 lies entirely within 18..26.
+        let mut gap = sibling_folds();
+        unsafe { fold_remove(&mut gap, 18, 26) };
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![10, 30], "only the contained fold goes");
+    }
+
+    #[test]
+    fn fold_remove_truncates_a_fold_that_starts_above_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Case 2: fold 10-14 starts above 12 and ends inside the
+        // range, so it is cut back to end at 11.
+        let mut gap = vec![FoldT { fd_top: 10, fd_len: 5, ..Default::default() }];
+        unsafe { fold_remove(&mut gap, 12, 20) };
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_top, 10);
+        assert_eq!(gap[0].fd_len, 2, "now covers 10-11 only");
+    }
+
+    #[test]
+    fn fold_remove_splits_a_fold_spanning_the_whole_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Case 3: fold 10-29 starts above 15 and ends below 19, so it
+        // is split into 10-14 and 20-29.
+        let mut gap = vec![FoldT { fd_top: 10, fd_len: 20, ..Default::default() }];
+        unsafe { fold_remove(&mut gap, 15, 19) };
+        assert_eq!(gap.len(), 2);
+        assert_eq!((gap[0].fd_top, gap[0].fd_len), (10, 5));
+        assert_eq!((gap[1].fd_top, gap[1].fd_len), (20, 10));
+    }
+
+    #[test]
+    fn fold_remove_moves_a_fold_that_ends_below_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Case 5: fold 20-29 starts inside 18..24 but ends below it,
+        // so it is moved to start just after bot.
+        let mut gap = vec![FoldT { fd_top: 20, fd_len: 10, ..Default::default() }];
+        unsafe { fold_remove(&mut gap, 18, 24) };
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_top, 25, "starts at bot + 1");
+        assert_eq!(gap[0].fd_len, 5, "10 - (24 - 20 + 1)");
+    }
+
+    #[test]
+    fn fold_remove_stops_at_the_first_fold_below_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Case 6: nothing overlaps 15..17, so every fold survives.
+        let mut gap = sibling_folds();
+        let before = gap.clone();
+        unsafe { fold_remove(&mut gap, 15, 17) };
+        assert_eq!(gap, before);
+    }
+
+    #[test]
+    fn fold_remove_recurses_into_nested_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The outer fold 10-29 survives (truncated), but its nested
+        // fold at absolute 22-26 lies inside the removed range and
+        // must go with it.
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_nested: vec![
+                FoldT { fd_top: 2, fd_len: 2, ..Default::default() },
+                FoldT { fd_top: 12, fd_len: 5, ..Default::default() },
+            ],
+            ..Default::default()
+        }];
+
+        unsafe { fold_remove(&mut gap, 20, 29) };
+
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_len, 10, "truncated to 10-19");
+        // Only the nested fold above the removed range remains.
+        assert_eq!(gap[0].fd_nested.len(), 1);
+        assert_eq!(gap[0].fd_nested[0].fd_top, 2);
     }
 
     #[test]
