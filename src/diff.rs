@@ -196,6 +196,42 @@ pub unsafe fn diff_alloc_new(
     dnew
 }
 
+/// Unlink and free diff block `dp` from `tp`'s chain, returning the
+/// block that followed it (`diff_free`).
+///
+/// `dprev` being null means `dp` was the head, so its successor takes
+/// over. The returned pointer lets a caller keep walking the chain
+/// after the removal.
+///
+/// The successor is read BEFORE `dp` is freed, since reading it
+/// afterwards would be a use-after-free - the same ordering
+/// [`diff_clear`] relies on.
+///
+/// # Safety
+/// `dp` must be a valid, non-null pointer to a live `Box`-allocated
+/// `DiffT` in `tp`'s chain, not referenced elsewhere. `dprev`, when
+/// non-null, must likewise be live and be `dp`'s predecessor.
+pub unsafe fn diff_free(
+    tp: &mut crate::buffer_defs::TabpageT,
+    dprev: *mut crate::buffer_defs::DiffT,
+    dp: *mut crate::buffer_defs::DiffT,
+) -> *mut crate::buffer_defs::DiffT {
+    // SAFETY: forwarded from this function's own safety doc - read
+    // the successor before freeing.
+    let ret = unsafe { (*dp).df_next };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { clear_diffblock(dp) };
+
+    if dprev.is_null() {
+        tp.tp_first_diff = ret;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*dprev).df_next = ret };
+    }
+
+    ret
+}
+
 /// Whether every diff block line range in `dp` fits inside its own
 /// buffer (`diff_check_sanity`).
 ///
@@ -735,6 +771,50 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- diff_free ---
+
+    #[test]
+    fn diff_free_of_the_head_promotes_its_successor() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let second = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let first = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), second) };
+        assert!(std::ptr::eq(tp.tp_first_diff, first));
+
+        let ret = unsafe { diff_free(&mut tp, std::ptr::null_mut(), first) };
+
+        assert!(std::ptr::eq(ret, second), "the successor is returned");
+        assert!(std::ptr::eq(tp.tp_first_diff, second), "and becomes the head");
+
+        unsafe { diff_clear(&mut tp) };
+    }
+
+    #[test]
+    fn diff_free_of_a_middle_block_relinks_around_it() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let third = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let second = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), third) };
+        let first = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), second) };
+
+        let ret = unsafe { diff_free(&mut tp, first, second) };
+
+        assert!(std::ptr::eq(ret, third));
+        assert!(std::ptr::eq(tp.tp_first_diff, first), "head is unchanged");
+        unsafe { assert!(std::ptr::eq((*first).df_next, third), "spliced around") };
+
+        unsafe { diff_clear(&mut tp) };
+    }
+
+    #[test]
+    fn diff_free_of_the_only_block_empties_the_chain() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let only = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+
+        let ret = unsafe { diff_free(&mut tp, std::ptr::null_mut(), only) };
+
+        assert!(ret.is_null());
+        assert!(tp.tp_first_diff.is_null());
+    }
 
     // --- diff_alloc_new ---
 
