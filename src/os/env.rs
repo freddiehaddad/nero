@@ -96,6 +96,33 @@ pub fn os_getenv(name: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Derive the installation prefix from `v:progpath`
+/// (`vim_get_prefix_from_exepath`).
+///
+/// Strips two trailing components from the executable's own path -
+/// first the program name, then the `bin/` directory holding it - so
+/// `/usr/local/bin/nvim` yields `/usr/local/`.
+///
+/// The original writes into a caller-supplied `char exe_name[MAXPATHL]`
+/// buffer; this returns the owned result instead, matching this
+/// crate's established idiom, so no length cap is needed.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::vars::get_vim_var_str`]'s own safety
+/// doc (touches the shared `v:` variable storage).
+#[must_use]
+pub unsafe fn vim_get_prefix_from_exepath() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut exe_name =
+        unsafe { crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Progpath) };
+
+    // Remove the trailing "nvim.exe".
+    exe_name.truncate(crate::path::path_tail_with_sep(&exe_name));
+    // Remove the trailing "bin/".
+    exe_name.truncate(crate::path::path_tail(&exe_name));
+    exe_name
+}
+
 /// Returns true if environment variable `name` is defined (even if
 /// empty). Returns false if not found or other failure (`os_env_exists`).
 ///
@@ -778,6 +805,71 @@ pub unsafe fn expand_env_save(src: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // --- vim_get_prefix_from_exepath ---
+
+    #[test]
+    fn vim_get_prefix_from_exepath_strips_the_program_and_bin_dir() {
+        // Cross-verified against real nvim: with v:progpath
+        // ".../nvim-win64/bin/nvim.exe" the prefix is
+        // ".../nvim-win64/".
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev =
+                crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Progpath);
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                Some(b"/usr/local/bin/nvim"),
+            );
+
+            assert_eq!(vim_get_prefix_from_exepath(), b"/usr/local/".to_vec());
+
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                Some(&prev),
+            );
+        }
+    }
+
+    #[test]
+    fn vim_get_prefix_from_exepath_handles_a_deeper_install_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev =
+                crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Progpath);
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                Some(b"/opt/nvim-linux64/bin/nvim"),
+            );
+
+            assert_eq!(vim_get_prefix_from_exepath(), b"/opt/nvim-linux64/".to_vec());
+
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                Some(&prev),
+            );
+        }
+    }
+
+    #[test]
+    fn vim_get_prefix_from_exepath_of_an_unset_progpath_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev =
+                crate::eval::vars::get_vim_var_str(crate::eval::vars::VimVarIndex::Progpath);
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                None,
+            );
+
+            assert_eq!(vim_get_prefix_from_exepath(), Vec::<u8>::new());
+
+            crate::eval::vars::set_vim_var_string(
+                crate::eval::vars::VimVarIndex::Progpath,
+                Some(&prev),
+            );
+        }
+    }
 
     // Environment variables are process-global state shared by all
     // threads; Rust's default test runner uses multiple threads, so
