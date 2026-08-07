@@ -6480,6 +6480,48 @@ mod did_set_option_tests {
     }
 }
 
+/// Build the new value of a string option after a `-=` removal
+/// (`stropt_remove_val`).
+///
+/// `strval` is the offset into `origval` where the matched value
+/// starts, and `len` its length. For a
+/// [`crate::option_defs::opt_flags::COMMA`] option one separating
+/// comma is removed along with the value, mirroring
+/// [`remove_comma_item`]'s rule but expressed the way this caller
+/// needs it: a leading match takes the comma AFTER it, any other match
+/// takes the comma BEFORE it.
+///
+/// @return the new value. The original writes into a caller-supplied
+///         `newval` buffer sized from `origval`; returning an owned
+///         `Vec<u8>` removes the need for the caller to size anything.
+#[must_use]
+pub fn stropt_remove_val(origval: &[u8], flags: u32, strval: usize, len: usize) -> Vec<u8> {
+    let mut newval = origval.to_vec();
+    // An offset at (or past) the end means nothing matched, so the
+    // value is copied through unchanged - the original's `if (*strval)`
+    // guard, which is false at the terminating NUL.
+    if strval >= origval.len() {
+        return newval;
+    }
+
+    let (mut start, mut len) = (strval, len);
+    if flags & crate::option_defs::opt_flags::COMMA != 0 {
+        if start == 0 {
+            // Include the comma after the string.
+            if origval.get(len) == Some(&b',') {
+                len += 1;
+            }
+        } else {
+            // Include the comma before the string.
+            start -= 1;
+            len += 1;
+        }
+    }
+
+    newval.drain(start..(start + len).min(newval.len()));
+    newval
+}
+
 /// Remove flags that appear twice from a flag-list option value
 /// (`stropt_remove_dupflags`).
 ///
@@ -6886,6 +6928,55 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stropt_remove_val_first_item_takes_the_comma_after_it() {
+        // Cross-verified against real nvim:
+        //   set path=/a,/b,/c | set path-=/a  ->  /b,/c
+        use crate::option_defs::opt_flags;
+        let out = stropt_remove_val(b"/a,/b,/c", opt_flags::COMMA, 0, 2);
+        assert_eq!(out, b"/b,/c");
+    }
+
+    #[test]
+    fn stropt_remove_val_middle_item_takes_the_comma_before_it() {
+        // Cross-verified: set path-=/b  ->  /a,/c
+        use crate::option_defs::opt_flags;
+        let out = stropt_remove_val(b"/a,/b,/c", opt_flags::COMMA, 3, 2);
+        assert_eq!(out, b"/a,/c");
+    }
+
+    #[test]
+    fn stropt_remove_val_last_item_takes_the_comma_before_it() {
+        // Cross-verified: set path-=/c  ->  /a,/b
+        use crate::option_defs::opt_flags;
+        let out = stropt_remove_val(b"/a,/b,/c", opt_flags::COMMA, 6, 2);
+        assert_eq!(out, b"/a,/b");
+    }
+
+    #[test]
+    fn stropt_remove_val_only_item_leaves_it_empty() {
+        use crate::option_defs::opt_flags;
+        let out = stropt_remove_val(b"/a", opt_flags::COMMA, 0, 2);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn stropt_remove_val_without_the_comma_flag_leaves_separators_alone() {
+        // A non-COMMA option has no separator to account for, so only
+        // the matched span itself is removed.
+        let out = stropt_remove_val(b"abcdef", 0, 2, 2);
+        assert_eq!(out, b"abef");
+    }
+
+    #[test]
+    fn stropt_remove_val_with_an_out_of_range_offset_copies_through() {
+        // The original's `if (*strval)` guard is false at the
+        // terminating NUL, so nothing is removed.
+        use crate::option_defs::opt_flags;
+        let out = stropt_remove_val(b"/a,/b", opt_flags::COMMA, 5, 2);
+        assert_eq!(out, b"/a,/b");
     }
 
     #[test]
