@@ -6480,6 +6480,52 @@ mod did_set_option_tests {
     }
 }
 
+/// Mark the window title and tabline for redraw (`redraw_titles`).
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn redraw_titles() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.need_maketitle = true;
+    g.redraw_tabline = true;
+}
+
+/// Process the updated `'readonly'` option value (`did_set_readonly`).
+///
+/// Resetting `'readonly'` globally also clears `readonlymode`, so a
+/// `-R`-started session stops opening further files read-only; a
+/// `:setlocal` is deliberately excluded from that, since it says
+/// nothing about the global intent.
+///
+/// Setting `'readonly'` clears `b_did_warn` so the "W10: Changing a
+/// readonly file" warning can be given again.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call. Also mutates `crate::globals::GLOBALS`.
+pub unsafe fn did_set_readonly(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    // SAFETY: forwarded from this function's own safety doc.
+    let b_p_ro = unsafe { (*buf_ptr).b_p_ro };
+
+    // When 'readonly' is reset globally, also reset readonlymode.
+    if b_p_ro == 0 && args.os_flags as u32 & crate::option_defs::opt_set_flags::OPT_LOCAL == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode = false;
+    }
+
+    // When 'readonly' is set we may give W10 again.
+    if b_p_ro != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*buf_ptr).b_did_warn = false };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { redraw_titles() };
+    None
+}
+
 /// Process the updated `'lisp'` option value (`did_set_lisp`).
 ///
 /// Changing `'lisp'` includes/excludes `-` in the keyword characters,
@@ -6661,6 +6707,94 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn redraw_titles_sets_both_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_title, prev_tabline) = (g.need_maketitle, g.redraw_tabline);
+        g.need_maketitle = false;
+        g.redraw_tabline = false;
+
+        unsafe { redraw_titles() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(g.need_maketitle);
+        assert!(g.redraw_tabline);
+        g.need_maketitle = prev_title;
+        g.redraw_tabline = prev_tabline;
+    }
+
+    #[test]
+    fn did_set_readonly_reset_globally_clears_readonlymode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode;
+        unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode = true;
+
+        let mut buf = crate::buffer_defs::BufT { b_p_ro: 0, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Readonly,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: 0,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_readonly(&mut args) }, None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode = prev;
+    }
+
+    #[test]
+    fn did_set_readonly_reset_locally_leaves_readonlymode_alone() {
+        // A :setlocal says nothing about the global intent, so
+        // readonlymode must survive it.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode;
+        unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode = true;
+
+        let mut buf = crate::buffer_defs::BufT { b_p_ro: 0, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Readonly,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_flags: crate::option_defs::opt_set_flags::OPT_LOCAL as i32,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_readonly(&mut args) }, None);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.readonlymode = prev;
+    }
+
+    #[test]
+    fn did_set_readonly_set_clears_the_warning_flag() {
+        // Setting 'readonly' lets the W10 warning be given again.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_ro: 1, b_did_warn: true, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Readonly,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_readonly(&mut args) }, None);
+        assert!(!buf.b_did_warn);
+    }
+
+    #[test]
+    fn did_set_readonly_reset_leaves_the_warning_flag_alone() {
+        // Only SETTING 'readonly' re-arms the warning; resetting it
+        // must not, since there is nothing to warn about.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf =
+            crate::buffer_defs::BufT { b_p_ro: 0, b_did_warn: true, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Readonly,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_readonly(&mut args) }, None);
+        assert!(buf.b_did_warn);
     }
 
     #[test]
