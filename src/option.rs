@@ -6480,6 +6480,82 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'smoothscroll'` option value
+/// (`did_set_smoothscroll`).
+///
+/// Turning `'smoothscroll'` OFF clears `w_skipcol`, since a partially
+/// scrolled first line is only meaningful while it is on. Turning it
+/// on leaves the value alone.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_smoothscroll(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if (*win_ptr).w_onebuf_opt.wo_sms == 0 {
+            (*win_ptr).w_skipcol = 0;
+        }
+    }
+    None
+}
+
+/// Process the updated `'textwidth'` option value
+/// (`did_set_textwidth`).
+///
+/// `'colorcolumn'` can be given relative to `'textwidth'` (`+1`), so
+/// every window's resolved column list has to be recomputed.
+///
+/// As elsewhere in this crate, the original's
+/// `FOR_ALL_TAB_WINDOWS(tp, wp)` is walked as
+/// `GLOBALS.firstwin`/`w_next`, the established simplification here.
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid, live
+/// `WinT` pointers.
+pub unsafe fn did_set_textwidth(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // The original discards this "is the value valid" result here:
+        // it calls check_colorcolumn purely for its recomputation side
+        // effect, since 'colorcolumn' itself has not changed.
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { crate::window::check_colorcolumn(None, Some(&mut *wp)) };
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+    None
+}
+
+/// Process the updated `'titlelen'` option value (`did_set_titlelen`).
+///
+/// The title is only redrawn when the value actually CHANGED, and
+/// never during startup - re-setting `'titlelen'` to what it already
+/// was schedules nothing.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn did_set_titlelen(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let old_value = match args.os_oldval {
+        crate::option_defs::OptVal::Number(n) => n,
+        _ => return None,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let starting = unsafe { crate::globals::GLOBALS.get_mut() }.starting;
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_titlelen = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_titlelen;
+
+    if starting != crate::globals::NO_SCREEN && old_value != p_titlelen {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = true;
+    }
+    None
+}
+
 /// Build the new value of a string option after a `-=` removal
 /// (`stropt_remove_val`).
 ///
@@ -6928,6 +7004,96 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn did_set_smoothscroll_clears_skipcol_only_when_turned_off() {
+        // A partially scrolled first line is only meaningful while
+        // 'smoothscroll' is ON, so turning it off clears w_skipcol and
+        // turning it on leaves the value alone.
+        let mut win = crate::buffer_defs::WinT { w_skipcol: 12, ..Default::default() };
+        win.w_onebuf_opt.wo_sms = 0;
+        let mut args = fold_args(crate::option_defs::OptIndex::Smoothscroll, &mut win);
+        assert_eq!(unsafe { did_set_smoothscroll(&mut args) }, None);
+        assert_eq!(win.w_skipcol, 0);
+
+        let mut win = crate::buffer_defs::WinT { w_skipcol: 12, ..Default::default() };
+        win.w_onebuf_opt.wo_sms = 1;
+        let mut args = fold_args(crate::option_defs::OptIndex::Smoothscroll, &mut win);
+        assert_eq!(unsafe { did_set_smoothscroll(&mut args) }, None);
+        assert_eq!(win.w_skipcol, 12, "w_skipcol must survive turning it ON");
+    }
+
+    #[test]
+    fn did_set_textwidth_walks_every_window() {
+        // 'colorcolumn' can be relative to 'textwidth' (+1), so every
+        // window's resolved column list is recomputed. Two windows are
+        // chained so the walk itself is exercised, not just the head.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+
+        let mut second = crate::buffer_defs::WinT::default();
+        let mut first = crate::buffer_defs::WinT {
+            w_next: &mut second,
+            ..crate::buffer_defs::WinT::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = &mut first;
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Textwidth,
+            ..Default::default()
+        };
+        // Must walk the whole chain without panicking on the null
+        // w_buffer both fixtures carry.
+        assert_eq!(unsafe { did_set_textwidth(&mut args) }, None);
+
+        first.w_next = std::ptr::null_mut();
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+    }
+
+    #[test]
+    fn did_set_titlelen_only_redraws_on_a_real_change() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_start, prev_title) = (g.starting, g.need_maketitle);
+        let prev_len = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_titlelen;
+
+        // Past startup, with a genuinely different old value.
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = 0;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_titlelen = 50;
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = false;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Titlelen,
+            os_oldval: crate::option_defs::OptVal::Number(85),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_titlelen(&mut args) }, None);
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+
+        // Re-setting it to what it already was schedules nothing.
+        unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle = false;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Titlelen,
+            os_oldval: crate::option_defs::OptVal::Number(50),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_titlelen(&mut args) }, None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+
+        // During startup nothing is scheduled even for a real change.
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = crate::globals::NO_SCREEN;
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Titlelen,
+            os_oldval: crate::option_defs::OptVal::Number(85),
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_titlelen(&mut args) }, None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.starting = prev_start;
+        g.need_maketitle = prev_title;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_titlelen = prev_len;
     }
 
     #[test]
