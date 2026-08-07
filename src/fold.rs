@@ -1851,6 +1851,31 @@ pub unsafe fn parse_marker(wp: &WinT) {
     *unsafe { FOLD_MARKERS.get_mut() } = Some(markers);
 }
 
+/// Recompute folds after leaving Insert mode
+/// (`foldUpdateAfterInsert`).
+///
+/// Skipped entirely for `'foldmethod'` `"manual"`, which needs no
+/// recomputation, and for `"syntax"`/`"expr"`, which the original
+/// deems too slow to run automatically on every insert-leave.
+///
+/// # Safety
+/// Same as [`fold_open_cursor`]; also touches `GLOBALS.curwin`.
+pub unsafe fn fold_update_after_insert() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*curwin };
+
+    if foldmethod_is_manual(win) || foldmethod_is_syntax(win) || foldmethod_is_expr(win) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_update_all(curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_open_cursor() };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2727,6 +2752,59 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fold_update_after_insert_skips_the_slow_and_manual_foldmethods() {
+        let _lock = crate::globals::global_state_test_lock();
+        for fdm in [b"manual".as_ref(), b"syntax", b"expr"] {
+            let mut buf = BufT::default();
+            let mut win = WinT {
+                w_buffer: &mut buf as *mut BufT,
+                w_onebuf_opt: crate::buffer_defs::WinoptT {
+                    wo_fen: 1,
+                    wo_fdm: Some(fdm.to_vec()),
+                    ..Default::default()
+                },
+                w_foldinvalid: false,
+                ..Default::default()
+            };
+            let win_ptr = &mut win as *mut WinT;
+            let _guard = CurwinGuard::set(win_ptr);
+
+            unsafe { fold_update_after_insert() };
+
+            assert!(
+                !unsafe { (*win_ptr).w_foldinvalid },
+                "'foldmethod'={} must not trigger a recompute",
+                String::from_utf8_lossy(fdm)
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "foldUpdate")]
+    fn fold_update_after_insert_reaches_the_fold_recomputation_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                // 'foldmethod'=indent is none of the three skipped
+                // methods, so the folds really are invalidated - and
+                // the following foldOpenCursor then calls checkupdate,
+                // which needs the not-yet-translated foldUpdate.
+                wo_fen: 1,
+                wo_fdm: Some(b"indent".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { fold_update_after_insert() };
     }
 
     #[test]
