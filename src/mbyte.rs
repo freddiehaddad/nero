@@ -1936,9 +1936,66 @@ pub unsafe fn mb_charlen(s: &[u8]) -> i32 {
     count
 }
 
-/// Adjust the cursor to a multi-byte character's head byte, and reset
-/// `coladd` when it sits on the right half of a double-wide character
-/// (`mb_adjust_cursor`).
+/// Count the characters in `s[..len]`, reporting both the codepoint
+/// count and the UTF-16 code-unit count (`mb_utflen`).
+///
+/// Both counters are ADDED to, not assigned, matching the original's
+/// own `*codepoints += count` accumulate-into-out-parameter shape, so
+/// callers can total several chunks.
+///
+/// Characters above the BMP take two UTF-16 code units, so
+/// `codeunits` grows by one extra per such character. Note the
+/// original deliberately reads the raw byte value for an invalid
+/// sequence (only whether it fits in the BMP matters), which this
+/// mirrors.
+pub fn mb_utflen(s: &[u8], len: usize, codepoints: &mut usize, codeunits: &mut usize) {
+    let mut count = 0usize;
+    let mut extra = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        let clen = usize::try_from(utf_ptr2len_len(&s[i..], len - i)).unwrap_or(1).max(1);
+        // NB: gets the byte value of invalid sequence bytes. We only
+        // care whether the char fits in the BMP or not.
+        let c = if clen > 1 { utf_ptr2char(&s[i..]) } else { i32::from(s[i]) };
+        count += 1;
+        if c > 0xFFFF {
+            extra += 1;
+        }
+        i += clen;
+    }
+    *codepoints += count;
+    *codeunits += count + extra;
+}
+
+/// Byte offset just past the character at character index `index` in
+/// `s[..len]`, or `-1` if the string has fewer than `index`
+/// characters (`mb_utf_index_to_bytes`).
+///
+/// With `use_utf16_units` the index counts UTF-16 code units, so a
+/// character above the BMP advances the count by two.
+#[must_use]
+pub fn mb_utf_index_to_bytes(s: &[u8], len: usize, index: usize, use_utf16_units: bool) -> isize {
+    if index == 0 {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        let clen = usize::try_from(utf_ptr2len_len(&s[i..], len - i)).unwrap_or(1).max(1);
+        // NB: as in mb_utflen, the raw byte value is used for an
+        // invalid sequence.
+        let c = if clen > 1 { utf_ptr2char(&s[i..]) } else { i32::from(s[i]) };
+        count += 1;
+        if use_utf16_units && c > 0xFFFF {
+            count += 1;
+        }
+        if count >= index {
+            return (i + clen) as isize;
+        }
+        i += clen;
+    }
+    -1
+}
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS`, with the usual "no overlapping
@@ -3304,6 +3361,88 @@ mod tests {
     fn mb_charlen_counts_multibyte_characters() {
         let _guard = option_vars_test_lock();
         assert_eq!(unsafe { mb_charlen("一二三".as_bytes()) }, 3);
+    }
+
+    // --- mb_utflen / mb_utf_index_to_bytes ---
+
+    /// "a" + U+1F600 (4 bytes, outside the BMP) + "b": 6 bytes,
+    /// 3 codepoints, 4 UTF-16 code units.
+    fn astral_sample() -> Vec<u8> {
+        "a\u{1F600}b".as_bytes().to_vec()
+    }
+
+    #[test]
+    fn mb_utflen_counts_codepoints_and_utf16_units() {
+        // Cross-verified against real nvim: for this string strchars()
+        // is 3 and strutf16len() is 4.
+        let s = astral_sample();
+        let (mut cp, mut cu) = (0usize, 0usize);
+        mb_utflen(&s, s.len(), &mut cp, &mut cu);
+        assert_eq!(cp, 3);
+        assert_eq!(cu, 4);
+    }
+
+    #[test]
+    fn mb_utflen_accumulates_rather_than_assigning() {
+        // The original's out-parameters are `+=`, so a second chunk
+        // adds to the running totals.
+        let s = astral_sample();
+        let (mut cp, mut cu) = (10usize, 20usize);
+        mb_utflen(&s, s.len(), &mut cp, &mut cu);
+        assert_eq!(cp, 13);
+        assert_eq!(cu, 24);
+    }
+
+    #[test]
+    fn mb_utflen_of_an_empty_range_adds_nothing() {
+        let (mut cp, mut cu) = (0usize, 0usize);
+        mb_utflen(b"", 0, &mut cp, &mut cu);
+        assert_eq!((cp, cu), (0, 0));
+    }
+
+    #[test]
+    fn mb_utf_index_to_bytes_by_codepoint() {
+        // Cross-verified against real nvim's vim.str_byteindex, which
+        // is this function's own caller: indices 0/1/2/3 give
+        // 0/1/5/6 for this string.
+        let s = astral_sample();
+        let len = s.len();
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 0, false), 0);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 1, false), 1);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 2, false), 5);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 3, false), 6);
+    }
+
+    #[test]
+    fn mb_utf_index_to_bytes_past_the_end_is_minus_one() {
+        // Cross-verified: vim.str_byteindex errors for this index,
+        // which is how the -1 surfaces.
+        let s = astral_sample();
+        assert_eq!(mb_utf_index_to_bytes(&s, s.len(), 4, false), -1);
+    }
+
+    #[test]
+    fn mb_utf_index_to_bytes_by_utf16_unit() {
+        // Cross-verified against real nvim's
+        // vim.str_byteindex(s, 'utf-16', i): 0/1/2/3/4 give
+        // 0/1/5/5/6. Note 2 and 3 both land on 5 - an index pointing
+        // into the middle of a surrogate pair resolves to the end of
+        // the whole character.
+        let s = astral_sample();
+        let len = s.len();
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 0, true), 0);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 1, true), 1);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 2, true), 5);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 3, true), 5);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 4, true), 6);
+        assert_eq!(mb_utf_index_to_bytes(&s, len, 5, true), -1);
+    }
+
+    #[test]
+    fn mb_utf_index_to_bytes_on_pure_ascii_is_the_index_itself() {
+        assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 3, false), 3);
+        assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 5, false), 5);
+        assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 6, false), -1);
     }
 
     #[test]
