@@ -127,6 +127,61 @@ pub fn ends_excmd(c: u8) -> bool {
     c == 0 || c == b'|' || c == b'"' || c == b'\n'
 }
 
+/// Skip leading colons (and the whitespace around them) at the start
+/// of an Ex command line, returning the byte offset just past them
+/// (`skip_colon_white`).
+///
+/// The original takes and returns a pointer; this returns an index
+/// instead, matching this crate's established index-in-place-of-
+/// pointer idiom.
+#[must_use]
+pub fn skip_colon_white(p: &[u8], skipleadingwhite: bool) -> usize {
+    let mut i = if skipleadingwhite { crate::charset::skipwhite(p) } else { 0 };
+
+    while p.get(i) == Some(&b':') {
+        i += 1;
+        i += crate::charset::skipwhite(&p[i..]);
+    }
+
+    i
+}
+
+/// Whether `p` starts with a command-modifying `!`, consuming it if so
+/// (`parse_bang`).
+///
+/// `:substitute` and its `:smagic`/`:snomagic` siblings are excluded:
+/// for those a `!` is part of the pattern, not a bang modifier.
+///
+/// Returns `(found, consumed)` rather than advancing a `char **p`
+/// out-parameter.
+#[must_use]
+pub fn parse_bang(cmdidx: crate::ex_cmds_defs::CmdIdxT, p: &[u8]) -> (bool, usize) {
+    use crate::ex_cmds_defs::CmdIdxT;
+    if p.first() == Some(&b'!')
+        && cmdidx != CmdIdxT::substitute
+        && cmdidx != CmdIdxT::smagic
+        && cmdidx != CmdIdxT::snomagic
+    {
+        return (true, 1);
+    }
+    (false, 0)
+}
+
+/// Whether the command expects expression arguments needing special
+/// parsing (`cmd_has_expr_args`).
+#[must_use]
+pub fn cmd_has_expr_args(cmdidx: crate::ex_cmds_defs::CmdIdxT) -> bool {
+    use crate::ex_cmds_defs::CmdIdxT;
+    matches!(
+        cmdidx,
+        CmdIdxT::execute
+            | CmdIdxT::echo
+            | CmdIdxT::echon
+            | CmdIdxT::echomsg
+            | CmdIdxT::echoerr
+    )
+}
+
 /// Return the offset, within `p`, of the character right after the
 /// first `|` or `\n`, or `None` if neither is found before the end of
 /// `p` (`find_nextcmd`).
@@ -645,6 +700,79 @@ mod tests {
         assert!(ends_excmd(b'|'));
         assert!(ends_excmd(b'"'));
         assert!(ends_excmd(b'\n'));
+    }
+
+    // --- skip_colon_white / parse_bang / cmd_has_expr_args ---
+
+    #[test]
+    fn skip_colon_white_consumes_colons_and_surrounding_space() {
+        assert_eq!(skip_colon_white(b"  :: echo", true), 5);
+        assert_eq!(skip_colon_white(b":::x", true), 3);
+        assert_eq!(skip_colon_white(b"echo", true), 0);
+    }
+
+    #[test]
+    fn skip_colon_white_can_skip_the_leading_whitespace_pass() {
+        // With skipleadingwhite false a leading space stops it dead,
+        // since the loop only advances past colons.
+        assert_eq!(skip_colon_white(b"  :echo", false), 0);
+        assert_eq!(skip_colon_white(b":  :echo", false), 4);
+    }
+
+    #[test]
+    fn skip_colon_white_on_empty_input_is_zero() {
+        assert_eq!(skip_colon_white(b"", true), 0);
+        assert_eq!(skip_colon_white(b"   ", true), 3);
+    }
+
+    #[test]
+    fn parse_bang_consumes_a_leading_bang() {
+        let (found, used) = parse_bang(crate::ex_cmds_defs::CmdIdxT::edit, b"! rest");
+        assert!(found);
+        assert_eq!(used, 1);
+    }
+
+    #[test]
+    fn parse_bang_ignores_the_bang_for_substitute_and_friends() {
+        // Cross-verified against real nvim: `s!a!X!` uses `!` as the
+        // pattern delimiter, so it must not be eaten as a modifier.
+        for idx in [
+            crate::ex_cmds_defs::CmdIdxT::substitute,
+            crate::ex_cmds_defs::CmdIdxT::smagic,
+            crate::ex_cmds_defs::CmdIdxT::snomagic,
+        ] {
+            let (found, used) = parse_bang(idx, b"!a!X!");
+            assert!(!found, "{idx:?} must keep its own delimiter");
+            assert_eq!(used, 0);
+        }
+    }
+
+    #[test]
+    fn parse_bang_is_false_without_a_bang() {
+        let (found, used) = parse_bang(crate::ex_cmds_defs::CmdIdxT::edit, b" file");
+        assert!(!found);
+        assert_eq!(used, 0);
+        assert_eq!(parse_bang(crate::ex_cmds_defs::CmdIdxT::edit, b""), (false, 0));
+    }
+
+    #[test]
+    fn cmd_has_expr_args_is_true_only_for_the_five_expression_commands() {
+        for idx in [
+            crate::ex_cmds_defs::CmdIdxT::execute,
+            crate::ex_cmds_defs::CmdIdxT::echo,
+            crate::ex_cmds_defs::CmdIdxT::echon,
+            crate::ex_cmds_defs::CmdIdxT::echomsg,
+            crate::ex_cmds_defs::CmdIdxT::echoerr,
+        ] {
+            assert!(cmd_has_expr_args(idx), "{idx:?} takes expression args");
+        }
+        for idx in [
+            crate::ex_cmds_defs::CmdIdxT::edit,
+            crate::ex_cmds_defs::CmdIdxT::substitute,
+            crate::ex_cmds_defs::CmdIdxT::append,
+        ] {
+            assert!(!cmd_has_expr_args(idx), "{idx:?} does not");
+        }
     }
 
     #[test]
