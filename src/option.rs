@@ -6480,6 +6480,29 @@ mod did_set_option_tests {
     }
 }
 
+/// Whether two option values are equal (`optval_equal`).
+///
+/// The original hand-writes a per-variant comparison because its
+/// `OptVal` is an untagged union plus a separate `type` field, so `==`
+/// on it would be meaningless. This crate models `OptVal` as a real
+/// Rust enum, whose derived `PartialEq` already performs exactly the
+/// original's own dispatch: different variants are unequal, `Nil` is
+/// equal to `Nil`, and each payload compares by value.
+///
+/// Kept as a named function anyway, so callers translated later read
+/// the same way the original does.
+#[must_use]
+pub fn optval_equal(o1: &crate::option_defs::OptVal, o2: &crate::option_defs::OptVal) -> bool {
+    o1 == o2
+}
+
+/// This option's own flags, or `0` for an invalid index
+/// (`get_option_flags`).
+#[must_use]
+pub fn get_option_flags(opt_idx: OptIndex) -> u32 {
+    if opt_idx == OptIndex::Invalid { 0 } else { get_option(opt_idx).flags }
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7097,6 +7120,58 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn optval_equal_matches_the_originals_per_variant_dispatch() {
+        use crate::option_defs::OptVal;
+        use crate::types_defs::TriState;
+
+        // Nil is equal to Nil.
+        assert!(optval_equal(&OptVal::Nil, &OptVal::Nil));
+        // Same variant, same payload.
+        assert!(optval_equal(
+            &OptVal::Boolean(TriState::True),
+            &OptVal::Boolean(TriState::True)
+        ));
+        assert!(optval_equal(&OptVal::Number(7), &OptVal::Number(7)));
+        assert!(optval_equal(
+            &OptVal::String(b"abc".to_vec()),
+            &OptVal::String(b"abc".to_vec())
+        ));
+
+        // Same variant, different payload.
+        assert!(!optval_equal(
+            &OptVal::Boolean(TriState::True),
+            &OptVal::Boolean(TriState::False)
+        ));
+        assert!(!optval_equal(&OptVal::Number(7), &OptVal::Number(8)));
+        assert!(!optval_equal(
+            &OptVal::String(b"abc".to_vec()),
+            &OptVal::String(b"abd".to_vec())
+        ));
+
+        // Different variants are never equal, whatever they carry.
+        assert!(!optval_equal(&OptVal::Nil, &OptVal::Number(0)));
+        assert!(!optval_equal(&OptVal::Number(1), &OptVal::Boolean(TriState::True)));
+    }
+
+    #[test]
+    fn get_option_flags_reports_zero_for_an_invalid_index() {
+        assert_eq!(get_option_flags(OptIndex::Invalid), 0);
+    }
+
+    #[test]
+    fn get_option_flags_matches_the_options_table() {
+        // A real option must report exactly its table entry's flags.
+        for idx in [OptIndex::Path, OptIndex::Whichwrap, OptIndex::Shortmess] {
+            assert_eq!(get_option_flags(idx), get_option(idx).flags);
+        }
+        // 'path' is a comma-separated list, so at minimum COMMA is set.
+        assert_ne!(
+            get_option_flags(OptIndex::Path) & crate::option_defs::opt_flags::COMMA,
+            0
+        );
     }
 
     #[test]
