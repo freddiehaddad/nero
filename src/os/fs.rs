@@ -373,6 +373,63 @@ pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Get the inode number from a `FileInfoT` (`os_fileinfo_inode`).
+///
+/// `0` on a platform that reports none - Windows `std::fs::Metadata`
+/// exposes no inode, matching the same narrow, documented gap
+/// [`os_fileinfo_mtime`] takes.
+#[must_use]
+pub fn os_fileinfo_inode(info: &FileInfoT) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        info.metadata.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = info;
+        0
+    }
+}
+
+/// Get the hard-link count from a `FileInfoT`
+/// (`os_fileinfo_hardlinks`).
+///
+/// `1` on a platform that reports none: a file always has at least
+/// the one link naming it, which is what a non-hard-linking caller
+/// expects to see.
+#[must_use]
+pub fn os_fileinfo_hardlinks(info: &FileInfoT) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        info.metadata.nlink()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = info;
+        1
+    }
+}
+
+/// Get the preferred I/O block size from a `FileInfoT`
+/// (`os_fileinfo_blocksize`).
+///
+/// `0` on a platform that reports none.
+#[must_use]
+pub fn os_fileinfo_blocksize(info: &FileInfoT) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        info.metadata.blksize()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = info;
+        0
+    }
+}
+
 /// Get the sub-second part of the last modification time from a
 /// `FileInfoT` (`file_info->stat.st_mtim.tv_nsec` in the original).
 ///
@@ -1496,6 +1553,50 @@ mod tests {
         assert!(os_file_is_readable(&path));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // --- os_fileinfo_inode / hardlinks / blocksize ---
+
+    #[test]
+    fn fileinfo_accessors_report_plausible_values_for_a_real_file() {
+        let path = std::env::temp_dir().join("nero_test_fileinfo_accessors");
+        std::fs::write(&path, b"contents").unwrap();
+        let info = os_fileinfo(&path).unwrap();
+
+        // A freshly created regular file has exactly one link.
+        assert_eq!(os_fileinfo_hardlinks(&info), 1);
+
+        #[cfg(unix)]
+        {
+            assert_ne!(os_fileinfo_inode(&info), 0, "unix reports a real inode");
+            assert_ne!(os_fileinfo_blocksize(&info), 0);
+        }
+        #[cfg(not(unix))]
+        {
+            // std::fs::Metadata exposes neither on Windows.
+            assert_eq!(os_fileinfo_inode(&info), 0);
+            assert_eq!(os_fileinfo_blocksize(&info), 0);
+        }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fileinfo_inode_distinguishes_two_different_files() {
+        let a = std::env::temp_dir().join("nero_test_inode_a");
+        let b = std::env::temp_dir().join("nero_test_inode_b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let ia = os_fileinfo_inode(&os_fileinfo(&a).unwrap());
+        let ib = os_fileinfo_inode(&os_fileinfo(&b).unwrap());
+        assert_ne!(ia, ib);
+        // ...and is stable for the same file.
+        assert_eq!(ia, os_fileinfo_inode(&os_fileinfo(&a).unwrap()));
+
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
     }
 
     #[test]
