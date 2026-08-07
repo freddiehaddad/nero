@@ -174,6 +174,48 @@ pub(crate) fn f_getftype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(type_str.map(|s| s.as_bytes().to_vec()));
 }
 
+/// `filecopy({from}, {to})` - copy the file `{from}` to `{to}`
+/// (`f_filecopy`, `eval/fs.c`).
+///
+/// Only a regular file or a symlink is copied; anything else (a
+/// directory, a device node, a socket) is silently refused, matching
+/// the original's own `S_ISREG || S_ISLNK` guard.
+///
+/// @return `1` on success, `0` on failure. Refuses to overwrite an
+///         existing `{to}`, since
+///         [`crate::fileio::vim_copyfile`] passes the original's own
+///         `UV_FS_COPYFILE_EXCL`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`]).
+pub(crate) unsafe fn f_filecopy(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() }
+        || crate::eval::typval::tv_check_for_string_arg(argvars, 0) == crate::vim_defs::FAIL
+        || crate::eval::typval::tv_check_for_string_arg(argvars, 1) == crate::vim_defs::FAIL
+    {
+        return;
+    }
+
+    let from = crate::eval::typval::tv_get_string(&argvars[0]);
+    let to = crate::eval::typval::tv_get_string(&argvars[1]);
+    let Some(from_path) = bytes_to_path(&from) else { return };
+
+    // os_fileinfo_link, so a symlink is judged by its OWN type rather
+    // than its target's - the original checks S_ISLNK explicitly.
+    let is_copyable = crate::os::fs::os_fileinfo_link(from_path).is_some_and(|info| {
+        matches!(crate::os::fs::os_fileinfo_type_str(&info), "file" | "link")
+    });
+    if is_copyable {
+        rettv.value = TypvalValue::Number(i64::from(
+            crate::fileio::vim_copyfile(&from, &to) == crate::vim_defs::OK,
+        ));
+    }
+}
+
 /// `getfperm({fname})` - the file's permissions as a 9-character
 /// `"rwxrwxrwx"`-style string (`f_getfperm`, `eval/fs.c`).
 ///
@@ -2157,6 +2199,139 @@ mod tests {
         let TypvalValue::List(l) = rettv.value else { unreachable!() };
         unsafe { crate::eval::typval::tv_list_unref(l) };
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // --- f_filecopy ---
+
+    /// Builds a scratch directory for the filecopy tests.
+    fn filecopy_scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("nero_test_filecopy_{name}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn filecopy_copies_a_plain_file() {
+        // Cross-verified against real nvim: returns 1 and the source
+        // survives (copy, not move).
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let dir = filecopy_scratch("plain");
+        let from = dir.join("from.txt");
+        let to = dir.join("to.txt");
+        std::fs::write(&from, b"payload").unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_filecopy(
+                &[
+                    string(from.to_str().unwrap().as_bytes()),
+                    string(to.to_str().unwrap().as_bytes()),
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        assert!(from.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filecopy_refuses_an_existing_destination() {
+        // Cross-verified against real nvim: returns 0 and the existing
+        // destination keeps its original contents (COPYFILE_EXCL).
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let dir = filecopy_scratch("excl");
+        let from = dir.join("from.txt");
+        let to = dir.join("exists.txt");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"original").unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_filecopy(
+                &[
+                    string(from.to_str().unwrap().as_bytes()),
+                    string(to.to_str().unwrap().as_bytes()),
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert_eq!(std::fs::read(&to).unwrap(), b"original");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filecopy_refuses_a_directory() {
+        // Cross-verified against real nvim: only a regular file or a
+        // symlink is copied (the original's S_ISREG || S_ISLNK guard).
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let dir = filecopy_scratch("dir");
+        let src = dir.join("adir");
+        std::fs::create_dir(&src).unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_filecopy(
+                &[
+                    string(src.to_str().unwrap().as_bytes()),
+                    string(dir.join("dircopy").to_str().unwrap().as_bytes()),
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert!(!dir.join("dircopy").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filecopy_refuses_a_missing_source() {
+        // Cross-verified against real nvim: returns 0.
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let dir = filecopy_scratch("missing");
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_filecopy(
+                &[
+                    string(dir.join("nope.txt").to_str().unwrap().as_bytes()),
+                    string(dir.join("x.txt").to_str().unwrap().as_bytes()),
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn filecopy_with_a_non_string_argument_fails() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        unsafe { f_filecopy(&[list_tv, string(b"/tmp/x")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     // --- f_getfperm / f_tempname ---

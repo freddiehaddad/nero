@@ -442,6 +442,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"readdir"[..], EvalFuncDefT { min_argc: 1, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_readdir });
         m.insert(&b"getfperm"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_getfperm });
         m.insert(&b"setfperm"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_setfperm });
+        m.insert(&b"filecopy"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: 1, func: crate::eval::fs::f_filecopy });
         m.insert(&b"tempname"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: 1, func: crate::eval::fs::f_tempname });
         m.insert(&b"glob2regpat"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_glob2regpat });
         m.insert(&b"bufexists"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::buffer::f_bufexists });
@@ -8429,6 +8430,7 @@ mod tests {
             "readdir",
             "getfperm",
             "setfperm",
+            "filecopy",
             "tempname",
             "glob2regpat",
             "bufexists",
