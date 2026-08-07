@@ -4061,6 +4061,14 @@ mod tests {
         // NOTE: no explicit `global_state_test_lock()` here -
         // `FoldUpdateGuard::set()` acquires it internally and holds it
         // for its whole lifetime; taking it twice would deadlock.
+        //
+        // The guard MUST be created BEFORE the fixture:
+        // indent_level_fixture temporarily installs GLOBALS.curbuf,
+        // so building it outside the lock races any other
+        // global-state test.
+        let _guard = FoldUpdateGuard::set();
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
         // The dispatch guard really is driven by 'foldmethod': with
         // "indent" it now runs the recomputation rather than stopping
         // at a deferred boundary.
@@ -4071,9 +4079,6 @@ mod tests {
         win.w_onebuf_opt.wo_fdl = 99;
         win.w_onebuf_opt.wo_fml = 0;
         let win_ptr: *mut WinT = &mut *win;
-        let _guard = FoldUpdateGuard::set();
-        // A previous test may have left the recursion sentinel set.
-        unsafe { *INVALID_TOP.get_mut() = 0 };
 
         unsafe { fold_update(&mut *win_ptr, 1, 4) };
 
@@ -4091,7 +4096,11 @@ mod tests {
     #[test]
     fn checkupdate_recomputes_and_clears_foldinvalid() {
         // No explicit lock: `FoldUpdateGuard::set()` self-locks (see
-        // the sibling test above).
+        // the sibling test above), and it must come BEFORE the
+        // fixture, which temporarily installs GLOBALS.curbuf.
+        let _guard = FoldUpdateGuard::set();
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
         let (buf, mut win) =
             indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
         win.w_onebuf_opt.wo_fen = 1;
@@ -4100,9 +4109,6 @@ mod tests {
         win.w_onebuf_opt.wo_fml = 0;
         win.w_foldinvalid = true;
         let win_ptr: *mut WinT = &mut *win;
-        let _guard = FoldUpdateGuard::set();
-        // A previous test may have left the recursion sentinel set.
-        unsafe { *INVALID_TOP.get_mut() = 0 };
 
         unsafe { checkupdate(&mut *win_ptr) };
 
@@ -6810,7 +6816,12 @@ mod tests {
     #[test]
     fn fold_update_after_insert_runs_the_real_recomputation() {
         // No explicit `global_state_test_lock()`: `FoldUpdateGuard`
-        // self-locks and holds it for the whole test body.
+        // self-locks and holds it for the whole test body, and it must
+        // come BEFORE the fixture, which temporarily installs
+        // GLOBALS.curbuf.
+        let _guard = FoldUpdateGuard::set();
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
         let (buf, mut win) =
             indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
         // 'foldmethod'=indent is none of the three skipped methods, so
@@ -6824,10 +6835,7 @@ mod tests {
         win.w_foldinvalid = false;
         win.w_cursor.lnum = 3;
         let win_ptr: *mut WinT = &mut *win;
-        let _guard = FoldUpdateGuard::set();
         let _curwin = CurwinGuard::set(win_ptr);
-        // A previous test may have left the recursion sentinel set.
-        unsafe { *INVALID_TOP.get_mut() = 0 };
 
         unsafe { fold_update_after_insert() };
 
