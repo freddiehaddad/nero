@@ -475,10 +475,22 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn stdpaths_get_xdg_var_config_dirs_is_unimplemented_when_using_the_default() {
+    fn stdpaths_get_xdg_var_config_dirs_deduplicates_the_default() {
         let _lock = xdg_test_lock();
         let _guard = XdgEnvGuard::set(&[("XDG_CONFIG_DIRS", None)]);
-        let result = std::panic::catch_unwind(|| unsafe { stdpaths_get_xdg_var(XdgVarType::ConfigDirs) });
-        assert!(result.is_err(), "expected a panic (xdg_remove_duplicate not yet translated)");
+        // The unix default is a single directory, so deduplication
+        // leaves it as-is (minus the trailing separator os_strtok
+        // would have dropped).
+        let result = unsafe { stdpaths_get_xdg_var(XdgVarType::ConfigDirs) };
+        assert_eq!(result, Some(b"/etc/xdg/".to_vec()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stdpaths_get_xdg_var_data_dirs_deduplicates_a_repeated_entry() {
+        let _lock = xdg_test_lock();
+        let _guard = XdgEnvGuard::set(&[("XDG_DATA_DIRS", Some("/usr/share:/usr/local/share:/usr/share"))]);
+        let result = unsafe { stdpaths_get_xdg_var(XdgVarType::DataDirs) };
+        assert_eq!(result, Some(b"/usr/share:/usr/local/share".to_vec()));
     }
 }
