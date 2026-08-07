@@ -34,6 +34,110 @@ pub unsafe fn clearop(oap: &mut crate::normal_defs::OpargT) {
     unsafe { crate::globals::GLOBALS.get_mut() }.motion_force = i32::from(crate::ascii_defs::NUL);
 }
 
+/// Swap the ends of the Visual selection (`v_swap_corners`).
+///
+/// For `O` in blockwise Visual mode this swaps the LEFT/RIGHT corners
+/// rather than the start/end, so the cursor moves to the opposite
+/// side of the block on the same line. If that swap would leave the
+/// cursor exactly where it started (the block is one column wide, or
+/// the cursor was already at that corner), the ends are swapped
+/// instead so `O` still does something.
+///
+/// Every other case is the plain `o` behaviour: exchange the cursor
+/// with `Visual.start`.
+///
+/// With `'selection'` "exclusive" the right edge sits one column
+/// further right, which the two `p_sel` checks account for.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curwin` must be a valid, non-null pointer
+/// to a live `WinT`. Forwarded from [`crate::plines::getvcols`] and
+/// [`crate::cursor::coladvance`]'s own safety docs.
+pub unsafe fn v_swap_corners(cmdchar: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let visual_mode = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.mode;
+
+    if cmdchar != i32::from(b'O') || visual_mode != i32::from(crate::ascii_defs::CTRL_V) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let old_cursor = unsafe { (*curwin).w_cursor };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        // SAFETY: as above.
+        unsafe { (*curwin).w_cursor = g.Visual.start };
+        g.Visual.start = old_cursor;
+        // SAFETY: as above.
+        unsafe { (*curwin).w_set_curswant = true };
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_cursor = unsafe { (*curwin).w_cursor };
+    let (mut left, mut right) = (0, 0);
+    let mut pos1 = old_cursor;
+    // SAFETY: as above.
+    let mut pos2 = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::plines::getvcols(curwin, &mut pos1, &mut pos2, &mut left, &mut right, 0) };
+
+    // SAFETY: momentary read of a plain option global.
+    let sel_exclusive = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_sel
+        .as_deref()
+        .and_then(<[u8]>::first)
+        .copied()
+        == Some(b'e');
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let visual_start_lnum = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start.lnum;
+    // SAFETY: as above.
+    unsafe { (*curwin).w_cursor.lnum = visual_start_lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::coladvance(curwin, left) };
+    // SAFETY: as above.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start = unsafe { (*curwin).w_cursor };
+
+    // SAFETY: as above.
+    unsafe {
+        (*curwin).w_cursor.lnum = old_cursor.lnum;
+        (*curwin).w_curswant = right;
+    };
+    // 'selection' "exclusive" and cursor at the right-bottom corner:
+    // move it right one column.
+    if old_cursor.lnum >= visual_start_lnum && sel_exclusive {
+        // SAFETY: as above.
+        unsafe { (*curwin).w_curswant += 1 };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::coladvance(curwin, (*curwin).w_curswant) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor = unsafe { (*curwin).w_cursor };
+    // SAFETY: as above.
+    let virt = unsafe { crate::state::virtual_active(&*curwin) };
+    if cursor.col == old_cursor.col && (!virt || cursor.coladd == old_cursor.coladd) {
+        // The swap changed nothing, so swap the ends instead.
+        // SAFETY: as above.
+        let visual_start_lnum = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start.lnum;
+        // SAFETY: as above.
+        unsafe { (*curwin).w_cursor.lnum = visual_start_lnum };
+        if old_cursor.lnum <= visual_start_lnum && sel_exclusive {
+            right += 1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(curwin, right) };
+        // SAFETY: as above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start = unsafe { (*curwin).w_cursor };
+
+        // SAFETY: as above.
+        unsafe { (*curwin).w_cursor.lnum = old_cursor.lnum };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::coladvance(curwin, left) };
+        // SAFETY: as above.
+        unsafe { (*curwin).w_curswant = left };
+    }
+}
+
 /// Rewrite a shifted cursor key in `cap` to its unshifted form
 /// (`unshift_special`).
 ///
@@ -144,6 +248,78 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- v_swap_corners ---
+
+    /// Installs `win` as curwin and seeds `Visual.start`, restoring
+    /// both on drop.
+    struct VisualGuard {
+        prev_win: *mut crate::buffer_defs::WinT,
+        prev_visual: crate::normal_defs::VisualState,
+    }
+
+    impl VisualGuard {
+        fn set(win: *mut crate::buffer_defs::WinT, start: crate::pos_defs::PosT, mode: i32) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = VisualGuard { prev_win: g.curwin, prev_visual: g.Visual };
+            g.curwin = win;
+            g.Visual.start = start;
+            g.Visual.mode = mode;
+            guard
+        }
+    }
+
+    impl Drop for VisualGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curwin = self.prev_win;
+            g.Visual = self.prev_visual;
+        }
+    }
+
+    #[test]
+    fn v_swap_corners_plain_o_exchanges_the_cursor_and_visual_start() {
+        // Cross-verified against real nvim: over a 3-line blockwise
+        // selection started at line 1, `o` moves the cursor to line 1
+        // (the opposite END of the selection).
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr: *mut crate::buffer_defs::WinT = &mut win;
+        let start = crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 };
+        let _guard = VisualGuard::set(win_ptr, start, i32::from(b'v'));
+
+        unsafe { v_swap_corners(i32::from(b'o')) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 1);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 1);
+        let vs = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start;
+        assert_eq!((vs.lnum, vs.col), (3, 3), "the old cursor becomes the start");
+        assert!(unsafe { (*win_ptr).w_set_curswant });
+    }
+
+    #[test]
+    fn v_swap_corners_uses_the_plain_swap_for_o_outside_blockwise() {
+        // Capital O only takes the corner-swapping path in blockwise
+        // mode; in charwise Visual it behaves like `o`.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr: *mut crate::buffer_defs::WinT = &mut win;
+        let start = crate::pos_defs::PosT { lnum: 2, col: 7, coladd: 0 };
+        let _guard = VisualGuard::set(win_ptr, start, i32::from(b'v'));
+
+        unsafe { v_swap_corners(i32::from(b'O')) };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 2);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 7);
+        let vs = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start;
+        assert_eq!((vs.lnum, vs.col), (5, 2));
+    }
 
     // --- unshift_special / buf_has_cstyle_comments ---
 
