@@ -157,6 +157,45 @@ pub unsafe fn clear_diffblock(dp: *mut crate::buffer_defs::DiffT) {
     drop(unsafe { Box::from_raw(dp) });
 }
 
+/// Allocate a new diff block and link it into `tp`'s chain between
+/// `dprev` and `dp` (`diff_alloc_new`).
+///
+/// `dprev` being null means the new block becomes the head of the
+/// chain. The returned pointer is a leaked `Box`, matching this
+/// module's own established ownership convention - `diff_clear`/
+/// `clear_diffblock` take it back.
+///
+/// The original's `ga_init(&dnew->df_changes, ..., 20)` sets an
+/// initial growth step on the array; this crate's `GarrayT` grows
+/// through `Vec`, which needs no such tuning, so a default array is
+/// used instead.
+///
+/// # Safety
+/// `dprev`, when non-null, must be a valid pointer to a live `DiffT`
+/// belonging to `tp`'s chain.
+pub unsafe fn diff_alloc_new(
+    tp: &mut crate::buffer_defs::TabpageT,
+    dprev: *mut crate::buffer_defs::DiffT,
+    dp: *mut crate::buffer_defs::DiffT,
+) -> *mut crate::buffer_defs::DiffT {
+    let dnew = Box::into_raw(Box::new(crate::buffer_defs::DiffT {
+        is_linematched: false,
+        df_next: dp,
+        has_changes: false,
+        df_changes: crate::garray_defs::GarrayT::default(),
+        ..Default::default()
+    }));
+
+    if dprev.is_null() {
+        tp.tp_first_diff = dnew;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*dprev).df_next = dnew };
+    }
+
+    dnew
+}
+
 /// Whether every diff block line range in `dp` fits inside its own
 /// buffer (`diff_check_sanity`).
 ///
@@ -696,6 +735,53 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- diff_alloc_new ---
+
+    #[test]
+    fn diff_alloc_new_with_no_previous_becomes_the_chain_head() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let dnew =
+            unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+
+        assert!(std::ptr::eq(tp.tp_first_diff, dnew));
+        unsafe {
+            assert!((*dnew).df_next.is_null());
+            assert!(!(*dnew).is_linematched);
+            assert!(!(*dnew).has_changes);
+        }
+
+        unsafe { diff_clear(&mut tp) };
+    }
+
+    #[test]
+    fn diff_alloc_new_links_after_the_previous_block() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let first = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let second = unsafe { diff_alloc_new(&mut tp, first, std::ptr::null_mut()) };
+
+        assert!(std::ptr::eq(tp.tp_first_diff, first), "head is unchanged");
+        unsafe {
+            assert!(std::ptr::eq((*first).df_next, second));
+            assert!((*second).df_next.is_null());
+        }
+
+        unsafe { diff_clear(&mut tp) };
+    }
+
+    #[test]
+    fn diff_alloc_new_splices_in_front_of_an_existing_block() {
+        // Insert between: dprev -> new -> dp.
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let last = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let middle = unsafe { diff_alloc_new(&mut tp, std::ptr::null_mut(), last) };
+
+        // `middle` took the head slot and points at `last`.
+        assert!(std::ptr::eq(tp.tp_first_diff, middle));
+        unsafe { assert!(std::ptr::eq((*middle).df_next, last)) };
+
+        unsafe { diff_clear(&mut tp) };
+    }
 
     // --- diff_check_sanity ---
 
