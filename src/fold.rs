@@ -1081,6 +1081,40 @@ pub unsafe fn check_closed(
     closed
 }
 
+/// Initialise the fold state of a new window (`foldInitWin`).
+///
+/// # Translation note
+/// The original is a `ga_init` sizing a `garray_T` for `fold_T` items
+/// with a growth step of 10. `w_folds` is a `Vec<FoldT>` here, whose
+/// item size and growth are the `Vec`'s own business, so this just
+/// leaves it empty - the state `ga_init` produces.
+pub fn fold_init_win(new_win: &mut WinT) {
+    new_win.w_folds = Vec::new();
+}
+
+/// Copy one window's folding state onto another (`copyFoldingState`).
+pub fn copy_folding_state(wp_from: &WinT, wp_to: &mut WinT) {
+    wp_to.w_fold_manual = wp_from.w_fold_manual;
+    wp_to.w_foldinvalid = wp_from.w_foldinvalid;
+    wp_to.w_folds = clone_fold_grow_array(&wp_from.w_folds);
+}
+
+/// Reverse the folds in `gap` between the indices `start` and `end`
+/// inclusive (`foldReverseOrder`).
+pub fn fold_reverse_order(gap: &mut [FoldT], start: usize, end: usize) {
+    if start < end && end < gap.len() {
+        gap[start..=end].reverse();
+    }
+}
+
+/// Insert a new, empty fold at index `i` in `gap` (`foldInsert`).
+///
+/// Existing folds from `i` onwards shift up to make room, which the
+/// original does with a `memmove` after `ga_grow`.
+pub fn fold_insert(gap: &mut Vec<FoldT>, i: usize) {
+    gap.insert(i.min(gap.len()), FoldT::default());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1923,6 +1957,110 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_init_win_leaves_a_new_window_with_no_folds() {
+        let mut win = WinT {
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        fold_init_win(&mut win);
+        assert!(win.w_folds.is_empty());
+    }
+
+    #[test]
+    fn copy_folding_state_deep_copies_the_folds_and_the_flags() {
+        let from = WinT {
+            w_fold_manual: true,
+            w_foldinvalid: true,
+            w_folds: nested_outer_inner(),
+            ..Default::default()
+        };
+        let mut to = WinT::default();
+
+        copy_folding_state(&from, &mut to);
+
+        assert!(to.w_fold_manual);
+        assert!(to.w_foldinvalid);
+        assert_eq!(to.w_folds, from.w_folds);
+        // The copy must be independent, including nested folds.
+        to.w_folds[0].fd_top = 999;
+        to.w_folds[0].fd_nested[0].fd_len = 999;
+        assert_eq!(from.w_folds[0].fd_top, 10);
+        assert_eq!(from.w_folds[0].fd_nested[0].fd_len, 5);
+    }
+
+    #[test]
+    fn copy_folding_state_from_a_window_with_no_folds_clears_the_target() {
+        let from = WinT::default();
+        let mut to = WinT {
+            w_fold_manual: true,
+            w_foldinvalid: true,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        copy_folding_state(&from, &mut to);
+        assert!(!to.w_fold_manual);
+        assert!(!to.w_foldinvalid);
+        assert!(to.w_folds.is_empty());
+    }
+
+    #[test]
+    fn fold_reverse_order_reverses_the_given_span_only() {
+        let mut gap = vec![
+            FoldT { fd_top: 1, ..Default::default() },
+            FoldT { fd_top: 2, ..Default::default() },
+            FoldT { fd_top: 3, ..Default::default() },
+            FoldT { fd_top: 4, ..Default::default() },
+        ];
+        fold_reverse_order(&mut gap, 1, 2);
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![1, 3, 2, 4]);
+
+        fold_reverse_order(&mut gap, 0, 3);
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![4, 2, 3, 1]);
+    }
+
+    #[test]
+    fn fold_reverse_order_is_a_noop_for_a_degenerate_span() {
+        let mut gap = sibling_folds();
+        let before: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        // start == end and start > end both leave the array alone,
+        // matching the original's `for (; start < end; ...)` guard.
+        fold_reverse_order(&mut gap, 1, 1);
+        fold_reverse_order(&mut gap, 2, 1);
+        let after: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn fold_insert_shifts_existing_folds_up() {
+        let mut gap = sibling_folds();
+        fold_insert(&mut gap, 1);
+        assert_eq!(gap.len(), 4);
+        // The new fold is empty and the old ones keep their order.
+        assert_eq!(gap[1], FoldT::default());
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![10, 0, 20, 30]);
+    }
+
+    #[test]
+    fn fold_insert_at_the_end_appends() {
+        let mut gap = sibling_folds();
+        fold_insert(&mut gap, 3);
+        assert_eq!(gap.len(), 4);
+        assert_eq!(gap[3], FoldT::default());
+        assert_eq!(gap[2].fd_top, 30);
+    }
+
+    #[test]
+    fn fold_insert_into_an_empty_array_creates_the_first_fold() {
+        let mut gap: Vec<FoldT> = Vec::new();
+        fold_insert(&mut gap, 0);
+        assert_eq!(gap.len(), 1);
+        assert!(gap[0].fd_nested.is_empty());
     }
 
     #[test]
