@@ -1996,6 +1996,67 @@ pub fn mb_utf_index_to_bytes(s: &[u8], len: usize, index: usize, use_utf16_units
     }
     -1
 }
+
+/// Byte index of the character BEFORE `p_idx` in `line`
+/// (`mb_prevptr`).
+///
+/// Returns `p_idx` unchanged when it is already at the start.
+/// Composing characters are NOT grouped here - the original's
+/// `MB_PTR_BACK` steps back one whole base character only.
+///
+/// # Safety
+/// Forwarded from [`utf_head_off`]'s own safety doc. `p_idx` must be
+/// within `line`.
+#[must_use]
+pub unsafe fn mb_prevptr(line: &[u8], p_idx: usize) -> usize {
+    if p_idx > 0 {
+        // SAFETY: forwarded from this function's own safety doc -
+        // `p_idx > 0`, so `p_idx - 1` is a valid index.
+        let off = usize::try_from(unsafe { utf_head_off(line, p_idx - 1) }).unwrap_or(0);
+        return p_idx - off - 1;
+    }
+    p_idx
+}
+
+/// Character length of `str[..len]`, each multi-byte character (with
+/// any following composing characters) counting as one
+/// (`mb_charlen_len`).
+///
+/// Unlike [`mb_charlen`] this is bounded by `len` as well as by a NUL
+/// byte, stopping at whichever comes first.
+///
+/// # Safety
+/// Forwarded from [`utfc_ptr2len`]'s own safety doc.
+#[must_use]
+pub unsafe fn mb_charlen_len(str: &[u8], len: usize) -> i32 {
+    let end = len.min(str.len());
+    let mut count = 0i32;
+    let mut p = 0usize;
+    while p < end && str[p] != crate::ascii_defs::NUL {
+        // SAFETY: forwarded from this function's own safety doc.
+        let adv = usize::try_from(unsafe { utfc_ptr2len(&str[p..]) }).unwrap_or(0).max(1);
+        p += adv;
+        count += 1;
+    }
+    count
+}
+
+/// Skip a `"2byte-"`/`"8bit-"` prefix on an encoding name, returning
+/// the byte index just past it (`enc_skip`).
+#[must_use]
+pub fn enc_skip(p: &[u8]) -> usize {
+    if p.starts_with(b"2byte-") {
+        return 6;
+    }
+    if p.starts_with(b"8bit-") {
+        return 5;
+    }
+    0
+}
+
+/// Adjust the cursor to a multi-byte character's head byte, and reset
+/// `coladd` when it sits on the right half of a double-wide character
+/// (`mb_adjust_cursor`).
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS`, with the usual "no overlapping
@@ -3443,6 +3504,57 @@ mod tests {
         assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 3, false), 3);
         assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 5, false), 5);
         assert_eq!(mb_utf_index_to_bytes(b"hello", 5, 6, false), -1);
+    }
+
+    // --- mb_prevptr / mb_charlen_len / enc_skip ---
+
+    #[test]
+    fn mb_prevptr_steps_back_one_ascii_byte() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_prevptr(b"hello", 3) }, 2);
+        assert_eq!(unsafe { mb_prevptr(b"hello", 1) }, 0);
+    }
+
+    #[test]
+    fn mb_prevptr_at_the_start_stays_put() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_prevptr(b"hello", 0) }, 0);
+    }
+
+    #[test]
+    fn mb_prevptr_steps_back_over_a_whole_multibyte_character() {
+        let _guard = option_vars_test_lock();
+        // "一二三" - three 3-byte characters, so from index 6 (the
+        // start of the third) the previous one starts at 3.
+        let s = "一二三".as_bytes();
+        assert_eq!(unsafe { mb_prevptr(s, 6) }, 3);
+        assert_eq!(unsafe { mb_prevptr(s, 3) }, 0);
+    }
+
+    #[test]
+    fn mb_charlen_len_is_bounded_by_the_given_length() {
+        let _guard = option_vars_test_lock();
+        let s = "一二三".as_bytes();
+        assert_eq!(unsafe { mb_charlen_len(s, 9) }, 3);
+        // Only the first two characters are within 6 bytes.
+        assert_eq!(unsafe { mb_charlen_len(s, 6) }, 2);
+        assert_eq!(unsafe { mb_charlen_len(s, 0) }, 0);
+    }
+
+    #[test]
+    fn mb_charlen_len_stops_at_a_nul_before_the_length() {
+        let _guard = option_vars_test_lock();
+        assert_eq!(unsafe { mb_charlen_len(b"ab\0cd", 5) }, 2);
+    }
+
+    #[test]
+    fn enc_skip_strips_the_documented_prefixes_only() {
+        assert_eq!(enc_skip(b"2byte-euc-jp"), 6);
+        assert_eq!(enc_skip(b"8bit-latin1"), 5);
+        assert_eq!(enc_skip(b"utf-8"), 0);
+        assert_eq!(enc_skip(b""), 0);
+        // A near-miss must not be stripped.
+        assert_eq!(enc_skip(b"2byte"), 0);
     }
 
     #[test]
