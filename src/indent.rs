@@ -1370,8 +1370,7 @@ pub unsafe fn f_shiftwidth(
 /// indent value for this specific, discrete, opt-in configuration
 /// (the caller must explicitly set `'breakindentopt'` to include
 /// `"list"` - not a value reachable through ordinary use), this
-/// `unimplemented!()`s there instead - matching `window.rs`'s
-/// `win_fdccol_count` precedent for `'foldcolumn'=auto`. Every other
+/// `unimplemented!()`s there instead. Every other
 /// case (the common, default configuration) is fully correct.
 ///
 /// # Safety

@@ -4,8 +4,7 @@
 //! lines) - almost entirely dependent on window creation/splitting/
 //! closing machinery and the display pipeline, not attempted here.
 //! Translated: `win_fdccol_count` (needed by `move.c`'s window-column-
-//! offset calculations, with one narrow, explicit gap - see its own
-//! doc comment); `valid_tabpage` (walks the real
+//! offset calculations, including the `'foldcolumn'=auto` forms); `valid_tabpage` (walks the real
 //! `GLOBALS.first_tabpage`/`tp_next` linked list, matching `undo.rs`'s
 //! `any_buf_is_changed`/`firstbuf`/`b_next` walk precedent);
 //! `is_bottom_win` (walks the real `WinT.w_frame`/`FrameT.fr_parent`
@@ -874,24 +873,30 @@ pub unsafe fn get_winnr(tp: *const crate::buffer_defs::TabpageT, arg: Option<&[u
 /// Return the width, in columns, of `wp`'s `'foldcolumn'`
 /// (`win_fdccol_count`).
 ///
-/// # Panics
-/// The original supports `'foldcolumn'` set to `"auto"`/`"auto:N"`,
-/// which needs `fold.c`'s real `getDeepestNesting` (walking the actual
-/// fold-nesting data structure, not yet translated) to compute how
-/// many columns are actually needed. That specific case is not
-/// silently approximated (which would produce a genuinely wrong
-/// column count, unlike e.g. `mf_write`'s omitted message displays,
-/// which never affect state) - it panics instead, loudly, exactly
-/// where the real gap is. The common, default case (`'foldcolumn'`
-/// set to a plain digit, `"0"`..`"9"`) is fully supported.
+/// `'foldcolumn'` is either a plain digit (`"0"`..`"9"`), used as-is,
+/// or `"auto"`/`"auto:N"`, which caps the requested width (`N`, or
+/// `1` for a bare `"auto"`) at the depth actually needed by the
+/// window's fold nesting.
+///
+/// # Safety
+/// For the `"auto"` forms this reaches
+/// [`crate::fold::get_deepest_nesting`], so `wp` must satisfy that
+/// function's own requirements (in particular a valid `w_buffer`,
+/// since recomputing invalid folds reads the buffer).
 #[must_use]
-pub fn win_fdccol_count(wp: &WinT) -> i32 {
-    let fdc = wp.w_onebuf_opt.wo_fdc.as_deref().unwrap_or(b"0");
+pub unsafe fn win_fdccol_count(wp: &mut WinT) -> i32 {
+    let fdc = wp.w_onebuf_opt.wo_fdc.clone().unwrap_or_else(|| b"0".to_vec());
 
+    // auto:<NUM>
     if fdc.starts_with(b"auto") {
-        unimplemented!(
-            "'foldcolumn'=auto needs fold.c's real getDeepestNesting, not yet translated"
-        );
+        let fdccol = if fdc.get(4) == Some(&b':') {
+            i32::from(fdc.get(5).copied().unwrap_or(b'0')) - i32::from(b'0')
+        } else {
+            1
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        let needed_fdccols = unsafe { crate::fold::get_deepest_nesting(wp) };
+        return fdccol.min(needed_fdccols);
     }
 
     i32::from(fdc.first().copied().unwrap_or(b'0')) - i32::from(b'0')
@@ -3366,23 +3371,52 @@ mod tests {
 
     #[test]
     fn win_fdccol_count_defaults_to_zero_when_unset() {
-        let win = WinT::default();
-        assert_eq!(win_fdccol_count(&win), 0);
+        let mut win = WinT::default();
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 0);
     }
 
     #[test]
     fn win_fdccol_count_reads_the_configured_digit() {
         let mut win = WinT::default();
         win.w_onebuf_opt.wo_fdc = Some(b"3".to_vec());
-        assert_eq!(win_fdccol_count(&win), 3);
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 3);
     }
 
     #[test]
-    #[should_panic(expected = "getDeepestNesting")]
-    fn win_fdccol_count_auto_panics_with_a_clear_message() {
-        let mut win = WinT::default();
+    fn win_fdccol_count_auto_is_capped_by_the_real_fold_nesting() {
+        // A bare "auto" asks for 1 column, but the cap is the actual
+        // nesting depth - with no folds at all that is 0.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT { w_buffer: &mut buf, ..Default::default() };
         win.w_onebuf_opt.wo_fdc = Some(b"auto".to_vec());
-        let _ = win_fdccol_count(&win);
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 0);
+    }
+
+    #[test]
+    fn win_fdccol_count_auto_grants_one_column_for_a_single_fold_level() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT { w_buffer: &mut buf, ..Default::default() };
+        win.w_onebuf_opt.wo_fdc = Some(b"auto".to_vec());
+        win.w_folds = vec![crate::fold::FoldT { fd_top: 1, fd_len: 3, ..Default::default() }];
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 1);
+    }
+
+    #[test]
+    fn win_fdccol_count_auto_n_caps_the_requested_width_at_the_nesting_depth() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = WinT { w_buffer: &mut buf, ..Default::default() };
+        // Two levels of nesting, so "auto:5" is capped down to 2
+        // while "auto:1" stays at its own smaller request.
+        win.w_folds = vec![crate::fold::FoldT {
+            fd_top: 1,
+            fd_len: 9,
+            fd_nested: vec![crate::fold::FoldT { fd_top: 1, fd_len: 3, ..Default::default() }],
+            ..Default::default()
+        }];
+        win.w_onebuf_opt.wo_fdc = Some(b"auto:5".to_vec());
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 2);
+        win.w_onebuf_opt.wo_fdc = Some(b"auto:1".to_vec());
+        assert_eq!(unsafe { win_fdccol_count(&mut win) }, 1);
     }
 
     /// Points `GLOBALS.first_tabpage` at `head` for the guard's

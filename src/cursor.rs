@@ -65,8 +65,7 @@
 //! that DOESN'T hit that inner branch (i.e. whenever `'virtualedit'`
 //! is unset, the overwhelmingly common case) - matches this crate's
 //! established "narrow, discrete, opt-in configuration branch" `unimplemented!()`
-//! precedent (`window.rs`'s `win_fdccol_count`, `indent.rs`'s
-//! `get_breakindent_win`).
+//! precedent (`indent.rs`'s `get_breakindent_win`).
 //!
 //! **`check_cursor_col`** itself (unlike `check_cursor`, its combo
 //! caller) turned out to need NO fold.c dependency at all - re-read

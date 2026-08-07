@@ -190,7 +190,8 @@ pub unsafe fn win_col_off(wp: &mut WinT) -> i32 {
         0
     };
 
-    num_part + crate::window::win_fdccol_count(wp) + wp.w_scwidth * SIGN_WIDTH
+    // SAFETY: forwarded from this function's own safety doc.
+    num_part + unsafe { crate::window::win_fdccol_count(wp) } + wp.w_scwidth * SIGN_WIDTH
 }
 
 /// Return the difference in column offset for the second screen line

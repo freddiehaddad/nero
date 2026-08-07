@@ -282,14 +282,15 @@ pub unsafe fn comp_textwidth(ff: bool) -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     let curbuf = unsafe { &*g.curbuf };
     // SAFETY: forwarded from this function's own safety doc.
-    let curwin = unsafe { &*g.curwin };
+    let curwin = unsafe { &mut *g.curwin };
 
     let mut textwidth = curbuf.b_p_tw as i32;
     if textwidth == 0 && curbuf.b_p_wm != 0 {
         // The width is the window width minus 'wrapmargin' minus all
         // the things that add to the margin.
         textwidth = curwin.w_view_width - curbuf.b_p_wm as i32;
-        textwidth -= crate::window::win_fdccol_count(curwin);
+        // SAFETY: forwarded from this function's own safety doc.
+        textwidth -= unsafe { crate::window::win_fdccol_count(curwin) };
         textwidth -= curwin.w_scwidth;
 
         if curwin.w_onebuf_opt.wo_nu != 0 || curwin.w_onebuf_opt.wo_rnu != 0 {

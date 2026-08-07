@@ -19,9 +19,8 @@
 //! `hasAnyFolding`/`w_foldinvalid` indicate folds might genuinely
 //! exist) is `unimplemented!()`, matching this crate's established
 //! "narrow, discrete, opt-in configuration branch" precedent
-//! (`window.rs`'s `win_fdccol_count`, `indent.rs`'s
-//! `get_breakindent_win`, `cursor.rs`'s `coladvance2` virtualedit
-//! branch) - genuinely reachable only by a session that has actually
+//! (`indent.rs`'s `get_breakindent_win`, `cursor.rs`'s `coladvance2`
+//! virtualedit branch) - genuinely reachable only by a session that has actually
 //! created a fold, which nothing in this crate can currently do
 //! (fold-creation itself needs `foldUpdate`/`setManualFold`/etc., none
 //! translated). `has_folding_win`/`has_folding` carry their full,
