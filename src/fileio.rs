@@ -170,6 +170,82 @@ pub unsafe fn get_fio_flags(name: &[u8]) -> i32 {
     0
 }
 
+/// Detect a byte-order mark at the start of `p` (`check_for_bom`).
+///
+/// Returns `Some((encoding_name, bom_len))` when the leading bytes
+/// are a BOM that is compatible with `flags` (the `FIO_*` set already
+/// chosen for this read), otherwise `None`.
+///
+/// `flags` genuinely narrows the result rather than merely filtering:
+/// the same `FF FE` prefix reports `"ucs-2le"`, `"utf-16le"` or
+/// nothing at all depending on it, and `utf-16` is preferred over
+/// `ucs-2` for a bare `FE FF` because it also handles ucs-2 text.
+///
+/// The original takes `int *lenp` as an out-parameter and returns the
+/// name separately; the length rides along in the returned tuple
+/// here. It also relies on `p[1]` being readable whenever `p[0]` is;
+/// this checks the slice length explicitly instead.
+#[must_use]
+pub fn check_for_bom(p: &[u8], size: i32, flags: i32) -> Option<(&'static [u8], i32)> {
+    if p.len() < 2 {
+        return None;
+    }
+
+    if p[0] == 0xef
+        && p[1] == 0xbb
+        && size >= 3
+        && p.len() >= 3
+        && p[2] == 0xbf
+        && (flags == fio::FIO_ALL || flags == fio::FIO_UTF8 || flags == 0)
+    {
+        return Some((b"utf-8", 3)); // EF BB BF
+    }
+
+    if p[0] == 0xff && p[1] == 0xfe {
+        if size >= 4
+            && p.len() >= 4
+            && p[2] == 0
+            && p[3] == 0
+            && (flags == fio::FIO_ALL || flags == (fio::FIO_UCS4 | fio::FIO_ENDIAN_L))
+        {
+            return Some((b"ucs-4le", 4)); // FF FE 00 00
+        }
+        if flags == (fio::FIO_UCS2 | fio::FIO_ENDIAN_L) {
+            return Some((b"ucs-2le", 2)); // FF FE
+        }
+        if flags == fio::FIO_ALL || flags == (fio::FIO_UTF16 | fio::FIO_ENDIAN_L) {
+            // utf-16le is preferred, it also works for ucs-2le text.
+            return Some((b"utf-16le", 2)); // FF FE
+        }
+        return None;
+    }
+
+    if p[0] == 0xfe
+        && p[1] == 0xff
+        && (flags == fio::FIO_ALL || flags == fio::FIO_UCS2 || flags == fio::FIO_UTF16)
+    {
+        // Default to utf-16, it works also for ucs-2 text.
+        return Some(if flags == fio::FIO_UCS2 {
+            (b"ucs-2", 2) // FE FF
+        } else {
+            (b"utf-16", 2) // FE FF
+        });
+    }
+
+    if size >= 4
+        && p.len() >= 4
+        && p[0] == 0
+        && p[1] == 0
+        && p[2] == 0xfe
+        && p[3] == 0xff
+        && (flags == fio::FIO_ALL || flags == fio::FIO_UCS4)
+    {
+        return Some((b"ucs-4", 4)); // 00 00 FE FF
+    }
+
+    None
+}
+
 /// Convert a Unicode character to bytes, appending them to `out`
 /// (`ucs2bytes`). Returns `true` for an error, `false` when it's OK -
 /// the original's own in-out `char **pp` pointer is replaced by
@@ -369,6 +445,87 @@ mod tests {
         let result = unsafe { get_fio_flags(b"") };
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
         assert_eq!(result, fio::FIO_UTF8);
+    }
+
+    // --- check_for_bom ---
+
+    #[test]
+    fn check_for_bom_detects_a_utf8_bom() {
+        // Cross-verified against real nvim: a file starting EF BB BF
+        // is opened with 'fileencoding' utf-8 and 'bomb' set.
+        let p = [0xEF, 0xBB, 0xBF, b'h', b'i'];
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_ALL),
+            Some((&b"utf-8"[..], 3))
+        );
+    }
+
+    #[test]
+    fn check_for_bom_prefers_utf16le_over_ucs2le_for_ff_fe() {
+        // Cross-verified against real nvim: a FF FE file reports
+        // 'fileencoding' utf-16le, not ucs-2le.
+        let p = [0xFF, 0xFE, b'h', 0];
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_ALL),
+            Some((&b"utf-16le"[..], 2))
+        );
+    }
+
+    #[test]
+    fn check_for_bom_ff_fe_narrows_by_flags() {
+        // The same prefix reports different encodings - the flags
+        // genuinely select, they do not merely filter.
+        let p = [0xFF, 0xFE, b'h', 0];
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_UCS2 | fio::FIO_ENDIAN_L),
+            Some((&b"ucs-2le"[..], 2))
+        );
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_UTF8),
+            None,
+            "incompatible flags reject the BOM entirely"
+        );
+    }
+
+    #[test]
+    fn check_for_bom_ff_fe_00_00_is_ucs4le_when_long_enough() {
+        let p = [0xFF, 0xFE, 0x00, 0x00];
+        assert_eq!(
+            check_for_bom(&p, 4, fio::FIO_ALL),
+            Some((&b"ucs-4le"[..], 4))
+        );
+        // With only two bytes available it falls back to utf-16le.
+        assert_eq!(
+            check_for_bom(&p, 2, fio::FIO_ALL),
+            Some((&b"utf-16le"[..], 2))
+        );
+    }
+
+    #[test]
+    fn check_for_bom_detects_the_big_endian_forms() {
+        // Cross-verified against real nvim: a FE FF file reports
+        // 'fileencoding' utf-16.
+        let p = [0xFE, 0xFF, 0, b'h'];
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_ALL),
+            Some((&b"utf-16"[..], 2))
+        );
+        assert_eq!(
+            check_for_bom(&p, p.len() as i32, fio::FIO_UCS2),
+            Some((&b"ucs-2"[..], 2))
+        );
+
+        let q = [0x00, 0x00, 0xFE, 0xFF];
+        assert_eq!(check_for_bom(&q, 4, fio::FIO_ALL), Some((&b"ucs-4"[..], 4)));
+    }
+
+    #[test]
+    fn check_for_bom_rejects_plain_text_and_short_input() {
+        assert_eq!(check_for_bom(b"hello", 5, fio::FIO_ALL), None);
+        // The original reads p[1] unconditionally; this checks the
+        // slice length instead of relying on the caller.
+        assert_eq!(check_for_bom(&[0xEF], 1, fio::FIO_ALL), None);
+        assert_eq!(check_for_bom(b"", 0, fio::FIO_ALL), None);
     }
 
     #[test]
