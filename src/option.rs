@@ -6480,6 +6480,55 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the new global `'undolevels'` option value
+/// (`did_set_global_undolevels`).
+///
+/// The undo state is synced with the OLD value still installed, then
+/// the new one is applied. Doing it the other way round would let
+/// `u_sync` misjudge how much history to keep.
+///
+/// # Safety
+/// Forwarded from [`crate::undo::u_sync`]'s own safety doc; also
+/// mutates `crate::option_vars::OPTION_VARS`.
+pub unsafe fn did_set_global_undolevels(
+    value: crate::types_defs::OptInt,
+    old_value: crate::types_defs::OptInt,
+) -> Option<&'static [u8]> {
+    // Sync undo before 'undolevels' changes; use the old value,
+    // otherwise u_sync() may not work properly.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = old_value;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::undo::u_sync(true) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = value;
+    None
+}
+
+/// Process the new buffer-local `'undolevels'` option value
+/// (`did_set_buflocal_undolevels`).
+///
+/// The buffer-local mirror of [`did_set_global_undolevels`]; see its
+/// doc comment for why the old value is installed first.
+///
+/// # Safety
+/// `buf` must be a valid, non-null pointer to a live `BufT` for the
+/// whole call. Also forwarded from [`crate::undo::u_sync`]'s own
+/// safety doc.
+pub unsafe fn did_set_buflocal_undolevels(
+    buf: *mut crate::buffer_defs::BufT,
+    value: crate::types_defs::OptInt,
+    old_value: crate::types_defs::OptInt,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).b_p_ul = old_value };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::undo::u_sync(true) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf).b_p_ul = value };
+    None
+}
+
 /// Process the updated `'langnoremap'` option value
 /// (`did_set_langnoremap`).
 ///
@@ -7048,6 +7097,62 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn did_set_global_undolevels_ends_with_the_new_value() {
+        // The OLD value is installed while u_sync runs, then the new
+        // one is applied - so the observable end state is the new
+        // value, but the sync sees the old one.
+        //
+        // u_sync dereferences GLOBALS.curbuf, so a real buffer must be
+        // installed BEFORE the call (and restored after).
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ul = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul;
+        let prev_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let mut curbuf = crate::buffer_defs::BufT { b_u_synced: true, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut curbuf;
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = 85;
+        assert_eq!(unsafe { did_set_global_undolevels(100, 85) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul, 100);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_buf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = prev_ul;
+    }
+
+    #[test]
+    fn did_set_buflocal_undolevels_ends_with_the_new_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let mut curbuf = crate::buffer_defs::BufT { b_u_synced: true, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut curbuf;
+
+        let mut buf = crate::buffer_defs::BufT { b_p_ul: 85, ..Default::default() };
+        assert_eq!(unsafe { did_set_buflocal_undolevels(&mut buf, 50, 85) }, None);
+        assert_eq!(buf.b_p_ul, 50);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_buf;
+    }
+
+    #[test]
+    fn did_set_buflocal_undolevels_does_not_touch_the_global_value() {
+        // Cross-verified against real nvim: :setlocal undolevels=50
+        // leaves &g:undolevels at its own value.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_ul = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul;
+        let prev_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        let mut curbuf = crate::buffer_defs::BufT { b_u_synced: true, ..Default::default() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut curbuf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = 100;
+
+        let mut buf = crate::buffer_defs::BufT { b_p_ul: 85, ..Default::default() };
+        assert_eq!(unsafe { did_set_buflocal_undolevels(&mut buf, 50, 85) }, None);
+        assert_eq!(buf.b_p_ul, 50);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul, 100);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_buf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ul = prev_ul;
     }
 
     #[test]
