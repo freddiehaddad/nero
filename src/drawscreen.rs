@@ -345,6 +345,27 @@ pub unsafe fn redraw_buf_range_later(buf: *mut BufT, first: LinenrT, last: Linen
     }
 }
 
+/// Clamp `Rows`/`Columns` to a usable range (`check_screensize`).
+///
+/// The lower bounds keep room for one window plus the command line
+/// (and, for columns, the minimum usable width); the upper bounds
+/// exist to avoid an overflow in `Rows * Columns`.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS`, and forwards
+/// [`crate::window::min_rows_for_all_tabpages`]'s own safety doc.
+pub unsafe fn check_screensize() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let min_rows = unsafe { crate::window::min_rows_for_all_tabpages() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // Deliberately max-then-min rather than clamp: the original's own
+    // MIN(MAX(Rows, min_rows), 1000) yields 1000 when min_rows
+    // exceeds it, whereas clamp would panic on the inverted bounds.
+    g.Rows = g.Rows.max(min_rows).min(1000);
+    g.Columns = g.Columns.clamp(crate::window::MIN_COLUMNS, 10000);
+}
+
 /// Columns needed by the standard ruler (`COL_RULER`).
 const COL_RULER: i32 = 17;
 /// Compute columns for the ruler and shown-command areas. `sc_col` is
@@ -945,6 +966,66 @@ mod tests {
         ov.p_ru = 0;
         ov.p_sc = 0;
         ov.p_sloc = None;
+    }
+
+    // --- check_screensize ---
+
+    #[test]
+    fn check_screensize_raises_values_below_the_minimums() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, pc, pf) = (g.Rows, g.Columns, g.firstwin);
+        g.Rows = 0;
+        g.Columns = 1;
+        // A null firstwin makes min_rows_for_all_tabpages answer
+        // MIN_LINES ("not initialized yet").
+        g.firstwin = std::ptr::null_mut();
+
+        unsafe { check_screensize() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Rows, crate::window::MIN_LINES);
+        assert_eq!(g.Columns, crate::window::MIN_COLUMNS);
+        g.Rows = pr;
+        g.Columns = pc;
+        g.firstwin = pf;
+    }
+
+    #[test]
+    fn check_screensize_clamps_values_above_the_overflow_ceilings() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, pc, pf) = (g.Rows, g.Columns, g.firstwin);
+        g.Rows = 99_999;
+        g.Columns = 99_999;
+        g.firstwin = std::ptr::null_mut();
+
+        unsafe { check_screensize() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Rows, 1000);
+        assert_eq!(g.Columns, 10_000);
+        g.Rows = pr;
+        g.Columns = pc;
+        g.firstwin = pf;
+    }
+
+    #[test]
+    fn check_screensize_leaves_an_in_range_size_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, pc, pf) = (g.Rows, g.Columns, g.firstwin);
+        g.Rows = 24;
+        g.Columns = 80;
+        g.firstwin = std::ptr::null_mut();
+
+        unsafe { check_screensize() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!((g.Rows, g.Columns), (24, 80));
+        g.Rows = pr;
+        g.Columns = pc;
+        g.firstwin = pf;
     }
 
     #[test]
