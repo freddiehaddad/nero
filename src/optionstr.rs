@@ -1571,9 +1571,10 @@ pub unsafe fn did_set_vartabstop(args: &mut crate::option_defs::OptsetT) -> Opti
         Ok(array) => {
             buf.b_p_vts_array = array;
             if crate::fold::foldmethod_is_indent(win) {
-                unimplemented!(
-                    "did_set_vartabstop: foldUpdateAll - real fold-tree update machinery, not translated"
-                );
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::fold::fold_update_all(args.os_win as *mut crate::buffer_defs::WinT)
+                };
             }
             None
         }
@@ -2553,7 +2554,7 @@ pub unsafe fn did_set_optexpr(args: &mut crate::option_defs::OptsetT) -> Option<
 /// for the whole call. `args.os_varp` must point to a live, WRITABLE
 /// `Option<Vec<u8>>` (forwarded from [`did_set_optexpr`]).
 pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
-    let win_ptr = args.os_win as *const crate::buffer_defs::WinT;
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
 
     // The original discards this return value; `did_set_optexpr`
     // never fails, so nothing is lost.
@@ -2562,9 +2563,8 @@ pub unsafe fn did_set_foldexpr(args: &mut crate::option_defs::OptsetT) -> Option
 
     // SAFETY: forwarded from this function's own safety doc.
     if crate::fold::foldmethod_is_expr(unsafe { &*win_ptr }) {
-        unimplemented!(
-            "did_set_foldexpr: foldUpdateAll - real fold-tree update machinery, not translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_update_all(win_ptr) };
     }
 
     None
@@ -2960,12 +2960,11 @@ pub fn did_set_breakat() -> Option<&'static [u8]> {
 /// `args.os_win` must be a valid, non-null pointer to a live `WinT`
 /// for the whole call.
 pub unsafe fn did_set_foldignore(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
     // SAFETY: forwarded from this function's own safety doc.
-    let win = unsafe { &*(args.os_win as *const crate::buffer_defs::WinT) };
-    if crate::fold::foldmethod_is_indent(win) {
-        unimplemented!(
-            "did_set_foldignore: foldUpdateAll - real fold-tree update machinery, not translated"
-        );
+    if crate::fold::foldmethod_is_indent(unsafe { &*win_ptr }) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_update_all(win_ptr) };
     }
     None
 }
@@ -3000,9 +2999,8 @@ pub unsafe fn did_set_foldmarker(args: &mut crate::option_defs::OptsetT) -> Opti
     }
 
     if crate::fold::foldmethod_is_marker(win) {
-        unimplemented!(
-            "did_set_foldmarker: foldUpdateAll - real fold-tree update machinery, not translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_update_all(args.os_win as *mut crate::buffer_defs::WinT) };
     }
 
     None
@@ -5326,7 +5324,7 @@ mod tests {
     #[test]
     fn did_set_foldignore_is_a_no_op_for_a_non_indent_foldmethod() {
         // Default 'foldmethod' is "manual", so foldmethod_is_indent is
-        // false and the unimplemented!() branch is never reached.
+        // false and the fold-update branch is never reached.
         let mut win = crate::buffer_defs::WinT::default();
         let mut val: Option<Vec<u8>> = Some(b"#".to_vec());
         let mut args = fold_args(&mut win, &mut val);
@@ -5342,13 +5340,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdateAll")]
-    fn did_set_foldignore_panics_when_foldmethod_is_indent() {
+    fn did_set_foldignore_invalidates_the_folds_when_foldmethod_is_indent() {
         let mut win = crate::buffer_defs::WinT::default();
         win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
         let mut val: Option<Vec<u8>> = Some(b"#".to_vec());
         let mut args = fold_args(&mut win, &mut val);
-        let _ = unsafe { did_set_foldignore(&mut args) };
+        assert_eq!(unsafe { did_set_foldignore(&mut args) }, None);
+        assert!(win.w_foldinvalid, "foldUpdateAll ran");
     }
 
     #[test]
@@ -5403,13 +5401,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdateAll")]
-    fn did_set_foldmarker_panics_when_foldmethod_is_marker() {
+    fn did_set_foldmarker_invalidates_the_folds_when_foldmethod_is_marker() {
         let mut win = crate::buffer_defs::WinT::default();
         win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
         let mut val: Option<Vec<u8>> = Some(b"{{{,}}}".to_vec());
         let mut args = fold_args(&mut win, &mut val);
-        let _ = unsafe { did_set_foldmarker(&mut args) };
+        assert_eq!(unsafe { did_set_foldmarker(&mut args) }, None);
+        assert!(win.w_foldinvalid, "foldUpdateAll ran");
     }
 
     #[test]
@@ -7436,8 +7434,8 @@ mod tests {
 
     #[test]
     fn did_set_foldexpr_is_a_no_op_for_a_non_expr_foldmethod() {
-        // Default 'foldmethod' is "manual", so the unimplemented!()
-        // fold-update branch is never reached.
+        // Default 'foldmethod' is "manual", so the fold-update branch
+        // is never reached.
         let _lock = crate::globals::global_state_test_lock();
         let mut win = crate::buffer_defs::WinT::default();
         let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
@@ -7462,13 +7460,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdateAll")]
-    fn did_set_foldexpr_panics_when_foldmethod_is_expr() {
+    fn did_set_foldexpr_invalidates_the_folds_when_foldmethod_is_expr() {
+        let _lock = crate::globals::global_state_test_lock();
         let mut win = crate::buffer_defs::WinT::default();
         win.w_onebuf_opt.wo_fdm = Some(b"expr".to_vec());
         let mut val: Option<Vec<u8>> = Some(b"MyFunc()".to_vec());
         let mut args = foldexpr_args(&mut win, &mut val);
-        let _ = unsafe { did_set_foldexpr(&mut args) };
+        assert_eq!(unsafe { did_set_foldexpr(&mut args) }, None);
+        assert!(win.w_foldinvalid, "foldUpdateAll ran");
     }
 
     // ---- did_set_winbar / did_set_tabline / did_set_statuscolumn ----
@@ -8326,7 +8325,7 @@ mod tests {
     fn did_set_vartabstop_valid_list_sets_the_array_without_fold_update() {
         let mut buf = crate::buffer_defs::BufT::default();
         // Default 'foldmethod' ("manual") means foldmethod_is_indent
-        // is false, so the unimplemented!() fold-update branch is
+        // is false, so the fold-update branch is
         // never reached.
         let mut win = crate::buffer_defs::WinT::default();
         let mut val: Option<Vec<u8>> = Some(b"4,8".to_vec());
@@ -8345,13 +8344,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdateAll")]
-    fn did_set_vartabstop_panics_when_foldmethod_is_indent() {
+    fn did_set_vartabstop_invalidates_the_folds_when_foldmethod_is_indent() {
         let mut buf = crate::buffer_defs::BufT::default();
         let mut win = crate::buffer_defs::WinT::default();
         win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
         let mut val: Option<Vec<u8>> = Some(b"4,8".to_vec());
         let mut args = vartabstop_args(&mut buf, &mut win, &mut val);
-        let _ = unsafe { did_set_vartabstop(&mut args) };
+        assert_eq!(unsafe { did_set_vartabstop(&mut args) }, None);
+        assert_eq!(buf.b_p_vts_array, Some(vec![4, 8]), "the array still lands");
+        assert!(win.w_foldinvalid, "foldUpdateAll ran");
     }
 }
