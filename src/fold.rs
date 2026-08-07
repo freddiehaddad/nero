@@ -205,10 +205,14 @@ pub unsafe fn fold_update(wp: &mut WinT, top: crate::pos_defs::LinenrT, bot: cra
     if !wp.w_folds.is_empty() {
         // Mark all folds from top to bot (or bot to top) as
         // maybe-small.
-        unimplemented!(
-            "marking folds maybe-small needs foldFind, not yet translated; \
-             unreachable while no fold can be created"
-        );
+        let maybe_small_start = top.min(bot);
+        let maybe_small_end = top.max(bot);
+
+        let (_, mut i) = fold_find(&wp.w_folds, maybe_small_start);
+        while i < wp.w_folds.len() && wp.w_folds[i].fd_top <= maybe_small_end {
+            wp.w_folds[i].fd_small = crate::types_defs::TriState::None;
+            i += 1;
+        }
     }
 
     if foldmethod_is_indent(wp)
@@ -217,13 +221,18 @@ pub unsafe fn fold_update(wp: &mut WinT, top: crate::pos_defs::LinenrT, bot: cra
         || foldmethod_is_diff(wp)
         || foldmethod_is_syntax(wp)
     {
-        unimplemented!(
-            "foldUpdateIEMS is not yet translated; unreachable while 'foldmethod' \
-             cannot be set away from its real default of \"manual\""
-        );
-    }
+        // SAFETY: reads/writes the got_int global, matching the
+        // original's own save-and-reset around the update.
+        let save_got_int = unsafe { crate::globals::GLOBALS.get_mut() }.got_int;
 
-    let _ = (top, bot);
+        // Reset got_int here, otherwise the update won't run.
+        // SAFETY: as above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.got_int = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { fold_update_iems(wp, top, bot) };
+        // SAFETY: as above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.got_int = save_got_int;
+    }
 }
 
 /// Returns `true` if creating/deleting a manual fold is allowed with
@@ -261,19 +270,18 @@ pub unsafe fn has_any_folding(win: &WinT) -> bool {
 /// Update the fold information, and re-calculate what needs to be
 /// displayed (`checkupdate`).
 ///
-/// The real `foldUpdate` recomputation (needed whenever
-/// `win.w_foldinvalid` is true - i.e. a fold was created/invalidated
-/// since the last update) is `unimplemented!()`: nothing in this crate
-/// can currently set `w_foldinvalid` to true (no fold-creation
-/// function is translated yet), so every real caller of this function
-/// today only ever observes the already-valid (no-op) case.
-pub fn checkupdate(wp: &mut WinT) {
+/// # Safety
+/// Same as [`fold_update`].
+pub unsafe fn checkupdate(wp: &mut WinT) {
     if !wp.w_foldinvalid {
         return;
     }
-    unimplemented!(
-        "fold::checkupdate: foldUpdate (the real fold-tree recomputation) is not yet translated"
-    );
+
+    let wp_ptr: *mut WinT = wp;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_update(&mut *wp_ptr, 1, crate::pos_defs::MAXLNUM) }; // will update all
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp_ptr).w_foldinvalid = false };
 }
 
 /// Search folds starting at `lnum` (`hasFoldingWin`).
@@ -301,7 +309,8 @@ pub unsafe fn has_folding_win(
     cache: bool,
     infop: Option<&mut crate::fold_defs::FoldinfoT>,
 ) -> bool {
-    checkupdate(win);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(win) };
 
     // Return quickly when there is no folding at all in this window.
     // SAFETY: forwarded from this function's own safety doc.
@@ -490,7 +499,8 @@ pub unsafe fn line_folded(win: &mut WinT, lnum: crate::pos_defs::LinenrT) -> boo
 /// Same as [`has_any_folding`].
 #[must_use]
 pub unsafe fn fold_level(wp: &mut WinT, lnum: crate::pos_defs::LinenrT) -> i32 {
-    checkupdate(wp);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(wp) };
 
     // Return quickly when there is no folding at all in this window.
     // SAFETY: forwarded from this function's own safety doc.
@@ -529,7 +539,8 @@ pub fn find_wl_entry(win: &WinT, lnum: crate::pos_defs::LinenrT) -> Option<usize
 /// Same as [`has_any_folding`].
 #[must_use]
 pub unsafe fn get_deepest_nesting(wp: &mut WinT) -> i32 {
-    checkupdate(wp);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(wp) };
     get_deepest_nesting_recurse(&wp.w_folds)
 }
 
@@ -1179,7 +1190,8 @@ pub unsafe fn fold_check_close() {
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     // SAFETY: forwarded from this function's own safety doc.
     let win = unsafe { &mut *curwin };
-    checkupdate(win);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(win) };
 
     let lnum = win.w_cursor.lnum;
     let level = win.w_onebuf_opt.wo_fdl as i32;
@@ -1394,7 +1406,8 @@ pub unsafe fn fold_update_all(win: *mut WinT) {
 pub unsafe fn new_fold_level_win(wp: *mut WinT) {
     // SAFETY: forwarded from this function's own safety doc.
     let win = unsafe { &mut *wp };
-    checkupdate(win);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(win) };
     if win.w_fold_manual {
         // Set all flags for the first level of folds to FD_LEVEL.
         for fp in &mut win.w_folds {
@@ -1548,7 +1561,8 @@ pub unsafe fn set_manual_fold_win(
     let mut off = 0;
     let mut done = done::DONE_NOTHING;
 
-    checkupdate(win);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(win) };
 
     // Find the fold, open or close it.
     loop {
@@ -1751,7 +1765,8 @@ pub unsafe fn fold_open_cursor() {
     // SAFETY: forwarded from this function's own safety doc.
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     // SAFETY: forwarded from this function's own safety doc.
-    checkupdate(unsafe { &mut *curwin });
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(&mut *curwin) };
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { has_any_folding(&*curwin) } {
         loop {
@@ -2132,7 +2147,8 @@ pub unsafe fn fold_move_to(updown: bool, dir: crate::vim_defs::Direction, count:
     // SAFETY: forwarded from this function's own safety doc.
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     // SAFETY: forwarded from this function's own safety doc.
-    checkupdate(unsafe { &mut *curwin });
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(&mut *curwin) };
 
     // Repeat "count" times.
     for _ in 0..count {
@@ -2479,7 +2495,8 @@ pub unsafe fn fold_create(
     }
 
     // SAFETY: forwarded from this function's own safety doc.
-    checkupdate(unsafe { &mut *wp });
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(&mut *wp) };
     // SAFETY: forwarded from this function's own safety doc.
     let fdl = unsafe { (*wp).w_onebuf_opt.wo_fdl };
 
@@ -2617,7 +2634,8 @@ pub unsafe fn delete_fold(
     let mut last_lnum = 0;
 
     // SAFETY: forwarded from this function's own safety doc.
-    checkupdate(unsafe { &mut *wp });
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { checkupdate(&mut *wp) };
     // SAFETY: forwarded from this function's own safety doc.
     let is_manual = unsafe { foldmethod_is_manual(&*wp) };
 
@@ -4002,14 +4020,75 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdateIEMS")]
-    fn fold_update_dispatch_is_unreachable_but_documented() {
-        // Proves the dispatch guard really is driven by 'foldmethod'
-        // rather than hardcoded away: forcing a value nothing in this
-        // crate can currently produce reaches the deferred branch.
+    fn fold_update_dispatches_to_the_real_recomputation() {
+        // NOTE: no explicit `global_state_test_lock()` here -
+        // `FoldUpdateGuard::set()` acquires it internally and holds it
+        // for its whole lifetime; taking it twice would deadlock.
+        // The dispatch guard really is driven by 'foldmethod': with
+        // "indent" it now runs the recomputation rather than stopping
+        // at a deferred boundary.
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        let win_ptr: *mut WinT = &mut *win;
         let _guard = FoldUpdateGuard::set();
-        let mut win = win_with_fdm(b"indent");
-        unsafe { fold_update(&mut win, 1, 10) };
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+
+        unsafe { fold_update(&mut *win_ptr, 1, 4) };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1, "the indented run became a fold");
+        assert_eq!(folds[0].fd_top, 2);
+        assert_eq!(folds[0].fd_len, 2);
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn checkupdate_recomputes_and_clears_foldinvalid() {
+        // No explicit lock: `FoldUpdateGuard::set()` self-locks (see
+        // the sibling test above).
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        win.w_foldinvalid = true;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = FoldUpdateGuard::set();
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+
+        unsafe { checkupdate(&mut *win_ptr) };
+
+        assert!(!unsafe { (*win_ptr).w_foldinvalid });
+        assert_eq!(unsafe { (*win_ptr).w_folds.len() }, 1);
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn checkupdate_is_a_noop_when_the_folds_are_already_valid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = WinT {
+            w_foldinvalid: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        // No buffer is needed: the early return happens first.
+        unsafe { checkupdate(&mut win) };
+        assert_eq!(win.w_folds.len(), 3, "left exactly as it was");
     }
 
     #[test]
@@ -6582,28 +6661,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldUpdate")]
-    fn fold_update_after_insert_reaches_the_fold_recomputation_boundary() {
-        let _lock = crate::globals::global_state_test_lock();
-        let mut buf = BufT::default();
-        let mut win = WinT {
-            w_buffer: &mut buf as *mut BufT,
-            w_onebuf_opt: crate::buffer_defs::WinoptT {
-                // 'foldmethod'=indent is none of the three skipped
-                // methods, so the folds really are invalidated - and
-                // the following foldOpenCursor then calls checkupdate,
-                // which needs the not-yet-translated foldUpdate.
-                wo_fen: 1,
-                wo_fdm: Some(b"indent".to_vec()),
-                ..Default::default()
-            },
-            w_foldinvalid: false,
-            ..Default::default()
-        };
-        let win_ptr = &mut win as *mut WinT;
-        let _guard = CurwinGuard::set(win_ptr);
+    fn fold_update_after_insert_runs_the_real_recomputation() {
+        // No explicit `global_state_test_lock()`: `FoldUpdateGuard`
+        // self-locks and holds it for the whole test body.
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        // 'foldmethod'=indent is none of the three skipped methods, so
+        // the folds really are invalidated - and the following
+        // foldOpenCursor then calls checkupdate, which now performs
+        // the real recomputation rather than stopping at a boundary.
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        win.w_foldinvalid = false;
+        win.w_cursor.lnum = 3;
+        let win_ptr: *mut WinT = &mut *win;
+        let _guard = FoldUpdateGuard::set();
+        let _curwin = CurwinGuard::set(win_ptr);
+        // A previous test may have left the recursion sentinel set.
+        unsafe { *INVALID_TOP.get_mut() = 0 };
 
         unsafe { fold_update_after_insert() };
+
+        assert!(
+            !unsafe { (*win_ptr).w_foldinvalid },
+            "checkupdate cleared the invalid flag after recomputing"
+        );
+        assert_eq!(
+            unsafe { (*win_ptr).w_folds.len() },
+            1,
+            "the indented run really was folded"
+        );
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
     }
 
     #[test]
