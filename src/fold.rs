@@ -1742,6 +1742,55 @@ pub unsafe fn fold_open_cursor() {
     }
 }
 
+/// Open or close folds in the current window across lines `firstpos`
+/// to `lastpos` (`opFoldRange`), used for `zo`/`zO`/`zc`/`zC` over a
+/// Visual selection.
+///
+/// When acting on one level only, the next line to visit is taken
+/// from the fold just opened or closed, so each fold in the range is
+/// touched exactly once rather than repeatedly.
+///
+/// # Safety
+/// Same as [`set_manual_fold`].
+pub unsafe fn op_fold_range(
+    firstpos: crate::pos_defs::PosT,
+    lastpos: crate::pos_defs::PosT,
+    opening: bool,
+    recurse: bool,
+) {
+    let mut done = done::DONE_NOTHING; // avoid error messages
+    let first = firstpos.lnum;
+    let last = lastpos.lnum;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    let mut lnum = first;
+    while lnum <= last {
+        let temp = crate::pos_defs::PosT { lnum, col: 0, coladd: 0 };
+        let mut lnum_next = lnum;
+        // Opening one level only: next fold to open is after the one
+        // going to be opened.
+        if opening && !recurse {
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { has_folding(&mut *curwin, lnum, None, Some(&mut lnum_next)) };
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_manual_fold(temp, opening, recurse, Some(&mut done)) };
+        // Closing one level only: next line to close a fold is after
+        // the just-closed fold.
+        if !opening && !recurse {
+            // SAFETY: forwarded from this function's own safety doc.
+            let _ = unsafe { has_folding(&mut *curwin, lnum, None, Some(&mut lnum_next)) };
+        }
+        lnum = lnum_next + 1;
+    }
+    // The original's `emsg(e_nofold)` when nothing was found is
+    // omitted under this crate's established message-display policy;
+    // `done` is still accumulated exactly as upstream.
+    let _ = done;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2617,6 +2666,127 @@ mod tests {
                 }],
             }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn op_fold_range_closes_every_fold_in_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        // Lines 10..34 span all three folds.
+        unsafe {
+            op_fold_range(
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 34, col: 0, coladd: 0 },
+                false,
+                false,
+            )
+        };
+
+        for fp in unsafe { &(*win_ptr).w_folds } {
+            assert_eq!(fp.fd_flags, fd_flags::FD_CLOSED);
+        }
+    }
+
+    #[test]
+    fn op_fold_range_only_touches_folds_inside_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        // Only the middle fold (20-24) lies in 20..24.
+        unsafe {
+            op_fold_range(
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 24, col: 0, coladd: 0 },
+                false,
+                false,
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds[0].fd_flags, fd_flags::FD_OPEN);
+        assert_eq!(folds[1].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(folds[2].fd_flags, fd_flags::FD_OPEN);
+    }
+
+    #[test]
+    fn op_fold_range_over_lines_with_no_folds_changes_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        // Lines 1..5 are outside every fold.
+        unsafe {
+            op_fold_range(
+                crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+                false,
+                false,
+            )
+        };
+
+        for fp in unsafe { &(*win_ptr).w_folds } {
+            assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
     }
 
