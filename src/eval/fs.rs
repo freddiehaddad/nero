@@ -208,6 +208,52 @@ pub(crate) fn f_getfperm(argvars: &[TypvalT], rettv: &mut TypvalT) {
     };
 }
 
+/// `setfperm({fname}, {mode})` - set the file's permissions from a
+/// 9-character `"rwxrwxrwx"`-style string (`f_setfperm`,
+/// `eval/funcs.c`).
+///
+/// Any character other than `-` in a position sets that bit, so the
+/// flag letters are only conventional - `"rwxrwxrwx"` and `"xxxxxxxxx"`
+/// mean exactly the same thing, matching the original's own
+/// `mode_str[i] != '-'` test rather than checking for the letter.
+///
+/// @return `1` on success, `0` on failure (a non-stringish argument,
+///         or a `{mode}` whose length is not exactly 9 - the
+///         original's accompanying `semsg` display is omitted,
+///         matching this module's established "skip the message, keep
+///         the state" policy).
+///
+/// Windows has no genuine Unix mode bits;
+/// [`crate::os::fs::os_setperm`] honours only the read-only flag
+/// there, derived from the owner-write bit.
+pub(crate) fn f_setfperm(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    rettv.value = TypvalValue::Number(0);
+
+    let Some(fname) = crate::eval::typval::tv_get_string_chk(&argvars[0]) else {
+        return;
+    };
+    let Some(mode_str) = crate::eval::typval::tv_get_string_chk(&argvars[1]) else {
+        return;
+    };
+    if mode_str.len() != 9 {
+        return;
+    }
+    let Some(path) = bytes_to_path(&fname) else {
+        return;
+    };
+
+    let mut mask = 1;
+    let mut mode = 0;
+    for i in (0..9).rev() {
+        if mode_str[i] != b'-' {
+            mode |= mask;
+        }
+        mask <<= 1;
+    }
+    rettv.value =
+        TypvalValue::Number(i64::from(crate::os::fs::os_setperm(path, mode) == crate::vim_defs::OK));
+}
+
 /// `tempname()` - a unique name usable for a temp file (`f_tempname`,
 /// `eval/fs.c`).
 ///
@@ -2128,6 +2174,65 @@ mod tests {
         let mut rettv = TypvalT::default();
         f_getfperm(&[string(b"/no/such/file/here/nero-test")], &mut rettv);
         assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn setfperm_round_trips_with_getfperm() {
+        // Cross-verified against real nvim (Windows): setfperm returns
+        // 1 and getfperm then reports exactly what was written back.
+        let path = std::env::temp_dir().join("nero_test_setfperm_roundtrip.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let name = string(path.to_str().unwrap().as_bytes());
+
+        let mut rettv = TypvalT::default();
+        f_setfperm(&[name.clone(), string(b"rw-rw-rw-")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let mut got = TypvalT::default();
+        f_getfperm(&[name], &mut got);
+        let TypvalValue::String(Some(perm)) = &got.value else { panic!("expected a String") };
+        // Owner read and write must both be set after asking for them.
+        assert_eq!(perm[0], b'r');
+        assert_eq!(perm[1], b'w');
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn setfperm_with_a_mode_that_is_not_nine_characters_fails() {
+        // Cross-verified against real nvim: a wrong-length {mode}
+        // returns 0 (and emits E475, which this crate omits).
+        let path = std::env::temp_dir().join("nero_test_setfperm_badlen.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let mut rettv = TypvalT::default();
+        f_setfperm(&[string(path.to_str().unwrap().as_bytes()), string(b"rwx")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn setfperm_treats_any_non_dash_character_as_a_set_bit() {
+        // Cross-verified against real nvim: "xxxxxxxxx" is accepted and
+        // returns 1 - the flag letters are only conventional, the
+        // original tests `!= '-'` rather than for a specific letter.
+        let path = std::env::temp_dir().join("nero_test_setfperm_nondash.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let mut rettv = TypvalT::default();
+        f_setfperm(&[string(path.to_str().unwrap().as_bytes()), string(b"xxxxxxxxx")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn setfperm_with_a_non_stringish_argument_fails() {
+        let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        let mut rettv = TypvalT::default();
+        f_setfperm(&[list_tv, string(b"rw-rw-rw-")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
     }
 
     #[test]
