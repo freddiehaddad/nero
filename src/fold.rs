@@ -92,6 +92,31 @@ pub static DISABLE_FOLD_UPDATE: crate::globals::GlobalCell<i32> =
 pub static FOLD_CHANGED: crate::globals::GlobalCell<bool> =
     crate::globals::GlobalCell::new(false);
 
+/// The line whose fold level was computed most recently, and that
+/// level (`prev_lnum`, `prev_lnum_lvl`).
+///
+/// `foldUpdateIEMSRecurse` publishes these so `foldlevel()` can see
+/// the previous line's level while an update is in progress; `0`
+/// means "no previous line", so nothing may rely on the level.
+pub static PREV_LNUM: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
+    crate::globals::GlobalCell::new(0);
+
+/// See [`PREV_LNUM`] (`prev_lnum_lvl`).
+pub static PREV_LNUM_LVL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+
+/// The line range whose fold levels are undefined while an update is
+/// running (`invalid_top`, `invalid_bot`).
+///
+/// `invalid_top == 0` means no update is in progress, which is what
+/// lets `foldLevel` tell "recompute first" from "mid-update, answer
+/// -1".
+pub static INVALID_TOP: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
+    crate::globals::GlobalCell::new(0);
+
+/// See [`INVALID_TOP`] (`invalid_bot`).
+pub static INVALID_BOT: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
+    crate::globals::GlobalCell::new(0);
+
 /// Result flags reported by `setManualFold`/`setManualFoldWin`.
 pub mod done {
     /// Nothing was found or changed (`DONE_NOTHING`).
@@ -3086,6 +3111,539 @@ pub unsafe fn foldtext_cleanup(str: &mut Vec<u8>) {
     }
 }
 
+/// Which per-`'foldmethod'` function supplies fold levels
+/// (`LevelGetter`, a function pointer in the original).
+///
+/// The original compares the pointer against specific functions to
+/// decide behaviour (`getlevel == foldlevelMarker` and friends), so
+/// this is an enum rather than a closure: the identity comparisons
+/// stay exact and cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelGetter {
+    /// [`foldlevel_indent`].
+    Indent,
+    /// [`foldlevel_marker`].
+    Marker,
+    /// `foldlevelExpr`, not yet translated.
+    Expr,
+    /// `foldlevelSyntax`, not yet translated.
+    Syntax,
+    /// [`foldlevel_diff`].
+    Diff,
+}
+
+impl LevelGetter {
+    /// Fill in `flp.lvl` (and, for some methods, `start`/`lvl_next`)
+    /// for the line `flp` names.
+    ///
+    /// # Safety
+    /// Same as the underlying `foldlevel*` function.
+    pub unsafe fn get(self, flp: &mut FlineT) {
+        match self {
+            // SAFETY: forwarded from this function's own safety doc.
+            LevelGetter::Indent => unsafe { foldlevel_indent(flp) },
+            // SAFETY: forwarded from this function's own safety doc.
+            LevelGetter::Marker => unsafe { foldlevel_marker(flp) },
+            // SAFETY: forwarded from this function's own safety doc.
+            LevelGetter::Diff => unsafe { foldlevel_diff(flp) },
+            LevelGetter::Expr => unimplemented!(
+                "fold::LevelGetter::Expr: foldlevelExpr needs the eval engine, not yet translated"
+            ),
+            LevelGetter::Syntax => unimplemented!(
+                "fold::LevelGetter::Syntax: foldlevelSyntax needs syn_get_foldlevel, not yet \
+                 translated"
+            ),
+        }
+    }
+
+    /// Whether this method needs the fold's end to be searched for
+    /// rather than inferred, which the original tests by comparing
+    /// against its three "the level can change anywhere" getters.
+    #[must_use]
+    pub fn needs_end_search(self) -> bool {
+        matches!(self, LevelGetter::Marker | LevelGetter::Expr | LevelGetter::Syntax)
+    }
+}
+
+/// Update folds for one level, recursing into nested folds
+/// (`foldUpdateIEMSRecurse`).
+///
+/// Walks lines from `flp.lnum` looking for where this fold ends,
+/// reusing, extending, splitting, merging or deleting existing folds
+/// as the newly computed levels require, and recursing whenever a
+/// deeper level starts. Returns the last line that needs redrawing,
+/// which may be past `bot`.
+///
+/// # Translation note
+/// The original carries a `fold_T *fp` across calls that can
+/// reallocate the array (`foldInsert`, `deleteFoldEntry`,
+/// `foldSplit`, `foldMerge`), re-deriving it from a saved index each
+/// time. Tracking the index directly is the same thing without the
+/// dangling-pointer window, and `None` stands in for its `NULL`.
+///
+/// # Safety
+/// Same as [`fold_split`]/[`fold_merge`]/[`fold_remove`]; `flp.wp`
+/// must be a valid, live [`WinT`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fold_update_iems_recurse(
+    gap: &mut Vec<FoldT>,
+    level: i32,
+    startlnum: crate::pos_defs::LinenrT,
+    flp: &mut FlineT,
+    getlevel: LevelGetter,
+    mut bot: crate::pos_defs::LinenrT,
+    topflags: u8,
+) -> crate::pos_defs::LinenrT {
+    let maxlnum = crate::pos_defs::MAXLNUM;
+    let mut fp: Option<usize> = None;
+
+    // If using the marker method, the start line is not the start of a
+    // fold at the level we're dealing with and the level is non-zero,
+    // we must use the previous fold. But ignore a fold that starts at
+    // or below startlnum, it must be deleted.
+    if getlevel == LevelGetter::Marker
+        && flp.start <= flp.lvl - level
+        && flp.lvl > 0
+        && !gap.is_empty()
+    {
+        let (_, idx) = fold_find(gap, startlnum - 1);
+        if idx < gap.len() && gap[idx].fd_top < startlnum {
+            fp = Some(idx);
+        }
+    }
+
+    let mut lvl = level;
+    let mut startlnum2 = startlnum;
+    let firstlnum = flp.lnum; // first lnum we got
+    let mut finish = false;
+    // SAFETY: forwarded from this function's own safety doc.
+    let linecount = unsafe { (*(*flp.wp).w_buffer).b_ml.ml_line_count } - flp.off;
+
+    // Loop over all lines in this fold, or until "bot" is hit, handling
+    // nested folds inside it. `flp.lnum` is the current line; when the
+    // end of the fold is found it is just below the fold.
+    flp.lnum_save = flp.lnum;
+    loop {
+        // SAFETY: reads the got_int global, matching the original's
+        // own CTRL-C polling (line_breakcheck's message side effects
+        // are omitted under this crate's established policy).
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+
+        // Set "lvl" to the level of line flp.lnum. After the first line
+        // of the fold, force the fold to end when flp.start is set or
+        // the previous line was marked as a fold end.
+        lvl = flp.lvl.min(MAX_LEVEL);
+        if flp.lnum > firstlnum && (level > lvl - flp.start || level >= flp.had_end) {
+            lvl = 0;
+        }
+
+        if flp.lnum > bot && !finish && let Some(fpi) = fp {
+            // For the end-searching methods, a change may have removed
+            // a nested fold (continue until where it ended) or created
+            // one (finish this fold).
+            if !getlevel.needs_end_search() {
+                break;
+            }
+            let mut i = 0;
+            if lvl >= level {
+                // Compute how deep the folds currently are; deeper than
+                // "lvl" means some must be deleted.
+                let mut ll = flp.lnum - gap[fpi].fd_top;
+                let mut path: Vec<usize> = vec![fpi];
+                loop {
+                    let sub = fold_subgap(gap, &path);
+                    let (found, idx) = fold_find(sub, ll);
+                    if !found {
+                        break;
+                    }
+                    i += 1;
+                    ll -= sub[idx].fd_top;
+                    path.push(idx);
+                }
+            }
+            if lvl < level + i {
+                let fd_top = gap[fpi].fd_top;
+                let (found, idx) = fold_find(&gap[fpi].fd_nested, flp.lnum - fd_top);
+                if found || idx < gap[fpi].fd_nested.len() {
+                    let n = &gap[fpi].fd_nested[idx];
+                    bot = n.fd_top + n.fd_len - 1 + fd_top;
+                }
+            } else if gap[fpi].fd_top + gap[fpi].fd_len <= flp.lnum && lvl >= level {
+                finish = true;
+            } else {
+                break;
+            }
+        }
+
+        // At the start of the first nested fold and at the end of the
+        // current fold: check whether existing folds at this level,
+        // before the current one, need deleting or truncating.
+        if fp.is_none()
+            && (lvl != level
+                || flp.lnum_save >= bot
+                || flp.start != 0
+                || flp.had_end <= MAX_LEVEL
+                || flp.lnum == linecount)
+        {
+            // Remove or update folds with lines between startlnum and
+            // firstlnum.
+            loop {
+                // SAFETY: as above.
+                if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+                    break;
+                }
+                // Whether this fold may be concatenated with a previous
+                // one that touches it.
+                let concat = i32::from(flp.start == 0 && flp.had_end > MAX_LEVEL);
+
+                // Find an existing fold to re-use: preferably one that
+                // includes startlnum, else one ending just before it or
+                // starting after it.
+                let mut reuse = None;
+                if !gap.is_empty() {
+                    // Preferably a fold including startlnum; failing
+                    // that one ending just before it or starting after.
+                    let (hit, idx) = fold_find(gap, startlnum);
+                    if hit || (idx < gap.len() && gap[idx].fd_top <= firstlnum) {
+                        reuse = Some(idx);
+                    } else {
+                        let (hit2, idx2) = fold_find(gap, firstlnum - concat);
+                        if hit2
+                            || (idx2 < gap.len()
+                                && ((lvl < level && gap[idx2].fd_top < flp.lnum)
+                                    || (lvl >= level && gap[idx2].fd_top <= flp.lnum_save)))
+                        {
+                            reuse = Some(idx2);
+                        }
+                    }
+                }
+
+                let Some(mut i) = reuse else {
+                    // Insert a new fold.
+                    let i = if gap.is_empty() {
+                        0
+                    } else {
+                        fold_find(gap, startlnum).1.min(gap.len())
+                    };
+                    fold_insert(gap, i);
+                    // The new fold runs until bot unless its end is
+                    // found earlier.
+                    gap[i].fd_top = firstlnum;
+                    gap[i].fd_len = bot - firstlnum + 1;
+                    // An open containing fold makes the new fold open;
+                    // otherwise it inherits from the fold above it, and
+                    // the first fold from the containing fold.
+                    if topflags == fd_flags::FD_OPEN {
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe { (*flp.wp).w_fold_manual = true };
+                        gap[i].fd_flags = fd_flags::FD_OPEN;
+                    } else if i == 0 {
+                        gap[i].fd_flags = topflags;
+                        if topflags != fd_flags::FD_LEVEL {
+                            // SAFETY: forwarded from this function's own safety doc.
+                            unsafe { (*flp.wp).w_fold_manual = true };
+                        }
+                    } else {
+                        gap[i].fd_flags = gap[i - 1].fd_flags;
+                    }
+                    gap[i].fd_small = crate::types_defs::TriState::None;
+                    if getlevel.needs_end_search() {
+                        finish = true;
+                    }
+                    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+                    *unsafe { FOLD_CHANGED.get_mut() } = true;
+                    fp = Some(i);
+                    break;
+                };
+
+                if gap[i].fd_top + gap[i].fd_len + concat > firstlnum {
+                    // Re-use this fold. Extend it when it starts before
+                    // where we began looking; when it starts elsewhere,
+                    // move its nested folds to keep their positions.
+                    let fd_top = gap[i].fd_top;
+                    if fd_top == firstlnum {
+                        // Found a fold beginning exactly where wanted.
+                    } else if fd_top >= startlnum {
+                        if fd_top > firstlnum {
+                            // Moving this fold's start up moves its
+                            // nested folds down.
+                            fold_mark_adjust_recurse(
+                                &mut gap[i].fd_nested,
+                                0,
+                                maxlnum,
+                                fd_top - firstlnum,
+                                0,
+                                false,
+                            );
+                        } else {
+                            // Moving the fold down moves nested folds up.
+                            fold_mark_adjust_recurse(
+                                &mut gap[i].fd_nested,
+                                0,
+                                firstlnum - fd_top - 1,
+                                maxlnum,
+                                fd_top - firstlnum,
+                                false,
+                            );
+                        }
+                        gap[i].fd_len += fd_top - firstlnum;
+                        gap[i].fd_top = firstlnum;
+                        gap[i].fd_small = crate::types_defs::TriState::None;
+                        // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+                        *unsafe { FOLD_CHANGED.get_mut() } = true;
+                    } else if (flp.start != 0 && lvl == level) || firstlnum != startlnum {
+                        // A fold spanned from above startlnum to below
+                        // firstlnum and now has a break in it, so split
+                        // it at the break.
+                        let (breakstart, breakend) = if firstlnum != startlnum {
+                            (startlnum, firstlnum)
+                        } else {
+                            (flp.lnum, flp.lnum)
+                        };
+                        // SAFETY: forwarded from this function's own safety doc.
+                        unsafe {
+                            fold_remove(
+                                &mut gap[i].fd_nested,
+                                breakstart - fd_top,
+                                breakend - fd_top,
+                            )
+                        };
+                        fold_split(gap, i, breakstart, breakend - 1);
+                        i += 1;
+                        if getlevel.needs_end_search() {
+                            finish = true;
+                        }
+                    }
+                    if gap[i].fd_top == startlnum
+                        && concat != 0
+                        && i != 0
+                        && gap[i - 1].fd_top + gap[i - 1].fd_len == gap[i].fd_top
+                    {
+                        let (left, right) = gap.split_at_mut(i);
+                        let fp2 = &mut left[i - 1];
+                        let mut tail: Vec<FoldT> = right.to_vec();
+                        fold_merge(fp2, &mut tail, 0);
+                        gap.truncate(i);
+                        gap.extend(tail);
+                        i -= 1;
+                    }
+                    fp = Some(i);
+                    break;
+                }
+
+                if gap[i].fd_top >= startlnum {
+                    // A fold starting at or after startlnum but ending
+                    // before the new fold must be deleted.
+                    delete_fold_entry(gap, i, true);
+                } else {
+                    // A fold with lines above startlnum is truncated to
+                    // stop just above it.
+                    gap[i].fd_len = startlnum - gap[i].fd_top;
+                    let fd_len = gap[i].fd_len;
+                    fold_mark_adjust_recurse(
+                        &mut gap[i].fd_nested,
+                        fd_len,
+                        maxlnum,
+                        maxlnum,
+                        0,
+                        false,
+                    );
+                    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+                    *unsafe { FOLD_CHANGED.get_mut() } = true;
+                }
+            }
+        }
+
+        if lvl < level || flp.lnum > linecount {
+            // A line with a lower fold level: this fold ends just above
+            // flp.lnum.
+            break;
+        }
+
+        // The fold includes flp.lnum and flp.lnum_save.
+        if lvl > level && let Some(fpi) = fp {
+            // A nested fold: handle it recursively, doing at least one
+            // line (which can happen when finish is set).
+            bot = bot.max(flp.lnum);
+
+            // Line numbers in the nested fold are relative to this
+            // fold's start.
+            let fd_top = gap[fpi].fd_top;
+            let fd_flags = gap[fpi].fd_flags;
+            flp.lnum = flp.lnum_save - fd_top;
+            flp.off += fd_top;
+            // SAFETY: forwarded from this function's own safety doc.
+            bot = unsafe {
+                fold_update_iems_recurse(
+                    &mut gap[fpi].fd_nested,
+                    level + 1,
+                    startlnum2 - fd_top,
+                    flp,
+                    getlevel,
+                    bot - fd_top,
+                    fd_flags,
+                )
+            };
+            let fd_top = gap[fpi].fd_top;
+            flp.lnum += fd_top;
+            flp.lnum_save += fd_top;
+            flp.off -= fd_top;
+            bot += fd_top;
+            startlnum2 = flp.lnum;
+            // This fold may end at the same line, so don't advance.
+        } else {
+            // Get the level of the next line, skipping undefined lines
+            // to find the level after them. The last line of the file
+            // always has a valid level.
+            flp.lnum = flp.lnum_save;
+            let ll = flp.lnum + 1;
+            loop {
+                // SAFETY: as above.
+                if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+                    break;
+                }
+                // Make the previous level available to foldlevel().
+                // SAFETY: plain GlobalCells, matching the original's
+                // own single-threaded-editor assumption.
+                unsafe {
+                    *PREV_LNUM.get_mut() = flp.lnum;
+                    *PREV_LNUM_LVL.get_mut() = flp.lvl;
+                }
+
+                flp.lnum += 1;
+                if flp.lnum > linecount {
+                    break;
+                }
+                flp.lvl = flp.lvl_next;
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { getlevel.get(flp) };
+                if flp.lvl >= 0 || flp.had_end <= MAX_LEVEL {
+                    break;
+                }
+            }
+            // SAFETY: as above.
+            unsafe { *PREV_LNUM.get_mut() = 0 };
+            if flp.lnum > linecount {
+                break;
+            }
+
+            // Leave lnum_save at the line used to get the level, and
+            // lnum at the next line.
+            flp.lnum_save = flp.lnum;
+            flp.lnum = ll;
+        }
+    }
+
+    let Some(mut fpi) = fp else {
+        // Only happens when got_int is set.
+        return bot;
+    };
+
+    // Reached here with either lvl < level (the fold ends just above
+    // flp.lnum) or lvl >= level (it continues below bot).
+
+    // The current fold extends at least until lnum.
+    if gap[fpi].fd_len < flp.lnum - gap[fpi].fd_top {
+        gap[fpi].fd_len = flp.lnum - gap[fpi].fd_top;
+        gap[fpi].fd_small = crate::types_defs::TriState::None;
+        // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+        *unsafe { FOLD_CHANGED.get_mut() } = true;
+    } else if gap[fpi].fd_top + gap[fpi].fd_len > linecount {
+        // Running into the end of the buffer (the last line was
+        // deleted).
+        gap[fpi].fd_len = linecount - gap[fpi].fd_top + 1;
+    }
+
+    // Delete contained folds from the end of the last one found until
+    // where we stopped looking.
+    let fd_top = gap[fpi].fd_top;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        fold_remove(
+            &mut gap[fpi].fd_nested,
+            startlnum2 - fd_top,
+            flp.lnum - 1 - fd_top,
+        )
+    };
+
+    if lvl < level && gap[fpi].fd_len != flp.lnum - gap[fpi].fd_top {
+        // End of fold found; update the length when it got shorter.
+        if gap[fpi].fd_top + gap[fpi].fd_len - 1 > bot {
+            // The fold continued below bot.
+            if getlevel.needs_end_search() {
+                // Truncate the fold and make sure the previously
+                // included lines are processed again.
+                bot = gap[fpi].fd_top + gap[fpi].fd_len - 1;
+                gap[fpi].fd_len = flp.lnum - gap[fpi].fd_top;
+            } else {
+                // Split the fold to create a new one below bot.
+                fold_split(gap, fpi, flp.lnum, bot);
+            }
+        } else {
+            gap[fpi].fd_len = flp.lnum - gap[fpi].fd_top;
+        }
+        // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+        *unsafe { FOLD_CHANGED.get_mut() } = true;
+    }
+
+    // Delete following folds that end before the current line.
+    loop {
+        let next = fpi + 1;
+        if next >= gap.len() || gap[next].fd_top > flp.lnum {
+            break;
+        }
+        if gap[next].fd_top + gap[next].fd_len > flp.lnum {
+            if gap[next].fd_top < flp.lnum {
+                // Make the fold that includes lnum start at lnum.
+                let fd_top = gap[next].fd_top;
+                fold_mark_adjust_recurse(
+                    &mut gap[next].fd_nested,
+                    0,
+                    flp.lnum - fd_top - 1,
+                    maxlnum,
+                    fd_top - flp.lnum,
+                    false,
+                );
+                gap[next].fd_len -= flp.lnum - fd_top;
+                gap[next].fd_top = flp.lnum;
+                // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+                *unsafe { FOLD_CHANGED.get_mut() } = true;
+            }
+
+            if lvl >= level {
+                // Merge the new fold with the existing fold that
+                // follows it.
+                let (left, right) = gap.split_at_mut(next);
+                let fp1 = &mut left[fpi];
+                let mut tail: Vec<FoldT> = right.to_vec();
+                fold_merge(fp1, &mut tail, 0);
+                gap.truncate(next);
+                gap.extend(tail);
+            }
+            break;
+        }
+        // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+        *unsafe { FOLD_CHANGED.get_mut() } = true;
+        delete_fold_entry(gap, next, true);
+        fpi = fpi.min(gap.len().saturating_sub(1));
+    }
+
+    // Redraw the lines inspected, which may be further down than asked.
+    bot.max(flp.lnum - 1)
+}
+
+/// Resolve an index path within `gap` to the nested array it names.
+fn fold_subgap<'a>(gap: &'a [FoldT], path: &[usize]) -> &'a [FoldT] {
+    let (first, rest) = path.split_first().expect("fold_subgap: empty path");
+    let mut sub = &gap[*first].fd_nested;
+    for idx in rest {
+        sub = &sub[*idx].fd_nested;
+    }
+    sub
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4228,6 +4786,151 @@ mod tests {
             *FOLD_MARKERS.get_mut() = None;
         }
         out
+    }
+
+    #[test]
+    fn level_getter_needs_end_search_only_for_the_scanning_methods() {
+        // The original tests its function pointer against exactly
+        // these three; indent and diff infer the end instead.
+        assert!(LevelGetter::Marker.needs_end_search());
+        assert!(LevelGetter::Expr.needs_end_search());
+        assert!(LevelGetter::Syntax.needs_end_search());
+        assert!(!LevelGetter::Indent.needs_end_search());
+        assert!(!LevelGetter::Diff.needs_end_search());
+    }
+
+    #[test]
+    #[should_panic(expected = "foldlevelExpr")]
+    fn level_getter_expr_is_unimplemented() {
+        let mut flp = FlineT::default();
+        unsafe { LevelGetter::Expr.get(&mut flp) };
+    }
+
+    #[test]
+    #[should_panic(expected = "foldlevelSyntax")]
+    fn level_getter_syntax_is_unimplemented() {
+        let mut flp = FlineT::default();
+        unsafe { LevelGetter::Syntax.get(&mut flp) };
+    }
+
+    #[test]
+    fn fold_update_iems_recurse_builds_a_fold_from_indent_levels() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Lines 2-4 are indented, so an indent-method update over the
+        // buffer must produce one fold covering exactly those lines.
+        let (buf, mut win) = indent_level_fixture(
+            &[b"top", b"  a", b"  b", b"  c", b"bottom"],
+            2,
+            20,
+            b"#",
+        );
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT {
+            wp: win_ptr,
+            lnum: 2,
+            lvl: 1,
+            lvl_next: -1,
+            end: MAX_LEVEL + 1,
+            had_end: MAX_LEVEL + 1,
+            ..Default::default()
+        };
+        let mut gap: Vec<FoldT> = Vec::new();
+        unsafe {
+            fold_update_iems_recurse(
+                &mut gap,
+                1,
+                2,
+                &mut flp,
+                LevelGetter::Indent,
+                5,
+                fd_flags::FD_LEVEL,
+            )
+        };
+
+        assert_eq!(gap.len(), 1, "one fold over the indented run");
+        assert_eq!(gap[0].fd_top, 2);
+        assert_eq!(gap[0].fd_len, 3, "lines 2-4");
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_LEVEL);
+
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_update_iems_recurse_reports_the_fold_structure_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        let win_ptr: *mut WinT = &mut *win;
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+
+        let mut flp = FlineT {
+            wp: win_ptr,
+            lnum: 2,
+            lvl: 1,
+            lvl_next: -1,
+            end: MAX_LEVEL + 1,
+            had_end: MAX_LEVEL + 1,
+            ..Default::default()
+        };
+        let mut gap: Vec<FoldT> = Vec::new();
+        unsafe {
+            fold_update_iems_recurse(
+                &mut gap,
+                1,
+                2,
+                &mut flp,
+                LevelGetter::Indent,
+                4,
+                fd_flags::FD_LEVEL,
+            )
+        };
+
+        assert!(unsafe { *FOLD_CHANGED.get_mut() }, "a fold was created");
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_update_iems_recurse_marks_an_open_container_manual() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        let win_ptr: *mut WinT = &mut *win;
+        assert!(!unsafe { (*win_ptr).w_fold_manual });
+
+        let mut flp = FlineT {
+            wp: win_ptr,
+            lnum: 2,
+            lvl: 1,
+            lvl_next: -1,
+            end: MAX_LEVEL + 1,
+            had_end: MAX_LEVEL + 1,
+            ..Default::default()
+        };
+        let mut gap: Vec<FoldT> = Vec::new();
+        unsafe {
+            fold_update_iems_recurse(
+                &mut gap,
+                1,
+                2,
+                &mut flp,
+                LevelGetter::Indent,
+                4,
+                // An open containing fold makes the new fold open and
+                // the window manually folded.
+                fd_flags::FD_OPEN,
+            )
+        };
+
+        assert_eq!(gap[0].fd_flags, fd_flags::FD_OPEN);
+        assert!(unsafe { (*win_ptr).w_fold_manual });
+
+        drop(win);
+        close_indent_level_fixture(buf);
     }
 
     #[test]
