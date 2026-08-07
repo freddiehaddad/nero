@@ -4,8 +4,7 @@
 //! builtins: `delete()`, `getcwd()`, `isdirectory()`, `mkdir()`,
 //! `rename()`, `glob()`/`globpath()`, `readfile()`/`writefile()`, and
 //! more. Most need substantial not-yet-translated machinery
-//! (`delete_recursive`'s directory-tree walk,
-//! `find_file_in_path_option`'s `'path'`-option search) - this file
+//! (`find_file_in_path_option`'s `'path'`-option search) - this file
 //! starts with the smallest, most self-contained subset.
 //!
 //! Translated: `isdirectory()` (via the already-existing
@@ -27,9 +26,8 @@
 //! (via [`crate::os::fs::os_mkdir_recurse`]) - `"D"`/`"R"`
 //! (deferred deletion) need the `:defer` subsystem (not yet
 //! translated) and panic via `unimplemented!()` if actually
-//! reached. The `"rf"` (recursive delete) flag needs
-//! `delete_recursive` (a directory-tree walk, not yet translated) and
-//! panics via `unimplemented!()` if actually reached. Every function
+//! reached. The `"rf"` (recursive delete) flag goes through
+//! [`crate::fileio::delete_recursive`]. Every function
 //! taking a path/name needs the byte string to be valid UTF-8 to
 //! build a `Path` from (this crate's established
 //! `path_full_dir_name`-style convention - see that function's own
@@ -178,7 +176,7 @@ pub(crate) fn f_getftype(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
 /// `delete({name} [, {flags}])` - delete a file (`{flags}` omitted or
 /// empty), an empty directory (`{flags} == "d"`), or a directory tree
-/// (`{flags} == "rf"`, not yet translated - needs `delete_recursive`)
+/// (`{flags} == "rf"`, via [`crate::fileio::delete_recursive`])
 /// (`f_delete`, `eval/fs.c`). Returns `0` on success, `-1` on failure
 /// (a missing/non-UTF8 `{name}`, or an unrecognized `{flags}` value -
 /// the original's own `check_secure()`/invalid-argument `emsg` display
@@ -208,7 +206,7 @@ pub(crate) unsafe fn f_delete(argvars: &[TypvalT], rettv: &mut TypvalT) {
     } else if flags == b"d" {
         rettv.value = TypvalValue::Number(if crate::os::fs::os_rmdir(path) == 0 { 0 } else { -1 });
     } else if flags == b"rf" {
-        unimplemented!("delete(): recursive directory delete needs delete_recursive, not yet translated");
+        rettv.value = TypvalValue::Number(i64::from(crate::fileio::delete_recursive(&name)));
     }
     // Any other flags value: rettv stays -1 (matching the original's
     // own semsg-then-fallthrough - v_number was already set to -1
@@ -819,6 +817,41 @@ mod tests {
         unsafe { f_delete(&[string(path.to_str().unwrap().as_bytes()), string(b"d")], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(0));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_directory_tree_with_rf_flag() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = std::env::temp_dir().join("nero_test_delete_rf_tree");
+        let _ = std::fs::remove_dir_all(&path);
+        let nested = path.join("sub").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.txt"), b"deep").unwrap();
+        std::fs::write(path.join("top.txt"), b"top").unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_delete(&[string(path.to_str().unwrap().as_bytes()), string(b"rf")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_rf_on_a_missing_path_fails() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_delete(
+                &[string(b"/definitely/does/not/exist/nero-test-rf"), string(b"rf")],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(-1));
     }
 
     #[test]

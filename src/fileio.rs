@@ -22,6 +22,11 @@
 //! as bytes in a given `FIO_*` encoding; needed by `bufwrite.c`'s
 //! `make_bom`).
 //!
+//! Also translated: the temp-directory family (`vim_mktempdir`,
+//! `vim_settempdir`, `vim_gettempdir`, `vim_deltempdir`,
+//! `vim_tempname`) and the directory helpers it builds on
+//! (`readdir_core`, `delete_recursive`).
+//!
 //! Deferred: everything else in the file.
 
 use crate::mbyte::enc_canon_props;
@@ -166,6 +171,32 @@ pub unsafe fn vim_mktempdir() {
     }
 }
 
+/// Delete Nvim's own temp directory and everything in it
+/// (`vim_deltempdir`).
+///
+/// Does nothing when no tempdir was ever created.
+///
+/// The original's `HAVE_DIRFD_AND_FLOCK`-gated `vim_closetempdir()`
+/// call is omitted along with its `vim_opentempdir()` counterpart:
+/// that pair holds an open directory handle plus a `flock` purely to
+/// stop a system tmp-cleaner from reaping the directory mid-session,
+/// which needs the still-deferred `Directory`/`os_scandir` FFI. Its
+/// absence costs only that protection, never correctness of the
+/// deletion itself.
+///
+/// # Safety
+/// Mutates the shared `VIM_TEMPDIR` file-static.
+pub unsafe fn vim_deltempdir() {
+    let cell = unsafe { VIM_TEMPDIR.get_mut() };
+    let Some(dir) = cell.take() else {
+        return;
+    };
+    // Remove the trailing path separator vim_settempdir added, so the
+    // directory itself (not a child of it) is what gets deleted.
+    let trimmed = &dir[..crate::path::path_tail(&dir).saturating_sub(1)];
+    delete_recursive(trimmed);
+}
+
 /// Get the path to Nvim's own temp dir, ending with a path separator
 /// (`vim_gettempdir`).
 ///
@@ -230,6 +261,120 @@ fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
     #[cfg(not(unix))]
     {
         std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Per-entry filter for [`readdir_core`] (`CheckItem`, `fileio.h`).
+///
+/// Returns a negative value to stop the walk entirely, `0` to skip
+/// just that entry, and any positive value to keep it. The original's
+/// separate `void *context` parameter is unnecessary here: a Rust
+/// closure captures whatever state it needs directly.
+pub type CheckItem<'a> = dyn FnMut(&[u8]) -> i64 + 'a;
+
+/// Retrieve the sorted list of entries in the directory `path`
+/// (`readdir_core`, the core of the `readdir()` builtin).
+///
+/// `.` and `..` are always excluded. `checkitem`, when given, decides
+/// per entry: a negative value stops the walk entirely, `0` skips just
+/// that entry, and any positive value keeps it.
+///
+/// @return `None` on failure (the directory could not be opened),
+///         matching the original's `FAIL`. The original's separate
+///         `garray_T` out-parameter is replaced by the returned
+///         `Vec`, this crate's established preference.
+///
+/// The original's `os_scandir`/`os_scandir_next`/`os_closedir` trio is
+/// expressed directly as `std::fs::read_dir`, which already excludes
+/// `.` and `..` on every platform, so the original's explicit filter
+/// for them has nothing left to reject.
+///
+/// The original's `smsg(0, _(e_notopen), path)` on failure is omitted
+/// (the message pipeline is not translated); the `FAIL` it accompanies
+/// is kept.
+pub fn readdir_core(
+    path: &[u8],
+    mut checkitem: Option<&mut CheckItem<'_>>,
+) -> Option<Vec<Vec<u8>>> {
+    let entries = std::fs::read_dir(bytes_to_path(path)).ok()?;
+
+    let mut gap: Vec<Vec<u8>> = Vec::new();
+    for entry in entries.flatten() {
+        let name = os_string_to_bytes(&entry.file_name());
+        let mut ignore = false;
+        if let Some(check) = checkitem.as_mut() {
+            let r = check(&name);
+            if r < 0 {
+                break;
+            }
+            if r == 0 {
+                ignore = true;
+            }
+        }
+        if !ignore {
+            gap.push(name);
+        }
+    }
+
+    if !gap.is_empty() {
+        crate::strings::sort_strings(&mut gap);
+    }
+    Some(gap)
+}
+
+/// Delete `name` and everything in it, recursively
+/// (`delete_recursive`).
+///
+/// @return `0` for success, `-1` if some file was not deleted.
+///
+/// A failure on one entry is remembered but does NOT stop the walk -
+/// every remaining entry is still attempted, exactly as upstream does.
+///
+/// Anything that is not a *real* directory (a plain file, or a symlink
+/// even when it points at a directory) is removed as a single entry
+/// rather than descended into, so a symlink's target is never touched.
+pub fn delete_recursive(name: &[u8]) -> i32 {
+    let mut result = 0;
+
+    if crate::os::fs::os_isrealdir(&bytes_to_path(name)) {
+        if let Some(entries) = readdir_core(name, None) {
+            for entry in entries {
+                // The original builds each child path in the shared
+                // NameBuff; a local Vec avoids that global entirely.
+                let mut child = name.to_vec();
+                child.push(b'/');
+                child.extend_from_slice(&entry);
+                if delete_recursive(&child) != 0 {
+                    // Remember the failure but continue deleting any
+                    // further entries.
+                    result = -1;
+                }
+            }
+            if crate::os::fs::os_rmdir(&bytes_to_path(name)) != 0 {
+                result = -1;
+            }
+        } else {
+            result = -1;
+        }
+    } else {
+        // Delete symlink only.
+        result = if crate::os::fs::os_remove(&bytes_to_path(name)) == 0 { 0 } else { -1 };
+    }
+
+    result
+}
+
+/// Render an [`std::ffi::OsStr`] back into the raw bytes this crate
+/// carries paths as - the inverse of [`bytes_to_path`].
+fn os_string_to_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
     }
 }
 
@@ -1027,5 +1172,134 @@ mod tests {
         assert_ne!(first, second);
         // The file itself is deliberately NOT created.
         assert!(!bytes_to_path(&first).exists());
+    }
+
+    // --- readdir_core / delete_recursive ---
+
+    /// Builds a small real directory tree under the system temp dir
+    /// and removes whatever survives on drop.
+    struct TreeScratch {
+        root: std::path::PathBuf,
+    }
+
+    impl TreeScratch {
+        fn new(name: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut root = std::env::temp_dir();
+            root.push(format!("nero_fileio_test_{name}_{}_{unique}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            TreeScratch { root }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            os_string_to_bytes(self.root.as_os_str())
+        }
+
+        fn bytes_joined(&self, child: &[u8]) -> Vec<u8> {
+            let mut p = self.bytes();
+            p.push(b'/');
+            p.extend_from_slice(child);
+            p
+        }
+    }
+
+    impl Drop for TreeScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn readdir_core_lists_entries_sorted_and_without_dot_entries() {
+        let scratch = TreeScratch::new("readdir_sorted");
+        std::fs::write(scratch.root.join("b.txt"), b"b").unwrap();
+        std::fs::write(scratch.root.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(scratch.root.join("c_dir")).unwrap();
+
+        let entries = readdir_core(&scratch.bytes(), None).expect("a real directory");
+        // The original sorts, and never reports "." or "..".
+        assert_eq!(entries, vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c_dir".to_vec()]);
+    }
+
+    #[test]
+    fn readdir_core_is_none_for_a_path_that_is_not_a_directory() {
+        let scratch = TreeScratch::new("readdir_missing");
+        assert_eq!(readdir_core(&scratch.bytes_joined(b"nope"), None), None);
+    }
+
+    #[test]
+    fn readdir_core_checkitem_zero_skips_just_that_entry() {
+        let scratch = TreeScratch::new("readdir_skip");
+        std::fs::write(scratch.root.join("keep.txt"), b"k").unwrap();
+        std::fs::write(scratch.root.join("skip.txt"), b"s").unwrap();
+
+        let mut check = |name: &[u8]| i64::from(name != b"skip.txt");
+        let entries = readdir_core(&scratch.bytes(), Some(&mut check)).expect("a real directory");
+        assert_eq!(entries, vec![b"keep.txt".to_vec()]);
+    }
+
+    #[test]
+    fn readdir_core_checkitem_negative_stops_the_walk() {
+        let scratch = TreeScratch::new("readdir_stop");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(scratch.root.join(n), b"x").unwrap();
+        }
+        // Stop as soon as anything is seen, so nothing is collected.
+        let mut check = |_: &[u8]| -1_i64;
+        let entries = readdir_core(&scratch.bytes(), Some(&mut check)).expect("a real directory");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn delete_recursive_removes_a_whole_tree() {
+        let scratch = TreeScratch::new("del_tree");
+        let nested = scratch.root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("deep.txt"), b"deep").unwrap();
+        std::fs::write(scratch.root.join("top.txt"), b"top").unwrap();
+
+        assert_eq!(delete_recursive(&scratch.bytes()), 0);
+        assert!(!scratch.root.exists());
+    }
+
+    #[test]
+    fn delete_recursive_removes_a_single_file() {
+        let scratch = TreeScratch::new("del_file");
+        let path = scratch.root.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        assert_eq!(delete_recursive(&os_string_to_bytes(path.as_os_str())), 0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_recursive_reports_failure_for_a_missing_path() {
+        let scratch = TreeScratch::new("del_missing");
+        let missing = scratch.root.join("does_not_exist");
+        assert_eq!(delete_recursive(&os_string_to_bytes(missing.as_os_str())), -1);
+    }
+
+    #[test]
+    fn vim_deltempdir_removes_the_tempdir_and_clears_the_static() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        let dir = unsafe { vim_gettempdir() }.expect("a tempdir must be creatable");
+        assert!(crate::os::fs::os_isdir(&bytes_to_path(&dir)));
+
+        unsafe { vim_deltempdir() };
+        assert!(!crate::os::fs::os_isdir(&bytes_to_path(&dir)));
+        // The static must be cleared, so a later vim_gettempdir makes
+        // a fresh directory rather than handing back the dead one.
+        assert!(unsafe { VIM_TEMPDIR.get_mut() }.is_none());
+    }
+
+    #[test]
+    fn vim_deltempdir_without_a_tempdir_is_a_no_op() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+        // TempdirGuard::new() already left VIM_TEMPDIR as None.
+        unsafe { vim_deltempdir() };
+        assert!(unsafe { VIM_TEMPDIR.get_mut() }.is_none());
     }
 }
