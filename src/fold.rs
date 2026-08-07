@@ -87,6 +87,11 @@ use crate::buffer_defs::WinT;
 pub static DISABLE_FOLD_UPDATE: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 
+/// Set by any operation that changes the fold structure, so the
+/// caller knows the folds need saving/redrawing (`fold_changed`).
+pub static FOLD_CHANGED: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
 /// @return true if `'foldmethod'` is "manual" (`foldmethodIsManual`).
 #[must_use]
 pub fn foldmethod_is_manual(wp: &WinT) -> bool {
@@ -1149,6 +1154,62 @@ pub unsafe fn fold_check_close() {
     }
 }
 
+/// Split the fold at index `i` in `gap`, which starts before `top`
+/// and ends below `bot`, into two pieces: one ending above `top` and
+/// the other starting below `bot` (`foldSplit`).
+///
+/// The caller must first have removed any nested folds between `top`
+/// and `bot`, which is why the nested-fold move below only has to
+/// consider folds starting at or after `bot + 1`.
+///
+/// Both halves have their smallness invalidated, since neither covers
+/// the same lines as before.
+///
+/// # Translation note
+/// The original moves the trailing nested folds with `ga_grow` plus
+/// an index loop, then fixes both arrays' lengths by hand. With a
+/// `Vec<FoldT>` that is a `split_off`, so the two arrays cannot get
+/// out of step.
+pub fn fold_split(
+    gap: &mut Vec<FoldT>,
+    i: usize,
+    top: crate::pos_defs::LinenrT,
+    bot: crate::pos_defs::LinenrT,
+) {
+    // The fold continues below bot, need to split it.
+    fold_insert(gap, i + 1);
+
+    let (fd_top, fd_len, fd_flags) = (gap[i].fd_top, gap[i].fd_len, gap[i].fd_flags);
+    let new_top = bot + 1;
+    // Check for wrap around (MAXLNUM, and 32bit).
+    assert!(new_top > bot, "fold_split: fd_top wrapped around");
+
+    gap[i + 1].fd_top = new_top;
+    gap[i + 1].fd_len = fd_len - (new_top - fd_top);
+    gap[i + 1].fd_flags = fd_flags;
+    gap[i + 1].fd_small = crate::types_defs::TriState::None;
+    gap[i].fd_small = crate::types_defs::TriState::None;
+
+    // Move nested folds below bot to the new fold. There can't be any
+    // between top and bot, they have been removed by the caller.
+    if !gap[i].fd_nested.is_empty() {
+        let (_, idx) = fold_find(&gap[i].fd_nested, new_top - fd_top);
+        let mut moved = gap[i].fd_nested.split_off(idx);
+        if !moved.is_empty() {
+            let shift = new_top - fd_top;
+            for fp in &mut moved {
+                fp.fd_top -= shift;
+            }
+            gap[i + 1].fd_nested = moved;
+        }
+    }
+
+    gap[i].fd_len = top - fd_top;
+    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>, matching the
+    // original's own single-threaded-editor assumption.
+    *unsafe { FOLD_CHANGED.get_mut() } = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1991,6 +2052,109 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_split_divides_a_fold_around_the_given_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // One fold covering lines 10-29 (fd_top 10, fd_len 20), split
+        // around lines 15..19: the first half must end above 15 and
+        // the second must start below 19.
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_flags: fd_flags::FD_CLOSED,
+            fd_small: crate::types_defs::TriState::True,
+            ..Default::default()
+        }];
+
+        fold_split(&mut gap, 0, 15, 19);
+
+        assert_eq!(gap.len(), 2);
+        // First half: 10..14, i.e. top - fd_top = 5 lines.
+        assert_eq!(gap[0].fd_top, 10);
+        assert_eq!(gap[0].fd_len, 5);
+        // Second half starts at bot + 1 and runs to the old end.
+        assert_eq!(gap[1].fd_top, 20);
+        assert_eq!(gap[1].fd_len, 10);
+        // The flags carry over, but neither half's smallness is known
+        // any more, since neither covers the same lines as before.
+        assert_eq!(gap[1].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(gap[0].fd_small, crate::types_defs::TriState::None);
+        assert_eq!(gap[1].fd_small, crate::types_defs::TriState::None);
+    }
+
+    #[test]
+    fn fold_split_moves_trailing_nested_folds_to_the_second_half() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Outer fold 10-29 with nested folds at absolute 12-13 and
+        // 22-23 (fd_top 2 and 12, relative to the parent).
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            fd_nested: vec![
+                FoldT { fd_top: 2, fd_len: 2, ..Default::default() },
+                FoldT { fd_top: 12, fd_len: 2, ..Default::default() },
+            ],
+            ..Default::default()
+        }];
+
+        fold_split(&mut gap, 0, 15, 19);
+
+        // The nested fold before the split stays put.
+        assert_eq!(gap[0].fd_nested.len(), 1);
+        assert_eq!(gap[0].fd_nested[0].fd_top, 2);
+        // The one after moves across and is rebased onto the new
+        // parent, which starts 10 lines later: 12 - 10 = 2, still
+        // absolute line 22.
+        assert_eq!(gap[1].fd_nested.len(), 1);
+        assert_eq!(gap[1].fd_nested[0].fd_top, 2);
+        assert_eq!(gap[1].fd_top + gap[1].fd_nested[0].fd_top, 22);
+    }
+
+    #[test]
+    fn fold_split_leaves_a_childless_fold_with_two_childless_halves() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            ..Default::default()
+        }];
+        fold_split(&mut gap, 0, 15, 19);
+        assert!(gap[0].fd_nested.is_empty());
+        assert!(gap[1].fd_nested.is_empty());
+    }
+
+    #[test]
+    fn fold_split_preserves_sibling_folds_around_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gap = vec![
+            FoldT { fd_top: 1, fd_len: 2, ..Default::default() },
+            FoldT { fd_top: 10, fd_len: 20, ..Default::default() },
+            FoldT { fd_top: 40, fd_len: 5, ..Default::default() },
+        ];
+
+        fold_split(&mut gap, 1, 15, 19);
+
+        assert_eq!(gap.len(), 4);
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        // The new half is inserted directly after the fold it came
+        // from, keeping the array sorted.
+        assert_eq!(tops, vec![1, 10, 20, 40]);
+    }
+
+    #[test]
+    fn fold_split_reports_the_fold_structure_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        let mut gap = vec![FoldT {
+            fd_top: 10,
+            fd_len: 20,
+            ..Default::default()
+        }];
+        fold_split(&mut gap, 0, 15, 19);
+        assert!(unsafe { *FOLD_CHANGED.get_mut() });
+        unsafe { *FOLD_CHANGED.get_mut() = false };
     }
 
     #[test]
