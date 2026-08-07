@@ -17621,6 +17621,13 @@ mod tests {
         // has type 3 (List). On a platform whose xdg_default is None
         // for this variant the list is empty, which real nvim also
         // reports there.
+        //
+        // Takes the GLOBAL state lock as well as the XDG one: this
+        // allocates a list, and typval.rs's GC tests assert
+        // GC_FIRST_LIST is empty while holding that global lock.
+        // Global is acquired FIRST here; nothing takes these two in
+        // the opposite order.
+        let _global = crate::globals::global_state_test_lock();
         let _lock = crate::os::stdpaths::tests::xdg_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_stdpath(&[string(b"config_dirs")], &mut rettv) };
@@ -17632,6 +17639,7 @@ mod tests {
 
     #[test]
     fn stdpath_data_dirs_returns_a_list() {
+        let _global = crate::globals::global_state_test_lock();
         let _lock = crate::os::stdpaths::tests::xdg_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_stdpath(&[string(b"data_dirs")], &mut rettv) };
@@ -17649,6 +17657,7 @@ mod tests {
         // WITHOUT mutating process-global environment variables
         // (std::env::set_var races any concurrent env read in other
         // test threads, so it is avoided here).
+        let _global = crate::globals::global_state_test_lock();
         let _lock = crate::os::stdpaths::tests::xdg_test_lock();
         let appname = crate::os::stdpaths::get_appname(false);
 

@@ -167,6 +167,20 @@ pub fn has_event(event: EventT) -> bool {
     !(unsafe { AUTOCMDS.get_mut() })[event as usize].is_empty()
 }
 
+/// Whether a `CursorHold`/`CursorHoldI` autocommand is defined for
+/// the mode the editor is really in (`has_cursorhold`).
+///
+/// Normal mode uses `CursorHold`; anything else (Insert, in
+/// particular) uses `CursorHoldI`. The check goes through
+/// [`crate::state::get_real_state`] rather than `State` directly, so
+/// a pending operator or mapping does not disguise the mode.
+#[must_use]
+pub fn has_cursorhold() -> bool {
+    let normal_busy = crate::state::get_real_state()
+        == crate::state_defs::mode::NORMAL_BUSY as i32;
+    has_event(if normal_busy { EventT::CursorHold } else { EventT::CursorHoldI })
+}
+
 /// Block executing autocommands until [`unblock_autocmds`] is called
 /// the same number of times (`block_autocmds`).
 pub fn block_autocmds() {
@@ -719,6 +733,81 @@ mod tests {
     fn is_autocmd_blocked_false_by_default() {
         let _lock = crate::globals::global_state_test_lock();
         assert!(!is_autocmd_blocked());
+    }
+
+    // --- has_cursorhold ---
+
+    /// Pushes a placeholder autocommand for `event`, restoring the
+    /// (empty) state on drop.
+    struct EventGuard {
+        event: EventT,
+    }
+
+    impl EventGuard {
+        fn set(event: EventT) -> Self {
+            (unsafe { AUTOCMDS.get_mut() })[event as usize].push(crate::autocmd_defs::AutoCmd {
+                pat: std::ptr::null_mut(),
+                id: 1,
+                desc: None,
+                handler_cmd: None,
+                handler_fn: crate::eval::typval_defs::Callback::default(),
+                script_ctx: crate::eval::typval_defs::SctxT::default(),
+                once: false,
+                nested: false,
+            });
+            Self { event }
+        }
+    }
+
+    impl Drop for EventGuard {
+        fn drop(&mut self) {
+            (unsafe { AUTOCMDS.get_mut() })[self.event as usize].clear();
+        }
+    }
+
+    #[test]
+    fn has_cursorhold_picks_cursorhold_in_normal_busy_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::NORMAL_BUSY as i32;
+
+        {
+            let _e = EventGuard::set(EventT::CursorHold);
+            assert!(has_cursorhold(), "the Normal-mode event is consulted");
+        }
+        {
+            // The Insert-mode event must NOT satisfy Normal mode.
+            let _e = EventGuard::set(EventT::CursorHoldI);
+            assert!(!has_cursorhold());
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    #[test]
+    fn has_cursorhold_picks_cursorholdi_outside_normal_busy_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::INSERT as i32;
+
+        {
+            let _e = EventGuard::set(EventT::CursorHoldI);
+            assert!(has_cursorhold());
+        }
+        {
+            let _e = EventGuard::set(EventT::CursorHold);
+            assert!(!has_cursorhold(), "the Normal-mode event does not apply");
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    #[test]
+    fn has_cursorhold_is_false_with_no_autocommand_defined() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!has_cursorhold());
     }
 
     #[test]
