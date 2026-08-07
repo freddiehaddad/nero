@@ -2558,6 +2558,123 @@ pub unsafe fn fold_create(
     unsafe { crate::r#move::changed_window_setting(wp) };
 }
 
+/// Delete the folds covering lines `start` to `end` in window `wp`
+/// (`deleteFold`).
+///
+/// For each line in the range the deepest fold containing it is
+/// removed, then the scan resumes past that fold. With `recursive`
+/// set, folds nested inside a deleted one go too; otherwise they are
+/// promoted a level, as [`delete_fold_entry`] describes. A line
+/// inside a *closed* fold deletes that fold rather than looking
+/// deeper.
+///
+/// # Deferred boundary
+/// When `'foldmethod'` is not `"manual"` the folds live as markers in
+/// the buffer text, so deleting one means editing the buffer via
+/// `deleteFoldMarkers`, which needs the `ml_replace_buf` path, not
+/// yet translated. The guard reaching it is real. The `changed_lines`
+/// and buffer-update notification at the end are likewise only
+/// reachable from that branch, since only it records the touched line
+/// range.
+///
+/// # Safety
+/// Same as [`check_closed`]; `wp` must be a valid, live [`WinT`].
+pub unsafe fn delete_fold(
+    wp: *mut WinT,
+    start: crate::pos_defs::LinenrT,
+    end: crate::pos_defs::LinenrT,
+    recursive: bool,
+    had_visual: bool,
+) {
+    let mut maybe_small = false;
+    let mut lnum = start;
+    let mut did_one = false;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    checkupdate(unsafe { &mut *wp });
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_manual = unsafe { foldmethod_is_manual(&*wp) };
+
+    while lnum <= end {
+        // Find the deepest fold for "lnum".
+        let mut path: Vec<usize> = Vec::new();
+        let mut found: Option<(Vec<usize>, usize, crate::pos_defs::LinenrT)> = None;
+        let mut lnum_off = 0;
+        let mut use_level = false;
+        let mut level = 0;
+
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            let (hit, idx) = fold_find(unsafe { fold_gap(wp, &path) }, lnum - lnum_off);
+            if !hit {
+                break;
+            }
+            // lnum is inside this fold, remember the info.
+            found = Some((path.clone(), idx, lnum_off));
+
+            // If "lnum" is folded, don't check nesting.
+            // SAFETY: forwarded from this function's own safety doc.
+            let closed = unsafe {
+                let fp = &mut fold_gap_mut(wp, &path)[idx];
+                check_closed(wp, fp, &mut use_level, level, &mut maybe_small, lnum_off)
+            };
+            if closed {
+                break;
+            }
+
+            // Check nested folds.
+            // SAFETY: forwarded from this function's own safety doc.
+            lnum_off += unsafe { fold_gap(wp, &path) }[idx].fd_top;
+            path.push(idx);
+            level += 1;
+        }
+
+        match found {
+            None => lnum += 1,
+            Some((fpath, idx, off)) => {
+                // SAFETY: forwarded from this function's own safety doc.
+                let fp = &unsafe { fold_gap(wp, &fpath) }[idx];
+                lnum = fp.fd_top + fp.fd_len + off;
+
+                if is_manual {
+                    // SAFETY: forwarded from this function's own safety doc.
+                    delete_fold_entry(unsafe { fold_gap_mut(wp, &fpath) }, idx, recursive);
+                } else {
+                    unimplemented!(
+                        "fold::delete_fold: deleting marker-based folds edits the buffer via \
+                         deleteFoldMarkers, which needs the ml_replace_buf path, not yet \
+                         translated"
+                    );
+                }
+                did_one = true;
+
+                // Redraw the window.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::r#move::changed_window_setting(wp) };
+            }
+        }
+    }
+
+    if !did_one {
+        // The original's `emsg(e_nofold)` is omitted under this
+        // crate's established message-display policy.
+        // Force a redraw to remove the Visual highlighting.
+        if had_visual {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::drawscreen::redraw_buf_later(
+                    (*wp).w_buffer,
+                    crate::drawscreen::UPD_INVERTED,
+                )
+            };
+        }
+    } else {
+        // Deleting markers may make the cursor column invalid.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::check_cursor_col(wp) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3493,6 +3610,159 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    #[test]
+    fn delete_fold_removes_the_deepest_fold_at_a_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 12, 12, false, false) };
+
+        assert!(unsafe { (*win_ptr).w_folds.is_empty() });
+    }
+
+    #[test]
+    fn delete_fold_promotes_nested_folds_like_real_nvim_zd() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: with a fold at 12-14
+        // nested inside one at 10-20, zd on line 10 leaves
+        // foldlevel() reporting 0 at line 10 and 1 at line 13.
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 10,
+            fd_len: 11,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            fd_nested: vec![FoldT {
+                fd_top: 2,
+                fd_len: 3,
+                fd_flags: fd_flags::FD_OPEN,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 10, 10, false, false) };
+
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 10), 0);
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 13), 1);
+    }
+
+    #[test]
+    fn delete_fold_recursive_removes_the_nested_folds_too() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 10,
+            fd_len: 11,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            fd_nested: vec![FoldT {
+                fd_top: 2,
+                fd_len: 3,
+                fd_flags: fd_flags::FD_OPEN,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 10, 10, true, false) };
+
+        assert!(unsafe { (*win_ptr).w_folds.is_empty() });
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 13), 0);
+    }
+
+    #[test]
+    fn delete_fold_over_a_range_removes_every_fold_in_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = sibling_folds();
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 10, 34, false, false) };
+
+        assert!(unsafe { (*win_ptr).w_folds.is_empty() });
+    }
+
+    #[test]
+    fn delete_fold_leaves_folds_outside_the_range_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = sibling_folds();
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        // Only the middle fold (20-24) is in range.
+        unsafe { delete_fold(win_ptr, 20, 24, false, false) };
+
+        let tops: Vec<_> = unsafe { (*win_ptr).w_folds.iter().map(|f| f.fd_top).collect() };
+        assert_eq!(tops, vec![10, 30]);
+    }
+
+    #[test]
+    fn delete_fold_over_lines_with_no_folds_changes_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = sibling_folds();
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+            fp.fd_small = crate::types_defs::TriState::False;
+        }
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 1, 5, false, false) };
+
+        assert_eq!(unsafe { (*win_ptr).w_folds.len() }, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "deleteFoldMarkers")]
+    fn delete_fold_with_a_marker_foldmethod_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
+        win.w_folds = vec![FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe { delete_fold(win_ptr, 12, 12, false, false) };
     }
 
     /// A window able to hold manual folds, with 'foldlevel' high
