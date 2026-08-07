@@ -34,6 +34,68 @@ pub unsafe fn clearop(oap: &mut crate::normal_defs::OpargT) {
     unsafe { crate::globals::GLOBALS.get_mut() }.motion_force = i32::from(crate::ascii_defs::NUL);
 }
 
+/// Rewrite a shifted cursor key in `cap` to its unshifted form
+/// (`unshift_special`).
+///
+/// The shift is not simply discarded: `simplify_key` folds it back
+/// into the global `mod_mask`, so a mapping can still see it.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `crate::globals::GLOBALS` (touches `mod_mask`).
+pub unsafe fn unshift_special(cap: &mut crate::normal_defs::CmdargT) {
+    use crate::keycodes_defs as kc;
+    cap.cmdchar = match cap.cmdchar {
+        c if c == kc::K_S_RIGHT => kc::K_RIGHT,
+        c if c == kc::K_S_LEFT => kc::K_LEFT,
+        c if c == kc::K_S_UP => kc::K_UP,
+        c if c == kc::K_S_DOWN => kc::K_DOWN,
+        c if c == kc::K_S_HOME => kc::K_HOME,
+        c if c == kc::K_S_END => kc::K_END,
+        other => other,
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mod_mask = &mut unsafe { crate::globals::GLOBALS.get_mut() }.mod_mask;
+    cap.cmdchar = crate::keycodes::simplify_key(cap.cmdchar, mod_mask);
+}
+
+/// Whether the current buffer's `'comments'` option defines a C-style
+/// (`//` or `/*`) comment leader (`buf_has_cstyle_comments`).
+///
+/// Each comma-separated part of `'comments'` is `flags:leader`; this
+/// looks for a leader starting `/` followed by `/` or `*`.
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`.
+#[must_use]
+pub unsafe fn buf_has_cstyle_comments() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let com = unsafe { &*crate::globals::GLOBALS.get_mut().curbuf }
+        .b_p_com
+        .clone()
+        .unwrap_or_default();
+
+    let mut list = 0usize;
+    while list < com.len() && com[list] != crate::ascii_defs::NUL {
+        let (part_buf, next) = crate::option::copy_option_part(
+            &com,
+            list,
+            crate::option_vars::COM_MAX_LEN as usize,
+            b",",
+        );
+        list = next;
+        // Flags and comment leader are separated by a colon.
+        if let Some(colon) = crate::strings::vim_strchr(&part_buf, i32::from(b':'))
+            && part_buf.get(colon + 1) == Some(&b'/')
+            && matches!(part_buf.get(colon + 2), Some(&b'/') | Some(&b'*'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns `true` if `line[offset]` is NOT inside a C-style comment or
 /// string, `false` otherwise (`is_ident`).
 ///
@@ -82,6 +144,92 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- unshift_special / buf_has_cstyle_comments ---
+
+    #[test]
+    fn unshift_special_maps_each_shifted_cursor_key_to_its_plain_form() {
+        let _lock = crate::globals::global_state_test_lock();
+        use crate::keycodes_defs as kc;
+        for (shifted, plain) in [
+            (kc::K_S_RIGHT, kc::K_RIGHT),
+            (kc::K_S_LEFT, kc::K_LEFT),
+            (kc::K_S_UP, kc::K_UP),
+            (kc::K_S_DOWN, kc::K_DOWN),
+            (kc::K_S_HOME, kc::K_HOME),
+            (kc::K_S_END, kc::K_END),
+        ] {
+            let mut cap = crate::normal_defs::CmdargT { cmdchar: shifted, ..Default::default() };
+            unsafe { unshift_special(&mut cap) };
+            assert_eq!(cap.cmdchar, plain);
+        }
+    }
+
+    #[test]
+    fn unshift_special_leaves_an_unshifted_key_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut cap =
+            crate::normal_defs::CmdargT { cmdchar: i32::from(b'x'), ..Default::default() };
+        unsafe { unshift_special(&mut cap) };
+        assert_eq!(cap.cmdchar, i32::from(b'x'));
+    }
+
+    #[test]
+    fn buf_has_cstyle_comments_finds_a_slash_leader() {
+        // Cross-verified against real nvim: the default 'comments'
+        // contains both "s1:/*" and "://".
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_com: Some(b"s1:/*,mb:*,ex:*/,://,b:#".to_vec()),
+            ..Default::default()
+        };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = &mut buf;
+
+        assert!(unsafe { buf_has_cstyle_comments() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn buf_has_cstyle_comments_is_false_without_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Hash and quote leaders only - no `/` followed by `/` or `*`.
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_com: Some(b"b:#,:%,n:>,fb:-".to_vec()),
+            ..Default::default()
+        };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = &mut buf;
+
+        assert!(!unsafe { buf_has_cstyle_comments() });
+
+        // An empty 'comments' likewise has nothing to find.
+        unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_p_com = Some(Vec::new()) };
+        assert!(!unsafe { buf_has_cstyle_comments() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn buf_has_cstyle_comments_needs_the_slash_right_after_the_colon() {
+        // A leader of "*" alone must not count, even though a
+        // C-comment continuation uses it.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_com: Some(b"mb:*,ex:*/".to_vec()),
+            ..Default::default()
+        };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = &mut buf;
+
+        assert!(!unsafe { buf_has_cstyle_comments() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
 
     #[test]
     fn clearop_resets_every_operator_field() {
