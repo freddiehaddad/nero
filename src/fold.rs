@@ -1115,6 +1115,40 @@ pub fn fold_insert(gap: &mut Vec<FoldT>, i: usize) {
     gap.insert(i.min(gap.len()), FoldT::default());
 }
 
+/// Close folds that no longer contain the cursor, when
+/// `'foldclose'` asks for it (`foldCheckClose`).
+///
+/// `'foldclose'` can only be `"all"` right now, so any non-empty
+/// value means "close them", exactly as the original's own
+/// `*p_fcl == NUL` test implies.
+///
+/// # Safety
+/// Same as [`has_any_folding`]; also touches `GLOBALS.curwin` and
+/// `OPTION_VARS`.
+pub unsafe fn fold_check_close() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fcl_empty = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_fcl
+        .as_deref()
+        .is_none_or(|s| s.is_empty() || s[0] == 0);
+    if fcl_empty {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *curwin };
+    checkupdate(win);
+
+    let lnum = win.w_cursor.lnum;
+    let level = win.w_onebuf_opt.wo_fdl as i32;
+    if check_close_rec(&mut win.w_folds, lnum, level) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::changed_window_setting(curwin) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1959,6 +1993,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fold_check_close_is_a_noop_when_foldclose_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_cursor: crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 },
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+        }
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let previous = ov.p_fcl.take();
+        unsafe { fold_check_close() };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fcl = previous;
+
+        // 'foldclose' empty means never close anything.
+        for fp in &win.w_folds {
+            assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
+        }
+    }
+
+    #[test]
+    fn fold_check_close_closes_folds_not_containing_the_cursor() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_cursor: crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 },
+            w_folds: sibling_folds(),
+            ..Default::default()
+        };
+        for fp in &mut win.w_folds {
+            fp.fd_flags = fd_flags::FD_OPEN;
+        }
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let previous = ov.p_fcl.replace(b"all".to_vec());
+        unsafe { fold_check_close() };
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_fcl = previous;
+
+        // The cursor is on line 22, inside the middle fold only.
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_LEVEL);
+        assert_eq!(win.w_folds[1].fd_flags, fd_flags::FD_OPEN);
+        assert_eq!(win.w_folds[2].fd_flags, fd_flags::FD_LEVEL);
+    }
     #[test]
     fn fold_init_win_leaves_a_new_window_with_no_folds() {
         let mut win = WinT {

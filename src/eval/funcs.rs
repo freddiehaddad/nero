@@ -7045,10 +7045,7 @@ unsafe fn f_shellescape(argvars: &[TypvalT], rettv: &mut TypvalT) {
 
 /// `foldlevel({lnum})` - the fold nesting level of line `{lnum}` in
 /// the current buffer (`f_foldlevel`, `fold.c`), via
-/// [`crate::fold::fold_level`]. `0` if `{lnum}` is out of range (also
-/// matching what `fold_level` itself always currently returns, given
-/// this crate's fold subsystem only translates the "no folds exist"
-/// fast path - see that function's own doc comment).
+/// [`crate::fold::fold_level`]. `0` if `{lnum}` is out of range.
 ///
 /// # Safety
 /// Touches `GLOBALS.curbuf`/`curwin`; forwarded from
@@ -7073,11 +7070,7 @@ unsafe fn f_foldlevel(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// (`foldclosed_both`, `fold.c`). `end == false` returns the first
 /// line of the closed fold containing `{lnum}`; `end == true` returns
 /// the last line. `-1` if `{lnum}` is out of range or not inside a
-/// closed fold - which, since [`crate::fold::has_folding_win`] only
-/// translates its own "no folds anywhere in this window" fast path
-/// (always taken today, given nothing in this crate can currently
-/// create a fold), is the ONLY result this crate can currently
-/// produce.
+/// closed fold.
 ///
 /// # Safety
 /// Touches `GLOBALS.curbuf`/`curwin`; forwarded from
