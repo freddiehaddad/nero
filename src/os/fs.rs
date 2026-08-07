@@ -373,6 +373,39 @@ pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Set the permission bits of the file at `path` (`os_setperm`).
+///
+/// Returns [`crate::vim_defs::OK`]/[`crate::vim_defs::FAIL`], matching
+/// the original.
+///
+/// Unix applies `perm` as the real mode bits. Windows has no such
+/// concept in `std::fs`, so only the read-only flag is honoured -
+/// derived from the owner-write bit, which is the same direction
+/// [`os_fileinfo_mode`] reports it in.
+pub fn os_setperm(path: &Path, perm: i32) -> i32 {
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(perm as u32)
+    };
+    #[cfg(not(unix))]
+    let permissions = {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return crate::vim_defs::FAIL;
+        };
+        let mut p = meta.permissions();
+        // 0o200 is the owner-write bit.
+        p.set_readonly(perm & 0o200 == 0);
+        p
+    };
+
+    if std::fs::set_permissions(path, permissions).is_ok() {
+        crate::vim_defs::OK
+    } else {
+        crate::vim_defs::FAIL
+    }
+}
+
 /// Get the inode number from a `FileInfoT` (`os_fileinfo_inode`).
 ///
 /// `0` on a platform that reports none - Windows `std::fs::Metadata`
@@ -1553,6 +1586,52 @@ mod tests {
         assert!(os_file_is_readable(&path));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // --- os_setperm ---
+
+    #[test]
+    fn os_setperm_makes_a_file_read_only_and_back() {
+        let path = std::env::temp_dir().join("nero_test_os_setperm");
+        std::fs::write(&path, b"x").unwrap();
+
+        // 0o444: readable, not writable.
+        assert_eq!(os_setperm(&path, 0o444), crate::vim_defs::OK);
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        // 0o644: owner-writable again.
+        assert_eq!(os_setperm(&path, 0o644), crate::vim_defs::OK);
+        assert!(!std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn os_setperm_round_trips_through_os_fileinfo_mode() {
+        // Whatever this platform can actually represent, writing then
+        // reading back must agree on the owner-write bit - the one bit
+        // both directions model everywhere.
+        let path = std::env::temp_dir().join("nero_test_os_setperm_roundtrip");
+        std::fs::write(&path, b"x").unwrap();
+
+        assert_eq!(os_setperm(&path, 0o444), crate::vim_defs::OK);
+        let mode = os_fileinfo_mode(&os_fileinfo(&path).unwrap());
+        assert_eq!(mode & 0o200, 0, "owner-write is clear");
+
+        assert_eq!(os_setperm(&path, 0o644), crate::vim_defs::OK);
+        let mode = os_fileinfo_mode(&os_fileinfo(&path).unwrap());
+        assert_ne!(mode & 0o200, 0, "owner-write is set");
+
+        // Restore writability so the cleanup below can remove it.
+        let _ = os_setperm(&path, 0o644);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn os_setperm_fails_for_a_missing_path() {
+        let path = std::env::temp_dir().join("nero_test_os_setperm_missing");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(os_setperm(&path, 0o644), crate::vim_defs::FAIL);
     }
 
     // --- os_fileinfo_inode / hardlinks / blocksize ---
