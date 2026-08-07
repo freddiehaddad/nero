@@ -2876,6 +2876,65 @@ pub unsafe fn fold_add_marker(
     }
 }
 
+/// Create a fold by writing its markers into the buffer at `start`
+/// and `end` (`foldCreateMarkers`).
+///
+/// Both line changes are reported together, so that folds after the
+/// start are not recomputed against a buffer holding only the start
+/// marker.
+///
+/// Does nothing when the buffer is not modifiable.
+///
+/// # Safety
+/// Same as [`fold_add_marker`]; `wp` must be a valid, live [`WinT`].
+pub unsafe fn fold_create_markers(
+    wp: *mut WinT,
+    start: crate::pos_defs::PosT,
+    end: crate::pos_defs::PosT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*buf).b_p_ma } == 0 {
+        // The original's `emsg(e_modifiable)` is omitted under this
+        // crate's established message-display policy.
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { parse_marker(&*wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let markers = unsafe { FOLD_MARKERS.get_mut() }
+        .clone()
+        .expect("fold_create_markers: parse_marker just ran");
+    // SAFETY: forwarded from this function's own safety doc.
+    let fmr = unsafe { (*wp).w_onebuf_opt.wo_fmr.clone() }.unwrap_or_default();
+    let startmarker = fmr[..markers.start_len.min(fmr.len())].to_vec();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_add_marker(buf, start.lnum, &startmarker) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_add_marker(buf, end.lnum, &markers.end) };
+
+    // Update both changes here, to avoid all folds after the start
+    // being changed when the start marker is inserted and the end
+    // isn't.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::change::changed_lines(&mut *buf, start.lnum, 0, end.lnum, 0, false) };
+
+    // fold_add_marker may not actually change start and/or end if
+    // u_save could not save the buffer line, but the notification is
+    // sent anyway since it does no harm.
+    let num_changed = crate::pos_defs::LinenrT::from(1) + end.lnum - start.lnum;
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::buffer_updates::buf_updates_send_changes(
+        unsafe { &mut *buf },
+        start.lnum,
+        num_changed as i64,
+        num_changed as i64,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3986,6 +4045,121 @@ mod tests {
             unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 3) },
             b"inner end }}}\0"
         );
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_create_markers_writes_both_markers_into_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"alpha", b"beta", b"gamma"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            fold_create_markers(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            );
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"alpha{{{\0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) }, b"beta}}}\0");
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 3) },
+            b"gamma\0",
+            "lines outside the range are untouched"
+        );
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_create_markers_does_nothing_when_the_buffer_is_not_modifiable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"alpha", b"beta"], b"");
+        buf.b_p_ma = 0;
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            fold_create_markers(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            );
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"alpha\0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) }, b"beta\0");
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_create_markers_round_trips_with_delete_fold_markers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"alpha", b"beta"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            fold_create_markers(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            );
+            let mut fp = FoldT { fd_top: 1, fd_len: 2, ..Default::default() };
+            delete_fold_markers(win_ptr, &mut fp, false, 0);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"alpha\0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) }, b"beta\0");
         unsafe { *FOLD_MARKERS.get_mut() = None };
         close_indent_level_fixture(buf);
     }
