@@ -196,6 +196,55 @@ pub unsafe fn diff_alloc_new(
     dnew
 }
 
+/// Remove `buf` from every tab page's list of diff buffers
+/// (`diff_buf_delete`).
+///
+/// Each tab page that held the buffer has its diff list marked
+/// outdated. For the CURRENT tab page a redraw is also requested, but
+/// deliberately deferred (`need_diff_redraw`) rather than done
+/// immediately: more may still change, and the buffer state is
+/// invalid right now.
+///
+/// As elsewhere in this crate, the original's `FOR_ALL_TABS(tp)` is
+/// walked as `GLOBALS.first_tabpage`/`tp_next`.
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain must consist of
+/// valid, live `TabpageT` pointers, and `GLOBALS.curwin` must be
+/// valid when the current tab page is reached.
+pub unsafe fn diff_buf_delete(buf: *mut crate::buffer_defs::BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curtab = g.curtab;
+    let curwin = g.curwin;
+    let mut tp = g.first_tabpage;
+
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*tp).tp_next };
+        let i = diff_buf_idx(buf, tp);
+        if i != crate::buffer_defs::DB_COUNT {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                (*tp).tp_diffbuf[i] = std::ptr::null_mut();
+                (*tp).tp_diff_invalid = 1;
+            };
+
+            if std::ptr::eq(tp, curtab) {
+                // Don't redraw right away, more might change or the
+                // buffer state is invalid right now.
+                // SAFETY: plain GlobalCell write.
+                unsafe { *NEED_DIFF_REDRAW.get_mut() = true };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    crate::drawscreen::redraw_later(curwin, crate::drawscreen::UPD_VALID);
+                };
+            }
+        }
+        tp = next;
+    }
+}
+
 /// Unlink and free diff block `dp` from `tp`'s chain, returning the
 /// block that followed it (`diff_free`).
 ///
@@ -771,6 +820,116 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- diff_buf_delete ---
+
+    #[test]
+    fn diff_buf_delete_clears_the_slot_and_marks_the_list_outdated() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr: *mut BufT = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[2] = buf_ptr;
+        let tp_ptr: *mut crate::buffer_defs::TabpageT = &mut tp;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc, pw) = (g.first_tabpage, g.curtab, g.curwin);
+        g.first_tabpage = tp_ptr;
+        g.curtab = tp_ptr;
+        g.curwin = &mut win;
+        let prev_redraw = unsafe { *NEED_DIFF_REDRAW.get_mut() };
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = false };
+
+        unsafe { diff_buf_delete(buf_ptr) };
+
+        assert!(unsafe { (*tp_ptr).tp_diffbuf[2] }.is_null());
+        assert_ne!(unsafe { (*tp_ptr).tp_diff_invalid }, 0);
+        assert!(
+            unsafe { *NEED_DIFF_REDRAW.get_mut() },
+            "the current tab page defers a redraw"
+        );
+
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = prev_redraw };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = pf;
+        g.curtab = pc;
+        g.curwin = pw;
+    }
+
+    #[test]
+    fn diff_buf_delete_skips_tab_pages_that_never_held_the_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut other = BufT::default();
+        let buf_ptr: *mut BufT = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut other;
+        let tp_ptr: *mut crate::buffer_defs::TabpageT = &mut tp;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc, pw) = (g.first_tabpage, g.curtab, g.curwin);
+        g.first_tabpage = tp_ptr;
+        g.curtab = tp_ptr;
+        g.curwin = &mut win;
+        let prev_redraw = unsafe { *NEED_DIFF_REDRAW.get_mut() };
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = false };
+
+        unsafe { diff_buf_delete(buf_ptr) };
+
+        assert!(!unsafe { (*tp_ptr).tp_diffbuf[0] }.is_null(), "left alone");
+        assert_eq!(unsafe { (*tp_ptr).tp_diff_invalid }, 0);
+        assert!(!unsafe { *NEED_DIFF_REDRAW.get_mut() }, "no redraw requested");
+
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = prev_redraw };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = pf;
+        g.curtab = pc;
+        g.curwin = pw;
+    }
+
+    #[test]
+    fn diff_buf_delete_walks_every_tab_page_but_defers_redraw_only_for_curtab() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr: *mut BufT = &mut buf;
+        let mut win = crate::buffer_defs::WinT::default();
+
+        let mut second = crate::buffer_defs::TabpageT::default();
+        second.tp_diffbuf[1] = buf_ptr;
+        let second_ptr: *mut crate::buffer_defs::TabpageT = &mut second;
+        let mut first = crate::buffer_defs::TabpageT::default();
+        first.tp_diffbuf[0] = buf_ptr;
+        first.tp_next = second_ptr;
+        let first_ptr: *mut crate::buffer_defs::TabpageT = &mut first;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc, pw) = (g.first_tabpage, g.curtab, g.curwin);
+        g.first_tabpage = first_ptr;
+        // Only the SECOND tab page is current.
+        g.curtab = second_ptr;
+        g.curwin = &mut win;
+        let prev_redraw = unsafe { *NEED_DIFF_REDRAW.get_mut() };
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = false };
+
+        unsafe { diff_buf_delete(buf_ptr) };
+
+        // Both tab pages lost the buffer...
+        assert!(unsafe { (*first_ptr).tp_diffbuf[0] }.is_null());
+        assert!(unsafe { (*second_ptr).tp_diffbuf[1] }.is_null());
+        assert_ne!(unsafe { (*first_ptr).tp_diff_invalid }, 0);
+        assert_ne!(unsafe { (*second_ptr).tp_diff_invalid }, 0);
+        // ...and the redraw came from the current one.
+        assert!(unsafe { *NEED_DIFF_REDRAW.get_mut() });
+
+        unsafe { *NEED_DIFF_REDRAW.get_mut() = prev_redraw };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.first_tabpage = pf;
+        g.curtab = pc;
+        g.curwin = pw;
+    }
 
     // --- diff_free ---
 
