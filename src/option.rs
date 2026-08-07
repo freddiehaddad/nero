@@ -6480,6 +6480,46 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'lisp'` option value (`did_set_lisp`).
+///
+/// Changing `'lisp'` includes/excludes `-` in the keyword characters,
+/// so the buffer's character table is rebuilt. Errors are ignored,
+/// exactly as the original does.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call.
+pub unsafe fn did_set_lisp(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::charset::buf_init_chartab(&mut *buf_ptr, false) };
+    None
+}
+
+/// Process the updated `'wrap'` option value (`did_set_wrap`).
+///
+/// Only ONE of the two scroll offsets is reset, depending on the new
+/// value: a wrapped window cannot be scrolled horizontally (so
+/// `w_leftcol` goes), and an unwrapped one has no partially-shown
+/// first line (so `w_skipcol` goes). The other is deliberately left
+/// alone, matching the original.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_wrap(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if (*win_ptr).w_onebuf_opt.wo_wrap != 0 {
+            (*win_ptr).w_leftcol = 0;
+        } else {
+            (*win_ptr).w_skipcol = 0;
+        }
+    }
+    None
+}
+
 /// Process the updated `'hlsearch'` option value (`did_set_hlsearch`).
 ///
 /// Setting *or* resetting `'hlsearch'` clears the "temporarily
@@ -6621,6 +6661,72 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn did_set_wrap_resets_only_the_relevant_scroll_offset() {
+        // A wrapped window cannot scroll horizontally, so w_leftcol
+        // goes; an unwrapped one has no partially-shown first line, so
+        // w_skipcol goes. The OTHER is deliberately left alone.
+        let mut win = crate::buffer_defs::WinT {
+            w_leftcol: 7,
+            w_skipcol: 9,
+            ..crate::buffer_defs::WinT::default()
+        };
+        win.w_onebuf_opt.wo_wrap = 1;
+        let mut args = fold_args(crate::option_defs::OptIndex::Wrap, &mut win);
+
+        assert_eq!(unsafe { did_set_wrap(&mut args) }, None);
+        assert_eq!(win.w_leftcol, 0);
+        assert_eq!(win.w_skipcol, 9, "w_skipcol must be untouched when wrapping");
+
+        let mut win = crate::buffer_defs::WinT {
+            w_leftcol: 7,
+            w_skipcol: 9,
+            ..crate::buffer_defs::WinT::default()
+        };
+        win.w_onebuf_opt.wo_wrap = 0;
+        let mut args = fold_args(crate::option_defs::OptIndex::Wrap, &mut win);
+
+        assert_eq!(unsafe { did_set_wrap(&mut args) }, None);
+        assert_eq!(win.w_skipcol, 0);
+        assert_eq!(win.w_leftcol, 7, "w_leftcol must be untouched when not wrapping");
+    }
+
+    #[test]
+    fn did_set_lisp_rebuilds_the_buffers_chartab() {
+        // Changing 'lisp' includes/excludes '-' in the keyword
+        // characters, which is what rebuilding b_chartab achieves.
+        // A default BufT has an empty 'iskeyword', so '-' being
+        // present is attributable to the lisp branch alone.
+        //
+        // Asserts on b_chartab directly (same bit layout set_chartab
+        // writes) rather than through vim_iswordc_buf, which resolves
+        // sub-0x100 characters via the GLOBAL chartab and so would not
+        // observe this buffer-local change at all.
+        const DASH: u32 = b'-' as u32;
+        let dash_set = |buf: &crate::buffer_defs::BufT| {
+            buf.b_chartab[(DASH >> 6) as usize] & (1u64 << (DASH & 0x3f)) != 0
+        };
+
+        let mut buf = crate::buffer_defs::BufT { b_p_lisp: 1, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Lisp,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_lisp(&mut args) }, None);
+        assert!(dash_set(&buf), "'lisp' must make '-' a keyword character");
+
+        // With 'lisp' off it must NOT be added.
+        let mut buf = crate::buffer_defs::BufT { b_p_lisp: 0, ..Default::default() };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Lisp,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_lisp(&mut args) }, None);
+        assert!(!dash_set(&buf));
     }
 
     #[test]
