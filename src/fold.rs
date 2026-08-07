@@ -2805,6 +2805,77 @@ pub unsafe fn delete_fold_markers(
     };
 }
 
+/// Append a fold marker to the end of line `lnum`, wrapping it in
+/// `'commentstring'` when that is set and the line is not already
+/// inside an unclosed comment (`foldAddMarker`).
+///
+/// # Safety
+/// Same as [`fold_del_marker`].
+pub unsafe fn fold_add_marker(
+    buf: *mut crate::buffer_defs::BufT,
+    lnum: crate::pos_defs::LinenrT,
+    marker: &[u8],
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let cms = unsafe { (*buf).b_p_cms.clone() }.unwrap_or_default();
+    let cms_end = cms.iter().position(|&c| c == 0).unwrap_or(cms.len());
+    let cms = &cms[..cms_end];
+    let pct = cms.windows(2).position(|w| w == b"%s");
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum) };
+    // ml_get_buf hands back the trailing NUL; the marker goes before
+    // it, so measure the text without it.
+    let line_len = line.iter().position(|&c| c == 0).unwrap_or(line.len());
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::undo::u_save(lnum - 1, lnum + 1) } != crate::vim_defs::OK {
+        return;
+    }
+
+    // Check whether the line ends with an unclosed comment.
+    // SAFETY: forwarded from this function's own safety doc.
+    let (_, line_is_comment) = unsafe { crate::ops::skip_comment(&line[..line_len], false, false) };
+
+    let mut newline = line[..line_len].to_vec();
+    let added = match pct {
+        // Append the marker to the end of the line.
+        None => {
+            newline.extend_from_slice(marker);
+            marker.len()
+        }
+        Some(_) if line_is_comment => {
+            newline.extend_from_slice(marker);
+            marker.len()
+        }
+        Some(p) => {
+            // Wrap the marker in 'commentstring', in place of its
+            // "%s".
+            newline.extend_from_slice(&cms[..p]);
+            newline.extend_from_slice(marker);
+            newline.extend_from_slice(&cms[p + 2..]);
+            marker.len() + cms.len() - 2
+        }
+    };
+    newline.push(0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let _ = unsafe { crate::memline::ml_replace_buf_len(&mut *buf, lnum, &newline) };
+    if added != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::extmark::extmark_splice_cols(
+                &mut *buf,
+                lnum - 1,
+                line_len as crate::pos_defs::ColnrT,
+                0,
+                added as crate::pos_defs::ColnrT,
+                crate::extmark_defs::ExtmarkOp::Undo,
+            )
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3917,6 +3988,84 @@ mod tests {
         );
         unsafe { *FOLD_MARKERS.get_mut() = None };
         close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_add_marker_wraps_the_marker_in_commentstring() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: with commentstring
+        // "/*%s*/" and the default 'foldmarker', zf over two lines
+        // yields "alpha/*{{{*/" and "beta/*}}}*/".
+        let mut buf = del_marker_fixture(&[b"alpha", b"beta"], b"/*%s*/");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { add_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+        unsafe { add_marker_with_curbuf(buf_ptr, 2, b"}}}") };
+
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) },
+            b"alpha/*{{{*/\0"
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) },
+            b"beta/*}}}*/\0"
+        );
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_add_marker_appends_plainly_without_a_commentstring() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"alpha"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+
+        unsafe { add_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) },
+            b"alpha{{{\0"
+        );
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_add_marker_round_trips_with_fold_del_marker() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Adding then deleting a marker must restore the line, both
+        // with and without a 'commentstring' wrapper.
+        for cms in [b"".as_ref(), b"/*%s*/"] {
+            let mut buf = del_marker_fixture(&[b"alpha"], cms);
+            let buf_ptr: *mut BufT = &mut *buf;
+
+            unsafe { add_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+            unsafe { del_marker_with_curbuf(buf_ptr, 1, b"{{{") };
+
+            assert_eq!(
+                unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) },
+                b"alpha\0",
+                "cms {cms:?}"
+            );
+            close_indent_level_fixture(buf);
+        }
+    }
+
+    /// Runs `fold_add_marker` with `curbuf` and `curwin` installed,
+    /// which `u_save` requires, restoring both afterwards.
+    unsafe fn add_marker_with_curbuf(buf: *mut BufT, lnum: crate::pos_defs::LinenrT, marker: &[u8]) {
+        unsafe {
+            let mut win = WinT {
+                w_buffer: buf,
+                ..Default::default()
+            };
+            let g = crate::globals::GLOBALS.get_mut();
+            let (prev_buf, prev_win) = (g.curbuf, g.curwin);
+            g.curbuf = buf;
+            g.curwin = &mut win as *mut WinT;
+            fold_add_marker(buf, lnum, marker);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = prev_buf;
+            g.curwin = prev_win;
+        }
     }
 
     /// Runs `fold_del_marker` with `curbuf` and `curwin` installed,
