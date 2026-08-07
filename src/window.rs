@@ -1519,6 +1519,36 @@ pub unsafe fn global_stl_height() -> i32 {
     }
 }
 
+/// Remember every window's current scroll position and size, so a
+/// later comparison can tell what moved
+/// (`snapshot_windows_scroll_size`).
+///
+/// As elsewhere in this crate, the original's
+/// `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is walked as
+/// `GLOBALS.firstwin`/`w_next`.
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid,
+/// live `WinT` pointers.
+pub unsafe fn snapshot_windows_scroll_size() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*wp).w_next };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*wp).w_last_topline = (*wp).w_topline;
+            (*wp).w_last_topfill = (*wp).w_topfill;
+            (*wp).w_last_leftcol = (*wp).w_leftcol;
+            (*wp).w_last_skipcol = (*wp).w_skipcol;
+            (*wp).w_last_width = (*wp).w_width;
+            (*wp).w_last_height = (*wp).w_height;
+        };
+        wp = next;
+    }
+}
+
 /// Rows available to the window layout: everything except the command
 /// line, the tab line and a global status line (`ROWS_AVAIL`, a macro
 /// in the original).
@@ -5144,6 +5174,66 @@ mod tests {
         let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
         let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
         assert_eq!(unsafe { tabline_height() }, 0);
+    }
+
+    // --- snapshot_windows_scroll_size ---
+
+    #[test]
+    fn snapshot_windows_scroll_size_copies_every_window_in_the_chain() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut second = crate::buffer_defs::WinT {
+            w_topline: 9,
+            w_topfill: 2,
+            w_leftcol: 3,
+            w_skipcol: 4,
+            w_width: 40,
+            w_height: 12,
+            ..Default::default()
+        };
+        let second_ptr: *mut WinT = &mut second;
+        let mut first = crate::buffer_defs::WinT {
+            w_topline: 5,
+            w_topfill: 1,
+            w_leftcol: 6,
+            w_skipcol: 7,
+            w_width: 80,
+            w_height: 24,
+            w_next: second_ptr,
+            ..Default::default()
+        };
+        let first_ptr: *mut WinT = &mut first;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = first_ptr;
+
+        unsafe { snapshot_windows_scroll_size() };
+
+        unsafe {
+            assert_eq!((*first_ptr).w_last_topline, 5);
+            assert_eq!((*first_ptr).w_last_topfill, 1);
+            assert_eq!((*first_ptr).w_last_leftcol, 6);
+            assert_eq!((*first_ptr).w_last_skipcol, 7);
+            assert_eq!((*first_ptr).w_last_width, 80);
+            assert_eq!((*first_ptr).w_last_height, 24);
+            // The second window in the chain is reached too.
+            assert_eq!((*second_ptr).w_last_topline, 9);
+            assert_eq!((*second_ptr).w_last_width, 40);
+            assert_eq!((*second_ptr).w_last_height, 12);
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+    }
+
+    #[test]
+    fn snapshot_windows_scroll_size_on_an_empty_window_list_is_a_noop() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = std::ptr::null_mut();
+
+        unsafe { snapshot_windows_scroll_size() };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
     }
 
     // --- rows_avail / win_init_size / prevwin_curwin ---
