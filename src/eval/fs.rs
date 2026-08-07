@@ -19,8 +19,8 @@
 //! `getftime()`/`getftype()` (via the already-existing
 //! [`crate::os::fs::os_fileinfo`]/[`crate::os::fs::os_fileinfo_link`]
 //! narrow-subset `FileInfo` - see that module's own doc comment for
-//! what's NOT modeled; `getfperm()`, needing the still-deferred
-//! `os_getperm` permission bits, is not translated here), `mkdir()`
+//! what's NOT modeled), `getfperm()` (via
+//! [`crate::os::fs::os_getperm`]), `mkdir()`
 //! for both its plain, single-directory case (via the already-existing
 //! [`crate::os::fs::os_mkdir`]) and the `"p"` recursive-create flag
 //! (via [`crate::os::fs::os_mkdir_recurse`]) - `"D"`/`"R"`
@@ -172,6 +172,53 @@ pub(crate) fn f_getftype(argvars: &[TypvalT], rettv: &mut TypvalT) {
         .and_then(crate::os::fs::os_fileinfo_link)
         .map(|info| crate::os::fs::os_fileinfo_type_str(&info));
     rettv.value = TypvalValue::String(type_str.map(|s| s.as_bytes().to_vec()));
+}
+
+/// `getfperm({fname})` - the file's permissions as a 9-character
+/// `"rwxrwxrwx"`-style string (`f_getfperm`, `eval/fs.c`).
+///
+/// Each of the nine positions shows its flag letter when the
+/// corresponding bit is set and `-` when it is not. Returns a null
+/// string when the file cannot be stat'd at all.
+///
+/// Windows has no genuine Unix mode bits;
+/// [`crate::os::fs::os_getperm`] reports the synthesized value libuv
+/// itself produces there, so this reports the same.
+pub(crate) fn f_getfperm(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let filename = crate::eval::typval::tv_get_string(&argvars[0]);
+    let file_perm = match bytes_to_path(&filename) {
+        Some(path) => crate::os::fs::os_getperm(path),
+        // A non-UTF8 name cannot be turned into a Path at all (this
+        // crate's established limitation); report it the same way the
+        // original reports an unstattable file.
+        None => -1,
+    };
+
+    rettv.value = if file_perm >= 0 {
+        const FLAGS: &[u8; 3] = b"rwx";
+        let mut perm = *b"---------";
+        for (i, slot) in perm.iter_mut().enumerate() {
+            if file_perm & (1 << (8 - i)) != 0 {
+                *slot = FLAGS[i % 3];
+            }
+        }
+        TypvalValue::String(Some(perm.to_vec()))
+    } else {
+        TypvalValue::String(None)
+    };
+}
+
+/// `tempname()` - a unique name usable for a temp file (`f_tempname`,
+/// `eval/fs.c`).
+///
+/// The file itself is NOT created. Returns a null string only when
+/// Nvim cannot create its own temp directory at all.
+///
+/// # Safety
+/// Forwarded from [`crate::fileio::vim_tempname`]'s own safety doc.
+pub(crate) unsafe fn f_tempname(_argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    rettv.value = TypvalValue::String(unsafe { crate::fileio::vim_tempname() });
 }
 
 /// Per-entry filter for [`f_readdir`] (`readdir_checkitem`,
@@ -2047,5 +2094,57 @@ mod tests {
         let TypvalValue::List(l) = rettv.value else { unreachable!() };
         unsafe { crate::eval::typval::tv_list_unref(l) };
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // --- f_getfperm / f_tempname ---
+
+    #[test]
+    fn getfperm_of_a_real_file_is_nine_flag_characters() {
+        // Cross-verified against real nvim (Windows): getfperm() on a
+        // plain writable file reports "rw-rw-rw-".
+        let path = std::env::temp_dir().join("nero_test_getfperm.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let mut rettv = TypvalT::default();
+        f_getfperm(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+
+        let TypvalValue::String(Some(perm)) = &rettv.value else {
+            panic!("expected a non-null String, got {:?}", rettv.value)
+        };
+        assert_eq!(perm.len(), 9);
+        // Every position is either its own flag letter or '-'.
+        for (i, &b) in perm.iter().enumerate() {
+            assert!(b == b'-' || b == b"rwx"[i % 3], "bad flag {} at {i}", b as char);
+        }
+        // The owner-read bit is always set for a file we just wrote.
+        assert_eq!(perm[0], b'r');
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn getfperm_of_a_missing_file_is_a_null_string() {
+        // Cross-verified against real nvim: an unstattable file yields
+        // an empty (null) string.
+        let mut rettv = TypvalT::default();
+        f_getfperm(&[string(b"/no/such/file/here/nero-test")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn tempname_is_nonempty_unique_and_not_created() {
+        // Cross-verified against real nvim: tempname() is non-empty,
+        // differs between calls, and the file does NOT exist yet.
+        let _guard = globals_test_lock();
+
+        let mut first = TypvalT::default();
+        unsafe { f_tempname(&[], &mut first) };
+        let mut second = TypvalT::default();
+        unsafe { f_tempname(&[], &mut second) };
+
+        let TypvalValue::String(Some(a)) = &first.value else { panic!("expected a String") };
+        let TypvalValue::String(Some(b)) = &second.value else { panic!("expected a String") };
+        assert!(!a.is_empty());
+        assert_ne!(a, b);
+        assert!(!std::path::Path::new(std::str::from_utf8(a).unwrap()).exists());
     }
 }
