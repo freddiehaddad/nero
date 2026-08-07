@@ -7563,18 +7563,18 @@ unsafe fn f_argv(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// `funcs.c`), via the already-existing
 /// `crate::os::stdpaths::get_xdg_home`.
 ///
-/// Only the 5 single-path variants (`"config"`/`"data"`/`"cache"`/
-/// `"state"`/`"log"`) are modeled - `"run"` needs `vim_mktempdir` (a
-/// persistent session-lifetime temp-directory subsystem) and
-/// `"config_dirs"`/`"data_dirs"` need `xdg_remove_duplicate` plus a
-/// real `List`-returning `get_xdg_var_list`, neither yet translated;
-/// both `unimplemented!()` if requested. An unrecognized `{what}`
-/// value leaves `rettv` at its default null string - the original's
-/// own `semsg` for this case is omitted (message display, not
-/// tractable).
+/// The 5 single-path variants (`"config"`/`"data"`/`"cache"`/
+/// `"state"`/`"log"`) return a string; `"config_dirs"`/`"data_dirs"`
+/// return a `List`, via [`get_xdg_var_list`]. `"run"` still needs
+/// `vim_mktempdir` (a persistent session-lifetime temp-directory
+/// subsystem) and `unimplemented!()`s if requested. An unrecognized
+/// `{what}` value leaves `rettv` at its default null string - the
+/// original's own `semsg` for this case is omitted (message display,
+/// not tractable).
 ///
 /// # Safety
-/// Forwarded from `crate::os::stdpaths::get_xdg_home`'s own safety doc.
+/// Forwarded from `crate::os::stdpaths::get_xdg_home`'s and
+/// [`get_xdg_var_list`]'s own safety docs.
 unsafe fn f_stdpath(argvars: &[TypvalT], rettv: &mut TypvalT) {
     use crate::os::stdpaths::{concat_fnames, get_xdg_home, XdgVarType};
 
@@ -7592,13 +7592,53 @@ unsafe fn f_stdpath(argvars: &[TypvalT], rettv: &mut TypvalT) {
         b"state" => unsafe { get_xdg_home(XdgVarType::StateHome) },
         b"log" => unsafe { get_xdg_home(XdgVarType::StateHome) }.map(|base| concat_fnames(base, b"logs")),
         b"run" => unimplemented!("f_stdpath: 'run' needs vim_mktempdir, not yet translated"),
-        b"config_dirs" | b"data_dirs" => {
-            unimplemented!("f_stdpath: a real List-returning get_xdg_var_list is not yet translated")
+        b"config_dirs" => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { get_xdg_var_list(XdgVarType::ConfigDirs, rettv) };
+            return;
+        }
+        b"data_dirs" => {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { get_xdg_var_list(XdgVarType::DataDirs, rettv) };
+            return;
         }
         _ => None,
     };
 
     rettv.value = TypvalValue::String(dir);
+}
+
+/// Set `rettv` to a `List` of the `xdg` directory list's entries, each
+/// with the application name appended (`get_xdg_var_list`).
+///
+/// The original walks the separator-joined value with `vim_env_iter`,
+/// which skips empty entries; the `split` here reproduces that
+/// directly. An unset variable still yields an EMPTY list, not a null
+/// one, matching the original's own "allocate first, then bail" order.
+///
+/// # Safety
+/// Forwarded from `crate::os::stdpaths::stdpaths_get_xdg_var`'s own
+/// safety doc, plus the usual `tv_list_*` contract.
+unsafe fn get_xdg_var_list(xdg: crate::os::stdpaths::XdgVarType, rettv: &mut TypvalT) {
+    let list = crate::eval::typval::tv_list_alloc(-1);
+    rettv.value = TypvalValue::List(list);
+    // SAFETY: freshly allocated above.
+    unsafe { crate::eval::typval::tv_list_ref(list) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(dirs) = (unsafe { crate::os::stdpaths::stdpaths_get_xdg_var(xdg) }) else {
+        return;
+    };
+    let appname = crate::os::stdpaths::get_appname(false);
+    let sep = crate::os::os_defs::ENV_SEPCHAR as u8;
+    for dir in dirs.split(|&b| b == sep) {
+        if dir.is_empty() {
+            continue;
+        }
+        let with_appname = crate::os::stdpaths::concat_fnames(dir.to_vec(), &appname);
+        // SAFETY: `list` is live and owned by `rettv`.
+        unsafe { crate::eval::typval::tv_list_append_string(list, Some(&with_appname)) };
+    }
 }
 
 #[cfg(test)]
@@ -17576,10 +17616,66 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "get_xdg_var_list")]
-    fn stdpath_config_dirs_is_unimplemented() {
+    fn stdpath_config_dirs_returns_a_list() {
+        // Cross-verified against real nvim: stdpath('config_dirs')
+        // has type 3 (List). On a platform whose xdg_default is None
+        // for this variant the list is empty, which real nvim also
+        // reports there.
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_stdpath(&[string(b"config_dirs")], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert!(!l.is_null());
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn stdpath_data_dirs_returns_a_list() {
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"data_dirs")], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert!(!l.is_null());
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn get_xdg_var_list_appends_the_appname_to_every_entry() {
+        // On unix these variants have a real xdg_default, so the
+        // splitting and appname-appending can be pinned against it
+        // WITHOUT mutating process-global environment variables
+        // (std::env::set_var races any concurrent env read in other
+        // test threads, so it is avoided here).
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
+        let appname = crate::os::stdpaths::get_appname(false);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_stdpath(&[string(b"data_dirs")], &mut rettv) };
+
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        unsafe {
+            let len = crate::eval::typval::tv_list_len(l);
+            assert!(len > 0, "the unix default lists at least one directory");
+            for i in 0..len {
+                let item = crate::eval::typval::tv_list_find(l, i);
+                let TypvalValue::String(Some(s)) = &(*item).li_tv.value else {
+                    panic!("expected a String")
+                };
+                assert!(
+                    s.ends_with(&appname),
+                    "every entry gains the appname: {:?}",
+                    String::from_utf8_lossy(s)
+                );
+                assert!(
+                    !s.contains(&(crate::os::os_defs::ENV_SEPCHAR as u8)),
+                    "entries are split apart, not left joined"
+                );
+            }
+            crate::eval::typval::tv_list_unref(l);
+        }
     }
 
     // --- f_getpos / f_getcharpos / f_getcurpos / f_getcursorcharpos ---
