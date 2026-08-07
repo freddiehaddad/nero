@@ -6480,6 +6480,36 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'modifiable'` option value
+/// (`did_set_modifiable`).
+///
+/// Changing `'modifiable'` only affects what the window title shows.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS` (via [`redraw_titles`]).
+pub unsafe fn did_set_modifiable(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { redraw_titles() };
+    None
+}
+
+/// Process the updated `'endoffile'`/`'endofline'`/`'fixendofline'`/
+/// `'bomb'` option value (`did_set_eof_eol_fixeol_bomb`).
+///
+/// One shared callback for all four, exactly as upstream registers it:
+/// each of them only affects what the window title and tab page text
+/// show.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS` (via [`redraw_titles`]).
+pub unsafe fn did_set_eof_eol_fixeol_bomb(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { redraw_titles() };
+    None
+}
+
 /// Process the updated `'modified'` option value (`did_set_modified`).
 ///
 /// When the buffer is being marked UNmodified, its current
@@ -6736,6 +6766,40 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn modifiable_and_eof_eol_fixeol_bomb_both_request_a_title_redraw() {
+        // Both are pure "the title text may have changed" callbacks,
+        // so each must set both redraw flags and touch nothing else.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_title, prev_tabline) = (g.need_maketitle, g.redraw_tabline);
+
+        for which in 0..2 {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.need_maketitle = false;
+            g.redraw_tabline = false;
+
+            let mut args = crate::option_defs::OptsetT {
+                os_idx: crate::option_defs::OptIndex::Modifiable,
+                ..Default::default()
+            };
+            let r = if which == 0 {
+                unsafe { did_set_modifiable(&mut args) }
+            } else {
+                unsafe { did_set_eof_eol_fixeol_bomb(&mut args) }
+            };
+            assert_eq!(r, None);
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            assert!(g.need_maketitle);
+            assert!(g.redraw_tabline);
+        }
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.need_maketitle = prev_title;
+        g.redraw_tabline = prev_tabline;
     }
 
     #[test]
