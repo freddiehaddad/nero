@@ -6480,6 +6480,50 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'langnoremap'` option value
+/// (`did_set_langnoremap`).
+///
+/// `'langnoremap'` and `'langremap'` are exact inverses of one
+/// another, so setting either updates the other. This pair of
+/// callbacks is what keeps them consistent.
+///
+/// # Safety
+/// Mutates `crate::option_vars::OPTION_VARS`.
+pub unsafe fn did_set_langnoremap(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    opts.p_lrm = i32::from(opts.p_lnr == 0);
+    None
+}
+
+/// Process the updated `'langremap'` option value
+/// (`did_set_langremap`).
+///
+/// The mirror image of [`did_set_langnoremap`]; see its doc comment.
+///
+/// # Safety
+/// Mutates `crate::option_vars::OPTION_VARS`.
+pub unsafe fn did_set_langremap(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    opts.p_lnr = i32::from(opts.p_lrm == 0);
+    None
+}
+
+/// Process the updated `'title'` or `'icon'` option value
+/// (`did_set_title_icon`).
+///
+/// One shared callback for both, exactly as upstream registers it.
+///
+/// # Safety
+/// Forwarded from [`did_set_title`]'s own safety doc.
+pub unsafe fn did_set_title_icon(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    did_set_title();
+    None
+}
+
 /// Process the updated `'smoothscroll'` option value
 /// (`did_set_smoothscroll`).
 ///
@@ -7004,6 +7048,63 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn langremap_and_langnoremap_stay_exact_inverses() {
+        // Cross-verified against real nvim:
+        //   set langremap     -> langremap 1, langnoremap 0
+        //   set nolangremap   -> langremap 0, langnoremap 1
+        //   set langnoremap   -> langnoremap 1, langremap 0
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_lnr, prev_lrm) = (opts.p_lnr, opts.p_lrm);
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Langremap,
+            ..Default::default()
+        };
+
+        // Setting 'langremap' clears 'langnoremap'.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lrm = 1;
+        assert_eq!(unsafe { did_set_langremap(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lnr, 0);
+
+        // Clearing it sets 'langnoremap'.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lrm = 0;
+        assert_eq!(unsafe { did_set_langremap(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lnr, 1);
+
+        // And the mirror direction.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lnr = 1;
+        assert_eq!(unsafe { did_set_langnoremap(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lrm, 0);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lnr = 0;
+        assert_eq!(unsafe { did_set_langnoremap(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_lrm, 1);
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_lnr = prev_lnr;
+        opts.p_lrm = prev_lrm;
+    }
+
+    #[test]
+    fn did_set_title_icon_delegates_to_did_set_title() {
+        // Shares one callback for both 'title' and 'icon'. Must not
+        // panic given `starting`'s own real default (see
+        // did_set_title's doc comment).
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.starting;
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = crate::globals::NO_SCREEN;
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Title,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_title_icon(&mut args) }, None);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.starting = prev;
     }
 
     #[test]
