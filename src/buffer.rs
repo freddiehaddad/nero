@@ -586,6 +586,66 @@ pub unsafe fn buflist_findlnum(buf: &BufT) -> crate::pos_defs::LinenrT {
     unsafe { buflist_findfmark(buf) }.mark.lnum
 }
 
+/// Set the current window's cursor from the position remembered for
+/// `curbuf` (`buflist_getfpos`).
+///
+/// With `'startofline'` set the column is reset to 0; otherwise the
+/// remembered column is restored and validated. When `'jumpoptions'`
+/// contains `"view"` the saved view is restored too.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`curwin` must be valid, non-null pointers to live
+/// values. Forwarded from [`buflist_findfmark`],
+/// [`crate::cursor::check_cursor_lnum`],
+/// [`crate::cursor::check_cursor_col`] and
+/// [`crate::mark::mark_view_restore`]'s own safety docs.
+pub unsafe fn buflist_getfpos() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let fm = unsafe { buflist_findfmark(&*curbuf) };
+    let fpos = fm.mark;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_cursor.lnum = fpos.lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::check_cursor_lnum(curwin) };
+
+    // SAFETY: momentary read of a plain option global.
+    let p_sol = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sol;
+    if p_sol != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor.col = 0 };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor.col = fpos.col };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::check_cursor_col(curwin) };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*curwin).w_cursor.coladd = 0;
+            (*curwin).w_set_curswant = true;
+        };
+    }
+
+    // SAFETY: momentary read of a plain option global.
+    let jop_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.jop_flags;
+    if jop_flags & crate::option_vars::opt_jop_flag::VIEW != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::mark::mark_view_restore(Some(&fm)) };
+    }
+}
+
+/// Whether `buf` names the same file as `file_id` (`buf_same_file_id`).
+///
+/// A buffer with no valid file id never matches.
+#[must_use]
+pub fn buf_same_file_id(buf: &BufT, file_id: &crate::os::fs_defs::FileID) -> bool {
+    buf.file_id_valid && crate::os::fs::os_fileid_equal(&buf.file_id, file_id)
+}
+
 /// Look up buffer `fnum`'s own short file name and remembered line
 /// number (`buflist_name_nr`). Returns `Some((fname, lnum))` in place
 /// of the original's own `char **fname`/`linenr_T *lnum` out-
@@ -1268,6 +1328,126 @@ mod tests {
         unsafe {
             drop(Box::from_raw(wi));
         }
+    }
+
+    // --- buflist_getfpos / buf_same_file_id ---
+
+    /// A buffer whose remembered position for `win` is `(lnum, col)`.
+    /// Returns the leaked `WinInfo` so the caller can free it.
+    fn buf_with_remembered_pos(
+        win_ptr: *mut crate::buffer_defs::WinT,
+        lnum: crate::pos_defs::LinenrT,
+        col: crate::pos_defs::ColnrT,
+    ) -> (BufT, *mut crate::buffer_defs::WinInfo) {
+        let wi = Box::into_raw(Box::new(crate::buffer_defs::WinInfo {
+            wi_win: win_ptr,
+            wi_mark: crate::mark_defs::FmarkT {
+                mark: crate::pos_defs::PosT { lnum, col, coladd: 0 },
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        (BufT { b_wininfo: vec![wi], ..Default::default() }, wi)
+    }
+
+    #[test]
+    fn buflist_getfpos_restores_the_remembered_line_and_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let (mut buf, wi) = buf_with_remembered_pos(win_ptr, 1, 3);
+        // A REAL memline: check_cursor_col reads the line's own length
+        // through ml_get, so a bare ml_line_count would clamp col to 0.
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"abcdef\0") },
+            crate::vim_defs::OK
+        );
+        let buf_ptr = &mut buf as *mut BufT;
+        unsafe { (*win_ptr).w_buffer = buf_ptr };
+        let _cw = CurwinGuard::set(win_ptr);
+        let _cb = CurbufGuard::set(buf_ptr);
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_sol, prev_jop) = (ov.p_sol, ov.jop_flags);
+        ov.p_sol = 0;
+        ov.jop_flags = 0;
+
+        unsafe { buflist_getfpos() };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 1);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 3);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.coladd }, 0);
+        assert!(unsafe { (*win_ptr).w_set_curswant }, "'nostartofline' sets curswant");
+
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_sol = prev_sol;
+        ov.jop_flags = prev_jop;
+        unsafe {
+            drop(Box::from_raw(wi));
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn buflist_getfpos_with_startofline_resets_the_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+        let (mut buf, wi) = buf_with_remembered_pos(win_ptr, 1, 3);
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"abcdef\0") },
+            crate::vim_defs::OK
+        );
+        let buf_ptr = &mut buf as *mut BufT;
+        unsafe { (*win_ptr).w_buffer = buf_ptr };
+        let _cw = CurwinGuard::set(win_ptr);
+        let _cb = CurbufGuard::set(buf_ptr);
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_sol, prev_jop) = (ov.p_sol, ov.jop_flags);
+        ov.p_sol = 1;
+        ov.jop_flags = 0;
+
+        unsafe { buflist_getfpos() };
+
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 1);
+        assert_eq!(unsafe { (*win_ptr).w_cursor.col }, 0, "'startofline' wins");
+        assert!(
+            !unsafe { (*win_ptr).w_set_curswant },
+            "the 'startofline' branch never touches curswant"
+        );
+
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_sol = prev_sol;
+        ov.jop_flags = prev_jop;
+        unsafe {
+            drop(Box::from_raw(wi));
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn buf_same_file_id_needs_a_valid_id() {
+        let id = crate::os::fs_defs::FileID::default();
+        let invalid = BufT { file_id_valid: false, file_id: id, ..Default::default() };
+        assert!(!buf_same_file_id(&invalid, &id), "an invalid id never matches");
+
+        let valid = BufT { file_id_valid: true, file_id: id, ..Default::default() };
+        assert!(buf_same_file_id(&valid, &id));
+    }
+
+    #[test]
+    fn buf_same_file_id_rejects_a_different_id() {
+        let mut other = crate::os::fs_defs::FileID::default();
+        other.inode = other.inode.wrapping_add(1);
+        let buf = BufT {
+            file_id_valid: true,
+            file_id: crate::os::fs_defs::FileID::default(),
+            ..Default::default()
+        };
+        assert!(!buf_same_file_id(&buf, &other));
     }
 
     /// Points `GLOBALS.firstwin` at `firstwin` for the guard's
