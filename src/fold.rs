@@ -92,6 +92,16 @@ pub static DISABLE_FOLD_UPDATE: crate::globals::GlobalCell<i32> =
 pub static FOLD_CHANGED: crate::globals::GlobalCell<bool> =
     crate::globals::GlobalCell::new(false);
 
+/// Result flags reported by `setManualFold`/`setManualFoldWin`.
+pub mod done {
+    /// Nothing was found or changed (`DONE_NOTHING`).
+    pub const DONE_NOTHING: i32 = 0;
+    /// A fold was actually opened or closed (`DONE_ACTION`).
+    pub const DONE_ACTION: i32 = 1;
+    /// A fold was found at the given line (`DONE_FOLD`).
+    pub const DONE_FOLD: i32 = 2;
+}
+
 /// @return true if `'foldmethod'` is "manual" (`foldmethodIsManual`).
 #[must_use]
 pub fn foldmethod_is_manual(wp: &WinT) -> bool {
@@ -1460,6 +1470,278 @@ pub unsafe fn fold_adjust_visual() {
     }
 }
 
+/// Resolve a path of nested-fold indices to the fold it names.
+///
+/// Used in place of the original's own `fold_T *found` pointer, which
+/// it keeps across a descent into nested arrays and mutates
+/// afterwards - a raw pointer lineage this crate deliberately avoids
+/// where an index path expresses the same thing safely.
+fn fold_at_path<'a>(gap: &'a mut [FoldT], path: &[usize]) -> &'a mut FoldT {
+    let (first, rest) = path.split_first().expect("fold_at_path: empty path");
+    let mut fp = &mut gap[*first];
+    for idx in rest {
+        fp = &mut fp.fd_nested[*idx];
+    }
+    fp
+}
+
+/// Open or close the fold at `lnum` in window `wp`
+/// (`setManualFoldWin`).
+///
+/// Returns the line number of the next fold to try, so the repeat
+/// wrappers can walk forward, or `MAXLNUM` when there is none.
+///
+/// Folds that were following `'foldlevel'` are switched to manual
+/// control first, taking their current open/closed state from the
+/// level they sit at. Closing without `recurse` closes the *deepest*
+/// open fold containing the line, which is why the descent remembers
+/// the last fold it entered; opening opens the *topmost* closed one.
+///
+/// `donep` accumulates [`done::DONE_ACTION`]/[`done::DONE_FOLD`]. When
+/// it is `None` and this is the current window, a missing fold is
+/// reported to the user, matching the original.
+///
+/// # Safety
+/// Same as `crate::move::changed_window_setting`.
+pub unsafe fn set_manual_fold_win(
+    wp: *mut WinT,
+    mut lnum: crate::pos_defs::LinenrT,
+    opening: bool,
+    recurse: bool,
+    donep: Option<&mut i32>,
+) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *wp };
+    let fdl = win.w_onebuf_opt.wo_fdl;
+
+    let mut found_path: Option<Vec<usize>> = None;
+    let mut path: Vec<usize> = Vec::new();
+    let mut level = 0;
+    let mut use_level = false;
+    let mut found_fold = false;
+    let mut next = crate::pos_defs::MAXLNUM;
+    let mut off = 0;
+    let mut done = done::DONE_NOTHING;
+
+    checkupdate(win);
+
+    // Find the fold, open or close it.
+    loop {
+        let gap: &mut Vec<FoldT> = if path.is_empty() {
+            &mut win.w_folds
+        } else {
+            &mut fold_at_path(&mut win.w_folds, &path).fd_nested
+        };
+
+        let (found, idx) = fold_find(gap, lnum);
+        if !found {
+            // If there is a following fold, continue there next time.
+            if idx < gap.len() {
+                next = gap[idx].fd_top + off;
+            }
+            break;
+        }
+
+        // lnum is inside this fold.
+        found_fold = true;
+
+        // If there is a following fold, continue there next time.
+        if idx + 1 < gap.len() {
+            next = gap[idx + 1].fd_top + off;
+        }
+
+        // Change from level-dependent folding to manual.
+        if use_level || gap[idx].fd_flags == fd_flags::FD_LEVEL {
+            use_level = true;
+            gap[idx].fd_flags = if crate::types_defs::OptInt::from(level) >= fdl {
+                fd_flags::FD_CLOSED
+            } else {
+                fd_flags::FD_OPEN
+            };
+            for fp2 in &mut gap[idx].fd_nested {
+                fp2.fd_flags = fd_flags::FD_LEVEL;
+            }
+        }
+
+        // Simple case: close recursively means closing the fold.
+        if !opening && recurse {
+            if gap[idx].fd_flags != fd_flags::FD_CLOSED {
+                done |= done::DONE_ACTION;
+                gap[idx].fd_flags = fd_flags::FD_CLOSED;
+            }
+            break;
+        } else if gap[idx].fd_flags == fd_flags::FD_CLOSED {
+            // When opening, open topmost closed fold.
+            if opening {
+                gap[idx].fd_flags = fd_flags::FD_OPEN;
+                done |= done::DONE_ACTION;
+                if recurse {
+                    fold_open_nested(&mut gap[idx]);
+                }
+            }
+            break;
+        }
+
+        // Fold is open, check nested folds.
+        let fd_top = gap[idx].fd_top;
+        path.push(idx);
+        found_path = Some(path.clone());
+        lnum -= fd_top;
+        off += fd_top;
+        level += 1;
+    }
+
+    if found_fold {
+        // When closing and not recurse, close deepest open fold.
+        if !opening && let Some(fpath) = &found_path {
+            fold_at_path(&mut win.w_folds, fpath).fd_flags = fd_flags::FD_CLOSED;
+            done |= done::DONE_ACTION;
+        }
+        win.w_fold_manual = true;
+        if done & done::DONE_ACTION != 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::changed_window_setting(wp) };
+        }
+        done |= done::DONE_FOLD;
+    }
+    // The original's `emsg(e_nofold)` on the "no fold here" path is
+    // omitted, matching this crate's established policy of skipping
+    // message display where it changes no control flow (see
+    // `memfile.rs`'s own module doc for the same decision).
+
+    if let Some(donep) = donep {
+        *donep |= done;
+    }
+
+    next
+}
+
+/// Open or close the fold at `pos` in the current window, mirroring
+/// the operation into other diff-mode windows (`setManualFold`).
+///
+/// Returns the line number of the next fold to try, as
+/// [`set_manual_fold_win`] does.
+///
+/// # Deferred boundary
+/// The original also mirrors the operation into other diff-mode
+/// windows, which needs the `'scrollbind'` window option (`w_p_scb`),
+/// not yet a `WinT` field. The guard that reaches it is real and
+/// faithful as far as it goes - `foldmethodIsDiff(curwin)` - and is
+/// unreachable today, since `wo_fdm` is `None` for every window this
+/// crate can build, so `'foldmethod'` is never `"diff"`.
+///
+/// # Safety
+/// Same as [`set_manual_fold_win`]; also touches `GLOBALS.curwin`.
+pub unsafe fn set_manual_fold(
+    pos: crate::pos_defs::PosT,
+    opening: bool,
+    recurse: bool,
+    donep: Option<&mut i32>,
+) -> crate::pos_defs::LinenrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { foldmethod_is_diff(&*curwin) } {
+        unimplemented!(
+            "fold::set_manual_fold: mirroring into other diff-mode windows needs the \
+             'scrollbind' window option (w_p_scb), not yet a WinT field - unreachable \
+             while 'foldmethod' can never be \"diff\""
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_manual_fold_win(curwin, pos.lnum, opening, recurse, donep) }
+}
+
+/// Open or close the fold at `pos` `count` times
+/// (`setFoldRepeat`).
+///
+/// Stops early as soon as an iteration changes nothing, which is how
+/// `zo`/`zc` with a count stop at the outermost/innermost fold.
+///
+/// # Safety
+/// Same as [`set_manual_fold`].
+pub unsafe fn set_fold_repeat(pos: crate::pos_defs::PosT, count: i32, do_open: bool) {
+    for _ in 0..count {
+        let mut done = done::DONE_NOTHING;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_manual_fold(pos, do_open, false, Some(&mut done)) };
+        if done & done::DONE_ACTION == 0 {
+            // The original emits "E490: No fold found" here when the
+            // very first iteration found no fold at all; the message
+            // itself is omitted under this crate's established policy
+            // (it changes no control flow).
+            break;
+        }
+    }
+}
+
+/// Open the fold at `pos` in the current window, `count` times
+/// (`openFold`).
+///
+/// # Safety
+/// Same as [`set_fold_repeat`].
+pub unsafe fn open_fold(pos: crate::pos_defs::PosT, count: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_fold_repeat(pos, count, true) };
+}
+
+/// Close the fold at `pos` in the current window, `count` times
+/// (`closeFold`).
+///
+/// # Safety
+/// Same as [`set_fold_repeat`].
+pub unsafe fn close_fold(pos: crate::pos_defs::PosT, count: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_fold_repeat(pos, count, false) };
+}
+
+/// Open the fold at `pos` and everything nested inside it
+/// (`openFoldRecurse`).
+///
+/// # Safety
+/// Same as [`set_manual_fold`].
+pub unsafe fn open_fold_recurse(pos: crate::pos_defs::PosT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_manual_fold(pos, true, true, None) };
+}
+
+/// Close the fold at `pos` and everything nested inside it
+/// (`closeFoldRecurse`).
+///
+/// # Safety
+/// Same as [`set_manual_fold`].
+pub unsafe fn close_fold_recurse(pos: crate::pos_defs::PosT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_manual_fold(pos, false, true, None) };
+}
+
+/// Open folds until the cursor line is no longer in a closed fold
+/// (`foldOpenCursor`).
+///
+/// # Safety
+/// Same as [`set_manual_fold`].
+pub unsafe fn fold_open_cursor() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    checkupdate(unsafe { &mut *curwin });
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { has_any_folding(&*curwin) } {
+        loop {
+            let mut done = done::DONE_NOTHING;
+            // SAFETY: forwarded from this function's own safety doc.
+            let pos = unsafe { (*curwin).w_cursor };
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { set_manual_fold(pos, true, false, Some(&mut done)) };
+            if done & done::DONE_ACTION == 0 {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2302,6 +2584,165 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    /// A window with an outer fold over lines 20-26 and a nested fold
+    /// over 22-24, both closed - the layout used for the `zo`/`zc`
+    /// behaviour cross-verified against real nvim.
+    fn manual_fold_win(buf: &mut BufT) -> WinT {
+        buf.b_ml.ml_line_count = 40;
+        WinT {
+            w_buffer: buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_cursor: crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 },
+            w_folds: vec![FoldT {
+                fd_top: 20,
+                fd_len: 7,
+                fd_flags: fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::False,
+                fd_nested: vec![FoldT {
+                    // Relative to the outer fold: absolute 22-24.
+                    fd_top: 2,
+                    fd_len: 3,
+                    fd_flags: fd_flags::FD_CLOSED,
+                    fd_small: crate::types_defs::TriState::False,
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn open_fold_opens_the_topmost_closed_fold_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+
+        // Every access goes through `win_ptr` rather than the local
+        // `win`, since open_fold reaches the window through the same
+        // pointer via GLOBALS.curwin - a direct `&mut win` here would
+        // invalidate that lineage under Tree Borrows.
+        //
+        // Cross-verified against real nvim: with folds at 22-24 and
+        // 20-26 both closed, foldclosed(22) is 20; one zo makes it
+        // 22; a second zo makes it -1.
+        let mut first = 0;
+        assert!(unsafe { has_folding(&mut *win_ptr, 22, Some(&mut first), None) });
+        assert_eq!(first, 20);
+
+        unsafe { open_fold(pos, 1) };
+        let mut first = 0;
+        assert!(unsafe { has_folding(&mut *win_ptr, 22, Some(&mut first), None) });
+        assert_eq!(first, 22, "the outer fold opened, revealing the inner");
+
+        unsafe { open_fold(pos, 1) };
+        assert!(
+            !unsafe { has_folding(&mut *win_ptr, 22, None, None) },
+            "both folds are now open"
+        );
+    }
+
+    #[test]
+    fn open_fold_with_a_count_opens_several_levels_at_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+
+        unsafe { open_fold(pos, 2) };
+        assert!(!unsafe { has_folding(&mut *win_ptr, 22, None, None) });
+    }
+
+    #[test]
+    fn open_fold_recurse_opens_every_nested_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+
+        unsafe { open_fold_recurse(pos) };
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_OPEN);
+        assert_eq!(win.w_folds[0].fd_nested[0].fd_flags, fd_flags::FD_OPEN);
+    }
+
+    #[test]
+    fn close_fold_recurse_closes_the_outer_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        win.w_folds[0].fd_flags = fd_flags::FD_OPEN;
+        win.w_folds[0].fd_nested[0].fd_flags = fd_flags::FD_OPEN;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+
+        unsafe { close_fold_recurse(pos) };
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_CLOSED);
+    }
+
+    #[test]
+    fn close_fold_closes_the_deepest_open_fold_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        win.w_folds[0].fd_flags = fd_flags::FD_OPEN;
+        win.w_folds[0].fd_nested[0].fd_flags = fd_flags::FD_OPEN;
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+        let pos = crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 };
+
+        unsafe { close_fold(pos, 1) };
+        // The inner fold is the deepest open one containing line 22.
+        assert_eq!(win.w_folds[0].fd_nested[0].fd_flags, fd_flags::FD_CLOSED);
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_OPEN);
+
+        unsafe { close_fold(pos, 1) };
+        assert_eq!(win.w_folds[0].fd_flags, fd_flags::FD_CLOSED);
+    }
+
+    #[test]
+    fn set_manual_fold_win_marks_the_window_manually_folded() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        assert!(!win.w_fold_manual);
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let mut done = done::DONE_NOTHING;
+        unsafe { set_manual_fold_win(&mut win as *mut WinT, 22, true, false, Some(&mut done)) };
+
+        assert!(win.w_fold_manual);
+        assert_ne!(done & done::DONE_FOLD, 0, "a fold was found");
+        assert_ne!(done & done::DONE_ACTION, 0, "and it was opened");
+    }
+
+    #[test]
+    fn set_manual_fold_win_reports_nothing_when_no_fold_is_there() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let mut done = done::DONE_NOTHING;
+        // Line 5 is outside every fold.
+        let next =
+            unsafe { set_manual_fold_win(&mut win as *mut WinT, 5, true, false, Some(&mut done)) };
+
+        assert_eq!(done, done::DONE_NOTHING);
+        assert!(!win.w_fold_manual);
+        assert_eq!(next, 20, "the next fold to try starts at 20");
     }
 
     #[test]
