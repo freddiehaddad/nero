@@ -2267,6 +2267,153 @@ unsafe fn fold_gap_mut<'a>(wp: *mut WinT, path: &[usize]) -> &'a mut Vec<FoldT> 
     gap
 }
 
+/// Move the folds covering lines `line1` to `line2` to after `dest`
+/// (`foldMoveRange`), requiring `line1 <= line2 <= dest`.
+///
+/// The original enumerates ten cases by how each fold overlaps the
+/// moved range and the destination; they are preserved here with the
+/// same numbering in the comments. Folds straddling a boundary are
+/// truncated or have their nested folds adjusted first.
+///
+/// The three reversals at the end rotate the moved folds back into
+/// sorted order: reversing `[move_start, dest_index)` as a whole and
+/// then each of its two parts is the standard block-swap idiom, which
+/// is exactly what the original does.
+///
+/// # Safety
+/// Same as [`truncate_fold`]; reads `GLOBALS.State` once for the
+/// Insert-mode test its nested adjustments need.
+pub unsafe fn fold_move_range(
+    gap: &mut [FoldT],
+    line1: crate::pos_defs::LinenrT,
+    line2: crate::pos_defs::LinenrT,
+    dest: crate::pos_defs::LinenrT,
+) {
+    let range_len = line2 - line1 + 1;
+    let move_len = dest - line2;
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    let insert_mode = (state & crate::state_defs::mode::INSERT as i32) != 0;
+
+    let fold_end = |fp: &FoldT| fp.fd_top + fp.fd_len - 1;
+
+    let (at_start, mut idx) = fold_find(gap, line1 - 1);
+    if at_start {
+        let fd_top = gap[idx].fd_top;
+        if fold_end(&gap[idx]) > dest {
+            // Case 4 -- don't have to change this fold, but have to
+            // move nested folds.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                fold_move_range(
+                    &mut gap[idx].fd_nested,
+                    line1 - fd_top,
+                    line2 - fd_top,
+                    dest - fd_top,
+                )
+            };
+            return;
+        } else if fold_end(&gap[idx]) > line2 {
+            // Case 3 -- remove nested folds between line1 and line2
+            // and reduce the length of the fold by range_len. Folds
+            // after this one must be dealt with.
+            fold_mark_adjust_recurse(
+                &mut gap[idx].fd_nested,
+                line1 - fd_top,
+                line2 - fd_top,
+                crate::pos_defs::MAXLNUM,
+                -range_len,
+                insert_mode,
+            );
+            gap[idx].fd_len -= range_len;
+        } else {
+            // Case 2 -- truncate the fold *above* line1. Folds after
+            // this one must be dealt with.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { truncate_fold(&mut gap[idx], line1 - 1) };
+        }
+        // Look at the next fold, and treat that one as if it were the
+        // first after line1 (because now it is).
+        idx += 1;
+    }
+
+    if idx >= gap.len() || gap[idx].fd_top > dest {
+        // No folds after line1 and before dest. Case 10.
+        return;
+    } else if gap[idx].fd_top > line2 {
+        while idx < gap.len() && fold_end(&gap[idx]) <= dest {
+            // Case 9 (for all case 9s) -- shift up.
+            gap[idx].fd_top -= range_len;
+            idx += 1;
+        }
+        if idx < gap.len() && gap[idx].fd_top <= dest {
+            // Case 8 -- ensure truncated at dest, shift up.
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { truncate_fold(&mut gap[idx], dest) };
+            gap[idx].fd_top -= range_len;
+        }
+        return;
+    } else if fold_end(&gap[idx]) > dest {
+        // Case 7 -- remove nested folds and shrink.
+        let fd_top = gap[idx].fd_top;
+        fold_mark_adjust_recurse(
+            &mut gap[idx].fd_nested,
+            line2 + 1 - fd_top,
+            dest - fd_top,
+            crate::pos_defs::MAXLNUM,
+            -move_len,
+            insert_mode,
+        );
+        gap[idx].fd_len -= move_len;
+        gap[idx].fd_top += move_len;
+        return;
+    }
+
+    // Case 5 or 6: what changes depends on whether there are folds
+    // between the end of this fold and dest.
+    let move_start = idx;
+    let mut move_end = 0usize;
+    while idx < gap.len() && gap[idx].fd_top <= dest {
+        if gap[idx].fd_top <= line2 {
+            // 5, or 6.
+            if fold_end(&gap[idx]) > line2 {
+                // 6, truncate before moving.
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { truncate_fold(&mut gap[idx], line2) };
+            }
+            gap[idx].fd_top += move_len;
+            idx += 1;
+            continue;
+        }
+
+        // Record the index of the first fold after the moved range.
+        if move_end == 0 {
+            move_end = idx;
+        }
+
+        if fold_end(&gap[idx]) > dest {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { truncate_fold(&mut gap[idx], dest) };
+        }
+
+        gap[idx].fd_top -= range_len;
+        idx += 1;
+    }
+    let dest_index = idx;
+
+    // All folds are now correct, but not necessarily in the correct
+    // order: swap the folds in [move_end, dest_index) with those in
+    // [move_start, move_end).
+    if move_end == 0 {
+        // There are no folds after those moved, so none were moved
+        // out of order.
+        return;
+    }
+    fold_reverse_order(gap, move_start, dest_index - 1);
+    fold_reverse_order(gap, move_start, move_start + dest_index - move_end - 1);
+    fold_reverse_order(gap, move_start + dest_index - move_end, dest_index - 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3202,6 +3349,102 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    #[test]
+    fn fold_move_range_case_10_no_folds_between_the_range_and_dest() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The only fold is well past dest, so nothing changes.
+        let mut gap = vec![FoldT { fd_top: 50, fd_len: 5, ..Default::default() }];
+        let before = gap.clone();
+        unsafe { fold_move_range(&mut gap, 5, 7, 20) };
+        assert_eq!(gap, before);
+    }
+
+    #[test]
+    fn fold_move_range_case_9_shifts_intervening_folds_up() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Moving lines 5..7 down to after 30 leaves the fold at 10-14
+        // entirely between the range and dest, so it shifts up by the
+        // three moved lines.
+        let mut gap = vec![FoldT { fd_top: 10, fd_len: 5, ..Default::default() }];
+        unsafe { fold_move_range(&mut gap, 5, 7, 30) };
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_top, 7, "10 - 3");
+        assert_eq!(gap[0].fd_len, 5, "its length is unchanged");
+    }
+
+    #[test]
+    fn fold_move_range_case_9_shifts_several_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gap = vec![
+            FoldT { fd_top: 10, fd_len: 5, ..Default::default() },
+            FoldT { fd_top: 20, fd_len: 5, ..Default::default() },
+        ];
+        unsafe { fold_move_range(&mut gap, 5, 7, 30) };
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert_eq!(tops, vec![7, 17], "both shift up by 3");
+    }
+
+    #[test]
+    fn fold_move_range_case_4_recurses_without_changing_the_outer_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The outer fold 1-40 contains the whole operation, so only
+        // its nested folds move.
+        let mut gap = vec![FoldT {
+            fd_top: 1,
+            fd_len: 40,
+            fd_nested: vec![FoldT { fd_top: 10, fd_len: 5, ..Default::default() }],
+            ..Default::default()
+        }];
+        unsafe { fold_move_range(&mut gap, 5, 7, 30) };
+        assert_eq!(gap[0].fd_top, 1, "the outer fold is untouched");
+        assert_eq!(gap[0].fd_len, 40);
+        // The nested fold shifted up by the three moved lines.
+        assert_eq!(gap[0].fd_nested[0].fd_top, 7);
+    }
+
+    #[test]
+    fn fold_move_range_keeps_the_folds_sorted_after_reordering() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A fold inside the moved range plus one after it: the moved
+        // fold ends up below the other, so the reversal has to put
+        // them back in order.
+        let mut gap = vec![
+            FoldT { fd_top: 5, fd_len: 3, ..Default::default() },
+            FoldT { fd_top: 12, fd_len: 4, ..Default::default() },
+        ];
+        unsafe { fold_move_range(&mut gap, 5, 7, 20) };
+
+        let tops: Vec<_> = gap.iter().map(|f| f.fd_top).collect();
+        assert!(
+            tops.windows(2).all(|w| w[0] <= w[1]),
+            "folds must stay sorted, got {tops:?}"
+        );
+        assert_eq!(gap.len(), 2, "no fold is lost");
+    }
+
+    #[test]
+    fn fold_move_range_case_3_shrinks_a_fold_containing_the_whole_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The fold 3-9 starts above line1 and ends below line2, so the
+        // moved range sits entirely inside it and the fold simply
+        // loses those three lines.
+        let mut gap = vec![FoldT { fd_top: 3, fd_len: 7, ..Default::default() }];
+        unsafe { fold_move_range(&mut gap, 5, 7, 20) };
+        assert_eq!(gap[0].fd_top, 3);
+        assert_eq!(gap[0].fd_len, 4, "7 - 3");
+    }
+
+    #[test]
+    fn fold_move_range_case_2_truncates_a_fold_ending_inside_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The fold 3-6 starts above line1 and ends *within* the moved
+        // range, so it is truncated to end just above line1.
+        let mut gap = vec![FoldT { fd_top: 3, fd_len: 4, ..Default::default() }];
+        unsafe { fold_move_range(&mut gap, 5, 7, 20) };
+        assert_eq!(gap[0].fd_top, 3);
+        assert_eq!(gap[0].fd_len, 2, "now covers 3-4 only");
     }
 
     #[test]
