@@ -373,6 +373,41 @@ pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Get the sub-second part of the last modification time from a
+/// `FileInfoT` (`file_info->stat.st_mtim.tv_nsec` in the original).
+///
+/// `0` when the platform can't report a modification time, or it's
+/// before the epoch - the same narrow, documented gap
+/// [`os_fileinfo_mtime`] takes for the seconds part.
+#[must_use]
+pub fn os_fileinfo_mtime_ns(info: &FileInfoT) -> i64 {
+    info.metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::from(d.subsec_nanos()))
+}
+
+/// Get the permission/type bits from a `FileInfoT`
+/// (`file_info->stat.st_mode` in the original).
+///
+/// On Windows `std::fs::Metadata` exposes no `st_mode`, so the
+/// read-only flag is reported in the same `0o444`/`0o666` shape
+/// libuv synthesises there (see this module's own doc comment on
+/// `st_mode` bit synthesis).
+#[must_use]
+pub fn os_fileinfo_mode(info: &FileInfoT) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        info.metadata.mode() as i32
+    }
+    #[cfg(not(unix))]
+    {
+        if info.metadata.permissions().readonly() { 0o444 } else { 0o666 }
+    }
+}
+
 /// Get a `getftype()`-style file-type description from a `FileInfoT`
 /// (mirrors the original's own `f_getftype`'s `S_ISREG`/`S_ISDIR`/
 /// `S_ISLNK`/`S_ISBLK`/`S_ISCHR`/`S_ISFIFO`/`S_ISSOCK` dispatch,

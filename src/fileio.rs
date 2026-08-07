@@ -170,6 +170,38 @@ pub unsafe fn get_fio_flags(name: &[u8]) -> i32 {
     0
 }
 
+/// Whether `file_info`'s modification time differs from the recorded
+/// `mtime`/`mtime_ns` (`time_differs`).
+///
+/// On Linux and Windows a one-second slack is allowed on the seconds
+/// part: a FAT filesystem stores only five bits of seconds, and the
+/// roundoff happens when the inode is flushed, so the value can shift
+/// by a second on its own. Elsewhere the comparison is exact.
+#[must_use]
+pub fn time_differs(file_info: &crate::os::fs::FileInfoT, mtime: i64, mtime_ns: i64) -> bool {
+    let secs = crate::os::fs::os_fileinfo_mtime(file_info);
+    let nsec = crate::os::fs::os_fileinfo_mtime_ns(file_info);
+
+    if cfg!(any(target_os = "linux", windows)) {
+        nsec != mtime_ns || secs - mtime > 1 || mtime - secs > 1
+    } else {
+        nsec != mtime_ns || secs != mtime
+    }
+}
+
+/// Record `file_info`'s modification time, size and mode on `buf`, so
+/// a later check can notice the file changing underneath us
+/// (`buf_store_file_info`).
+pub fn buf_store_file_info(
+    buf: &mut crate::buffer_defs::BufT,
+    file_info: &crate::os::fs::FileInfoT,
+) {
+    buf.b_mtime = crate::os::fs::os_fileinfo_mtime(file_info);
+    buf.b_mtime_ns = crate::os::fs::os_fileinfo_mtime_ns(file_info);
+    buf.b_orig_size = crate::os::fs::os_fileinfo_size(file_info);
+    buf.b_orig_mode = crate::os::fs::os_fileinfo_mode(file_info);
+}
+
 /// Detect a byte-order mark at the start of `p` (`check_for_bom`).
 ///
 /// Returns `Some((encoding_name, bom_len))` when the leading bytes
@@ -445,6 +477,86 @@ mod tests {
         let result = unsafe { get_fio_flags(b"") };
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_enc = saved;
         assert_eq!(result, fio::FIO_UTF8);
+    }
+
+    // --- time_differs / buf_store_file_info ---
+
+    /// A real file on disk, so the tests exercise genuine metadata
+    /// rather than a hand-built struct.
+    fn temp_file_info(name: &str) -> (std::path::PathBuf, crate::os::fs::FileInfoT) {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, b"contents").unwrap();
+        let info = crate::os::fs::os_fileinfo(&path).unwrap();
+        (path, info)
+    }
+
+    #[test]
+    fn time_differs_is_false_against_the_files_own_timestamp() {
+        let (path, info) = temp_file_info("nero_test_time_differs_same");
+        let secs = crate::os::fs::os_fileinfo_mtime(&info);
+        let nsec = crate::os::fs::os_fileinfo_mtime_ns(&info);
+
+        assert!(!time_differs(&info, secs, nsec));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn time_differs_notices_a_changed_nanosecond_part() {
+        let (path, info) = temp_file_info("nero_test_time_differs_nsec");
+        let secs = crate::os::fs::os_fileinfo_mtime(&info);
+        let nsec = crate::os::fs::os_fileinfo_mtime_ns(&info);
+
+        assert!(time_differs(&info, secs, nsec + 1));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn time_differs_notices_a_clearly_different_second() {
+        let (path, info) = temp_file_info("nero_test_time_differs_secs");
+        let secs = crate::os::fs::os_fileinfo_mtime(&info);
+        let nsec = crate::os::fs::os_fileinfo_mtime_ns(&info);
+
+        // Well outside the one-second FAT slack, so every platform
+        // agrees this is a real change.
+        assert!(time_differs(&info, secs + 100, nsec));
+        assert!(time_differs(&info, secs - 100, nsec));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn time_differs_allows_one_second_of_fat_slack() {
+        // Only the seconds part is slackened, so the nanosecond part
+        // has to match for this to report "unchanged".
+        let (path, info) = temp_file_info("nero_test_time_differs_slack");
+        let secs = crate::os::fs::os_fileinfo_mtime(&info);
+        let nsec = crate::os::fs::os_fileinfo_mtime_ns(&info);
+
+        assert!(!time_differs(&info, secs + 1, nsec));
+        assert!(!time_differs(&info, secs - 1, nsec));
+        assert!(time_differs(&info, secs + 2, nsec));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn buf_store_file_info_records_mtime_size_and_mode() {
+        let (path, info) = temp_file_info("nero_test_buf_store_file_info");
+        let mut buf = crate::buffer_defs::BufT::default();
+
+        buf_store_file_info(&mut buf, &info);
+
+        assert_eq!(buf.b_mtime, crate::os::fs::os_fileinfo_mtime(&info));
+        assert_eq!(buf.b_mtime_ns, crate::os::fs::os_fileinfo_mtime_ns(&info));
+        assert_eq!(buf.b_orig_size, 8, "\"contents\" is 8 bytes");
+        assert_eq!(buf.b_orig_mode, crate::os::fs::os_fileinfo_mode(&info));
+        // What was just stored must compare as unchanged.
+        assert!(!time_differs(&info, buf.b_mtime, buf.b_mtime_ns));
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     // --- check_for_bom ---
