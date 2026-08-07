@@ -521,12 +521,11 @@ pub(crate) unsafe fn f_rename(argvars: &[TypvalT], rettv: &mut TypvalT) {
 ///   name, needs a temp-file round-trip" sub-case
 ///   (`rename_with_tmp`) is not modeled at all.
 /// - When `os_rename` itself fails (typically a cross-filesystem
-///   move), the original falls back to `vim_copyfile` (copy, then
-///   delete the source) - not yet translated (needs symlink-aware
-///   copying) - `unimplemented!()`s if actually reached, rather than
-///   silently reporting failure for what could be a legitimate move.
+///   move), falls back to [`crate::fileio::vim_copyfile`] and then
+///   deletes the source, exactly as the original does.
 ///
-/// @return `0` on success, `-1` on failure (`from` doesn't exist).
+/// @return `0` on success, `-1` on failure (`from` doesn't exist, or
+///         the copy fallback also failed).
 fn vim_rename(from: &std::path::Path, to: &std::path::Path) -> i32 {
     if from.as_os_str() == to.as_os_str() {
         return 0;
@@ -542,7 +541,25 @@ fn vim_rename(from: &std::path::Path, to: &std::path::Path) -> i32 {
         return 0;
     }
 
-    unimplemented!("vim_rename(): os_rename failed, vim_copyfile fallback not yet translated");
+    // Rename failed, try copying the file.
+    let (Some(from_bytes), Some(to_bytes)) = (path_to_bytes(from), path_to_bytes(to)) else {
+        return -1;
+    };
+    if crate::fileio::vim_copyfile(&from_bytes, &to_bytes) != crate::vim_defs::OK {
+        return -1;
+    }
+
+    if crate::os::fs::os_fileinfo(from).is_some() {
+        crate::os::fs::os_remove(from);
+    }
+
+    0
+}
+
+/// Render a [`std::path::Path`] back into the raw bytes this crate
+/// carries paths as - the inverse of [`bytes_to_path`].
+fn path_to_bytes(p: &std::path::Path) -> Option<Vec<u8>> {
+    p.to_str().map(|s| s.as_bytes().to_vec())
 }
 
 /// `glob2regpat({string})` - convert a file pattern into a search

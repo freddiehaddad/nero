@@ -24,8 +24,8 @@
 //!
 //! Also translated: the temp-directory family (`vim_mktempdir`,
 //! `vim_settempdir`, `vim_gettempdir`, `vim_deltempdir`,
-//! `vim_tempname`) and the directory helpers it builds on
-//! (`readdir_core`, `delete_recursive`).
+//! `vim_tempname`), the directory helpers it builds on
+//! (`readdir_core`, `delete_recursive`), and `vim_copyfile`.
 //!
 //! Deferred: everything else in the file.
 
@@ -271,6 +271,49 @@ fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
 /// separate `void *context` parameter is unnecessary here: a Rust
 /// closure captures whatever state it needs directly.
 pub type CheckItem<'a> = dyn FnMut(&[u8]) -> i64 + 'a;
+
+/// Copy the file `from` to `to` (`vim_copyfile`).
+///
+/// A symlink is copied AS a symlink - its target text is read and a
+/// new link with the same target is created - rather than having its
+/// contents copied. That branch is `HAVE_READLINK`-gated upstream, so
+/// on a platform without it (Windows) a symlink falls through to the
+/// plain byte copy below, exactly as upstream does.
+///
+/// @return [`crate::vim_defs::OK`]/[`crate::vim_defs::FAIL`].
+///
+/// The original's `os_get_acl`/`os_set_acl`/`os_free_acl` calls are
+/// omitted because upstream's own implementations of all three are
+/// unconditional no-ops (`os_get_acl` always returns NULL; the other
+/// two return immediately for a NULL argument). Nothing observable is
+/// lost. Its `errmsg` local is likewise dropped: it is declared, never
+/// assigned, and so its `semsg` branch is unreachable upstream too.
+///
+/// Refuses to overwrite an existing `to`, via the same
+/// `UV_FS_COPYFILE_EXCL` the original passes.
+pub fn vim_copyfile(from: &[u8], to: &[u8]) -> i32 {
+    let from_path = bytes_to_path(from);
+    let to_path = bytes_to_path(to);
+
+    #[cfg(unix)]
+    {
+        // HAVE_READLINK: copy a symlink as a symlink.
+        if std::fs::symlink_metadata(&from_path).is_ok_and(|m| m.is_symlink()) {
+            let ret = match std::fs::read_link(&from_path) {
+                Ok(target) => std::os::unix::fs::symlink(target, &to_path).is_ok(),
+                // A failed readlink leaves the original at ret = -1,
+                // never attempting the symlink() call.
+                Err(_) => false,
+            };
+            return if ret { crate::vim_defs::OK } else { crate::vim_defs::FAIL };
+        }
+    }
+
+    if crate::os::fs::os_copy(&from_path, &to_path, crate::os::fs::copyfile::EXCL) != 0 {
+        return crate::vim_defs::FAIL;
+    }
+    crate::vim_defs::OK
+}
 
 /// Retrieve the sorted list of entries in the directory `path`
 /// (`readdir_core`, the core of the `readdir()` builtin).
@@ -1277,6 +1320,74 @@ mod tests {
         let scratch = TreeScratch::new("del_missing");
         let missing = scratch.root.join("does_not_exist");
         assert_eq!(delete_recursive(&os_string_to_bytes(missing.as_os_str())), -1);
+    }
+
+    // --- vim_copyfile ---
+
+    #[test]
+    fn vim_copyfile_copies_a_plain_file() {
+        let scratch = TreeScratch::new("copy_plain");
+        let from = scratch.root.join("from.txt");
+        let to = scratch.root.join("to.txt");
+        std::fs::write(&from, b"payload").unwrap();
+
+        let r = vim_copyfile(
+            &os_string_to_bytes(from.as_os_str()),
+            &os_string_to_bytes(to.as_os_str()),
+        );
+        assert_eq!(r, crate::vim_defs::OK);
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
+        // The source must survive - copy, not move.
+        assert!(from.exists());
+    }
+
+    #[test]
+    fn vim_copyfile_refuses_to_overwrite_an_existing_destination() {
+        // The original passes UV_FS_COPYFILE_EXCL, so an existing
+        // destination is an error rather than being clobbered.
+        let scratch = TreeScratch::new("copy_excl");
+        let from = scratch.root.join("from.txt");
+        let to = scratch.root.join("to.txt");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"original").unwrap();
+
+        let r = vim_copyfile(
+            &os_string_to_bytes(from.as_os_str()),
+            &os_string_to_bytes(to.as_os_str()),
+        );
+        assert_eq!(r, crate::vim_defs::FAIL);
+        assert_eq!(std::fs::read(&to).unwrap(), b"original");
+    }
+
+    #[test]
+    fn vim_copyfile_fails_for_a_missing_source() {
+        let scratch = TreeScratch::new("copy_missing");
+        let r = vim_copyfile(
+            &scratch.bytes_joined(b"nope.txt"),
+            &scratch.bytes_joined(b"to.txt"),
+        );
+        assert_eq!(r, crate::vim_defs::FAIL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vim_copyfile_copies_a_symlink_as_a_symlink() {
+        // HAVE_READLINK-gated upstream: the link's TARGET TEXT is
+        // reproduced, rather than the target's contents being copied.
+        let scratch = TreeScratch::new("copy_symlink");
+        let target = scratch.root.join("target.txt");
+        let link = scratch.root.join("link");
+        let copy = scratch.root.join("copy");
+        std::fs::write(&target, b"payload").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let r = vim_copyfile(
+            &os_string_to_bytes(link.as_os_str()),
+            &os_string_to_bytes(copy.as_os_str()),
+        );
+        assert_eq!(r, crate::vim_defs::OK);
+        assert!(std::fs::symlink_metadata(&copy).unwrap().is_symlink());
+        assert_eq!(std::fs::read_link(&copy).unwrap(), target);
     }
 
     #[test]
