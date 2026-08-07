@@ -2086,6 +2086,187 @@ fn marker_number(line: &[u8], at: usize) -> Option<i32> {
     (n > 0).then_some(n)
 }
 
+/// Move the cursor to a fold boundary (`foldMoveTo`).
+///
+/// With `updown` false this is `[z`/`]z`: move to the start or end of
+/// the fold the cursor is in, stopping at a closed fold. With
+/// `updown` true it is `zj`/`zk`: move to the next or previous fold
+/// at the same level.
+///
+/// Repeats `count` times, returning `OK` if the cursor moved at all
+/// and `FAIL` otherwise. The first move sets the previous-context
+/// mark, as any jump does.
+///
+/// # Safety
+/// Same as [`check_closed`]; also touches `GLOBALS.curwin` and, on a
+/// successful move, [`crate::mark::setpcmark`].
+pub unsafe fn fold_move_to(updown: bool, dir: crate::vim_defs::Direction, count: i32) -> i32 {
+    let mut retval = crate::vim_defs::FAIL;
+    let forward = dir == crate::vim_defs::Direction::Forward;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    checkupdate(unsafe { &mut *curwin });
+
+    // Repeat "count" times.
+    for _ in 0..count {
+        // Find nested folds. Stop when a fold is closed. The deepest
+        // fold that moves the cursor is used.
+        let mut lnum_off = 0;
+        let mut path: Vec<usize> = Vec::new();
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*curwin).w_folds.is_empty() } {
+            break;
+        }
+        let mut use_level = false;
+        let mut maybe_small = false;
+        // SAFETY: forwarded from this function's own safety doc.
+        let cursor_lnum = unsafe { (*curwin).w_cursor.lnum };
+        let mut lnum_found = cursor_lnum;
+        let mut level = 0;
+        let mut last = false;
+
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            let gap_len = unsafe { fold_gap(curwin, &path) }.len();
+            // SAFETY: forwarded from this function's own safety doc.
+            let (found, found_idx) =
+                fold_find(unsafe { fold_gap(curwin, &path) }, cursor_lnum - lnum_off);
+            // The original steps this index one BEFORE the array when
+            // moving forward past the last fold, so that `idx + 1`
+            // still names the first candidate - hence the signed type.
+            let mut idx = found_idx as i64;
+            if !found {
+                if !updown || gap_len == 0 {
+                    break;
+                }
+                // When moving up, consider a fold above the cursor;
+                // when moving down consider a fold below it.
+                if forward {
+                    if idx >= gap_len as i64 {
+                        break;
+                    }
+                    idx -= 1;
+                } else if idx == 0 {
+                    break;
+                }
+                // Don't look for contained folds, they would always
+                // move the cursor too far.
+                last = true;
+            }
+
+            if !last {
+                // Check if this fold is closed.
+                // SAFETY: forwarded from this function's own safety doc.
+                let closed = unsafe {
+                    let fp = &mut fold_gap_mut(curwin, &path)[idx as usize];
+                    check_closed(curwin, fp, &mut use_level, level, &mut maybe_small, lnum_off)
+                };
+                if closed {
+                    last = true;
+                }
+                // "[z" and "]z" stop at a closed fold.
+                if last && !updown {
+                    break;
+                }
+            }
+
+            // SAFETY: forwarded from this function's own safety doc.
+            let gap = unsafe { fold_gap(curwin, &path) };
+            if updown {
+                if forward {
+                    // To the start of the next fold, if there is one.
+                    if idx + 1 < gap.len() as i64 {
+                        let lnum = gap[(idx + 1) as usize].fd_top + lnum_off;
+                        if lnum > cursor_lnum {
+                            lnum_found = lnum;
+                        }
+                    }
+                } else {
+                    // To the end of the previous fold, if there is one.
+                    if idx > 0 {
+                        let prev = &gap[(idx - 1) as usize];
+                        let lnum = prev.fd_top + lnum_off + prev.fd_len - 1;
+                        if lnum < cursor_lnum {
+                            lnum_found = lnum;
+                        }
+                    }
+                }
+            } else {
+                // Open fold found: set the cursor to its start or end,
+                // then check nested folds.
+                let fp = &gap[idx as usize];
+                if forward {
+                    let lnum = fp.fd_top + lnum_off + fp.fd_len - 1;
+                    if lnum > cursor_lnum {
+                        lnum_found = lnum;
+                    }
+                } else {
+                    let lnum = fp.fd_top + lnum_off;
+                    if lnum < cursor_lnum {
+                        lnum_found = lnum;
+                    }
+                }
+            }
+
+            if last {
+                break;
+            }
+
+            // Check nested folds (if any).
+            lnum_off += gap[idx as usize].fd_top;
+            path.push(idx as usize);
+            level += 1;
+        }
+
+        if lnum_found != cursor_lnum {
+            if retval == crate::vim_defs::FAIL {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { crate::mark::setpcmark() };
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                (*curwin).w_cursor.lnum = lnum_found;
+                (*curwin).w_cursor.col = 0;
+            }
+            retval = crate::vim_defs::OK;
+        } else {
+            break;
+        }
+    }
+
+    retval
+}
+
+/// Resolve an index path to the fold array it names, starting from
+/// `wp.w_folds`.
+///
+/// # Safety
+/// `wp` must be a valid, live [`WinT`], and `path` must name folds
+/// that exist.
+unsafe fn fold_gap<'a>(wp: *mut WinT, path: &[usize]) -> &'a [FoldT] {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut gap: &[FoldT] = unsafe { &(*wp).w_folds };
+    for idx in path {
+        gap = &gap[*idx].fd_nested;
+    }
+    gap
+}
+
+/// Mutable counterpart of [`fold_gap`].
+///
+/// # Safety
+/// Same as [`fold_gap`].
+unsafe fn fold_gap_mut<'a>(wp: *mut WinT, path: &[usize]) -> &'a mut Vec<FoldT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut gap: &mut Vec<FoldT> = unsafe { &mut (*wp).w_folds };
+    for idx in path {
+        gap = &mut gap[*idx].fd_nested;
+    }
+    gap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3021,6 +3202,143 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    #[test]
+    fn fold_move_to_matches_real_nvim_zj_and_bracket_z() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: with open folds at 10-14
+        // and 20-24, zj from line 1 lands on 10 and again on 20;
+        // ]z from line 12 lands on 14 and [z on 10.
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: vec![
+                FoldT {
+                    fd_top: 10,
+                    fd_len: 5,
+                    fd_flags: fd_flags::FD_OPEN,
+                    fd_small: crate::types_defs::TriState::False,
+                    ..Default::default()
+                },
+                FoldT {
+                    fd_top: 20,
+                    fd_len: 5,
+                    fd_flags: fd_flags::FD_OPEN,
+                    fd_small: crate::types_defs::TriState::False,
+                    ..Default::default()
+                },
+            ],
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let buf_ptr = win.w_buffer;
+        let _guard = CurwinGuard::set(win_ptr);
+        // A successful move calls setpcmark, which reads curbuf.
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = buf_ptr;
+
+        // zj: next fold start, twice.
+        assert_eq!(
+            unsafe { fold_move_to(true, crate::vim_defs::Direction::Forward, 1) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 10);
+        assert_eq!(
+            unsafe { fold_move_to(true, crate::vim_defs::Direction::Forward, 1) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 20);
+
+        // ]z: end of the fold containing the cursor.
+        unsafe { (*win_ptr).w_cursor.lnum = 12 };
+        assert_eq!(
+            unsafe { fold_move_to(false, crate::vim_defs::Direction::Forward, 1) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 14);
+
+        // [z: start of that same fold.
+        unsafe { (*win_ptr).w_cursor.lnum = 12 };
+        assert_eq!(
+            unsafe { fold_move_to(false, crate::vim_defs::Direction::Backward, 1) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 10);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+    }
+
+    #[test]
+    fn fold_move_to_fails_when_the_window_has_no_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_cursor: crate::pos_defs::PosT { lnum: 5, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        assert_eq!(
+            unsafe { fold_move_to(true, crate::vim_defs::Direction::Forward, 1) },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 5, "cursor is unmoved");
+    }
+
+    #[test]
+    fn fold_move_to_stops_when_there_is_no_further_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: vec![FoldT {
+                fd_top: 10,
+                fd_len: 5,
+                fd_flags: fd_flags::FD_OPEN,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
+            // Already past the only fold.
+            w_cursor: crate::pos_defs::PosT { lnum: 30, col: 0, coladd: 0 },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        assert_eq!(
+            unsafe { fold_move_to(true, crate::vim_defs::Direction::Forward, 1) },
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(unsafe { (*win_ptr).w_cursor.lnum }, 30);
     }
 
     /// Sets up `'foldmarker'` state for the marker tests and returns
