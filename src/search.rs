@@ -459,6 +459,128 @@ unsafe fn set_vv_searchforward() {
     }
 }
 
+/// Saved copy of `spats[RE_SEARCH]` plus the two flags that travel
+/// with it (`saved_last_search_spat`/`saved_last_idx`/
+/// `saved_no_hlsearch`), together with the nesting depth
+/// (`did_save_last_search_spat`) that makes save/restore re-entrant.
+#[derive(Debug, Default)]
+struct SavedLastSearch {
+    depth: i32,
+    spat: SearchPattern,
+    last_idx: usize,
+    no_hlsearch: bool,
+}
+
+static SAVED_LAST_SEARCH: std::sync::LazyLock<crate::globals::GlobalCell<SavedLastSearch>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SavedLastSearch::default()));
+
+/// Save the last search pattern so a nested search cannot clobber it
+/// (`save_last_search_pattern`).
+///
+/// Re-entrant: only the OUTERMOST call saves anything, so nested
+/// save/restore pairs are harmless.
+///
+/// # Safety
+/// Must not run concurrently with any write to `SEARCH_PATTERNS`, and
+/// touches `GLOBALS.Search`.
+pub unsafe fn save_last_search_pattern() {
+    // SAFETY: see [`get_search_pattern`].
+    let saved = unsafe { SAVED_LAST_SEARCH.get_mut() };
+    saved.depth += 1;
+    if saved.depth != 1 {
+        // nested call, nothing to do
+        return;
+    }
+
+    // SAFETY: see [`get_search_pattern`]. The clone covers the
+    // original's own xstrnsave of the pattern bytes.
+    let patterns = unsafe { SEARCH_PATTERNS.get_mut() };
+    saved.spat = patterns.spats[0].clone();
+    saved.last_idx = patterns.last_idx;
+    // SAFETY: momentary read of a plain global.
+    saved.no_hlsearch = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch;
+}
+
+/// Restore what [`save_last_search_pattern`] saved
+/// (`restore_last_search_pattern`).
+///
+/// Re-entrant in the same way: only the outermost restore does any
+/// work. The original's own `iemsg` for an unbalanced call (more
+/// restores than saves) is omitted per this crate's established
+/// "skip the message display, keep the state exact" policy - the
+/// early return it guards is kept.
+///
+/// # Safety
+/// Same as [`save_last_search_pattern`]; also forwards
+/// `set_vv_searchforward`'s own safety doc.
+pub unsafe fn restore_last_search_pattern() {
+    // SAFETY: see [`get_search_pattern`].
+    let saved = unsafe { SAVED_LAST_SEARCH.get_mut() };
+    saved.depth -= 1;
+    if saved.depth > 0 {
+        // nested call, nothing to do
+        return;
+    }
+    if saved.depth != 0 {
+        // Called more often than save_last_search_pattern().
+        return;
+    }
+
+    // SAFETY: see [`get_search_pattern`]. Assigning drops the old
+    // pattern's heap bytes, covering the original's own xfree.
+    unsafe { SEARCH_PATTERNS.get_mut() }.spats[0] = std::mem::take(&mut saved.spat);
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { set_vv_searchforward() };
+    // SAFETY: see [`get_search_pattern`].
+    unsafe { SEARCH_PATTERNS.get_mut() }.last_idx = saved.last_idx;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::ex_docmd::set_no_hlsearch(saved.no_hlsearch) };
+}
+
+/// Saved incsearch highlighting variables
+/// (`saved_search_match_endcol`/`saved_search_match_lines`).
+#[derive(Debug, Default)]
+struct SavedIncsearch {
+    match_endcol: crate::pos_defs::ColnrT,
+    match_lines: crate::pos_defs::LinenrT,
+}
+
+static SAVED_INCSEARCH: std::sync::LazyLock<crate::globals::GlobalCell<SavedIncsearch>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SavedIncsearch::default()));
+
+/// Save the incsearch highlighting variables
+/// (`save_incsearch_state`, `static` in the original).
+///
+/// Needed so that calling `searchcount()` does not invalidate the
+/// incsearch highlighting.
+///
+/// # Safety
+/// Touches `GLOBALS.Search`, with the usual "no overlapping live
+/// access" requirement.
+pub unsafe fn save_incsearch_state() {
+    // SAFETY: momentary read of a plain global.
+    let search = unsafe { crate::globals::GLOBALS.get_mut() }.Search;
+    // SAFETY: see [`get_search_pattern`].
+    let saved = unsafe { SAVED_INCSEARCH.get_mut() };
+    saved.match_endcol = search.match_endcol;
+    saved.match_lines = search.match_lines;
+}
+
+/// Restore what [`save_incsearch_state`] saved
+/// (`restore_incsearch_state`, `static` in the original).
+///
+/// # Safety
+/// Same as [`save_incsearch_state`].
+pub unsafe fn restore_incsearch_state() {
+    // SAFETY: see [`get_search_pattern`].
+    let saved = unsafe { SAVED_INCSEARCH.get_mut() };
+    let (endcol, lines) = (saved.match_endcol, saved.match_lines);
+    // SAFETY: momentary write to a plain global.
+    let search = &mut unsafe { crate::globals::GLOBALS.get_mut() }.Search;
+    search.match_endcol = endcol;
+    search.match_lines = lines;
+}
+
 /// Set the last search pattern (`set_search_pattern`).
 ///
 /// # Safety
@@ -965,6 +1087,108 @@ mod tests {
         // dir == '?' (backward), so v:searchforward becomes 0.
         assert_eq!(vv_searchforward(), 0);
         reset_vv_searchforward();
+    }
+
+    // --- save/restore_last_search_pattern, save/restore_incsearch_state ---
+
+    fn reset_saved_last_search() {
+        // SAFETY: see get_search_pattern's own doc comment.
+        *unsafe { SAVED_LAST_SEARCH.get_mut() } = SavedLastSearch::default();
+    }
+
+    #[test]
+    fn save_and_restore_last_search_pattern_round_trips() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        reset_saved_last_search();
+        unsafe {
+            SEARCH_PATTERNS.get_mut().spats[0].pat = Some(b"original".to_vec());
+            SEARCH_PATTERNS.get_mut().last_idx = 1;
+
+            save_last_search_pattern();
+            // A nested search clobbers the live pattern...
+            SEARCH_PATTERNS.get_mut().spats[0].pat = Some(b"clobbered".to_vec());
+            SEARCH_PATTERNS.get_mut().last_idx = 0;
+
+            restore_last_search_pattern();
+
+            assert_eq!(SEARCH_PATTERNS.get_mut().spats[0].pat, Some(b"original".to_vec()));
+            assert_eq!(SEARCH_PATTERNS.get_mut().last_idx, 1);
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn nested_save_last_search_pattern_only_saves_once() {
+        // The inner save/restore pair must be inert, so the OUTER
+        // save's value is what finally comes back.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        reset_saved_last_search();
+        unsafe {
+            SEARCH_PATTERNS.get_mut().spats[0].pat = Some(b"outer".to_vec());
+
+            save_last_search_pattern();
+            SEARCH_PATTERNS.get_mut().spats[0].pat = Some(b"inner".to_vec());
+            save_last_search_pattern();
+            restore_last_search_pattern();
+
+            assert_eq!(
+                SEARCH_PATTERNS.get_mut().spats[0].pat,
+                Some(b"inner".to_vec()),
+                "the inner restore is a no-op"
+            );
+
+            restore_last_search_pattern();
+            assert_eq!(SEARCH_PATTERNS.get_mut().spats[0].pat, Some(b"outer".to_vec()));
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn unbalanced_restore_last_search_pattern_does_nothing() {
+        // More restores than saves: the original iemsg's and returns;
+        // the message is skipped here but the early return is kept, so
+        // the live pattern must be left alone.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_search_patterns();
+        reset_saved_last_search();
+        unsafe {
+            SEARCH_PATTERNS.get_mut().spats[0].pat = Some(b"live".to_vec());
+
+            restore_last_search_pattern();
+            restore_last_search_pattern();
+
+            assert_eq!(SEARCH_PATTERNS.get_mut().spats[0].pat, Some(b"live".to_vec()));
+        }
+        reset_vv_searchforward();
+    }
+
+    #[test]
+    fn save_and_restore_incsearch_state_round_trips() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let search = &mut crate::globals::GLOBALS.get_mut().Search;
+            let prev = (search.match_endcol, search.match_lines);
+            search.match_endcol = 12;
+            search.match_lines = 3;
+
+            save_incsearch_state();
+
+            let search = &mut crate::globals::GLOBALS.get_mut().Search;
+            search.match_endcol = 99;
+            search.match_lines = 99;
+
+            restore_incsearch_state();
+
+            let search = &crate::globals::GLOBALS.get_mut().Search;
+            assert_eq!(search.match_endcol, 12);
+            assert_eq!(search.match_lines, 3);
+
+            let search = &mut crate::globals::GLOBALS.get_mut().Search;
+            search.match_endcol = prev.0;
+            search.match_lines = prev.1;
+        }
     }
 
     #[test]
