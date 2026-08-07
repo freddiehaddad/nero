@@ -286,6 +286,10 @@ const B0_DIRTY: u8 = 0x55;
 /// used by [`ml_setflags`]).
 const B0_FF_MASK: u8 = 3;
 const B0_HAS_FENC: u8 = 8;
+/// Swapfile is in the same directory as the edited file
+/// (`B0_SAME_DIR`), used to decide whether a swapfile found elsewhere
+/// really belongs to this file.
+const B0_SAME_DIR: u8 = 4;
 
 const B0_MAGIC_LONG: i64 = 0x3031_3233;
 const B0_MAGIC_INT: i32 = 0x2021_2223;
@@ -294,6 +298,47 @@ const B0_MAGIC_INT: i32 = 0x2021_2223;
 // that cast, so that's what's stored here directly.
 const B0_MAGIC_SHORT: i16 = 0x1213;
 const B0_MAGIC_CHAR: u8 = 0x55;
+
+/// Set or clear the `B0_SAME_DIR` flag on `b0`, depending on whether
+/// the swapfile lives beside the edited file (`set_b0_dir_flag`).
+///
+/// The flag lets a later reader tell whether a swapfile found in a
+/// different directory really belongs to the file being edited.
+///
+/// # Safety
+/// `buf.b_ml.ml_mfp` must be a valid, non-null pointer to a live
+/// memfile. Forwarded from [`crate::path::same_directory`]'s own
+/// safety doc.
+pub unsafe fn set_b0_dir_flag(b0: &mut ZeroBlock, buf: &BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mf_fname = unsafe { &*buf.b_ml.ml_mfp }.mf_fname.clone();
+    // SAFETY: forwarded from this function's own safety doc.
+    let same = unsafe { crate::path::same_directory(mf_fname.as_deref(), buf.b_ffname.as_deref()) };
+    let flags = b0.b0_flags();
+    if same {
+        b0.set_b0_flags(flags | B0_SAME_DIR);
+    } else {
+        b0.set_b0_flags(flags & !B0_SAME_DIR);
+    }
+}
+
+/// Replace line `lnum` in the CURRENT buffer (`ml_replace_len`).
+///
+/// A thin wrapper over [`ml_replace_buf_len`], which this crate's own
+/// `line` slice already carries the length for - so the original's
+/// separate `len` parameter is dropped, as are its `copy`/`noalloc`
+/// flags (see `ml_replace_buf_len`'s own doc comment).
+///
+/// # Safety
+/// `crate::globals::GLOBALS.curbuf` must be a valid, non-null pointer
+/// to a live `BufT`. Forwarded from [`ml_replace_buf_len`]'s own
+/// safety doc.
+pub unsafe fn ml_replace_len(lnum: LinenrT, line: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { &mut *crate::globals::GLOBALS.get_mut().curbuf };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { ml_replace_buf_len(curbuf, lnum, line) }
+}
 
 /// Whether `b0` carries the block-0 identifier (`ml_check_b0_id`).
 ///
@@ -3424,6 +3469,75 @@ mod tests {
         );
         assert_eq!(buf[ZB_OFF_MAGIC_CHAR], B0_MAGIC_CHAR);
     }
+
+    // --- set_b0_dir_flag / ml_replace_len ---
+
+    #[test]
+    fn set_b0_dir_flag_sets_the_flag_when_the_swapfile_sits_beside_the_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { ml_open(&mut buf) }, crate::vim_defs::OK);
+        // Both in the same directory.
+        unsafe { (*buf.b_ml.ml_mfp).mf_fname = Some(b"/tmp/proj/.file.swp".to_vec()) };
+        buf.b_ffname = Some(b"/tmp/proj/file".to_vec());
+
+        let mut b0 = ZeroBlock::new(4096);
+        b0.set_b0_flags(0);
+        unsafe { set_b0_dir_flag(&mut b0, &buf) };
+        assert_eq!(b0.b0_flags() & B0_SAME_DIR, B0_SAME_DIR);
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn set_b0_dir_flag_clears_the_flag_for_a_different_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { ml_open(&mut buf) }, crate::vim_defs::OK);
+        unsafe { (*buf.b_ml.ml_mfp).mf_fname = Some(b"/var/swap/.file.swp".to_vec()) };
+        buf.b_ffname = Some(b"/tmp/proj/file".to_vec());
+
+        // Start with the flag already set to prove it is cleared, and
+        // with a neighbouring bit set to prove only this one changes.
+        let mut b0 = ZeroBlock::new(4096);
+        b0.set_b0_flags(B0_SAME_DIR | B0_HAS_FENC);
+        unsafe { set_b0_dir_flag(&mut b0, &buf) };
+        assert_eq!(b0.b0_flags() & B0_SAME_DIR, 0);
+        assert_eq!(
+            b0.b0_flags() & B0_HAS_FENC,
+            B0_HAS_FENC,
+            "other flag bits are preserved"
+        );
+
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    #[test]
+    fn ml_replace_len_targets_the_current_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        assert_eq!(unsafe { ml_open(&mut buf) }, crate::vim_defs::OK);
+        let buf_ptr: *mut BufT = &mut buf;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = buf_ptr;
+
+        assert_eq!(unsafe { ml_replace_len(1, b"replaced\0") }, crate::vim_defs::OK);
+        assert_eq!(unsafe { ml_get_buf(&mut *buf_ptr, 1) }, b"replaced\0");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
 
     // --- ml_check_b0_id / ml_check_b0_strings / b0_magic_wrong ---
 
