@@ -3644,6 +3644,245 @@ fn fold_subgap<'a>(gap: &'a [FoldT], path: &[usize]) -> &'a [FoldT] {
     sub
 }
 
+/// Recompute the folds of window `wp` for the line range `top` to
+/// `bot` (`foldUpdateIEMS`).
+///
+/// Picks the level-supplying function from `'foldmethod'`, backs up
+/// to a line whose level is defined, then drives
+/// [`fold_update_iems_recurse`] over the range, finally removing any
+/// folds left in the part it covered and redrawing when the structure
+/// changed.
+///
+/// # Safety
+/// Same as [`fold_update_iems_recurse`]; `wp` must be a valid, live
+/// [`WinT`].
+pub unsafe fn fold_update_iems(
+    wp: *mut WinT,
+    mut top: crate::pos_defs::LinenrT,
+    mut bot: crate::pos_defs::LinenrT,
+) {
+    // Avoid problems when being called recursively.
+    // SAFETY: plain GlobalCells, matching the original's own
+    // single-threaded-editor assumption.
+    if *unsafe { INVALID_TOP.get_mut() } != 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*wp).w_foldinvalid } {
+        // Need to update all folds.
+        top = 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        bot = unsafe { (*buf).b_ml.ml_line_count };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*wp).w_foldinvalid = false };
+
+        // Mark all folds as maybe-small.
+        // SAFETY: forwarded from this function's own safety doc.
+        set_small_maybe(unsafe { &mut (*wp).w_folds });
+    }
+
+    // When deleting lines at the end of the buffer "top" can be past
+    // the end of the buffer.
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { (*buf).b_ml.ml_line_count };
+    top = top.min(line_count);
+
+    let mut fline = FlineT {
+        wp,
+        off: 0,
+        lvl: 0,
+        lvl_next: -1,
+        start: 0,
+        end: MAX_LEVEL + 1,
+        had_end: MAX_LEVEL + 1,
+        ..Default::default()
+    };
+
+    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+    *unsafe { FOLD_CHANGED.get_mut() } = false;
+    // SAFETY: as above.
+    unsafe {
+        *INVALID_TOP.get_mut() = top;
+        *INVALID_BOT.get_mut() = bot;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*wp };
+    let getlevel = if foldmethod_is_marker(win) {
+        LevelGetter::Marker
+    } else if foldmethod_is_expr(win) {
+        LevelGetter::Expr
+    } else if foldmethod_is_syntax(win) {
+        LevelGetter::Syntax
+    } else if foldmethod_is_diff(win) {
+        LevelGetter::Diff
+    } else {
+        LevelGetter::Indent
+    };
+
+    if getlevel == LevelGetter::Marker {
+        // Init marker variables to speed up foldlevel_marker.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { parse_marker(win) };
+
+        // Need the level of the line above top, used when there is no
+        // marker at the top.
+        if top > 1 {
+            // SAFETY: forwarded from this function's own safety doc.
+            let level = fold_level_win(unsafe { &*wp }, top - 1);
+
+            // The fold may end just above top, so check for that.
+            fline.lnum = top - 1;
+            fline.lvl = level;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { getlevel.get(&mut fline) };
+
+            // If a fold started here we already had the level; if it
+            // stops here we need lvl_next. A line can also both start
+            // and end a fold.
+            fline.lvl = if fline.lvl > level {
+                level - (fline.lvl - fline.lvl_next)
+            } else {
+                fline.lvl_next
+            };
+        }
+        fline.lnum = top;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { getlevel.get(&mut fline) };
+    } else {
+        fline.lnum = top;
+        // For "expr", start one line back because a "<1" may indicate
+        // the end of a fold in the top line; for "indent", because a
+        // line above top with an undefined level folds according to
+        // the line under it, which is top.
+        if matches!(getlevel, LevelGetter::Expr | LevelGetter::Indent) && top > 1 {
+            fline.lnum -= 1;
+        }
+
+        // Back up to a line whose fold level is defined. Since line
+        // one always has one, the search stops there.
+        fline.lvl = -1;
+        loop {
+            // SAFETY: reads the got_int global.
+            if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+                break;
+            }
+            // Reset lvl_next each time: it is set for the NEXT line,
+            // but the search here runs backwards.
+            fline.lvl_next = -1;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { getlevel.get(&mut fline) };
+            if fline.lvl >= 0 {
+                break;
+            }
+            fline.lnum -= 1;
+        }
+    }
+
+    let mut start = fline.lnum;
+    let mut end = bot;
+    // Do at least one line.
+    if start > end && end < line_count {
+        end = start;
+    }
+
+    loop {
+        // SAFETY: reads the got_int global.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        // Always stop at the end of the file ("end" can be past it).
+        if fline.lnum > line_count {
+            break;
+        }
+        if fline.lnum > end {
+            // For the end-searching methods: if a change removed a
+            // fold, continue at least until where it ended.
+            if !getlevel.needs_end_search() {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            let folds = unsafe { &(*wp).w_folds };
+            let (hit_end, idx_end) = fold_find(folds, end);
+            let (hit_cur, idx_cur) = fold_find(folds, fline.lnum);
+            if start <= end
+                && hit_end
+                && folds[idx_end].fd_top + folds[idx_end].fd_len - 1 > end
+            {
+                end = folds[idx_end].fd_top + folds[idx_end].fd_len - 1;
+            } else if fline.lvl == 0 && hit_cur && folds[idx_cur].fd_top < fline.lnum {
+                end = folds[idx_cur].fd_top + folds[idx_cur].fd_len - 1;
+            } else if getlevel == LevelGetter::Syntax
+                // SAFETY: forwarded from this function's own safety doc.
+                && fold_level_win(unsafe { &*wp }, fline.lnum) != fline.lvl
+            {
+                // For "syntax": when the level the syntax reports and
+                // the level from the existing folds disagree, keep
+                // updating.
+                end = fline.lnum;
+            } else {
+                break;
+            }
+        }
+
+        // A level 1 fold starts at a line with foldlevel > 0.
+        if fline.lvl > 0 {
+            // SAFETY: as above.
+            unsafe {
+                *INVALID_TOP.get_mut() = fline.lnum;
+                *INVALID_BOT.get_mut() = end;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            end = unsafe {
+                fold_update_iems_recurse(
+                    &mut (*wp).w_folds,
+                    1,
+                    start,
+                    &mut fline,
+                    getlevel,
+                    end,
+                    fd_flags::FD_LEVEL,
+                )
+            };
+            start = fline.lnum;
+        } else {
+            if fline.lnum == line_count {
+                break;
+            }
+            fline.lnum += 1;
+            fline.lvl = fline.lvl_next;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { getlevel.get(&mut fline) };
+        }
+    }
+
+    // There can't be any folds from start until end now.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_remove(&mut (*wp).w_folds, start, end) };
+
+    // If some fold changed, redraw and position the cursor.
+    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>.
+    // SAFETY: forwarded from this function's own safety doc.
+    if *unsafe { FOLD_CHANGED.get_mut() } && unsafe { (*wp).w_onebuf_opt.wo_fen } != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::r#move::changed_window_setting(wp) };
+    }
+
+    // If folds past "bot" were updated, more lines need redrawing.
+    // Doing this in other situations can cause the whole window to be
+    // updated, and the changed lines are redrawn anyway.
+    if end != bot {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::redraw_win_range_later(wp, top, end) };
+    }
+
+    // SAFETY: as above.
+    unsafe { *INVALID_TOP.get_mut() = 0 };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4786,6 +5025,118 @@ mod tests {
             *FOLD_MARKERS.get_mut() = None;
         }
         out
+    }
+
+    #[test]
+    fn fold_update_iems_builds_folds_from_indent_matching_real_nvim() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: with shiftwidth=2 and
+        // 'foldmethod'=indent over "top" / "  a" / "  b" / "  c" /
+        // "bottom", foldlevel() reports 0, 1, 1, 1, 0.
+        let (buf, mut win) = indent_level_fixture(
+            &[b"top", b"  a", b"  b", b"  c", b"bottom"],
+            2,
+            20,
+            b"#",
+        );
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        let win_ptr: *mut WinT = &mut *win;
+
+        unsafe { fold_update_iems(win_ptr, 1, 5) };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1, "one fold over the indented run");
+        assert_eq!(folds[0].fd_top, 2);
+        assert_eq!(folds[0].fd_len, 3, "lines 2-4");
+
+        for (lnum, want) in [(1, 0), (2, 1), (3, 1), (4, 1), (5, 0)] {
+            assert_eq!(
+                fold_level_win(unsafe { &*win_ptr }, lnum),
+                want,
+                "line {lnum}"
+            );
+        }
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_update_iems_clears_foldinvalid_and_recomputes_everything() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"  b", b"bottom"], 2, 20, b"#");
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        // A stale fold plus the invalid flag: the whole buffer is
+        // recomputed and the stale fold replaced.
+        win.w_foldinvalid = true;
+        win.w_folds = vec![FoldT {
+            fd_top: 1,
+            fd_len: 4,
+            ..Default::default()
+        }];
+        let win_ptr: *mut WinT = &mut *win;
+
+        unsafe { fold_update_iems(win_ptr, 3, 3) };
+
+        assert!(!unsafe { (*win_ptr).w_foldinvalid });
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1);
+        assert_eq!(folds[0].fd_top, 2, "recomputed from the indents");
+        assert_eq!(folds[0].fd_len, 2);
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_update_iems_makes_no_folds_when_nothing_is_indented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = indent_level_fixture(&[b"a", b"b", b"c"], 2, 20, b"#");
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        win.w_onebuf_opt.wo_fdl = 99;
+        win.w_onebuf_opt.wo_fml = 0;
+        let win_ptr: *mut WinT = &mut *win;
+
+        unsafe { fold_update_iems(win_ptr, 1, 3) };
+
+        assert!(unsafe { (*win_ptr).w_folds.is_empty() });
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn fold_update_iems_is_a_noop_while_another_update_is_running() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) =
+            indent_level_fixture(&[b"top", b"  a", b"bottom"], 2, 20, b"#");
+        win.w_onebuf_opt.wo_fen = 1;
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        let win_ptr: *mut WinT = &mut *win;
+
+        // A non-zero invalid_top means an update is already in
+        // progress, so a recursive call must return immediately.
+        unsafe { *INVALID_TOP.get_mut() = 1 };
+        unsafe { fold_update_iems(win_ptr, 1, 3) };
+        assert!(unsafe { (*win_ptr).w_folds.is_empty() }, "did nothing");
+
+        unsafe { *INVALID_TOP.get_mut() = 0 };
+        drop(win);
+        close_indent_level_fixture(buf);
     }
 
     #[test]
