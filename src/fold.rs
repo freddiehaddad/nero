@@ -2414,6 +2414,150 @@ pub unsafe fn fold_move_range(
     fold_reverse_order(gap, move_start + dest_index - move_end, dest_index - 1);
 }
 
+/// Create a fold covering `start` to `end` in window `wp`
+/// (`foldCreate`).
+///
+/// Existing folds that fall inside the new one are moved into it as
+/// nested folds, with their line numbers rebased; if the first of
+/// them starts above the new fold, or the last ends below it, the new
+/// fold is widened rather than changing them. The new fold is created
+/// closed.
+///
+/// # Deferred boundary
+/// With `'foldmethod'` set to `"marker"` the original writes the fold
+/// markers into the buffer instead, which needs `foldCreateMarkers`
+/// and the `ml_replace_buf` text-editing path, not yet translated.
+/// The guard reaching it is real.
+///
+/// # Safety
+/// Same as [`close_fold`]; `wp` must be a valid, live [`WinT`].
+pub unsafe fn fold_create(
+    wp: *mut WinT,
+    start: crate::pos_defs::PosT,
+    end: crate::pos_defs::PosT,
+) {
+    let mut use_level = false;
+    let mut closed = false;
+    let mut level = 0;
+
+    // Reverse the range when it was given backwards.
+    let (start, end) = if start.lnum > end.lnum { (end, start) } else { (start, end) };
+    let mut start_rel = start;
+    let mut end_rel = end;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { foldmethod_is_marker(&*wp) } {
+        unimplemented!(
+            "fold::fold_create: 'foldmethod'=marker writes markers into the buffer via \
+             foldCreateMarkers, which needs the ml_replace_buf text-editing path, not yet \
+             translated"
+        );
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    checkupdate(unsafe { &mut *wp });
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdl = unsafe { (*wp).w_onebuf_opt.wo_fdl };
+
+    // Find the place to insert the new fold.
+    let mut path: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { fold_gap(wp, &path) }.is_empty() {
+        loop {
+            // SAFETY: forwarded from this function's own safety doc.
+            let gap = unsafe { fold_gap(wp, &path) };
+            let (found, idx) = fold_find(gap, start_rel.lnum);
+            if !found {
+                i = idx;
+                break;
+            }
+            let fp = &gap[idx];
+            if fp.fd_top + fp.fd_len > end_rel.lnum {
+                // The new fold is completely inside this one: go one
+                // level deeper.
+                let fd_top = fp.fd_top;
+                let (fd_flags, _) = (fp.fd_flags, ());
+                start_rel.lnum -= fd_top;
+                end_rel.lnum -= fd_top;
+                if use_level || fd_flags == fd_flags::FD_LEVEL {
+                    use_level = true;
+                    if crate::types_defs::OptInt::from(level) >= fdl {
+                        closed = true;
+                    }
+                } else if fd_flags == fd_flags::FD_CLOSED {
+                    closed = true;
+                }
+                level += 1;
+                path.push(idx);
+            } else {
+                // This fold and the new fold overlap: insert here and
+                // move some folds inside the new fold.
+                i = idx;
+                break;
+            }
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { fold_gap(wp, &path) }.is_empty() {
+            i = 0;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let gap = unsafe { fold_gap_mut(wp, &path) };
+
+    // Count the folds that will be contained in the new fold.
+    let mut cont = 0usize;
+    while i + cont < gap.len() && gap[i + cont].fd_top <= end_rel.lnum {
+        cont += 1;
+    }
+
+    let mut nested: Vec<FoldT> = Vec::new();
+    if cont > 0 {
+        // If the first contained fold starts before the new fold, let
+        // the new fold start there instead; otherwise that fold would
+        // change. Likewise widen the end for a partly-contained last
+        // fold.
+        start_rel.lnum = start_rel.lnum.min(gap[i].fd_top);
+        let last = &gap[i + cont - 1];
+        end_rel.lnum = end_rel.lnum.max(last.fd_top + last.fd_len - 1);
+
+        // Move the contained folds inside the new fold, rebasing them
+        // onto it.
+        nested = gap.drain(i..i + cont).collect();
+        for fp in &mut nested {
+            fp.fd_top -= start_rel.lnum;
+        }
+    }
+
+    // Insert the new fold.
+    gap.insert(
+        i,
+        FoldT {
+            fd_top: start_rel.lnum,
+            fd_len: end_rel.lnum - start_rel.lnum + 1,
+            fd_nested: nested,
+            fd_flags: fd_flags::FD_CLOSED,
+            fd_small: crate::types_defs::TriState::None,
+        },
+    );
+
+    // The new fold should be closed. If it would stay open because of
+    // 'foldlevel', adjust the containing folds' flags.
+    if use_level && !closed && crate::types_defs::OptInt::from(level) < fdl {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { close_fold(start, 1) };
+    }
+    if !use_level {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*wp).w_fold_manual = true };
+    }
+
+    // Redraw.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::r#move::changed_window_setting(wp) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3349,6 +3493,193 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    /// A window able to hold manual folds, with 'foldlevel' high
+    /// enough that nothing closes on level alone.
+    fn fold_create_win(buf: &mut BufT) -> WinT {
+        buf.b_ml.ml_line_count = 40;
+        WinT {
+            w_buffer: buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fold_create_makes_a_closed_fold_over_the_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1);
+        assert_eq!(folds[0].fd_top, 10);
+        assert_eq!(folds[0].fd_len, 11, "10..20 inclusive");
+        assert_eq!(folds[0].fd_flags, fd_flags::FD_CLOSED);
+        assert!(unsafe { (*win_ptr).w_fold_manual });
+    }
+
+    #[test]
+    fn fold_create_reverses_a_backwards_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds[0].fd_top, 10);
+        assert_eq!(folds[0].fd_len, 11);
+    }
+
+    #[test]
+    fn fold_create_absorbs_an_existing_fold_as_nested() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: with a fold at 12-14
+        // already present, creating one over 10-20 leaves the outer
+        // fold at level 1 and the inner at level 2, with lines past
+        // the outer fold back at level 0.
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 12,
+            fd_len: 3,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1, "the old fold is now nested");
+        assert_eq!(folds[0].fd_top, 10);
+        assert_eq!(folds[0].fd_nested.len(), 1);
+        // Rebased onto the new parent: 12 - 10 = 2.
+        assert_eq!(folds[0].fd_nested[0].fd_top, 2);
+
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 10), 1);
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 13), 2);
+        assert_eq!(fold_level_win(unsafe { &*win_ptr }, 21), 0);
+    }
+
+    #[test]
+    fn fold_create_widens_to_cover_a_partly_overlapping_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The existing fold 8-12 starts above the new fold's range,
+        // so the new fold starts there instead rather than splitting
+        // the existing one.
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 8,
+            fd_len: 5,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds[0].fd_top, 8, "widened to the contained fold's start");
+        assert_eq!(folds[0].fd_len, 13, "8..20 inclusive");
+        assert_eq!(folds[0].fd_nested[0].fd_top, 0, "8 - 8");
+    }
+
+    #[test]
+    fn fold_create_nests_inside_an_enclosing_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The new fold lies entirely inside an existing one, so it
+        // becomes a child rather than a sibling.
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_folds = vec![FoldT {
+            fd_top: 5,
+            fd_len: 30,
+            fd_flags: fd_flags::FD_OPEN,
+            fd_small: crate::types_defs::TriState::False,
+            ..Default::default()
+        }];
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+            )
+        };
+
+        let folds = unsafe { &(*win_ptr).w_folds };
+        assert_eq!(folds.len(), 1, "still one top-level fold");
+        assert_eq!(folds[0].fd_top, 5);
+        assert_eq!(folds[0].fd_nested.len(), 1);
+        // Relative to the enclosing fold: 10 - 5 = 5.
+        assert_eq!(folds[0].fd_nested[0].fd_top, 5);
+        assert_eq!(folds[0].fd_nested[0].fd_len, 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "foldCreateMarkers")]
+    fn fold_create_with_foldmethod_marker_is_unimplemented() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = fold_create_win(&mut buf);
+        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
+        let win_ptr = &mut win as *mut WinT;
+        let _guard = CurwinGuard::set(win_ptr);
+
+        unsafe {
+            fold_create(
+                win_ptr,
+                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
+            )
+        };
     }
 
     #[test]
