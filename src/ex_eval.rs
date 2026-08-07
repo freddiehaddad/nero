@@ -22,6 +22,60 @@
 
 use crate::vim_defs::FAIL;
 
+/// Set while `force_abort` is being held back (`cause_abort`).
+/// File-static in the original.
+///
+/// When several errors appear in a row, setting `force_abort` is
+/// delayed until the failing command returns, and this flag records
+/// that situation meanwhile. It matters when `force_abort` was set
+/// during a function call inside an expression: aborting the
+/// expression itself produces no messages, but parsing errors during
+/// the evaluation must still be reported, even inside a `:try`.
+static CAUSE_ABORT: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Restore `force_abort` from the held-back `CAUSE_ABORT` flag
+/// (`update_force_abort`).
+///
+/// `force_abort` is temporarily reset by the first `emsg()` during an
+/// expression evaluation, with `cause_abort` standing in for it; this
+/// puts it back, which can be needed before the throw point for the
+/// error message is reached.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `CAUSE_ABORT`
+/// or `crate::globals::GLOBALS`.
+pub unsafe fn update_force_abort() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *CAUSE_ABORT.get_mut() } {
+        // SAFETY: as above.
+        unsafe { crate::globals::GLOBALS.get_mut() }.force_abort = true;
+    }
+}
+
+/// Set or clear `CAUSE_ABORT`.
+///
+/// The original's callers (`cause_errthrow`/`do_errthrow`/
+/// `enter_cleanup`/`leave_cleanup`) assign the file-static directly;
+/// none of them is translated yet, so this accessor exists so the
+/// flag can be driven once they are.
+///
+/// # Safety
+/// Same as [`update_force_abort`].
+pub unsafe fn set_cause_abort(flag: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CAUSE_ABORT.get_mut() = flag };
+}
+
+/// Read `CAUSE_ABORT`.
+///
+/// # Safety
+/// Same as [`update_force_abort`].
+#[must_use]
+pub unsafe fn cause_abort() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CAUSE_ABORT.get_mut() }
+}
+
 /// Returns `true` when immediately aborting on error, or when an
 /// interrupt occurred or an exception was thrown but not caught
 /// (`aborting`).
@@ -76,6 +130,62 @@ mod tests {
     use super::*;
     use crate::globals::{global_state_test_lock, GLOBALS};
     use crate::vim_defs::OK;
+
+    // --- cause_abort / update_force_abort ---
+
+    #[test]
+    fn update_force_abort_restores_force_abort_when_cause_abort_is_set() {
+        let _lock = global_state_test_lock();
+        unsafe {
+            let prev_cause = cause_abort();
+            let prev_force = GLOBALS.get_mut().force_abort;
+
+            set_cause_abort(true);
+            GLOBALS.get_mut().force_abort = false;
+            update_force_abort();
+            assert!(GLOBALS.get_mut().force_abort);
+
+            set_cause_abort(prev_cause);
+            GLOBALS.get_mut().force_abort = prev_force;
+        }
+    }
+
+    #[test]
+    fn update_force_abort_leaves_force_abort_alone_without_cause_abort() {
+        // The original only ever SETS force_abort here - it never
+        // clears it, so a already-set flag survives a false
+        // cause_abort too.
+        let _lock = global_state_test_lock();
+        unsafe {
+            let prev_cause = cause_abort();
+            let prev_force = GLOBALS.get_mut().force_abort;
+
+            set_cause_abort(false);
+            GLOBALS.get_mut().force_abort = false;
+            update_force_abort();
+            assert!(!GLOBALS.get_mut().force_abort);
+
+            GLOBALS.get_mut().force_abort = true;
+            update_force_abort();
+            assert!(GLOBALS.get_mut().force_abort, "never cleared");
+
+            set_cause_abort(prev_cause);
+            GLOBALS.get_mut().force_abort = prev_force;
+        }
+    }
+
+    #[test]
+    fn cause_abort_round_trips_through_its_setter() {
+        let _lock = global_state_test_lock();
+        unsafe {
+            let prev = cause_abort();
+            set_cause_abort(true);
+            assert!(cause_abort());
+            set_cause_abort(false);
+            assert!(!cause_abort());
+            set_cause_abort(prev);
+        }
+    }
 
     /// Resets every field `aborting`/`should_abort` read, restoring
     /// them on drop - callers must hold `global_state_test_lock()`
