@@ -1559,30 +1559,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the real fold-tree search is not yet translated")]
-    fn get_cursor_rel_lnum_panics_when_folding_could_be_active() {
-        // No real ml_open-backed memline is needed here: the panic
-        // path (has_any_folding -> has_folding_win's own
-        // unimplemented!()) never touches buf.b_ml, only
-        // buf.terminal/win.w_onebuf_opt - avoids leaking a boxed
-        // MemfileT across the panic (this test never reaches a
-        // cleanup step).
+    fn get_cursor_rel_lnum_skips_over_a_closed_fold() {
         let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
             w_cursor: PosT { lnum: 1, col: 0, coladd: 0 },
             w_onebuf_opt: crate::buffer_defs::WinoptT {
                 wo_fen: 1,
-                wo_fdm: Some(b"expr".to_vec()),
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
                 ..Default::default()
             },
+            w_foldinvalid: false,
+            // A closed fold over lines 3-5 collapses to one display
+            // line, so lines 1..7 count as 1, 2, [3-5], 6, 7.
+            w_folds: vec![crate::fold::FoldT {
+                fd_top: 3,
+                fd_len: 3,
+                fd_flags: crate::fold::fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
-        // lnum != cursor and has_any_folding is true -> enters the
-        // fold-skipping loop, which panics via has_folding_win's own
-        // unimplemented!() on its first has_folding call.
-        let _ = unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 2) };
+        // Line 2 is one display line below the cursor at line 1.
+        assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 2) }, 1);
+        // Line 6 is past the closed fold, which counts once: line 2,
+        // then the whole fold, then line 6 itself.
+        assert_eq!(unsafe { get_cursor_rel_lnum(&mut win as *mut WinT, 6) }, 3);
     }
 
     #[test]

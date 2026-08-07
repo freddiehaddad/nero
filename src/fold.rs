@@ -26,12 +26,9 @@
 //! (fold-creation itself needs `foldUpdate`/`setManualFold`/etc., none
 //! translated). `has_folding_win`/`has_folding` carry their full,
 //! real signatures (`firstp`/`lastp`/`cache`/`infop`, as
-//! `Option<&mut _>` out-parameters) even though the fast path
-//! translated here never touches `firstp`/`lastp` (matching the
-//! original's own behavior on this exact path) - kept for forward-
-//! compatibility with the real fold-tree search once it exists,
-//! avoiding a future signature change; `fold_info`/`line_folded` are
-//! this widened signature's first real consumers.
+//! `Option<&mut _>` out-parameters) and are now fully translated,
+//! including the fold-tree search and the displayed-line cache;
+//! `fold_info`/`line_folded` are their first real consumers.
 //!
 //! This precisely unblocks `cursor.c`'s `check_cursor_lnum`/
 //! `check_cursor` (the `check_cursor_lnum` + `check_cursor_col` combo)
@@ -241,32 +238,32 @@ pub fn checkupdate(wp: &mut WinT) {
 
 /// Search folds starting at `lnum` (`hasFoldingWin`).
 ///
-/// Only the "no folds in this window" fast path is translated (see
-/// this module's own doc comment) - the real fold-tree search,
-/// reached only when [`has_any_folding`] is true, is
-/// `unimplemented!()`. On this fast path, `firstp`/`lastp` are left
-/// untouched (matching the original's own behavior: they're only ever
-/// written on the "a fold WAS found" path) and `infop`'s `fi_level` is
-/// set to `0` (matching the original's own `if (infop != NULL) {
-/// infop->fi_level = 0; }` on this exact path) - every other
-/// `FoldinfoT` field is left at whatever `infop` already held, again
-/// matching the original (which writes only `fi_level` here). `cache`
-/// is accepted for signature fidelity but genuinely unused: the
-/// original doesn't read it until after the `hasAnyFolding` check
-/// either.
+/// Returns whether `lnum` is inside a *closed* fold. When it is,
+/// `firstp`/`lastp` receive the first and last line of the folded
+/// range (with `lastp` clamped to the buffer's line count), and
+/// `infop` receives the fold's level, start line and lowest level.
+/// When it is not, `firstp`/`lastp` are left untouched - matching the
+/// original, which only ever writes them on the "a fold WAS found"
+/// path - while `infop` still receives the level and position
+/// reached by the search.
+///
+/// With `cache` set, the displayed-line cache (`w_lines`) is
+/// consulted first, which is faster but only valid for lines
+/// currently on screen.
 ///
 /// # Safety
 /// `win.w_buffer` must be a valid, non-null pointer to a live `BufT`.
 pub unsafe fn has_folding_win(
     win: &mut WinT,
-    _lnum: crate::pos_defs::LinenrT,
-    _firstp: Option<&mut crate::pos_defs::LinenrT>,
-    _lastp: Option<&mut crate::pos_defs::LinenrT>,
-    _cache: bool,
+    lnum: crate::pos_defs::LinenrT,
+    firstp: Option<&mut crate::pos_defs::LinenrT>,
+    lastp: Option<&mut crate::pos_defs::LinenrT>,
+    cache: bool,
     infop: Option<&mut crate::fold_defs::FoldinfoT>,
 ) -> bool {
     checkupdate(win);
 
+    // Return quickly when there is no folding at all in this window.
     // SAFETY: forwarded from this function's own safety doc.
     if !unsafe { has_any_folding(win) } {
         if let Some(info) = infop {
@@ -274,17 +271,111 @@ pub unsafe fn has_folding_win(
         }
         return false;
     }
-    unimplemented!(
-        "fold::has_folding_win: the real fold-tree search is not yet translated (only the \
-         \"hasAnyFolding() == false\" fast path is)"
-    );
+
+    let mut had_folded = false;
+    let mut first: crate::pos_defs::LinenrT = 0;
+    let mut last: crate::pos_defs::LinenrT = 0;
+
+    if cache {
+        // First look in cached info for displayed lines. This is
+        // probably the fastest, but it can only be used if the entry
+        // is still valid.
+        if let Some(x) = find_wl_entry(win, lnum) {
+            first = win.w_lines[x].wl_lnum;
+            last = win.w_lines[x].wl_foldend;
+            had_folded = win.w_lines[x].wl_folded;
+        }
+    }
+
+    let mut lnum_rel = lnum;
+    let mut level = 0;
+    let mut low_level = 0;
+    let mut maybe_small = false;
+    let mut use_level = false;
+
+    if first == 0 {
+        // Recursively search for a fold that contains "lnum".
+        let win_ptr: *mut WinT = win;
+        // SAFETY: `gap` walks into `win.w_folds` and then into each
+        // fold's own `fd_nested`, all reached through this one
+        // pointer lineage, which stays valid for the whole walk.
+        let mut gap: *mut Vec<FoldT> = unsafe { &raw mut (*win_ptr).w_folds };
+        loop {
+            // SAFETY: as above.
+            let (found, idx) = fold_find(unsafe { &*gap }, lnum_rel);
+            if !found {
+                break;
+            }
+            // SAFETY: fold_find returned an in-bounds index.
+            let fp: *mut FoldT = unsafe { (&mut *gap).as_mut_ptr().add(idx) };
+            // SAFETY: as above.
+            let fd_top = unsafe { (*fp).fd_top };
+
+            // Remember lowest level of fold that starts in "lnum".
+            if lnum_rel == fd_top && low_level == 0 {
+                low_level = level + 1;
+            }
+
+            first += fd_top;
+            last += fd_top;
+
+            // Is this fold closed?
+            // SAFETY: as above; `fp` and `win_ptr` are distinct
+            // objects, so the two mutable borrows do not overlap.
+            had_folded = unsafe {
+                check_closed(
+                    win_ptr,
+                    &mut *fp,
+                    &mut use_level,
+                    level,
+                    &mut maybe_small,
+                    lnum - lnum_rel,
+                )
+            };
+            if had_folded {
+                // Fold closed: set last and quit loop.
+                // SAFETY: as above.
+                last += unsafe { (*fp).fd_len } - 1;
+                break;
+            }
+
+            // Fold found, but it's open: check nested folds. Line
+            // number is relative to the containing fold.
+            // SAFETY: as above.
+            gap = unsafe { &raw mut (*fp).fd_nested };
+            lnum_rel -= fd_top;
+            level += 1;
+        }
+    }
+
+    if !had_folded {
+        if let Some(info) = infop {
+            info.fi_level = level;
+            info.fi_lnum = lnum - lnum_rel;
+            info.fi_low_level = if low_level == 0 { level } else { low_level };
+        }
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    last = last.min(unsafe { (*win.w_buffer).b_ml.ml_line_count });
+    if let Some(lastp) = lastp {
+        *lastp = last;
+    }
+    if let Some(firstp) = firstp {
+        *firstp = first;
+    }
+    if let Some(info) = infop {
+        info.fi_level = level + 1;
+        info.fi_lnum = first;
+        info.fi_low_level = if low_level == 0 { level + 1 } else { low_level };
+    }
+    true
 }
 
-/// When returning true, `firstp`/`lastp` would be set to the first and
-/// last lnum of the sequence of folded lines - not modeled here since
-/// only the "no folds" (`false`-returning) fast path is translated
-/// (`hasFolding`). On this fast path, `firstp`/`lastp` are left
-/// untouched - see [`has_folding_win`]'s own doc comment.
+/// When returning true, `firstp`/`lastp` are set to the first and
+/// last lnum of the sequence of folded lines (`hasFolding`). They are
+/// left untouched when it returns false.
 ///
 /// # Safety
 /// Same as [`has_folding_win`].
@@ -1233,8 +1324,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the real fold-tree search is not yet translated")]
-    fn has_folding_win_panics_when_folding_could_be_active() {
+    fn has_folding_win_reports_nothing_for_a_window_with_no_actual_folds() {
         let mut buf = BufT::default();
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
@@ -1245,7 +1335,14 @@ mod tests {
             },
             ..Default::default()
         };
-        let _ = unsafe { has_folding_win(&mut win, 1, None, None, true, None) };
+        // hasAnyFolding is true, so the search really runs - but
+        // w_folds is empty, so it finds nothing.
+        let mut info = crate::fold_defs::FoldinfoT::default();
+        assert!(!unsafe { has_folding_win(&mut win, 1, None, None, true, Some(&mut info)) });
+        assert_eq!(info.fi_level, 0);
+        // fi_lnum is `lnum - lnum_rel`, and with no fold found
+        // lnum_rel never moves off lnum, so this is 0.
+        assert_eq!(info.fi_lnum, 0);
     }
 
     #[test]
@@ -1488,20 +1585,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the real fold-tree search is not yet translated")]
-    fn fold_adjust_cursor_panics_when_folding_could_be_active() {
+    fn fold_adjust_cursor_moves_the_cursor_to_the_start_of_a_closed_fold() {
         let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
             w_onebuf_opt: crate::buffer_defs::WinoptT {
                 wo_fen: 1,
-                wo_fdm: Some(b"expr".to_vec()),
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
                 ..Default::default()
             },
-            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            w_foldinvalid: false,
+            w_folds: vec![FoldT {
+                fd_top: 20,
+                fd_len: 5,
+                fd_flags: fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
+            w_cursor: crate::pos_defs::PosT { lnum: 22, col: 0, coladd: 0 },
             ..Default::default()
         };
+
         unsafe { fold_adjust_cursor(&mut win) };
+        assert_eq!(win.w_cursor.lnum, 20, "moved to the fold's first line");
+
+        // A line outside any fold is left alone.
+        win.w_cursor.lnum = 30;
+        unsafe { fold_adjust_cursor(&mut win) };
+        assert_eq!(win.w_cursor.lnum, 30);
     }
 
     #[test]
@@ -1814,6 +1928,132 @@ mod tests {
     #[test]
     fn check_close_rec_on_an_empty_array_reports_nothing_closed() {
         assert!(!check_close_rec(&mut [], 5, 0));
+    }
+
+    /// A window with a single closed fold over lines 20-24, plus a
+    /// buffer long enough that `last` is never clamped.
+    fn closed_fold_win(buf: &mut BufT) -> WinT {
+        buf.b_ml.ml_line_count = 40;
+        WinT {
+            w_buffer: buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            w_folds: vec![FoldT {
+                fd_top: 20,
+                fd_len: 5,
+                fd_flags: fd_flags::FD_CLOSED,
+                fd_small: crate::types_defs::TriState::False,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn has_folding_win_matches_real_nvim_foldclosed() {
+        // Cross-verified against real nvim: with :20,24fold closed,
+        // foldclosed() is 20 and foldclosedend() is 24 for any line
+        // inside, and -1 for lines outside.
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+
+        for lnum in [20, 22, 24] {
+            let (mut first, mut last) = (0, 0);
+            assert!(
+                unsafe { has_folding(&mut win, lnum, Some(&mut first), Some(&mut last)) },
+                "line {lnum} should be in a closed fold"
+            );
+            assert_eq!(first, 20, "line {lnum}");
+            assert_eq!(last, 24, "line {lnum}");
+        }
+
+        for lnum in [19, 25] {
+            let (mut first, mut last) = (0, 0);
+            assert!(!unsafe {
+                has_folding(&mut win, lnum, Some(&mut first), Some(&mut last))
+            });
+        }
+    }
+
+    #[test]
+    fn has_folding_win_reports_false_for_an_open_fold_but_fills_infop() {
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+        win.w_folds[0].fd_flags = fd_flags::FD_OPEN;
+
+        let mut info = crate::fold_defs::FoldinfoT::default();
+        assert!(!unsafe { has_folding_win(&mut win, 22, None, None, false, Some(&mut info)) });
+        // The line is inside one open fold, so it is at level 1 even
+        // though nothing is folded away.
+        assert_eq!(info.fi_level, 1);
+    }
+
+    #[test]
+    fn has_folding_win_reports_level_and_low_level_for_a_closed_fold() {
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+
+        let mut info = crate::fold_defs::FoldinfoT::default();
+        assert!(unsafe { has_folding_win(&mut win, 22, None, None, false, Some(&mut info)) });
+        assert_eq!(info.fi_level, 1);
+        assert_eq!(info.fi_lnum, 20, "the fold starts here");
+        assert_eq!(info.fi_low_level, 1);
+    }
+
+    #[test]
+    fn has_folding_win_clamps_last_to_the_buffer_line_count() {
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+        // A fold running past the end of the buffer must not report a
+        // last line beyond it.
+        win.w_folds[0].fd_len = 100;
+        unsafe { (*win.w_buffer).b_ml.ml_line_count = 22 };
+
+        let mut last = 0;
+        assert!(unsafe { has_folding(&mut win, 21, None, Some(&mut last)) });
+        assert_eq!(last, 22);
+    }
+
+    #[test]
+    fn has_folding_win_uses_the_displayed_line_cache_when_asked() {
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+        // An empty w_folds would normally mean "no fold here", but a
+        // valid cache entry answers first, which is the whole point
+        // of the cache parameter.
+        win.w_lines = vec![crate::buffer_defs::WlineT {
+            wl_lnum: 5,
+            wl_foldend: 9,
+            wl_folded: true,
+            wl_valid: true,
+            ..Default::default()
+        }];
+        win.w_lines_valid = 1;
+
+        let (mut first, mut last) = (0, 0);
+        assert!(unsafe { has_folding(&mut win, 5, Some(&mut first), Some(&mut last)) });
+        assert_eq!((first, last), (5, 9));
+
+        // With cache disabled the same lookup falls through to the
+        // real fold tree, which has nothing at line 5.
+        assert!(!unsafe { has_folding_win(&mut win, 5, None, None, false, None) });
+    }
+
+    #[test]
+    fn has_folding_win_still_reports_nothing_when_the_window_has_no_folds() {
+        let mut buf = BufT::default();
+        let mut win = closed_fold_win(&mut buf);
+        win.w_folds.clear();
+
+        let mut info = crate::fold_defs::FoldinfoT::default();
+        assert!(!unsafe { has_folding_win(&mut win, 22, None, None, true, Some(&mut info)) });
+        assert_eq!(info.fi_level, 0);
     }
 
     /// A window whose buffer has `lines` single-screen-line lines, so
