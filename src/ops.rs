@@ -295,6 +295,41 @@ pub fn clear_oparg(oap: &mut crate::normal_defs::OpargT) {
     *oap = crate::normal_defs::OpargT::default();
 }
 
+/// Insert `c` at the cursor in Replace mode, then step back onto the
+/// character just written (`replace_character`).
+///
+/// `State` is switched to `MODE_REPLACE` only for the duration of the
+/// insert and restored afterwards, so the caller's own mode is
+/// unaffected.
+///
+/// # Deferred boundary
+/// Switching into Replace mode is exactly what makes
+/// [`crate::change::ins_char`]'s own Replace branch reachable, and
+/// that branch needs `replace_push`/`replace_push_nul`, not yet
+/// translated - so this function panics there today. The translation
+/// itself is complete and faithful; only the downstream dependency is
+/// missing.
+///
+/// # Safety
+/// Forwarded from [`crate::change::ins_char`]/
+/// [`crate::cursor::dec_cursor`]'s own safety docs; also touches
+/// `crate::globals::GLOBALS.State`.
+pub unsafe fn replace_character(c: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+
+    // SAFETY: as above.
+    unsafe { crate::globals::GLOBALS.get_mut() }.State =
+        crate::state_defs::mode::REPLACE as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::change::ins_char(c) };
+    // SAFETY: as above.
+    unsafe { crate::globals::GLOBALS.get_mut() }.State = n;
+    // Backup to the replaced character.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::dec_cursor() };
+}
+
 /// The `'operatorfunc'` callback (`opfunc_cb`, a file-static
 /// `Callback`). Nothing in this crate can currently set a real value
 /// here: doing so needs `option_set_callback_func`, itself needing
@@ -1809,6 +1844,63 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    /// Restores `GLOBALS.State` on drop, including during a panic -
+    /// essential for [`replace_character`]'s boundary test, which
+    /// unwinds out of the function BEFORE its own restore runs and
+    /// would otherwise leave `MODE_REPLACE` set for every later test
+    /// in this process.
+    struct StateGuard {
+        prev: i32,
+    }
+
+    impl StateGuard {
+        fn set(state: i32) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = StateGuard { prev: g.State };
+            g.State = state;
+            guard
+        }
+    }
+
+    impl Drop for StateGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.State = self.prev;
+        }
+    }
+
+    #[test]
+    fn replace_character_switches_to_replace_mode_and_reaches_its_boundary() {
+        // Proves the mode switch is real: ins_char's Replace branch is
+        // reachable ONLY because this function sets MODE_REPLACE, and
+        // that branch still needs replace_push/replace_push_nul.
+        //
+        // Cross-verified against real nvim for when the dependency
+        // lands: "abcd" with the cursor on column 3 and `rX` yields
+        // "abXd" with the cursor left ON the replaced character.
+        let mut buf = crate::buffer_defs::BufT { b_p_ts: 8, ..Default::default() };
+        let mut win = WinT::default();
+        let guard = open_and_set_test_buf(&mut win, &mut buf, b"abcd\0");
+        buf.b_u_curhead = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        buf.b_p_ma = 1;
+        buf.b_u_synced = true;
+        win.w_cursor.lnum = 1;
+        win.w_cursor.col = 2;
+        let _state = StateGuard::set(crate::state_defs::mode::NORMAL as i32);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            replace_character(i32::from(b'X'));
+        }));
+        assert!(result.is_err(), "expected the replace_push boundary");
+
+        drop(_state);
+        drop(guard);
+        unsafe {
+            drop(Box::from_raw(buf.b_u_curhead));
+            buf.b_u_curhead = std::ptr::null_mut();
+        }
+        close_buf_with_memline(buf);
     }
 
     #[test]

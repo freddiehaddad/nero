@@ -387,7 +387,7 @@ pub unsafe fn ins_char_bytes(buf: &[u8]) {
     if state & crate::state_defs::mode::REPLACE_FLAG != 0 {
         unimplemented!(
             "Replace mode needs replace_push/replace_push_nul, not yet translated; \
-             unreachable while nothing can enter Replace mode"
+             reachable only through ops.rs's replace_character"
         );
     }
 
