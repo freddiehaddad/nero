@@ -186,6 +186,51 @@ static EMPTY_REG: crate::globals::GlobalCell<YankregT> = crate::globals::GlobalC
     timestamp: 0,
 });
 
+/// The register at `Y_REGS` index `reg` (`get_y_register`).
+///
+/// The original indexes `y_regs[]` unchecked; this bounds-checks and
+/// returns `None` past the end instead.
+///
+/// # Safety
+/// Touches `Y_REGS` (a `GlobalCell`) - no overlapping live access.
+#[must_use]
+pub unsafe fn get_y_register(reg: usize) -> Option<*mut YankregT> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let regs = unsafe { Y_REGS.get_mut() };
+    if reg >= regs.len() {
+        return None;
+    }
+    Some(&mut regs[reg])
+}
+
+/// Whether the register `regname` holds linewise content, also
+/// handing back the register itself (`yank_register_mline`).
+///
+/// An invalid register name, or the black hole `"_` (which is always
+/// empty), answers `false` with no register.
+///
+/// The original writes the register through a `yankreg_T **reg`
+/// out-parameter and returns the linewise flag separately; both ride
+/// in the returned tuple here.
+///
+/// # Safety
+/// Forwarded from [`get_yank_register`]'s own safety doc.
+#[must_use]
+pub unsafe fn yank_register_mline(regname: i32) -> (bool, Option<*mut YankregT>) {
+    if regname != 0 && !valid_yank_reg(regname, false) {
+        return (false, None);
+    }
+    if regname == i32::from(b'_') {
+        // black hole is always empty
+        return (false, None);
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg = unsafe { get_yank_register(regname, YregModeT::Paste) };
+    // SAFETY: get_yank_register always returns a live pointer.
+    let is_line = unsafe { (*reg).y_type } == crate::normal_defs::MotionType::LineWise;
+    (is_line, Some(reg))
+}
+
 /// Get the yank register for `regname` (`get_yank_register`).
 ///
 /// # Safety
@@ -543,6 +588,71 @@ pub fn format_reg_type(reg_type: Option<crate::normal_defs::MotionType>, reg_wid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- get_y_register / yank_register_mline ---
+
+    #[test]
+    fn get_y_register_bounds_checks_the_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            assert!(get_y_register(0).is_some());
+            assert!(get_y_register(NUM_REGISTERS - 1).is_some());
+            // The original indexes unchecked; this answers None.
+            assert!(get_y_register(NUM_REGISTERS).is_none());
+        }
+    }
+
+    #[test]
+    fn get_y_register_returns_distinct_slots() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let a = get_y_register(0).unwrap();
+            let b = get_y_register(1).unwrap();
+            assert!(!std::ptr::eq(a, b));
+        }
+    }
+
+    #[test]
+    fn yank_register_mline_refuses_the_black_hole() {
+        // Cross-verified against real nvim: getreg('_') is empty, so
+        // the black hole can never be linewise.
+        let _lock = crate::globals::global_state_test_lock();
+        let (is_line, reg) = unsafe { yank_register_mline(i32::from(b'_')) };
+        assert!(!is_line);
+        assert!(reg.is_none(), "no register is handed back");
+    }
+
+    #[test]
+    fn yank_register_mline_refuses_an_invalid_register_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (is_line, reg) = unsafe { yank_register_mline(i32::from(b'!')) };
+        assert!(!is_line);
+        assert!(reg.is_none());
+    }
+
+    #[test]
+    fn yank_register_mline_reports_the_registers_own_motion_type() {
+        // Cross-verified against real nvim: `yy` leaves the register
+        // linewise (getregtype is "V") while `yl` leaves it charwise
+        // ("v").
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let slot = get_y_register(op_reg_index(i32::from(b'a')).unwrap()).unwrap();
+            let saved = (*slot).y_type;
+
+            (*slot).y_type = crate::normal_defs::MotionType::LineWise;
+            let (is_line, reg) = yank_register_mline(i32::from(b'a'));
+            assert!(is_line);
+            assert!(reg.is_some());
+
+            (*slot).y_type = crate::normal_defs::MotionType::CharWise;
+            let (is_line, reg) = yank_register_mline(i32::from(b'a'));
+            assert!(!is_line);
+            assert!(reg.is_some(), "still handed back when not linewise");
+
+            (*slot).y_type = saved;
+        }
+    }
 
     // --- op_reg_index / valid_yank_reg ---
 
