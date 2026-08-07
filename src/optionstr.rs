@@ -385,6 +385,15 @@
 //! `did_set_background` remains deferred - it needs `init_highlight`
 //! and `do_unlet` (colorscheme reload), neither translated.
 //!
+//! `free_string_option`, `clear_string_option` and
+//! `check_string_option` need NO Rust equivalent at all: all three
+//! exist purely to manage the original's `empty_string_option`
+//! sentinel pointer (a C technique for avoiding an allocation for the
+//! empty string, and for telling "empty" apart from "unset"). This
+//! crate models a string option as `Option<Vec<u8>>`, where `None`
+//! already carries the "unset" distinction and `Vec`'s own `Drop`
+//! already performs the free - see `option_vars.rs`'s own module doc.
+//!
 //! Deferred: everything else - the ~150 real `did_set_*`/`expand_*`
 //! per-option callbacks (each needs a real `optset_T args` from an
 //! actual `:set`/`set_option_value` call, per `option_defs.rs`'s own
@@ -632,6 +641,32 @@ pub unsafe fn didset_string_options() {
     for opt in OPTS {
         // SAFETY: forwarded from this function's own safety doc.
         let _ = unsafe { check_str_opt(opt, None) };
+    }
+}
+
+/// Resolve `val` against `values` and store the resulting flags
+/// bitmask, or report `E474` (`did_set_opt_flags`).
+///
+/// A thin wrapper over [`opt_strings_flags`], turning its
+/// success/failure into the `Option<&'static [u8]>` error shape every
+/// `did_set_*` callback returns.
+///
+/// The original writes through an `unsigned *flagp` out-parameter and
+/// returns `OK`/`FAIL`; [`opt_strings_flags`] here already returns the
+/// bitmask itself, so the flags are stored only on success, exactly as
+/// upstream does.
+pub fn did_set_opt_flags(
+    val: &[u8],
+    values: &[&str],
+    flagp: &mut u32,
+    list: bool,
+) -> Option<&'static [u8]> {
+    match opt_strings_flags(val, values, list) {
+        Some(flags) => {
+            *flagp = flags;
+            None
+        }
+        None => Some(crate::errors::e_invarg.as_bytes()),
     }
 }
 
@@ -4228,6 +4263,38 @@ mod tests {
         unsafe { didset_string_options() };
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssop = prev;
+    }
+
+    #[test]
+    fn did_set_opt_flags_stores_the_bitmask_on_success() {
+        // The wrapper's whole job is turning opt_strings_flags'
+        // success into "no error" plus a stored bitmask.
+        let values = ["one", "two", "three"];
+        let mut flags = 0u32;
+        assert_eq!(did_set_opt_flags(b"two", &values, &mut flags, false), None);
+        assert_eq!(flags, 1 << 1);
+    }
+
+    #[test]
+    fn did_set_opt_flags_leaves_the_bitmask_untouched_on_failure() {
+        // An unknown value must report E474 AND leave the caller's
+        // existing flags alone, exactly as upstream does by only
+        // writing through flagp on success.
+        let values = ["one", "two"];
+        let mut flags = 0xdead_u32;
+        assert_eq!(
+            did_set_opt_flags(b"nope", &values, &mut flags, false),
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert_eq!(flags, 0xdead, "flags must survive a rejected value");
+    }
+
+    #[test]
+    fn did_set_opt_flags_list_true_accepts_a_comma_separated_value() {
+        let values = ["one", "two", "three"];
+        let mut flags = 0u32;
+        assert_eq!(did_set_opt_flags(b"one,three", &values, &mut flags, true), None);
+        assert_eq!(flags, (1 << 0) | (1 << 2));
     }
 
     #[test]
