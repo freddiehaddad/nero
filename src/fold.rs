@@ -1991,6 +1991,101 @@ pub unsafe fn foldlevel_diff(flp: &mut FlineT) {
     flp.lvl = i32::from(infold);
 }
 
+/// Fold level for the `"marker"` method (`foldlevelMarker`).
+///
+/// Scans the line for `'foldmarker'`'s start and end markers. A bare
+/// start marker raises the level by one; one followed by a number
+/// sets the level to that number outright, and likewise for the end
+/// marker, which lowers the level for the *next* line rather than
+/// this one. A line may contain several markers, so the scan
+/// continues to the end.
+///
+/// Requires a preceding [`parse_marker`] call, and expects `flp.lvl`
+/// to hold the previous line's level - which is why the original
+/// warns it cannot be called twice on the same line.
+///
+/// # Safety
+/// `flp.wp` must be a valid, live [`WinT`] whose `w_buffer` is a
+/// valid, live `BufT`; [`FOLD_MARKERS`] must have been set by
+/// [`parse_marker`].
+pub unsafe fn foldlevel_marker(flp: &mut FlineT) {
+    let start_lvl = flp.lvl;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let markers = unsafe { FOLD_MARKERS.get_mut() }
+        .clone()
+        .expect("foldlevel_marker: parse_marker must run first");
+    // SAFETY: forwarded from this function's own safety doc.
+    let fmr = unsafe { (*flp.wp).w_onebuf_opt.wo_fmr.clone() }.unwrap_or_default();
+    let startmarker = &fmr[..markers.start_len.min(fmr.len())];
+    let endmarker = &markers.end[..];
+
+    // Default: no start found, next level is same as current level.
+    flp.start = 0;
+    flp.lvl_next = flp.lvl;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*flp.wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(&mut *buf, flp.lnum + flp.off) };
+
+    let mut i = 0usize;
+    while i < line.len() && line[i] != 0 {
+        let rest = &line[i..];
+        if !startmarker.is_empty() && rest.starts_with(startmarker) {
+            // Found startmarker: set flp.lvl.
+            i += startmarker.len();
+            match marker_number(&line, i) {
+                Some(n) => {
+                    flp.lvl = n;
+                    flp.lvl_next = n;
+                    flp.start = (n - start_lvl).max(1);
+                }
+                None => {
+                    flp.lvl += 1;
+                    flp.lvl_next += 1;
+                    flp.start += 1;
+                }
+            }
+        } else if !endmarker.is_empty() && rest.starts_with(endmarker) {
+            // Found endmarker: set flp.lvl_next.
+            i += endmarker.len();
+            match marker_number(&line, i) {
+                Some(n) => {
+                    flp.lvl = n;
+                    // Never start a fold with an end marker.
+                    flp.lvl_next = (n - 1).min(start_lvl);
+                }
+                None => flp.lvl_next -= 1,
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            i += (unsafe { crate::mbyte::utfc_ptr2len(&line[i..]) } as usize).max(1);
+        }
+    }
+
+    // The level can't go negative, must be missing a start marker.
+    flp.lvl_next = flp.lvl_next.max(0);
+}
+
+/// Reads the optional level number written straight after a fold
+/// marker, as the original's own `ascii_isdigit`/`atoi` pair does.
+///
+/// Returns `None` when there is no digit there, or when the number is
+/// not positive - the original ignores a zero or negative level and
+/// falls back to the plain "one deeper" behaviour.
+fn marker_number(line: &[u8], at: usize) -> Option<i32> {
+    if !line.get(at).is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let end = line[at..]
+        .iter()
+        .position(|c| !c.is_ascii_digit())
+        .map_or(line.len(), |off| at + off);
+    let n: i32 = std::str::from_utf8(&line[at..end]).ok()?.parse().ok()?;
+    (n > 0).then_some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2926,6 +3021,132 @@ mod tests {
             }
             crate::memline::ml_close(&mut buf, false);
         }
+    }
+
+    /// Sets up `'foldmarker'` state for the marker tests and returns
+    /// a window plus a real memline holding `lines`.
+    fn marker_level_fixture(lines: &[&[u8]]) -> (Box<BufT>, Box<WinT>) {
+        let (buf, mut win) = indent_level_fixture(lines, 8, 20, b"#");
+        win.w_onebuf_opt.wo_fmr = Some(b"{{{,}}}".to_vec());
+        unsafe { parse_marker(&win) };
+        (buf, win)
+    }
+
+    #[test]
+    fn foldlevel_marker_matches_real_nvim() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim with the default
+        // 'foldmarker': for the lines "plain" / "start {{{" /
+        // "inner" / "end }}}" / "numbered {{{2" / "after",
+        // foldlevel() reports 0, 1, 1, 1, 2, 2.
+        let (buf, mut win) = marker_level_fixture(&[
+            b"plain",
+            b"start {{{",
+            b"inner",
+            b"end }}}",
+            b"numbered {{{2",
+            b"after",
+        ]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        // The scan carries the previous line's level in flp.lvl, so
+        // walk the buffer the way the fold-update pass would.
+        let mut lvl = 0;
+        let mut levels = Vec::new();
+        for lnum in 1..=6 {
+            let mut flp = FlineT { wp: win_ptr, lnum, lvl, ..Default::default() };
+            unsafe { foldlevel_marker(&mut flp) };
+            levels.push(flp.lvl);
+            lvl = flp.lvl_next;
+        }
+        assert_eq!(levels, vec![0, 1, 1, 1, 2, 2]);
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_marker_start_marker_raises_the_level_and_records_a_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = marker_level_fixture(&[b"a {{{", b"b"]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, lvl: 0, ..Default::default() };
+        unsafe { foldlevel_marker(&mut flp) };
+        assert_eq!(flp.lvl, 1);
+        assert_eq!(flp.lvl_next, 1);
+        assert_eq!(flp.start, 1, "one fold starts here");
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_marker_end_marker_only_lowers_the_next_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = marker_level_fixture(&[b"a }}}", b"b"]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, lvl: 2, ..Default::default() };
+        unsafe { foldlevel_marker(&mut flp) };
+        assert_eq!(flp.lvl, 2, "this line is still inside the fold");
+        assert_eq!(flp.lvl_next, 1);
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_marker_numbered_start_sets_the_level_outright() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = marker_level_fixture(&[b"a {{{5", b"b"]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, lvl: 1, ..Default::default() };
+        unsafe { foldlevel_marker(&mut flp) };
+        assert_eq!(flp.lvl, 5, "not one deeper, but exactly 5");
+        assert_eq!(flp.lvl_next, 5);
+        assert_eq!(flp.start, 4, "5 - 1 folds start here");
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_marker_handles_several_markers_on_one_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = marker_level_fixture(&[b"a {{{ b {{{ c", b"d"]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, lvl: 0, ..Default::default() };
+        unsafe { foldlevel_marker(&mut flp) };
+        assert_eq!(flp.lvl, 2, "both start markers count");
+        assert_eq!(flp.start, 2);
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_marker_never_goes_negative() {
+        let _lock = crate::globals::global_state_test_lock();
+        // An end marker with no matching start would drive the next
+        // level below zero, which the original clamps.
+        let (buf, mut win) = marker_level_fixture(&[b"a }}}", b"b"]);
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, lvl: 0, ..Default::default() };
+        unsafe { foldlevel_marker(&mut flp) };
+        assert_eq!(flp.lvl_next, 0);
+
+        drop(win);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
     }
 
     #[test]
