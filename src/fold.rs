@@ -1919,16 +1919,19 @@ pub unsafe fn fold_update_after_insert() {
 /// Apply a changed `'foldlevel'` to the current window
 /// (`newFoldLevel`).
 ///
-/// # Deferred boundary
-/// The original also propagates the level to other diff-mode windows,
-/// which needs the `'scrollbind'` window option (`w_p_scb`), not yet
-/// a `WinT` field - the same gap [`set_manual_fold`] documents. The
-/// guard reaching it, `foldmethodIsDiff(curwin)`, is real and
-/// unreachable today, since `wo_fdm` is `None` for every window this
-/// crate can build.
+/// When the current window is in diff mode AND scroll-bound, the same
+/// `'foldlevel'` is pushed into every other diff-mode, scroll-bound
+/// window in the tab page, so a diff split stays in step.
+///
+/// As elsewhere in this crate, the original's
+/// `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is walked as
+/// `GLOBALS.firstwin`/`w_next`, which is the established
+/// simplification here.
 ///
 /// # Safety
-/// Same as [`new_fold_level_win`]; also touches `GLOBALS.curwin`.
+/// Same as [`new_fold_level_win`]; also touches `GLOBALS.curwin` and
+/// `GLOBALS.firstwin`, whose own `w_next` chain must consist of
+/// valid, live `WinT` pointers.
 pub unsafe fn new_fold_level() {
     // SAFETY: forwarded from this function's own safety doc.
     let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
@@ -1936,12 +1939,27 @@ pub unsafe fn new_fold_level() {
     unsafe { new_fold_level_win(curwin) };
 
     // SAFETY: forwarded from this function's own safety doc.
-    if unsafe { foldmethod_is_diff(&*curwin) } {
-        unimplemented!(
-            "fold::new_fold_level: propagating 'foldlevel' to other diff-mode windows needs \
-             the 'scrollbind' window option (w_p_scb), not yet a WinT field - unreachable \
-             while 'foldmethod' can never be \"diff\""
-        );
+    if unsafe { foldmethod_is_diff(&*curwin) } && unsafe { (*curwin).w_onebuf_opt.wo_scb } != 0 {
+        // Set the same foldlevel in other windows in diff mode.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let next = unsafe { (*wp).w_next };
+            // SAFETY: forwarded from this function's own safety doc.
+            if wp != curwin
+                && unsafe { foldmethod_is_diff(&*wp) }
+                && unsafe { (*wp).w_onebuf_opt.wo_scb } != 0
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe {
+                    (*wp).w_onebuf_opt.wo_fdl = (*curwin).w_onebuf_opt.wo_fdl;
+                };
+                // SAFETY: forwarded from this function's own safety doc.
+                unsafe { new_fold_level_win(wp) };
+            }
+            wp = next;
+        }
     }
 }
 
@@ -6612,24 +6630,134 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "scrollbind")]
-    fn new_fold_level_reaches_the_diff_mirroring_boundary() {
+    fn new_fold_level_mirrors_foldlevel_into_other_diff_windows() {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = BufT::default();
+        // A scroll-bound diff window that should receive curwin's
+        // 'foldlevel', plus one that must be skipped for each of the
+        // two reasons the original checks.
+        let mut other = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"diff".to_vec()),
+                wo_scb: 1,
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let other_ptr: *mut WinT = &mut other;
+
+        let mut not_bound = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"diff".to_vec()),
+                wo_scb: 0,
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            w_next: other_ptr,
+            ..Default::default()
+        };
+        let not_bound_ptr: *mut WinT = &mut not_bound;
+
+        let mut not_diff = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_scb: 1,
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            w_next: not_bound_ptr,
+            ..Default::default()
+        };
+        let not_diff_ptr: *mut WinT = &mut not_diff;
+
         let mut win = WinT {
             w_buffer: &mut buf as *mut BufT,
             w_onebuf_opt: crate::buffer_defs::WinoptT {
                 wo_fen: 1,
                 wo_fdm: Some(b"diff".to_vec()),
+                wo_scb: 1,
+                wo_fdl: 7,
                 ..Default::default()
             },
+            w_next: not_diff_ptr,
             w_foldinvalid: false,
             ..Default::default()
         };
-        let win_ptr = &mut win as *mut WinT;
+        let win_ptr: *mut WinT = &mut win;
         let _guard = CurwinGuard::set(win_ptr);
+        let prev_first = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
 
         unsafe { new_fold_level() };
+
+        assert_eq!(
+            unsafe { (*other_ptr).w_onebuf_opt.wo_fdl },
+            7,
+            "a diff + scroll-bound window takes curwin's 'foldlevel'"
+        );
+        assert_eq!(
+            unsafe { (*not_bound_ptr).w_onebuf_opt.wo_fdl },
+            0,
+            "'scrollbind' off means no mirroring"
+        );
+        assert_eq!(
+            unsafe { (*not_diff_ptr).w_onebuf_opt.wo_fdl },
+            0,
+            "a non-diff window is skipped"
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_first;
+    }
+
+    #[test]
+    fn new_fold_level_does_not_mirror_when_curwin_is_not_scroll_bound() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut other = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"diff".to_vec()),
+                wo_scb: 1,
+                wo_fdl: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let other_ptr: *mut WinT = &mut other;
+
+        // curwin is in diff mode but NOT scroll-bound, so the original
+        // never enters the mirroring loop at all.
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"diff".to_vec()),
+                wo_scb: 0,
+                wo_fdl: 7,
+                ..Default::default()
+            },
+            w_next: other_ptr,
+            w_foldinvalid: false,
+            ..Default::default()
+        };
+        let win_ptr: *mut WinT = &mut win;
+        let _guard = CurwinGuard::set(win_ptr);
+        let prev_first = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = win_ptr;
+
+        unsafe { new_fold_level() };
+
+        assert_eq!(unsafe { (*other_ptr).w_onebuf_opt.wo_fdl }, 0);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_first;
     }
 
     #[test]
