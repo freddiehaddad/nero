@@ -19,13 +19,11 @@
 //! a plain local `Vec<u8>`, matching the same established preference.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - `xdg_remove_duplicate` (deduplicates `:`/`;`-separated dir lists,
-//!   needed only by the `config_dirs`/`data_dirs` variants of
-//!   `stdpath()`) and the `kXDGRuntimeDir` branch's `vim_gettempdir`
+//! - The `kXDGRuntimeDir` branch's `vim_gettempdir`
 //!   (a persistent session-lifetime temp-directory subsystem) -
-//!   [`stdpaths_get_xdg_var`] only models the `env_val`-set and
-//!   `fallback`-string branches for now, `unimplemented!()`-ing the
-//!   other two.
+//!   [`stdpaths_get_xdg_var`] models the `env_val`-set and
+//!   `fallback`-string branches plus [`xdg_remove_duplicate`],
+//!   `unimplemented!()`-ing only that one.
 //! - `stdpaths_user_cache_subpath`/`stdpaths_user_conf_subpath`/
 //!   `stdpaths_user_data_subpath`/`stdpaths_user_state_subpath`: thin
 //!   wrappers over [`get_xdg_home`] + `concat_fnames_realloc` - no real
@@ -161,11 +159,55 @@ pub unsafe fn stdpaths_get_xdg_var(idx: XdgVarType) -> Option<Vec<u8>> {
         None
     };
 
-    if matches!(idx, XdgVarType::DataDirs | XdgVarType::ConfigDirs) && ret.is_some() {
-        unimplemented!("stdpaths_get_xdg_var: xdg_remove_duplicate not yet translated");
+    if matches!(idx, XdgVarType::DataDirs | XdgVarType::ConfigDirs)
+        && let Some(v) = ret
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        return Some(unsafe { xdg_remove_duplicate(&v) });
     }
 
     ret
+}
+
+/// Drop repeated entries from a separator-joined XDG directory list,
+/// keeping the FIRST occurrence of each and preserving order
+/// (`xdg_remove_duplicate`).
+///
+/// Comparison uses [`crate::path::path_fnamecmp`], so it follows the
+/// platform's own filename case/separator rules rather than a plain
+/// byte compare.
+///
+/// The original splits in place with `os_strtok`, which also collapses
+/// runs of separators and drops empty leading/trailing entries; the
+/// `split` here reproduces that by skipping empty tokens.
+///
+/// # Safety
+/// Forwarded from [`crate::path::path_fnamecmp`]'s own safety doc.
+#[must_use]
+pub unsafe fn xdg_remove_duplicate(ret: &[u8]) -> Vec<u8> {
+    let sep = crate::os::os_defs::ENV_SEPCHAR as u8;
+    let mut data: Vec<&[u8]> = Vec::new();
+    for token in ret.split(|&b| b == sep) {
+        if token.is_empty() {
+            continue;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_duplicate = data
+            .iter()
+            .any(|prev| unsafe { crate::path::path_fnamecmp(prev, token) } == 0);
+        if !is_duplicate {
+            data.push(token);
+        }
+    }
+
+    let mut result = Vec::new();
+    for (i, token) in data.iter().enumerate() {
+        if i != 0 {
+            result.push(sep);
+        }
+        result.extend_from_slice(token);
+    }
+    result
 }
 
 /// Concatenate `fname1`/`fname2`, adding a path separator between them
@@ -242,6 +284,43 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // --- xdg_remove_duplicate ---
+
+    #[test]
+    fn xdg_remove_duplicate_keeps_the_first_of_each_repeated_entry() {
+        let sep = crate::os::os_defs::ENV_SEPCHAR;
+        let input = format!("/a{sep}/b{sep}/a{sep}/c{sep}/b").into_bytes();
+        let want = format!("/a{sep}/b{sep}/c").into_bytes();
+        assert_eq!(unsafe { xdg_remove_duplicate(&input) }, want);
+    }
+
+    #[test]
+    fn xdg_remove_duplicate_leaves_an_already_unique_list_alone() {
+        let sep = crate::os::os_defs::ENV_SEPCHAR;
+        let input = format!("/x{sep}/y{sep}/z").into_bytes();
+        assert_eq!(unsafe { xdg_remove_duplicate(&input) }, input);
+    }
+
+    #[test]
+    fn xdg_remove_duplicate_drops_empty_entries_like_os_strtok() {
+        // os_strtok collapses runs of separators and ignores leading/
+        // trailing ones, so no empty component survives.
+        let sep = crate::os::os_defs::ENV_SEPCHAR;
+        let input = format!("{sep}{sep}/a{sep}{sep}/b{sep}").into_bytes();
+        let want = format!("/a{sep}/b").into_bytes();
+        assert_eq!(unsafe { xdg_remove_duplicate(&input) }, want);
+    }
+
+    #[test]
+    fn xdg_remove_duplicate_on_a_single_entry_is_the_identity() {
+        assert_eq!(unsafe { xdg_remove_duplicate(b"/only") }, b"/only".to_vec());
+    }
+
+    #[test]
+    fn xdg_remove_duplicate_of_an_empty_list_is_empty() {
+        assert_eq!(unsafe { xdg_remove_duplicate(b"") }, Vec::<u8>::new());
+    }
 
     // NVIM_APPNAME is process-global state shared by all threads; Rust's
     // default test runner uses multiple threads, so no test here can
