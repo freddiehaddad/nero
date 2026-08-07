@@ -157,6 +157,35 @@ pub unsafe fn clear_diffblock(dp: *mut crate::buffer_defs::DiffT) {
     drop(unsafe { Box::from_raw(dp) });
 }
 
+/// Whether every diff block line range in `dp` fits inside its own
+/// buffer (`diff_check_sanity`).
+///
+/// Returns `FAIL` for the first buffer whose range runs past the end,
+/// `OK` when every registered buffer is consistent. Slots with no
+/// registered buffer are skipped.
+///
+/// # Safety
+/// Every non-null entry in `tp.tp_diffbuf` must be a valid pointer to
+/// a live `BufT`.
+#[must_use]
+pub unsafe fn diff_check_sanity(
+    tp: &crate::buffer_defs::TabpageT,
+    dp: &crate::buffer_defs::DiffT,
+) -> i32 {
+    for i in 0..crate::buffer_defs::DB_COUNT {
+        let buf = tp.tp_diffbuf[i];
+        if buf.is_null() {
+            continue;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let line_count = unsafe { (*buf).b_ml.ml_line_count };
+        if dp.df_lnum[i] + dp.df_count[i] - 1 > line_count {
+            return crate::vim_defs::FAIL;
+        }
+    }
+    crate::vim_defs::OK
+}
+
 /// Free the whole list of diff blocks for tab page `tp`
 /// (`diff_clear`).
 ///
@@ -667,6 +696,91 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- diff_check_sanity ---
+
+    #[test]
+    fn diff_check_sanity_accepts_a_range_inside_the_buffer() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 10;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut buf;
+
+        // Lines 3..=6, well inside a 10-line buffer.
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 3;
+        dp.df_count[0] = 4;
+
+        assert_eq!(unsafe { diff_check_sanity(&tp, &dp) }, crate::vim_defs::OK);
+    }
+
+    #[test]
+    fn diff_check_sanity_accepts_a_range_ending_exactly_at_the_last_line() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 10;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut buf;
+
+        // df_lnum + df_count - 1 == 10, the last valid line.
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 8;
+        dp.df_count[0] = 3;
+
+        assert_eq!(unsafe { diff_check_sanity(&tp, &dp) }, crate::vim_defs::OK);
+    }
+
+    #[test]
+    fn diff_check_sanity_rejects_a_range_past_the_end() {
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 10;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut buf;
+
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 8;
+        dp.df_count[0] = 4; // reaches line 11
+
+        assert_eq!(unsafe { diff_check_sanity(&tp, &dp) }, crate::vim_defs::FAIL);
+    }
+
+    #[test]
+    fn diff_check_sanity_skips_slots_with_no_registered_buffer() {
+        // Only slot 1 has a buffer; slot 0's nonsense range must be
+        // ignored entirely rather than dereferenced.
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 10;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[1] = &mut buf;
+
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 999;
+        dp.df_count[0] = 999;
+        dp.df_lnum[1] = 1;
+        dp.df_count[1] = 2;
+
+        assert_eq!(unsafe { diff_check_sanity(&tp, &dp) }, crate::vim_defs::OK);
+    }
+
+    #[test]
+    fn diff_check_sanity_checks_every_registered_buffer() {
+        // The first buffer is fine, the second is not - the failure
+        // must still be reported.
+        let mut ok_buf = BufT::default();
+        ok_buf.b_ml.ml_line_count = 10;
+        let mut short_buf = BufT::default();
+        short_buf.b_ml.ml_line_count = 2;
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut ok_buf;
+        tp.tp_diffbuf[1] = &mut short_buf;
+
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 1;
+        dp.df_count[0] = 3;
+        dp.df_lnum[1] = 1;
+        dp.df_count[1] = 5; // reaches line 5 of a 2-line buffer
+
+        assert_eq!(unsafe { diff_check_sanity(&tp, &dp) }, crate::vim_defs::FAIL);
+    }
 
     /// Allocates a diff block chain of `n` blocks, returning the head.
     fn alloc_diff_chain(n: usize) -> *mut crate::buffer_defs::DiffT {
