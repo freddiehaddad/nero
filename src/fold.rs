@@ -1210,6 +1210,54 @@ pub fn fold_split(
     *unsafe { FOLD_CHANGED.get_mut() } = true;
 }
 
+/// Merge the fold at index `i2` in `gap` into `fp1`, which must be
+/// the fold immediately above it (`foldMerge`).
+///
+/// Nested folds that touch across the join are merged recursively
+/// first, then `fp2`'s remaining children move to the end of `fp1`'s,
+/// rebased by `fp1`'s length since they are now measured from a
+/// parent that starts earlier. `fp2` itself is then removed from
+/// `gap`.
+///
+/// # Translation note
+/// `fp1` and `gap` are separate parameters because the original's own
+/// recursion genuinely needs them to be: it descends with `fp1`'s
+/// nested array on one side and `fp2`'s on the other. Passing the
+/// containing array plus an index, rather than a second fold
+/// reference, is what lets `fp2` be removed at the end - the original
+/// recovers that same index with pointer arithmetic.
+pub fn fold_merge(fp1: &mut FoldT, gap: &mut Vec<FoldT>, i2: usize) {
+    // If the last nested fold in fp1 touches the first nested fold in
+    // fp2, merge them recursively.
+    let (found3, i3) = fold_find(&fp1.fd_nested, fp1.fd_len - 1);
+    let (found4, i4) = fold_find(&gap[i2].fd_nested, 0);
+    if found3 && found4 {
+        // The two nested arrays belong to different folds, so these
+        // borrows genuinely do not overlap.
+        let fp3 = &mut fp1.fd_nested[i3];
+        let gap2 = &mut gap[i2].fd_nested;
+        fold_merge(fp3, gap2, i4);
+    }
+
+    // Move nested folds in fp2 to the end of fp1.
+    let fp1_len = fp1.fd_len;
+    let mut moved = std::mem::take(&mut gap[i2].fd_nested);
+    if !moved.is_empty() {
+        for fp in &mut moved {
+            fp.fd_top += fp1_len;
+        }
+        fp1.fd_nested.append(&mut moved);
+    }
+
+    fp1.fd_len += gap[i2].fd_len;
+    // Everything nested under fp2 has already been moved out, so the
+    // original's recursive delete and a plain one are equivalent here.
+    delete_fold_entry(gap, i2, true);
+    // SAFETY: FOLD_CHANGED is a plain GlobalCell<bool>, matching the
+    // original's own single-threaded-editor assumption.
+    *unsafe { FOLD_CHANGED.get_mut() } = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2052,6 +2100,128 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_merge_joins_two_adjacent_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Folds 10-14 and 15-19, adjacent.
+        let mut fp1 = FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            ..Default::default()
+        };
+        let mut gap = vec![FoldT {
+            fd_top: 15,
+            fd_len: 5,
+            ..Default::default()
+        }];
+
+        fold_merge(&mut fp1, &mut gap, 0);
+
+        assert_eq!(fp1.fd_len, 10, "the merged fold spans both");
+        assert_eq!(fp1.fd_top, 10);
+        assert!(gap.is_empty(), "the second fold is removed");
+    }
+
+    #[test]
+    fn fold_merge_moves_nested_folds_and_rebases_them() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fp1 = FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 1, fd_len: 1, ..Default::default() }],
+            ..Default::default()
+        };
+        // fp2's child sits at its own line 2; once fp2's lines belong
+        // to fp1, that child must be measured from fp1 instead, i.e.
+        // shifted by fp1's original length of 5.
+        let mut gap = vec![FoldT {
+            fd_top: 15,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 2, fd_len: 1, ..Default::default() }],
+            ..Default::default()
+        }];
+
+        fold_merge(&mut fp1, &mut gap, 0);
+
+        assert_eq!(fp1.fd_nested.len(), 2);
+        assert_eq!(fp1.fd_nested[0].fd_top, 1, "fp1's own child is unmoved");
+        assert_eq!(fp1.fd_nested[1].fd_top, 7, "2 + 5");
+        // Absolute position is preserved: 10 + 7 == 15 + 2.
+        assert_eq!(fp1.fd_top + fp1.fd_nested[1].fd_top, 17);
+    }
+
+    #[test]
+    fn fold_merge_recursively_merges_nested_folds_that_touch() {
+        let _lock = crate::globals::global_state_test_lock();
+        // fp1's last child ends exactly where fp2's first child
+        // begins, so the two must be merged into one.
+        let mut fp1 = FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 3, fd_len: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        let mut gap = vec![FoldT {
+            fd_top: 15,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 0, fd_len: 2, ..Default::default() }],
+            ..Default::default()
+        }];
+
+        fold_merge(&mut fp1, &mut gap, 0);
+
+        assert_eq!(fp1.fd_len, 10);
+        assert_eq!(fp1.fd_nested.len(), 1, "the touching children merged");
+        assert_eq!(fp1.fd_nested[0].fd_top, 3);
+        assert_eq!(fp1.fd_nested[0].fd_len, 4, "2 + 2");
+    }
+
+    #[test]
+    fn fold_merge_leaves_non_touching_nested_folds_separate() {
+        let _lock = crate::globals::global_state_test_lock();
+        // fp1's child ends well before fp1 does, so nothing touches
+        // across the join.
+        let mut fp1 = FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 0, fd_len: 1, ..Default::default() }],
+            ..Default::default()
+        };
+        let mut gap = vec![FoldT {
+            fd_top: 15,
+            fd_len: 5,
+            fd_nested: vec![FoldT { fd_top: 3, fd_len: 1, ..Default::default() }],
+            ..Default::default()
+        }];
+
+        fold_merge(&mut fp1, &mut gap, 0);
+
+        assert_eq!(fp1.fd_nested.len(), 2, "both children survive");
+        assert_eq!(fp1.fd_nested[1].fd_top, 8, "3 + 5");
+    }
+
+    #[test]
+    fn fold_merge_preserves_sibling_folds_and_reports_the_change() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *FOLD_CHANGED.get_mut() = false };
+        let mut fp1 = FoldT {
+            fd_top: 10,
+            fd_len: 5,
+            ..Default::default()
+        };
+        let mut gap = vec![
+            FoldT { fd_top: 15, fd_len: 5, ..Default::default() },
+            FoldT { fd_top: 40, fd_len: 3, ..Default::default() },
+        ];
+
+        fold_merge(&mut fp1, &mut gap, 0);
+
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].fd_top, 40, "the later sibling is untouched");
+        assert!(unsafe { *FOLD_CHANGED.get_mut() });
+        unsafe { *FOLD_CHANGED.get_mut() = false };
     }
 
     #[test]
