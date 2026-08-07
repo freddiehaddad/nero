@@ -127,6 +127,49 @@ pub fn ends_excmd(c: u8) -> bool {
     c == 0 || c == b'|' || c == b'"' || c == b'\n'
 }
 
+/// Apply a numeric count to `eap`'s address range (`set_cmd_count`).
+///
+/// For a non-line address type (`:buffer 2`, `:sleep 3`) the count IS
+/// the address. For a line range the count instead extends the range
+/// forwards from `line2`, saturating at `i32::MAX` rather than
+/// overflowing. With `validate` the end is clamped to the buffer's
+/// last line - silently, since the original notes vi gives no error
+/// for an out-of-range count.
+///
+/// # Safety
+/// When `validate` is true, `crate::globals::GLOBALS.curbuf` must be
+/// a valid, non-null pointer to a live `BufT`.
+pub unsafe fn set_cmd_count(
+    eap: &mut crate::ex_cmds_defs::ExargT,
+    count: crate::pos_defs::LinenrT,
+    validate: bool,
+) {
+    if eap.addr_type != crate::ex_cmds_defs::CmdAddrT::Lines {
+        // e.g. :buffer 2, :sleep 3
+        eap.line2 = count;
+        if eap.addr_count == 0 {
+            eap.addr_count = 1;
+        }
+        return;
+    }
+
+    eap.line1 = eap.line2;
+    if eap.line2 >= i32::MAX - (count - 1) {
+        eap.line2 = i32::MAX;
+    } else {
+        eap.line2 += count - 1;
+    }
+    eap.addr_count += 1;
+    // Be vi compatible: no error message for out of range.
+    if validate {
+        // SAFETY: forwarded from this function's own safety doc.
+        let line_count = unsafe { (*crate::globals::GLOBALS.get_mut().curbuf).b_ml.ml_line_count };
+        if eap.line2 > line_count {
+            eap.line2 = line_count;
+        }
+    }
+}
+
 /// Recognise the two Ex commands whose names may be abbreviated to a
 /// single letter, `:k` and `:s` (`one_letter_cmd`).
 ///
@@ -736,6 +779,94 @@ mod tests {
         assert!(ends_excmd(b'|'));
         assert!(ends_excmd(b'"'));
         assert!(ends_excmd(b'\n'));
+    }
+
+    // --- set_cmd_count ---
+
+    #[test]
+    fn set_cmd_count_extends_a_line_range_forwards() {
+        // Cross-verified against real nvim: `2delete 3` removes lines
+        // 2-4, i.e. the count extends the range forwards from line2.
+        use crate::ex_cmds_defs::{CmdAddrT, ExargT};
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Lines,
+            line1: 1,
+            line2: 2,
+            addr_count: 1,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 3, false) };
+        assert_eq!((eap.line1, eap.line2), (2, 4));
+        assert_eq!(eap.addr_count, 2);
+    }
+
+    #[test]
+    fn set_cmd_count_is_the_address_itself_for_a_non_line_type() {
+        // e.g. `:buffer 2` - the count IS the address.
+        use crate::ex_cmds_defs::{CmdAddrT, ExargT};
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Buffers,
+            line1: 0,
+            line2: 0,
+            addr_count: 0,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 2, false) };
+        assert_eq!(eap.line2, 2);
+        assert_eq!(eap.addr_count, 1, "a bare count still counts as one address");
+
+        // An existing address count is left alone.
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Buffers,
+            addr_count: 5,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 7, false) };
+        assert_eq!((eap.line2, eap.addr_count), (7, 5));
+    }
+
+    #[test]
+    fn set_cmd_count_saturates_instead_of_overflowing() {
+        use crate::ex_cmds_defs::{CmdAddrT, ExargT};
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Lines,
+            line2: i32::MAX - 2,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 100, false) };
+        assert_eq!(eap.line2, i32::MAX);
+    }
+
+    #[test]
+    fn set_cmd_count_clamps_to_the_buffer_when_validating() {
+        // Cross-verified against real nvim: `2delete 99` on a 3-line
+        // buffer silently clamps rather than erroring.
+        use crate::ex_cmds_defs::{CmdAddrT, ExargT};
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 3;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = &mut buf;
+
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Lines,
+            line2: 2,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 99, true) };
+        assert_eq!(eap.line2, 3, "clamped to the last line");
+
+        // Without validate the out-of-range value survives.
+        let mut eap = ExargT {
+            addr_type: CmdAddrT::Lines,
+            line2: 2,
+            ..Default::default()
+        };
+        unsafe { set_cmd_count(&mut eap, 99, false) };
+        assert_eq!(eap.line2, 100);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
     }
 
     // --- one_letter_cmd ---
