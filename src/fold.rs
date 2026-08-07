@@ -1791,6 +1791,66 @@ pub unsafe fn op_fold_range(
     let _ = done;
 }
 
+/// The `'foldmarker'` end marker, plus the byte lengths of both
+/// markers, as parsed by [`parse_marker`] (`foldendmarker`,
+/// `foldstartmarkerlen`, `foldendmarkerlen`).
+///
+/// The original keeps these as three file-statics that
+/// `foldlevelMarker` and the marker-writing helpers read after
+/// `parseMarker` has run. Grouping them into one cell keeps that
+/// "these are set together, read together" contract explicit.
+#[derive(Debug, Clone, Default)]
+pub struct FoldMarkers {
+    /// The end marker, i.e. everything after the comma in
+    /// `'foldmarker'`.
+    pub end: Vec<u8>,
+    /// Length of the start marker, i.e. everything before the comma.
+    pub start_len: usize,
+    /// Length of [`FoldMarkers::end`].
+    pub end_len: usize,
+}
+
+/// Parsed `'foldmarker'` state, valid after a [`parse_marker`] call.
+pub static FOLD_MARKERS: crate::globals::GlobalCell<Option<FoldMarkers>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Split `wp`'s `'foldmarker'` into its start and end halves
+/// (`parseMarker`).
+///
+/// `'foldmarker'` is a comma-separated pair, so the start marker is
+/// everything before the first comma and the end marker everything
+/// after it. Must be called before anything that reads
+/// [`FOLD_MARKERS`].
+///
+/// # Safety
+/// Touches the [`FOLD_MARKERS`] global; no overlapping live access.
+pub unsafe fn parse_marker(wp: &WinT) {
+    let fmr = wp.w_onebuf_opt.wo_fmr.as_deref().unwrap_or(b"");
+    let markers = match fmr.iter().position(|&c| c == b',') {
+        Some(comma) => {
+            let end = fmr[comma + 1..].to_vec();
+            FoldMarkers {
+                start_len: comma,
+                end_len: end.len(),
+                end,
+            }
+        }
+        None => {
+            // The original's own `vim_strchr` would return NULL here,
+            // leaving the lengths meaningless; 'foldmarker' is always
+            // validated to contain a comma before it is set, so this
+            // is unreachable in a real session.
+            FoldMarkers {
+                end: Vec::new(),
+                start_len: fmr.len(),
+                end_len: 0,
+            }
+        }
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { FOLD_MARKERS.get_mut() } = Some(markers);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2667,6 +2727,83 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn parse_marker_splits_foldmarker_at_the_comma() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim: 'foldmarker' defaults to
+        // the brace-triple pair and accepts custom pairs like
+        // "<<<,>>>", always comma-separated.
+        let win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe { parse_marker(&win) };
+        let m = unsafe { FOLD_MARKERS.get_mut() }.clone().expect("parsed");
+        assert_eq!(m.start_len, 3);
+        assert_eq!(m.end, b"}}}");
+        assert_eq!(m.end_len, 3);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+    }
+
+    #[test]
+    fn parse_marker_handles_markers_of_different_lengths() {
+        let _lock = crate::globals::global_state_test_lock();
+        let win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"BEGIN,END".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe { parse_marker(&win) };
+        let m = unsafe { FOLD_MARKERS.get_mut() }.clone().expect("parsed");
+        assert_eq!(m.start_len, 5);
+        assert_eq!(m.end, b"END");
+        assert_eq!(m.end_len, 3);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+    }
+
+    #[test]
+    fn parse_marker_splits_at_the_first_comma_only() {
+        let _lock = crate::globals::global_state_test_lock();
+        let win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"a,b,c".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe { parse_marker(&win) };
+        let m = unsafe { FOLD_MARKERS.get_mut() }.clone().expect("parsed");
+        assert_eq!(m.start_len, 1);
+        assert_eq!(m.end, b"b,c", "everything after the first comma");
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+    }
+
+    #[test]
+    fn parse_marker_without_a_comma_leaves_no_end_marker() {
+        let _lock = crate::globals::global_state_test_lock();
+        // 'foldmarker' is validated to contain a comma before it can
+        // be set, so this is unreachable in a real session; it is
+        // asserted only to pin the behaviour down.
+        let win = WinT {
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"nocomma".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe { parse_marker(&win) };
+        let m = unsafe { FOLD_MARKERS.get_mut() }.clone().expect("parsed");
+        assert_eq!(m.start_len, 7);
+        assert!(m.end.is_empty());
+        assert_eq!(m.end_len, 0);
+        unsafe { *FOLD_MARKERS.get_mut() = None };
     }
 
     #[test]
