@@ -6480,6 +6480,54 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the new `'foldlevel'` option value (`did_set_foldlevel`).
+///
+/// # Safety
+/// Forwarded from [`crate::fold::new_fold_level`]'s own safety doc.
+pub unsafe fn did_set_foldlevel(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::fold::new_fold_level() };
+    None
+}
+
+/// Process the new `'foldminlines'` option value
+/// (`did_set_foldminlines`).
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_foldminlines(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::fold::fold_update_all(win_ptr) };
+    None
+}
+
+/// Process the new `'foldnestmax'` option value
+/// (`did_set_foldnestmax`).
+///
+/// Only the `"syntax"` and `"indent"` fold methods actually consult
+/// `'foldnestmax'`, so every other method skips the update entirely -
+/// the original's own guard, not an optimization added here.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_foldnestmax(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &*win_ptr };
+    if crate::fold::foldmethod_is_syntax(win) || crate::fold::foldmethod_is_indent(win) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_update_all(win_ptr) };
+    }
+    None
+}
+
 /// Update the window title/icon after `'titlestring'`/`'iconstring'`/
 /// `'title'`/`'icon'` change (`did_set_title`).
 ///
@@ -6507,6 +6555,80 @@ pub fn did_set_title() {
 #[cfg(test)]
 mod did_set_title_tests {
     use super::*;
+    use std::ffi::c_void;
+
+    /// Builds an `OptsetT` pointing at `win`, matching the fixture
+    /// `optionstr.rs`'s own fold-callback tests use.
+    fn fold_args(
+        idx: crate::option_defs::OptIndex,
+        win: &mut crate::buffer_defs::WinT,
+    ) -> crate::option_defs::OptsetT {
+        crate::option_defs::OptsetT {
+            os_idx: idx,
+            os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_set_foldminlines_invalidates_the_windows_folds() {
+        let mut win = crate::buffer_defs::WinT {
+            w_foldinvalid: false,
+            ..crate::buffer_defs::WinT::default()
+        };
+        let mut args = fold_args(crate::option_defs::OptIndex::Foldminlines, &mut win);
+
+        assert_eq!(unsafe { did_set_foldminlines(&mut args) }, None);
+        assert!(win.w_foldinvalid, "foldUpdateAll must invalidate the folds");
+    }
+
+    #[test]
+    fn did_set_foldnestmax_updates_for_syntax_and_indent_only() {
+        // Only 'syntax' and 'indent' actually consult 'foldnestmax',
+        // so every other method must leave the folds alone - the
+        // original's own guard.
+        for (method, expect_update) in [
+            (&b"syntax"[..], true),
+            (&b"indent"[..], true),
+            (&b"manual"[..], false),
+            (&b"marker"[..], false),
+            (&b"expr"[..], false),
+            (&b"diff"[..], false),
+        ] {
+            let mut win = crate::buffer_defs::WinT {
+                w_foldinvalid: false,
+                ..crate::buffer_defs::WinT::default()
+            };
+            win.w_onebuf_opt.wo_fdm = Some(method.to_vec());
+            let mut args = fold_args(crate::option_defs::OptIndex::Foldnestmax, &mut win);
+
+            assert_eq!(unsafe { did_set_foldnestmax(&mut args) }, None);
+            assert_eq!(
+                win.w_foldinvalid,
+                expect_update,
+                "foldmethod={} should{} update",
+                String::from_utf8_lossy(method),
+                if expect_update { "" } else { " NOT" }
+            );
+        }
+    }
+
+    #[test]
+    fn did_set_foldlevel_runs_new_fold_level_against_curwin() {
+        // new_fold_level reads GLOBALS.curwin, so this needs the
+        // global lock, and curwin must be installed BEFORE the call.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_fdm = Some(b"manual".to_vec());
+
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win;
+
+        let mut args = fold_args(crate::option_defs::OptIndex::Foldlevel, &mut win);
+        assert_eq!(unsafe { did_set_foldlevel(&mut args) }, None);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
+    }
 
     #[test]
     fn did_set_title_is_a_no_op_when_starting_is_no_screen() {
