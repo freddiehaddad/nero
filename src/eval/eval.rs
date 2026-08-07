@@ -4665,19 +4665,26 @@ pub unsafe fn skip_expr(arg: &[u8], mut evalarg: Option<&mut EvalargT>) -> (i32,
 /// same as every other function in this crate touching those types).
 ///
 /// # Deferred
-/// `join_list = true` with a real `List` value needs `tv_list_join`
-/// (join a list's items into newline-separated lines) - not yet
-/// translated, `unimplemented!()`s only when actually reached. A
-/// `List`/`Dict` value with `join_list = false` needs `encode_tv2string`
-/// (`eval/encode.c`'s ~970-line JSON-like stringification engine, a
-/// substantial separate undertaking) - `unimplemented!()`s there too.
-/// Every other value type uses [`crate::eval::typval::tv_get_string`],
-/// already real.
+/// A `List`/`Dict` value with `join_list = false` needs
+/// `encode_tv2string` (`eval/encode.c`'s ~970-line JSON-like
+/// stringification engine, a substantial separate undertaking) -
+/// `unimplemented!()`s there. Every other value type uses
+/// [`crate::eval::typval::tv_get_string`], already real.
 unsafe fn typval2string(tv: &TypvalT, join_list: bool) -> Vec<u8> {
-    if join_list && matches!(tv.value, TypvalValue::List(_)) {
-        unimplemented!(
-            "typval2string: join_list=true with a List value needs tv_list_join, not yet translated"
-        );
+    if join_list
+        && let TypvalValue::List(l) = tv.value
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut out = unsafe { crate::eval::typval::tv_list_join(l, b"\n") };
+        // SAFETY: forwarded from this function's own safety doc.
+        if !l.is_null() && unsafe { crate::eval::typval::tv_list_len(l) } > 0 {
+            out.push(crate::ascii_defs::NL);
+        }
+        // The original's own trailing `ga_append(&ga, NUL)` - this
+        // crate's established convention for freshly-produced string
+        // outputs keeps it explicit.
+        out.push(crate::ascii_defs::NUL);
+        return out;
     }
     if matches!(tv.value, TypvalValue::List(_) | TypvalValue::Dict(_)) {
         unimplemented!(
@@ -10735,6 +10742,61 @@ mod tests {
         // SAFETY: list was freshly allocated above and never shared
         // with anything else; typval2string never takes ownership.
         unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn typval2string_join_list_joins_items_with_newlines_and_a_trailing_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe {
+            crate::eval::typval::tv_list_append_string(list, Some(b"one"));
+            crate::eval::typval::tv_list_append_string(list, Some(b"two"));
+        }
+        let tv = TypvalT { value: TypvalValue::List(list), ..Default::default() };
+
+        let got = unsafe { typval2string(&tv, true) };
+        assert_eq!(got, b"one\ntwo\n\0".to_vec());
+
+        // SAFETY: list was freshly allocated above and never shared;
+        // typval2string never takes ownership.
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn typval2string_join_list_of_an_empty_list_is_just_the_terminator() {
+        // The original only appends the trailing NL when the list has
+        // at least one item, so an empty list yields the NUL alone.
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        let tv = TypvalT { value: TypvalValue::List(list), ..Default::default() };
+
+        let got = unsafe { typval2string(&tv, true) };
+        assert_eq!(got, b"\0".to_vec());
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn typval2string_join_list_of_a_single_item_still_gets_the_trailing_newline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let list = crate::eval::typval::tv_list_alloc(0);
+        unsafe { crate::eval::typval::tv_list_append_string(list, Some(b"solo")) };
+        let tv = TypvalT { value: TypvalValue::List(list), ..Default::default() };
+
+        let got = unsafe { typval2string(&tv, true) };
+        assert_eq!(got, b"solo\n\0".to_vec());
+
+        unsafe { crate::eval::typval::tv_list_unref(list) };
+    }
+
+    #[test]
+    fn typval2string_join_list_of_a_null_list_is_just_the_terminator() {
+        // tv_list_join tolerates a null list; the length check then
+        // skips the trailing NL exactly as the original's own
+        // `v_list != NULL` guard does.
+        let _lock = crate::globals::global_state_test_lock();
+        let tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
+        assert_eq!(unsafe { typval2string(&tv, true) }, b"\0".to_vec());
     }
 
     // --- eval_interp_string ---
