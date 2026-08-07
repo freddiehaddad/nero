@@ -6480,6 +6480,45 @@ mod did_set_option_tests {
     }
 }
 
+/// Remove flags that appear twice from a flag-list option value
+/// (`stropt_remove_dupflags`).
+///
+/// Two shapes are handled, selected by the option's own flags:
+/// - [`crate::option_defs::opt_flags::ONE_COMMA`]: each flag is a
+///   single character followed by a comma, so a duplicate takes its
+///   trailing comma with it.
+/// - otherwise: bare characters, so only the duplicate itself goes.
+///   A comma is never treated as a duplicate for a
+///   [`crate::option_defs::opt_flags::COMMA`] option.
+///
+/// The LAST occurrence of each flag is kept and every earlier one
+/// removed: the scan drops a character precisely when that same
+/// character appears again later in the string. Cross-verified
+/// against a real nvim binary, where `whichwrap=b,s,b,h` becomes
+/// `s,b,h` - the FIRST `b` is the one that goes.
+pub fn stropt_remove_dupflags(newval: &mut Vec<u8>, flags: u32) {
+    use crate::option_defs::opt_flags;
+    let mut s = 0usize;
+    while s < newval.len() {
+        if flags & opt_flags::ONE_COMMA != 0 {
+            if newval[s] != b','
+                && newval.get(s + 1) == Some(&b',')
+                && newval[s + 2..].contains(&newval[s])
+            {
+                // Remove the duplicated value and the next comma.
+                newval.drain(s..s + 2);
+                continue;
+            }
+        } else if (flags & opt_flags::COMMA == 0 || newval[s] != b',')
+            && newval[s + 1..].contains(&newval[s])
+        {
+            newval.remove(s);
+            continue;
+        }
+        s += 1;
+    }
+}
+
 /// Remove the comma-separated item at `[item, item + item_len)` from
 /// `str` (`remove_comma_item`).
 ///
@@ -6847,6 +6886,67 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_one_comma_keeps_the_last_occurrence() {
+        // Cross-verified against real nvim:
+        //   set whichwrap=b,s,b,h  ->  s,b,h
+        // The FIRST 'b' goes, not the second - the scan drops a flag
+        // precisely when the same one appears again later.
+        use crate::option_defs::opt_flags;
+        let mut s = b"b,s,b,h".to_vec();
+        stropt_remove_dupflags(&mut s, opt_flags::ONE_COMMA);
+        assert_eq!(s, b"s,b,h");
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_one_comma_collapses_a_pure_duplicate() {
+        // Cross-verified: set whichwrap=b,b  ->  b
+        use crate::option_defs::opt_flags;
+        let mut s = b"b,b".to_vec();
+        stropt_remove_dupflags(&mut s, opt_flags::ONE_COMMA);
+        assert_eq!(s, b"b");
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_bare_flags_keep_the_last_occurrence() {
+        // Cross-verified against real nvim:
+        //   set shortmess=filf  ->  ilf
+        // Same last-wins rule, but without a comma to carry along.
+        let mut s = b"filf".to_vec();
+        stropt_remove_dupflags(&mut s, 0);
+        assert_eq!(s, b"ilf");
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_leaves_a_unique_list_alone() {
+        use crate::option_defs::opt_flags;
+        let mut s = b"b,s,h".to_vec();
+        stropt_remove_dupflags(&mut s, opt_flags::ONE_COMMA);
+        assert_eq!(s, b"b,s,h");
+
+        let mut s = b"ilf".to_vec();
+        stropt_remove_dupflags(&mut s, 0);
+        assert_eq!(s, b"ilf");
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_never_treats_a_comma_as_a_duplicate() {
+        // For a COMMA option the separators themselves must survive,
+        // however many of them there are.
+        use crate::option_defs::opt_flags;
+        let mut s = b"a,b,c".to_vec();
+        stropt_remove_dupflags(&mut s, opt_flags::COMMA);
+        assert_eq!(s, b"a,b,c");
+    }
+
+    #[test]
+    fn stropt_remove_dupflags_of_an_empty_value_is_a_no_op() {
+        use crate::option_defs::opt_flags;
+        let mut s = Vec::new();
+        stropt_remove_dupflags(&mut s, opt_flags::ONE_COMMA);
+        assert_eq!(s, b"");
     }
 
     #[test]
