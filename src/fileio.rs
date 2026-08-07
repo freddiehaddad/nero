@@ -26,6 +26,213 @@
 
 use crate::mbyte::enc_canon_props;
 
+/// The path separator this platform's `PATHSEPSTR` appends.
+const PATHSEP: u8 = if cfg!(windows) { b'\\' } else { b'/' };
+
+/// Nvim's own temp directory, ending with a path separator
+/// (`vim_tempdir`, a `static` in the original).
+///
+/// `None` until [`vim_mktempdir`] has successfully created one.
+static VIM_TEMPDIR: std::sync::LazyLock<crate::globals::GlobalCell<Option<Vec<u8>>>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(None));
+
+/// Counter behind [`vim_tempname`]'s unique names (`temp_count`, a
+/// function-local `static` in the original).
+static TEMP_COUNT: std::sync::LazyLock<crate::globals::GlobalCell<u64>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(0));
+
+/// Set Nvim's own temp directory to `tempdir`, which must already
+/// exist (`vim_settempdir`).
+///
+/// Expands `tempdir` to a full path first, so a later `:cd` cannot
+/// change what it refers to, and guarantees a trailing path separator.
+///
+/// The original returns `false` only when its `MAXPATHL + 2` scratch
+/// allocation fails; a growing `Vec<u8>` cannot fail that way, so this
+/// always succeeds and returns `bool` purely to keep the caller's own
+/// structure intact.
+///
+/// # Safety
+/// Mutates the shared `VIM_TEMPDIR` file-static.
+unsafe fn vim_settempdir(tempdir: &[u8]) -> bool {
+    // MSWIN passes force=true, every other platform false.
+    let (mut buf, _ok) = crate::path::vim_full_name(tempdir, cfg!(windows));
+    if !crate::path::after_pathsep(&buf, buf.len()) {
+        buf.push(PATHSEP);
+    }
+    let cell = unsafe { VIM_TEMPDIR.get_mut() };
+    *cell = Some(buf);
+    true
+}
+
+/// Create Nvim's own temp directory (`vim_mktempdir`).
+///
+/// Tries each of `os_defs::TEMP_DIR_NAMES` until one works, creating
+/// `<parent>/nvim.<user>/XXXXXX` (the `XXXXXX` replaced with random
+/// characters by [`crate::os::fs::os_mkdtemp`]).
+///
+/// The `nvim.<user>/` level is skipped when it cannot be created as a
+/// directory genuinely owned by this user with mode 0700, exactly as
+/// upstream does - otherwise one user could deny service to another by
+/// pre-creating `/tmp/nvim.<them>/`.
+///
+/// The original's `DLOG`/`WLOG`/`ELOG` diagnostics are omitted (the
+/// message pipeline is not translated); every state change and every
+/// control-flow decision is kept.
+///
+/// # Safety
+/// Forwarded from `expand_env`/`vim_settempdir`'s own safety docs.
+pub unsafe fn vim_mktempdir() {
+    let mut user = match crate::os::users::os_get_username() {
+        Ok(name) | Err(name) => name,
+    };
+    // Usernames may contain slashes (upstream #19240), which would
+    // otherwise turn one directory level into several.
+    crate::memory::memchrsub(&mut user, b'/', b'_');
+    crate::memory::memchrsub(&mut user, b'\\', b'_');
+
+    // Make sure the umask doesn't remove the executable bit; "repl"
+    // has been reported to use 0177.
+    #[cfg(unix)]
+    // SAFETY: umask() has no preconditions and cannot fail; the saved
+    // value is restored before returning, exactly as upstream does.
+    let umask_save = unsafe { libc::umask(0o077) };
+
+    for dir_name in crate::os::os_defs::TEMP_DIR_NAMES {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut tmp = unsafe { crate::os::env::expand_env(dir_name.as_bytes()) };
+        if !crate::os::fs::os_isdir(&bytes_to_path(&tmp)) {
+            // Upstream distinguishes "$TMPDIR unset" from "$TMPDIR set
+            // but not a directory" purely to log a different message;
+            // both simply move on to the next candidate.
+            continue;
+        }
+
+        // "<parent>" exists, now try to create "<parent>/nvim.<user>/".
+        if !crate::path::after_pathsep(&tmp, tmp.len()) {
+            tmp.push(PATHSEP);
+        }
+        let without_user_len = tmp.len();
+        tmp.extend_from_slice(b"nvim.");
+        tmp.extend_from_slice(&user);
+
+        let tmp_path = bytes_to_path(&tmp);
+        // Always create, to avoid a race.
+        crate::os::fs::os_mkdir(&tmp_path, 0o700);
+        let owned = crate::os::fs::os_file_owned(&tmp_path);
+        let isdir = crate::os::fs::os_isdir(&tmp_path);
+        // XDG_RUNTIME_DIR must be owned by the user, mode 0700.
+        #[cfg(unix)]
+        let valid = {
+            let perm = crate::os::fs::os_getperm(&tmp_path);
+            isdir && owned && 0o700 == (perm & 0o777)
+        };
+        #[cfg(not(unix))]
+        // Upstream's own `// TODO(justinmk): Windows ACL?` - no
+        // permission component is checked off Unix.
+        let valid = isdir && owned;
+
+        if valid {
+            if !crate::path::after_pathsep(&tmp, tmp.len()) {
+                tmp.push(PATHSEP);
+            }
+        } else {
+            // If our "root" tempdir is invalid or fails, proceed
+            // without "<user>/" - else user1 could break user2 by
+            // creating "/tmp/nvim.user2/".
+            tmp.truncate(without_user_len);
+        }
+
+        // Now try to create "<parent>/nvim.<user>/XXXXXX". "XXXXXX" is
+        // the mkdtemp template, replaced with random characters.
+        tmp.extend_from_slice(b"XXXXXX");
+        let Some(path) = crate::os::fs::os_mkdtemp(&tmp) else {
+            continue;
+        };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { vim_settempdir(&path) } {
+            // Successfully created and set, so stop trying.
+            break;
+        }
+        // Couldn't set vim_tempdir to path, so remove what we created.
+        crate::os::fs::os_rmdir(&bytes_to_path(&path));
+    }
+
+    #[cfg(unix)]
+    // SAFETY: restoring the value saved above; umask cannot fail.
+    unsafe {
+        libc::umask(umask_save);
+    }
+}
+
+/// Get the path to Nvim's own temp dir, ending with a path separator
+/// (`vim_gettempdir`).
+///
+/// Creates the directory on the first call, and re-creates it if it
+/// has since disappeared (an antivirus or an over-eager cleanup job
+/// can genuinely delete it mid-session).
+///
+/// The original's `notfound` counter exists only to decide which
+/// diagnostic to emit, so it is omitted along with those messages;
+/// the re-creation behaviour itself is kept exactly.
+///
+/// # Safety
+/// Forwarded from [`vim_mktempdir`]'s own safety doc.
+pub unsafe fn vim_gettempdir() -> Option<Vec<u8>> {
+    let missing = {
+        let cell = unsafe { VIM_TEMPDIR.get_mut() };
+        match cell.as_ref() {
+            None => true,
+            Some(dir) => !crate::os::fs::os_isdir(&bytes_to_path(dir)),
+        }
+    };
+    if missing {
+        {
+            let cell = unsafe { VIM_TEMPDIR.get_mut() };
+            *cell = None;
+        }
+        unsafe { vim_mktempdir() };
+    }
+    let cell = unsafe { VIM_TEMPDIR.get_mut() };
+    cell.clone()
+}
+
+/// Return a unique name usable for a temp file (`vim_tempname`).
+///
+/// The file itself is NOT created. There is no need to check whether
+/// it already exists: we own the directory and nobody else creates
+/// files in it.
+///
+/// @return `None` if Nvim cannot create its own temp directory.
+///
+/// # Safety
+/// Forwarded from [`vim_gettempdir`]'s own safety doc.
+pub unsafe fn vim_tempname() -> Option<Vec<u8>> {
+    let tempdir = unsafe { vim_gettempdir() }?;
+    let count = unsafe { TEMP_COUNT.get_mut() };
+    let mut name = tempdir;
+    name.extend_from_slice(count.to_string().as_bytes());
+    *count = count.wrapping_add(1);
+    Some(name)
+}
+
+/// Interpret raw path bytes as a [`std::path::Path`].
+///
+/// Every path in this crate is carried as `Vec<u8>`, matching the
+/// original's own `char *`, while `std::fs` wants a `Path`.
+fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
 /// `FIO_*` conversion flags (`fileio.h`).
 pub mod fio {
     /// Convert Latin1.
@@ -716,5 +923,109 @@ mod tests {
         let error = ucs2bytes(0x0001_0000, &mut out, fio::FIO_UCS2);
         assert!(error);
         assert_eq!(out, vec![0x00, 0x00]);
+    }
+
+    // --- vim_mktempdir / vim_gettempdir / vim_tempname ---
+    //
+    // These all mutate the shared VIM_TEMPDIR/TEMP_COUNT file-statics
+    // and create real directories, so every one of them holds
+    // global_state_test_lock() for its whole body. Each also resets
+    // VIM_TEMPDIR afterwards so a later test cannot observe a stale
+    // (or since-deleted) directory left behind by this one.
+
+    /// Restores `VIM_TEMPDIR` to its pre-test value on drop, even if
+    /// the test panics, and removes any directory this test created.
+    struct TempdirGuard {
+        saved: Option<Vec<u8>>,
+    }
+
+    impl TempdirGuard {
+        fn new() -> Self {
+            let saved = unsafe { VIM_TEMPDIR.get_mut() }.clone();
+            unsafe { *VIM_TEMPDIR.get_mut() = None };
+            TempdirGuard { saved }
+        }
+    }
+
+    impl Drop for TempdirGuard {
+        fn drop(&mut self) {
+            let created = unsafe { VIM_TEMPDIR.get_mut() }.clone();
+            if let Some(dir) = created {
+                let _ = std::fs::remove_dir_all(bytes_to_path(&dir));
+            }
+            unsafe { *VIM_TEMPDIR.get_mut() = self.saved.take() };
+        }
+    }
+
+    #[test]
+    fn vim_gettempdir_creates_a_real_directory_ending_in_a_separator() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        let dir = unsafe { vim_gettempdir() }.expect("a tempdir must be creatable");
+        assert!(!dir.is_empty());
+        // The original guarantees a trailing path separator so callers
+        // can concatenate a file name directly.
+        assert_eq!(*dir.last().unwrap(), PATHSEP);
+        assert!(crate::os::fs::os_isdir(&bytes_to_path(&dir)));
+    }
+
+    #[test]
+    fn vim_gettempdir_is_stable_across_calls() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        let first = unsafe { vim_gettempdir() }.expect("a tempdir must be creatable");
+        let second = unsafe { vim_gettempdir() }.expect("still creatable");
+        // The second call must reuse the existing directory, not make
+        // a fresh one.
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn vim_gettempdir_recreates_a_disappeared_directory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        let first = unsafe { vim_gettempdir() }.expect("a tempdir must be creatable");
+        // An antivirus or over-eager cleanup job can genuinely delete
+        // it mid-session; the original detects that and remakes it.
+        std::fs::remove_dir_all(bytes_to_path(&first)).unwrap();
+        assert!(!crate::os::fs::os_isdir(&bytes_to_path(&first)));
+
+        let second = unsafe { vim_gettempdir() }.expect("must be recreated");
+        assert_ne!(first, second);
+        assert!(crate::os::fs::os_isdir(&bytes_to_path(&second)));
+    }
+
+    #[test]
+    fn vim_mktempdir_creates_a_directory_under_a_temp_dir_name_candidate() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        unsafe { vim_mktempdir() };
+        let dir = unsafe { VIM_TEMPDIR.get_mut() }
+            .clone()
+            .expect("vim_mktempdir must set VIM_TEMPDIR");
+        assert!(crate::os::fs::os_isdir(&bytes_to_path(&dir)));
+        // The mkdtemp template's six random characters are always
+        // present, so the leaf name is never the bare "nvim.<user>".
+        assert!(dir.len() > b"nvim.".len() + 6);
+    }
+
+    #[test]
+    fn vim_tempname_is_inside_the_tempdir_and_unique_per_call() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TempdirGuard::new();
+
+        let dir = unsafe { vim_gettempdir() }.expect("a tempdir must be creatable");
+        let first = unsafe { vim_tempname() }.expect("a name must be producible");
+        let second = unsafe { vim_tempname() }.expect("a name must be producible");
+
+        assert!(first.starts_with(&dir));
+        assert!(second.starts_with(&dir));
+        assert_ne!(first, second);
+        // The file itself is deliberately NOT created.
+        assert!(!bytes_to_path(&first).exists());
     }
 }

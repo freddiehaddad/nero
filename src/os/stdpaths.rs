@@ -19,11 +19,6 @@
 //! a plain local `Vec<u8>`, matching the same established preference.
 //!
 //! Deferred (each needs a not-yet-translated subsystem):
-//! - The `kXDGRuntimeDir` branch's `vim_gettempdir`
-//!   (a persistent session-lifetime temp-directory subsystem) -
-//!   [`stdpaths_get_xdg_var`] models the `env_val`-set and
-//!   `fallback`-string branches plus [`xdg_remove_duplicate`],
-//!   `unimplemented!()`-ing only that one.
 //! - `stdpaths_user_cache_subpath`/`stdpaths_user_conf_subpath`/
 //!   `stdpaths_user_data_subpath`/`stdpaths_user_state_subpath`: thin
 //!   wrappers over [`get_xdg_home`] + `concat_fnames_realloc` - no real
@@ -104,18 +99,18 @@ fn xdg_default_env_var(idx: XdgVarType) -> Option<&'static [u8]> {
 /// Gets the value of an XDG base-directory variable, or its
 /// (`~`/`$VAR`-expanded) fallback default (`stdpaths_get_xdg_var`).
 ///
-/// Only the two most common branches are modeled for real: the
-/// variable's own real environment value (with Windows' extra
-/// `os_realpath` canonicalization for `kXDGCacheHome`), and the
-/// plain-string-fallback path via [`crate::os::env::expand_env_save`].
-/// `unimplemented!()`s for [`XdgVarType::RuntimeDir`] (needs
-/// `vim_mktempdir`, a persistent session-lifetime temp-directory
-/// subsystem) when neither the real variable nor (on Windows) its own
-/// fallback environment variable is set - not reached by any of
-/// `stdpath()`'s other, more common arguments.
+/// Three branches are modeled: the variable's own real environment
+/// value (with Windows' extra `os_realpath` canonicalization for
+/// `kXDGCacheHome`), the plain-string-fallback path via
+/// [`crate::os::env::expand_env_save`], and - for
+/// [`XdgVarType::RuntimeDir`], which has no string fallback at all -
+/// the tempdir that [`crate::fileio::vim_gettempdir`] creates at
+/// startup, falling back to `"/tmp/"` and trimmed of its trailing
+/// separator, exactly as upstream does.
 ///
 /// # Safety
-/// Forwarded from [`crate::os::env::expand_env_save`]'s own safety doc.
+/// Forwarded from [`crate::os::env::expand_env_save`]'s and
+/// [`crate::fileio::vim_gettempdir`]'s own safety docs.
 #[must_use]
 pub unsafe fn stdpaths_get_xdg_var(idx: XdgVarType) -> Option<Vec<u8>> {
     let env = xdg_env_var(idx);
@@ -152,9 +147,12 @@ pub unsafe fn stdpaths_get_xdg_var(idx: XdgVarType) -> Option<Vec<u8>> {
         // SAFETY: forwarded from this function's own safety doc.
         Some(unsafe { crate::os::env::expand_env_save(fallback) })
     } else if idx == XdgVarType::RuntimeDir {
-        unimplemented!(
-            "stdpaths_get_xdg_var: the RuntimeDir fallback needs vim_mktempdir, not yet translated"
-        );
+        // Special-case: stdpath('run') is defined at startup.
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut dir = unsafe { crate::fileio::vim_gettempdir() }.unwrap_or_else(|| b"/tmp/".to_vec());
+        // Trim the trailing slash vim_gettempdir guarantees.
+        dir.truncate(if dir.len() >= 2 { dir.len() - 1 } else { 0 });
+        Some(dir)
     } else {
         None
     };
@@ -471,6 +469,33 @@ pub(crate) mod tests {
         let mut expected = b"/custom/data/".to_vec();
         expected.extend_from_slice(&appname);
         assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn stdpaths_get_xdg_var_runtime_dir_uses_the_real_env_var_when_set() {
+        let _lock = xdg_test_lock();
+        let _guard = XdgEnvGuard::set(&[("XDG_RUNTIME_DIR", Some("/run/user/1000"))]);
+        let result = unsafe { stdpaths_get_xdg_var(XdgVarType::RuntimeDir) };
+        assert_eq!(result, Some(b"/run/user/1000".to_vec()));
+    }
+
+    #[test]
+    fn stdpaths_get_xdg_var_runtime_dir_falls_back_to_the_tempdir() {
+        // RuntimeDir has no string fallback at all, so an unset
+        // variable resolves through vim_gettempdir() instead - the one
+        // branch that kept this function's own translation incomplete
+        // until fileio.c's tempdir family landed.
+        let _global = crate::globals::global_state_test_lock();
+        let _lock = xdg_test_lock();
+        let _guard = XdgEnvGuard::set(&[("XDG_RUNTIME_DIR", None)]);
+
+        let result = unsafe { stdpaths_get_xdg_var(XdgVarType::RuntimeDir) }.expect("always Some");
+        assert!(!result.is_empty());
+        // Upstream trims the trailing separator vim_gettempdir
+        // guarantees, so the result is a plain directory path.
+        assert_ne!(*result.last().unwrap(), b'/');
+        #[cfg(windows)]
+        assert_ne!(*result.last().unwrap(), b'\\');
     }
 
     #[test]

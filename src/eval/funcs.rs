@@ -7591,7 +7591,7 @@ unsafe fn f_stdpath(argvars: &[TypvalT], rettv: &mut TypvalT) {
         b"cache" => unsafe { get_xdg_home(XdgVarType::CacheHome) },
         b"state" => unsafe { get_xdg_home(XdgVarType::StateHome) },
         b"log" => unsafe { get_xdg_home(XdgVarType::StateHome) }.map(|base| concat_fnames(base, b"logs")),
-        b"run" => unimplemented!("f_stdpath: 'run' needs vim_mktempdir, not yet translated"),
+        b"run" => unsafe { crate::os::stdpaths::stdpaths_get_xdg_var(XdgVarType::RuntimeDir) },
         b"config_dirs" => {
             // SAFETY: forwarded from this function's own safety doc.
             unsafe { get_xdg_var_list(XdgVarType::ConfigDirs, rettv) };
@@ -17609,10 +17609,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "vim_mktempdir")]
-    fn stdpath_run_is_unimplemented() {
+    fn stdpath_run_returns_a_real_runtime_directory() {
+        // Was `should_panic(expected = "vim_mktempdir")` until fileio.c's
+        // tempdir family landed; 'run' now resolves for real through
+        // stdpaths_get_xdg_var(RuntimeDir).
+        let _global = crate::globals::global_state_test_lock();
+        let _lock = crate::os::stdpaths::tests::xdg_test_lock();
         let mut rettv = TypvalT::default();
         unsafe { f_stdpath(&[string(b"run")], &mut rettv) };
+        match &rettv.value {
+            TypvalValue::String(Some(s)) => {
+                assert!(!s.is_empty());
+                // Upstream trims the trailing separator.
+                assert_ne!(*s.last().unwrap(), b'/');
+            }
+            other => panic!("stdpath('run') must be a non-null String, got {other:?}"),
+        }
     }
 
     #[test]
