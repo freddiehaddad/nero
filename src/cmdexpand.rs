@@ -79,6 +79,56 @@ pub fn get_mapclear_arg(idx: i32) -> Option<&'static str> {
     (idx == 0).then_some("<buffer>")
 }
 
+/// Whether fuzzy matching may be used for this completion context
+/// (`cmdline_fuzzy_completion_supported`).
+///
+/// A group of contexts opt OUT unconditionally: they either match
+/// against the filesystem or have their own ordering that fuzzy
+/// matching would scramble. Everything else defers to the `"fuzzy"`
+/// flag in `'wildoptions'`.
+///
+/// The original takes the whole `expand_T`; only `xp_context` is
+/// read, so that is all this takes.
+#[must_use]
+pub fn cmdline_fuzzy_completion_supported(
+    xp_context: crate::cmdexpand_defs::ExpandContext,
+) -> bool {
+    use crate::cmdexpand_defs::ExpandContext as E;
+    if matches!(
+        xp_context,
+        E::BoolSettings
+            | E::Colors
+            | E::Compiler
+            | E::Directories
+            | E::DirsInCdpath
+            | E::Files
+            | E::FilesInPath
+            | E::Filetype
+            | E::Filetypecmd
+            | E::Findfunc
+            | E::Help
+            | E::Keymap
+            | E::Lua
+            | E::OldSetting
+            | E::StringSetting
+            | E::SettingSubtract
+            | E::Ownsyntax
+            | E::Packadd
+            | E::Runtime
+            | E::Shellcmd
+            | E::Shellcmdline
+            | E::Tags
+            | E::TagsListfiles
+            | E::UserList
+            | E::UserLua
+    ) {
+        return false;
+    }
+
+    let wop_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.wop_flags;
+    wop_flags & crate::option_vars::opt_wop_flag::FUZZY != 0
+}
+
 /// Whether fuzzy completion for cmdline completion is enabled AND
 /// `fuzzystr` is not empty - an empty search pattern should never use
 /// fuzzy matching (`cmdline_fuzzy_complete`).
@@ -142,6 +192,73 @@ mod tests {
     fn get_retab_arg_offers_only_indentonly() {
         assert_eq!(get_retab_arg(0), Some("-indentonly"));
         assert_eq!(get_retab_arg(1), None);
+    }
+
+    // --- cmdline_fuzzy_completion_supported ---
+
+    #[test]
+    fn fuzzy_completion_is_refused_for_the_opted_out_contexts() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        let _lock = crate::globals::global_state_test_lock();
+        // Even with 'wildoptions' fuzzy ON, these must refuse.
+        let _guard = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::FUZZY);
+        for ctx in [
+            E::Files,
+            E::Directories,
+            E::DirsInCdpath,
+            E::FilesInPath,
+            E::Shellcmd,
+            E::Shellcmdline,
+            E::Tags,
+            E::TagsListfiles,
+            E::Help,
+            E::Colors,
+            E::Compiler,
+            E::Filetype,
+            E::Filetypecmd,
+            E::Findfunc,
+            E::Keymap,
+            E::Lua,
+            E::UserLua,
+            E::UserList,
+            E::Ownsyntax,
+            E::Packadd,
+            E::Runtime,
+            E::BoolSettings,
+            E::OldSetting,
+            E::StringSetting,
+            E::SettingSubtract,
+        ] {
+            assert!(
+                !cmdline_fuzzy_completion_supported(ctx),
+                "{ctx:?} opts out of fuzzy matching"
+            );
+        }
+    }
+
+    #[test]
+    fn fuzzy_completion_follows_wildoptions_for_other_contexts() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        let _lock = crate::globals::global_state_test_lock();
+        {
+            let _guard = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::FUZZY);
+            assert!(cmdline_fuzzy_completion_supported(E::Commands));
+            assert!(cmdline_fuzzy_completion_supported(E::Buffers));
+            assert!(cmdline_fuzzy_completion_supported(E::Mappings));
+        }
+        {
+            let _guard = WopFlagsGuard::set(0);
+            assert!(!cmdline_fuzzy_completion_supported(E::Commands));
+            assert!(!cmdline_fuzzy_completion_supported(E::Buffers));
+        }
+    }
+
+    #[test]
+    fn fuzzy_completion_ignores_unrelated_wildoptions_flags() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::PUM);
+        assert!(!cmdline_fuzzy_completion_supported(E::Commands));
     }
 
     #[test]
