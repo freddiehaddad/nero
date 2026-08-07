@@ -373,6 +373,41 @@ pub fn os_fileinfo_mtime(info: &FileInfoT) -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Flags for [`os_copy`] (`uv_fs_copyfile`'s own flag set).
+pub mod copyfile {
+    /// Fail if the destination already exists (`UV_FS_COPYFILE_EXCL`).
+    pub const EXCL: i32 = 0x0001;
+    /// Try a copy-on-write reflink, falling back to a normal copy
+    /// (`UV_FS_COPYFILE_FICLONE`).
+    pub const FICLONE: i32 = 0x0002;
+    /// Require a copy-on-write reflink (`UV_FS_COPYFILE_FICLONE_FORCE`).
+    pub const FICLONE_FORCE: i32 = 0x0004;
+}
+
+/// Copy the file at `path` to `new_path` (`os_copy`).
+///
+/// Returns `0` on success and `-1` on failure, matching this module's
+/// established simplification of the original's libuv error codes (no
+/// specific cause is surfaced anywhere in this crate yet - see
+/// [`os_mkdir`]).
+///
+/// Only [`copyfile::EXCL`] changes observable behaviour and is
+/// modelled. The two reflink flags are copy-on-write OPTIMIZATIONS:
+/// libuv silently falls back to a byte copy for `FICLONE`, so
+/// ignoring it is behaviourally identical. `FICLONE_FORCE` instead
+/// REQUIRES a reflink and fails without one, which `std::fs::copy`
+/// cannot express - it is rejected outright rather than silently
+/// downgraded to a plain copy that the caller did not ask for.
+pub fn os_copy(path: &Path, new_path: &Path, flags: i32) -> i32 {
+    if flags & copyfile::FICLONE_FORCE != 0 {
+        return -1;
+    }
+    if flags & copyfile::EXCL != 0 && new_path.exists() {
+        return -1;
+    }
+    if std::fs::copy(path, new_path).is_ok() { 0 } else { -1 }
+}
+
 /// Set the permission bits of the file at `path` (`os_setperm`).
 ///
 /// Returns [`crate::vim_defs::OK`]/[`crate::vim_defs::FAIL`], matching
@@ -1586,6 +1621,71 @@ mod tests {
         assert!(os_file_is_readable(&path));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // --- os_copy ---
+
+    #[test]
+    fn os_copy_duplicates_the_file_contents() {
+        let src = std::env::temp_dir().join("nero_test_os_copy_src");
+        let dst = std::env::temp_dir().join("nero_test_os_copy_dst");
+        std::fs::write(&src, b"payload").unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        assert_eq!(os_copy(&src, &dst, 0), 0);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+
+        std::fs::remove_file(&src).unwrap();
+        std::fs::remove_file(&dst).unwrap();
+    }
+
+    #[test]
+    fn os_copy_overwrites_by_default_but_not_with_excl() {
+        let src = std::env::temp_dir().join("nero_test_os_copy_excl_src");
+        let dst = std::env::temp_dir().join("nero_test_os_copy_excl_dst");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dst, b"old").unwrap();
+
+        // EXCL refuses to clobber an existing destination...
+        assert_eq!(os_copy(&src, &dst, copyfile::EXCL), -1);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"old", "left untouched");
+
+        // ...while the default overwrites it.
+        assert_eq!(os_copy(&src, &dst, 0), 0);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+
+        std::fs::remove_file(&src).unwrap();
+        std::fs::remove_file(&dst).unwrap();
+    }
+
+    #[test]
+    fn os_copy_ignores_ficlone_but_rejects_ficlone_force() {
+        let src = std::env::temp_dir().join("nero_test_os_copy_clone_src");
+        let dst = std::env::temp_dir().join("nero_test_os_copy_clone_dst");
+        std::fs::write(&src, b"data").unwrap();
+        let _ = std::fs::remove_file(&dst);
+
+        // FICLONE is an optimization libuv itself falls back from, so
+        // a plain copy is behaviourally identical.
+        assert_eq!(os_copy(&src, &dst, copyfile::FICLONE), 0);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"data");
+
+        // FICLONE_FORCE demands a reflink, which cannot be expressed
+        // here - refused rather than silently downgraded.
+        assert_eq!(os_copy(&src, &dst, copyfile::FICLONE_FORCE), -1);
+
+        std::fs::remove_file(&src).unwrap();
+        std::fs::remove_file(&dst).unwrap();
+    }
+
+    #[test]
+    fn os_copy_fails_for_a_missing_source() {
+        let src = std::env::temp_dir().join("nero_test_os_copy_missing_src");
+        let dst = std::env::temp_dir().join("nero_test_os_copy_missing_dst");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+
+        assert_eq!(os_copy(&src, &dst, 0), -1);
     }
 
     // --- os_setperm ---
