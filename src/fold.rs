@@ -1388,6 +1388,78 @@ pub unsafe fn truncate_fold(fp: &mut FoldT, end: crate::pos_defs::LinenrT) {
     fp.fd_len = end - fd_top;
 }
 
+/// Extend the Visual selection so it covers whole closed folds
+/// (`foldAdjustVisual`).
+///
+/// The selection's start is pulled back to the first line of any
+/// closed fold it begins in, and its end pushed forward to that
+/// fold's last line, so a fold is never half-selected.
+///
+/// # Safety
+/// Touches `GLOBALS` (`Visual`, `curwin`) and `OPTION_VARS`; also
+/// forwarded from [`has_folding`]'s own safety doc.
+pub unsafe fn fold_adjust_visual() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    if !g.Visual.active || !unsafe { has_any_folding(&*curwin) } {
+        return;
+    }
+
+    // The earlier of the Visual anchor and the cursor is the start.
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor_first = crate::mark_defs::ltoreq(g.Visual.start, unsafe { (*curwin).w_cursor });
+    let (mut start, mut end) = if cursor_first {
+        // SAFETY: forwarded from this function's own safety doc.
+        (g.Visual.start, unsafe { (*curwin).w_cursor })
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        (unsafe { (*curwin).w_cursor }, g.Visual.start)
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { has_folding(&mut *curwin, start.lnum, Some(&mut start.lnum), None) } {
+        start.col = 0;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let end_folded = unsafe { has_folding(&mut *curwin, end.lnum, None, Some(&mut end.lnum)) };
+    if end_folded {
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { (*curwin).w_buffer };
+        // SAFETY: forwarded from this function's own safety doc.
+        end.col = unsafe { crate::memline::ml_get_buf_len(&mut *buf, end.lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let sel_o = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sel
+            .as_deref()
+            .is_some_and(|s| s.first() == Some(&b'o'));
+        if end.col > 0 && sel_o {
+            end.col -= 1;
+        }
+    }
+
+    // Write both positions back the way round they came from.
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    if cursor_first {
+        g.Visual.start = start;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor = end };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor = start };
+        g.Visual.start = end;
+    }
+
+    if end_folded {
+        // Prevent cursor from moving on the trail byte.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::mbyte::mb_adjust_cursor() };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,6 +2302,103 @@ mod tests {
         for fp in &gap {
             assert_eq!(fp.fd_flags, fd_flags::FD_OPEN);
         }
+    }
+
+    #[test]
+    fn fold_adjust_visual_is_a_noop_when_visual_is_inactive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = closed_fold_win(&mut buf);
+        win.w_cursor = crate::pos_defs::PosT { lnum: 22, col: 3, coladd: 0 };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_visual = g.Visual;
+        g.Visual.active = false;
+        g.Visual.start = crate::pos_defs::PosT { lnum: 18, col: 1, coladd: 0 };
+
+        unsafe { fold_adjust_visual() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Visual.start.lnum, 18, "nothing is touched");
+        assert_eq!(win.w_cursor.lnum, 22);
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual = prev_visual;
+    }
+
+    #[test]
+    fn fold_adjust_visual_is_a_noop_without_any_folding() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = closed_fold_win(&mut buf);
+        // 'nofoldenable' makes has_any_folding false.
+        win.w_onebuf_opt.wo_fen = 0;
+        win.w_cursor = crate::pos_defs::PosT { lnum: 22, col: 3, coladd: 0 };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_visual = g.Visual;
+        g.Visual.active = true;
+        g.Visual.start = crate::pos_defs::PosT { lnum: 18, col: 1, coladd: 0 };
+
+        unsafe { fold_adjust_visual() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Visual.start.lnum, 18);
+        assert_eq!(win.w_cursor.lnum, 22);
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual = prev_visual;
+    }
+
+    #[test]
+    fn fold_adjust_visual_pulls_the_selection_start_back_to_the_fold_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = closed_fold_win(&mut buf);
+        // The selection starts inside the closed fold at 20-24 and
+        // ends outside it, so only the start is adjusted (leaving
+        // ml_get_buf_len out of this test entirely).
+        win.w_cursor = crate::pos_defs::PosT { lnum: 30, col: 0, coladd: 0 };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_visual = g.Visual;
+        g.Visual.active = true;
+        g.Visual.start = crate::pos_defs::PosT { lnum: 22, col: 5, coladd: 0 };
+
+        unsafe { fold_adjust_visual() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Visual.start.lnum, 20, "pulled back to the fold's start");
+        assert_eq!(g.Visual.start.col, 0, "and to the start of that line");
+        assert_eq!(win.w_cursor.lnum, 30, "the end is outside any fold");
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual = prev_visual;
+    }
+
+    #[test]
+    fn fold_adjust_visual_handles_the_cursor_being_the_earlier_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_ml.ml_line_count = 40;
+        let mut win = closed_fold_win(&mut buf);
+        // Selection made upwards: the cursor is the start, and the
+        // Visual anchor is the end.
+        win.w_cursor = crate::pos_defs::PosT { lnum: 22, col: 5, coladd: 0 };
+        let _guard = CurwinGuard::set(&mut win as *mut WinT);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_visual = g.Visual;
+        g.Visual.active = true;
+        g.Visual.start = crate::pos_defs::PosT { lnum: 30, col: 0, coladd: 0 };
+
+        unsafe { fold_adjust_visual() };
+
+        assert_eq!(win.w_cursor.lnum, 20, "the cursor end is pulled back");
+        assert_eq!(win.w_cursor.col, 0);
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.Visual.start.lnum, 30, "the anchor stays put");
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual = prev_visual;
     }
 
     #[test]
