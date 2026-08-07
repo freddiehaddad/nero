@@ -2762,6 +2762,49 @@ pub unsafe fn fold_del_marker(
     }
 }
 
+/// Delete the start and end markers of fold `fp`, and of every fold
+/// nested inside it when `recursive` is set (`deleteFoldMarkers`).
+///
+/// `lnum_off` offsets `fp.fd_top`, since a nested fold stores it
+/// relative to its parent; the recursion accumulates it.
+///
+/// Requires a preceding [`parse_marker`] call, whose result names
+/// both markers.
+///
+/// # Safety
+/// Same as [`fold_del_marker`]; `wp` must be a valid, live [`WinT`].
+pub unsafe fn delete_fold_markers(
+    wp: *mut WinT,
+    fp: &mut FoldT,
+    recursive: bool,
+    lnum_off: crate::pos_defs::LinenrT,
+) {
+    if recursive {
+        let fd_top = fp.fd_top;
+        for nested in &mut fp.fd_nested {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { delete_fold_markers(wp, nested, true, lnum_off + fd_top) };
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let markers = unsafe { FOLD_MARKERS.get_mut() }
+        .clone()
+        .expect("delete_fold_markers: parse_marker must run first");
+    // SAFETY: forwarded from this function's own safety doc.
+    let fmr = unsafe { (*wp).w_onebuf_opt.wo_fmr.clone() }.unwrap_or_default();
+    let startmarker = fmr[..markers.start_len.min(fmr.len())].to_vec();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { fold_del_marker(buf, fp.fd_top + lnum_off, &startmarker) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        fold_del_marker(buf, fp.fd_top + lnum_off + fp.fd_len - 1, &markers.end)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3728,13 +3771,152 @@ mod tests {
         let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
         unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = buf_ptr;
         for (i, text) in lines.iter().enumerate().skip(1) {
+            // NUL-terminate like the replaced first line, so every
+            // line in the fixture reads back the same way.
+            let mut owned = text.to_vec();
+            owned.push(0);
             assert_eq!(
-                unsafe { crate::memline::ml_append(i as crate::pos_defs::LinenrT, text, 0, false) },
+                unsafe { crate::memline::ml_append(i as crate::pos_defs::LinenrT, &owned, 0, false) },
                 crate::vim_defs::OK
             );
         }
         unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
         buf
+    }
+
+    #[test]
+    fn delete_fold_markers_removes_both_ends_of_a_fold() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(&[b"start {{{", b"middle", b"end }}}"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { parse_marker(&win) };
+
+        let mut fp = FoldT { fd_top: 1, fd_len: 3, ..Default::default() };
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            delete_fold_markers(win_ptr, &mut fp, false, 0);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"start \0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 3) }, b"end \0");
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn delete_fold_markers_recurses_into_nested_folds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(
+            &[b"outer {{{", b"inner {{{", b"inner end }}}", b"outer end }}}"],
+            b"",
+        );
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { parse_marker(&win) };
+
+        // Outer fold spans lines 1-4; the nested one spans 2-3, i.e.
+        // fd_top 1 relative to its parent.
+        let mut fp = FoldT {
+            fd_top: 1,
+            fd_len: 4,
+            fd_nested: vec![FoldT { fd_top: 1, fd_len: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            delete_fold_markers(win_ptr, &mut fp, true, 0);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        for (lnum, want) in [
+            (1, b"outer \0".as_ref()),
+            (2, b"inner \0"),
+            (3, b"inner end \0"),
+            (4, b"outer end \0"),
+        ] {
+            assert_eq!(
+                unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, lnum) },
+                want,
+                "line {lnum}"
+            );
+        }
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn delete_fold_markers_without_recursion_leaves_nested_markers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = del_marker_fixture(
+            &[b"outer {{{", b"inner {{{", b"inner end }}}", b"outer end }}}"],
+            b"",
+        );
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let win_ptr = &mut win as *mut WinT;
+        unsafe { parse_marker(&win) };
+
+        let mut fp = FoldT {
+            fd_top: 1,
+            fd_len: 4,
+            fd_nested: vec![FoldT { fd_top: 1, fd_len: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
+            delete_fold_markers(win_ptr, &mut fp, false, 0);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"outer \0");
+        // The nested fold's own markers survive.
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) }, b"inner {{{\0");
+        assert_eq!(
+            unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 3) },
+            b"inner end }}}\0"
+        );
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
     }
 
     /// Runs `fold_del_marker` with `curbuf` and `curwin` installed,
