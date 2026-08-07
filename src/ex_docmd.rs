@@ -127,6 +127,42 @@ pub fn ends_excmd(c: u8) -> bool {
     c == 0 || c == b'|' || c == b'"' || c == b'\n'
 }
 
+/// Recognise the two Ex commands whose names may be abbreviated to a
+/// single letter, `:k` and `:s` (`one_letter_cmd`).
+///
+/// Returns the command index when `p` starts with such an
+/// abbreviation, otherwise `None`. The tangled conditions exist to
+/// avoid stealing the prefixes of longer commands: `:kee[pmarks]`
+/// must not become `:k`, and `:scs`/`:scr`/`:sim`/`:sil`/`:sig`/
+/// `:sre` must not become `:s`.
+///
+/// The original indexes freely past the matched bytes, relying on the
+/// C string's own NUL terminator to stop it; this reads out-of-range
+/// positions as `0` instead, which is the same value that comparison
+/// sees.
+#[must_use]
+pub fn one_letter_cmd(p: &[u8]) -> Option<crate::ex_cmds_defs::CmdIdxT> {
+    let at = |i: usize| p.get(i).copied().unwrap_or(0);
+
+    if at(0) == b'k' && (at(1) != b'e' || at(2) != b'e') {
+        return Some(crate::ex_cmds_defs::CmdIdxT::k);
+    }
+    if at(0) == b's'
+        && ((at(1) == b'c'
+            && (at(2) == 0
+                || (at(2) != b's'
+                    && at(2) != b'r'
+                    && (at(3) == 0 || (at(3) != b'i' && at(4) != b'p')))))
+            || at(1) == b'g'
+            || (at(1) == b'i' && at(2) != b'm' && at(2) != b'l' && at(2) != b'g')
+            || at(1) == b'I'
+            || (at(1) == b'r' && at(2) != b'e'))
+    {
+        return Some(crate::ex_cmds_defs::CmdIdxT::substitute);
+    }
+    None
+}
+
 /// Skip leading colons (and the whitespace around them) at the start
 /// of an Ex command line, returning the byte offset just past them
 /// (`skip_colon_white`).
@@ -700,6 +736,55 @@ mod tests {
         assert!(ends_excmd(b'|'));
         assert!(ends_excmd(b'"'));
         assert!(ends_excmd(b'\n'));
+    }
+
+    // --- one_letter_cmd ---
+
+    #[test]
+    fn one_letter_cmd_recognizes_k_but_not_keepmarks() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert_eq!(one_letter_cmd(b"k"), Some(CmdIdxT::k));
+        assert_eq!(one_letter_cmd(b"ka"), Some(CmdIdxT::k));
+        // "ke" alone is still :k - only a second 'e' rules it out,
+        // which is what protects :keepmarks/:keepalt etc.
+        assert_eq!(one_letter_cmd(b"ke"), Some(CmdIdxT::k));
+        assert_eq!(one_letter_cmd(b"kee"), None);
+        assert_eq!(one_letter_cmd(b"keepmarks"), None);
+    }
+
+    #[test]
+    fn one_letter_cmd_recognizes_the_substitute_abbreviations() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        for s in [&b"sg"[..], b"sI", b"sr", b"si", b"sc"] {
+            assert_eq!(
+                one_letter_cmd(s),
+                Some(CmdIdxT::substitute),
+                "{} abbreviates :substitute",
+                String::from_utf8_lossy(s)
+            );
+        }
+    }
+
+    #[test]
+    fn one_letter_cmd_leaves_the_longer_s_commands_alone() {
+        // These prefixes belong to real commands (:scscope, :scriptnames,
+        // :simalt, :silent, :sign, :sread-style), so they must not be
+        // stolen by the :s abbreviation.
+        for s in [&b"scs"[..], b"scr", b"sim", b"sil", b"sig", b"sre"] {
+            assert_eq!(
+                one_letter_cmd(s),
+                None,
+                "{} must not become :substitute",
+                String::from_utf8_lossy(s)
+            );
+        }
+    }
+
+    #[test]
+    fn one_letter_cmd_is_none_for_anything_else() {
+        assert_eq!(one_letter_cmd(b""), None);
+        assert_eq!(one_letter_cmd(b"echo"), None);
+        assert_eq!(one_letter_cmd(b"s"), None, "a bare s is not handled here");
     }
 
     // --- skip_colon_white / parse_bang / cmd_has_expr_args ---
