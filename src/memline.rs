@@ -295,6 +295,61 @@ const B0_MAGIC_INT: i32 = 0x2021_2223;
 const B0_MAGIC_SHORT: i16 = 0x1213;
 const B0_MAGIC_CHAR: u8 = 0x55;
 
+/// Whether `b0` carries the block-0 identifier (`ml_check_b0_id`).
+///
+/// This crate's `ZeroBlock` is write-only (see the module doc), so
+/// there is no parsed struct to inspect; these three validators take
+/// the raw serialized block instead, which is exactly the form a
+/// block read back from a swapfile arrives in.
+///
+/// A block shorter than the identifier cannot be valid.
+#[must_use]
+pub fn ml_check_b0_id(b0: &[u8]) -> bool {
+    b0.get(ZB_OFF_ID) == Some(&BLOCK0_ID0) && b0.get(ZB_OFF_ID + 1) == Some(&BLOCK0_ID1)
+}
+
+/// Whether every string field in `b0` is NUL-terminated
+/// (`ml_check_b0_strings`).
+///
+/// A swapfile written by another program could leave a field with no
+/// terminator, which would run a C reader off the end; this rejects
+/// such a block up front.
+#[must_use]
+pub fn ml_check_b0_strings(b0: &[u8]) -> bool {
+    let terminated = |off: usize, len: usize| {
+        b0.get(off..off + len).is_some_and(|f| f.contains(&crate::ascii_defs::NUL))
+    };
+    terminated(ZB_OFF_VERSION, 10)
+        && terminated(ZB_OFF_UNAME, B0_UNAME_SIZE)
+        && terminated(ZB_OFF_HNAME, B0_HNAME_SIZE)
+        // The original checks B0_FNAME_SIZE_CRYPT here; this crate
+        // lays the field out at its uncrypted size, which is the
+        // only size it ever writes.
+        && terminated(ZB_OFF_FNAME, B0_FNAME_SIZE_NOCRYPT)
+}
+
+/// Whether `b0`'s magic numbers are wrong (`b0_magic_wrong`).
+///
+/// The four values are written in native endianness and different
+/// widths on purpose: a swapfile carried to a machine with a
+/// different byte order or integer size fails at least one of them.
+///
+/// A block too short to hold them all is likewise wrong.
+#[must_use]
+pub fn b0_magic_wrong(b0: &[u8]) -> bool {
+    let read = |off: usize, len: usize| b0.get(off..off + len);
+
+    let Some(long_bytes) = read(ZB_OFF_MAGIC_LONG, 8) else { return true };
+    let Some(int_bytes) = read(ZB_OFF_MAGIC_INT, 4) else { return true };
+    let Some(short_bytes) = read(ZB_OFF_MAGIC_SHORT, 2) else { return true };
+    let Some(&char_byte) = b0.get(ZB_OFF_MAGIC_CHAR) else { return true };
+
+    i64::from_ne_bytes(long_bytes.try_into().unwrap()) != B0_MAGIC_LONG
+        || i32::from_ne_bytes(int_bytes.try_into().unwrap()) != B0_MAGIC_INT
+        || i16::from_ne_bytes(short_bytes.try_into().unwrap()) != B0_MAGIC_SHORT
+        || char_byte != B0_MAGIC_CHAR
+}
+
 /// Block zero: portable, hand-packed byte layout for the first block
 /// of a swapfile (`ZeroBlock`). See this module's own doc comment for
 /// why this isn't a `#[repr(C)]` struct reinterpreting raw bytes.
@@ -3368,6 +3423,83 @@ mod tests {
             B0_MAGIC_LONG
         );
         assert_eq!(buf[ZB_OFF_MAGIC_CHAR], B0_MAGIC_CHAR);
+    }
+
+    // --- ml_check_b0_id / ml_check_b0_strings / b0_magic_wrong ---
+
+    /// A freshly serialized block 0, i.e. exactly what this crate
+    /// writes to a swapfile.
+    fn serialized_b0() -> Vec<u8> {
+        let b0 = ZeroBlock::new(4096);
+        let mut buf = vec![0u8; 4096];
+        b0.write_into(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn a_freshly_written_block0_passes_every_validator() {
+        let buf = serialized_b0();
+        assert!(ml_check_b0_id(&buf));
+        assert!(ml_check_b0_strings(&buf));
+        assert!(!b0_magic_wrong(&buf), "magic must be right");
+    }
+
+    #[test]
+    fn ml_check_b0_id_rejects_a_wrong_or_short_identifier() {
+        let mut buf = serialized_b0();
+        buf[ZB_OFF_ID] = b'x';
+        assert!(!ml_check_b0_id(&buf));
+
+        let mut buf = serialized_b0();
+        buf[ZB_OFF_ID + 1] = b'x';
+        assert!(!ml_check_b0_id(&buf));
+
+        assert!(!ml_check_b0_id(&[]), "a short block cannot be valid");
+        assert!(!ml_check_b0_id(&[BLOCK0_ID0]));
+    }
+
+    #[test]
+    fn ml_check_b0_strings_rejects_an_unterminated_field() {
+        // Fill the whole uname field with non-NUL bytes: a C reader
+        // would run off the end of it.
+        let mut buf = serialized_b0();
+        for b in &mut buf[ZB_OFF_UNAME..ZB_OFF_UNAME + B0_UNAME_SIZE] {
+            *b = b'x';
+        }
+        assert!(!ml_check_b0_strings(&buf));
+
+        let mut buf = serialized_b0();
+        for b in &mut buf[ZB_OFF_HNAME..ZB_OFF_HNAME + B0_HNAME_SIZE] {
+            *b = b'x';
+        }
+        assert!(!ml_check_b0_strings(&buf));
+
+        assert!(!ml_check_b0_strings(&[]), "a short block cannot be valid");
+    }
+
+    #[test]
+    fn b0_magic_wrong_detects_each_corrupted_magic_field() {
+        for off in [
+            ZB_OFF_MAGIC_LONG,
+            ZB_OFF_MAGIC_INT,
+            ZB_OFF_MAGIC_SHORT,
+            ZB_OFF_MAGIC_CHAR,
+        ] {
+            let mut buf = serialized_b0();
+            buf[off] ^= 0xFF;
+            assert!(
+                b0_magic_wrong(&buf),
+                "corrupting the field at {off} must be detected"
+            );
+        }
+    }
+
+    #[test]
+    fn b0_magic_wrong_treats_a_truncated_block_as_wrong() {
+        let buf = serialized_b0();
+        assert!(b0_magic_wrong(&buf[..ZB_OFF_MAGIC_LONG]));
+        assert!(b0_magic_wrong(&buf[..ZB_OFF_MAGIC_CHAR]));
+        assert!(b0_magic_wrong(&[]));
     }
 
     #[test]
