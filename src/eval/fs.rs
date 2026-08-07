@@ -174,6 +174,91 @@ pub(crate) fn f_getftype(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::String(type_str.map(|s| s.as_bytes().to_vec()));
 }
 
+/// Per-entry filter for [`f_readdir`] (`readdir_checkitem`,
+/// `eval/fs.c`).
+///
+/// Evaluates `{expr}` with `v:val` (and the sole positional argument)
+/// set to the entry name, returning its number value: negative stops
+/// the walk, `0` skips the entry, positive keeps it. An absent
+/// `{expr}` keeps everything; a non-number result is reported as `-1`,
+/// matching the original's own `error` handling.
+///
+/// # Safety
+/// Forwarded from [`crate::eval::eval::eval_expr_typval`]'s and the
+/// `v:val` accessors' own safety docs.
+unsafe fn readdir_checkitem(expr: &TypvalT, name: &[u8]) -> i64 {
+    if matches!(expr.value, TypvalValue::Unknown) {
+        return 1;
+    }
+
+    let mut save_val = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::prepare_vimvar(crate::eval::vars::VimVarIndex::Val, &mut save_val) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Val, Some(name)) };
+
+    let mut retval = 0;
+    let mut rettv = TypvalT::default();
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::eval::eval::eval_expr_typval(expr, false, &mut [], &mut rettv) }
+        != crate::vim_defs::FAIL
+    {
+        let mut error = false;
+        retval = crate::eval::typval::tv_get_number_chk(&rettv, Some(&mut error));
+        if error {
+            retval = -1;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_clear_simple(&rettv) };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::set_vim_var_string(crate::eval::vars::VimVarIndex::Val, None) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::eval::vars::restore_vimvar(crate::eval::vars::VimVarIndex::Val, save_val) };
+    retval
+}
+
+/// `readdir({directory} [, {expr}])` - list the entries of
+/// `{directory}`, sorted and excluding `.`/`..` (`f_readdir`,
+/// `eval/fs.c`).
+///
+/// `{expr}`, when given, is evaluated per entry with `v:val` set to
+/// the entry name: a negative result stops the walk, `0` skips that
+/// entry, and anything positive keeps it.
+///
+/// Always returns a List; an unreadable `{directory}` yields an empty
+/// one, exactly as the original does (its `readdir_core` `FAIL` leaves
+/// the already-allocated return list untouched). The original's own
+/// `check_secure()` message display is omitted, matching this module's
+/// established "skip the message, keep the state" policy.
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS` (via
+/// [`crate::ex_cmds::check_secure`]) and forwards
+/// [`readdir_checkitem`]'s own safety doc.
+pub(crate) unsafe fn f_readdir(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let list = unsafe { crate::eval::typval::tv_list_alloc_ret(rettv, -1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::ex_cmds::check_secure() } {
+        return;
+    }
+
+    let path = crate::eval::typval::tv_get_string(&argvars[0]);
+    let unknown = TypvalT::default();
+    let expr = argvars.get(1).unwrap_or(&unknown);
+
+    let mut check = |name: &[u8]| unsafe { readdir_checkitem(expr, name) };
+    let Some(entries) = crate::fileio::readdir_core(&path, Some(&mut check)) else {
+        return;
+    };
+    for entry in entries {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::eval::typval::tv_list_append_string(list, Some(&entry)) };
+    }
+}
+
 /// `delete({name} [, {flags}])` - delete a file (`{flags}` omitted or
 /// empty), an empty directory (`{flags} == "d"`), or a directory tree
 /// (`{flags} == "rf"`, via [`crate::fileio::delete_recursive`])
@@ -1854,5 +1939,113 @@ mod tests {
         let list_tv = TypvalT { value: TypvalValue::List(std::ptr::null_mut()), ..Default::default() };
         unsafe { f_glob2regpat(&[list_tv], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    // --- f_readdir ---
+
+    /// Collects a `readdir()` result List into plain byte strings.
+    unsafe fn list_strings(rettv: &TypvalT) -> Vec<Vec<u8>> {
+        let TypvalValue::List(l) = rettv.value else { panic!("expected a List") };
+        assert!(!l.is_null());
+        let len = unsafe { crate::eval::typval::tv_list_len(l) };
+        let mut out = Vec::new();
+        for i in 0..len {
+            let item = unsafe { crate::eval::typval::tv_list_find(l, i) };
+            assert!(!item.is_null());
+            out.push(crate::eval::typval::tv_get_string(unsafe { &(*item).li_tv }));
+        }
+        out
+    }
+
+    /// Builds a small real directory for the readdir tests.
+    fn readdir_scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("nero_test_readdir_{name}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("b.txt"), b"b").unwrap();
+        std::fs::write(path.join("a.txt"), b"a").unwrap();
+        std::fs::create_dir(path.join("c_dir")).unwrap();
+        path
+    }
+
+    #[test]
+    fn readdir_lists_every_entry_sorted() {
+        // Cross-verified against real nvim: readdir(dir) reports
+        // ['a.txt', 'b.txt', 'c_dir'] - sorted, and without . or ..
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = readdir_scratch("all");
+        let mut rettv = TypvalT::default();
+        unsafe { f_readdir(&[string(path.to_str().unwrap().as_bytes())], &mut rettv) };
+
+        assert_eq!(
+            unsafe { list_strings(&rettv) },
+            vec![b"a.txt".to_vec(), b"b.txt".to_vec(), b"c_dir".to_vec()]
+        );
+        let TypvalValue::List(l) = rettv.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn readdir_of_an_unreadable_directory_is_an_empty_list() {
+        // Cross-verified against real nvim: a missing directory still
+        // yields a List, just an empty one (readdir_core's FAIL leaves
+        // the already-allocated return list untouched).
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_readdir(&[string(b"/no/such/dir/here")], &mut rettv) };
+
+        assert!(unsafe { list_strings(&rettv) }.is_empty());
+        let TypvalValue::List(l) = rettv.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    #[test]
+    fn readdir_with_a_string_expr_filters_entries() {
+        // Cross-verified against real nvim: an {expr} evaluating to 0
+        // skips just that entry, keeping the rest.
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = readdir_scratch("filter");
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_readdir(
+                &[string(path.to_str().unwrap().as_bytes()), string(b"v:val != 'a.txt'")],
+                &mut rettv,
+            );
+        }
+
+        assert_eq!(unsafe { list_strings(&rettv) }, vec![b"b.txt".to_vec(), b"c_dir".to_vec()]);
+        let TypvalValue::List(l) = rettv.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn readdir_with_a_negative_expr_stops_the_walk() {
+        // Cross-verified against real nvim: a negative {expr} result
+        // stops the walk entirely, so nothing is collected.
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let path = readdir_scratch("stop");
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_readdir(&[string(path.to_str().unwrap().as_bytes()), string(b"-1")], &mut rettv);
+        }
+
+        assert!(unsafe { list_strings(&rettv) }.is_empty());
+        let TypvalValue::List(l) = rettv.value else { unreachable!() };
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
