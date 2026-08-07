@@ -655,10 +655,11 @@ pub unsafe fn vim_getenv(name: &[u8]) -> Option<Vec<u8>> {
 /// translated for structural fidelity anyway since it adds no real
 /// complexity.
 ///
-/// The Unix-only `~user` form (`~someone/...`, needing
-/// `os_get_userdir`, not yet translated) `unimplemented!()`s if ever
-/// reached - a real, if less common, gap (`~` alone, and every
-/// `$VAR` form, both work for real).
+/// The Unix-only `~user` form (`~someone/...`) resolves through
+/// [`crate::os::users::os_get_userdir`]. On any platform where the
+/// original's own `HAVE_PWD_FUNCS` is absent (i.e. not Unix), that
+/// lookup is compiled out upstream too and always fails, leaving the
+/// `~user` text unexpanded - matching the original exactly.
 ///
 /// # Safety
 /// Forwarded from [`vim_getenv`]/[`os_homedir`]'s own safety docs.
@@ -735,12 +736,30 @@ pub unsafe fn expand_env_esc(srcp: &[u8], esc_chars: Option<&[u8]>, one: bool, p
                 var = unsafe { os_homedir() };
                 tail = pos + 1;
             } else {
-                // ~user - needs os_get_userdir (Unix-only, not yet
-                // translated). Only reached for a genuine ~name form,
-                // never for a bare ~ (handled above).
-                unimplemented!(
-                    "expand_env_esc: a real ~user form needs os_get_userdir, not yet translated"
-                );
+                // ~user - a user's own home directory.
+                //
+                // The original copies "~name" into dst first purely so
+                // it can put a NUL after it (C needs a terminated
+                // string for os_get_userdir), then passes dst + 1 to
+                // skip the '~'. A Rust slice already carries its own
+                // length, so the name is taken directly out of srcp
+                // with no scratch copy at all - same scan, same
+                // resulting name, no destination-buffer round trip.
+                let mut end = pos + 1;
+                while srcp
+                    .get(end)
+                    .is_some_and(|&b| {
+                        b != crate::ascii_defs::NUL
+                            && crate::charset::vim_isfilec(i32::from(b))
+                            && !crate::path::vim_ispathsep(i32::from(b))
+                    })
+                {
+                    end += 1;
+                }
+                // Unix-only upstream: without HAVE_PWD_FUNCS the
+                // original sets var = NULL and does not expand at all.
+                var = crate::os::users::os_get_userdir(&srcp[pos + 1..end]);
+                tail = end;
             }
 
             if let (Some(ec), Some(v)) = (esc_chars, &var)
@@ -1521,6 +1540,41 @@ pub(crate) mod tests {
             unsafe { expand_env_save_opt(b"$NERO_TEST_EXPAND_ENV_ESCOPT/f", false, None) },
             b"/has space/dir/f"
         );
+    }
+
+    #[test]
+    fn expand_env_leaves_an_unknown_tilde_user_unexpanded() {
+        // Cross-verified against real nvim: expand() on a ~user naming
+        // no real account leaves the whole "~name" text alone (only
+        // the path separator is normalized, which is a separate step).
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        assert_eq!(
+            unsafe { expand_env(b"~nero_no_such_user_9c1f4a2b/x") },
+            b"~nero_no_such_user_9c1f4a2b/x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_env_expands_a_real_tilde_user() {
+        // The ~user form is Unix-only upstream (HAVE_PWD_FUNCS).
+        // Resolve the CURRENT user by name so this exercises the real
+        // getpwnam path rather than only the not-found branch.
+        let _homedir_lock = homedir_test_lock();
+        let Ok(name) = crate::os::users::os_get_username() else {
+            return; // no passwd entry reachable for this uid
+        };
+        let Some(dir) = crate::os::users::os_get_userdir(&name) else {
+            return; // reachable by uid but not by name
+        };
+        let mut src = b"~".to_vec();
+        src.extend_from_slice(&name);
+        src.extend_from_slice(b"/x");
+        let mut expected = dir.clone();
+        expected.extend_from_slice(b"/x");
+        assert_eq!(unsafe { expand_env(&src) }, expected);
     }
 
     // --- os_shell_is_cmdexe ---
