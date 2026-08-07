@@ -598,6 +598,66 @@ fn opt_values(opt_idx: crate::option_defs::OptIndex) -> &'static [&'static str] 
     crate::option::get_option(idx1).values
 }
 
+/// Validate every string option that carries a flags bitmask, at
+/// startup and after `:set all&` (`didset_string_options`).
+///
+/// Each entry is checked against its own value list, which as a side
+/// effect recomputes the option's `flags_var` bitmask. Return values
+/// are discarded exactly as the original does - this runs over values
+/// that are already known-good defaults.
+///
+/// # Safety
+/// Forwarded from `check_str_opt`'s own safety doc: every listed
+/// option's global `.var` pointer must be live.
+pub unsafe fn didset_string_options() {
+    const OPTS: [crate::option_defs::OptIndex; 17] = [
+        crate::option_defs::OptIndex::Casemap,
+        crate::option_defs::OptIndex::Backupcopy,
+        crate::option_defs::OptIndex::Belloff,
+        crate::option_defs::OptIndex::Completeopt,
+        crate::option_defs::OptIndex::Sessionoptions,
+        crate::option_defs::OptIndex::Viewoptions,
+        crate::option_defs::OptIndex::Foldopen,
+        crate::option_defs::OptIndex::Display,
+        crate::option_defs::OptIndex::Jumpoptions,
+        crate::option_defs::OptIndex::Redrawdebug,
+        crate::option_defs::OptIndex::Tagcase,
+        crate::option_defs::OptIndex::Termpastefilter,
+        crate::option_defs::OptIndex::Virtualedit,
+        crate::option_defs::OptIndex::Switchbuf,
+        crate::option_defs::OptIndex::Tabclose,
+        crate::option_defs::OptIndex::Wildoptions,
+        crate::option_defs::OptIndex::Clipboard,
+    ];
+    for opt in OPTS {
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { check_str_opt(opt, None) };
+    }
+}
+
+/// The `'isident'`/`'iskeyword'`/`'isprint'`/`'isfname'` option is
+/// changed (`did_set_isopt`).
+///
+/// Refills the buffer's own `b_chartab[]`. On failure the caller is
+/// asked to put the old value back, via `os_restore_chartab`.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call. Forwarded from
+/// [`crate::charset::buf_init_chartab`]'s own safety doc.
+pub unsafe fn did_set_isopt(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &mut *(args.os_buf as *mut crate::buffer_defs::BufT) };
+    // 'isident', 'iskeyword', 'isprint' or 'isfname': refill
+    // b_chartab[]. If the new option is invalid, use the old value.
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::charset::buf_init_chartab(buf, true) } == crate::vim_defs::FAIL {
+        args.os_restore_chartab = true; // need to restore it below
+        return Some(crate::errors::e_invarg.as_bytes()); // error in value
+    }
+    None
+}
+
 /// Whether the string value at `varp` (or, when `None`, at the
 /// option's own global storage, `opt.var`) is a valid value for
 /// `opt_idx` (`check_str_opt`).
@@ -4087,6 +4147,81 @@ mod tests {
         assert!(!unsafe { check_str_opt(OptIndex::Fileformat, None) });
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ff = prev;
+    }
+
+    // ---- didset_string_options / did_set_isopt ----
+
+    #[test]
+    fn didset_string_options_recomputes_a_flags_var_from_the_live_value() {
+        // The whole point of the sweep is its side effect: each
+        // listed option's flags bitmask is recomputed from whatever
+        // value its global storage currently holds.
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_ssop = opts.p_ssop.clone();
+        let prev_flags = opts.ssop_flags;
+        opts.p_ssop = Some(b"help,blank".to_vec());
+        opts.ssop_flags = 0;
+
+        unsafe { didset_string_options() };
+
+        assert_ne!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.ssop_flags,
+            0,
+            "'sessionoptions' flags were recomputed"
+        );
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_ssop = prev_ssop;
+        opts.ssop_flags = prev_flags;
+    }
+
+    #[test]
+    fn didset_string_options_ignores_an_invalid_value() {
+        // Return values are discarded, matching the original - an
+        // invalid value must not panic or abort the sweep.
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = opts.p_ssop.clone();
+        opts.p_ssop = Some(b"bogus".to_vec());
+
+        unsafe { didset_string_options() };
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssop = prev;
+    }
+
+    #[test]
+    fn did_set_isopt_accepts_a_valid_iskeyword_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"@,48-57,_,192-255".to_vec()),
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_isopt(&mut args) }, None);
+        assert!(!args.os_restore_chartab, "no restore needed on success");
+    }
+
+    #[test]
+    fn did_set_isopt_rejects_a_bad_value_and_asks_for_a_restore() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A reversed range is invalid, so buf_init_chartab FAILs.
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"200-100".to_vec()),
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_isopt(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+        assert!(args.os_restore_chartab, "the caller must put the old value back");
     }
 
     #[test]
