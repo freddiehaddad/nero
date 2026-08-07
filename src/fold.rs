@@ -1905,6 +1905,78 @@ pub unsafe fn new_fold_level() {
     }
 }
 
+/// State passed to the per-`'foldmethod'` fold-level functions
+/// (`fline_T`, defined in `fold.c` itself, so kept with its own `.c`
+/// file's translation).
+///
+/// Each `foldlevel*` function reads the line named by `lnum + off`
+/// and writes its answer into `lvl`, sometimes also setting `start`,
+/// `end` or `lvl_next` for the fold-update walk that drives them.
+#[derive(Debug, Clone, Default)]
+pub struct FlineT {
+    /// Window whose fold settings apply.
+    pub wp: *mut WinT,
+    /// Current line number, relative to `off`.
+    pub lnum: crate::pos_defs::LinenrT,
+    /// Offset between `lnum` and the real line number.
+    pub off: crate::pos_defs::LinenrT,
+    /// Line number used by `foldUpdateIEMSRecurse`.
+    pub lnum_save: crate::pos_defs::LinenrT,
+    /// Current level, `-1` when undefined.
+    pub lvl: i32,
+    /// Level used for the next line.
+    pub lvl_next: i32,
+    /// Number of folds forced to start at this line.
+    pub start: i32,
+    /// Level of the fold forced to end below this line.
+    pub end: i32,
+    /// Level of the fold forced to end above this line (a copy of the
+    /// previous line's `end`).
+    pub had_end: i32,
+}
+
+/// Fold level for the `"indent"` method (`foldlevelIndent`).
+///
+/// The level is the line's indent divided by `'shiftwidth'`, capped
+/// at `'foldnestmax'`. An empty line, or one starting with a
+/// character in `'foldignore'`, has no level of its own and takes
+/// `-1` so the surrounding lines decide - except at the very first
+/// and last lines of the buffer, which cannot be left undefined.
+///
+/// # Safety
+/// `flp.wp` must be a valid, live [`WinT`] whose `w_buffer` is a
+/// valid, live `BufT`; also forwarded from
+/// [`crate::indent::get_indent_buf`]'s own safety doc.
+pub unsafe fn foldlevel_indent(flp: &mut FlineT) {
+    let lnum = flp.lnum + flp.off;
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { (*flp.wp).w_buffer };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get_buf(&mut *buf, lnum) };
+    let first = line.get(crate::charset::skipwhite(&line)).copied().unwrap_or(0);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdi_has = unsafe { (*flp.wp).w_onebuf_opt.wo_fdi.as_deref() }
+        .is_some_and(|fdi| first != 0 && fdi.contains(&first));
+
+    if first == 0 || fdi_has {
+        // The first and last line can't be undefined, use level 0.
+        // SAFETY: forwarded from this function's own safety doc.
+        let line_count = unsafe { (*buf).b_ml.ml_line_count };
+        flp.lvl = if lnum == 1 || lnum == line_count { 0 } else { -1 };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let indent = unsafe { crate::indent::get_indent_buf(&mut *buf, lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let sw = unsafe { crate::indent::get_sw_value(&*buf) };
+        flp.lvl = indent / sw;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdn = unsafe { (*flp.wp).w_onebuf_opt.wo_fdn };
+    flp.lvl = flp.lvl.min(0.max(fdn as i32));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2781,6 +2853,153 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// Builds a real memline holding `lines`, plus a window wired to
+    /// it with the given `'shiftwidth'`, `'foldnestmax'` and
+    /// `'foldignore'`.
+    fn indent_level_fixture(
+        lines: &[&[u8]],
+        sw: i32,
+        fdn: crate::types_defs::OptInt,
+        fdi: &[u8],
+    ) -> (Box<BufT>, Box<WinT>) {
+        let mut buf = Box::new(BufT {
+            b_p_ts: 8,
+            b_p_sw: crate::types_defs::OptInt::from(sw),
+            b_u_curhead: Box::into_raw(Box::new(crate::undo_defs::UHeader::default())),
+            ..Default::default()
+        });
+        assert_eq!(
+            unsafe { crate::memline::ml_open(&mut buf) },
+            crate::vim_defs::OK
+        );
+        // ml_open leaves a single empty line; replace it, then append.
+        let mut first = lines[0].to_vec();
+        first.push(0);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, &first) },
+            crate::vim_defs::OK
+        );
+        let buf_ptr: *mut BufT = &mut *buf;
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = buf_ptr;
+        for (i, text) in lines.iter().enumerate().skip(1) {
+            assert_eq!(
+                unsafe { crate::memline::ml_append(i as crate::pos_defs::LinenrT, text, 0, false) },
+                crate::vim_defs::OK
+            );
+        }
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+
+        let win = Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fdn: fdn,
+                wo_fdi: Some(fdi.to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        (buf, win)
+    }
+
+    fn close_indent_level_fixture(mut buf: Box<BufT>) {
+        unsafe {
+            if !buf.b_u_curhead.is_null() {
+                drop(Box::from_raw(buf.b_u_curhead));
+                buf.b_u_curhead = std::ptr::null_mut();
+            }
+            crate::memline::ml_close(&mut buf, false);
+        }
+    }
+
+    #[test]
+    fn foldlevel_indent_matches_real_nvim() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Cross-verified against real nvim with shiftwidth=2,
+        // foldnestmax=20 and foldignore=#: for the lines
+        // "a" / "  b" / "    c" / "" / "  # d" / "e", foldlevel()
+        // reports 0, 1, 2, 0, 0, 0.
+        let (buf, mut win) = indent_level_fixture(
+            &[b"a", b"  b", b"    c", b"", b"  # d", b"e"],
+            2,
+            20,
+            b"#",
+        );
+        let win_ptr: *mut WinT = &mut *win;
+
+        for (lnum, want) in [(1, 0), (2, 1), (3, 2)] {
+            let mut flp = FlineT {
+                wp: win_ptr,
+                lnum,
+                ..Default::default()
+            };
+            unsafe { foldlevel_indent(&mut flp) };
+            assert_eq!(flp.lvl, want, "line {lnum}");
+        }
+
+        // An empty line and a 'foldignore' line are both undefined,
+        // so the surrounding lines decide - except the last line,
+        // which cannot be left undefined.
+        let mut flp = FlineT { wp: win_ptr, lnum: 4, ..Default::default() };
+        unsafe { foldlevel_indent(&mut flp) };
+        assert_eq!(flp.lvl, -1, "empty line is undefined");
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 5, ..Default::default() };
+        unsafe { foldlevel_indent(&mut flp) };
+        assert_eq!(flp.lvl, -1, "'foldignore' line is undefined");
+
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_indent_never_leaves_the_first_or_last_line_undefined() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (buf, mut win) = indent_level_fixture(&[b"", b"  x", b""], 2, 20, b"#");
+        let win_ptr: *mut WinT = &mut *win;
+
+        for lnum in [1, 3] {
+            let mut flp = FlineT { wp: win_ptr, lnum, ..Default::default() };
+            unsafe { foldlevel_indent(&mut flp) };
+            assert_eq!(flp.lvl, 0, "line {lnum} is an edge line");
+        }
+
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_indent_is_capped_by_foldnestmax() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Indent 8 with shiftwidth 2 would be level 4, but
+        // 'foldnestmax' of 2 caps it.
+        let (buf, mut win) = indent_level_fixture(&[b"a", b"        deep", b"b"], 2, 2, b"#");
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 2, ..Default::default() };
+        unsafe { foldlevel_indent(&mut flp) };
+        assert_eq!(flp.lvl, 2);
+
+        drop(win);
+        close_indent_level_fixture(buf);
+    }
+
+    #[test]
+    fn foldlevel_indent_applies_the_line_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        // lnum + off names the real line, so lnum 1 with off 2 is
+        // line 3.
+        let (buf, mut win) = indent_level_fixture(&[b"a", b"  b", b"    c"], 2, 20, b"#");
+        let win_ptr: *mut WinT = &mut *win;
+
+        let mut flp = FlineT { wp: win_ptr, lnum: 1, off: 2, ..Default::default() };
+        unsafe { foldlevel_indent(&mut flp) };
+        assert_eq!(flp.lvl, 2, "resolved to line 3");
+
+        drop(win);
+        close_indent_level_fixture(buf);
     }
 
     #[test]
