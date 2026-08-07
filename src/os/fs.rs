@@ -441,6 +441,50 @@ pub fn os_setperm(path: &Path, perm: i32) -> i32 {
     }
 }
 
+/// Get the device id from a `FileInfoT` (`file_info->stat.st_dev` in
+/// the original).
+///
+/// `0` on a platform that reports none, the same narrow gap
+/// [`os_fileinfo_inode`] takes.
+#[must_use]
+pub fn os_fileinfo_device_id(info: &FileInfoT) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        info.metadata.dev()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = info;
+        0
+    }
+}
+
+/// Build the [`crate::os::fs_defs::FileID`] identifying the file a
+/// `FileInfoT` describes (`os_fileinfo_id`).
+///
+/// The original fills a caller-supplied `FileID *` out-parameter;
+/// this returns the value instead, matching this crate's established
+/// idiom.
+#[must_use]
+pub fn os_fileinfo_id(info: &FileInfoT) -> crate::os::fs_defs::FileID {
+    crate::os::fs_defs::FileID {
+        inode: os_fileinfo_inode(info),
+        device_id: os_fileinfo_device_id(info),
+    }
+}
+
+/// Whether two `FileInfoT`s describe the same file
+/// (`os_fileinfo_id_equal`).
+///
+/// Both the inode and the device id must match: an inode number is
+/// only unique within one filesystem.
+#[must_use]
+pub fn os_fileinfo_id_equal(a: &FileInfoT, b: &FileInfoT) -> bool {
+    os_fileinfo_inode(a) == os_fileinfo_inode(b)
+        && os_fileinfo_device_id(a) == os_fileinfo_device_id(b)
+}
+
 /// Get the inode number from a `FileInfoT` (`os_fileinfo_inode`).
 ///
 /// `0` on a platform that reports none - Windows `std::fs::Metadata`
@@ -1621,6 +1665,53 @@ mod tests {
         assert!(os_file_is_readable(&path));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // --- os_fileinfo_id / os_fileinfo_id_equal ---
+
+    #[test]
+    fn os_fileinfo_id_equal_is_true_for_the_same_file_read_twice() {
+        let path = std::env::temp_dir().join("nero_test_fileid_same");
+        std::fs::write(&path, b"x").unwrap();
+
+        let a = os_fileinfo(&path).unwrap();
+        let b = os_fileinfo(&path).unwrap();
+        assert!(os_fileinfo_id_equal(&a, &b));
+        assert_eq!(os_fileinfo_id(&a), os_fileinfo_id(&b));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn os_fileinfo_id_equal_is_false_for_two_different_files() {
+        // Unix-only: Windows std::fs::Metadata reports no inode or
+        // device id, so every FileID there is the same empty value.
+        let a = std::env::temp_dir().join("nero_test_fileid_a");
+        let b = std::env::temp_dir().join("nero_test_fileid_b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let ia = os_fileinfo(&a).unwrap();
+        let ib = os_fileinfo(&b).unwrap();
+        assert!(!os_fileinfo_id_equal(&ia, &ib));
+        assert_ne!(os_fileinfo_id(&ia), os_fileinfo_id(&ib));
+
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+    }
+
+    #[test]
+    fn os_fileinfo_id_agrees_with_the_individual_accessors() {
+        let path = std::env::temp_dir().join("nero_test_fileid_fields");
+        std::fs::write(&path, b"x").unwrap();
+        let info = os_fileinfo(&path).unwrap();
+
+        let id = os_fileinfo_id(&info);
+        assert_eq!(id.inode, os_fileinfo_inode(&info));
+        assert_eq!(id.device_id, os_fileinfo_device_id(&info));
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     // --- os_copy ---
