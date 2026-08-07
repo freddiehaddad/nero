@@ -22,6 +22,88 @@
 
 use crate::types_defs::ProftimeT;
 
+/// Subcommands offered when completing `:profile`
+/// (`pexpand_cmds`). File-static in the original, which terminates
+/// the array with a `NULL` sentinel; a Rust slice carries its own
+/// length, so the sentinel is dropped.
+const PEXPAND_CMDS: [&str; 7] = [
+    "continue", "dump", "file", "func", "pause", "start", "stop",
+];
+
+/// What `:profile` completion is currently expanding
+/// (`pexpand_what`). File-static in the original.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PexpandWhat {
+    /// completing a `:profile` subcommand (`PEXP_SUBCMD`)
+    #[default]
+    Subcmd,
+    /// completing anything else - no candidates (`PEXP_NOTHING`)
+    Nothing,
+}
+
+static PEXPAND_WHAT: crate::globals::GlobalCell<PexpandWhat> =
+    crate::globals::GlobalCell::new(PexpandWhat::Subcmd);
+
+/// Set what `:profile` completion should offer.
+///
+/// The original assigns its file-static directly from
+/// `set_context_in_profile_cmd`, which is not translated yet; this
+/// accessor exists so it can drive the flag once it lands.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `PEXPAND_WHAT`.
+pub unsafe fn set_pexpand_what(what: PexpandWhat) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *PEXPAND_WHAT.get_mut() = what };
+}
+
+/// The `idx`'th `:profile` completion candidate, or `None` past the
+/// end (`get_profile_name`, given to `ExpandGeneric`).
+///
+/// Only the subcommand list has candidates; every other expansion
+/// state offers none, matching the original's own `default: return
+/// NULL`.
+///
+/// The original's unused `expand_T *xp` parameter is dropped, and its
+/// unchecked `pexpand_cmds[idx]` index becomes a bounds-checked
+/// lookup - the original relies on `ExpandGeneric` stopping at the
+/// `NULL` sentinel instead.
+///
+/// # Safety
+/// Must not run concurrently with any write to `PEXPAND_WHAT`.
+#[must_use]
+pub unsafe fn get_profile_name(idx: i32) -> Option<&'static str> {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { *PEXPAND_WHAT.get_mut() } {
+        PexpandWhat::Subcmd => {
+            let idx = usize::try_from(idx).ok()?;
+            PEXPAND_CMDS.get(idx).copied()
+        }
+        PexpandWhat::Nothing => None,
+    }
+}
+
+/// Whether the script currently being sourced asked for its functions
+/// to be profiled (`prof_def_func`).
+///
+/// # Safety
+/// Touches `crate::globals::GLOBALS.current_sctx` and forwards
+/// [`crate::runtime::script_item`]'s own safety doc.
+#[must_use]
+pub unsafe fn prof_def_func() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if sid > 0 {
+        let item = crate::runtime::script_item(sid);
+        if item.is_null() {
+            return false;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { (*item).sn_pr_force };
+    }
+    false
+}
+
 /// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
 /// docs. Returns nanoseconds since an arbitrary, fixed, monotonic
 /// reference point established on first use.
@@ -185,6 +267,69 @@ pub fn profile_cmp(tm1: ProftimeT, tm2: ProftimeT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- get_profile_name / prof_def_func ---
+
+    #[test]
+    fn get_profile_name_walks_the_subcommand_list_then_stops() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev = *PEXPAND_WHAT.get_mut();
+            set_pexpand_what(PexpandWhat::Subcmd);
+
+            assert_eq!(get_profile_name(0), Some("continue"));
+            assert_eq!(get_profile_name(6), Some("stop"));
+            assert_eq!(get_profile_name(7), None, "past the end");
+            assert_eq!(get_profile_name(-1), None);
+
+            set_pexpand_what(prev);
+        }
+    }
+
+    #[test]
+    fn get_profile_name_offers_nothing_in_the_other_state() {
+        // Matches the original's own `default: return NULL`.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev = *PEXPAND_WHAT.get_mut();
+            set_pexpand_what(PexpandWhat::Nothing);
+
+            assert_eq!(get_profile_name(0), None);
+
+            set_pexpand_what(prev);
+        }
+    }
+
+    #[test]
+    fn prof_def_func_is_false_without_a_script_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            let prev = crate::globals::GLOBALS.get_mut().current_sctx.sc_sid;
+            crate::globals::GLOBALS.get_mut().current_sctx.sc_sid = 0;
+
+            assert!(!prof_def_func());
+
+            crate::globals::GLOBALS.get_mut().current_sctx.sc_sid = prev;
+        }
+    }
+
+    #[test]
+    fn prof_def_func_reports_the_scripts_own_force_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        crate::runtime::tests_reset_for_test();
+        unsafe {
+            let prev = crate::globals::GLOBALS.get_mut().current_sctx.sc_sid;
+            let (sid, item) = crate::runtime::new_script_item(None);
+            crate::globals::GLOBALS.get_mut().current_sctx.sc_sid = sid;
+
+            (*item).sn_pr_force = false;
+            assert!(!prof_def_func());
+            (*item).sn_pr_force = true;
+            assert!(prof_def_func());
+
+            crate::globals::GLOBALS.get_mut().current_sctx.sc_sid = prev;
+        }
+    }
 
     #[test]
     fn start_and_end_measure_positive_elapsed_time() {
