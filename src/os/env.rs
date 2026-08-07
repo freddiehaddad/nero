@@ -802,6 +802,39 @@ pub unsafe fn expand_env_save(src: &[u8]) -> Vec<u8> {
     unsafe { expand_env_esc(src, None, false, None) }
 }
 
+/// [`expand_env_save`] with control over `one` and `esc_chars`
+/// (`expand_env_save_opt`).
+///
+/// With `one` set, `src` is treated as a SINGLE file name, so only a
+/// leading `~` is expanded.
+///
+/// The original allocates a fixed `MAXPATHL` buffer and truncates
+/// into it; [`expand_env_esc`] here returns a growing `Vec<u8>`, so
+/// there is no length cap and nothing to truncate.
+///
+/// # Safety
+/// Forwarded from [`expand_env_esc`]'s own safety doc.
+#[must_use]
+pub unsafe fn expand_env_save_opt(src: &[u8], one: bool, esc_chars: Option<&[u8]>) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { expand_env_esc(src, esc_chars, one, None) }
+}
+
+/// Expand environment variables and a leading `~` in `src`
+/// (`expand_env`).
+///
+/// The original writes into a caller-supplied `dst`/`dstlen` buffer;
+/// this returns the owned result, matching [`expand_env_save`]'s own
+/// shape, so the length argument has nothing to bound.
+///
+/// # Safety
+/// Forwarded from [`expand_env_esc`]'s own safety doc.
+#[must_use]
+pub unsafe fn expand_env(src: &[u8]) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { expand_env_esc(src, None, false, None) }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1437,6 +1470,57 @@ pub(crate) mod tests {
         // normally on the very next loop iteration, so this traces
         // through as a plain "no expansion happened" case either way.
         assert_eq!(result, b"foo\\$bar");
+    }
+
+    // --- expand_env / expand_env_save_opt ---
+
+    #[test]
+    fn expand_env_matches_expand_env_save() {
+        // Both are the same expand_env_esc call; pin that they agree
+        // rather than restating the expansion rules.
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_PLAIN", Some("/opt/thing"))]);
+        let src = b"$NERO_TEST_EXPAND_ENV_PLAIN/tail";
+        assert_eq!(unsafe { expand_env(src) }, b"/opt/thing/tail");
+        assert_eq!(unsafe { expand_env(src) }, unsafe { expand_env_save(src) });
+    }
+
+    #[test]
+    fn expand_env_expands_a_leading_tilde() {
+        // Cross-verified against real nvim: expand('~') gives the home
+        // directory.
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        assert_eq!(unsafe { expand_env(b"~/foo") }, b"/home/alice/foo");
+        // Cross-verified: a '~' that is not at the start is left alone.
+        assert_eq!(unsafe { expand_env(b"a~b") }, b"a~b");
+    }
+
+    #[test]
+    fn expand_env_save_opt_one_true_only_expands_the_leading_tilde() {
+        // With one=true the string is a SINGLE file name, so a space
+        // does not start a fresh name - the second '~' stays put.
+        let _homedir_lock = homedir_test_lock();
+        let _guard = EnvVarGuard::set(&[("HOME", Some("/home/alice"))]);
+        unsafe { init_homedir() };
+        assert_eq!(
+            unsafe { expand_env_save_opt(b"~ foo ~ bar", true, None) },
+            b"/home/alice foo ~ bar"
+        );
+    }
+
+    #[test]
+    fn expand_env_save_opt_passes_esc_chars_through() {
+        let _guard = EnvVarGuard::set(&[("NERO_TEST_EXPAND_ENV_ESCOPT", Some("/has space/dir"))]);
+        assert_eq!(
+            unsafe { expand_env_save_opt(b"$NERO_TEST_EXPAND_ENV_ESCOPT/f", false, Some(b" ")) },
+            b"/has\\ space/dir/f"
+        );
+        // Without esc_chars the space is left unescaped.
+        assert_eq!(
+            unsafe { expand_env_save_opt(b"$NERO_TEST_EXPAND_ENV_ESCOPT/f", false, None) },
+            b"/has space/dir/f"
+        );
     }
 
     // --- os_shell_is_cmdexe ---
