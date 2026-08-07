@@ -138,6 +138,37 @@ static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
 /// File-static in the original.
 static TYPEAHEAD_CHAR: GlobalCell<i32> = GlobalCell::new(0);
 
+/// Fold a pending CTRL modifier into the character itself where an
+/// equivalent control code exists (`merge_modifiers`).
+///
+/// `@`..`DEL` map onto their control codes; a resulting NUL becomes
+/// `K_ZERO`, since NUL cannot travel through the input stream. CTRL-6
+/// is special-cased to CTRL-^ so the common keyboard spelling works.
+/// The CTRL bit is cleared from `modifiers` only when the character
+/// actually changed, so an unaffected key keeps its modifier for a
+/// mapping to match on.
+#[must_use]
+pub fn merge_modifiers(c_arg: i32, modifiers: &mut i32) -> i32 {
+    let mut c = c_arg;
+
+    if *modifiers & i32::from(crate::keycodes_defs::MOD_MASK_CTRL) != 0 {
+        if (i32::from(b'@')..=0x7f).contains(&c) {
+            c &= 0x1f;
+            if c == i32::from(crate::ascii_defs::NUL) {
+                c = crate::keycodes_defs::K_ZERO;
+            }
+        } else if c == i32::from(b'6') {
+            // CTRL-6 is equivalent to CTRL-^
+            c = 0x1e;
+        }
+        if c != c_arg {
+            *modifiers &= !i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        }
+    }
+
+    c
+}
+
 /// Set a typeahead character that will not be flushed
 /// (`typeahead_noflush`).
 ///
@@ -589,6 +620,57 @@ mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
     use crate::input_defs::BuffblockT;
+
+    // --- merge_modifiers ---
+
+    #[test]
+    fn merge_modifiers_folds_ctrl_into_the_control_code() {
+        // Cross-verified against real nvim: CTRL-a is 1.
+        let mut m = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        assert_eq!(merge_modifiers(i32::from(b'a'), &mut m), 1);
+        assert_eq!(m, 0, "the CTRL bit is consumed once it is folded in");
+    }
+
+    #[test]
+    fn merge_modifiers_turns_a_resulting_nul_into_k_zero() {
+        // Cross-verified against real nvim: CTRL-@ becomes a special
+        // key rather than a NUL byte, which cannot travel through the
+        // input stream.
+        let mut m = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        assert_eq!(
+            merge_modifiers(i32::from(b'@'), &mut m),
+            crate::keycodes_defs::K_ZERO
+        );
+        assert_eq!(m, 0);
+    }
+
+    #[test]
+    fn merge_modifiers_maps_ctrl_6_to_ctrl_caret() {
+        // Cross-verified against real nvim: CTRL-^ is 30 (0x1e).
+        let mut m = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        assert_eq!(merge_modifiers(i32::from(b'6'), &mut m), 0x1e);
+        assert_eq!(m, 0);
+    }
+
+    #[test]
+    fn merge_modifiers_keeps_the_ctrl_bit_when_nothing_changed() {
+        // A key with no control-code equivalent keeps its modifier so
+        // a mapping can still match on it.
+        let mut m = i32::from(crate::keycodes_defs::MOD_MASK_CTRL);
+        let c = crate::keycodes_defs::K_LEFT;
+        assert_eq!(merge_modifiers(c, &mut m), c);
+        assert_eq!(m, i32::from(crate::keycodes_defs::MOD_MASK_CTRL));
+    }
+
+    #[test]
+    fn merge_modifiers_without_ctrl_is_the_identity() {
+        let mut m = i32::from(crate::keycodes_defs::MOD_MASK_SHIFT);
+        assert_eq!(merge_modifiers(i32::from(b'a'), &mut m), i32::from(b'a'));
+        assert_eq!(m, i32::from(crate::keycodes_defs::MOD_MASK_SHIFT));
+
+        let mut none = 0;
+        assert_eq!(merge_modifiers(i32::from(b'6'), &mut none), i32::from(b'6'));
+    }
 
     fn reset_buffers() {
         // SAFETY: test-only, serialized via `global_state_test_lock`.
