@@ -22,11 +22,11 @@
 //! narrow-subset `FileInfo` - see that module's own doc comment for
 //! what's NOT modeled; `getfperm()`, needing the still-deferred
 //! `os_getperm` permission bits, is not translated here), `mkdir()`
-//! for its plain, single-directory case (via the already-existing
-//! [`crate::os::fs::os_mkdir`]) - the `"p"` (recursive create) flag
-//! needs `os_mkdir_recurse` (not yet translated) and `"D"`/`"R"`
+//! for both its plain, single-directory case (via the already-existing
+//! [`crate::os::fs::os_mkdir`]) and the `"p"` recursive-create flag
+//! (via [`crate::os::fs::os_mkdir_recurse`]) - `"D"`/`"R"`
 //! (deferred deletion) need the `:defer` subsystem (not yet
-//! translated), both panicking via `unimplemented!()` if actually
+//! translated) and panic via `unimplemented!()` if actually
 //! reached. The `"rf"` (recursive delete) flag needs
 //! `delete_recursive` (a directory-tree walk, not yet translated) and
 //! panics via `unimplemented!()` if actually reached. Every function
@@ -222,13 +222,12 @@ pub(crate) unsafe fn f_delete(argvars: &[TypvalT], rettv: &mut TypvalT) {
 /// its own `semsg` display on failure omitted, matching this module's
 /// established "skip the message, keep the state" policy).
 ///
-/// Only the plain, single-directory case (no `{flags}`, or `{flags}`
-/// not containing `"p"`/`"D"`/`"R"`) is modeled. `"p"` (create
-/// intermediate directories) needs `os_mkdir_recurse` (not yet
-/// translated) and `"D"`/`"R"` (schedule deferred deletion) need the
-/// `:defer` subsystem (`can_add_defer`/`defer_add`, not yet
-/// translated) - both panic via `unimplemented!()` if actually
-/// reached.
+/// Both the plain, single-directory case and `"p"` (create
+/// intermediate directories, via
+/// [`crate::os::fs::os_mkdir_recurse`]) are modeled. `"D"`/`"R"`
+/// (schedule deferred deletion) need the `:defer` subsystem
+/// (`can_add_defer`/`defer_add`, not yet translated) and panic via
+/// `unimplemented!()` if actually reached.
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS` (via
@@ -266,7 +265,15 @@ pub(crate) unsafe fn f_mkdir(argvars: &[TypvalT], rettv: &mut TypvalT) {
             unimplemented!("mkdir(): \"D\"/\"R\" flags need the :defer subsystem, not yet translated");
         }
         if flags.contains(&b'p') {
-            unimplemented!("mkdir(): \"p\" flag needs os_mkdir_recurse, not yet translated");
+            // The original's own semsg(e_mkdir, failed_dir, ...) on
+            // failure is skipped, matching this crate's established
+            // "omit the message display, keep the state and return
+            // value exact" policy - the FAIL already set above stands.
+            if crate::os::fs::os_mkdir_recurse(&dir, prot).is_err() {
+                return;
+            }
+            rettv.value = TypvalValue::Number(i64::from(crate::vim_defs::OK));
+            return;
         }
     }
 
@@ -908,6 +915,85 @@ mod tests {
     }
 
     #[test]
+    fn mkdir_p_creates_missing_intermediate_directories() {
+        // Cross-verified against real nvim: mkdir(deep, 'p') returns 1
+        // and the whole chain exists afterwards, whereas the same call
+        // without 'p' fails with E739.
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let root = std::env::temp_dir().join("nero_test_mkdir_p_root");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a").join("b").join("c");
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_mkdir(
+                &[string(deep.to_str().unwrap().as_bytes()), string(b"p")],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(deep.is_dir());
+        assert!(root.join("a").is_dir(), "intermediate levels too");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mkdir_p_on_an_existing_directory_still_succeeds() {
+        // Cross-verified against real nvim: a second mkdir(dir, 'p')
+        // returns 1 rather than failing.
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let root = std::env::temp_dir().join("nero_test_mkdir_p_twice");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_mkdir(
+                &[string(deep.to_str().unwrap().as_bytes()), string(b"p")],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mkdir_p_honours_an_explicit_prot_argument() {
+        let _guard = globals_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
+
+        let root = std::env::temp_dir().join("nero_test_mkdir_p_prot");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("a").join("b");
+
+        let mut rettv = TypvalT::default();
+        unsafe {
+            f_mkdir(
+                &[
+                    string(deep.to_str().unwrap().as_bytes()),
+                    string(b"p"),
+                    TypvalT { value: TypvalValue::Number(0o700), ..Default::default() },
+                ],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(deep.is_dir());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn mkdir_fails_when_parent_is_missing() {
         let _guard = globals_test_lock();
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
@@ -946,16 +1032,29 @@ mod tests {
     }
 
     #[test]
-    fn mkdir_p_flag_is_unimplemented() {
+    fn mkdir_p_relative_to_an_existing_root_creates_only_the_missing_part() {
         let _guard = globals_test_lock();
         unsafe { crate::globals::GLOBALS.get_mut() }.secure = 0;
         unsafe { crate::globals::GLOBALS.get_mut() }.sandbox = 0;
 
+        // The temp dir already exists, so only the two new levels are
+        // created - exercising the shrink-then-create walk's stop
+        // condition rather than running all the way to the root.
+        let root = std::env::temp_dir().join("nero_test_mkdir_p_partial");
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("only").join("these");
+
         let mut rettv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_mkdir(&[string(b"irrelevant/deep/path"), string(b"p")], &mut rettv);
-        }));
-        assert!(result.is_err(), "expected a panic (os_mkdir_recurse not yet translated)");
+        unsafe {
+            f_mkdir(
+                &[string(deep.to_str().unwrap().as_bytes()), string(b"p")],
+                &mut rettv,
+            );
+        }
+        assert_eq!(rettv.value, TypvalValue::Number(1));
+        assert!(deep.is_dir());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
