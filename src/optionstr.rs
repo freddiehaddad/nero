@@ -3213,6 +3213,36 @@ const LCS_TAB: [CharsTab; 12] = [
     charstab_entry(CharsField::None, "leadmultispace", None, None),
 ];
 
+/// The `idx`'th possible `'fileformat'` value, or `None` past the end
+/// (`get_fileformat_name`, given to `ExpandGeneric` for completion).
+///
+/// The original's own unused `expand_T *xp` parameter is dropped -
+/// this crate's established treatment for parameters no branch reads.
+#[must_use]
+pub fn get_fileformat_name(idx: i32) -> Option<&'static str> {
+    let idx = usize::try_from(idx).ok()?;
+    crate::option_vars::OPT_FF_VALUES.get(idx).copied()
+}
+
+/// The `idx`'th `'fillchars'` field name, or `None` past the end
+/// (`get_fillchars_name`).
+///
+/// Unlike [`get_fileformat_name`] the original bounds-checks `idx < 0`
+/// explicitly here; the `usize` conversion covers both ends.
+#[must_use]
+pub fn get_fillchars_name(idx: i32) -> Option<&'static str> {
+    let idx = usize::try_from(idx).ok()?;
+    FCS_TAB.get(idx).map(|e| e.name)
+}
+
+/// The `idx`'th `'listchars'` field name, or `None` past the end
+/// (`get_listchars_name`).
+#[must_use]
+pub fn get_listchars_name(idx: i32) -> Option<&'static str> {
+    let idx = usize::try_from(idx).ok()?;
+    LCS_TAB.get(idx).map(|e| e.name)
+}
+
 /// Store `v` into whichever `LcsCharsT`/`FcsCharsT` field `f` names.
 ///
 /// A no-op for [`CharsField::None`], matching the original's own
@@ -5432,6 +5462,47 @@ mod tests {
         let mut val: Option<Vec<u8>> = Some(b"nocomma".to_vec());
         let mut args = fold_args(&mut win, &mut val);
         assert_eq!(unsafe { did_set_foldmarker(&mut args) }, Some(e_comma_required.as_bytes()));
+    }
+
+    // ---- get_fileformat_name / get_fillchars_name / get_listchars_name ----
+
+    #[test]
+    fn get_fileformat_name_walks_the_value_list_then_stops() {
+        // Cross-verified against real nvim: 'fileformat' accepts
+        // exactly unix/dos/mac and rejects anything else.
+        assert_eq!(get_fileformat_name(0), Some("unix"));
+        assert_eq!(get_fileformat_name(1), Some("dos"));
+        assert_eq!(get_fileformat_name(2), Some("mac"));
+        assert_eq!(get_fileformat_name(3), None);
+    }
+
+    #[test]
+    fn get_fileformat_name_rejects_a_negative_index() {
+        assert_eq!(get_fileformat_name(-1), None);
+    }
+
+    #[test]
+    fn get_fillchars_name_walks_the_field_table_then_stops() {
+        assert_eq!(get_fillchars_name(0), Some("stl"));
+        assert_eq!(get_fillchars_name(1), Some("stlnc"));
+        assert_eq!(
+            get_fillchars_name((FCS_TAB.len() - 1) as i32),
+            Some(FCS_TAB[FCS_TAB.len() - 1].name)
+        );
+        assert_eq!(get_fillchars_name(FCS_TAB.len() as i32), None);
+        assert_eq!(get_fillchars_name(-1), None);
+    }
+
+    #[test]
+    fn get_listchars_name_walks_the_field_table_then_stops() {
+        assert_eq!(get_listchars_name(0), Some("eol"));
+        assert_eq!(get_listchars_name(1), Some("extends"));
+        // The two trailing pseudo-fields are listed for completion
+        // even though they map to CharsField::None.
+        assert_eq!(get_listchars_name(10), Some("multispace"));
+        assert_eq!(get_listchars_name(11), Some("leadmultispace"));
+        assert_eq!(get_listchars_name(LCS_TAB.len() as i32), None);
+        assert_eq!(get_listchars_name(-1), None);
     }
 
     // ---- did_set_foldmethod ----
