@@ -6480,6 +6480,49 @@ mod did_set_option_tests {
     }
 }
 
+/// Recognize the `:set` operator prefixing `arg`'s `=`
+/// (`get_op`).
+///
+/// Only a two-character `X=` opening sequence counts, so a bare `+`,
+/// or a `+` followed by anything other than `=`, is
+/// [`crate::option_defs::SetOpT::None`].
+#[must_use]
+pub fn get_op(arg: &[u8]) -> crate::option_defs::SetOpT {
+    use crate::option_defs::SetOpT;
+    if arg.first().is_some_and(|&c| c != 0) && arg.get(1) == Some(&b'=') {
+        match arg[0] {
+            b'+' => return SetOpT::Adding,
+            b'^' => return SetOpT::Prepending,
+            b'-' => return SetOpT::Removing,
+            _ => {}
+        }
+    }
+    SetOpT::None
+}
+
+/// Recognize and consume a `:set` boolean-option prefix
+/// (`get_option_prefix`).
+///
+/// @return the prefix found, and how many bytes of `arg` it occupied -
+///         replacing the original's `char **argp` in/out pointer,
+///         which the caller advances past the prefix. Reporting the
+///         length instead lets the caller keep `arg` as a plain slice.
+///
+/// The match is a plain prefix test, exactly as upstream: `"nose"` is
+/// read as `"no"` + `"se"` rather than as the option name `nose`.
+/// Disambiguating that is the caller's job, not this function's.
+#[must_use]
+pub fn get_option_prefix(arg: &[u8]) -> (crate::option_defs::SetPrefixT, usize) {
+    use crate::option_defs::SetPrefixT;
+    if arg.starts_with(b"no") {
+        (SetPrefixT::No, 2)
+    } else if arg.starts_with(b"inv") {
+        (SetPrefixT::Inv, 3)
+    } else {
+        (SetPrefixT::None, 0)
+    }
+}
+
 /// Process the updated `'modifiable'` option value
 /// (`did_set_modifiable`).
 ///
@@ -6766,6 +6809,59 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn get_op_recognizes_each_set_operator() {
+        use crate::option_defs::SetOpT;
+        // Cross-verified against real nvim: += appends, ^= prepends
+        // and -= removes.
+        assert_eq!(get_op(b"+=/b"), SetOpT::Adding);
+        assert_eq!(get_op(b"^=/z"), SetOpT::Prepending);
+        assert_eq!(get_op(b"-=/b"), SetOpT::Removing);
+        assert_eq!(get_op(b"=/a"), SetOpT::None);
+    }
+
+    #[test]
+    fn get_op_needs_the_equals_in_the_second_position() {
+        use crate::option_defs::SetOpT;
+        // Only a two-character "X=" opening sequence counts.
+        assert_eq!(get_op(b"+"), SetOpT::None);
+        assert_eq!(get_op(b"+x="), SetOpT::None);
+        assert_eq!(get_op(b""), SetOpT::None);
+        // A recognized operator character but no '=' is still None.
+        assert_eq!(get_op(b"-x"), SetOpT::None);
+    }
+
+    #[test]
+    fn get_option_prefix_recognizes_and_measures_no_and_inv() {
+        use crate::option_defs::SetPrefixT;
+        // Cross-verified against real nvim: :set nonumber clears it,
+        // :set invnumber toggles it back.
+        assert_eq!(get_option_prefix(b"number"), (SetPrefixT::None, 0));
+        assert_eq!(get_option_prefix(b"nonumber"), (SetPrefixT::No, 2));
+        assert_eq!(get_option_prefix(b"invnumber"), (SetPrefixT::Inv, 3));
+    }
+
+    #[test]
+    fn get_option_prefix_is_a_plain_prefix_test() {
+        use crate::option_defs::SetPrefixT;
+        // "nose" reads as "no" + "se", exactly as upstream - telling
+        // that apart from a real option named "nose" is the caller's
+        // job, not this function's.
+        assert_eq!(get_option_prefix(b"nose"), (SetPrefixT::No, 2));
+        // Too short to carry the prefix at all.
+        assert_eq!(get_option_prefix(b"n"), (SetPrefixT::None, 0));
+        assert_eq!(get_option_prefix(b""), (SetPrefixT::None, 0));
+    }
+
+    #[test]
+    fn set_prefix_discriminants_match_the_original() {
+        use crate::option_defs::SetPrefixT;
+        // The "no prefix" case is deliberately NOT the zero value.
+        assert_eq!(SetPrefixT::No as i32, 0);
+        assert_eq!(SetPrefixT::None as i32, 1);
+        assert_eq!(SetPrefixT::Inv as i32, 2);
     }
 
     #[test]

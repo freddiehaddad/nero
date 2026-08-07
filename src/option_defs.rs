@@ -223,6 +223,21 @@ pub enum SetOpT {
     Removing,
 }
 
+/// `:set` boolean option prefix (`set_prefix_T`).
+///
+/// Note the discriminant order: `No` is `0` and `None` is `1`, so the
+/// "no prefix" case is deliberately NOT the zero value. Preserved as
+/// the original declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPrefixT {
+    /// `"no"` prefix
+    No = 0,
+    /// no prefix
+    None,
+    /// `"inv"` prefix
+    Inv,
+}
+
 /// Argument for the callback function ([`OptDidSetCbT`]) invoked after
 /// an option value is modified (`optset_T`).
 pub struct OptsetT {
