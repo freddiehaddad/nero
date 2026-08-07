@@ -2423,11 +2423,10 @@ pub unsafe fn fold_move_range(
 /// fold is widened rather than changing them. The new fold is created
 /// closed.
 ///
-/// # Deferred boundary
-/// With `'foldmethod'` set to `"marker"` the original writes the fold
-/// markers into the buffer instead, which needs `foldCreateMarkers`
-/// and the `ml_replace_buf` text-editing path, not yet translated.
-/// The guard reaching it is real.
+/// # Marker `'foldmethod'`
+/// With `'foldmethod'` set to `"marker"` the fold is created by
+/// writing the markers into the buffer text instead of building a
+/// fold structure, which is what [`fold_create_markers`] does.
 ///
 /// # Safety
 /// Same as [`close_fold`]; `wp` must be a valid, live [`WinT`].
@@ -2445,13 +2444,13 @@ pub unsafe fn fold_create(
     let mut start_rel = start;
     let mut end_rel = end;
 
+    // When 'foldmethod' is "marker" add markers, which creates the
+    // folds.
     // SAFETY: forwarded from this function's own safety doc.
     if unsafe { foldmethod_is_marker(&*wp) } {
-        unimplemented!(
-            "fold::fold_create: 'foldmethod'=marker writes markers into the buffer via \
-             foldCreateMarkers, which needs the ml_replace_buf text-editing path, not yet \
-             translated"
-        );
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { fold_create_markers(wp, start, end) };
+        return;
     }
 
     // SAFETY: forwarded from this function's own safety doc.
@@ -4664,22 +4663,48 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "foldCreateMarkers")]
-    fn fold_create_with_foldmethod_marker_is_unimplemented() {
+    fn fold_create_with_foldmethod_marker_writes_markers_instead() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut buf = BufT::default();
-        let mut win = fold_create_win(&mut buf);
-        win.w_onebuf_opt.wo_fdm = Some(b"marker".to_vec());
+        // With 'foldmethod'=marker the fold lives in the buffer text,
+        // so no FoldT is built at all.
+        let mut buf = del_marker_fixture(&[b"alpha", b"beta", b"gamma"], b"");
+        let buf_ptr: *mut BufT = &mut *buf;
+        let mut win = WinT {
+            w_buffer: buf_ptr,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"marker".to_vec()),
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        };
         let win_ptr = &mut win as *mut WinT;
-        let _guard = CurwinGuard::set(win_ptr);
 
         unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = buf_ptr;
+            g.curwin = win_ptr;
             fold_create(
                 win_ptr,
-                crate::pos_defs::PosT { lnum: 10, col: 0, coladd: 0 },
-                crate::pos_defs::PosT { lnum: 20, col: 0, coladd: 0 },
-            )
-        };
+                crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+                crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 },
+            );
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+        }
+
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 1) }, b"alpha{{{\0");
+        assert_eq!(unsafe { crate::memline::ml_get_buf(&mut *buf_ptr, 2) }, b"beta}}}\0");
+        assert!(
+            unsafe { (*win_ptr).w_folds.is_empty() },
+            "no fold structure is built for marker folds"
+        );
+        unsafe { *FOLD_MARKERS.get_mut() = None };
+        close_indent_level_fixture(buf);
     }
 
     #[test]
