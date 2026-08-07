@@ -6259,13 +6259,40 @@ unsafe fn f_byte2line(argvars: &[TypvalT], rettv: &mut TypvalT) {
 }
 
 unsafe fn f_line(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    let mut fp = None;
     if argvars.len() > 1 {
-        unimplemented!("f_line: the {{winid}} form needs win_id2wp_tp, not yet translated");
+        // Use the window specified in the second argument.
+        let id = crate::eval::typval::tv_get_number(&argvars[1]) as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        let (wp, tp) = unsafe { crate::window::win_id2wp_tp(id) };
+        if !wp.is_null() && !tp.is_null() {
+            // With 'splitkeep' != cursor and in diff mode, prevent
+            // that the window scrolls and keep the topline.
+            let spk_is_cursor = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+                .p_spk
+                .as_deref()
+                .is_some_and(|s| s.first() == Some(&b'c'));
+            // SAFETY: forwarded from this function's own safety doc.
+            let both_diff = unsafe { (*wp).w_onebuf_opt.wo_diff } != 0 && {
+                let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+                !curwin.is_null() && unsafe { (*curwin).w_onebuf_opt.wo_diff } != 0
+            };
+            if !spk_is_cursor || both_diff {
+                unsafe { crate::globals::GLOBALS.get_mut() }.skip_update_topline = true;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::cursor::check_cursor(wp) };
+            // SAFETY: forwarded from this function's own safety doc.
+            fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, wp) };
+            unsafe { crate::globals::GLOBALS.get_mut() }.skip_update_topline = false;
+        }
+    } else {
+        // Use the current window.
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, curwin) };
     }
-    // SAFETY: forwarded from this function's own safety doc.
-    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-    // SAFETY: forwarded from this function's own safety doc.
-    let fp = unsafe { crate::eval::eval::var2fpos(&argvars[0], true, false, curwin) };
     rettv.value = TypvalValue::Number(i64::from(fp.map_or(0, |p| p.lnum)));
 }
 
@@ -6296,12 +6323,21 @@ unsafe fn get_col(argvars: &[TypvalT], rettv: &mut TypvalT, charcol: bool) {
     {
         return;
     }
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     if argvars.len() > 1 {
-        unimplemented!("get_col: the {{winid}} form needs win_id2wp_tp, not yet translated");
+        // Use the window specified in the second argument.
+        let id = crate::eval::typval::tv_get_number(&argvars[1]) as i32;
+        // SAFETY: forwarded from this function's own safety doc.
+        let (w, tp) = unsafe { crate::window::win_id2wp_tp(id) };
+        if w.is_null() || tp.is_null() {
+            return;
+        }
+        wp = w;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::cursor::check_cursor(wp) };
     }
 
-    // SAFETY: forwarded from this function's own safety doc.
-    let wp = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
     // SAFETY: forwarded from this function's own safety doc.
     let w = unsafe { &*wp };
     // SAFETY: forwarded from this function's own safety doc.
@@ -15361,12 +15397,110 @@ mod tests {
     }
 
     #[test]
-    fn line_with_a_winid_argument_is_unimplemented() {
+    fn line_with_a_winid_argument_reads_that_windows_cursor() {
+        // Cross-verified against real nvim: with a split whose cursor
+        // is on line 3, line('.', winid) is 3 while line('.') in the
+        // current window is 1, and line('$', winid) is 3.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"aaa", b"bbb", b"ccc"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut other = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 3, col: 0, coladd: 0 },
+            ..focusable_win(42)
+        };
+        let other_ptr = &mut other as *mut crate::buffer_defs::WinT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            w_next: other_ptr,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
         let mut rettv = TypvalT::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_line(&[string(b"."), num(1000)], &mut rettv);
-        }));
-        assert!(result.is_err());
+        unsafe { f_line(&[string(b"."), num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1), "still the current window");
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b"$"), num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(3));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn line_with_an_unknown_winid_returns_zero() {
+        // Cross-verified against real nvim: line('.', 9999) is 0.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"aaa"]);
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_line(&[string(b"."), num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn col_with_a_winid_argument_reads_that_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello", b"world"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut other = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 2, col: 3, coladd: 0 },
+            ..focusable_win(42)
+        };
+        let other_ptr = &mut other as *mut crate::buffer_defs::WinT;
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 },
+            w_next: other_ptr,
+            ..focusable_win(1)
+        };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_col(&[string(b"."), num(42)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(4));
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_col(&[string(b".")], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(1), "still the current window");
+
+        close_test_buf(buf);
+    }
+
+    #[test]
+    fn col_with_an_unknown_winid_returns_zero() {
+        // Cross-verified against real nvim: col('.', 9999) is 0.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = buf_with_lines(&[b"hello"]);
+        let mut win =
+            crate::buffer_defs::WinT { w_buffer: &mut buf as *mut crate::buffer_defs::BufT, ..focusable_win(1) };
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
+
+        // call_func pre-sets "default rettv is number zero" before
+        // dispatching to any builtin, so mirror that here: get_col's
+        // unknown-winid path returns without touching rettv, exactly
+        // as the original does.
+        let mut rettv = TypvalT { value: TypvalValue::Number(0), ..Default::default() };
+        unsafe { f_col(&[string(b"."), num(9999)], &mut rettv) };
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+
+        close_test_buf(buf);
     }
 
     #[test]
