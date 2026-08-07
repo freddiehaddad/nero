@@ -635,6 +635,46 @@ pub unsafe fn didset_string_options() {
     }
 }
 
+/// The `'iskeyword'` option is changed (`did_set_iskeyword`).
+///
+/// The GLOBAL value is only validated, never applied: it is the
+/// template new buffers inherit, so there is no single `b_chartab[]`
+/// to refill for it. A buffer-LOCAL value falls through to
+/// [`did_set_isopt`], which does refill that buffer's table.
+///
+/// The original decides between the two with a `varp == &p_isk`
+/// pointer comparison; that is reproduced here as a real
+/// [`std::ptr::eq`] against `OPTION_VARS`' own `p_isk` address,
+/// matching this module's established precedent for
+/// `'briopt'`/`'colorcolumn'`.
+///
+/// # Safety
+/// `args.os_varp` must point to a live `Option<Vec<u8>>`, and (for the
+/// local case) `args.os_buf` must be a valid, non-null pointer to a
+/// live `BufT` for the whole call.
+pub unsafe fn did_set_iskeyword(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let global_isk =
+        std::ptr::from_mut(&mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk);
+
+    if std::ptr::eq(args.os_varp as *const Option<Vec<u8>>, global_isk) {
+        // Only check the global value.
+        // SAFETY: forwarded from this function's own safety doc.
+        let varp = unsafe { &*(args.os_varp as *const Option<Vec<u8>>) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::charset::check_isopt(varp.as_deref().unwrap_or_default()) }
+            == crate::vim_defs::FAIL
+        {
+            return Some(crate::errors::e_invarg.as_bytes());
+        }
+        return None;
+    }
+
+    // Fallthrough for the local value.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { did_set_isopt(args) }
+}
+
 /// The `'isident'`/`'iskeyword'`/`'isprint'`/`'isfname'` option is
 /// changed (`did_set_isopt`).
 ///
@@ -4188,6 +4228,76 @@ mod tests {
         unsafe { didset_string_options() };
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ssop = prev;
+    }
+
+    #[test]
+    fn did_set_iskeyword_global_only_validates() {
+        // The GLOBAL value is the template new buffers inherit, so it
+        // is validated but never applied - no buffer chartab is
+        // refilled and no restore is ever requested.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk.clone();
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk =
+            Some(b"@,48-57,_,192-255".to_vec());
+        let varp = std::ptr::from_mut(
+            &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk,
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: varp as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_iskeyword(&mut args) }, None);
+        assert!(!args.os_restore_chartab, "the global path never refills a chartab");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk = prev;
+    }
+
+    #[test]
+    fn did_set_iskeyword_global_rejects_an_invalid_value() {
+        // Cross-verified against real nvim: an unparseable value is
+        // rejected and the previous one kept.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk.clone();
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk =
+            Some(b"@@@bogus###".to_vec());
+        let varp = std::ptr::from_mut(
+            &mut unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk,
+        );
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: varp as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { did_set_iskeyword(&mut args) },
+            Some(crate::errors::e_invarg.as_bytes())
+        );
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_isk = prev;
+    }
+
+    #[test]
+    fn did_set_iskeyword_local_falls_through_to_did_set_isopt() {
+        // A buffer-LOCAL value does refill that buffer's chartab, so
+        // the local path must reach did_set_isopt rather than stopping
+        // at the global validation.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_isk: Some(b"@,48-57,_,192-255".to_vec()),
+            ..Default::default()
+        };
+        // os_varp points at the BUFFER's own value, not the global one.
+        let varp = std::ptr::from_mut(&mut buf.b_p_isk);
+        let mut args = crate::option_defs::OptsetT {
+            os_varp: varp as *mut c_void,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_iskeyword(&mut args) }, None);
+        assert!(!args.os_restore_chartab);
+        // The chartab really was refilled from the local value.
+        assert!(buf.b_chartab.iter().any(|&w| w != 0));
     }
 
     #[test]
