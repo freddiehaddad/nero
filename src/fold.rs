@@ -2965,6 +2965,127 @@ pub unsafe fn fold_create_markers(
     );
 }
 
+/// Strip fold markers and `'commentstring'` from a line of fold text
+/// (`foldtext_cleanup`).
+///
+/// The default fold text is built from the fold's first line, which
+/// usually still carries the marker that created the fold and often
+/// the comment syntax wrapping it; neither is useful to show, so both
+/// are removed along with any whitespace that follows.
+///
+/// The comment start and end are each removed at most once, matching
+/// the original's own `did1`/`did2` flags. A marker's optional level
+/// digit goes with it, and a comment start directly before a marker
+/// is removed too - useful when it is a quote character and the
+/// matching one has already gone.
+///
+/// # Translation note
+/// The original shifts bytes left in place with `STRMOVE`; taking a
+/// `&mut Vec<u8>` and draining the removed spans expresses the same
+/// edit without the overlapping copy.
+///
+/// # Safety
+/// Touches `GLOBALS.curwin`/`curbuf` (for `'foldmarker'` and
+/// `'commentstring'`), which must both be valid and live.
+pub unsafe fn foldtext_cleanup(str: &mut Vec<u8>) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (curwin, curbuf) = (g.curwin, g.curbuf);
+
+    // Ignore leading and trailing white space in 'commentstring'.
+    // SAFETY: forwarded from this function's own safety doc.
+    let cms_raw = unsafe { (*curbuf).b_p_cms.clone() }.unwrap_or_default();
+    let cms_raw = &cms_raw[..cms_raw.iter().position(|&c| c == 0).unwrap_or(cms_raw.len())];
+    let cms_all = &cms_raw[crate::charset::skipwhite(cms_raw)..];
+    let mut cms_slen = cms_all.len();
+    while cms_slen > 0 && crate::ascii_defs::ascii_iswhite(i32::from(cms_all[cms_slen - 1])) {
+        cms_slen -= 1;
+    }
+
+    // Locate "%s" in 'commentstring': the parts before and after it
+    // are what actually wrap the marker.
+    let mut cms_start: &[u8] = &cms_all[..cms_slen];
+    let mut cms_end: Option<&[u8]> = None;
+    if let Some(pct) = cms_all[..cms_slen].windows(2).position(|w| w == b"%s") {
+        // Skip "%s" and the white space after it.
+        let after = &cms_all[pct + 2..cms_slen];
+        let after = &after[crate::charset::skipwhite(after)..];
+        cms_start = &cms_all[..pct];
+        // The original narrows cms_slen to the part BEFORE "%s"; it
+        // is the length of cms_start from here on.
+        cms_slen = pct;
+        cms_end = Some(after);
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { parse_marker(&*curwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let markers = unsafe { FOLD_MARKERS.get_mut() }
+        .clone()
+        .expect("foldtext_cleanup: parse_marker just ran");
+    // SAFETY: forwarded from this function's own safety doc.
+    let fmr = unsafe { (*curwin).w_onebuf_opt.wo_fmr.clone() }.unwrap_or_default();
+    let startmarker = &fmr[..markers.start_len.min(fmr.len())];
+    let endmarker = &markers.end[..];
+
+    let mut did1 = false;
+    let mut did2 = false;
+
+    let mut s = 0usize;
+    while s < str.len() && str[s] != 0 {
+        let mut len = 0usize;
+        if !startmarker.is_empty() && str[s..].starts_with(startmarker) {
+            len = startmarker.len();
+        } else if !endmarker.is_empty() && str[s..].starts_with(endmarker) {
+            len = endmarker.len();
+        }
+
+        let mut start = s;
+        if len > 0 {
+            if str.get(s + len).is_some_and(u8::is_ascii_digit) {
+                len += 1;
+            }
+
+            // May remove the 'commentstring' start. Useful when it is
+            // a double quote and one has already been removed.
+            let mut p = s;
+            while p > 0 && crate::ascii_defs::ascii_iswhite(i32::from(str[p - 1])) {
+                p -= 1;
+            }
+            if p >= cms_slen && cms_slen > 0 && str[p - cms_slen..p] == *cms_start {
+                len += (s - p) + cms_slen;
+                start = p - cms_slen;
+            }
+        } else if cms_end.is_some() {
+            if !did1 && cms_slen > 0 && str[s..].starts_with(cms_start) {
+                len = cms_slen;
+                did1 = true;
+            } else if let Some(end) = cms_end
+                && !did2
+                && !end.is_empty()
+                && str[s..].starts_with(end)
+            {
+                len = end.len();
+                did2 = true;
+            }
+        }
+
+        if len != 0 {
+            while str
+                .get(start + len)
+                .is_some_and(|&c| crate::ascii_defs::ascii_iswhite(i32::from(c)))
+            {
+                len += 1;
+            }
+            str.drain(start..start + len);
+            s = start;
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            s += (unsafe { crate::mbyte::utfc_ptr2len(&str[s..]) } as usize).max(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4077,6 +4198,78 @@ mod tests {
         );
         unsafe { *FOLD_MARKERS.get_mut() = None };
         close_indent_level_fixture(buf);
+    }
+
+    /// Runs `foldtext_cleanup` with `curwin`/`curbuf` installed,
+    /// carrying the given `'commentstring'`, and returns the result.
+    fn cleanup_foldtext(text: &[u8], cms: &[u8]) -> Vec<u8> {
+        let mut buf = BufT {
+            b_p_cms: Some(cms.to_vec()),
+            ..Default::default()
+        };
+        let mut win = WinT {
+            w_buffer: &mut buf as *mut BufT,
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fmr: Some(b"{{{,}}}".to_vec()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut out = text.to_vec();
+        unsafe {
+            let g = crate::globals::GLOBALS.get_mut();
+            let (pb, pw) = (g.curbuf, g.curwin);
+            g.curbuf = &mut buf as *mut BufT;
+            g.curwin = &mut win as *mut WinT;
+            foldtext_cleanup(&mut out);
+            let g = crate::globals::GLOBALS.get_mut();
+            g.curbuf = pb;
+            g.curwin = pw;
+            *FOLD_MARKERS.get_mut() = None;
+        }
+        out
+    }
+
+    #[test]
+    fn foldtext_cleanup_strips_a_bare_marker() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(cleanup_foldtext(b"alpha {{{", b""), b"alpha ");
+        assert_eq!(cleanup_foldtext(b"alpha }}}", b""), b"alpha ");
+    }
+
+    #[test]
+    fn foldtext_cleanup_strips_the_marker_level_digit() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(cleanup_foldtext(b"alpha {{{3", b""), b"alpha ");
+    }
+
+    #[test]
+    fn foldtext_cleanup_strips_a_comment_wrapped_marker() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The marker's own comment start is removed along with it,
+        // and the trailing comment end is removed once.
+        assert_eq!(cleanup_foldtext(b"alpha /*{{{*/", b"/*%s*/"), b"alpha ");
+    }
+
+    #[test]
+    fn foldtext_cleanup_leaves_text_without_markers_alone() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(cleanup_foldtext(b"just some text", b""), b"just some text");
+    }
+
+    #[test]
+    fn foldtext_cleanup_removes_each_comment_part_at_most_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The original's did1/did2 flags mean a second occurrence of
+        // the comment start or end survives.
+        let out = cleanup_foldtext(b"/* a /* b", b"/*%s*/");
+        assert_eq!(out, b"a /* b");
+    }
+
+    #[test]
+    fn foldtext_cleanup_strips_whitespace_following_what_it_removes() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(cleanup_foldtext(b"{{{   alpha", b""), b"alpha");
     }
 
     #[test]
