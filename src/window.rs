@@ -1519,6 +1519,78 @@ pub unsafe fn global_stl_height() -> i32 {
     }
 }
 
+/// Rows available to the window layout: everything except the command
+/// line, the tab line and a global status line (`ROWS_AVAIL`, a macro
+/// in the original).
+///
+/// # Safety
+/// Forwarded from [`tabline_height`]/[`global_stl_height`]'s own
+/// safety docs; also reads `GLOBALS.Rows`.
+#[must_use]
+pub unsafe fn rows_avail() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let rows = unsafe { crate::globals::GLOBALS.get_mut() }.Rows;
+    // SAFETY: as above.
+    let p_ch = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    let tabline = unsafe { tabline_height() };
+    // SAFETY: as above.
+    let global_stl = unsafe { global_stl_height() };
+    rows - p_ch - tabline - global_stl
+}
+
+/// Size the first window and the top frame to fill the screen
+/// (`win_init_size`), used when the layout is a single window.
+///
+/// # Safety
+/// `GLOBALS.firstwin` and `GLOBALS.topframe` must be valid, non-null
+/// pointers to live values. Forwarded from [`rows_avail`]'s own
+/// safety doc.
+pub unsafe fn win_init_size() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let avail = unsafe { rows_avail() };
+    // SAFETY: as above.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let columns = g.Columns;
+    let (firstwin, topframe) = (g.firstwin, g.topframe);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*firstwin).w_height = avail;
+        (*firstwin).w_prev_height = avail;
+        (*firstwin).w_view_height = avail - (*firstwin).w_winbar_height;
+        (*firstwin).w_height_outer = avail;
+        (*firstwin).w_winrow_off = (*firstwin).w_winbar_height;
+        (*topframe).fr_height = avail;
+        (*firstwin).w_width = columns;
+        (*firstwin).w_view_width = columns;
+        (*firstwin).w_width_outer = columns;
+        (*topframe).fr_width = columns;
+    };
+}
+
+/// The window whose buffer should be treated as the "previous" one
+/// (`prevwin_curwin`).
+///
+/// Normally the current window, but inside the command-line window
+/// the alternative buffer belongs to `prevwin` instead.
+///
+/// # Safety
+/// Forwarded from [`crate::ex_getln::is_in_cmdwin`]'s own safety doc;
+/// also reads `GLOBALS.prevwin`/`curwin`.
+#[must_use]
+pub unsafe fn prevwin_curwin() -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // In cmdwin, the alternative buffer should be used.
+    // SAFETY: as above.
+    if unsafe { crate::ex_getln::is_in_cmdwin() } && !g.prevwin.is_null() {
+        g.prevwin
+    } else {
+        g.curwin
+    }
+}
+
 /// Return the minimal number of rows needed on the screen to display
 /// the current number of windows for tab page `tp` (`min_rows`).
 ///
@@ -5072,6 +5144,95 @@ mod tests {
         let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
         let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
         assert_eq!(unsafe { tabline_height() }, 0);
+    }
+
+    // --- rows_avail / win_init_size / prevwin_curwin ---
+
+    #[test]
+    fn rows_avail_subtracts_the_cmdline_tabline_and_global_statusline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_rows = g.Rows;
+        g.Rows = 30;
+
+        {
+            // 'showtabline'=0, 'laststatus'=0: only the command line.
+            let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
+            let p_ch = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch as i32;
+            assert_eq!(unsafe { rows_avail() }, 30 - p_ch);
+        }
+        {
+            // 'showtabline'=2 always shows it, 'laststatus'=3 adds a
+            // global status line - one row each.
+            let _guard = TablineGlobalsGuard::set(2, 3, tp_ptr);
+            let p_ch = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch as i32;
+            assert_eq!(unsafe { rows_avail() }, 30 - p_ch - 1 - STATUS_HEIGHT);
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn win_init_size_fills_the_screen_with_the_first_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
+
+        let mut win = crate::buffer_defs::WinT { w_winbar_height: 1, ..Default::default() };
+        let mut frame = crate::buffer_defs::FrameT::default();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, pc, pf, pt) = (g.Rows, g.Columns, g.firstwin, g.topframe);
+        g.Rows = 30;
+        g.Columns = 80;
+        g.firstwin = &mut win;
+        g.topframe = &mut frame;
+
+        let avail = unsafe { rows_avail() };
+        unsafe { win_init_size() };
+
+        assert_eq!(win.w_height, avail);
+        assert_eq!(win.w_prev_height, avail);
+        assert_eq!(win.w_height_outer, avail);
+        assert_eq!(frame.fr_height, avail);
+        // The winbar eats into the VIEW height, not the total.
+        assert_eq!(win.w_view_height, avail - 1);
+        assert_eq!(win.w_winrow_off, 1);
+        assert_eq!((win.w_width, win.w_view_width, win.w_width_outer), (80, 80, 80));
+        assert_eq!(frame.fr_width, 80);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Rows = pr;
+        g.Columns = pc;
+        g.firstwin = pf;
+        g.topframe = pt;
+    }
+
+    #[test]
+    fn prevwin_curwin_is_curwin_outside_the_cmdline_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut cur = crate::buffer_defs::WinT::default();
+        let mut prev = crate::buffer_defs::WinT::default();
+        let (cur_ptr, prev_ptr): (*mut WinT, *mut WinT) = (&mut cur, &mut prev);
+        // is_in_cmdwin() reaches curbuf via bt_cmdwin, so it has to be
+        // a real buffer; a default one is not a command-line window.
+        let mut buf = crate::buffer_defs::BufT::default();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pc, pp, pb) = (g.curwin, g.prevwin, g.curbuf);
+        g.curwin = cur_ptr;
+        g.prevwin = prev_ptr;
+        g.curbuf = &mut buf;
+
+        // is_in_cmdwin() is false with no command-line window open, so
+        // prevwin is ignored even though it is set.
+        assert!(std::ptr::eq(unsafe { prevwin_curwin() }, cur_ptr));
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = pc;
+        g.prevwin = pp;
+        g.curbuf = pb;
     }
 
     #[test]
