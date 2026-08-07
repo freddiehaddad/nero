@@ -6480,6 +6480,59 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'hlsearch'` option value (`did_set_hlsearch`).
+///
+/// Setting *or* resetting `'hlsearch'` clears the "temporarily
+/// suppress highlighting" flag, so `:nohlsearch` does not survive a
+/// later `:set hlsearch`.
+///
+/// # Safety
+/// Forwarded from [`crate::ex_docmd::set_no_hlsearch`]'s own safety
+/// doc.
+pub unsafe fn did_set_hlsearch(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::ex_docmd::set_no_hlsearch(false) };
+    None
+}
+
+/// Process the updated `'ignorecase'` option value
+/// (`did_set_ignorecase`).
+///
+/// Only redraws when `'hlsearch'` is on: with highlighting off, the
+/// case-sensitivity change has nothing visible to update.
+///
+/// # Safety
+/// Forwarded from [`crate::drawscreen::redraw_all_later`]'s own safety
+/// doc.
+pub unsafe fn did_set_ignorecase(_args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    // SAFETY: a plain scalar copy-out read, no aliasing hazard.
+    let p_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+    if p_hls != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_SOME_VALID) };
+    }
+    None
+}
+
+/// Process the updated `'numberwidth'` option value
+/// (`did_set_numberwidth`).
+///
+/// Zeroing `w_nrwidth_line_count` is what triggers the redraw: the
+/// number column's width is recomputed whenever that cached line count
+/// no longer matches the buffer's.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`
+/// for the whole call.
+pub unsafe fn did_set_numberwidth(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win_ptr = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*win_ptr).w_nrwidth_line_count = 0 };
+    None
+}
+
 /// Process the new `'foldlevel'` option value (`did_set_foldlevel`).
 ///
 /// # Safety
@@ -6568,6 +6621,68 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn did_set_numberwidth_zeroes_the_cached_line_count() {
+        // Zeroing w_nrwidth_line_count is what forces the number
+        // column's width to be recomputed on the next redraw.
+        let mut win = crate::buffer_defs::WinT {
+            w_nrwidth_line_count: 42,
+            ..crate::buffer_defs::WinT::default()
+        };
+        let mut args = fold_args(crate::option_defs::OptIndex::Numberwidth, &mut win);
+
+        assert_eq!(unsafe { did_set_numberwidth(&mut args) }, None);
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    #[test]
+    fn did_set_hlsearch_clears_the_no_hlsearch_flag() {
+        // Setting OR resetting 'hlsearch' clears the ":nohlsearch"
+        // suppression, so it does not survive a later :set hlsearch.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = true;
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Hlsearch,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { did_set_hlsearch(&mut args) }, None);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch);
+    }
+
+    #[test]
+    fn did_set_ignorecase_only_redraws_when_hlsearch_is_on() {
+        // With highlighting off there is nothing visible to update, so
+        // the original skips the redraw entirely.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+        let prev_firstwin = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+
+        let mut win = crate::buffer_defs::WinT {
+            w_redr_type: 0,
+            ..crate::buffer_defs::WinT::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = &mut win;
+
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Ignorecase,
+            ..Default::default()
+        };
+
+        // 'hlsearch' off: no redraw is scheduled.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 0;
+        assert_eq!(unsafe { did_set_ignorecase(&mut args) }, None);
+        assert_eq!(win.w_redr_type, 0);
+
+        // 'hlsearch' on: every window is marked for redraw.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 1;
+        assert_eq!(unsafe { did_set_ignorecase(&mut args) }, None);
+        assert_eq!(win.w_redr_type, crate::drawscreen::UPD_SOME_VALID);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_firstwin;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = prev_hls;
     }
 
     #[test]
