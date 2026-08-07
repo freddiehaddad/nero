@@ -6480,6 +6480,35 @@ mod did_set_option_tests {
     }
 }
 
+/// Process the updated `'modified'` option value (`did_set_modified`).
+///
+/// When the buffer is being marked UNmodified, its current
+/// `'fileformat'`/`'fileencoding'` are snapshotted, so a later change
+/// back can tell whether those settings themselves moved.
+///
+/// # Safety
+/// `args.os_buf` must be a valid, non-null pointer to a live `BufT`
+/// for the whole call. Also mutates `crate::globals::GLOBALS`.
+pub unsafe fn did_set_modified(args: &mut crate::option_defs::OptsetT) -> Option<&'static [u8]> {
+    let buf_ptr = args.os_buf as *mut crate::buffer_defs::BufT;
+    // A TriState, not a plain bool: only an explicit True counts as
+    // "modified", matching the original's own `!!(int)` coercion.
+    let newval = matches!(
+        args.os_newval,
+        crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::True)
+    );
+
+    if !newval {
+        // SAFETY: forwarded from this function's own safety doc.
+        crate::change::save_file_ff(unsafe { &mut *buf_ptr });
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { redraw_titles() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*buf_ptr).b_modified_was_set = newval };
+    None
+}
+
 /// Mark the window title and tabline for redraw (`redraw_titles`).
 ///
 /// # Safety
@@ -6707,6 +6736,54 @@ mod did_set_title_tests {
             os_win: win as *mut crate::buffer_defs::WinT as *mut c_void,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn did_set_modified_unmodified_snapshots_the_file_format() {
+        // Marking the buffer UNmodified snapshots the current
+        // 'fileformat'/'fileencoding', so a later change back can tell
+        // whether those settings themselves moved.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_fenc: Some(b"utf-8".to_vec()),
+            b_p_bomb: 1,
+            b_modified_was_set: true,
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Modified,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_newval: crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::False),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_modified(&mut args) }, None);
+        assert_eq!(buf.b_start_fenc.as_deref(), Some(&b"utf-8"[..]));
+        assert_eq!(buf.b_start_bomb, 1);
+        assert!(!buf.b_modified_was_set);
+    }
+
+    #[test]
+    fn did_set_modified_modified_does_not_snapshot() {
+        // Marking it MODIFIED must not snapshot: b_start_fenc stays
+        // whatever it was, so file_ff_differs can still see the change.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT {
+            b_p_fenc: Some(b"latin1".to_vec()),
+            b_start_fenc: None,
+            b_modified_was_set: false,
+            ..Default::default()
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_idx: crate::option_defs::OptIndex::Modified,
+            os_buf: &mut buf as *mut crate::buffer_defs::BufT as *mut c_void,
+            os_newval: crate::option_defs::OptVal::Boolean(crate::types_defs::TriState::True),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_modified(&mut args) }, None);
+        assert_eq!(buf.b_start_fenc, None, "must NOT snapshot when marking modified");
+        assert!(buf.b_modified_was_set);
     }
 
     #[test]
