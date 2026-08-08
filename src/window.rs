@@ -1569,6 +1569,80 @@ pub unsafe fn rows_avail() -> i32 {
     rows - p_ch - tabline - global_stl
 }
 
+/// Recursively copy a frame tree's layout into a fresh snapshot
+/// (`make_snapshot_rec`).
+///
+/// Only the layout shape and sizes are recorded, NOT the windows
+/// themselves - with one deliberate exception: the leaf holding
+/// `curwin` stores that pointer, so the snapshot can later restore
+/// which window was current. Every other leaf's `fr_win` stays null,
+/// which is what [`get_snapshot_curwin_rec`]'s fallthrough relies on.
+///
+/// # Safety
+/// `fr` must be a valid, non-null pointer to a live frame whose own
+/// `fr_next`/`fr_child` links are likewise valid or null. The returned
+/// tree is heap-allocated and must eventually be freed with
+/// [`clear_snapshot_rec`].
+pub unsafe fn make_snapshot_rec(fr: *mut crate::buffer_defs::FrameT) -> *mut crate::buffer_defs::FrameT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        let curwin = crate::globals::GLOBALS.get_mut().curwin;
+        let mut snap = Box::new(crate::buffer_defs::FrameT {
+            fr_layout: (*fr).fr_layout,
+            fr_width: (*fr).fr_width,
+            fr_height: (*fr).fr_height,
+            ..Default::default()
+        });
+        if !(*fr).fr_next.is_null() {
+            snap.fr_next = make_snapshot_rec((*fr).fr_next);
+        }
+        if !(*fr).fr_child.is_null() {
+            snap.fr_child = make_snapshot_rec((*fr).fr_child);
+        }
+        if (*fr).fr_layout == crate::buffer_defs::FR_LEAF && (*fr).fr_win == curwin {
+            snap.fr_win = curwin;
+        }
+        Box::into_raw(snap)
+    }
+}
+
+/// Whether snapshot `sn` still matches the live frame tree `fr`
+/// (`check_snapshot_rec`).
+///
+/// The layout must match structurally - same kind, and the same
+/// presence-or-absence of a sibling and a child at every level - and
+/// any window the snapshot recorded must still be valid. A window that
+/// has since been closed invalidates the whole snapshot, since
+/// restoring it would install a dangling pointer.
+///
+/// @return [`crate::vim_defs::OK`]/[`crate::vim_defs::FAIL`], matching
+///         the original.
+///
+/// # Safety
+/// Both `sn` and `fr` must be valid, non-null pointers to live frames
+/// whose own links are likewise valid or null. Forwarded from
+/// [`win_valid`]'s own safety doc.
+pub unsafe fn check_snapshot_rec(
+    sn: *mut crate::buffer_defs::FrameT,
+    fr: *mut crate::buffer_defs::FrameT,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if (*sn).fr_layout != (*fr).fr_layout
+            || (*sn).fr_next.is_null() != (*fr).fr_next.is_null()
+            || (*sn).fr_child.is_null() != (*fr).fr_child.is_null()
+            || (!(*sn).fr_next.is_null()
+                && check_snapshot_rec((*sn).fr_next, (*fr).fr_next) == crate::vim_defs::FAIL)
+            || (!(*sn).fr_child.is_null()
+                && check_snapshot_rec((*sn).fr_child, (*fr).fr_child) == crate::vim_defs::FAIL)
+            || (!(*sn).fr_win.is_null() && !win_valid((*sn).fr_win))
+        {
+            return crate::vim_defs::FAIL;
+        }
+        crate::vim_defs::OK
+    }
+}
+
 /// Free a snapshot frame tree (`clear_snapshot_rec`).
 ///
 /// Both the sibling chain and the child subtree are freed before the
@@ -5376,6 +5450,111 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn make_snapshot_rec_copies_the_layout_and_only_the_curwin_leaf() {
+        // Only the layout shape and sizes are recorded. The single
+        // leaf holding curwin stores that pointer; every other leaf's
+        // fr_win stays null, which is what get_snapshot_curwin_rec's
+        // fallthrough relies on.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut cur = crate::buffer_defs::WinT::default();
+        let mut other = crate::buffer_defs::WinT::default();
+        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut cur;
+
+        let mut leaf_other = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut other,
+            fr_width: 11,
+            fr_height: 7,
+            ..Default::default()
+        };
+        let mut leaf_cur = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut cur,
+            fr_next: &mut leaf_other,
+            fr_width: 22,
+            fr_height: 9,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf_cur,
+            fr_width: 33,
+            fr_height: 16,
+            ..Default::default()
+        };
+
+        let snap = unsafe { make_snapshot_rec(&mut root) };
+        // SAFETY: make_snapshot_rec just built this tree.
+        unsafe {
+            assert_eq!((*snap).fr_layout, crate::buffer_defs::FR_ROW);
+            assert_eq!((*snap).fr_width, 33);
+            assert_eq!((*snap).fr_height, 16);
+            // The root is not a leaf, so it records no window.
+            assert!((*snap).fr_win.is_null());
+
+            let child = (*snap).fr_child;
+            assert!(!child.is_null());
+            assert_eq!((*child).fr_width, 22);
+            // This leaf held curwin, so the pointer IS recorded.
+            assert!(std::ptr::eq((*child).fr_win, &raw mut cur));
+
+            let sibling = (*child).fr_next;
+            assert!(!sibling.is_null());
+            assert_eq!((*sibling).fr_width, 11);
+            // This leaf held a different window, so it records none.
+            assert!((*sibling).fr_win.is_null());
+
+            clear_snapshot_rec(snap);
+        }
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+    }
+
+    #[test]
+    fn check_snapshot_rec_accepts_a_matching_layout() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf,
+            ..Default::default()
+        };
+        let snap = unsafe { make_snapshot_rec(&mut root) };
+        assert_eq!(unsafe { check_snapshot_rec(snap, &mut root) }, crate::vim_defs::OK);
+        unsafe { clear_snapshot_rec(snap) };
+    }
+
+    #[test]
+    fn check_snapshot_rec_rejects_a_changed_layout() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf,
+            ..Default::default()
+        };
+        let snap = unsafe { make_snapshot_rec(&mut root) };
+
+        // A different frame KIND is a mismatch.
+        root.fr_layout = crate::buffer_defs::FR_COL;
+        assert_eq!(unsafe { check_snapshot_rec(snap, &mut root) }, crate::vim_defs::FAIL);
+        root.fr_layout = crate::buffer_defs::FR_ROW;
+
+        // So is losing a child.
+        root.fr_child = std::ptr::null_mut();
+        assert_eq!(unsafe { check_snapshot_rec(snap, &mut root) }, crate::vim_defs::FAIL);
+
+        unsafe { clear_snapshot_rec(snap) };
     }
 
     #[test]
