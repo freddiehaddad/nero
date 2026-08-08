@@ -78,9 +78,10 @@
 //!   `std::io::{Read, Write, Seek}` on
 //!   `MemfileT.mf_fd: Option<std::fs::File>`, sidestepping the need
 //!   for these raw-fd wrappers entirely for that specific caller).
-//! - `os_exepath`/`os_can_exe`/`is_executable*`: executable-search
-//!   logic tied to `'path'`-searching semantics (`path.c`) and exec-bit
-//!   permission checks (`os_getperm`).
+//! - `os_exepath`/`os_can_exe`/`is_executable_ext`: executable-SEARCH
+//!   logic tied to `'path'`-searching semantics (`path.c`) and, on
+//!   Windows, `$PATHEXT` extension probing. The underlying
+//!   [`is_executable`] permission check itself IS translated.
 //! - `os_copy_xattr`/`os_get_acl`/`os_set_acl`/`os_free_acl`/
 //!   `os_chown`/`os_fchown`: platform ACL/xattr/
 //!   ownership APIs, out of scope until a real FFI decision is made.
@@ -251,6 +252,53 @@ fn path_to_cstring(path: &Path) -> Option<std::ffi::CString> {
 // `libc::R_OK`/`libc::W_OK` (available on Unix only).
 const R_OK: i32 = 4;
 const W_OK: i32 = 2;
+
+/// Whether `name` is an executable file, optionally reporting its
+/// absolute path (`is_executable`).
+///
+/// Unix checks the real execute bit via [`libc::access`] with `X_OK`,
+/// but only for a REGULAR file - a directory can be "executable" in
+/// the search-permission sense and must not be mistaken for a command.
+///
+/// Windows has no execute bit at all, so the original settles for
+/// "exists and is a regular file"; that difference is upstream's, not
+/// a simplification here.
+///
+/// @return whether it is executable, plus its absolute path when it is
+///         and `want_abspath` is set. The original writes that through
+///         a `char **abspath` out-parameter, which becomes part of the
+///         return value here.
+#[must_use]
+pub fn is_executable(name: &Path, want_abspath: bool) -> (bool, Option<Vec<u8>>) {
+    let Some(info) = os_fileinfo(name) else {
+        // os_getperm's negative result: nothing to stat.
+        return (false, None);
+    };
+    let is_regular = os_fileinfo_type_str(&info) == "file";
+
+    #[cfg(windows)]
+    // Windows does not have an exec bit; just check that the file
+    // exists and is not a directory.
+    let ok = is_regular;
+
+    #[cfg(not(windows))]
+    let ok = {
+        const X_OK: i32 = 1;
+        is_regular
+            && path_to_cstring(name).is_some_and(|cpath| {
+                // SAFETY: cpath is a valid, NUL-terminated C string for
+                // its own lifetime, which outlives this call.
+                unsafe { libc::access(cpath.as_ptr(), X_OK) == 0 }
+            })
+    };
+
+    if ok && want_abspath {
+        let bytes = name.to_str().map(|s| crate::path::save_abs_path(s.as_bytes()));
+        (true, bytes)
+    } else {
+        (ok, None)
+    }
+}
 
 /// Check if a file is readable (`os_file_is_readable`), via
 /// [`libc::access`] with `R_OK` - the same underlying syscall the
@@ -1473,6 +1521,77 @@ mod tests {
         std::fs::write(&blocker, b"not a directory").unwrap();
         let fname = blocker.join("child").join("file.txt");
         assert_eq!(os_file_mkdir(&path_bytes(&fname), 0o755), -1);
+    }
+
+    #[test]
+    fn is_executable_is_false_for_a_missing_path() {
+        let scratch = TempScratch::new("isexec_missing");
+        let (ok, abs) = is_executable(&scratch.path.join("does_not_exist"), true);
+        assert!(!ok);
+        assert_eq!(abs, None, "no path is reported when not executable");
+    }
+
+    #[test]
+    fn is_executable_is_false_for_a_directory() {
+        // A directory can be "executable" in the search-permission
+        // sense, so the regular-file check is what keeps it from being
+        // mistaken for a command.
+        let scratch = TempScratch::new("isexec_dir");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let (ok, _abs) = is_executable(&scratch.path, false);
+        assert!(!ok);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_executable_on_windows_accepts_any_regular_file() {
+        // Windows has no exec bit at all, so upstream settles for
+        // "exists and is a regular file".
+        let scratch = TempScratch::new("isexec_win");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("plain.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        let (ok, abs) = is_executable(&path, true);
+        assert!(ok);
+        let abs = abs.expect("an absolute path is reported when asked");
+        assert!(!abs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_on_unix_requires_the_execute_bit() {
+        // A plain non-executable file is refused; setting the execute
+        // bit makes it acceptable.
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = TempScratch::new("isexec_unix");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("script");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&path, false).0, "no execute bit yet");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (ok, abs) = is_executable(&path, true);
+        assert!(ok);
+        assert!(abs.is_some_and(|a| !a.is_empty()));
+    }
+
+    #[test]
+    fn is_executable_reports_no_path_unless_asked() {
+        let scratch = TempScratch::new("isexec_noabs");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join("f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (_ok, abs) = is_executable(&path, false);
+        assert_eq!(abs, None);
     }
 
     #[test]
