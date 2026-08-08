@@ -231,6 +231,60 @@ pub unsafe fn nv_beginline(cap: &mut crate::normal_defs::CmdargT) {
     unsafe { crate::globals::GLOBALS.get_mut() }.ins_at_eol = false;
 }
 
+/// "G", "gg", CTRL-END, CTRL-HOME (`nv_goto`).
+///
+/// `cap.arg` is true for "G" (go to the last line); false means "gg"
+/// (go to the first line). A count overrides either default, clamped
+/// to the buffer's own line range.
+///
+/// # Safety
+/// Reads `GLOBALS`/`OPTION_VARS` and forwards
+/// [`crate::mark::setpcmark`]/[`crate::insert::beginline`]/
+/// [`crate::fold::fold_open_cursor`]'s own safety docs. `cap.oap` must
+/// point at a live [`crate::normal_defs::OpargT`].
+pub unsafe fn nv_goto(cap: &mut crate::normal_defs::CmdargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: curbuf is the live current buffer.
+    let line_count = unsafe { (*curbuf).b_ml.ml_line_count };
+
+    let mut lnum = if cap.arg != 0 { line_count } else { 1 };
+
+    // SAFETY: cap.oap is a raw pointer in this crate's CmdargT.
+    unsafe { (*cap.oap).motion_type = crate::normal_defs::MotionType::LineWise };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mark::setpcmark() };
+
+    // When a count is given, use it instead of the default lnum.
+    if cap.count0 != 0 {
+        lnum = cap.count0;
+    }
+    lnum = lnum.clamp(1, line_count);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: curwin is the live current window.
+    unsafe { (*curwin).w_cursor.lnum = lnum };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::insert::beginline(crate::insert::BL_SOL | crate::insert::BL_FIX) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdo_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags;
+    // SAFETY: forwarded from this function's own safety doc.
+    let key_typed = unsafe { crate::globals::GLOBALS.get_mut() }.KeyTyped;
+    // SAFETY: cap.oap is a raw pointer, see above.
+    let op_type = unsafe { (*cap.oap).op_type };
+
+    if fdo_flags & crate::option_vars::opt_fdo_flag::JUMP != 0
+        && key_typed
+        && op_type == crate::ops_defs::OpType::Nop as i32
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_open_cursor() };
+    }
+}
+
 /// The virtual top line of `wp` (`get_vtopline`).
 ///
 /// Counts the screen lines the buffer occupies down to `w_topline`,
@@ -621,6 +675,119 @@ mod tests {
         assert!(!win.w_set_curswant);
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
+    }
+
+    // --- nv_goto ---
+
+    /// A buffer with a real memline holding one line, for the
+    /// `beginline` call `nv_goto` makes (which reads the line's own
+    /// text). Mirrors `insert.rs`'s own equivalent test helper.
+    fn goto_buf_with_lines(lines: &[&[u8]]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, lines[0]) },
+            crate::vim_defs::OK
+        );
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            assert_eq!(
+                unsafe { crate::memline::ml_append_buf(&mut buf, i as i32, line, 0, false) },
+                crate::vim_defs::OK
+            );
+        }
+        buf
+    }
+
+    fn goto_close_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// Run `nv_goto` against a 3-line buffer and report where the
+    /// cursor lands, given `arg` ("G" vs "gg") and a count.
+    fn run_nv_goto(arg: i32, count0: i32) -> i32 {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = goto_buf_with_lines(&[b"aaa\0", b"  bbb\0", b"ccc\0"]);
+        let buf_ptr = &mut buf as *mut crate::buffer_defs::BufT;
+        let mut win = crate::buffer_defs::WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor.lnum = 1;
+        let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf, prev_tab) = (g.curwin, g.curbuf, g.curtab);
+        g.curwin = win_ptr;
+        g.curbuf = buf_ptr;
+        g.curtab = &mut tp;
+        // Keep the fold-open branch out of the picture.
+        let prev_fdo = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags = 0;
+
+        let mut oap = crate::normal_defs::OpargT {
+            motion_type: crate::normal_defs::MotionType::CharWise,
+            ..Default::default()
+        };
+        let mut cap = crate::normal_defs::CmdargT { oap: &mut oap, arg, count0, ..Default::default() };
+
+        unsafe { nv_goto(&mut cap) };
+
+        assert_eq!(
+            oap.motion_type,
+            crate::normal_defs::MotionType::LineWise,
+            "G/gg is always a linewise motion"
+        );
+        let landed = win.w_cursor.lnum;
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags = prev_fdo;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+        g.curtab = prev_tab;
+        goto_close_buf(buf);
+        landed
+    }
+
+    #[test]
+    fn nv_goto_with_arg_set_goes_to_the_last_line() {
+        // "G" with no count.
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(1, 0), 3);
+    }
+
+    #[test]
+    fn nv_goto_without_arg_goes_to_the_first_line() {
+        // "gg" with no count.
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(0, 0), 1);
+    }
+
+    #[test]
+    fn nv_goto_count_overrides_either_default() {
+        // A count wins over both the "G" and the "gg" default.
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(1, 2), 2);
+        assert_eq!(run_nv_goto(0, 2), 2);
+    }
+
+    #[test]
+    fn nv_goto_clamps_a_count_past_the_last_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(0, 99), 3);
+    }
+
+    #[test]
+    fn nv_goto_treats_a_zero_count_as_absent_rather_than_clamping_to_one() {
+        // count0 == 0 means "no count given", so the "G" default
+        // (last line) still applies - it is NOT clamped up to 1.
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(1, 0), 3);
+    }
+
+    #[test]
+    fn nv_goto_clamps_a_negative_count_up_to_the_first_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(run_nv_goto(1, -5), 1);
     }
 
     #[test]
