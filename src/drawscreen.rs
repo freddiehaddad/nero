@@ -204,6 +204,48 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// Whether the cursor line should be concealed in `wp`
+/// (`conceal_cursor_line`).
+///
+/// `'concealcursor'` lists the modes in which concealing stays active
+/// on the cursor's own line: `n`, `v`, `i`, `c`. An empty value means
+/// never.
+///
+/// Visual mode is tested via [`crate::state::get_real_state`] rather
+/// than `State` directly, because `State` reports the underlying mode
+/// while Visual is active; the other three read `State`. Preserved
+/// exactly as upstream.
+///
+/// # Safety
+/// Reads `GLOBALS.State`. Forwarded from
+/// [`crate::state::get_real_state`]'s own reasoning.
+#[must_use]
+pub unsafe fn conceal_cursor_line(wp: &WinT) -> bool {
+    let cocu = match wp.w_onebuf_opt.wo_cocu.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    use crate::state_defs::mode;
+    let real_state = crate::state::get_real_state() as u32;
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+
+    let c = if real_state & mode::VISUAL != 0 {
+        b'v'
+    } else if state & mode::INSERT != 0 {
+        b'i'
+    } else if state & mode::NORMAL != 0 {
+        b'n'
+    } else if state & mode::CMDLINE != 0 {
+        b'c'
+    } else {
+        return false;
+    };
+
+    cocu.contains(&c)
+}
+
 /// Mark every status line and window bar for redraw
 /// (`status_redraw_all`).
 ///
@@ -696,6 +738,65 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conceal_cursor_line_is_false_for_an_empty_or_unset_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::NORMAL as i32;
+
+        let win = crate::buffer_defs::WinT::default();
+        assert!(!unsafe { conceal_cursor_line(&win) }, "unset means never");
+
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_cocu = Some(Vec::new());
+        assert!(!unsafe { conceal_cursor_line(&win) }, "empty means never");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn conceal_cursor_line_matches_the_current_mode_letter() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_cocu = Some(b"nc".to_vec());
+
+        // Normal mode is listed.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::NORMAL as i32;
+        assert!(unsafe { conceal_cursor_line(&win) });
+
+        // Command-line mode is listed too.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::CMDLINE as i32;
+        assert!(unsafe { conceal_cursor_line(&win) });
+
+        // Insert mode is NOT listed.
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::INSERT as i32;
+        assert!(!unsafe { conceal_cursor_line(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn conceal_cursor_line_is_false_for_an_unlisted_mode() {
+        // A mode none of the four branches recognize returns false
+        // outright, without consulting the option at all.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_cocu = Some(b"nvic".to_vec());
+        unsafe { crate::globals::GLOBALS.get_mut() }.State =
+            crate::state_defs::mode::TERMINAL as i32;
+        assert!(!unsafe { conceal_cursor_line(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
 
     #[test]
     fn status_redraw_all_marks_status_winbar_and_curwin() {
