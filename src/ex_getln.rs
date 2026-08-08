@@ -77,6 +77,49 @@ const SHELL_ESC_CHARS: &[u8] = b" \t\n*?[{`$\\%#'\"|!<>();&";
 #[cfg(not(windows))]
 const BUFFER_ESC_CHARS: &[u8] = b" \t\n*?[`$\\%#'\"|!<";
 
+/// Saved window view state, used while `'incsearch'` highlighting and
+/// `'inccommand'` preview temporarily move the view (`viewstate_T`, a
+/// private struct in the original).
+///
+/// Every field is a plain copy of the window field of the same name,
+/// so [`save_viewstate`]/[`restore_viewstate`] are exact inverses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ViewstateT {
+    pub vs_curswant: crate::pos_defs::ColnrT,
+    pub vs_leftcol: crate::pos_defs::ColnrT,
+    pub vs_skipcol: crate::pos_defs::ColnrT,
+    pub vs_topline: crate::pos_defs::LinenrT,
+    pub vs_topfill: i32,
+    pub vs_botline: crate::pos_defs::LinenrT,
+    pub vs_empty_rows: i32,
+}
+
+/// Record `wp`'s current view so it can be put back later
+/// (`save_viewstate`).
+pub fn save_viewstate(wp: &crate::buffer_defs::WinT) -> ViewstateT {
+    ViewstateT {
+        vs_curswant: wp.w_curswant,
+        vs_leftcol: wp.w_leftcol,
+        vs_skipcol: wp.w_skipcol,
+        vs_topline: wp.w_topline,
+        vs_topfill: wp.w_topfill,
+        vs_botline: wp.w_botline,
+        vs_empty_rows: wp.w_empty_rows,
+    }
+}
+
+/// Put back a view previously recorded by [`save_viewstate`]
+/// (`restore_viewstate`).
+pub fn restore_viewstate(wp: &mut crate::buffer_defs::WinT, vs: &ViewstateT) {
+    wp.w_curswant = vs.vs_curswant;
+    wp.w_leftcol = vs.vs_leftcol;
+    wp.w_skipcol = vs.vs_skipcol;
+    wp.w_topline = vs.vs_topline;
+    wp.w_topfill = vs.vs_topfill;
+    wp.w_botline = vs.vs_botline;
+    wp.w_empty_rows = vs.vs_empty_rows;
+}
+
 /// Parse a `"from,to"` number range from the front of `str_`
 /// (`get_list_range`).
 ///
@@ -632,6 +675,46 @@ pub unsafe fn check_opt_wim() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_and_restore_viewstate_round_trip_exactly() {
+        // The two are exact inverses, so a save/restore pair must
+        // leave every field as it started - including the ones a
+        // partial implementation would be most likely to miss.
+        let mut win = crate::buffer_defs::WinT {
+            w_curswant: 11,
+            w_leftcol: 3,
+            w_skipcol: 4,
+            w_topline: 20,
+            w_topfill: 2,
+            w_botline: 45,
+            w_empty_rows: 6,
+            ..Default::default()
+        };
+        let saved = save_viewstate(&win);
+
+        // Move the view somewhere completely different.
+        win.w_curswant = 0;
+        win.w_leftcol = 0;
+        win.w_skipcol = 0;
+        win.w_topline = 1;
+        win.w_topfill = 0;
+        win.w_botline = 2;
+        win.w_empty_rows = 0;
+
+        restore_viewstate(&mut win, &saved);
+
+        assert_eq!(win.w_curswant, 11);
+        assert_eq!(win.w_leftcol, 3);
+        assert_eq!(win.w_skipcol, 4);
+        assert_eq!(win.w_topline, 20);
+        assert_eq!(win.w_topfill, 2);
+        assert_eq!(win.w_botline, 45);
+        assert_eq!(win.w_empty_rows, 6);
+
+        // Saving again must produce an identical record.
+        assert_eq!(save_viewstate(&win), saved);
+    }
 
     #[test]
     fn get_list_range_lone_number_becomes_both_ends() {
