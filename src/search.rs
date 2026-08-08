@@ -302,6 +302,84 @@ struct SearchPatterns {
 static SEARCH_PATTERNS: std::sync::LazyLock<crate::globals::GlobalCell<SearchPatterns>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SearchPatterns::default()));
 
+/// Saved copy of [`SEARCH_PATTERNS`], plus the nesting depth that
+/// decides when a save/restore pair actually takes effect
+/// (`saved_spats`/`saved_spats_last_idx`/`saved_spats_no_hlsearch`/
+/// `save_level`, file-statics in the original).
+#[derive(Debug, Clone, Default)]
+struct SavedSearchPatterns {
+    patterns: SearchPatterns,
+    no_hlsearch: bool,
+    /// Nesting depth (`save_level`).
+    save_level: i32,
+}
+
+static SAVED_SEARCH_PATTERNS: std::sync::LazyLock<
+    crate::globals::GlobalCell<SavedSearchPatterns>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(SavedSearchPatterns::default())
+});
+
+/// Save the current search patterns (`save_search_patterns`).
+///
+/// Only the OUTERMOST save actually records anything: a nested call
+/// just bumps the depth, so an inner save/restore pair cannot clobber
+/// what an outer one is holding.
+///
+/// The original's `mr_pattern` is not saved here, because this crate
+/// does not model it - `search_regcomp`'s "most recent pattern" is not
+/// translated yet, so there is nothing to preserve.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `SEARCH_PATTERNS`/`SAVED_SEARCH_PATTERNS`, or to
+/// `GLOBALS.Search.no_hlsearch`.
+pub unsafe fn save_search_patterns() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved = unsafe { SAVED_SEARCH_PATTERNS.get_mut() };
+    let level = saved.save_level;
+    saved.save_level += 1;
+    if level != 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    saved.patterns = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+    // SAFETY: forwarded from this function's own safety doc.
+    saved.no_hlsearch = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch;
+}
+
+/// Restore the search patterns saved by [`save_search_patterns`]
+/// (`restore_search_patterns`).
+///
+/// Only the OUTERMOST restore puts anything back; see
+/// [`save_search_patterns`].
+///
+/// The original's `set_vv_searchforward()` call is omitted - `v:`
+/// variable publication is a display-side effect this crate skips
+/// elsewhere too - while the `set_no_hlsearch` restore, which is real
+/// state, is kept.
+///
+/// # Safety
+/// Same as [`save_search_patterns`]; also forwarded from
+/// [`crate::ex_docmd::set_no_hlsearch`]'s own safety doc.
+pub unsafe fn restore_search_patterns() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let saved = unsafe { SAVED_SEARCH_PATTERNS.get_mut() };
+    saved.save_level -= 1;
+    if saved.save_level != 0 {
+        return;
+    }
+
+    let (patterns, no_hlsearch) = (saved.patterns.clone(), saved.no_hlsearch);
+    // The previous Vec<u8> patterns are dropped by this assignment,
+    // which is what the original's free_spat() loop does by hand.
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { SEARCH_PATTERNS.get_mut() } = patterns;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::ex_docmd::set_no_hlsearch(no_hlsearch) };
+}
+
 /// The last search pattern, borrowed (`last_search_pattern`).
 ///
 /// # Safety
@@ -643,6 +721,59 @@ pub unsafe fn set_last_search_pat(s: &[u8], is_substitute: bool, magic: bool, se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_restore_search_patterns_round_trips() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+        let prev_saved = unsafe { SAVED_SEARCH_PATTERNS.get_mut() }.clone();
+        *unsafe { SAVED_SEARCH_PATTERNS.get_mut() } = SavedSearchPatterns::default();
+
+        unsafe { set_last_search_pat(b"original", false, true, true) };
+        unsafe { save_search_patterns() };
+
+        // Change it, then put the saved one back.
+        unsafe { set_last_search_pat(b"changed", false, true, true) };
+        assert_eq!(unsafe { last_search_pattern() }, Some(&b"changed"[..]));
+
+        unsafe { restore_search_patterns() };
+        assert_eq!(unsafe { last_search_pattern() }, Some(&b"original"[..]));
+
+        *unsafe { SEARCH_PATTERNS.get_mut() } = prev;
+        *unsafe { SAVED_SEARCH_PATTERNS.get_mut() } = prev_saved;
+    }
+
+    #[test]
+    fn nested_save_restore_only_acts_at_the_outermost_level() {
+        // An inner save/restore pair must not clobber what an outer
+        // one is holding - that is the whole purpose of save_level.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+        let prev_saved = unsafe { SAVED_SEARCH_PATTERNS.get_mut() }.clone();
+        *unsafe { SAVED_SEARCH_PATTERNS.get_mut() } = SavedSearchPatterns::default();
+
+        unsafe { set_last_search_pat(b"outer", false, true, true) };
+        unsafe { save_search_patterns() };
+
+        unsafe { set_last_search_pat(b"middle", false, true, true) };
+        // A nested save records NOTHING.
+        unsafe { save_search_patterns() };
+        unsafe { set_last_search_pat(b"inner", false, true, true) };
+        // ...so a nested restore puts nothing back either.
+        unsafe { restore_search_patterns() };
+        assert_eq!(
+            unsafe { last_search_pattern() },
+            Some(&b"inner"[..]),
+            "an inner restore must be a no-op"
+        );
+
+        // Only the outermost restore reinstates the saved pattern.
+        unsafe { restore_search_patterns() };
+        assert_eq!(unsafe { last_search_pattern() }, Some(&b"outer"[..]));
+
+        *unsafe { SEARCH_PATTERNS.get_mut() } = prev;
+        *unsafe { SAVED_SEARCH_PATTERNS.get_mut() } = prev_saved;
+    }
 
     /// Saves and restores the whole search-pattern state.
     struct SpatsGuard {
