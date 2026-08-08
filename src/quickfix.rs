@@ -108,6 +108,52 @@
 use crate::buffer_defs::{BufT, WinT, BUF_HAS_LL_ENTRY, BUF_HAS_QF_ENTRY};
 use crate::garray_defs::GarrayT;
 
+/// One entry of the directory stack used while parsing `'errorformat'`
+/// output (`dir_stack_T`).
+///
+/// The original is an intrusive singly-linked list of raw pointers,
+/// each owning its own `dirname`. An owned `Option<Box<..>>` chain
+/// expresses the same shape while making the ownership explicit -
+/// which is what lets the explicit `xfree` calls disappear below.
+#[derive(Debug, Default)]
+pub struct DirStackT {
+    /// The next entry down the stack (`next`).
+    pub next: Option<Box<DirStackT>>,
+    /// The directory this entry names (`dirname`).
+    pub dirname: Option<Vec<u8>>,
+}
+
+/// Pop the top entry off a directory stack (`qf_pop_dir`).
+///
+/// @return the directory now on top, or `None` when the stack has been
+///         emptied. The original returns the new top's own `dirname`
+///         pointer; this returns a copy, since the entry it points
+///         into may be freed by a later pop.
+///
+/// The original frees the popped entry explicitly; dropping the owned
+/// `Box` here is the whole of that.
+pub fn qf_pop_dir(stackptr: &mut Option<Box<DirStackT>>) -> Option<Vec<u8>> {
+    // Pop the top element and free it.
+    if let Some(top) = stackptr.take() {
+        *stackptr = top.next;
+    }
+
+    stackptr.as_ref().and_then(|d| d.dirname.clone())
+}
+
+/// Empty a directory stack completely (`qf_clean_dir_stack`).
+///
+/// The original walks the list freeing each entry and its `dirname`;
+/// dropping the owned chain does all of that.
+pub fn qf_clean_dir_stack(stackptr: &mut Option<Box<DirStackT>>) {
+    // Iteratively, not by simply assigning None: a recursive drop of a
+    // long chain could overflow the stack.
+    let mut cur = stackptr.take();
+    while let Some(mut entry) = cur {
+        cur = entry.next.take();
+    }
+}
+
 /// Sentinel for "no quickfix list index" (`INVALID_QFIDX`).
 pub const INVALID_QFIDX: i32 = -1;
 /// Sentinel for "no quickfix window buffer" (`INVALID_QFBUFNR`).
@@ -702,6 +748,67 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_pop_dir / qf_clean_dir_stack ---
+
+    fn dir_stack(dirs: &[&[u8]]) -> Option<Box<DirStackT>> {
+        // Built top-first, so dirs[0] ends up on top of the stack.
+        let mut head: Option<Box<DirStackT>> = None;
+        for d in dirs.iter().rev() {
+            head = Some(Box::new(DirStackT { next: head, dirname: Some(d.to_vec()) }));
+        }
+        head
+    }
+
+    #[test]
+    fn qf_pop_dir_reports_the_directory_now_on_top() {
+        let mut stack = dir_stack(&[b"/top", b"/middle", b"/bottom"]);
+
+        assert_eq!(qf_pop_dir(&mut stack).as_deref(), Some(&b"/middle"[..]));
+        assert_eq!(qf_pop_dir(&mut stack).as_deref(), Some(&b"/bottom"[..]));
+    }
+
+    #[test]
+    fn qf_pop_dir_reports_nothing_once_the_stack_is_emptied() {
+        let mut stack = dir_stack(&[b"/only"]);
+
+        // Popping the single entry leaves nothing on top.
+        assert_eq!(qf_pop_dir(&mut stack), None);
+        assert!(stack.is_none());
+    }
+
+    #[test]
+    fn qf_pop_dir_on_an_empty_stack_is_a_noop() {
+        let mut stack: Option<Box<DirStackT>> = None;
+        assert_eq!(qf_pop_dir(&mut stack), None);
+        assert!(stack.is_none());
+    }
+
+    #[test]
+    fn qf_clean_dir_stack_empties_the_whole_stack() {
+        let mut stack = dir_stack(&[b"/a", b"/b", b"/c"]);
+        qf_clean_dir_stack(&mut stack);
+        assert!(stack.is_none());
+    }
+
+    #[test]
+    fn qf_clean_dir_stack_on_an_empty_stack_is_a_noop() {
+        let mut stack: Option<Box<DirStackT>> = None;
+        qf_clean_dir_stack(&mut stack);
+        assert!(stack.is_none());
+    }
+
+    #[test]
+    fn qf_clean_dir_stack_handles_a_long_chain_without_overflowing() {
+        // The iterative teardown exists so a deep stack cannot blow
+        // the call stack via recursive Drop.
+        let dirs: Vec<Vec<u8>> = (0..50_000).map(|i| format!("/d{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = dirs.iter().map(std::vec::Vec::as_slice).collect();
+        let mut stack = dir_stack(&refs);
+
+        qf_clean_dir_stack(&mut stack);
+        assert!(stack.is_none());
+    }
 
     // --- efm_option_part_len ---
 
