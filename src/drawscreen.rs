@@ -204,6 +204,36 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// The width actually usable by the fold column, given that `col`
+/// columns are already spoken for (`compute_foldcolumn`).
+///
+/// The requested `'foldcolumn'` width is capped by whatever space is
+/// left after `col` and a minimum window width, so a wide fold column
+/// can never squeeze the text area away entirely.
+///
+/// The current window is allowed a minimum of 1 even when
+/// `'winminwidth'` is 0, matching the original - a window you are
+/// editing in must keep at least one usable column.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` for the
+/// whole call. Forwarded from
+/// [`crate::window::win_fdccol_count`]'s own safety doc.
+pub unsafe fn compute_foldcolumn(wp: *mut WinT, col: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdc = unsafe { crate::window::win_fdccol_count(&mut *wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_wmw = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw as i32;
+
+    let wmw = if std::ptr::eq(wp, curwin) && p_wmw == 0 { 1 } else { p_wmw };
+    // SAFETY: forwarded from this function's own safety doc.
+    let n = unsafe { (*wp).w_view_width } - (col + wmw);
+
+    fdc.min(n)
+}
+
 /// Schedule a title redraw if `'titlestring'`/`'iconstring'` contain
 /// statusline items (`redraw_custom_title_later`).
 ///
@@ -815,6 +845,57 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_foldcolumn_caps_the_requested_width_by_available_space() {
+        // The requested 'foldcolumn' is capped by whatever is left
+        // after `col` and a minimum window width, so a wide fold
+        // column can never squeeze the text area away.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wmw = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw;
+        let prev_cur = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::null_mut();
+
+        // Plenty of room: the requested width wins.
+        let mut win = crate::buffer_defs::WinT { w_view_width: 80, ..Default::default() };
+        win.w_onebuf_opt.wo_fdc = Some(b"4".to_vec());
+        assert_eq!(unsafe { compute_foldcolumn(&mut win, 0) }, 4);
+
+        // Almost no room left: the available space wins instead.
+        let mut win = crate::buffer_defs::WinT { w_view_width: 10, ..Default::default() };
+        win.w_onebuf_opt.wo_fdc = Some(b"9".to_vec());
+        // 10 - (7 + 1) == 2
+        assert_eq!(unsafe { compute_foldcolumn(&mut win, 7) }, 2);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_cur;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = prev_wmw;
+    }
+
+    #[test]
+    fn compute_foldcolumn_reserves_one_column_for_the_current_window() {
+        // With 'winminwidth' at 0 the CURRENT window still keeps one
+        // usable column; any other window does not get that floor.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_wmw = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw;
+        let prev_cur = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = 0;
+
+        let mut win = crate::buffer_defs::WinT { w_view_width: 10, ..Default::default() };
+        win.w_onebuf_opt.wo_fdc = Some(b"9".to_vec());
+
+        // Not the current window: wmw is 0, so 10 - (0 + 0) == 10,
+        // capped by the requested 9.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::null_mut();
+        assert_eq!(unsafe { compute_foldcolumn(&mut win, 0) }, 9);
+
+        // The current window: wmw becomes 1, so 10 - (0 + 1) == 9.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win;
+        assert_eq!(unsafe { compute_foldcolumn(&mut win, 2) }, 7);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_cur;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = prev_wmw;
+    }
 
     #[test]
     fn redraw_custom_title_later_needs_both_enabled_and_statusline_syntax() {
