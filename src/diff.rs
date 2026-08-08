@@ -281,6 +281,69 @@ pub unsafe fn diff_free(
     ret
 }
 
+/// Input to a diff operation (`diffin_T`).
+///
+/// Exactly one of the two fields is in use: an external diff writes
+/// the text to a temporary FILE and names it in `din_fname`, while an
+/// internal diff keeps it in memory. `din_fname` being unset is what
+/// distinguishes the two, and drives [`clear_diffin`].
+///
+/// The original's `mmfile_t` (an xdiff `{ptr, size}` pair) becomes an
+/// owned `Vec<u8>`, matching `linematch.rs`'s own treatment of the
+/// same type.
+#[derive(Debug, Default)]
+pub struct DiffinT {
+    /// Temporary file holding the text, for an external diff
+    /// (`din_fname`).
+    pub din_fname: Option<Vec<u8>>,
+    /// The text itself, for an internal diff (`din_mmfile`).
+    pub din_mmfile: Vec<u8>,
+}
+
+/// Result of a diff operation (`diffout_T`).
+///
+/// Mirrors [`DiffinT`]: an external diff leaves its output in a
+/// temporary file, an internal one in a growable array.
+#[derive(Debug, Default)]
+pub struct DiffoutT {
+    /// Temporary file holding the result, for an external diff
+    /// (`dout_fname`).
+    pub dout_fname: Option<Vec<u8>>,
+    /// The result itself, for an internal diff (`dout_ga`).
+    pub dout_ga: crate::garray_defs::GarrayT,
+}
+
+/// Release whichever half of `din` is actually in use
+/// (`clear_diffin`).
+///
+/// With no temporary file the in-memory buffer is released; with one,
+/// the FILE is deleted instead. Getting that branch backwards would
+/// leak a temp file on every external diff, so it is what the tests
+/// check.
+pub fn clear_diffin(din: &mut DiffinT) {
+    match din.din_fname.as_ref() {
+        None => din.din_mmfile.clear(),
+        Some(fname) => {
+            if let Ok(s) = std::str::from_utf8(fname) {
+                crate::os::fs::os_remove(std::path::Path::new(s));
+            }
+        }
+    }
+}
+
+/// Release whichever half of `dout` is actually in use
+/// (`clear_diffout`).
+pub fn clear_diffout(dout: &mut DiffoutT) {
+    match dout.dout_fname.as_ref() {
+        None => dout.dout_ga.ga_clear(),
+        Some(fname) => {
+            if let Ok(s) = std::str::from_utf8(fname) {
+                crate::os::fs::os_remove(std::path::Path::new(s));
+            }
+        }
+    }
+}
+
 /// Copy one diff entry's line range from one buffer slot to another
 /// (`diff_copy_entry`).
 ///
@@ -845,6 +908,66 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- clear_diffin / clear_diffout ---
+
+    #[test]
+    fn clear_diffin_releases_the_in_memory_buffer_when_there_is_no_temp_file() {
+        let mut din = DiffinT {
+            din_fname: None,
+            din_mmfile: b"line one\nline two\n".to_vec(),
+        };
+        clear_diffin(&mut din);
+        assert!(din.din_mmfile.is_empty());
+    }
+
+    #[test]
+    fn clear_diffin_deletes_the_temp_file_when_there_is_one() {
+        // The branch that matters: with a file named, the FILE is
+        // removed rather than the (unused) memory buffer.
+        let path = std::env::temp_dir().join("nero_clear_diffin_test.txt");
+        std::fs::write(&path, b"scratch").unwrap();
+        assert!(path.exists());
+
+        let mut din = DiffinT {
+            din_fname: Some(path.to_str().unwrap().as_bytes().to_vec()),
+            din_mmfile: Vec::new(),
+        };
+        clear_diffin(&mut din);
+
+        let gone = !path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(gone, "the temporary file must be deleted");
+    }
+
+    #[test]
+    fn clear_diffout_releases_the_growable_array_when_there_is_no_temp_file() {
+        let mut dout = DiffoutT {
+            dout_fname: None,
+            dout_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+        };
+        clear_diffout(&mut dout);
+        assert_eq!(dout.dout_ga.ga_len, 0);
+    }
+
+    #[test]
+    fn clear_diffout_deletes_the_temp_file_when_there_is_one() {
+        let path = std::env::temp_dir().join("nero_clear_diffout_test.txt");
+        std::fs::write(&path, b"scratch").unwrap();
+
+        let mut dout = DiffoutT {
+            dout_fname: Some(path.to_str().unwrap().as_bytes().to_vec()),
+            dout_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+        };
+        clear_diffout(&mut dout);
+
+        let gone = !path.exists();
+        let ga_len = dout.dout_ga.ga_len;
+        let _ = std::fs::remove_file(&path);
+
+        assert!(gone, "the temporary file must be deleted");
+        assert_eq!(ga_len, 3, "the unused array is left alone on this branch");
+    }
 
     // --- diff_copy_entry ---
 
