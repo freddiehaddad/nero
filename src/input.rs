@@ -138,6 +138,20 @@ static BLOCK_REDO: GlobalCell<bool> = GlobalCell::new(false);
 /// File-static in the original.
 static TYPEAHEAD_CHAR: GlobalCell<i32> = GlobalCell::new(0);
 
+/// `getcharmod()` - the modifiers of the last obtained character
+/// (`f_getcharmod`, `input.c`).
+///
+/// # Safety
+/// Reads `GLOBALS`.
+pub unsafe fn f_getcharmod(
+    _argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mod_mask = unsafe { crate::globals::GLOBALS.get_mut() }.mod_mask;
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(mod_mask));
+}
+
 /// Remove the last `slen` bytes from `buf` (`delete_buff_tail`).
 ///
 /// A no-op when the buffer is empty or its last block is shorter than
@@ -666,6 +680,36 @@ mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
     use crate::input_defs::BuffblockT;
+
+    // --- f_getcharmod ---
+
+    #[test]
+    fn getcharmod_reports_the_current_modifier_mask() {
+        let _lock = global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.mod_mask;
+        g.mod_mask = 0x24;
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getcharmod(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.mod_mask = prev;
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(0x24));
+    }
+
+    #[test]
+    fn getcharmod_reports_zero_when_no_modifiers_are_held() {
+        let _lock = global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.mod_mask;
+        g.mod_mask = 0;
+
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+        unsafe { f_getcharmod(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.mod_mask = prev;
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(0));
+    }
 
     // --- delete_buff_tail / start_stuff ---
 

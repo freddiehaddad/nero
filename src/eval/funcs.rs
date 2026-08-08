@@ -541,6 +541,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"getcmdwintype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcmdwintype });
         m.insert(&b"getpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getpos });
         m.insert(&b"getcharpos"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_getcharpos });
+        m.insert(&b"getcharmod"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::input::f_getcharmod });
         m.insert(&b"getcurpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcurpos });
         m.insert(&b"getcursorcharpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: 1, func: f_getcursorcharpos });
         m.insert(&b"setcharsearch"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: f_setcharsearch });
@@ -8430,6 +8431,7 @@ mod tests {
     #[test]
     fn new_builtins_are_all_registered() {
         for name in [
+            "getcharmod",
             "executable",
             "exepath",
             "and",
