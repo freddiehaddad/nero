@@ -204,6 +204,58 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// Schedule a title redraw if `'titlestring'`/`'iconstring'` contain
+/// statusline items (`redraw_custom_title_later`).
+///
+/// @return whether a redraw was actually scheduled - the caller uses
+///         this to decide whether anything more is needed.
+///
+/// Only a title/icon that is ENABLED and actually uses statusline
+/// syntax needs re-evaluating; a plain literal title cannot have
+/// changed.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn redraw_custom_title_later() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    let (p_icon, p_title) = (opts.p_icon, opts.p_title);
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+
+    if (p_icon != 0 && g.stl_syntax & crate::globals::STL_IN_ICON != 0)
+        || (p_title != 0 && g.stl_syntax & crate::globals::STL_IN_TITLE != 0)
+    {
+        g.need_maketitle = true;
+        return true;
+    }
+    false
+}
+
+/// Move the message cursor to the start of the last screen row
+/// (`msg_pos_mode`).
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn msg_pos_mode() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.msg_col = 0;
+    g.msg_row = g.Rows - 1;
+}
+
+/// Mark a single line in `wp` for redraw (`redrawWinline`).
+///
+/// A thin wrapper over [`redraw_win_range_later`] with the same line
+/// as both ends of the range.
+///
+/// # Safety
+/// Forwarded from [`redraw_win_range_later`]'s own safety doc.
+pub unsafe fn redraw_winline(wp: *mut WinT, lnum: LinenrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { redraw_win_range_later(wp, lnum, lnum) };
+}
+
 /// Invalidate every window's allocated grid and schedule a full
 /// redraw (`screen_invalidate_highlights`).
 ///
@@ -763,6 +815,110 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redraw_custom_title_later_needs_both_enabled_and_statusline_syntax() {
+        // Only a title/icon that is ENABLED and actually uses
+        // statusline syntax needs re-evaluating; a plain literal title
+        // cannot have changed.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_syntax, prev_title_flag) = (g.stl_syntax, g.need_maketitle);
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_icon, prev_title) = (opts.p_icon, opts.p_title);
+
+        // Enabled AND using statusline syntax: schedules a redraw.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_title = 1;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_icon = 0;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.stl_syntax = crate::globals::STL_IN_TITLE;
+        g.need_maketitle = false;
+        assert!(unsafe { redraw_custom_title_later() });
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+
+        // Statusline syntax present but 'title' is OFF: nothing to do.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_title = 0;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.need_maketitle = false;
+        assert!(!unsafe { redraw_custom_title_later() });
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_maketitle);
+
+        // 'title' on but the string has no statusline items.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_title = 1;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.stl_syntax = 0;
+        g.need_maketitle = false;
+        assert!(!unsafe { redraw_custom_title_later() });
+
+        // The icon half works the same way, independently.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_title = 0;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_icon = 1;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.stl_syntax = crate::globals::STL_IN_ICON;
+        g.need_maketitle = false;
+        assert!(unsafe { redraw_custom_title_later() });
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.stl_syntax = prev_syntax;
+        g.need_maketitle = prev_title_flag;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_icon = prev_icon;
+        opts.p_title = prev_title;
+    }
+
+    #[test]
+    fn msg_pos_mode_moves_to_the_start_of_the_last_row() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_col, prev_row, prev_rows) = (g.msg_col, g.msg_row, g.Rows);
+        g.Rows = 30;
+        g.msg_col = 17;
+        g.msg_row = 3;
+
+        unsafe { msg_pos_mode() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.msg_col, 0);
+        assert_eq!(g.msg_row, 29, "the LAST row, i.e. Rows - 1");
+
+        g.msg_col = prev_col;
+        g.msg_row = prev_row;
+        g.Rows = prev_rows;
+    }
+
+    #[test]
+    fn redraw_winline_marks_exactly_one_line() {
+        // redraw_win_range_later only records a line that is actually
+        // visible, so the fixture needs a real topline/botline window.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_topline: 1,
+            w_botline: 20,
+            ..Default::default()
+        };
+        unsafe { redraw_winline(&mut win, 7) };
+
+        // Both ends of the range are the same line.
+        assert_eq!(win.w_redraw_top, 7);
+        assert_eq!(win.w_redraw_bot, 7);
+    }
+
+    #[test]
+    fn redraw_winline_ignores_a_line_outside_the_view() {
+        // A line below w_botline is not on screen, so nothing is
+        // scheduled - the range check lives in redraw_win_range_later
+        // and this wrapper must not bypass it.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_topline: 1,
+            w_botline: 20,
+            ..Default::default()
+        };
+        unsafe { redraw_winline(&mut win, 99) };
+
+        assert_eq!(win.w_redraw_top, 0);
+        assert_eq!(win.w_redraw_bot, 0);
+    }
 
     #[test]
     fn screen_invalidate_highlights_clears_every_windows_grid() {
