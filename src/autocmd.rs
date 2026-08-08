@@ -475,6 +475,34 @@ pub fn augroup_exists(name: &[u8]) -> bool {
     augroup_find(name) > 0
 }
 
+/// Parse a group name at the start of `arg` (`arg_augroup_get`).
+///
+/// @return the group ID plus the offset past the consumed group name,
+///         or [`crate::autocmd_defs::augroup::ALL`] with the offset
+///         unchanged when there is no leading name or it does not
+///         match a real group. The original advances a `char **argp`
+///         in place; that becomes the returned offset here.
+#[must_use]
+pub fn arg_augroup_get(arg: &[u8]) -> (i32, usize) {
+    let mut p = 0;
+    while p < arg.len() && arg[p] != 0 && !crate::ascii_defs::ascii_iswhite(i32::from(arg[p])) && arg[p] != b'|' {
+        p += 1;
+    }
+    if p == 0 {
+        return (crate::autocmd_defs::augroup::ALL, 0);
+    }
+
+    let group = augroup_find(&arg[..p]);
+    if group == crate::autocmd_defs::augroup::ERROR {
+        // No match, use all groups - and leave the argument alone, so
+        // the caller re-reads what it was given.
+        (crate::autocmd_defs::augroup::ALL, 0)
+    } else {
+        // Match: skip over the group name and any following blanks.
+        (group, p + crate::charset::skipwhite(&arg[p..]))
+    }
+}
+
 /// Event names for `ExpandGeneric`, excluding group names
 /// (`get_event_name_no_group`).
 ///
@@ -942,6 +970,75 @@ mod tests {
         assert_eq!(augroup_find(b"GroupA"), 1);
         assert_eq!(augroup_find(b"GroupB"), 2);
         assert_eq!(augroup_find(b"GroupC"), augroup::ERROR);
+        reset_augroup_map();
+    }
+
+    // --- arg_augroup_get ---
+
+    #[test]
+    fn arg_augroup_get_finds_a_real_group_and_consumes_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"MyGroup".to_vec(), 5);
+
+        let arg = b"MyGroup BufRead *.c";
+        let (group, off) = arg_augroup_get(arg);
+        assert_eq!(group, 5);
+        assert_eq!(&arg[off..], b"BufRead *.c", "the name and blanks are consumed");
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn arg_augroup_get_leaves_the_argument_alone_when_the_name_is_not_a_group() {
+        // An unmatched leading word is NOT consumed - it is the event
+        // list, not a group name - so the offset stays at zero.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+
+        let arg = b"BufRead *.c";
+        let (group, off) = arg_augroup_get(arg);
+        assert_eq!(group, augroup::ALL);
+        assert_eq!(off, 0);
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn arg_augroup_get_with_no_leading_word_is_all_groups() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+
+        for arg in [&b""[..], &b" BufRead"[..], &b"|foo"[..]] {
+            let (group, off) = arg_augroup_get(arg);
+            assert_eq!(group, augroup::ALL, "{arg:?}");
+            assert_eq!(off, 0, "{arg:?}");
+        }
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn arg_augroup_get_stops_the_name_at_a_bar() {
+        // A '|' ends the group name just as whitespace does.
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"MyGroup".to_vec(), 7);
+
+        let arg = b"MyGroup|echo";
+        let (group, off) = arg_augroup_get(arg);
+        assert_eq!(group, 7);
+        assert_eq!(&arg[off..], b"|echo", "the bar itself is not consumed");
+        reset_augroup_map();
+    }
+
+    #[test]
+    fn arg_augroup_get_consumes_a_bare_group_name_with_nothing_after_it() {
+        let _lock = crate::globals::global_state_test_lock();
+        reset_augroup_map();
+        unsafe { MAP_AUGROUP_NAME_TO_ID.get_mut() }.insert(b"Solo".to_vec(), 9);
+
+        let arg = b"Solo";
+        let (group, off) = arg_augroup_get(arg);
+        assert_eq!(group, 9);
+        assert_eq!(off, arg.len());
         reset_augroup_map();
     }
 
