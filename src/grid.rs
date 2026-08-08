@@ -111,6 +111,79 @@ pub fn get_bordertext_col(
     }
 }
 
+/// Line buffer holding the characters to be drawn (`linebuf_char`).
+///
+/// The original is a raw pointer to an array reallocated as the screen
+/// resizes; a `Vec` carries its own length, so the separate size
+/// tracking has no equivalent.
+pub static LINEBUF_CHAR: crate::globals::GlobalCell<Vec<ScharT>> =
+    crate::globals::GlobalCell::new(Vec::new());
+/// Line buffer holding each cell's highlight attribute
+/// (`linebuf_attr`).
+pub static LINEBUF_ATTR: crate::globals::GlobalCell<Vec<crate::types_defs::SattrT>> =
+    crate::globals::GlobalCell::new(Vec::new());
+/// Line buffer holding each cell's virtual column (`linebuf_vcol`).
+pub static LINEBUF_VCOL: crate::globals::GlobalCell<Vec<crate::pos_defs::ColnrT>> =
+    crate::globals::GlobalCell::new(Vec::new());
+/// Scratch line buffer (`linebuf_scratch`).
+pub static LINEBUF_SCRATCH: crate::globals::GlobalCell<Vec<u8>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Whether the cell at `col` differs from what the grid already shows
+/// (`grid_char_needs_redraw`).
+///
+/// A redraw is needed when the character or its attribute changed, or
+/// when the character is two cells wide and its second cell differs.
+/// Ex mode and `'redrawdebug'`'s "nodelta" both force every cell to be
+/// redrawn regardless.
+///
+/// # Safety
+/// `grid.chars`/`grid.attrs` must be valid arrays covering `off_to`
+/// (and `off_to + 1` when `cols > 1`), and reads `GLOBALS`/
+/// `OPTION_VARS` plus the `LINEBUF_*` file-statics.
+#[must_use]
+pub unsafe fn grid_char_needs_redraw(
+    grid: &crate::grid_defs::ScreenGrid,
+    col: usize,
+    off_to: usize,
+    cols: i32,
+) -> bool {
+    if cols <= 0 {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (linebuf_char, linebuf_attr) =
+        unsafe { (&*LINEBUF_CHAR.get_mut(), &*LINEBUF_ATTR.get_mut()) };
+
+    let ch = linebuf_char.get(col).copied().unwrap_or(0);
+    let at = linebuf_attr.get(col).copied().unwrap_or(0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let (grid_ch, grid_at) = unsafe { (*grid.chars.add(off_to), *grid.attrs.add(off_to)) };
+
+    let mut changed = ch != grid_ch || at != grid_at;
+
+    if !changed && cols > 1 {
+        // A double-width character's second cell is stored as 0; if
+        // the grid disagrees there, the pair still needs redrawing.
+        let next = linebuf_char.get(col + 1).copied().unwrap_or(0);
+        // SAFETY: forwarded from this function's own safety doc.
+        let grid_next = unsafe { *grid.chars.add(off_to + 1) };
+        changed = next == 0 && next != grid_next;
+    }
+
+    if changed {
+        return true;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let exmode_active = unsafe { crate::globals::GLOBALS.get_mut() }.exmode_active;
+    // SAFETY: forwarded from this function's own safety doc.
+    let rdb_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.rdb_flags;
+
+    exmode_active || rdb_flags & crate::option_vars::opt_rdb_flag::NODELTA != 0
+}
+
 /// Handle for the default grid (`DEFAULT_GRID_HANDLE`).
 pub const DEFAULT_GRID_HANDLE: crate::types_defs::HandleT = 1;
 
@@ -566,6 +639,118 @@ pub unsafe fn grid_getchar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- grid_char_needs_redraw ---
+
+    /// A grid backed by real arrays, plus the line buffers set to the
+    /// values being compared against it.
+    fn redraw_fixture(
+        grid_chars: &mut [ScharT],
+        grid_attrs: &mut [crate::types_defs::SattrT],
+        buf_chars: &[ScharT],
+        buf_attrs: &[crate::types_defs::SattrT],
+    ) -> crate::grid_defs::ScreenGrid {
+        unsafe {
+            *LINEBUF_CHAR.get_mut() = buf_chars.to_vec();
+            *LINEBUF_ATTR.get_mut() = buf_attrs.to_vec();
+        }
+        crate::grid_defs::ScreenGrid {
+            chars: grid_chars.as_mut_ptr(),
+            attrs: grid_attrs.as_mut_ptr(),
+            rows: 1,
+            cols: grid_chars.len() as i32,
+            ..Default::default()
+        }
+    }
+
+    fn clear_linebufs() {
+        unsafe {
+            LINEBUF_CHAR.get_mut().clear();
+            LINEBUF_ATTR.get_mut().clear();
+        }
+    }
+
+    #[test]
+    fn grid_char_needs_redraw_is_false_when_nothing_changed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gc = [65u32, 66];
+        let mut ga = [1i32, 1];
+        let grid = redraw_fixture(&mut gc, &mut ga, &[65, 66], &[1, 1]);
+
+        let got = unsafe { grid_char_needs_redraw(&grid, 0, 0, 1) };
+        clear_linebufs();
+        assert!(!got);
+    }
+
+    #[test]
+    fn grid_char_needs_redraw_detects_a_changed_character_or_attribute() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let mut gc = [65u32, 66];
+        let mut ga = [1i32, 1];
+        let grid = redraw_fixture(&mut gc, &mut ga, &[99, 66], &[1, 1]);
+        let char_changed = unsafe { grid_char_needs_redraw(&grid, 0, 0, 1) };
+
+        let mut gc2 = [65u32, 66];
+        let mut ga2 = [1i32, 1];
+        let grid2 = redraw_fixture(&mut gc2, &mut ga2, &[65, 66], &[9, 1]);
+        let attr_changed = unsafe { grid_char_needs_redraw(&grid2, 0, 0, 1) };
+
+        clear_linebufs();
+        assert!(char_changed, "a different character needs a redraw");
+        assert!(attr_changed, "so does a different attribute");
+    }
+
+    #[test]
+    fn grid_char_needs_redraw_checks_the_second_cell_of_a_wide_character() {
+        // A double-width character stores 0 in its second cell. If the
+        // grid disagrees there, the pair needs redrawing even though
+        // the first cell and its attribute both match.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gc = [65u32, 77];
+        let mut ga = [1i32, 1];
+        let grid = redraw_fixture(&mut gc, &mut ga, &[65, 0], &[1, 1]);
+
+        let needs = unsafe { grid_char_needs_redraw(&grid, 0, 0, 2) };
+        // With cols == 1 the second cell is not consulted at all.
+        let ignored = unsafe { grid_char_needs_redraw(&grid, 0, 0, 1) };
+
+        clear_linebufs();
+        assert!(needs);
+        assert!(!ignored, "the second cell only matters when cols > 1");
+    }
+
+    #[test]
+    fn grid_char_needs_redraw_is_false_for_a_zero_width_run() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gc = [99u32];
+        let mut ga = [9i32];
+        let grid = redraw_fixture(&mut gc, &mut ga, &[65], &[1]);
+
+        let got = unsafe { grid_char_needs_redraw(&grid, 0, 0, 0) };
+        clear_linebufs();
+        assert!(!got, "nothing to draw, however different it is");
+    }
+
+    #[test]
+    fn grid_char_needs_redraw_is_forced_by_nodelta() {
+        // 'redrawdebug' nodelta forces every cell to be redrawn even
+        // when it is identical.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut gc = [65u32];
+        let mut ga = [1i32];
+        let grid = redraw_fixture(&mut gc, &mut ga, &[65], &[1]);
+
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = ov.rdb_flags;
+        ov.rdb_flags = crate::option_vars::opt_rdb_flag::NODELTA;
+
+        let got = unsafe { grid_char_needs_redraw(&grid, 0, 0, 1) };
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.rdb_flags = prev;
+        clear_linebufs();
+        assert!(got);
+    }
 
     // --- get_bordertext_col ---
 
