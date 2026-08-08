@@ -51,6 +51,7 @@ pub mod ex_cmds2;
 pub mod ex_cmds_defs;
 pub mod ex_docmd;
 pub mod ex_getln;
+pub mod ex_getln_defs;
 pub mod ex_eval;
 pub mod ex_eval_defs;
 pub mod ex_session;
