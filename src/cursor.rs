@@ -666,7 +666,7 @@ pub unsafe fn coladvance_force(wcol: ColnrT) -> i32 {
     } else {
         // Virtcol is valid.
         // SAFETY: forwarded from this function's own safety doc.
-        crate::r#move::set_valid_virtcol(unsafe { &mut *curwin }, wcol);
+        unsafe { crate::r#move::set_valid_virtcol(curwin, wcol) };
     }
     rc
 }
@@ -709,8 +709,9 @@ pub unsafe fn coladvance(wp: *mut WinT, wcol: ColnrT) -> i32 {
             // precedent), kept exactly as-is rather than "fixed" to
             // use `wp`.
             // SAFETY: forwarded from this function's own safety doc.
-            let curwin = unsafe { &mut *crate::globals::GLOBALS.get_mut().curwin };
-            crate::r#move::set_valid_virtcol(curwin, wcol);
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::r#move::set_valid_virtcol(curwin, wcol) };
         }
     }
     rc

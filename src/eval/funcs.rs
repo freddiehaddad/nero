@@ -15931,7 +15931,8 @@ mod tests {
         // set_valid_virtcol below) stays set, avoiding
         // validate_virtcol's own getvvcol fallback, which would need
         // a real buffer.
-        crate::r#move::set_valid_virtcol(&mut win, 7);
+        // SAFETY: `win` is a live local for the whole call.
+        unsafe { crate::r#move::set_valid_virtcol(&mut win, 7) };
         let mut tp = crate::buffer_defs::TabpageT::default();
         let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
 

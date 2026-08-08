@@ -559,22 +559,75 @@ unsafe fn scrolloffpad_eof_pressure(
     i64::from(lnum) > i64::from(line_count) - so
 }
 
+/// Schedule the redraws a horizontal cursor move requires
+/// (`redraw_for_cursorcolumn`).
+///
+/// Four independent effects, each with its own guard:
+/// - With `'conceallevel'` on and the cursor line concealed, that line
+///   must be redrawn so the cursor position can be recomputed.
+/// - Everything below is skipped once `VALID_VIRTCOL` is set, since
+///   the virtual column has not actually moved.
+/// - `'cursorcolumn'` needs `UPD_SOME_VALID`; failing that,
+///   `'cursorline'` with `"screenline"` needs the cheaper `UPD_VALID`.
+/// - A cursor move in Visual mode re-inverts the current buffer.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`. Reads
+/// `GLOBALS.curwin`/`curbuf`/`Visual`, which must be valid. Forwarded
+/// from [`crate::drawscreen::conceal_cursor_line`]'s own safety doc.
+pub unsafe fn redraw_for_cursorcolumn(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (curwin, curbuf, visual_active) = (g.curwin, g.curbuf, g.Visual.active);
+
+    // If the cursor moves horizontally when 'concealcursor' is active,
+    // the current line needs redrawing to compute the cursor position.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if std::ptr::eq(wp, curwin)
+            && (*wp).w_onebuf_opt.wo_cole > 0
+            && crate::drawscreen::conceal_cursor_line(&*wp)
+        {
+            crate::drawscreen::redraw_winline(wp, (*wp).w_cursor.lnum);
+        }
+
+        if (*wp).w_valid & i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL) != 0 {
+            return;
+        }
+
+        if (*wp).w_onebuf_opt.wo_cuc != 0 {
+            // 'cursorcolumn' needs a wider redraw.
+            crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_SOME_VALID);
+        } else if (*wp).w_onebuf_opt.wo_cul != 0
+            && u32::from((*wp).w_p_culopt_flags)
+                & crate::option_vars::opt_culopt_flag::SCREENLINE
+                != 0
+        {
+            // 'cursorlineopt' containing "screenline" needs only the
+            // cheaper UPD_VALID.
+            crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_VALID);
+        }
+
+        // A cursor move in Visual mode re-inverts the current buffer.
+        if visual_active && std::ptr::eq((*wp).w_buffer, curbuf) {
+            crate::drawscreen::redraw_buf_later(curbuf, crate::drawscreen::UPD_INVERTED);
+        }
+    }
+}
+
 /// Set `wp.w_virtcol`/`w_valid`'s `VALID_VIRTCOL` bit for virtual
 /// column `vcol` (`set_valid_virtcol`).
 ///
-/// Deviates from the original by omitting the
-/// `redraw_for_cursorcolumn(wp)` call: a pure redraw-scheduling side
-/// effect (marks dirty regions for `'cursorcolumn'`/`'cursorlineopt'=
-/// "screenline"` redraws) that doesn't feed back into any value this
-/// crate currently computes - matches the established
-/// "skip the deferred-subsystem side effect, keep the state correct"
-/// policy (e.g. `mf_write`/`ml_open`/`u_sync`'s omitted `iemsg`/`emsg`
-/// calls). `redraw_for_cursorcolumn` itself needs `conceal_cursor_line`/
-/// `redrawWinline`/`redraw_later` (decoration.c/drawscreen.c's redraw-
-/// tracking side, not yet translated).
-pub fn set_valid_virtcol(wp: &mut WinT, vcol: crate::pos_defs::ColnrT) {
-    wp.w_virtcol = vcol;
-    wp.w_valid |= i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`. Forwarded
+/// from [`redraw_for_cursorcolumn`]'s own safety doc.
+pub unsafe fn set_valid_virtcol(wp: *mut WinT, vcol: crate::pos_defs::ColnrT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*wp).w_virtcol = vcol;
+        redraw_for_cursorcolumn(wp);
+        (*wp).w_valid |= i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL);
+    }
 }
 
 /// Check if the cursor has moved. Set the `w_valid` flag accordingly
@@ -1606,6 +1659,115 @@ pub unsafe fn cursor_correct_sms(wp: *mut WinT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redraw_for_cursorcolumn_stops_once_virtcol_is_already_valid() {
+        // Everything below the VALID_VIRTCOL check is skipped, because
+        // the virtual column has not actually moved.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
+        g.Visual.active = false;
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT {
+            w_valid: i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL),
+            w_redr_type: 0,
+            ..Default::default()
+        };
+        // 'cursorcolumn' would normally schedule a redraw.
+        win.w_onebuf_opt.wo_cuc = 1;
+
+        unsafe { redraw_for_cursorcolumn(&mut win) };
+        assert_eq!(win.w_redr_type, 0, "a valid virtcol short-circuits");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+        g.Visual.active = prev_vis;
+    }
+
+    #[test]
+    fn redraw_for_cursorcolumn_cursorcolumn_wins_over_cursorline() {
+        // 'cursorcolumn' takes the wider UPD_SOME_VALID; only when it
+        // is off does 'cursorline' + "screenline" get the cheaper
+        // UPD_VALID.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
+        g.Visual.active = false;
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT { w_redr_type: 0, ..Default::default() };
+        win.w_onebuf_opt.wo_cuc = 1;
+        win.w_onebuf_opt.wo_cul = 1;
+        win.w_p_culopt_flags =
+            crate::option_vars::opt_culopt_flag::SCREENLINE as u8;
+
+        unsafe { redraw_for_cursorcolumn(&mut win) };
+        assert_eq!(win.w_redr_type, crate::drawscreen::UPD_SOME_VALID);
+
+        // With 'cursorcolumn' off the cheaper level is used.
+        let mut win = crate::buffer_defs::WinT { w_redr_type: 0, ..Default::default() };
+        win.w_onebuf_opt.wo_cuc = 0;
+        win.w_onebuf_opt.wo_cul = 1;
+        win.w_p_culopt_flags =
+            crate::option_vars::opt_culopt_flag::SCREENLINE as u8;
+
+        unsafe { redraw_for_cursorcolumn(&mut win) };
+        assert_eq!(win.w_redr_type, crate::drawscreen::UPD_VALID);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+        g.Visual.active = prev_vis;
+    }
+
+    #[test]
+    fn redraw_for_cursorcolumn_needs_screenline_specifically() {
+        // 'cursorline' alone is not enough - the "screenline" flag in
+        // 'cursorlineopt' is what makes a horizontal move matter.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
+        g.Visual.active = false;
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT { w_redr_type: 0, ..Default::default() };
+        win.w_onebuf_opt.wo_cul = 1;
+        win.w_p_culopt_flags = crate::option_vars::opt_culopt_flag::LINE as u8;
+
+        unsafe { redraw_for_cursorcolumn(&mut win) };
+        assert_eq!(win.w_redr_type, 0);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+        g.Visual.active = prev_vis;
+    }
+
+    #[test]
+    fn set_valid_virtcol_sets_the_column_and_the_valid_bit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
+        g.Visual.active = false;
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT::default();
+        unsafe { set_valid_virtcol(&mut win, 7) };
+
+        assert_eq!(win.w_virtcol, 7);
+        assert_ne!(
+            win.w_valid & i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL),
+            0
+        );
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+        g.Visual.active = prev_vis;
+    }
     use crate::buffer_defs::BufT;
 
     fn win_with_buf(buf: *mut BufT) -> WinT {
