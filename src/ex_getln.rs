@@ -417,6 +417,80 @@ pub fn cmdline_at_end() -> bool {
 }
 
 
+/// The screen width of the command-line character at byte offset
+/// `idx` (`cmdline_charsize`).
+///
+/// An obscured command line shows `'*'` for every character, which is
+/// always one cell wide.
+///
+/// # Safety
+/// Reads `GLOBALS` and the `CCLINE` file-static, and forwards
+/// [`crate::charset::ptr2cells`]'s own safety doc.
+#[must_use]
+pub unsafe fn cmdline_charsize(idx: usize) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::globals::GLOBALS.get_mut() }.cmdline_star > 0 {
+        // Showing '*': always one position.
+        return 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    let Some(buff) = ccline.cmdbuff.as_ref() else {
+        return 1;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::charset::ptr2cells(buff.get(idx..).unwrap_or_default()) }
+}
+
+/// The screen-column offset of the command line's own text, past the
+/// prompt and indent (`cmd_startcol`).
+///
+/// # Safety
+/// Reads the `CCLINE` file-static.
+#[must_use]
+pub unsafe fn cmd_startcol() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    ccline.cmdindent + i32::from(ccline.cmdfirstc != 0)
+}
+
+/// Nudge a screen column past a wide character that would not fit
+/// (`correct_screencol`).
+///
+/// A multi-byte, multi-cell character that would straddle the right
+/// edge is pushed to the next row, so one extra column is consumed to
+/// leave room for the `">"` marker.
+///
+/// The original adds into an `int *col` in-out parameter; the column
+/// is taken and returned by value here.
+///
+/// # Safety
+/// Reads `GLOBALS` and the `CCLINE` file-static, and forwards
+/// [`crate::mbyte::utfc_ptr2len`]/[`crate::mbyte::utf_ptr2cells`]'s
+/// own safety docs.
+#[must_use]
+pub unsafe fn correct_screencol(idx: usize, cells: i32, col: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    let Some(buff) = ccline.cmdbuff.as_ref() else {
+        return col;
+    };
+    let p = buff.get(idx..).unwrap_or_default();
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let columns = unsafe { crate::globals::GLOBALS.get_mut() }.Columns;
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_multibyte = unsafe { crate::mbyte::utfc_ptr2len(p) } > 1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_wide = unsafe { crate::mbyte::utf_ptr2cells(p) } > 1;
+
+    if is_multibyte && is_wide && columns > 0 && col % columns + cells > columns {
+        col + 1
+    } else {
+        col
+    }
+}
+
 /// `getcmdcomplpat()` - the current command-line completion pattern
 /// (`f_getcmdcomplpat`, `ex_getln.c`) - always empty today, since
 /// `cmdline_is_active` is always `false` (the original's own
@@ -998,6 +1072,103 @@ mod tests {
 
         // SAFETY: forwarded from the lock reasoning above.
         unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    // --- cmdline column helpers ---
+
+    #[test]
+    fn cmd_startcol_accounts_for_the_indent_and_leading_character() {
+        let _guard = crate::globals::global_state_test_lock();
+
+        // No leading character: just the indent.
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdindent = 4;
+                cc.cmdfirstc = 0;
+            },
+            || unsafe { cmd_startcol() },
+        );
+        assert_eq!(got, 4);
+
+        // A leading ':' occupies one further column.
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdindent = 4;
+                cc.cmdfirstc = i32::from(b':');
+            },
+            || unsafe { cmd_startcol() },
+        );
+        assert_eq!(got, 5);
+    }
+
+    #[test]
+    fn cmdline_charsize_reports_one_cell_for_ascii() {
+        let _guard = crate::globals::global_state_test_lock();
+        let got = with_cmdline(
+            |cc| cc.cmdbuff = Some(b"abc".to_vec()),
+            || unsafe { cmdline_charsize(1) },
+        );
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    fn cmdline_charsize_is_one_for_an_obscured_command_line() {
+        // Every character shows as '*', so width never varies - even
+        // for a character that would otherwise be two cells wide.
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.cmdline_star;
+        g.cmdline_star = 1;
+
+        let got = with_cmdline(
+            |cc| cc.cmdbuff = Some("一".as_bytes().to_vec()),
+            || unsafe { cmdline_charsize(0) },
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.cmdline_star = prev;
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    fn correct_screencol_leaves_a_narrow_character_alone() {
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_cols = g.Columns;
+        g.Columns = 80;
+
+        // Plain ASCII is neither multi-byte nor wide, so no nudge -
+        // even sitting right at the edge.
+        let got = with_cmdline(
+            |cc| cc.cmdbuff = Some(b"abc".to_vec()),
+            || unsafe { correct_screencol(0, 1, 79) },
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Columns = prev_cols;
+        assert_eq!(got, 79);
+    }
+
+    #[test]
+    fn correct_screencol_nudges_a_wide_character_that_would_straddle_the_edge() {
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_cols = g.Columns;
+        g.Columns = 80;
+
+        // A two-cell character starting at the last column would run
+        // off the end, so one extra column is consumed.
+        let straddling = with_cmdline(
+            |cc| cc.cmdbuff = Some("一".as_bytes().to_vec()),
+            || unsafe { correct_screencol(0, 2, 79) },
+        );
+        // The same character with room to spare is left alone.
+        let fitting = with_cmdline(
+            |cc| cc.cmdbuff = Some("一".as_bytes().to_vec()),
+            || unsafe { correct_screencol(0, 2, 10) },
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Columns = prev_cols;
+        assert_eq!(straddling, 80);
+        assert_eq!(fitting, 10);
     }
 
     // --- getcmd* builtins ---
