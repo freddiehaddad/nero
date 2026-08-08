@@ -170,6 +170,110 @@ pub unsafe fn ui_rgb_attached() -> bool {
     })
 }
 
+/// Current cursor row as last sent to the UIs (`cursor_row`).
+static CURSOR_ROW: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+/// Current cursor column as last sent to the UIs (`cursor_col`).
+static CURSOR_COL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+/// Whether a cursor update is still owed to the UIs
+/// (`pending_cursor_update`).
+static PENDING_CURSOR_UPDATE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+/// Whether a mode-info update is still owed to the UIs
+/// (`pending_mode_info_update`).
+static PENDING_MODE_INFO_UPDATE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+/// The grid the cursor currently sits on (`cursor_grid_handle`).
+static CURSOR_GRID_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
+    crate::globals::GlobalCell::new(crate::grid::DEFAULT_GRID_HANDLE);
+
+/// The cursor's current row (`ui_current_row`).
+///
+/// # Safety
+/// Reads the `CURSOR_ROW` file-static.
+#[must_use]
+pub unsafe fn ui_current_row() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURSOR_ROW.get_mut() }
+}
+
+/// The cursor's current column (`ui_current_col`).
+///
+/// # Safety
+/// Reads the `CURSOR_COL` file-static.
+#[must_use]
+pub unsafe fn ui_current_col() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURSOR_COL.get_mut() }
+}
+
+/// Note that a mode-info update is owed to the UIs
+/// (`ui_mode_info_set`).
+///
+/// # Safety
+/// Mutates the `PENDING_MODE_INFO_UPDATE` file-static.
+pub unsafe fn ui_mode_info_set() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *PENDING_MODE_INFO_UPDATE.get_mut() = true };
+}
+
+/// Note that moving `grid_handle` implicitly moved the cursor
+/// (`ui_check_cursor_grid`).
+///
+/// Only the grid the cursor actually sits on matters; moving any
+/// other leaves the cursor where it was.
+///
+/// # Safety
+/// Reads/mutates the `CURSOR_GRID_HANDLE`/`PENDING_CURSOR_UPDATE`
+/// file-statics.
+pub unsafe fn ui_check_cursor_grid(grid_handle: crate::types_defs::HandleT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *CURSOR_GRID_HANDLE.get_mut() } == grid_handle {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *PENDING_CURSOR_UPDATE.get_mut() = true };
+    }
+}
+
+/// Whether the mouse is active for `mode` (`ui_mouse_has`).
+///
+/// `mode` is one of the `'mouse'` mode characters. An `"a"` in the
+/// option means every mode in `MOUSE_A`, and an `"h"` means every mode
+/// EXCEPT the hit-return prompt, but only while a help buffer is
+/// current.
+///
+/// # Safety
+/// Reads `OPTION_VARS` and `GLOBALS.curbuf`, which must be a valid
+/// pointer to a live buffer.
+#[must_use]
+pub unsafe fn ui_mouse_has(mode: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(p_mouse) = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mouse.clone() else {
+        return false;
+    };
+
+    for &c in &p_mouse {
+        if c == 0 {
+            break;
+        }
+        if c == b'a' {
+            if crate::strings::vim_strchr(crate::option_vars::MOUSE_A.as_bytes(), mode).is_some() {
+                return true;
+            }
+        } else if c == crate::option_vars::MOUSE_HELP {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+            // SAFETY: forwarded from this function's own safety doc.
+            let is_help = !curbuf.is_null() && unsafe { (*curbuf).b_help };
+            if mode != i32::from(crate::option_vars::MOUSE_RETURN) && is_help {
+                return true;
+            }
+        } else if mode == i32::from(c) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// The popup-menu height every attached UI can accommodate
 /// (`ui_pum_get_height`).
 ///
@@ -296,6 +400,123 @@ mod tests {
         let r = f();
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tgc = prev;
         r
+    }
+
+    // ---- ui_mouse_has / cursor accessors ----
+
+    fn with_mouse_opt<T>(opt: Option<&[u8]>, f: impl FnOnce() -> T) -> T {
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = ov.p_mouse.clone();
+        ov.p_mouse = opt.map(<[u8]>::to_vec);
+        let r = f();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_mouse = prev;
+        r
+    }
+
+    /// Boxed: the pointer is installed into GLOBALS.curbuf.
+    fn with_help_buf<T>(is_help: bool, f: impl FnOnce() -> T) -> T {
+        let mut buf = Box::new(crate::buffer_defs::BufT { b_help: is_help, ..Default::default() });
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = std::ptr::addr_of_mut!(*buf);
+        let r = f();
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+        r
+    }
+
+    #[test]
+    fn ui_mouse_has_all_covers_every_mode_in_mouse_a() {
+        let _lock = crate::globals::global_state_test_lock();
+        // MOUSE_A is "nvich", so those modes are covered...
+        for m in *b"nvich" {
+            assert!(
+                with_mouse_opt(Some(b"a"), || unsafe { ui_mouse_has(i32::from(m)) }),
+                "mode {} should be covered by 'a'",
+                m as char
+            );
+        }
+        // ...and the hit-return prompt is NOT one of them.
+        assert!(!with_mouse_opt(Some(b"a"), || unsafe {
+            ui_mouse_has(i32::from(crate::option_vars::MOUSE_RETURN))
+        }));
+    }
+
+    #[test]
+    fn ui_mouse_has_matches_an_explicitly_listed_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(with_mouse_opt(Some(b"nv"), || unsafe { ui_mouse_has(i32::from(b'n')) }));
+        assert!(with_mouse_opt(Some(b"nv"), || unsafe { ui_mouse_has(i32::from(b'v')) }));
+        assert!(!with_mouse_opt(Some(b"nv"), || unsafe { ui_mouse_has(i32::from(b'c')) }));
+    }
+
+    #[test]
+    fn ui_mouse_has_help_flag_needs_a_help_buffer() {
+        // 'h' means "any mode, but only in a help buffer".
+        let _lock = crate::globals::global_state_test_lock();
+
+        let in_help = with_help_buf(true, || {
+            with_mouse_opt(Some(b"h"), || unsafe { ui_mouse_has(i32::from(b'n')) })
+        });
+        let not_help = with_help_buf(false, || {
+            with_mouse_opt(Some(b"h"), || unsafe { ui_mouse_has(i32::from(b'n')) })
+        });
+
+        assert!(in_help);
+        assert!(!not_help, "'h' does nothing outside a help buffer");
+    }
+
+    #[test]
+    fn ui_mouse_has_help_flag_excludes_the_hit_return_prompt() {
+        // Even in a help buffer, 'h' deliberately does not cover the
+        // hit-return prompt.
+        let _lock = crate::globals::global_state_test_lock();
+        let got = with_help_buf(true, || {
+            with_mouse_opt(Some(b"h"), || unsafe {
+                ui_mouse_has(i32::from(crate::option_vars::MOUSE_RETURN))
+            })
+        });
+        assert!(!got);
+    }
+
+    #[test]
+    fn ui_mouse_has_is_false_when_mouse_is_unset_or_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(!with_mouse_opt(None, || unsafe { ui_mouse_has(i32::from(b'n')) }));
+        assert!(!with_mouse_opt(Some(b""), || unsafe { ui_mouse_has(i32::from(b'n')) }));
+    }
+
+    #[test]
+    fn ui_check_cursor_grid_only_reacts_to_the_cursors_own_grid() {
+        let _lock = crate::globals::global_state_test_lock();
+        let cursor_grid = unsafe { *CURSOR_GRID_HANDLE.get_mut() };
+
+        unsafe { *PENDING_CURSOR_UPDATE.get_mut() = false };
+        unsafe { ui_check_cursor_grid(cursor_grid + 1) };
+        let other = unsafe { *PENDING_CURSOR_UPDATE.get_mut() };
+
+        unsafe { ui_check_cursor_grid(cursor_grid) };
+        let same = unsafe { *PENDING_CURSOR_UPDATE.get_mut() };
+
+        unsafe { *PENDING_CURSOR_UPDATE.get_mut() = false };
+        assert!(!other, "another grid moving leaves the cursor alone");
+        assert!(same);
+    }
+
+    #[test]
+    fn ui_mode_info_set_records_the_pending_update() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { *PENDING_MODE_INFO_UPDATE.get_mut() = false };
+        unsafe { ui_mode_info_set() };
+        let got = unsafe { *PENDING_MODE_INFO_UPDATE.get_mut() };
+        unsafe { *PENDING_MODE_INFO_UPDATE.get_mut() = false };
+        assert!(got);
+    }
+
+    #[test]
+    fn ui_current_row_and_col_start_at_zero() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { ui_current_row() }, 0);
+        assert_eq!(unsafe { ui_current_col() }, 0);
     }
 
     #[test]
