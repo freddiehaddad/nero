@@ -92,6 +92,25 @@ pub unsafe fn grid_invalid_row(grid: &crate::grid_defs::ScreenGrid, row: i32) ->
     unsafe { *grid.attrs.add(off) < 0 }
 }
 
+/// The starting column for border text of a given width
+/// (`get_bordertext_col`).
+///
+/// Columns are 1-based, and the result never falls below 1: text wider
+/// than the border it sits on starts flush at the left rather than
+/// running off it.
+#[must_use]
+pub fn get_bordertext_col(
+    total_col: i32,
+    text_width: i32,
+    align: crate::buffer_defs::AlignTextPos,
+) -> i32 {
+    match align {
+        crate::buffer_defs::AlignTextPos::Left => 1,
+        crate::buffer_defs::AlignTextPos::Center => ((total_col - text_width) / 2 + 1).max(1),
+        crate::buffer_defs::AlignTextPos::Right => (total_col - text_width + 1).max(1),
+    }
+}
+
 /// Handle for the default grid (`DEFAULT_GRID_HANDLE`).
 pub const DEFAULT_GRID_HANDLE: crate::types_defs::HandleT = 1;
 
@@ -547,6 +566,34 @@ pub unsafe fn grid_getchar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- get_bordertext_col ---
+
+    #[test]
+    fn get_bordertext_col_left_always_starts_at_column_one() {
+        use crate::buffer_defs::AlignTextPos;
+        assert_eq!(get_bordertext_col(20, 5, AlignTextPos::Left), 1);
+        // Even when the text is wider than the border.
+        assert_eq!(get_bordertext_col(4, 30, AlignTextPos::Left), 1);
+    }
+
+    #[test]
+    fn get_bordertext_col_centers_and_right_aligns() {
+        use crate::buffer_defs::AlignTextPos;
+        // 20 wide, 6 of text: (20-6)/2 + 1 = 8.
+        assert_eq!(get_bordertext_col(20, 6, AlignTextPos::Center), 8);
+        // Right: 20 - 6 + 1 = 15.
+        assert_eq!(get_bordertext_col(20, 6, AlignTextPos::Right), 15);
+    }
+
+    #[test]
+    fn get_bordertext_col_never_returns_less_than_one() {
+        // Text wider than the border would compute a column below 1,
+        // which would run off the left edge; both alignments clamp.
+        use crate::buffer_defs::AlignTextPos;
+        assert_eq!(get_bordertext_col(4, 30, AlignTextPos::Center), 1);
+        assert_eq!(get_bordertext_col(4, 30, AlignTextPos::Right), 1);
+    }
 
     // --- grid_adjust / grid_invalid_row ---
 
