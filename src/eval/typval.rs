@@ -2386,6 +2386,38 @@ pub unsafe fn tv_blob_get(b: *const crate::eval::typval_defs::BlobT, idx: i32) -
     unsafe { (&(*b).bv_ga.ga_data)[idx as usize] }
 }
 
+/// Set byte `idx` of `b`, growing the blob by one when `idx` is
+/// exactly the current end (`tv_blob_set_append`).
+///
+/// Appending is allowed ONLY at the immediate end. Setting a byte
+/// anywhere beyond that is silently ignored rather than growing the
+/// blob to reach it, which would leave uninitialized bytes behind.
+///
+/// # Safety
+/// `b` must be a valid, non-null pointer to a live
+/// [`crate::eval::typval_defs::BlobT`] for the whole call.
+pub unsafe fn tv_blob_set_append(b: *mut crate::eval::typval_defs::BlobT, idx: i32, byte: u8) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { tv_blob_len(b) };
+
+    // Allow for appending a byte; setting a byte beyond the end is an
+    // error otherwise.
+    if idx > len {
+        return;
+    }
+    if idx == len {
+        // Grow by one. `ga_len` is the authoritative length that
+        // tv_blob_len reports, so it must move with `ga_data`.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*b).bv_ga.ga_data.push(0);
+            (*b).bv_ga.ga_len += 1;
+        }
+    }
+    // SAFETY: idx is now guaranteed < tv_blob_len(b).
+    unsafe { tv_blob_set(b, idx, byte) };
+}
+
 /// Store a byte at index `idx` in a blob (`tv_blob_set`, `eval/typval.h`'s
 /// own `static inline`).
 ///
@@ -8082,6 +8114,62 @@ mod tests {
         unsafe {
             assert_eq!(tv_blob_get(&b as *const _, 0), 10);
             assert_eq!(tv_blob_get(&b as *const _, 2), 30);
+        }
+    }
+
+    #[test]
+    fn tv_blob_set_append_appends_at_the_end() {
+        // Cross-verified against real nvim:
+        //   let b = 0z0011 | let b[2] = 0x22  ->  0z001122
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        b.bv_ga.ga_data = vec![0x00, 0x11];
+        b.bv_ga.ga_len = 2;
+
+        unsafe {
+            tv_blob_set_append(&mut b as *mut _, 2, 0x22);
+            // ga_len is the authoritative length, so it must have moved.
+            assert_eq!(tv_blob_len(&b as *const _), 3);
+            assert_eq!(tv_blob_get(&b as *const _, 2), 0x22);
+        }
+        assert_eq!(b.bv_ga.ga_data, vec![0x00, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn tv_blob_set_append_ignores_an_index_beyond_the_end() {
+        // Cross-verified: `let b[9] = ...` on a 3-byte blob is
+        // rejected and leaves the blob untouched. Growing to reach it
+        // would leave uninitialized bytes behind.
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        b.bv_ga.ga_data = vec![0x00, 0x11, 0x22];
+        b.bv_ga.ga_len = 3;
+
+        unsafe { tv_blob_set_append(&mut b as *mut _, 9, 0x33) };
+
+        assert_eq!(unsafe { tv_blob_len(&b as *const _) }, 3);
+        assert_eq!(b.bv_ga.ga_data, vec![0x00, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn tv_blob_set_append_overwrites_an_existing_index() {
+        // Cross-verified: `let b[0] = 0xff` on 0z001122 -> 0zFF1122,
+        // with no growth.
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        b.bv_ga.ga_data = vec![0x00, 0x11, 0x22];
+        b.bv_ga.ga_len = 3;
+
+        unsafe { tv_blob_set_append(&mut b as *mut _, 0, 0xff) };
+
+        assert_eq!(unsafe { tv_blob_len(&b as *const _) }, 3);
+        assert_eq!(b.bv_ga.ga_data, vec![0xff, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn tv_blob_set_append_grows_an_empty_blob() {
+        let mut b = crate::eval::typval_defs::BlobT::default();
+        unsafe {
+            tv_blob_set_append(&mut b as *mut _, 0, 0x7f);
+            assert_eq!(tv_blob_len(&b as *const _), 1);
+            assert_eq!(tv_blob_get(&b as *const _, 0), 0x7f);
         }
     }
 
