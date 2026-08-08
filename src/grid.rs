@@ -57,6 +57,9 @@ use crate::types_defs::{MAX_SCHAR_SIZE, ScharT};
 pub static GLYPH_CACHE: std::sync::LazyLock<crate::globals::GlobalCell<Set<Vec<u8>>>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Set::default()));
 
+/// Handle for the default grid (`DEFAULT_GRID_HANDLE`).
+pub const DEFAULT_GRID_HANDLE: crate::types_defs::HandleT = 1;
+
 /// `schar_from_ascii(x)` - a single ASCII byte as a `schar_T`.
 ///
 /// The original is a macro with two endianness branches, deliberately
@@ -69,6 +72,52 @@ pub const fn schar_from_ascii(x: u8) -> ScharT {
     } else {
         x as ScharT
     }
+}
+
+/// The most recently assigned grid handle (`last_grid_handle`, a
+/// function-static in the original).
+static LAST_GRID_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
+    crate::globals::GlobalCell::new(DEFAULT_GRID_HANDLE);
+
+/// Give `grid` a handle, unless it already has one
+/// (`grid_assign_handle`).
+///
+/// The grid need not be allocated. Handles are assigned from a single
+/// increasing counter, so the same grid keeps its identity across
+/// reallocation.
+///
+/// # Safety
+/// Mutates the `LAST_GRID_HANDLE` file-static.
+pub unsafe fn grid_assign_handle(grid: &mut crate::grid_defs::ScreenGrid) {
+    if grid.handle == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { LAST_GRID_HANDLE.get_mut() };
+        *next += 1;
+        grid.handle = *next;
+    }
+}
+
+/// The window whose own allocated grid carries `handle`, in the
+/// current tabpage (`get_win_by_grid_handle`).
+///
+/// # Safety
+/// `GLOBALS.firstwin` and its `w_next` chain must be valid pointers to
+/// live `WinT`s.
+#[must_use]
+pub unsafe fn get_win_by_grid_handle(
+    handle: crate::types_defs::HandleT,
+) -> *mut crate::buffer_defs::WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*wp).w_grid_alloc.handle } == handle {
+            return wp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+    std::ptr::null_mut()
 }
 
 /// Whether `sc` refers to the glyph cache rather than holding its own
@@ -463,6 +512,75 @@ pub unsafe fn grid_getchar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- grid_assign_handle / get_win_by_grid_handle ---
+
+    #[test]
+    fn grid_assign_handle_gives_each_grid_a_distinct_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut a = crate::grid_defs::ScreenGrid::default();
+        let mut b = crate::grid_defs::ScreenGrid::default();
+
+        unsafe { grid_assign_handle(&mut a) };
+        unsafe { grid_assign_handle(&mut b) };
+
+        assert_ne!(a.handle, 0);
+        assert_ne!(b.handle, 0);
+        assert_ne!(a.handle, b.handle, "handles must be unique");
+    }
+
+    #[test]
+    fn grid_assign_handle_leaves_an_existing_handle_alone() {
+        // A grid keeps its identity across reallocation, so a handle
+        // that is already set must not be reassigned.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut g = crate::grid_defs::ScreenGrid { handle: 42, ..Default::default() };
+
+        unsafe { grid_assign_handle(&mut g) };
+
+        assert_eq!(g.handle, 42);
+    }
+
+    #[test]
+    fn get_win_by_grid_handle_finds_the_matching_window() {
+        // Boxed: these pointers are installed into GLOBALS.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut w1 = Box::new(crate::buffer_defs::WinT::default());
+        let mut w2 = Box::new(crate::buffer_defs::WinT::default());
+        w1.w_grid_alloc.handle = 7;
+        w2.w_grid_alloc.handle = 9;
+        let w1_ptr = std::ptr::addr_of_mut!(*w1);
+        let w2_ptr = std::ptr::addr_of_mut!(*w2);
+        w1.w_next = w2_ptr;
+        w2.w_next = std::ptr::null_mut();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = w1_ptr;
+
+        let found_first = unsafe { get_win_by_grid_handle(7) };
+        let found_second = unsafe { get_win_by_grid_handle(9) };
+        let missing = unsafe { get_win_by_grid_handle(1234) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+
+        assert_eq!(found_first, w1_ptr);
+        assert_eq!(found_second, w2_ptr, "the walk continues past the first window");
+        assert!(missing.is_null(), "an unknown handle finds nothing");
+    }
+
+    #[test]
+    fn get_win_by_grid_handle_is_null_with_no_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = std::ptr::null_mut();
+
+        let found = unsafe { get_win_by_grid_handle(1) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        assert!(found.is_null());
+    }
 
     /// The glyph cache is process-wide, so any test touching it must
     /// hold the same lock every other global-state test holds.
