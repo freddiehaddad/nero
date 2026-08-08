@@ -475,26 +475,22 @@ pub fn augroup_exists(name: &[u8]) -> bool {
     augroup_find(name) > 0
 }
 
-/// Returns the display name of `event` (`event_nr2name`).
+/// The name of `event` (`event_nr2name`).
 ///
-/// The original's own `event >= 0 && event < NUM_EVENTS` bounds check
-/// (falling back to `"Unknown"` otherwise) has no equivalent here:
-/// [`EventT`] is a real, exhaustive Rust enum, so every value is
-/// always in range by construction - there is no way to construct an
-/// "out-of-range" `EventT` in safe Rust, unlike the original's own
-/// plain `int`-typed `event_T`. Uses `EventT`'s own derived `Debug`
-/// impl, which is guaranteed to produce exactly the same string as
-/// the original's own `event_names[event].name` table: `EventT`'s own
-/// variants are themselves a direct, mechanical transcription of
-/// those exact same names (see `autocmd_defs.rs`'s own module doc for
-/// the cross-checked transcription methodology) - independently
-/// re-verified here (and by this function's own tests) against
-/// several tricky, easy-to-get-wrong capitalizations
-/// (`CmdlineChanged`, `CmdwinEnter`) directly against the generated
-/// `auevents_name_map.generated.h` table.
+/// Looks the name up in [`crate::autocmd_defs::EVENT_NAMES`], the
+/// transcription of the original's own `event_names[]` table, rather
+/// than deriving it from the enum's `Debug` formatting as this used
+/// to. The two agree today - the `EventT` variants are themselves a
+/// mechanical transcription of those same name strings - but relying
+/// on that was a coincidence of the derive, not a guarantee; the
+/// table is the same source of truth the original reads.
+///
+/// The original returns `"Unknown"` for an out-of-range event. That
+/// cannot happen here, since `EventT` is an enum rather than a raw
+/// integer, so every value indexes a real entry.
 #[must_use]
 pub fn event_nr2name(event: EventT) -> String {
-    format!("{event:?}")
+    String::from_utf8_lossy(crate::autocmd_defs::EVENT_NAMES[event as usize].name).into_owned()
 }
 
 /// Defer sending the `OptionSet` autocommand for `buf`'s own
