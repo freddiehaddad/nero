@@ -475,6 +475,40 @@ pub fn augroup_exists(name: &[u8]) -> bool {
     augroup_find(name) > 0
 }
 
+/// Event names for `ExpandGeneric`, excluding group names
+/// (`get_event_name_no_group`).
+///
+/// `win` restricts the list to events that may appear in
+/// `'eventignorewin'`, in which case `idx` counts only those.
+///
+/// The original takes an unused `expand_T *xp` that has no equivalent
+/// here, and returns `NULL` past the end; that becomes `None`.
+#[must_use]
+pub fn get_event_name_no_group(idx: i32, win: bool) -> Option<&'static [u8]> {
+    let names = &crate::autocmd_defs::EVENT_NAMES;
+    if idx < 0 || idx as usize >= names.len() {
+        return None;
+    }
+
+    if !win {
+        return Some(names[idx as usize].name);
+    }
+
+    // Only a subset of events is allowed in 'eventignorewin', so walk
+    // the table counting just those. The original tests `event <= 0`,
+    // the sign it packs this into; here it is an explicit flag.
+    let mut j = 0;
+    for entry in names {
+        if entry.win_local {
+            j += 1;
+            if j == idx + 1 {
+                return Some(entry.name);
+            }
+        }
+    }
+    None
+}
+
 /// The name of `event` (`event_nr2name`).
 ///
 /// Looks the name up in [`crate::autocmd_defs::EVENT_NAMES`], the
@@ -909,6 +943,68 @@ mod tests {
         assert_eq!(augroup_find(b"GroupB"), 2);
         assert_eq!(augroup_find(b"GroupC"), augroup::ERROR);
         reset_augroup_map();
+    }
+
+    // --- get_event_name_no_group ---
+
+    #[test]
+    fn get_event_name_no_group_indexes_the_table_directly() {
+        assert_eq!(get_event_name_no_group(0, false), Some(&b"BufAdd"[..]));
+        let last = crate::autocmd_defs::NUM_EVENTS as i32 - 1;
+        assert_eq!(get_event_name_no_group(last, false), Some(&b"WinScrolled"[..]));
+    }
+
+    #[test]
+    fn get_event_name_no_group_is_none_out_of_range() {
+        assert_eq!(get_event_name_no_group(-1, false), None);
+        assert_eq!(
+            get_event_name_no_group(crate::autocmd_defs::NUM_EVENTS as i32, false),
+            None
+        );
+        // The bounds check uses the FULL table length even for the
+        // window-local list, so an index past the end is rejected
+        // there too rather than wrapping.
+        assert_eq!(
+            get_event_name_no_group(crate::autocmd_defs::NUM_EVENTS as i32, true),
+            None
+        );
+    }
+
+    #[test]
+    fn get_event_name_no_group_with_win_walks_only_window_local_events() {
+        // Derive the expectation independently from the table rather
+        // than hardcoding it, so this genuinely cross-checks the
+        // counting loop instead of restating it.
+        let expected: Vec<&[u8]> = crate::autocmd_defs::EVENT_NAMES
+            .iter()
+            .filter(|e| e.win_local)
+            .map(|e| e.name)
+            .collect();
+        assert!(!expected.is_empty(), "the window-local subset must not be empty");
+
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(
+                get_event_name_no_group(i as i32, true),
+                Some(*want),
+                "window-local index {i}"
+            );
+        }
+
+        // One past the window-local subset reports nothing, even
+        // though it is still inside the full table.
+        assert!(expected.len() < crate::autocmd_defs::NUM_EVENTS);
+        assert_eq!(get_event_name_no_group(expected.len() as i32, true), None);
+    }
+
+    #[test]
+    fn get_event_name_no_group_win_list_is_a_strict_subset() {
+        // The two modes must genuinely differ, or the win branch would
+        // be untested by the above.
+        let full = get_event_name_no_group(3, false);
+        let win = get_event_name_no_group(3, true);
+        assert!(full.is_some() && win.is_some());
+        let win_count = crate::autocmd_defs::EVENT_NAMES.iter().filter(|e| e.win_local).count();
+        assert!(win_count < crate::autocmd_defs::NUM_EVENTS);
     }
 
     // --- event_nr2name ---
