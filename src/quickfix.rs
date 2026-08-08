@@ -154,6 +154,42 @@ pub fn qf_clean_dir_stack(stackptr: &mut Option<Box<DirStackT>>) {
     }
 }
 
+/// Propagate a window's `'lhistory'` to its location-list window, if
+/// it has one (`qf_sync_win_to_llw`).
+///
+/// Only the quickfix-type window whose own `w_llist_ref` names this
+/// window's location list counts, so an unrelated location-list window
+/// is left alone.
+///
+/// # Safety
+/// `pwp` must point at a live `WinT`, and `GLOBALS.firstwin`'s own
+/// `w_next` chain must consist of live windows with valid buffers.
+pub unsafe fn qf_sync_win_to_llw(pwp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let llw = unsafe { (*pwp).w_llist };
+    if llw.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let lhi = unsafe { (*pwp).w_onebuf_opt.wo_lhi };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (llist_ref, buf) = unsafe { ((*wp).w_llist_ref, (*wp).w_buffer) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_qf = crate::buffer::bt_quickfix(unsafe { buf.as_ref() });
+        if std::ptr::eq(llist_ref, llw) && is_qf {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*wp).w_onebuf_opt.wo_lhi = lhi };
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+}
+
 /// A window displaying a Vim help file in the current tabpage
 /// (`qf_find_help_win`).
 ///
@@ -775,6 +811,151 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_sync_win_to_llw ---
+
+    #[test]
+    fn qf_sync_win_to_llw_copies_lhistory_to_the_matching_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut list = Box::new(crate::types_defs::QfInfoT::default());
+        let list_ptr = std::ptr::addr_of_mut!(*list);
+
+        // A quickfix-type window referring to the same location list.
+        let mut qf_buf = Box::new(BufT::default());
+        qf_buf.b_p_bt = Some(b"quickfix".to_vec());
+        let qf_buf_ptr = std::ptr::addr_of_mut!(*qf_buf);
+        let mut llw = Box::new(WinT {
+            w_buffer: qf_buf_ptr,
+            w_llist_ref: list_ptr,
+            ..Default::default()
+        });
+        llw.w_onebuf_opt.wo_lhi = 1;
+        let llw_ptr = std::ptr::addr_of_mut!(*llw);
+
+        // The window whose 'lhistory' is being propagated.
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut pwp = Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_llist: list_ptr,
+            w_next: llw_ptr,
+            ..Default::default()
+        });
+        pwp.w_onebuf_opt.wo_lhi = 42;
+        let pwp_ptr = std::ptr::addr_of_mut!(*pwp);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = pwp_ptr;
+
+        unsafe { qf_sync_win_to_llw(pwp_ptr) };
+
+        let got = llw.w_onebuf_opt.wo_lhi;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn qf_sync_win_to_llw_is_a_noop_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut pwp = Box::new(WinT { w_buffer: buf_ptr, ..Default::default() });
+        pwp.w_onebuf_opt.wo_lhi = 42;
+        let pwp_ptr = std::ptr::addr_of_mut!(*pwp);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = pwp_ptr;
+
+        unsafe { qf_sync_win_to_llw(pwp_ptr) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        assert_eq!(pwp.w_onebuf_opt.wo_lhi, 42, "its own value is untouched");
+    }
+
+    #[test]
+    fn qf_sync_win_to_llw_skips_a_window_referring_to_another_list() {
+        // A location-list window for a DIFFERENT list must not be
+        // updated, so the reference comparison genuinely matters.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut list = Box::new(crate::types_defs::QfInfoT::default());
+        let mut other = Box::new(crate::types_defs::QfInfoT::default());
+        let list_ptr = std::ptr::addr_of_mut!(*list);
+        let other_ptr = std::ptr::addr_of_mut!(*other);
+
+        let mut qf_buf = Box::new(BufT::default());
+        qf_buf.b_p_bt = Some(b"quickfix".to_vec());
+        let qf_buf_ptr = std::ptr::addr_of_mut!(*qf_buf);
+        let mut llw = Box::new(WinT {
+            w_buffer: qf_buf_ptr,
+            w_llist_ref: other_ptr,
+            ..Default::default()
+        });
+        llw.w_onebuf_opt.wo_lhi = 1;
+        let llw_ptr = std::ptr::addr_of_mut!(*llw);
+
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut pwp = Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_llist: list_ptr,
+            w_next: llw_ptr,
+            ..Default::default()
+        });
+        pwp.w_onebuf_opt.wo_lhi = 42;
+        let pwp_ptr = std::ptr::addr_of_mut!(*pwp);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = pwp_ptr;
+
+        unsafe { qf_sync_win_to_llw(pwp_ptr) };
+
+        let got = llw.w_onebuf_opt.wo_lhi;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        assert_eq!(got, 1, "another list's window is left alone");
+    }
+
+    #[test]
+    fn qf_sync_win_to_llw_skips_a_non_quickfix_window() {
+        // Matching the list is not enough; the window must actually be
+        // a quickfix-type one.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut list = Box::new(crate::types_defs::QfInfoT::default());
+        let list_ptr = std::ptr::addr_of_mut!(*list);
+
+        let mut plain_buf = Box::new(BufT::default());
+        let plain_buf_ptr = std::ptr::addr_of_mut!(*plain_buf);
+        let mut other = Box::new(WinT {
+            w_buffer: plain_buf_ptr,
+            w_llist_ref: list_ptr,
+            ..Default::default()
+        });
+        other.w_onebuf_opt.wo_lhi = 1;
+        let other_ptr = std::ptr::addr_of_mut!(*other);
+
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut pwp = Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_llist: list_ptr,
+            w_next: other_ptr,
+            ..Default::default()
+        });
+        pwp.w_onebuf_opt.wo_lhi = 42;
+        let pwp_ptr = std::ptr::addr_of_mut!(*pwp);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = pwp_ptr;
+
+        unsafe { qf_sync_win_to_llw(pwp_ptr) };
+
+        let got = other.w_onebuf_opt.wo_lhi;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        assert_eq!(got, 1, "a non-quickfix window is left alone");
+    }
 
     // --- qf_find_help_win ---
 
