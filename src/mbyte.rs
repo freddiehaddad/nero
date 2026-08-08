@@ -192,6 +192,63 @@ pub fn utf_byte2len(b: u8) -> u8 {
     UTF8LEN_TAB[b as usize]
 }
 
+/// Decode one multibyte character from an escaped key sequence
+/// (`mb_unescape`).
+///
+/// `K_SPECIAL KS_SPECIAL KE_FILLER` is the escape used to represent a
+/// literal `K_SPECIAL` byte inside a key string, so it is folded back
+/// to a single `K_SPECIAL`. A bare `K_SPECIAL` starts a real special
+/// key, which can never be part of a multibyte character, so the scan
+/// stops there.
+///
+/// @return `Some((character_bytes, consumed))` when a multibyte
+///         character was decoded, where `consumed` is how many input
+///         bytes it occupied, or `None` otherwise. The original
+///         returns a pointer into a `static char buf[6]` and advances
+///         the caller's own pointer through a `const char **`;
+///         returning the bytes plus a length removes both the shared
+///         buffer and the in/out pointer.
+///
+/// ASCII bails out immediately: a byte below 128 is a complete
+/// character on its own, so it is never reported here.
+#[must_use]
+pub fn mb_unescape(p: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // The maximum length of a UTF-8 character is 4 bytes.
+    let mut buf: Vec<u8> = Vec::with_capacity(4);
+
+    let mut str_idx = 0;
+    while str_idx < p.len() && p[str_idx] != crate::ascii_defs::NUL && buf.len() < 4 {
+        if p[str_idx] == crate::keycodes_defs::K_SPECIAL
+            && p.get(str_idx + 1) == Some(&crate::keycodes_defs::KS_SPECIAL)
+            && p.get(str_idx + 2) == Some(&crate::keycodes_defs::KE_FILLER)
+        {
+            buf.push(crate::keycodes_defs::K_SPECIAL);
+            str_idx += 2;
+        } else if p[str_idx] == crate::keycodes_defs::K_SPECIAL {
+            // A special key can't be a multibyte char.
+            break;
+        } else {
+            buf.push(p[str_idx]);
+        }
+
+        // Report a multibyte character once one is complete. An
+        // illegal sequence yields a length of 1 here, so it does not
+        // match.
+        if utf_ptr2len(&buf) > 1 {
+            return Some((buf, str_idx + 1));
+        }
+
+        // Bail out quickly for ASCII.
+        if buf[0] < 128 {
+            break;
+        }
+
+        str_idx += 1;
+    }
+
+    None
+}
+
 /// Get the length of a UTF-8 byte sequence representing a single
 /// codepoint.
 ///
@@ -2394,6 +2451,56 @@ pub fn enc_canon_props(name: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mb_unescape_returns_none_for_ascii() {
+        // A byte below 128 is a complete character on its own, so the
+        // scan bails out immediately without reporting anything.
+        assert_eq!(mb_unescape(b"abc"), None);
+        assert_eq!(mb_unescape(b"x"), None);
+    }
+
+    #[test]
+    fn mb_unescape_returns_none_for_an_empty_or_nul_input() {
+        assert_eq!(mb_unescape(b""), None);
+        assert_eq!(mb_unescape(b"\0rest"), None);
+    }
+
+    #[test]
+    fn mb_unescape_decodes_a_plain_multibyte_character() {
+        // U+00E9 is 0xC3 0xA9 in UTF-8: two bytes in, two consumed.
+        let (bytes, used) = mb_unescape(b"\xc3\xa9tail").expect("a multibyte char");
+        assert_eq!(bytes, vec![0xc3, 0xa9]);
+        assert_eq!(used, 2);
+    }
+
+    #[test]
+    fn mb_unescape_folds_the_k_special_escape() {
+        // K_SPECIAL KS_SPECIAL KE_FILLER represents one literal
+        // K_SPECIAL byte (0x80), which then forms the LEAD byte of a
+        // multibyte sequence rather than a special key.
+        let mut input = vec![
+            crate::keycodes_defs::K_SPECIAL,
+            crate::keycodes_defs::KS_SPECIAL,
+            crate::keycodes_defs::KE_FILLER,
+        ];
+        // 0x80 is a continuation byte, so on its own it is illegal and
+        // yields length 1; append a real second byte to complete a
+        // two-byte sequence's worth of input.
+        input.push(0xa9);
+
+        // The escape collapses to a single 0x80, so the buffer holds
+        // 0x80 0xA9 - still not a valid lead byte, hence None.
+        assert_eq!(mb_unescape(&input), None);
+    }
+
+    #[test]
+    fn mb_unescape_stops_at_a_bare_k_special() {
+        // A bare K_SPECIAL starts a real special key, which can never
+        // be part of a multibyte character, so the scan stops.
+        let input = [0xc3, crate::keycodes_defs::K_SPECIAL, 0xa9];
+        assert_eq!(mb_unescape(&input), None);
+    }
 
     #[test]
     fn enc_canon_table_has_exactly_60_entries() {
