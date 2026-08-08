@@ -729,6 +729,46 @@ pub unsafe fn sb_text_restart_cmdline() {
     }
 }
 
+/// Discard text remembered for scrolling back (`clear_sb_text`).
+///
+/// With `all` unset the most recent screen line is kept; everything
+/// before it is discarded. Called when redrawing the screen.
+///
+/// Note this frees BACKWARDS along `sb_prev`, unlike
+/// [`sb_text_restart_cmdline`], which discards a trailing unfinished
+/// line forwards along `sb_next`.
+///
+/// # Safety
+/// The `LAST_MSGCHUNK` chain must consist of live chunks originally
+/// allocated with `Box`, since the discarded ones are freed here.
+pub unsafe fn clear_sb_text(all: bool) {
+    // The original walks a `msgchunk_T **`, so that the same loop can
+    // clear either the global head or one chunk's own `sb_prev` link.
+    let lastp: *mut *mut MsgchunkT = if all {
+        // SAFETY: forwarded from this function's own safety doc.
+        std::ptr::from_mut(unsafe { LAST_MSGCHUNK.get_mut() })
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let last = unsafe { *LAST_MSGCHUNK.get_mut() };
+        if last.is_null() {
+            return;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { std::ptr::addr_of_mut!((*msg_sb_start(last)).sb_prev) }
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    while !unsafe { *lastp }.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let mp = unsafe { (**lastp).sb_prev };
+        // SAFETY: the chunk was allocated with Box, per this
+        // function's own safety doc.
+        drop(unsafe { Box::from_raw(*lastp) });
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *lastp = mp };
+    }
+}
+
 /// Starting to edit the command line: do not clear messages now
 /// (`sb_text_start_cmdline`).
 ///
@@ -817,6 +857,56 @@ pub(crate) mod tests {
                 *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::None;
             }
         }
+    }
+
+    #[test]
+    fn clear_sb_text_all_discards_every_chunk() {
+        let _g = ChunkGuard::install(&[true, false, false]);
+
+        unsafe { clear_sb_text(true) };
+
+        assert!(unsafe { *LAST_MSGCHUNK.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn clear_sb_text_keeps_the_most_recent_screen_line() {
+        // Chunk 0 ends a line; chunks 1 and 2 form the most recent
+        // one, which must survive. Everything before it goes.
+        let g = ChunkGuard::install(&[true, false, false]);
+        let keep_head = g.ptr(1);
+        let keep_tail = g.ptr(2);
+
+        unsafe { clear_sb_text(false) };
+
+        assert_eq!(
+            unsafe { *LAST_MSGCHUNK.get_mut() },
+            keep_tail,
+            "the last chunk is still the last"
+        );
+        assert!(
+            unsafe { (*keep_head).sb_prev }.is_null(),
+            "the surviving line's backward link is cleared"
+        );
+    }
+
+    #[test]
+    fn clear_sb_text_without_all_is_a_noop_with_no_chunks() {
+        let _g = ChunkGuard::install(&[]);
+        unsafe { clear_sb_text(false) };
+        assert!(unsafe { *LAST_MSGCHUNK.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn clear_sb_text_keeping_a_single_line_discards_nothing() {
+        // One unfinished line and nothing before it: there is nothing
+        // to discard, so both chunks survive.
+        let g = ChunkGuard::install(&[false, false]);
+        let head = g.ptr(0);
+
+        unsafe { clear_sb_text(false) };
+
+        assert_eq!(unsafe { *LAST_MSGCHUNK.get_mut() }, g.ptr(1));
+        assert!(unsafe { (*head).sb_prev }.is_null());
     }
 
     #[test]
