@@ -57,6 +57,41 @@ use crate::types_defs::{MAX_SCHAR_SIZE, ScharT};
 pub static GLYPH_CACHE: std::sync::LazyLock<crate::globals::GlobalCell<Set<Vec<u8>>>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(Set::default()));
 
+/// Resolve a view's own row/column offsets against its target grid
+/// (`grid_adjust`).
+///
+/// When the default grid is used, window-relative positions become
+/// global screen positions.
+///
+/// @return `(target, row_off, col_off)` - the grid actually drawn to,
+///         plus the adjusted offsets. The original adds into `int *`
+///         in-out parameters; they are taken and returned by value
+///         here.
+#[must_use]
+pub fn grid_adjust(
+    grid: &crate::grid_defs::GridView,
+    row_off: i32,
+    col_off: i32,
+) -> (*mut crate::grid_defs::ScreenGrid, i32, i32) {
+    (grid.target, row_off + grid.row_offset, col_off + grid.col_offset)
+}
+
+/// Whether `row` of `grid` has been invalidated (`grid_invalid_row`).
+///
+/// A negative attribute in the row's first cell is the marker
+/// `grid_invalidate` leaves behind.
+///
+/// # Safety
+/// `grid.attrs` and `grid.line_offset` must be valid, allocated arrays
+/// with at least `row + 1` rows.
+#[must_use]
+pub unsafe fn grid_invalid_row(grid: &crate::grid_defs::ScreenGrid, row: i32) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let off = unsafe { *grid.line_offset.add(row as usize) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *grid.attrs.add(off) < 0 }
+}
+
 /// Handle for the default grid (`DEFAULT_GRID_HANDLE`).
 pub const DEFAULT_GRID_HANDLE: crate::types_defs::HandleT = 1;
 
@@ -513,7 +548,52 @@ pub unsafe fn grid_getchar(
 mod tests {
     use super::*;
 
-    // --- grid_assign_handle / get_win_by_grid_handle ---
+    // --- grid_adjust / grid_invalid_row ---
+
+    #[test]
+    fn grid_adjust_adds_the_views_own_offsets() {
+        let mut target = crate::grid_defs::ScreenGrid::default();
+        let target_ptr = std::ptr::addr_of_mut!(target);
+        let view = crate::grid_defs::GridView {
+            target: target_ptr,
+            row_offset: 3,
+            col_offset: 10,
+        };
+
+        let (g, row, col) = grid_adjust(&view, 5, 2);
+        assert_eq!(g, target_ptr);
+        assert_eq!(row, 8);
+        assert_eq!(col, 12);
+    }
+
+    #[test]
+    fn grid_adjust_with_no_offsets_passes_positions_through() {
+        let mut target = crate::grid_defs::ScreenGrid::default();
+        let target_ptr = std::ptr::addr_of_mut!(target);
+        let view = crate::grid_defs::GridView { target: target_ptr, ..Default::default() };
+
+        let (_g, row, col) = grid_adjust(&view, 4, 7);
+        assert_eq!((row, col), (4, 7));
+    }
+
+    #[test]
+    fn grid_invalid_row_reads_the_first_cell_of_that_row() {
+        // A negative attribute in a row's first cell is the marker
+        // grid_invalidate leaves behind; row 1 is invalid here and
+        // row 0 is not, so a version ignoring line_offset would fail.
+        let mut attrs: Vec<crate::types_defs::SattrT> = vec![0, 0, -1, 0];
+        let mut offsets: Vec<usize> = vec![0, 2];
+        let grid = crate::grid_defs::ScreenGrid {
+            attrs: attrs.as_mut_ptr(),
+            line_offset: offsets.as_mut_ptr(),
+            rows: 2,
+            cols: 2,
+            ..Default::default()
+        };
+
+        assert!(!unsafe { grid_invalid_row(&grid, 0) });
+        assert!(unsafe { grid_invalid_row(&grid, 1) });
+    }
 
     #[test]
     fn grid_assign_handle_gives_each_grid_a_distinct_handle() {
