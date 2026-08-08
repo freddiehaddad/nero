@@ -15,6 +15,48 @@
 //!
 //! Deferred: everything else in the file.
 
+/// `0`/`^`/`_` and friends: move to the start of the line
+/// (`nv_beginline`).
+///
+/// Folds are only opened when the move was actually TYPED and no
+/// operator is pending - an operator's own motion should not disturb
+/// the fold state, and a mapped or replayed key is not a user
+/// navigation.
+///
+/// # Safety
+/// Reads `GLOBALS`/`OPTION_VARS` and forwards
+/// [`crate::insert::beginline`]/[`crate::fold::fold_open_cursor`]'s
+/// own safety docs.
+pub unsafe fn nv_beginline(cap: &mut crate::normal_defs::CmdargT) {
+    // SAFETY: cap.oap is a raw pointer in this crate's CmdargT.
+    unsafe {
+        (*cap.oap).motion_type = crate::normal_defs::MotionType::CharWise;
+        (*cap.oap).inclusive = false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::insert::beginline(cap.arg) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fdo_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags;
+    // SAFETY: forwarded from this function's own safety doc.
+    let key_typed = unsafe { crate::globals::GLOBALS.get_mut() }.KeyTyped;
+    // SAFETY: cap.oap is a raw pointer, see above.
+    let op_type = unsafe { (*cap.oap).op_type };
+
+    if fdo_flags & crate::option_vars::opt_fdo_flag::HOR != 0
+        && key_typed
+        && op_type == crate::ops_defs::OpType::Nop as i32
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::fold::fold_open_cursor() };
+    }
+
+    // Don't move the cursor past eol (only necessary in a
+    // one-character line).
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.ins_at_eol = false;
+}
+
 /// The virtual top line of `wp` (`get_vtopline`).
 ///
 /// Counts the screen lines the buffer occupies down to `w_topline`,
@@ -326,6 +368,50 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv_beginline_moves_to_column_zero_and_sets_the_motion_type() {
+        // beginline(0) takes the plain branch: cursor to column 0.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_typed, prev_eol) = (g.curwin, g.KeyTyped, g.ins_at_eol);
+        let prev_fdo = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf, ..Default::default() };
+        win.w_cursor.lnum = 1;
+        win.w_cursor.col = 7;
+        win.w_cursor.coladd = 2;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = &mut win;
+        g.ins_at_eol = true;
+        // No fold-open: 'foldopen' has no "hor" flag here, so the
+        // fold_open_cursor path is not taken.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags = 0;
+
+        let mut oap = crate::normal_defs::OpargT {
+            motion_type: crate::normal_defs::MotionType::LineWise,
+            inclusive: true,
+            ..Default::default()
+        };
+        let mut cap =
+            crate::normal_defs::CmdargT { oap: &mut oap, arg: 0, ..Default::default() };
+
+        unsafe { nv_beginline(&mut cap) };
+
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::CharWise);
+        assert!(!oap.inclusive);
+        assert_eq!(win.w_cursor.col, 0);
+        assert_eq!(win.w_cursor.coladd, 0);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.ins_at_eol);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.KeyTyped = prev_typed;
+        g.ins_at_eol = prev_eol;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags = prev_fdo;
+    }
 
     #[test]
     fn nv_ignore_sets_command_busy_and_nv_nop_does_not() {
