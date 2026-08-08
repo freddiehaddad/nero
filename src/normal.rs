@@ -15,6 +15,31 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Decide whether Select mode should start instead of Visual mode
+/// (`may_start_select`).
+///
+/// Select mode is entered only when the command character appears in
+/// `'selectmode'` AND the command was genuinely user-initiated: either
+/// it is `'o'`, or nothing is being replayed from the stuff buffer and
+/// the typeahead really was typed. A mapping or a replayed register
+/// therefore gives plain Visual mode, matching the original.
+///
+/// # Safety
+/// Mutates `GLOBALS.Visual`; reads `OPTION_VARS.p_slm`.
+pub unsafe fn may_start_select(c: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let in_slm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_slm
+        .as_deref()
+        .is_some_and(|slm| u8::try_from(c).is_ok_and(|b| slm.contains(&b)));
+
+    let user_initiated = c == i32::from(b'o')
+        || (crate::input::stuff_empty() && crate::input::typebuf_typed());
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select = user_initiated && in_slm;
+}
+
 /// `0`/`^`/`_` and friends: move to the start of the line
 /// (`nv_beginline`).
 ///
@@ -368,6 +393,57 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn may_start_select_needs_the_char_listed_in_selectmode() {
+        // Select mode only starts when the command character actually
+        // appears in 'selectmode'.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_slm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm.clone();
+        let prev_sel = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select;
+
+        // 'o' is always treated as user-initiated, so this isolates
+        // the 'selectmode' membership test.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = Some(b"o".to_vec());
+        unsafe { may_start_select(i32::from(b'o')) };
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select);
+
+        // Not listed: plain Visual mode.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = Some(b"k".to_vec());
+        unsafe { may_start_select(i32::from(b'o')) };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select);
+
+        // Empty 'selectmode' never starts Select mode.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = Some(Vec::new());
+        unsafe { may_start_select(i32::from(b'o')) };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select);
+
+        // Unset likewise.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = None;
+        unsafe { may_start_select(i32::from(b'o')) };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = prev_slm;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select = prev_sel;
+    }
+
+    #[test]
+    fn may_start_select_handles_a_non_byte_command_char() {
+        // Special keys are negative or above 0xff; neither can appear
+        // in 'selectmode', and neither must panic on conversion.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_slm = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm.clone();
+        let prev_sel = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select;
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = Some(b"okm".to_vec());
+        for c in [-1_i32, 0x1000] {
+            unsafe { may_start_select(c) };
+            assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select);
+        }
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_slm = prev_slm;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select = prev_sel;
+    }
 
     #[test]
     fn nv_beginline_moves_to_column_zero_and_sets_the_motion_type() {
