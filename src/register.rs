@@ -42,13 +42,13 @@
 //! always `None`, see its own doc comment), matching a real session
 //! in which nothing has ever performed a genuine yank.
 //!
+//! `@.` (last inserted text) reads the real `last_insert` file-static
+//! via [`crate::insert::get_last_insert_save`], which owns it (matching
+//! `insert.c`'s own placement). It reports nothing until something
+//! calls `set_last_insert`, which only real insert-mode text entry
+//! does - correct for every session that has not yet inserted text.
+//!
 //! Deferred:
-//! - `@.` (last inserted text) needs a `last_insert` `String`
-//!   file-static (`insert.c`) populated only by real insert-mode text
-//!   entry, not yet translated - modeled as an always-`None`
-//!   `LAST_INSERT` `GlobalCell` (matching `EXPR_LINE`'s own
-//!   identical "always empty, nothing writes it yet" treatment),
-//!   correct for every real session today.
 //! - `@Ctrl-F`/`@Ctrl-P`/`@Ctrl-W`/`@Ctrl-A`/`@Ctrl-L` ("under cursor"
 //!   pseudo-registers): the original's own `get_spec_reg` immediately
 //!   returns `false` for these whenever `errmsg` is `false` - which
@@ -325,21 +325,17 @@ pub fn get_expr_line_src() -> Option<Vec<u8>> {
     unsafe { EXPR_LINE.get_mut() }.clone()
 }
 
-/// The last inserted text (`last_insert`, a file-static `String` in
-/// `insert.c`, not this file - grouped here anyway since `get_spec_reg`
-/// is this module's own only real reader). Always `None` today - see
-/// this module's own doc comment.
-static LAST_INSERT: crate::globals::GlobalCell<Option<Vec<u8>>> = crate::globals::GlobalCell::new(None);
-
-/// Get the last inserted text, with a trailing `<Esc>` kept but no
-/// other trailing byte trimmed (`get_last_insert_save`).
+/// Get the last inserted text, with a trailing `<Esc>` removed
+/// (`get_last_insert_save`).
 ///
-/// Not yet reachable with a real value (see `LAST_INSERT`'s own doc
-/// comment), but translated faithfully for when real insert-mode
-/// tracking exists.
+/// Delegates to [`crate::insert::get_last_insert_save`], which owns
+/// the real `last_insert` file-static (matching `insert.c`'s own
+/// placement); this module is only its reader, via `get_spec_reg`.
 #[must_use]
 fn get_last_insert_save() -> Option<Vec<u8>> {
-    unsafe { LAST_INSERT.get_mut() }.clone()
+    // SAFETY: reads insert.rs's own LAST_INSERT/LAST_INSERT_SKIP
+    // file-statics, serialized by this crate's test lock.
+    unsafe { crate::insert::get_last_insert_save() }
 }
 
 /// Get the alternate file name (`@#`) (`getaltfname`).
@@ -960,10 +956,24 @@ mod tests {
     }
 
     #[test]
-    fn get_spec_reg_dot_returns_last_insert_which_is_always_unset_today() {
+    fn get_spec_reg_dot_reports_nothing_before_any_insert() {
+        // Nothing has called set_last_insert, so the last-insert
+        // register is genuinely empty.
         let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::insert::reset_last_insert_for_test() };
         let result = unsafe { get_spec_reg(i32::from(b'.'), false) };
         assert_eq!(result, Some((None, true)));
+    }
+
+    #[test]
+    fn get_spec_reg_dot_reports_the_real_last_insert() {
+        // Once a real insert has been recorded, "@." reports it with
+        // the trailing <Esc> removed.
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe { crate::insert::set_last_insert(i32::from(b'x')) };
+        let result = unsafe { get_spec_reg(i32::from(b'.'), false) };
+        unsafe { crate::insert::reset_last_insert_for_test() };
+        assert_eq!(result, Some((Some(b"x".to_vec()), true)));
     }
 
     #[test]

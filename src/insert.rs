@@ -81,6 +81,91 @@ mod bl {
 }
 pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
 
+/// The last inserted text (`last_insert`, a file-static `String` in
+/// `insert.c`).
+///
+/// `set_last_insert` fills this in; `get_last_insert` reads it back,
+/// skipping [`LAST_INSERT_SKIP`] leading bytes.
+static LAST_INSERT: crate::globals::GlobalCell<Option<Vec<u8>>> = crate::globals::GlobalCell::new(None);
+
+/// Number of bytes in front of the previous insert to skip when
+/// reading [`LAST_INSERT`] back (`last_insert_skip`).
+static LAST_INSERT_SKIP: crate::globals::GlobalCell<usize> = crate::globals::GlobalCell::new(0);
+
+/// Store a single character as the "last insert", for the replace
+/// command (`set_last_insert`).
+///
+/// A control character is stored with a leading CTRL-V, matching how
+/// it would have to be typed; a trailing `<Esc>` always terminates the
+/// stored text.
+///
+/// # Safety
+/// Mutates the `LAST_INSERT`/`LAST_INSERT_SKIP` file-statics.
+pub unsafe fn set_last_insert(c: i32) {
+    let mut s = Vec::new();
+    // Use the CTRL-V only when entering a special char.
+    if c < i32::from(b' ') || c == i32::from(crate::ascii_defs::DEL) {
+        s.push(crate::ascii_defs::CTRL_V);
+    }
+    let mut tmp = [0u8; crate::mbyte_defs::MB_MAXBYTES * 3 + 5];
+    let n = crate::keycodes::add_char2buf(c, &mut tmp);
+    s.extend_from_slice(&tmp[..n]);
+    s.push(crate::ascii_defs::ESC);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *LAST_INSERT.get_mut() = Some(s);
+        *LAST_INSERT_SKIP.get_mut() = 0;
+    }
+}
+
+/// The last inserted text (`get_last_insert`), past whatever leading
+/// bytes were already present before the insert started.
+///
+/// # Safety
+/// Reads the `LAST_INSERT`/`LAST_INSERT_SKIP` file-statics.
+#[must_use]
+pub unsafe fn get_last_insert() -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let stored = unsafe { LAST_INSERT.get_mut() }.as_ref()?;
+    // SAFETY: forwarded from this function's own safety doc.
+    let skip = unsafe { *LAST_INSERT_SKIP.get_mut() };
+    Some(stored.get(skip..).unwrap_or_default().to_vec())
+}
+
+/// The last inserted text with a trailing `<Esc>` removed
+/// (`get_last_insert_save`).
+///
+/// # Safety
+/// Same as [`get_last_insert`].
+#[must_use]
+pub unsafe fn get_last_insert_save() -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut s = unsafe { get_last_insert() }?;
+    if s.last() == Some(&crate::ascii_defs::ESC) {
+        s.pop();
+    }
+    Some(s)
+}
+
+/// Clear the last-insert state, for tests only.
+///
+/// The original has no such function - a real session simply never
+/// unsets `last_insert` once set. Tests need it so one test's stored
+/// insert cannot leak into another's assumptions about the shared
+/// file-static.
+///
+/// # Safety
+/// Mutates the [`LAST_INSERT`]/[`LAST_INSERT_SKIP`] file-statics.
+#[cfg(test)]
+pub(crate) unsafe fn reset_last_insert_for_test() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *LAST_INSERT.get_mut() = None;
+        *LAST_INSERT_SKIP.get_mut() = 0;
+    }
+}
+
 /// Move the cursor up `n` lines in window `wp` (`cursor_up_inner`).
 ///
 /// Takes care of closed folds; skips over concealed lines when
@@ -572,6 +657,103 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    // --- last_insert family ---
+
+    #[test]
+    fn last_insert_is_unset_until_something_records_one() {
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        assert_eq!(unsafe { get_last_insert() }, None);
+        assert_eq!(unsafe { get_last_insert_save() }, None);
+    }
+
+    #[test]
+    fn set_last_insert_stores_a_plain_character_with_a_trailing_esc() {
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(i32::from(b'a')) };
+
+        assert_eq!(unsafe { get_last_insert() }, Some(vec![b'a', crate::ascii_defs::ESC]));
+        // get_last_insert_save drops the terminating <Esc>.
+        assert_eq!(unsafe { get_last_insert_save() }, Some(vec![b'a']));
+        unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn set_last_insert_prefixes_a_control_character_with_ctrl_v() {
+        // A control character could not be typed literally, so it is
+        // stored the way it would have to be entered.
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(9) }; // TAB
+
+        assert_eq!(
+            unsafe { get_last_insert_save() },
+            Some(vec![crate::ascii_defs::CTRL_V, 9])
+        );
+        unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn set_last_insert_prefixes_del_with_ctrl_v_too() {
+        // DEL is the one non-control byte that also takes the CTRL-V
+        // prefix, matching the original's own `c == DEL` test.
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(i32::from(crate::ascii_defs::DEL)) };
+
+        assert_eq!(
+            unsafe { get_last_insert_save() },
+            Some(vec![crate::ascii_defs::CTRL_V, crate::ascii_defs::DEL])
+        );
+        unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn set_last_insert_stores_a_multibyte_character() {
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(0xe9) }; // e-acute, UTF-8 C3 A9
+
+        assert_eq!(unsafe { get_last_insert_save() }, Some(vec![0xc3, 0xa9]));
+        unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn set_last_insert_escapes_a_utf8_byte_equal_to_k_special() {
+        // `add_char2buf` escapes any stored byte that happens to equal
+        // K_SPECIAL (0x80), so the text stays replayable through the
+        // typeahead buffer. U+4E00 encodes as E4 B8 80, whose last
+        // byte is exactly K_SPECIAL - so three bytes are stored in its
+        // place, matching the original rather than the raw UTF-8.
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(0x4e00) };
+
+        assert_eq!(
+            unsafe { get_last_insert_save() },
+            Some(vec![
+                0xe4,
+                0xb8,
+                crate::keycodes_defs::K_SPECIAL,
+                crate::keycodes_defs::KS_SPECIAL,
+                crate::keycodes_defs::KE_FILLER,
+            ])
+        );
+        unsafe { reset_last_insert_for_test() };
+    }
+
+    #[test]
+    fn set_last_insert_replaces_any_earlier_value() {
+        let _lock = global_state_test_lock();
+        unsafe { reset_last_insert_for_test() };
+        unsafe { set_last_insert(i32::from(b'a')) };
+        unsafe { set_last_insert(i32::from(b'b')) };
+
+        assert_eq!(unsafe { get_last_insert_save() }, Some(vec![b'b']));
+        unsafe { reset_last_insert_for_test() };
     }
 
     // --- cursor_up_inner / cursor_down_inner ---
