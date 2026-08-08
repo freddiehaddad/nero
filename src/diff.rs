@@ -281,6 +281,31 @@ pub unsafe fn diff_free(
     ret
 }
 
+/// Copy one diff entry's line range from one buffer slot to another
+/// (`diff_copy_entry`).
+///
+/// `dprev` is the entry before `dp`, or `None` for the first one. The
+/// line-number offset that everything above `dp` has accumulated
+/// between the two slots is subtracted, so `idx_new` describes the
+/// same change `idx_orig` does, expressed in the other buffer's own
+/// line numbers.
+pub fn diff_copy_entry(
+    dprev: Option<&crate::buffer_defs::DiffT>,
+    dp: &mut crate::buffer_defs::DiffT,
+    idx_orig: usize,
+    idx_new: usize,
+) {
+    let off = match dprev {
+        None => 0,
+        Some(prev) => {
+            (prev.df_lnum[idx_orig] + prev.df_count[idx_orig])
+                - (prev.df_lnum[idx_new] + prev.df_count[idx_new])
+        }
+    };
+    dp.df_lnum[idx_new] = dp.df_lnum[idx_orig] - off;
+    dp.df_count[idx_new] = dp.df_count[idx_orig];
+}
+
 /// Whether every diff block line range in `dp` fits inside its own
 /// buffer (`diff_check_sanity`).
 ///
@@ -820,6 +845,78 @@ pub unsafe fn diff_infold(wp: &WinT, _lnum: crate::pos_defs::LinenrT) -> bool {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // --- diff_copy_entry ---
+
+    #[test]
+    fn diff_copy_entry_with_no_previous_entry_copies_verbatim() {
+        // Without a previous entry the offset is zero, so the new slot
+        // takes the original's numbers unchanged.
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 10;
+        dp.df_count[0] = 3;
+
+        diff_copy_entry(None, &mut dp, 0, 1);
+
+        assert_eq!(dp.df_lnum[1], 10);
+        assert_eq!(dp.df_count[1], 3);
+    }
+
+    #[test]
+    fn diff_copy_entry_subtracts_the_offset_accumulated_above_it() {
+        // The previous entry ends at 5+2=7 in slot 0 but 5+0=5 in
+        // slot 1, so slot 1 runs 2 lines "behind": an entry at line 20
+        // in slot 0 is line 18 in slot 1.
+        let mut prev = crate::buffer_defs::DiffT::default();
+        prev.df_lnum[0] = 5;
+        prev.df_count[0] = 2;
+        prev.df_lnum[1] = 5;
+        prev.df_count[1] = 0;
+
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 20;
+        dp.df_count[0] = 4;
+
+        diff_copy_entry(Some(&prev), &mut dp, 0, 1);
+
+        assert_eq!(dp.df_lnum[1], 18);
+        assert_eq!(dp.df_count[1], 4, "the count is copied, never shifted");
+    }
+
+    #[test]
+    fn diff_copy_entry_handles_a_negative_offset() {
+        // The offset runs the other way when the NEW slot is the one
+        // that ran ahead, so the copied line number moves down the
+        // buffer rather than up.
+        let mut prev = crate::buffer_defs::DiffT::default();
+        prev.df_lnum[0] = 5;
+        prev.df_count[0] = 0;
+        prev.df_lnum[1] = 5;
+        prev.df_count[1] = 3;
+
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 20;
+        dp.df_count[0] = 1;
+
+        diff_copy_entry(Some(&prev), &mut dp, 0, 1);
+
+        assert_eq!(dp.df_lnum[1], 23);
+        assert_eq!(dp.df_count[1], 1);
+    }
+
+    #[test]
+    fn diff_copy_entry_leaves_the_source_slot_untouched() {
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_lnum[0] = 7;
+        dp.df_count[0] = 2;
+
+        diff_copy_entry(None, &mut dp, 0, 2);
+
+        assert_eq!(dp.df_lnum[0], 7);
+        assert_eq!(dp.df_count[0], 2);
+        assert_eq!(dp.df_lnum[2], 7);
+        assert_eq!(dp.df_count[2], 2);
+    }
 
     // --- diff_buf_delete ---
 
