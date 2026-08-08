@@ -15,6 +15,62 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Step `pp` back one character, undoing an exclusive-selection
+/// adjustment (`unadjust_for_sel_inner`).
+///
+/// @return whether the position moved to the PREVIOUS line, which the
+///         caller needs to know because the column it lands on is the
+///         line's length rather than a real character position.
+///
+/// Three cases, in priority order: a virtual-space offset is given
+/// back first, then a real column, and only then does the position
+/// wrap to the previous line. A position already at the very start of
+/// the buffer stays put.
+///
+/// After stepping a real column back, the position is re-aligned to a
+/// character boundary, and under `'virtualedit'` its `coladd` is
+/// recomputed from the character's own screen width - so a step onto a
+/// TAB lands at the right visual place.
+///
+/// # Safety
+/// Reads `GLOBALS.curwin`/`GLOBALS.curbuf`, which must be valid and
+/// non-null. Forwarded from [`crate::mark::mark_mb_adjustpos`]/
+/// [`crate::plines::getvcol`]/[`crate::memline::ml_get_len`]'s own
+/// safety docs.
+pub unsafe fn unadjust_for_sel_inner(pp: &mut crate::pos_defs::PosT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = false;
+
+    if pp.coladd > 0 {
+        pp.coladd -= 1;
+    } else if pp.col > 0 {
+        pp.col -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::mark::mark_mb_adjustpos(&mut *curbuf, pp) };
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        if crate::state::virtual_active(unsafe { &*curwin }) {
+            let (mut cs, mut ce) = (0, 0);
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                crate::plines::getvcol(curwin, pp, Some(&mut cs), None, Some(&mut ce), 0);
+            }
+            pp.coladd = ce - cs;
+        }
+    } else if pp.lnum > 1 {
+        pp.lnum -= 1;
+        // SAFETY: forwarded from this function's own safety doc.
+        pp.col = unsafe { crate::memline::ml_get_len(pp.lnum) };
+        return true;
+    }
+
+    false
+}
+
 /// Decide whether Select mode should start instead of Visual mode
 /// (`may_start_select`).
 ///
@@ -393,6 +449,44 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unadjust_for_sel_inner_gives_back_virtual_space_first() {
+        // A coladd offset is surrendered before any real column.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_adj =
+            unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = true;
+
+        let mut pp = crate::pos_defs::PosT { lnum: 5, col: 3, coladd: 2 };
+        assert!(!unsafe { unadjust_for_sel_inner(&mut pp) });
+        assert_eq!(pp.coladd, 1);
+        assert_eq!(pp.col, 3, "the real column must be untouched");
+        assert_eq!(pp.lnum, 5);
+        // The flag is always cleared, whichever branch ran.
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = prev_adj;
+    }
+
+    #[test]
+    fn unadjust_for_sel_inner_at_the_buffer_start_stays_put() {
+        // Nothing to step back to, so the position is unchanged and no
+        // line wrap is reported.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_adj =
+            unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = true;
+
+        let mut pp = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
+        assert!(!unsafe { unadjust_for_sel_inner(&mut pp) });
+        assert_eq!(pp.lnum, 1);
+        assert_eq!(pp.col, 0);
+        assert_eq!(pp.coladd, 0);
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = prev_adj;
+    }
 
     #[test]
     fn may_start_select_needs_the_char_listed_in_selectmode() {
