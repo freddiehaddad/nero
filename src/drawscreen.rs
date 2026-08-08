@@ -52,6 +52,158 @@ pub const UPD_NOT_VALID: i32 = 40;
 /// Screen messed up, clear it (`UPD_CLEAR`).
 pub const UPD_CLEAR: i32 = 50;
 
+/// Corner value flags for [`hsep_connected`]/[`vsep_connected`]
+/// (`WindowCorner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCorner {
+    /// (`WC_TOP_LEFT = 0`).
+    TopLeft = 0,
+    /// (`WC_TOP_RIGHT`).
+    TopRight,
+    /// (`WC_BOTTOM_LEFT`).
+    BottomLeft,
+    /// (`WC_BOTTOM_RIGHT`).
+    BottomRight,
+}
+
+/// The row just past the bottom of `wp` (`W_ENDROW`, a macro in the
+/// original).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn w_endrow(wp: *const crate::buffer_defs::WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_winrow + (*wp).w_height }
+}
+
+/// The column just past the right edge of `wp` (`W_ENDCOL`, a macro in
+/// the original).
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`.
+#[must_use]
+pub unsafe fn w_endcol(wp: *const crate::buffer_defs::WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_wincol + (*wp).w_width }
+}
+
+/// Whether `wp`'s horizontal separator at `corner` is connected to
+/// another window's (`hsep_connected`).
+///
+/// Walks up to find a sibling frame on the relevant side, then back
+/// down to the leaf whose own edge could meet this one, and finally
+/// checks whether the two separator rows actually coincide. That last
+/// check is what makes this a real test rather than "is there a
+/// neighbour at all".
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose
+/// `w_frame` and that frame's own links are likewise valid. Forwarded
+/// from [`crate::window::frame2win`]'s own safety doc.
+pub unsafe fn hsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCorner) -> bool {
+    let before = matches!(corner, WindowCorner::TopLeft | WindowCorner::BottomLeft);
+    // SAFETY: forwarded from this function's own safety doc.
+    let sep_row = unsafe {
+        if matches!(corner, WindowCorner::TopLeft | WindowCorner::TopRight) {
+            (*wp).w_winrow - 1
+        } else {
+            w_endrow(wp)
+        }
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut fr = unsafe { (*wp).w_frame };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        while !(*fr).fr_parent.is_null() {
+            let sibling = if before { (*fr).fr_prev } else { (*fr).fr_next };
+            if (*(*fr).fr_parent).fr_layout == crate::buffer_defs::FR_ROW && !sibling.is_null() {
+                fr = sibling;
+                break;
+            }
+            fr = (*fr).fr_parent;
+        }
+        if (*fr).fr_parent.is_null() {
+            return false;
+        }
+        while (*fr).fr_layout != crate::buffer_defs::FR_LEAF {
+            fr = (*fr).fr_child;
+            if (*(*fr).fr_parent).fr_layout == crate::buffer_defs::FR_ROW && before {
+                while !(*fr).fr_next.is_null() {
+                    fr = (*fr).fr_next;
+                }
+            } else {
+                while !(*fr).fr_next.is_null()
+                    && (*crate::window::frame2win(fr)).w_winrow + (*fr).fr_height < sep_row
+                {
+                    fr = (*fr).fr_next;
+                }
+            }
+        }
+
+        let leaf_win = (*fr).fr_win;
+        sep_row == (*leaf_win).w_winrow - 1 || sep_row == w_endrow(leaf_win)
+    }
+}
+
+/// Whether `wp`'s vertical separator at `corner` is connected to
+/// another window's (`vsep_connected`).
+///
+/// The exact mirror of [`hsep_connected`]: columns and widths in place
+/// of rows and heights, and `FR_COL` in place of `FR_ROW`. Kept as a
+/// separate function rather than being unified with it, matching the
+/// original - the two axes' frame layouts are genuinely different
+/// constants, not a parameter.
+///
+/// # Safety
+/// Same as [`hsep_connected`].
+pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCorner) -> bool {
+    let before = matches!(corner, WindowCorner::TopLeft | WindowCorner::TopRight);
+    // SAFETY: forwarded from this function's own safety doc.
+    let sep_col = unsafe {
+        if matches!(corner, WindowCorner::TopLeft | WindowCorner::BottomLeft) {
+            (*wp).w_wincol - 1
+        } else {
+            w_endcol(wp)
+        }
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut fr = unsafe { (*wp).w_frame };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        while !(*fr).fr_parent.is_null() {
+            let sibling = if before { (*fr).fr_prev } else { (*fr).fr_next };
+            if (*(*fr).fr_parent).fr_layout == crate::buffer_defs::FR_COL && !sibling.is_null() {
+                fr = sibling;
+                break;
+            }
+            fr = (*fr).fr_parent;
+        }
+        if (*fr).fr_parent.is_null() {
+            return false;
+        }
+        while (*fr).fr_layout != crate::buffer_defs::FR_LEAF {
+            fr = (*fr).fr_child;
+            if (*(*fr).fr_parent).fr_layout == crate::buffer_defs::FR_COL && before {
+                while !(*fr).fr_next.is_null() {
+                    fr = (*fr).fr_next;
+                }
+            } else {
+                while !(*fr).fr_next.is_null()
+                    && (*crate::window::frame2win(fr)).w_wincol + (*fr).fr_width < sep_col
+                {
+                    fr = (*fr).fr_next;
+                }
+            }
+        }
+
+        let leaf_win = (*fr).fr_win;
+        sep_col == (*leaf_win).w_wincol - 1 || sep_col == w_endcol(leaf_win)
+    }
+}
+
 /// While computing a statusline and the like we do not want any
 /// `w_redr_type` or `must_redraw` to be set (`redraw_not_allowed`).
 pub static REDRAW_NOT_ALLOWED: GlobalCell<bool> = GlobalCell::new(false);
@@ -442,6 +594,137 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w_endrow_and_w_endcol_are_just_past_the_window() {
+        let win = crate::buffer_defs::WinT {
+            w_winrow: 5,
+            w_height: 10,
+            w_wincol: 3,
+            w_width: 40,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { w_endrow(&win) }, 15);
+        assert_eq!(unsafe { w_endcol(&win) }, 43);
+    }
+
+    #[test]
+    fn hsep_connected_is_false_for_a_lone_window() {
+        // With no parent frame there is no sibling to connect to, so
+        // the upward walk reaches the root and gives up.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win,
+            ..Default::default()
+        };
+        win.w_frame = &mut frame;
+
+        for corner in [
+            WindowCorner::TopLeft,
+            WindowCorner::TopRight,
+            WindowCorner::BottomLeft,
+            WindowCorner::BottomRight,
+        ] {
+            assert!(!unsafe { hsep_connected(&mut win, corner) });
+            assert!(!unsafe { vsep_connected(&mut win, corner) });
+        }
+    }
+
+    #[test]
+    fn vsep_connected_true_when_the_neighbours_edges_meet() {
+        // Two windows side by side in a row: the left one's right edge
+        // is the column just before the right one's left edge, so the
+        // separators genuinely coincide.
+        let mut left_win = crate::buffer_defs::WinT {
+            w_wincol: 0,
+            w_width: 40,
+            ..Default::default()
+        };
+        let mut right_win = crate::buffer_defs::WinT {
+            w_wincol: 41,
+            w_width: 39,
+            ..Default::default()
+        };
+
+        let mut parent = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            ..Default::default()
+        };
+        let mut right_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut right_win,
+            fr_width: 39,
+            fr_parent: &mut parent,
+            ..Default::default()
+        };
+        let mut left_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut left_win,
+            fr_width: 40,
+            fr_parent: &mut parent,
+            fr_next: &mut right_frame,
+            ..Default::default()
+        };
+        right_frame.fr_prev = &mut left_frame;
+        left_win.w_frame = &mut left_frame;
+        right_win.w_frame = &mut right_frame;
+
+        // The left window's RIGHT edge (w_endcol == 40) is exactly the
+        // column before the right window starts (41 - 1).
+        assert!(unsafe { vsep_connected(&mut left_win, WindowCorner::BottomRight) });
+    }
+
+    #[test]
+    fn hsep_connected_false_when_the_edges_do_not_line_up() {
+        // A sibling exists, but its rows do not meet this window's
+        // separator row - so "is there a neighbour" is not enough.
+        let mut top_win = crate::buffer_defs::WinT {
+            w_winrow: 0,
+            w_height: 10,
+            ..Default::default()
+        };
+        let mut other_win = crate::buffer_defs::WinT {
+            w_winrow: 50,
+            w_height: 5,
+            ..Default::default()
+        };
+
+        let mut parent = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            ..Default::default()
+        };
+        let mut other_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut other_win,
+            fr_height: 5,
+            fr_parent: &mut parent,
+            ..Default::default()
+        };
+        let mut top_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut top_win,
+            fr_height: 10,
+            fr_parent: &mut parent,
+            fr_next: &mut other_frame,
+            ..Default::default()
+        };
+        other_frame.fr_prev = &mut top_frame;
+        top_win.w_frame = &mut top_frame;
+        other_win.w_frame = &mut other_frame;
+
+        // top_win's bottom separator row is 10; the sibling spans rows
+        // 50..55, so nothing meets it.
+        assert!(!unsafe { hsep_connected(&mut top_win, WindowCorner::BottomRight) });
+    }
+
+    #[test]
+    fn window_corner_discriminants_match_the_original() {
+        assert_eq!(WindowCorner::TopLeft as i32, 0);
+        assert_eq!(WindowCorner::TopRight as i32, 1);
+        assert_eq!(WindowCorner::BottomLeft as i32, 2);
+        assert_eq!(WindowCorner::BottomRight as i32, 3);
+    }
 
     /// RAII guard installing a window chain and restoring the previous
     /// globals afterwards (even on panic). Self-locking, matching this
