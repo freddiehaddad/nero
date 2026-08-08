@@ -81,6 +81,117 @@ mod bl {
 }
 pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
 
+/// Move the cursor up `n` lines in window `wp` (`cursor_up_inner`).
+///
+/// Takes care of closed folds; skips over concealed lines when
+/// `skip_conceal` is set.
+///
+/// # Safety
+/// `wp` must point at a live `WinT`. Forwards
+/// [`crate::decoration::win_lines_concealed`]/
+/// [`crate::decoration::decor_conceal_line`]/
+/// [`crate::fold::has_folding`]'s own safety docs, and reads
+/// `GLOBALS`/`OPTION_VARS`.
+pub unsafe fn cursor_up_inner(wp: *mut crate::buffer_defs::WinT, n: crate::pos_defs::LinenrT, skip_conceal: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lnum = unsafe { (*wp).w_cursor.lnum };
+    let mut n = n;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let concealed = unsafe { crate::decoration::win_lines_concealed(&*wp) };
+
+    if n >= lnum {
+        lnum = 1;
+    } else if concealed {
+        // Count each sequence of folded lines as one logical line.
+
+        // Go to the start of the current fold.
+        // SAFETY: forwarded from this function's own safety doc.
+        let _ = unsafe { crate::fold::has_folding(&mut *wp, lnum, Some(&mut lnum), None) };
+
+        while n > 0 {
+            n -= 1;
+            // Move up one line.
+            lnum -= 1;
+            if lnum <= 1 {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            if skip_conceal && unsafe { crate::decoration::decor_conceal_line(&*wp, lnum - 1, true) } {
+                n += 1;
+            }
+            // If we entered a fold, move to the beginning, unless in
+            // Insert mode or when 'foldopen' contains "all": it will
+            // open in a moment.
+            // SAFETY: forwarded from this function's own safety doc.
+            let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+            // SAFETY: forwarded from this function's own safety doc.
+            let fdo_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.fdo_flags;
+            if n > 0
+                || !((state as u32 & crate::state_defs::mode::INSERT) != 0
+                    || fdo_flags & crate::option_vars::opt_fdo_flag::ALL != 0)
+            {
+                // SAFETY: forwarded from this function's own safety doc.
+                let _ = unsafe { crate::fold::has_folding(&mut *wp, lnum, Some(&mut lnum), None) };
+            }
+        }
+        lnum = lnum.max(1);
+    } else {
+        lnum -= n;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_cursor.lnum = lnum };
+}
+
+/// Move the cursor down `n` lines in window `wp` (`cursor_down_inner`).
+///
+/// Takes care of closed folds; skips over concealed lines when
+/// `skip_conceal` is set.
+///
+/// # Safety
+/// Same as [`cursor_up_inner`], and `wp`'s own `w_buffer` must point
+/// at a live `BufT`.
+pub unsafe fn cursor_down_inner(wp: *mut crate::buffer_defs::WinT, n: i32, skip_conceal: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut lnum = unsafe { (*wp).w_cursor.lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { (*(*wp).w_buffer).b_ml.ml_line_count };
+    let mut n = n;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let concealed = unsafe { crate::decoration::win_lines_concealed(&*wp) };
+
+    if lnum + n >= line_count {
+        lnum = line_count;
+    } else if concealed {
+        // Count each sequence of folded lines as one logical line.
+        while n > 0 {
+            n -= 1;
+            let mut last = 0;
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::fold::has_folding_win(&mut *wp, lnum, None, Some(&mut last), true, None) } {
+                lnum = last + 1;
+            } else {
+                lnum += 1;
+            }
+            if lnum >= line_count {
+                break;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            if skip_conceal && unsafe { crate::decoration::decor_conceal_line(&*wp, lnum - 1, true) } {
+                n += 1;
+            }
+        }
+        lnum = lnum.min(line_count);
+    } else {
+        lnum += n;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_cursor.lnum = lnum };
+}
+
 /// Move the cursor to the start of the line, according to `flags`
 /// (a combination of [`BL_WHITE`]/[`BL_SOL`]/[`BL_FIX`]) (`beginline`).
 ///
@@ -461,6 +572,101 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    // --- cursor_up_inner / cursor_down_inner ---
+
+    /// Neither function reads the buffer text, so a bare `BufT` with
+    /// a hand-set `ml_line_count` is enough. `w_p_cole` stays at its
+    /// default 0, so `win_lines_concealed` is false and the plain
+    /// (non-fold, non-conceal) arithmetic branch is the one taken -
+    /// which is also the only reachable branch today, since nothing
+    /// in this crate can create a fold or a concealed line.
+    fn cursor_move_win(line_count: crate::pos_defs::LinenrT, start: crate::pos_defs::LinenrT) -> (Box<BufT>, Box<WinT>) {
+        let mut buf = Box::new(BufT::default());
+        buf.b_ml.ml_line_count = line_count;
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(WinT { w_buffer: buf_ptr, ..Default::default() });
+        win.w_cursor.lnum = start;
+        (buf, win)
+    }
+
+    #[test]
+    fn cursor_up_inner_moves_up_by_n_lines() {
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 7);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_up_inner(win_ptr, 3, false) };
+        assert_eq!(win.w_cursor.lnum, 4);
+    }
+
+    #[test]
+    fn cursor_up_inner_clamps_at_the_first_line() {
+        // n >= lnum takes the "go to line 1" branch outright.
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 3);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_up_inner(win_ptr, 99, false) };
+        assert_eq!(win.w_cursor.lnum, 1);
+    }
+
+    #[test]
+    fn cursor_up_inner_from_the_first_line_stays_there() {
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 1);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_up_inner(win_ptr, 1, false) };
+        assert_eq!(win.w_cursor.lnum, 1);
+    }
+
+    #[test]
+    fn cursor_up_inner_with_zero_lines_does_not_move() {
+        // n == 0 is strictly less than any valid lnum, so the plain
+        // subtraction branch applies and subtracts nothing.
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 5);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_up_inner(win_ptr, 0, false) };
+        assert_eq!(win.w_cursor.lnum, 5);
+    }
+
+    #[test]
+    fn cursor_down_inner_moves_down_by_n_lines() {
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 2);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_down_inner(win_ptr, 3, false) };
+        assert_eq!(win.w_cursor.lnum, 5);
+    }
+
+    #[test]
+    fn cursor_down_inner_clamps_at_the_last_line() {
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 4);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_down_inner(win_ptr, 99, false) };
+        assert_eq!(win.w_cursor.lnum, 10);
+    }
+
+    #[test]
+    fn cursor_down_inner_landing_exactly_on_the_last_line_takes_the_clamp_branch() {
+        // lnum + n == line_count satisfies ">=", so the clamp branch
+        // runs rather than the plain addition - same result here, but
+        // it is the branch the original itself takes.
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 6);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_down_inner(win_ptr, 4, false) };
+        assert_eq!(win.w_cursor.lnum, 10);
+    }
+
+    #[test]
+    fn cursor_down_inner_with_zero_lines_does_not_move() {
+        let _lock = global_state_test_lock();
+        let (_buf, mut win) = cursor_move_win(10, 5);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        unsafe { cursor_down_inner(win_ptr, 0, false) };
+        assert_eq!(win.w_cursor.lnum, 5);
     }
 
     // --- beginline ---
