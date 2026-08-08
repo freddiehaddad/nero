@@ -204,6 +204,37 @@ pub unsafe fn init_spell_chartab() {
     }
 }
 
+/// Character classes for [`get_char_type`] (an anonymous `enum` in the
+/// original).
+pub mod char_type {
+    /// Neither a digit nor uppercase (`CHAR_OTHER`).
+    pub const OTHER: i32 = 0;
+    /// An uppercase letter (`CHAR_UPPER`).
+    pub const UPPER: i32 = 1;
+    /// An ASCII digit (`CHAR_DIGIT`).
+    pub const DIGIT: i32 = 2;
+}
+
+/// Classify `c` for camelCase word splitting (`get_char_type`).
+///
+/// Digits are tested BEFORE uppercase, so the two classes never
+/// overlap even if a locale were to report a digit as uppercase.
+/// "Other" is the catch-all, covering lowercase and everything else.
+///
+/// # Safety
+/// Forwarded from [`spell_is_upper`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_char_type(c: i32) -> i32 {
+    if crate::ascii_defs::ascii_isdigit(c) {
+        return char_type::DIGIT;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { spell_is_upper(c) } {
+        return char_type::UPPER;
+    }
+    char_type::OTHER
+}
+
 /// `SPELL_ISUPPER(c)` (`mbyte.h`): whether codepoint `c` is uppercase,
 /// per spelling's own chartab for `c < 128` (matching the original's
 /// exact `c >= 128` cutoff - NOT 256, so bytes 128..255 always go
@@ -907,6 +938,37 @@ mod tests {
     /// `global_state_test_lock()`.
     fn reset_spelltab_ascii() {
         clear_spell_chartab(unsafe { SPELLTAB.get_mut() });
+    }
+
+    #[test]
+    fn get_char_type_classifies_digits_upper_and_other() {
+        let _lock = crate::globals::global_state_test_lock();
+        for c in b'0'..=b'9' {
+            assert_eq!(unsafe { get_char_type(i32::from(c)) }, char_type::DIGIT);
+        }
+        for c in b'A'..=b'Z' {
+            assert_eq!(unsafe { get_char_type(i32::from(c)) }, char_type::UPPER);
+        }
+        for c in *b"az_- " {
+            assert_eq!(unsafe { get_char_type(i32::from(c)) }, char_type::OTHER);
+        }
+    }
+
+    #[test]
+    fn get_char_type_tests_digits_before_uppercase() {
+        // The digit check runs FIRST, so the two classes can never
+        // overlap however spell_is_upper happens to answer.
+        let _lock = crate::globals::global_state_test_lock();
+        let five = i32::from(b'5');
+        assert_eq!(unsafe { get_char_type(five) }, char_type::DIGIT);
+        assert_ne!(unsafe { get_char_type(five) }, char_type::UPPER);
+    }
+
+    #[test]
+    fn char_type_values_match_the_original() {
+        assert_eq!(char_type::OTHER, 0);
+        assert_eq!(char_type::UPPER, 1);
+        assert_eq!(char_type::DIGIT, 2);
     }
 
     #[test]
