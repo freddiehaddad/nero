@@ -81,6 +81,38 @@ mod bl {
 }
 pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
 
+/// Trigger `event` and take care of fixing undo
+/// (`ins_apply_autocmds`).
+///
+/// If the autocommand changed the buffer then `u_savesub` may have
+/// been called, leaving undo unprepared to start a new line; an empty
+/// `u_save` fixes that. Not done when leaving Insert mode, where a new
+/// line is not about to be started anyway.
+///
+/// # Safety
+/// `GLOBALS.curbuf`/`GLOBALS.curwin` must point at live objects, and
+/// [`crate::undo::u_save`]'s own safety doc applies.
+pub unsafe fn ins_apply_autocmds(event: crate::autocmd_defs::EventT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let tick = crate::buffer::buf_get_changedtick(unsafe { &*curbuf });
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let r = crate::autocmd::apply_autocmds(event, None, None, false, Some(unsafe { &*curbuf }));
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let tick_now = crate::buffer::buf_get_changedtick(unsafe { &*curbuf });
+    if event != crate::autocmd_defs::EventT::InsertLeave && tick != tick_now {
+        // SAFETY: forwarded from this function's own safety doc.
+        let lnum = unsafe { (*crate::globals::GLOBALS.get_mut().curwin).w_cursor.lnum };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::undo::u_save(lnum, lnum + 1) };
+    }
+
+    r
+}
+
 /// Redraw the line spell-checking asked for, if any
 /// (`check_spell_redraw`).
 ///
@@ -836,6 +868,65 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    // --- ins_apply_autocmds ---
+
+    #[test]
+    fn ins_apply_autocmds_reports_no_autocommand_was_executed() {
+        // Nothing in this crate can register a real autocommand yet,
+        // so apply_autocmds reports false and leaves the buffer
+        // untouched - which also means the changedtick is unchanged
+        // and the undo-fixing branch is not taken.
+        //
+        // Boxed, not stack-allocated: these pointers go into GLOBALS.
+        let _lock = global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(WinT { w_buffer: buf_ptr, ..Default::default() });
+        win.w_cursor.lnum = 1;
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_buf, prev_win) = (g.curbuf, g.curwin);
+        g.curbuf = buf_ptr;
+        g.curwin = win_ptr;
+
+        let tick_before = crate::buffer::buf_get_changedtick(&buf);
+        let r = unsafe { ins_apply_autocmds(crate::autocmd_defs::EventT::InsertEnter) };
+        let tick_after = crate::buffer::buf_get_changedtick(&buf);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curbuf = prev_buf;
+        g.curwin = prev_win;
+
+        assert!(!r);
+        assert_eq!(tick_before, tick_after, "no autocommand ran, so nothing changed");
+    }
+
+    #[test]
+    fn ins_apply_autocmds_skips_the_undo_fix_when_leaving_insert_mode() {
+        // InsertLeave is excluded from the undo fix-up regardless of
+        // whether the tick moved, since no new line is about to start.
+        let _lock = global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(WinT { w_buffer: buf_ptr, ..Default::default() });
+        win.w_cursor.lnum = 1;
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_buf, prev_win) = (g.curbuf, g.curwin);
+        g.curbuf = buf_ptr;
+        g.curwin = win_ptr;
+
+        let r = unsafe { ins_apply_autocmds(crate::autocmd_defs::EventT::InsertLeave) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curbuf = prev_buf;
+        g.curwin = prev_win;
+
+        assert!(!r);
     }
 
     #[test]
