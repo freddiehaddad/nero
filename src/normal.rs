@@ -15,6 +15,84 @@
 //!
 //! Deferred: everything else in the file.
 
+/// The virtual top line of `wp` (`get_vtopline`).
+///
+/// Counts the screen lines the buffer occupies down to `w_topline`,
+/// minus the filler lines currently shown above it - so the result is
+/// a scroll position comparable across windows with different fold and
+/// diff-filler states, which is what `'scrollbind'` needs.
+///
+/// # Safety
+/// Forwarded from [`crate::plines::plines_m_win_fill`]'s own safety
+/// doc.
+#[must_use]
+pub unsafe fn get_vtopline(wp: &crate::buffer_defs::WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::plines::plines_m_win_fill(wp, 1, wp.w_topline) - wp.w_topfill }
+}
+
+/// Command character that doesn't do anything, and does NOT start
+/// `edit()` afterwards (`nv_ignore`).
+pub fn nv_ignore(cap: &mut crate::normal_defs::CmdargT) {
+    // Don't call edit() now.
+    cap.retval |= crate::normal_defs::ca_flags::COMMAND_BUSY;
+}
+
+/// Command character that doesn't do anything, but unlike
+/// [`nv_ignore`] DOES start `edit()` afterwards (`nv_nop`).
+///
+/// Used for `:startinsert` executed while starting up. The empty body
+/// is the whole point: leaving `retval` untouched is what allows
+/// `edit()` to run.
+pub fn nv_nop(_cap: &mut crate::normal_defs::CmdargT) {}
+
+/// Include the character under the cursor for `'selection'` ==
+/// `"exclusive"` (`adjust_for_sel`).
+///
+/// With an exclusive selection the character the cursor sits on is not
+/// part of the Visual area, so an inclusive operator has to step the
+/// cursor forward and become exclusive itself. The `select_exclu_adj`
+/// flag records that this happened, so it can be undone afterwards.
+///
+/// # Safety
+/// Reads `GLOBALS.Visual`/`GLOBALS.curwin`, which must be valid.
+/// Forwarded from [`crate::cursor::gchar_cursor`]/
+/// [`crate::cursor::inc_cursor`]'s own safety docs.
+pub unsafe fn adjust_for_sel(cap: &mut crate::normal_defs::CmdargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    // SAFETY: cap.oap is a raw pointer in this crate's CmdargT,
+    // matching the original's own `oparg_T *oap` member.
+    let inclusive = unsafe { (*cap.oap).inclusive };
+    if !g.Visual.active || !inclusive {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let exclusive = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_sel
+        .as_deref()
+        .is_some_and(|s| s.first() == Some(&b'e'));
+    if !exclusive {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::cursor::gchar_cursor() } == i32::from(crate::ascii_defs::NUL) {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor = unsafe { (*g.curwin).w_cursor };
+    if !crate::mark_defs::lt(g.Visual.start, cursor) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::cursor::inc_cursor() };
+    // SAFETY: cap.oap is a raw pointer, see above.
+    unsafe { (*cap.oap).inclusive = false };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Visual.select_exclu_adj = true;
+}
+
 /// Clear a pending operator (`clearop`).
 ///
 /// Resets both the operator argument's own fields AND the global
@@ -248,6 +326,118 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv_ignore_sets_command_busy_and_nv_nop_does_not() {
+        // The difference between the two IS the flag: nv_ignore
+        // suppresses the following edit(), nv_nop deliberately allows
+        // it. An empty nv_nop body is correct, not an oversight.
+        let mut oap = crate::normal_defs::OpargT::default();
+        let mut cap = crate::normal_defs::CmdargT { oap: &mut oap, ..Default::default() };
+
+        nv_ignore(&mut cap);
+        assert_ne!(cap.retval & crate::normal_defs::ca_flags::COMMAND_BUSY, 0);
+
+        cap.retval = 0;
+        nv_nop(&mut cap);
+        assert_eq!(cap.retval, 0, "nv_nop must leave retval alone");
+    }
+
+    #[test]
+    fn ca_flag_values_match_the_original() {
+        assert_eq!(crate::normal_defs::ca_flags::COMMAND_BUSY, 1);
+        assert_eq!(crate::normal_defs::ca_flags::NO_ADJ_OP_END, 2);
+    }
+
+    #[test]
+    fn get_vtopline_subtracts_the_filler_lines() {
+        // The filler lines shown ABOVE w_topline are not part of the
+        // buffer's own screen-line count, so they are subtracted.
+        //
+        // plines_m_win_fill reaches diff.rs, which dereferences
+        // GLOBALS.curtab, so a real tabpage must be installed first.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let prev_tab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = &mut tp;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_ml.ml_line_count = 100;
+        let win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_topline: 1,
+            w_topfill: 0,
+            ..Default::default()
+        };
+        let without_fill = unsafe { get_vtopline(&win) };
+
+        let win_filled = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_topline: 1,
+            w_topfill: 3,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { get_vtopline(&win_filled) }, without_fill - 3);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_tab;
+    }
+
+    #[test]
+    fn adjust_for_sel_does_nothing_outside_visual_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_active = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = false;
+
+        let mut oap = crate::normal_defs::OpargT { inclusive: true, ..Default::default() };
+        let mut cap = crate::normal_defs::CmdargT { oap: &mut oap, ..Default::default() };
+        unsafe { adjust_for_sel(&mut cap) };
+
+        assert!(oap.inclusive, "an inclusive operator must be left alone");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = prev_active;
+    }
+
+    #[test]
+    fn adjust_for_sel_does_nothing_for_an_exclusive_operator() {
+        // Only an INCLUSIVE operator needs adjusting; an already
+        // exclusive one is left untouched whatever 'selection' says.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_active = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active;
+        let prev_sel = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel.clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = true;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel =
+            Some(b"exclusive".to_vec());
+
+        let mut oap = crate::normal_defs::OpargT { inclusive: false, ..Default::default() };
+        let mut cap = crate::normal_defs::CmdargT { oap: &mut oap, ..Default::default() };
+        unsafe { adjust_for_sel(&mut cap) };
+
+        assert!(!oap.inclusive);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = prev_active;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = prev_sel;
+    }
+
+    #[test]
+    fn adjust_for_sel_does_nothing_for_inclusive_selection() {
+        // 'selection' must start with 'e' (exclusive); the default
+        // "inclusive" leaves everything alone.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_active = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active;
+        let prev_sel = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel.clone();
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = true;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel =
+            Some(b"inclusive".to_vec());
+
+        let mut oap = crate::normal_defs::OpargT { inclusive: true, ..Default::default() };
+        let mut cap = crate::normal_defs::CmdargT { oap: &mut oap, ..Default::default() };
+        unsafe { adjust_for_sel(&mut cap) };
+
+        assert!(oap.inclusive, "inclusive 'selection' needs no adjustment");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active = prev_active;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = prev_sel;
+    }
 
     // --- v_swap_corners ---
 

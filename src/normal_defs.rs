@@ -107,6 +107,15 @@ pub struct CmdargT {
     pub searchbuf: Option<Vec<u8>>,
 }
 
+/// `CA_*` values for [`CmdargT::retval`] (an anonymous `enum` in the
+/// original).
+pub mod ca_flags {
+    /// Skip restarting `edit()` once (`CA_COMMAND_BUSY`).
+    pub const COMMAND_BUSY: i32 = 1;
+    /// Don't adjust the operator end (`CA_NO_ADJ_OP_END`).
+    pub const NO_ADJ_OP_END: i32 = 2;
+}
+
 impl Default for CmdargT {
     fn default() -> Self {
         CmdargT {
