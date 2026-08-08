@@ -301,9 +301,234 @@ pub struct AutoCmdEvent {
     pub data: *mut crate::api::private::defs::Object,
 }
 
+
+/// One entry of the event-name table (`struct event_name`).
+///
+/// The original also stores the name's own length; a Rust slice
+/// already carries it, so that field has no equivalent here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventName {
+    /// Event name as written in an `:autocmd` command (`name`).
+    pub name: &'static [u8],
+    /// The event this name denotes (`event`).
+    ///
+    /// Several names are aliases for the same event (for example
+    /// `BufCreate` for [`EventT::BufAdd`]), so this is not always the
+    /// variant whose own slot the entry occupies.
+    pub event: EventT,
+    /// Whether the event may appear in `'eventignorewin'`.
+    ///
+    /// The original encodes this in the SIGN of its own `event` field:
+    /// a negated event is window-local, and `event <= 0` is how it
+    /// tests for one. Splitting it out into its own flag keeps
+    /// [`EventName::event`] usable directly, without the caller having
+    /// to negate it first.
+    pub win_local: bool,
+}
+
+/// Every recognised autocommand event name (`event_names`).
+///
+/// Indexed by [`EventT`] discriminant, so `EVENT_NAMES[e as usize]`
+/// is the spelling of `e` - including for alias entries, whose own
+/// `event` field then names the event they alias.
+pub static EVENT_NAMES: [EventName; NUM_EVENTS] = [
+    EventName { name: b"BufAdd", event: EventT::BufAdd, win_local: true },
+    EventName { name: b"BufCreate", event: EventT::BufAdd, win_local: true },
+    EventName { name: b"BufDelete", event: EventT::BufDelete, win_local: true },
+    EventName { name: b"BufEnter", event: EventT::BufEnter, win_local: true },
+    EventName { name: b"BufFilePost", event: EventT::BufFilePost, win_local: true },
+    EventName { name: b"BufFilePre", event: EventT::BufFilePre, win_local: true },
+    EventName { name: b"BufHidden", event: EventT::BufHidden, win_local: true },
+    EventName { name: b"BufLeave", event: EventT::BufLeave, win_local: true },
+    EventName { name: b"BufNew", event: EventT::BufNew, win_local: true },
+    EventName { name: b"BufNewFile", event: EventT::BufNewFile, win_local: true },
+    EventName { name: b"BufRead", event: EventT::BufReadPost, win_local: true },
+    EventName { name: b"BufReadCmd", event: EventT::BufReadCmd, win_local: true },
+    EventName { name: b"BufReadPost", event: EventT::BufReadPost, win_local: true },
+    EventName { name: b"BufReadPre", event: EventT::BufReadPre, win_local: true },
+    EventName { name: b"BufUnload", event: EventT::BufUnload, win_local: true },
+    EventName { name: b"BufWinEnter", event: EventT::BufWinEnter, win_local: true },
+    EventName { name: b"BufWinLeave", event: EventT::BufWinLeave, win_local: true },
+    EventName { name: b"BufWipeout", event: EventT::BufWipeout, win_local: true },
+    EventName { name: b"BufWrite", event: EventT::BufWritePre, win_local: true },
+    EventName { name: b"BufWriteCmd", event: EventT::BufWriteCmd, win_local: true },
+    EventName { name: b"BufWritePost", event: EventT::BufWritePost, win_local: true },
+    EventName { name: b"BufWritePre", event: EventT::BufWritePre, win_local: true },
+    EventName { name: b"ChanClose", event: EventT::ChanClose, win_local: false },
+    EventName { name: b"ChanInfo", event: EventT::ChanInfo, win_local: false },
+    EventName { name: b"ChanOpen", event: EventT::ChanOpen, win_local: false },
+    EventName { name: b"CmdlineChanged", event: EventT::CmdlineChanged, win_local: false },
+    EventName { name: b"CmdlineEnter", event: EventT::CmdlineEnter, win_local: false },
+    EventName { name: b"CmdlineLeave", event: EventT::CmdlineLeave, win_local: false },
+    EventName { name: b"CmdlineLeavePre", event: EventT::CmdlineLeavePre, win_local: false },
+    EventName { name: b"CmdUndefined", event: EventT::CmdUndefined, win_local: false },
+    EventName { name: b"CmdwinEnter", event: EventT::CmdwinEnter, win_local: false },
+    EventName { name: b"CmdwinLeave", event: EventT::CmdwinLeave, win_local: false },
+    EventName { name: b"ColorScheme", event: EventT::ColorScheme, win_local: false },
+    EventName { name: b"ColorSchemePre", event: EventT::ColorSchemePre, win_local: false },
+    EventName { name: b"CompleteChanged", event: EventT::CompleteChanged, win_local: false },
+    EventName { name: b"CompleteDone", event: EventT::CompleteDone, win_local: false },
+    EventName { name: b"CompleteDonePre", event: EventT::CompleteDonePre, win_local: false },
+    EventName { name: b"CursorHold", event: EventT::CursorHold, win_local: true },
+    EventName { name: b"CursorHoldI", event: EventT::CursorHoldI, win_local: true },
+    EventName { name: b"CursorMoved", event: EventT::CursorMoved, win_local: true },
+    EventName { name: b"CursorMovedC", event: EventT::CursorMovedC, win_local: true },
+    EventName { name: b"CursorMovedI", event: EventT::CursorMovedI, win_local: true },
+    EventName { name: b"DiagnosticChanged", event: EventT::DiagnosticChanged, win_local: false },
+    EventName { name: b"DiffUpdated", event: EventT::DiffUpdated, win_local: false },
+    EventName { name: b"DirChanged", event: EventT::DirChanged, win_local: false },
+    EventName { name: b"DirChangedPre", event: EventT::DirChangedPre, win_local: false },
+    EventName { name: b"EncodingChanged", event: EventT::EncodingChanged, win_local: false },
+    EventName { name: b"ExitPre", event: EventT::ExitPre, win_local: false },
+    EventName { name: b"FileAppendCmd", event: EventT::FileAppendCmd, win_local: true },
+    EventName { name: b"FileAppendPost", event: EventT::FileAppendPost, win_local: true },
+    EventName { name: b"FileAppendPre", event: EventT::FileAppendPre, win_local: true },
+    EventName { name: b"FileChangedRO", event: EventT::FileChangedRO, win_local: true },
+    EventName { name: b"FileChangedShell", event: EventT::FileChangedShell, win_local: true },
+    EventName { name: b"FileChangedShellPost", event: EventT::FileChangedShellPost, win_local: true },
+    EventName { name: b"FileEncoding", event: EventT::EncodingChanged, win_local: false },
+    EventName { name: b"FileReadCmd", event: EventT::FileReadCmd, win_local: true },
+    EventName { name: b"FileReadPost", event: EventT::FileReadPost, win_local: true },
+    EventName { name: b"FileReadPre", event: EventT::FileReadPre, win_local: true },
+    EventName { name: b"FileType", event: EventT::FileType, win_local: true },
+    EventName { name: b"FileWriteCmd", event: EventT::FileWriteCmd, win_local: true },
+    EventName { name: b"FileWritePost", event: EventT::FileWritePost, win_local: true },
+    EventName { name: b"FileWritePre", event: EventT::FileWritePre, win_local: true },
+    EventName { name: b"FilterReadPost", event: EventT::FilterReadPost, win_local: true },
+    EventName { name: b"FilterReadPre", event: EventT::FilterReadPre, win_local: true },
+    EventName { name: b"FilterWritePost", event: EventT::FilterWritePost, win_local: true },
+    EventName { name: b"FilterWritePre", event: EventT::FilterWritePre, win_local: true },
+    EventName { name: b"FocusGained", event: EventT::FocusGained, win_local: false },
+    EventName { name: b"FocusLost", event: EventT::FocusLost, win_local: false },
+    EventName { name: b"FuncUndefined", event: EventT::FuncUndefined, win_local: false },
+    EventName { name: b"GUIEnter", event: EventT::GUIEnter, win_local: false },
+    EventName { name: b"GUIFailed", event: EventT::GUIFailed, win_local: false },
+    EventName { name: b"InsertChange", event: EventT::InsertChange, win_local: true },
+    EventName { name: b"InsertCharPre", event: EventT::InsertCharPre, win_local: true },
+    EventName { name: b"InsertEnter", event: EventT::InsertEnter, win_local: true },
+    EventName { name: b"InsertLeave", event: EventT::InsertLeave, win_local: true },
+    EventName { name: b"InsertLeavePre", event: EventT::InsertLeavePre, win_local: true },
+    EventName { name: b"LspAttach", event: EventT::LspAttach, win_local: false },
+    EventName { name: b"LspDetach", event: EventT::LspDetach, win_local: false },
+    EventName { name: b"LspNotify", event: EventT::LspNotify, win_local: false },
+    EventName { name: b"LspProgress", event: EventT::LspProgress, win_local: false },
+    EventName { name: b"LspRequest", event: EventT::LspRequest, win_local: false },
+    EventName { name: b"LspTokenUpdate", event: EventT::LspTokenUpdate, win_local: false },
+    EventName { name: b"MarkSet", event: EventT::MarkSet, win_local: false },
+    EventName { name: b"MenuPopup", event: EventT::MenuPopup, win_local: false },
+    EventName { name: b"ModeChanged", event: EventT::ModeChanged, win_local: false },
+    EventName { name: b"OptionSet", event: EventT::OptionSet, win_local: false },
+    EventName { name: b"PackChanged", event: EventT::PackChanged, win_local: false },
+    EventName { name: b"PackChangedPre", event: EventT::PackChangedPre, win_local: false },
+    EventName { name: b"Progress", event: EventT::Progress, win_local: false },
+    EventName { name: b"QuickFixCmdPost", event: EventT::QuickFixCmdPost, win_local: false },
+    EventName { name: b"QuickFixCmdPre", event: EventT::QuickFixCmdPre, win_local: false },
+    EventName { name: b"QuitPre", event: EventT::QuitPre, win_local: false },
+    EventName { name: b"RecordingEnter", event: EventT::RecordingEnter, win_local: true },
+    EventName { name: b"RecordingLeave", event: EventT::RecordingLeave, win_local: true },
+    EventName { name: b"RemoteReply", event: EventT::RemoteReply, win_local: false },
+    EventName { name: b"SafeState", event: EventT::SafeState, win_local: false },
+    EventName { name: b"SearchWrapped", event: EventT::SearchWrapped, win_local: true },
+    EventName { name: b"SessionLoadPost", event: EventT::SessionLoadPost, win_local: false },
+    EventName { name: b"SessionLoadPre", event: EventT::SessionLoadPre, win_local: false },
+    EventName { name: b"SessionWritePost", event: EventT::SessionWritePost, win_local: false },
+    EventName { name: b"SessionWritePre", event: EventT::SessionWritePre, win_local: false },
+    EventName { name: b"ShellCmdPost", event: EventT::ShellCmdPost, win_local: false },
+    EventName { name: b"ShellFilterPost", event: EventT::ShellFilterPost, win_local: true },
+    EventName { name: b"Signal", event: EventT::Signal, win_local: false },
+    EventName { name: b"SourceCmd", event: EventT::SourceCmd, win_local: false },
+    EventName { name: b"SourcePost", event: EventT::SourcePost, win_local: false },
+    EventName { name: b"SourcePre", event: EventT::SourcePre, win_local: false },
+    EventName { name: b"SpellFileMissing", event: EventT::SpellFileMissing, win_local: false },
+    EventName { name: b"StdinReadPost", event: EventT::StdinReadPost, win_local: false },
+    EventName { name: b"StdinReadPre", event: EventT::StdinReadPre, win_local: false },
+    EventName { name: b"SwapExists", event: EventT::SwapExists, win_local: false },
+    EventName { name: b"Syntax", event: EventT::Syntax, win_local: false },
+    EventName { name: b"TabClosed", event: EventT::TabClosed, win_local: false },
+    EventName { name: b"TabClosedPre", event: EventT::TabClosedPre, win_local: false },
+    EventName { name: b"TabEnter", event: EventT::TabEnter, win_local: false },
+    EventName { name: b"TabLeave", event: EventT::TabLeave, win_local: false },
+    EventName { name: b"TabMoved", event: EventT::TabMoved, win_local: false },
+    EventName { name: b"TabNew", event: EventT::TabNew, win_local: false },
+    EventName { name: b"TabNewEntered", event: EventT::TabNewEntered, win_local: false },
+    EventName { name: b"TermChanged", event: EventT::TermChanged, win_local: false },
+    EventName { name: b"TermClose", event: EventT::TermClose, win_local: false },
+    EventName { name: b"TermEnter", event: EventT::TermEnter, win_local: false },
+    EventName { name: b"TermLeave", event: EventT::TermLeave, win_local: false },
+    EventName { name: b"TermOpen", event: EventT::TermOpen, win_local: false },
+    EventName { name: b"TermRequest", event: EventT::TermRequest, win_local: false },
+    EventName { name: b"TermResponse", event: EventT::TermResponse, win_local: false },
+    EventName { name: b"TextChanged", event: EventT::TextChanged, win_local: true },
+    EventName { name: b"TextChangedI", event: EventT::TextChangedI, win_local: true },
+    EventName { name: b"TextChangedP", event: EventT::TextChangedP, win_local: true },
+    EventName { name: b"TextChangedT", event: EventT::TextChangedT, win_local: true },
+    EventName { name: b"TextPutPost", event: EventT::TextPutPost, win_local: true },
+    EventName { name: b"TextPutPre", event: EventT::TextPutPre, win_local: true },
+    EventName { name: b"TextYankPost", event: EventT::TextYankPost, win_local: true },
+    EventName { name: b"UIEnter", event: EventT::UIEnter, win_local: false },
+    EventName { name: b"UILeave", event: EventT::UILeave, win_local: false },
+    EventName { name: b"User", event: EventT::User, win_local: false },
+    EventName { name: b"VimEnter", event: EventT::VimEnter, win_local: false },
+    EventName { name: b"VimLeave", event: EventT::VimLeave, win_local: false },
+    EventName { name: b"VimLeavePre", event: EventT::VimLeavePre, win_local: false },
+    EventName { name: b"VimResized", event: EventT::VimResized, win_local: false },
+    EventName { name: b"VimResume", event: EventT::VimResume, win_local: false },
+    EventName { name: b"VimSuspend", event: EventT::VimSuspend, win_local: false },
+    EventName { name: b"WinClosed", event: EventT::WinClosed, win_local: true },
+    EventName { name: b"WinEnter", event: EventT::WinEnter, win_local: true },
+    EventName { name: b"WinLeave", event: EventT::WinLeave, win_local: true },
+    EventName { name: b"WinNew", event: EventT::WinNew, win_local: false },
+    EventName { name: b"WinNewPre", event: EventT::WinNewPre, win_local: false },
+    EventName { name: b"WinResized", event: EventT::WinResized, win_local: true },
+    EventName { name: b"WinScrolled", event: EventT::WinScrolled, win_local: true },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_names_covers_every_event_slot() {
+        assert_eq!(EVENT_NAMES.len(), NUM_EVENTS);
+        assert!(EVENT_NAMES.iter().all(|e| !e.name.is_empty()));
+    }
+
+    #[test]
+    fn event_names_spells_each_slots_own_event() {
+        // Every non-alias entry names the event whose slot it sits in.
+        assert_eq!(EVENT_NAMES[EventT::BufAdd as usize].name, b"BufAdd");
+        assert_eq!(EVENT_NAMES[EventT::CursorHold as usize].name, b"CursorHold");
+        assert_eq!(EVENT_NAMES[EventT::WinScrolled as usize].name, b"WinScrolled");
+    }
+
+    #[test]
+    fn event_names_records_aliases_pointing_at_the_event_they_alias() {
+        // "BufCreate" occupies its own slot but denotes BufAdd.
+        let alias = EVENT_NAMES[EventT::BufCreate as usize];
+        assert_eq!(alias.name, b"BufCreate");
+        assert_eq!(alias.event, EventT::BufAdd);
+    }
+
+    #[test]
+    fn event_names_marks_window_local_events() {
+        // The original encodes this as a negated event; only a subset
+        // of events may appear in 'eventignorewin'.
+        assert!(EVENT_NAMES[EventT::BufAdd as usize].win_local);
+        assert!(!EVENT_NAMES[EventT::ChanClose as usize].win_local);
+
+        // Both kinds genuinely occur, so neither flag value is vacuous.
+        assert!(EVENT_NAMES.iter().any(|e| e.win_local));
+        assert!(EVENT_NAMES.iter().any(|e| !e.win_local));
+    }
+
+    #[test]
+    fn event_names_are_unique() {
+        let mut seen: Vec<&[u8]> = EVENT_NAMES.iter().map(|e| e.name).collect();
+        seen.sort_unstable();
+        let count = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "event names must be distinct");
+    }
 
     #[test]
     fn event_t_first_and_last_values_match_generator() {
