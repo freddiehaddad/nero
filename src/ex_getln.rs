@@ -417,6 +417,77 @@ pub fn cmdline_at_end() -> bool {
 }
 
 
+/// The command-line cursor position to apply once the current
+/// CTRL-\\ e or CTRL-R `=` evaluation finishes (`new_cmdpos`).
+///
+/// The position is deliberately NOT applied directly: the expression
+/// being evaluated may itself still change the command line.
+static NEW_CMDPOS: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// The screen column for a byte position on the command line
+/// (`cmd_screencol`).
+///
+/// When the command line does not fit, the cursor is shown on the
+/// last visible character - without moving the cursor itself, so text
+/// can still be appended.
+///
+/// # Safety
+/// Reads `GLOBALS` and the `CCLINE` file-static, and forwards
+/// [`cmdline_charsize`]/[`correct_screencol`]/
+/// [`crate::mbyte::utfc_ptr2len`]'s own safety docs.
+#[must_use]
+pub unsafe fn cmd_screencol(bytepos: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut col = unsafe { cmd_startcol() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let m = if g.KeyTyped {
+        let cmdline_win = g.cmdline_win;
+        let m = if cmdline_win.is_null() {
+            g.Columns.saturating_mul(g.Rows)
+        } else {
+            // SAFETY: cmdline_win is non-null here.
+            unsafe { (*cmdline_win).w_view_width.saturating_mul((*cmdline_win).w_view_height) }
+        };
+        // Overflow: Columns or Rows at a weird value.
+        if m < 0 { crate::pos_defs::MAXCOL } else { m }
+    } else {
+        crate::pos_defs::MAXCOL
+    };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    let cmdlen = ccline.cmdlen;
+    let Some(buff) = ccline.cmdbuff.clone() else {
+        return col;
+    };
+
+    let mut i: i32 = 0;
+    while i < cmdlen && i < bytepos {
+        // SAFETY: forwarded from this function's own safety doc.
+        let c = unsafe { cmdline_charsize(i as usize) };
+        // Count ">" for a double-wide character that doesn't fit.
+        // SAFETY: forwarded from this function's own safety doc.
+        col = unsafe { correct_screencol(i as usize, c, col) };
+
+        // If the command line doesn't fit, show the cursor on the last
+        // visible character - without moving the cursor itself, so
+        // text can still be appended.
+        col += c;
+        if col >= m {
+            col -= c;
+            break;
+        }
+
+        // SAFETY: forwarded from this function's own safety doc.
+        let step = unsafe { crate::mbyte::utfc_ptr2len(buff.get(i as usize..).unwrap_or_default()) };
+        i += step.max(1);
+    }
+
+    col
+}
+
 /// Allocate a new command-line buffer (`alloc_cmdbuff`).
 ///
 /// Extra space is reserved beyond the requested length so that typing
@@ -801,15 +872,24 @@ pub fn f_setcmdline(
     rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
 }
 
-/// Set the command line's cursor byte position to `pos` (zero-based)
-/// (`set_cmdline_pos`, `ex_getln.c`). Returns `1` (fail) unless a
-/// command line is currently active - see [`set_cmdline_str`]'s own
-/// doc comment for why this is always the case today.
-fn set_cmdline_pos(_pos: i32) -> i32 {
-    if !cmdline_is_active() {
+/// Request a new command-line cursor position (`set_cmdline_pos`).
+///
+/// @return `1` when there is no command line to position, `0` on
+///         success - the original's own inverted convention, kept.
+///
+/// # Safety
+/// Same as [`get_ccline_ptr`], and mutates the `NEW_CMDPOS`
+/// file-static.
+unsafe fn set_cmdline_pos(pos: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { get_ccline_ptr() }.is_null() {
         return 1;
     }
-    unimplemented!("set_cmdline_pos(): needs a real, live command-line-editing state")
+    // The position is not set directly but after CTRL-\ e or CTRL-R =
+    // has changed the command line.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *NEW_CMDPOS.get_mut() = pos.max(0) };
+    0
 }
 
 /// `setcmdpos({pos})` - set the command-line cursor position
@@ -820,8 +900,9 @@ pub fn f_setcmdpos(
 ) {
     let pos = (crate::eval::typval::tv_get_number(&argvars[0]) - 1) as i32;
     if pos >= 0 {
-        rettv.value =
-            crate::eval::typval_defs::TypvalValue::Number(i64::from(set_cmdline_pos(pos)));
+        // SAFETY: reads this module's own ccline file-static.
+        let n = unsafe { set_cmdline_pos(pos) };
+        rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(n));
     }
 }
 
@@ -1148,6 +1229,78 @@ mod tests {
 
         // SAFETY: forwarded from the lock reasoning above.
         unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn cmd_screencol_accumulates_character_widths_from_the_start_column() {
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_cols, prev_rows, prev_typed) = (g.Columns, g.Rows, g.KeyTyped);
+        g.Columns = 80;
+        g.Rows = 24;
+        g.KeyTyped = false;
+
+        // Start column is indent(0) + 1 for the ':' , then three
+        // one-cell characters.
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdbuff = Some(b"echo".to_vec());
+                cc.cmdlen = 4;
+                cc.cmdfirstc = i32::from(b':');
+            },
+            || unsafe { cmd_screencol(3) },
+        );
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Columns = prev_cols;
+        g.Rows = prev_rows;
+        g.KeyTyped = prev_typed;
+        assert_eq!(got, 4);
+    }
+
+    #[test]
+    fn cmd_screencol_at_position_zero_is_just_the_start_column() {
+        let _guard = crate::globals::global_state_test_lock();
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdbuff = Some(b"echo".to_vec());
+                cc.cmdlen = 4;
+                cc.cmdindent = 2;
+                cc.cmdfirstc = i32::from(b':');
+            },
+            || unsafe { cmd_screencol(0) },
+        );
+        assert_eq!(got, 3, "indent 2 plus one for the ':'");
+    }
+
+    #[test]
+    fn cmd_screencol_stops_at_the_last_visible_character_when_it_does_not_fit() {
+        // With a typed key the maximum is the real screen area, so a
+        // long command line clamps rather than running past it.
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_cols, prev_rows, prev_typed, prev_win) =
+            (g.Columns, g.Rows, g.KeyTyped, g.cmdline_win);
+        g.Columns = 4;
+        g.Rows = 1;
+        g.KeyTyped = true;
+        g.cmdline_win = std::ptr::null_mut();
+
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdbuff = Some(b"abcdefghij".to_vec());
+                cc.cmdlen = 10;
+                cc.cmdfirstc = i32::from(b':');
+            },
+            || unsafe { cmd_screencol(10) },
+        );
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Columns = prev_cols;
+        g.Rows = prev_rows;
+        g.KeyTyped = prev_typed;
+        g.cmdline_win = prev_win;
+        assert!(got < 10, "clamped to the visible area, got {got}");
     }
 
     // --- cmdline buffer lifecycle and save/restore ---
@@ -1837,7 +1990,46 @@ mod tests {
     #[test]
     fn set_cmdline_pos_returns_1_when_no_command_line_is_active() {
         let _guard = crate::globals::global_state_test_lock();
-        assert_eq!(set_cmdline_pos(0), 1);
+        assert_eq!(unsafe { set_cmdline_pos(0) }, 1);
+    }
+
+    #[test]
+    fn set_cmdline_pos_records_the_position_when_a_command_line_is_active() {
+        // The position is deliberately NOT applied to cmdpos directly:
+        // the expression being evaluated may still change the command
+        // line, so it is staged in new_cmdpos instead.
+        let _guard = crate::globals::global_state_test_lock();
+        let got = with_cmdline(
+            |cc| {
+                cc.cmdbuff = Some(b":echo".to_vec());
+                cc.cmdpos = 0;
+            },
+            || {
+                let rc = unsafe { set_cmdline_pos(3) };
+                let staged = unsafe { *NEW_CMDPOS.get_mut() };
+                let cmdpos = unsafe { (*get_cmdline_info()).cmdpos };
+                (rc, staged, cmdpos)
+            },
+        );
+        unsafe { *NEW_CMDPOS.get_mut() = 0 };
+
+        assert_eq!(got.0, 0, "reports success");
+        assert_eq!(got.1, 3, "the position is staged");
+        assert_eq!(got.2, 0, "but cmdpos itself is untouched");
+    }
+
+    #[test]
+    fn set_cmdline_pos_clamps_a_negative_position_to_zero() {
+        let _guard = crate::globals::global_state_test_lock();
+        let staged = with_cmdline(
+            |cc| cc.cmdbuff = Some(b":echo".to_vec()),
+            || {
+                unsafe { set_cmdline_pos(-5) };
+                unsafe { *NEW_CMDPOS.get_mut() }
+            },
+        );
+        unsafe { *NEW_CMDPOS.get_mut() = 0 };
+        assert_eq!(staged, 0);
     }
 
     #[test]
