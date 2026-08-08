@@ -798,6 +798,38 @@ pub fn translated_function_exists(name: &[u8]) -> bool {
     }
 }
 
+/// Get the number of required/optional arguments a function takes,
+/// and whether it accepts a variable number (`get_func_arity`).
+///
+/// Builtins are looked up first via
+/// [`crate::eval::funcs::find_internal_func`]; anything else is
+/// resolved as a user-defined function via [`fname_trans_sid`] plus
+/// [`find_func`].
+///
+/// @return `Some((required, optional, varargs))`, or `None` when no
+///         such function exists. The original writes those three
+///         through out-parameters and returns `OK`/`FAIL`; they become
+///         the return value here.
+#[must_use]
+pub fn get_func_arity(name: &[u8]) -> Option<(i32, i32, bool)> {
+    let (argcount, min_argcount, varargs) = if let Some(fdef) = crate::eval::funcs::find_internal_func(name) {
+        (i32::from(fdef.max_argc), i32::from(fdef.min_argc), false)
+    } else {
+        // May need to translate <SNR>123_ to K_SNR.
+        let fname = fname_trans_sid(name).ok()?;
+        let ufunc = find_func(&fname);
+        if ufunc.is_null() {
+            return None;
+        }
+        // SAFETY: find_func returned a non-null pointer into the
+        // function hashtable, which outlives this read.
+        let (args, def_args, va) = unsafe { (&(*ufunc).uf_args, &(*ufunc).uf_def_args, (*ufunc).uf_varargs) };
+        (args.ga_len, args.ga_len - def_args.ga_len, va != 0)
+    };
+
+    Some((min_argcount, argcount - min_argcount, varargs))
+}
+
 /// Errors for when calling a function (`FnameTransError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FnameTransError {
@@ -4065,6 +4097,57 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         func_init();
         assert!(!translated_function_exists(b"NoSuchUserFunctionAtAll"));
+    }
+
+    #[test]
+    fn get_func_arity_reports_a_builtin_functions_own_arity() {
+        // "len" takes exactly one argument, no optionals, no varargs.
+        assert_eq!(get_func_arity(b"len"), Some((1, 0, false)));
+    }
+
+    #[test]
+    fn get_func_arity_counts_a_builtins_optional_arguments() {
+        // "get" accepts 2 or 3 arguments: 2 required, 1 optional.
+        assert_eq!(get_func_arity(b"get"), Some((2, 1, false)));
+    }
+
+    #[test]
+    fn get_func_arity_is_none_for_an_unknown_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        assert_eq!(get_func_arity(b"no_such_function_anywhere_xyz"), None);
+    }
+
+    #[test]
+    fn get_func_arity_reports_a_user_functions_own_arity() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp = Box::new(UfuncT {
+            uf_name: b"ArityUserFunc\0".to_vec(),
+            uf_args: crate::garray_defs::GarrayT { ga_len: 4, ..Default::default() },
+            uf_def_args: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+
+        // 4 declared args, 1 of which has a default -> 3 required,
+        // 1 optional.
+        assert_eq!(get_func_arity(b"ArityUserFunc"), Some((3, 1, false)));
+    }
+
+    #[test]
+    fn get_func_arity_reports_a_user_functions_varargs_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        func_init();
+        let mut fp = Box::new(UfuncT {
+            uf_name: b"ArityVarargsFunc\0".to_vec(),
+            uf_args: crate::garray_defs::GarrayT { ga_len: 1, ..Default::default() },
+            uf_varargs: 1,
+            ..Default::default()
+        });
+        unsafe { func_hashtab_add(fp.as_mut() as *mut UfuncT) };
+
+        assert_eq!(get_func_arity(b"ArityVarargsFunc"), Some((1, 0, true)));
     }
 
     #[test]
