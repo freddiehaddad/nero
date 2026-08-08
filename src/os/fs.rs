@@ -300,6 +300,194 @@ pub fn is_executable(name: &Path, want_abspath: bool) -> (bool, Option<Vec<u8>>)
     }
 }
 
+/// [`is_executable`] for a byte-string name.
+///
+/// The rest of this family (mirroring `path.c`'s own convention)
+/// works in byte strings, while `is_executable` itself takes a
+/// [`Path`] like the rest of this module. A name that isn't valid
+/// UTF-8 can't become a `Path` here and is simply not executable,
+/// matching this crate's documented narrow "requires valid UTF-8"
+/// convention (see [`path_to_cstring`]).
+fn is_executable_bytes(name: &[u8], want_abspath: bool) -> (bool, Option<Vec<u8>>) {
+    match std::str::from_utf8(name) {
+        Ok(s) => is_executable(Path::new(s), want_abspath),
+        Err(_) => (false, None),
+    }
+}
+
+/// Whether `haystack` contains `needle` (the original's own `strstr`
+/// against a `path_tail`-derived slice). Only the Windows branches
+/// need this, matching the original's own `#ifdef MSWIN` placement.
+#[cfg(windows)]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether `name` is executable under any of these conditions
+/// (`is_executable_ext`):
+///
+/// - its extension is in `$PATHEXT` and `name` is executable, or
+/// - the result of appending any `$PATHEXT` extension to `name` is.
+///
+/// Windows only. The original `#define`s this straight to
+/// `is_executable` elsewhere, which [`is_executable_ext`] mirrors with
+/// a `cfg`-gated pair rather than a macro.
+#[cfg(windows)]
+fn is_executable_ext(name: &[u8], want_abspath: bool) -> (bool, Option<Vec<u8>>) {
+    let sh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_sh
+        .clone()
+        .unwrap_or_default();
+    let sh_tail = &sh[crate::path::path_tail(&sh)..];
+    let is_unix_shell = !contains_bytes(sh_tail, b"powershell")
+        && !contains_bytes(sh_tail, b"pwsh")
+        && contains_bytes(sh_tail, b"sh");
+
+    // The name's own extension, including its leading dot.
+    let nameext = name.iter().rposition(|&c| c == b'.').map(|i| &name[i..]);
+    let nameext_len = nameext.map_or(0, <[u8]>::len);
+
+    let pathext = crate::os::env::os_getenv(b"PATHEXT").unwrap_or_else(|| b".com;.exe;.bat;.cmd".to_vec());
+
+    // The original appends each extension into the shared `os_buf`
+    // scratch buffer, right after a copy of `name`; a growable `Vec`
+    // does the same by truncating back to `name`'s length each round.
+    let mut buf = name.to_vec();
+    let sep = crate::os::os_defs::ENV_SEPCHAR as u8;
+
+    let mut ext = 0usize;
+    while ext < pathext.len() {
+        // If $PATHEXT itself contains a bare dot, that entry means
+        // "the name as given, with no extension appended".
+        if pathext[ext] == b'.' && pathext.get(ext + 1).is_none_or(|&c| c == sep) {
+            let r = is_executable_bytes(name, want_abspath);
+            if r.0 {
+                return r;
+            }
+            // Skip it.
+            ext += 1;
+            if ext < pathext.len() {
+                ext += 1;
+            }
+            continue;
+        }
+
+        let maxlen = (crate::os::os_defs::MAXPATHL as usize).saturating_sub(name.len());
+        let (part, next) = crate::option::copy_option_part(&pathext, ext, maxlen, &[sep]);
+        if !part.is_empty() {
+            let in_pathext =
+                nameext_len == part.len() && nameext.is_some_and(|e| crate::mbyte::mb_strnicmp(e, &part, part.len()) == 0);
+
+            if in_pathext || is_unix_shell {
+                let r = is_executable_bytes(name, want_abspath);
+                if r.0 {
+                    return r;
+                }
+            }
+            buf.truncate(name.len());
+            buf.extend_from_slice(&part);
+            let r = is_executable_bytes(&buf, want_abspath);
+            if r.0 {
+                return r;
+            }
+        }
+        ext = next;
+    }
+    (false, None)
+}
+
+/// Non-Windows counterpart of [`is_executable_ext`]: the original
+/// `#define`s the name straight to `is_executable` there, since only
+/// Windows has `$PATHEXT`.
+#[cfg(not(windows))]
+fn is_executable_ext(name: &[u8], want_abspath: bool) -> (bool, Option<Vec<u8>>) {
+    is_executable_bytes(name, want_abspath)
+}
+
+/// Whether `name` is an executable somewhere in `$PATH`
+/// (`is_executable_in_path`).
+fn is_executable_in_path(name: &[u8], want_abspath: bool) -> (bool, Option<Vec<u8>>) {
+    let Some(path_env) = crate::os::env::os_getenv(b"PATH") else {
+        return (false, None);
+    };
+    let sep = crate::os::os_defs::ENV_SEPCHAR as u8;
+
+    // On Windows `cmd.exe` searches the current directory first,
+    // unless that behaviour is explicitly disabled.
+    #[cfg(windows)]
+    let path = {
+        let sh = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+            .p_sh
+            .clone()
+            .unwrap_or_default();
+        let sh_tail = &sh[crate::path::path_tail(&sh)..];
+        if !crate::os::env::os_env_exists(b"NoDefaultCurrentDirectoryInExePath", false)
+            && contains_bytes(sh_tail, b"cmd.exe")
+        {
+            let mut p = vec![b'.', sep];
+            p.extend_from_slice(&path_env);
+            p
+        } else {
+            path_env
+        }
+    };
+    #[cfg(not(windows))]
+    let path = path_env;
+
+    let bufsize = name.len() + path.len() + 2;
+
+    // Walk every $PATH entry, checking whether `name` sits there and
+    // is executable.
+    let mut p = 0usize;
+    loop {
+        let e = path[p..].iter().position(|&c| c == sep).map_or(path.len(), |i| p + i);
+
+        let mut buf = path[p..e].to_vec();
+        crate::path::append_path(&mut buf, name, bufsize);
+
+        let r = is_executable_ext(&buf, want_abspath);
+        if r.0 {
+            return r;
+        }
+
+        if path.get(e) != Some(&sep) {
+            // End of $PATH without finding any executable called name.
+            return (false, None);
+        }
+        p = e + 1;
+    }
+}
+
+/// Whether `name` names an executable file (`os_can_exe`), optionally
+/// reporting its resolved path.
+///
+/// @return whether `name` is executable AND either can be found in
+///         `$PATH`, is relative to the current directory, or is
+///         absolute; plus its resolved path when `want_abspath` is
+///         set (the original's own `char **abspath` out-parameter).
+#[must_use]
+pub fn os_can_exe(name: &[u8], want_abspath: bool, use_path: bool) -> (bool, Option<Vec<u8>>) {
+    let has_dir_part = crate::path::gettail_dir(name) != 0;
+
+    if !use_path || has_dir_part {
+        #[cfg(windows)]
+        {
+            return is_executable_ext(name, want_abspath);
+        }
+        #[cfg(not(windows))]
+        {
+            // Must have a path separator: a file in the current
+            // directory alone cannot be executed.
+            if use_path || has_dir_part {
+                return is_executable_bytes(name, want_abspath);
+            }
+            return (false, None);
+        }
+    }
+
+    is_executable_in_path(name, want_abspath)
+}
+
 /// Check if a file is readable (`os_file_is_readable`), via
 /// [`libc::access`] with `R_OK` - the same underlying syscall the
 /// original's own `uv_fs_access` wraps.
@@ -1592,6 +1780,107 @@ mod tests {
 
         let (_ok, abs) = is_executable(&path, false);
         assert_eq!(abs, None);
+    }
+
+    #[test]
+    fn os_can_exe_is_false_for_a_missing_path() {
+        let scratch = TempScratch::new("cancxe_missing");
+        let name = scratch.path.join("nope").to_str().unwrap().as_bytes().to_vec();
+        let (ok, abs) = os_can_exe(&name, true, false);
+        assert!(!ok);
+        assert_eq!(abs, None);
+    }
+
+    #[test]
+    fn os_can_exe_is_false_for_a_directory() {
+        let scratch = TempScratch::new("cancxe_dir");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let name = scratch.path.to_str().unwrap().as_bytes().to_vec();
+        assert!(!os_can_exe(&name, false, false).0);
+    }
+
+    #[test]
+    fn os_can_exe_accepts_an_executable_given_with_a_directory_part() {
+        // A name carrying a directory part skips the $PATH search
+        // entirely, whether or not use_path is set.
+        let scratch = TempScratch::new("cancxe_dirpart");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let path = scratch.path.join(if cfg!(windows) { "tool.exe" } else { "tool" });
+        std::fs::write(&path, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let name = path.to_str().unwrap().as_bytes().to_vec();
+        for use_path in [false, true] {
+            let (ok, abs) = os_can_exe(&name, true, use_path);
+            assert!(ok, "use_path={use_path}");
+            assert!(abs.is_some_and(|a| !a.is_empty()));
+        }
+    }
+
+    #[test]
+    fn os_can_exe_searches_the_real_path_and_reports_a_bogus_name_as_missing() {
+        // A bare name with use_path set walks every $PATH entry to
+        // exhaustion; a name that cannot exist anywhere must come back
+        // false rather than looping or panicking. (The positive
+        // "found in $PATH" case would need to mutate the process-wide
+        // $PATH, which has no crate-wide test lock to serialize
+        // against `eval.rs`'s own env tests - so it is deliberately
+        // not covered here.)
+        let (ok, abs) = os_can_exe(b"nero_definitely_not_a_real_command_xyz", true, true);
+        assert!(!ok);
+        assert_eq!(abs, None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn os_can_exe_on_unix_refuses_a_bare_name_without_use_path() {
+        // "Must have path separator, cannot execute files in the
+        // current directory."
+        assert!(!os_can_exe(b"sh", false, false).0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_can_exe_on_windows_appends_a_pathext_extension() {
+        // The name is given WITHOUT an extension, so only $PATHEXT
+        // probing can find it.
+        let scratch = TempScratch::new("cancxe_pathext");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        std::fs::write(scratch.path.join("widget.exe"), b"x").unwrap();
+
+        let name = scratch.path.join("widget").to_str().unwrap().as_bytes().to_vec();
+        let (ok, abs) = os_can_exe(&name, true, false);
+        assert!(ok, "the .exe extension should be appended from $PATHEXT");
+        let abs = String::from_utf8(abs.expect("a resolved path is reported")).unwrap();
+        assert!(abs.to_ascii_lowercase().ends_with("widget.exe"), "{abs}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_can_exe_on_windows_accepts_a_name_that_already_has_its_extension() {
+        let scratch = TempScratch::new("cancxe_hasext");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        std::fs::write(scratch.path.join("gadget.exe"), b"x").unwrap();
+
+        let name = scratch.path.join("gadget.exe").to_str().unwrap().as_bytes().to_vec();
+        assert!(os_can_exe(&name, false, false).0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_can_exe_on_windows_refuses_a_file_with_a_non_pathext_extension() {
+        let scratch = TempScratch::new("cancxe_badext");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        std::fs::write(scratch.path.join("notes.txt"), b"x").unwrap();
+
+        // Neither "notes.txt" (its own extension isn't in $PATHEXT)
+        // nor "notes.txt" + any $PATHEXT extension exists as a file.
+        let name = scratch.path.join("notes.txt").to_str().unwrap().as_bytes().to_vec();
+        assert!(!os_can_exe(&name, false, false).0);
     }
 
     #[test]
