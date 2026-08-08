@@ -272,6 +272,75 @@ fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
 /// closure captures whatever state it needs directly.
 pub type CheckItem<'a> = dyn FnMut(&[u8]) -> i64 + 'a;
 
+/// Move all lines from `frombuf` to `tobuf` (`move_lines`).
+///
+/// @return [`crate::vim_defs::OK`]/[`crate::vim_defs::FAIL`].
+///
+/// The copy runs first and the delete only follows if every append
+/// succeeded, so a failure part-way through leaves the SOURCE intact
+/// rather than losing lines from both buffers. If a delete then fails,
+/// the original gives up too - its own comment notes that putting the
+/// saved lines back "might fail again".
+///
+/// `ml_append`/`ml_delete` operate on `curbuf`, so it is swapped
+/// around each phase and restored at the end, exactly as upstream
+/// does.
+///
+/// # Safety
+/// `frombuf` and `tobuf` must be valid, non-null pointers to live,
+/// distinct `BufT`s for the whole call. Forwarded from
+/// [`crate::memline::ml_append`]/[`crate::memline::ml_delete`]'s own
+/// safety docs; also mutates `GLOBALS.curbuf`.
+pub unsafe fn move_lines(
+    frombuf: *mut crate::buffer_defs::BufT,
+    tobuf: *mut crate::buffer_defs::BufT,
+) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let tbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    let mut retval = crate::vim_defs::OK;
+
+    // Copy the lines in "frombuf" to "tobuf".
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = tobuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    let from_count = unsafe { (*frombuf).b_ml.ml_line_count };
+    for lnum in 1..=from_count {
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(&mut *frombuf, lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let len = unsafe { crate::memline::ml_get_buf_len(&mut *frombuf, lnum) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::memline::ml_append(lnum - 1, &line[..len as usize], 0, false) }
+            == crate::vim_defs::FAIL
+        {
+            retval = crate::vim_defs::FAIL;
+            break;
+        }
+    }
+
+    // Delete all the lines in "frombuf".
+    if retval != crate::vim_defs::FAIL {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = frombuf;
+        // SAFETY: forwarded from this function's own safety doc.
+        let mut lnum = unsafe { (*frombuf).b_ml.ml_line_count };
+        while lnum > 0 {
+            // SAFETY: forwarded from this function's own safety doc.
+            if unsafe { crate::memline::ml_delete(lnum) } == crate::vim_defs::FAIL {
+                // Oops! We could try putting back the saved lines, but
+                // that might fail again...
+                retval = crate::vim_defs::FAIL;
+                break;
+            }
+            lnum -= 1;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = tbuf;
+    retval
+}
+
 /// Copy the file `from` to `to` (`vim_copyfile`).
 ///
 /// A symlink is copied AS a symlink - its target text is read and a
@@ -1320,6 +1389,52 @@ mod tests {
         let scratch = TreeScratch::new("del_missing");
         let missing = scratch.root.join("does_not_exist");
         assert_eq!(delete_recursive(&os_string_to_bytes(missing.as_os_str())), -1);
+    }
+
+    #[test]
+    fn move_lines_transfers_every_line_and_empties_the_source() {
+        // The copy runs first and the delete only follows if every
+        // append succeeded, so the source is never emptied on a
+        // partial failure.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_buf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+
+        let mut from = crate::buffer_defs::BufT::default();
+        let mut to = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut from) }, crate::vim_defs::OK);
+        assert_eq!(unsafe { crate::memline::ml_open(&mut to) }, crate::vim_defs::OK);
+
+        // Give the source three real lines.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = &mut from;
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut from, 1, b"one\0") },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append(1, b"two", 0, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            unsafe { crate::memline::ml_append(2, b"three", 0, false) },
+            crate::vim_defs::OK
+        );
+        assert_eq!(from.b_ml.ml_line_count, 3);
+
+        assert_eq!(unsafe { move_lines(&mut from, &mut to) }, crate::vim_defs::OK);
+
+        // Every line arrived, and the source is emptied down to the
+        // single line an empty buffer always has.
+        assert_eq!(from.b_ml.ml_line_count, 1);
+        assert!(to.b_ml.ml_line_count >= 3);
+
+        // curbuf is restored to whatever it was AT THE TIME OF THE
+        // CALL - which the setup above left pointing at the source.
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.curbuf,
+            &raw mut from
+        );
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_buf;
     }
 
     // --- vim_copyfile ---
