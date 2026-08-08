@@ -26,6 +26,116 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Cterm color of the `Normal` highlight group's foreground
+/// (`cterm_normal_fg_color`).
+pub static CTERM_NORMAL_FG_COLOR: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+/// Cterm color of the `Normal` highlight group's background
+/// (`cterm_normal_bg_color`).
+pub static CTERM_NORMAL_BG_COLOR: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// RGB foreground of the `Normal` highlight group (`normal_fg`).
+///
+/// `-1` means unset, which is why it is a signed value rather than an
+/// unsigned color.
+pub static NORMAL_FG: crate::globals::GlobalCell<crate::highlight_defs::RgbValue> =
+    crate::globals::GlobalCell::new(-1);
+/// RGB background of the `Normal` highlight group (`normal_bg`).
+pub static NORMAL_BG: crate::globals::GlobalCell<crate::highlight_defs::RgbValue> =
+    crate::globals::GlobalCell::new(-1);
+/// RGB special (underline/undercurl) color of the `Normal` highlight
+/// group (`normal_sp`).
+pub static NORMAL_SP: crate::globals::GlobalCell<crate::highlight_defs::RgbValue> =
+    crate::globals::GlobalCell::new(-1);
+
+/// Substitute the built-in default for any unset color
+/// (`HL_SET_DEFAULT_COLORS`).
+///
+/// The foreground/background defaults depend on `'background'`, so a
+/// dark background gets a light foreground and vice versa; the
+/// special color has one fixed default.
+///
+/// The original is a macro assigning through its arguments; this takes
+/// and returns the triple instead.
+///
+/// # Safety
+/// Reads `OPTION_VARS`.
+#[must_use]
+pub unsafe fn hl_set_default_colors(
+    rgb_fg: crate::highlight_defs::RgbValue,
+    rgb_bg: crate::highlight_defs::RgbValue,
+    rgb_sp: crate::highlight_defs::RgbValue,
+) -> (
+    crate::highlight_defs::RgbValue,
+    crate::highlight_defs::RgbValue,
+    crate::highlight_defs::RgbValue,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_bg = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bg.clone();
+    let dark = p_bg.as_deref().and_then(<[u8]>::first) == Some(&b'd');
+
+    let fg = if rgb_fg != -1 {
+        rgb_fg
+    } else if dark {
+        0x00FF_FFFF
+    } else {
+        0x0000_0000
+    };
+    let bg = if rgb_bg != -1 {
+        rgb_bg
+    } else if dark {
+        0x0000_0000
+    } else {
+        0x00FF_FFFF
+    };
+    let sp = if rgb_sp != -1 { rgb_sp } else { 0x00FF_0000 };
+
+    (fg, bg, sp)
+}
+
+/// Fill in any unset colors of `attrs`, and resolve an inverse
+/// attribute by swapping foreground and background
+/// (`get_colors_force`).
+///
+/// Never leaves a color at `-1`. Cterm colors are untouched.
+///
+/// # Safety
+/// Reads `OPTION_VARS` and the `NORMAL_*` file-statics.
+#[must_use]
+pub unsafe fn get_colors_force(
+    attrs: crate::highlight_defs::HlAttrs,
+) -> crate::highlight_defs::HlAttrs {
+    let mut attrs = attrs;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if attrs.rgb_bg_color == -1 {
+            attrs.rgb_bg_color = *NORMAL_BG.get_mut();
+        }
+        if attrs.rgb_fg_color == -1 {
+            attrs.rgb_fg_color = *NORMAL_FG.get_mut();
+        }
+        if attrs.rgb_sp_color == -1 {
+            attrs.rgb_sp_color = *NORMAL_SP.get_mut();
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let (fg, bg, sp) =
+        unsafe { hl_set_default_colors(attrs.rgb_fg_color, attrs.rgb_bg_color, attrs.rgb_sp_color) };
+    attrs.rgb_fg_color = fg;
+    attrs.rgb_bg_color = bg;
+    attrs.rgb_sp_color = sp;
+
+    if attrs.rgb_ae_attr & (crate::highlight_defs::HL_INVERSE as i32) != 0 {
+        std::mem::swap(&mut attrs.rgb_bg_color, &mut attrs.rgb_fg_color);
+        attrs.rgb_ae_attr &= !(crate::highlight_defs::HL_INVERSE as i32);
+    }
+
+    attrs
+}
+
 /// Convert an 8-bit terminal color number (0-255) to a packed RGB
 /// value, compatible with xterm's own color cube/greyscale-ramp
 /// layout (`hl_cterm2rgb_color`).
@@ -137,6 +247,98 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- hl_set_default_colors / get_colors_force ----
+
+    fn with_background<T>(dark: bool, f: impl FnOnce() -> T) -> T {
+        let _lock = crate::globals::global_state_test_lock();
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev = ov.p_bg.clone();
+        ov.p_bg = Some(if dark { b"dark".to_vec() } else { b"light".to_vec() });
+        let r = f();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bg = prev;
+        r
+    }
+
+    #[test]
+    fn hl_set_default_colors_depends_on_the_background_setting() {
+        // A dark background gets a light foreground and vice versa,
+        // so the two must not be filled in with the same constant.
+        let (fg_d, bg_d, sp_d) = with_background(true, || unsafe {
+            hl_set_default_colors(-1, -1, -1)
+        });
+        assert_eq!((fg_d, bg_d), (0x00FF_FFFF, 0x0000_0000));
+
+        let (fg_l, bg_l, sp_l) = with_background(false, || unsafe {
+            hl_set_default_colors(-1, -1, -1)
+        });
+        assert_eq!((fg_l, bg_l), (0x0000_0000, 0x00FF_FFFF));
+
+        // The special color has one fixed default either way.
+        assert_eq!(sp_d, 0x00FF_0000);
+        assert_eq!(sp_l, 0x00FF_0000);
+    }
+
+    #[test]
+    fn hl_set_default_colors_leaves_colors_that_are_already_set() {
+        let got = with_background(true, || unsafe {
+            hl_set_default_colors(0x0011_2233, 0x0044_5566, 0x0077_8899)
+        });
+        assert_eq!(got, (0x0011_2233, 0x0044_5566, 0x0077_8899));
+    }
+
+    #[test]
+    fn get_colors_force_never_leaves_a_color_unset() {
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: -1,
+            rgb_bg_color: -1,
+            rgb_sp_color: -1,
+            ..Default::default()
+        };
+        let got = with_background(true, || unsafe { get_colors_force(attrs) });
+
+        assert_ne!(got.rgb_fg_color, -1);
+        assert_ne!(got.rgb_bg_color, -1);
+        assert_ne!(got.rgb_sp_color, -1);
+    }
+
+    #[test]
+    fn get_colors_force_resolves_inverse_by_swapping_and_clearing_it() {
+        // The inverse attribute is applied here rather than passed on,
+        // so the caller sees already-swapped colors and no flag.
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: 0x0011_1111,
+            rgb_bg_color: 0x0022_2222,
+            rgb_sp_color: 0x0033_3333,
+            rgb_ae_attr: crate::highlight_defs::HL_INVERSE as i32,
+            ..Default::default()
+        };
+        let got = with_background(true, || unsafe { get_colors_force(attrs) });
+
+        assert_eq!(got.rgb_fg_color, 0x0022_2222);
+        assert_eq!(got.rgb_bg_color, 0x0011_1111);
+        assert_eq!(
+            got.rgb_ae_attr & crate::highlight_defs::HL_INVERSE as i32,
+            0,
+            "the flag is cleared once applied"
+        );
+    }
+
+    #[test]
+    fn get_colors_force_leaves_cterm_colors_alone() {
+        let attrs = crate::highlight_defs::HlAttrs {
+            rgb_fg_color: -1,
+            rgb_bg_color: -1,
+            rgb_sp_color: -1,
+            cterm_fg_color: 4,
+            cterm_bg_color: 5,
+            ..Default::default()
+        };
+        let got = with_background(true, || unsafe { get_colors_force(attrs) });
+
+        assert_eq!(got.cterm_fg_color, 4);
+        assert_eq!(got.cterm_bg_color, 5);
+    }
 
     // ---- hl_cterm2rgb_color ----
 
