@@ -596,9 +596,323 @@ pub unsafe fn msg_starthere() {
     globals.msg_didany = false;
 }
 
+/// One chunk of previously displayed message text, kept so the
+/// message area can be scrolled back (`msgchunk_T`).
+///
+/// The chunks form an intrusive doubly-linked list, with raw pointers
+/// matching this crate's convention for such lists (see `DiffT`). The
+/// original's flexible array member `sb_text[]` becomes an owned
+/// `Vec<u8>`, so the chunk no longer needs a single trailing
+/// allocation.
+#[derive(Debug, Default)]
+pub struct MsgchunkT {
+    /// Next chunk (`sb_next`).
+    pub sb_next: *mut MsgchunkT,
+    /// Previous chunk (`sb_prev`).
+    pub sb_prev: *mut MsgchunkT,
+    /// Whether the line ends after this text (`sb_eol`).
+    pub sb_eol: bool,
+    /// Column in which the text starts (`sb_msg_col`).
+    pub sb_msg_col: i32,
+    /// Text highlight id (`sb_hl_id`).
+    pub sb_hl_id: i32,
+    /// The text itself (`sb_text`).
+    pub sb_text: Vec<u8>,
+}
+
+/// When remembered scroll-back text should be cleared (`sb_clear_T`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SbClearT {
+    /// Nothing to clear (`SB_CLEAR_NONE`).
+    #[default]
+    None = 0,
+    /// Clear everything (`SB_CLEAR_ALL`).
+    All = 1,
+    /// Editing the command line: do not clear yet
+    /// (`SB_CLEAR_CMDLINE_BUSY`).
+    CmdlineBusy = 2,
+    /// Finished editing the command line: clear old lines but keep the
+    /// last (`SB_CLEAR_CMDLINE_DONE`).
+    CmdlineDone = 3,
+}
+
+/// Pending scroll-back clear request (`do_clear_sb_text`).
+static DO_CLEAR_SB_TEXT: crate::globals::GlobalCell<SbClearT> =
+    crate::globals::GlobalCell::new(SbClearT::None);
+
+/// The most recently displayed text chunk (`last_msgchunk`).
+static LAST_MSGCHUNK: crate::globals::GlobalCell<*mut MsgchunkT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// Move back to the start of a screen line in already displayed text
+/// (`msg_sb_start`).
+///
+/// Walks back over chunks belonging to the same line, stopping at the
+/// one whose predecessor ended a line.
+///
+/// # Safety
+/// `mps` must be null or point at a live [`MsgchunkT`] whose `sb_prev`
+/// chain is likewise valid.
+#[must_use]
+pub unsafe fn msg_sb_start(mps: *mut MsgchunkT) -> *mut MsgchunkT {
+    let mut mp = mps;
+    // SAFETY: forwarded from this function's own safety doc.
+    while !mp.is_null() && !unsafe { (*mp).sb_prev }.is_null() && !unsafe { (*(*mp).sb_prev).sb_eol }
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        mp = unsafe { (*mp).sb_prev };
+    }
+    mp
+}
+
+/// Mark the last message chunk as finishing the line (`msg_sb_eol`).
+///
+/// # Safety
+/// The `LAST_MSGCHUNK` file-static must be null or point at a live
+/// [`MsgchunkT`].
+pub unsafe fn msg_sb_eol() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let last = unsafe { *LAST_MSGCHUNK.get_mut() };
+    if !last.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*last).sb_eol = true };
+    }
+}
+
+/// Finished editing the command line: clear old lines but keep the
+/// last one, later (`sb_text_end_cmdline`).
+///
+/// # Safety
+/// Mutates the `DO_CLEAR_SB_TEXT` file-static.
+pub unsafe fn sb_text_end_cmdline() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::CmdlineDone };
+}
+
+/// Redrawing the command line: discard the last unfinished line
+/// (`sb_text_restart_cmdline`).
+///
+/// # Safety
+/// The `LAST_MSGCHUNK` chain must consist of live chunks originally
+/// allocated with `Box`, since the discarded ones are freed here.
+pub unsafe fn sb_text_restart_cmdline() {
+    // Needed when returning from a nested command line.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::CmdlineBusy };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let last = unsafe { *LAST_MSGCHUNK.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    if last.is_null() || unsafe { (*last).sb_eol } {
+        // No unfinished line: don't clear anything.
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tofree = unsafe { msg_sb_start(last) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let new_last = unsafe { (*tofree).sb_prev };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *LAST_MSGCHUNK.get_mut() = new_last };
+    if !new_last.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*new_last).sb_next = std::ptr::null_mut() };
+    }
+
+    while !tofree.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let next = unsafe { (*tofree).sb_next };
+        // SAFETY: the chunk was allocated with Box, per this
+        // function's own safety doc.
+        drop(unsafe { Box::from_raw(tofree) });
+        tofree = next;
+    }
+}
+
+/// Starting to edit the command line: do not clear messages now
+/// (`sb_text_start_cmdline`).
+///
+/// # Safety
+/// Same as [`sb_text_restart_cmdline`].
+pub unsafe fn sb_text_start_cmdline() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *DO_CLEAR_SB_TEXT.get_mut() } == SbClearT::CmdlineBusy {
+        // Invoking the command line recursively: the previous level's
+        // command line need not be remembered, since it is redrawn on
+        // returning to that level.
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { sb_text_restart_cmdline() };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { msg_sb_eol() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::CmdlineBusy };
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // --- msgchunk / msg_sb family ---
+
+    /// Owns an installed chunk chain and guarantees it is torn down,
+    /// even if the test panics part-way through.
+    ///
+    /// Without this, a panicking test would leave `LAST_MSGCHUNK`
+    /// pointing at chunks it no longer owns, and the next test to run
+    /// would inherit that dangling global - a genuine
+    /// use-after-free/double-free hazard rather than a mere leak.
+    struct ChunkGuard {
+        ptrs: Vec<*mut MsgchunkT>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ChunkGuard {
+        fn install(eols: &[bool]) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let mut ptrs: Vec<*mut MsgchunkT> = Vec::new();
+            for &eol in eols {
+                ptrs.push(Box::into_raw(Box::new(MsgchunkT {
+                    sb_eol: eol,
+                    ..Default::default()
+                })));
+            }
+            for i in 0..ptrs.len() {
+                unsafe {
+                    (*ptrs[i]).sb_prev = if i == 0 { std::ptr::null_mut() } else { ptrs[i - 1] };
+                    (*ptrs[i]).sb_next =
+                        if i + 1 == ptrs.len() { std::ptr::null_mut() } else { ptrs[i + 1] };
+                }
+            }
+            unsafe {
+                *LAST_MSGCHUNK.get_mut() = ptrs.last().copied().unwrap_or(std::ptr::null_mut());
+                *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::None;
+            }
+            ChunkGuard { ptrs, _lock }
+        }
+
+        fn ptr(&self, i: usize) -> *mut MsgchunkT {
+            self.ptrs[i]
+        }
+    }
+
+    impl Drop for ChunkGuard {
+        fn drop(&mut self) {
+            // Free whatever chain is still installed, walking from its
+            // head. Chunks the code under test already freed are no
+            // longer reachable from LAST_MSGCHUNK, so they are not
+            // freed twice.
+            unsafe {
+                let mut mp = *LAST_MSGCHUNK.get_mut();
+                while !mp.is_null() && !(*mp).sb_prev.is_null() {
+                    mp = (*mp).sb_prev;
+                }
+                while !mp.is_null() {
+                    let next = (*mp).sb_next;
+                    drop(Box::from_raw(mp));
+                    mp = next;
+                }
+                *LAST_MSGCHUNK.get_mut() = std::ptr::null_mut();
+                *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::None;
+            }
+        }
+    }
+
+    #[test]
+    fn msg_sb_eol_marks_only_the_last_chunk() {
+        let g = ChunkGuard::install(&[false, false, false]);
+
+        unsafe { msg_sb_eol() };
+
+        let flags: Vec<bool> = (0..3).map(|i| unsafe { (*g.ptr(i)).sb_eol }).collect();
+        assert_eq!(flags, vec![false, false, true]);
+    }
+
+    #[test]
+    fn msg_sb_eol_is_a_noop_with_no_chunks() {
+        let _g = ChunkGuard::install(&[]);
+        unsafe { msg_sb_eol() };
+        assert!(unsafe { *LAST_MSGCHUNK.get_mut() }.is_null());
+    }
+
+    #[test]
+    fn msg_sb_start_walks_back_to_the_start_of_the_screen_line() {
+        // Chunk 0 ends a line, so chunks 1..3 form one screen line and
+        // starting from chunk 3 must land on chunk 1.
+        let g = ChunkGuard::install(&[true, false, false, false]);
+        assert_eq!(unsafe { msg_sb_start(g.ptr(3)) }, g.ptr(1));
+    }
+
+    #[test]
+    fn msg_sb_start_of_null_is_null() {
+        let _g = ChunkGuard::install(&[]);
+        assert!(unsafe { msg_sb_start(std::ptr::null_mut()) }.is_null());
+    }
+
+    #[test]
+    fn sb_text_end_cmdline_records_the_pending_clear() {
+        let _g = ChunkGuard::install(&[]);
+        unsafe { sb_text_end_cmdline() };
+        assert_eq!(unsafe { *DO_CLEAR_SB_TEXT.get_mut() }, SbClearT::CmdlineDone);
+    }
+
+    #[test]
+    fn sb_text_restart_cmdline_keeps_a_finished_line() {
+        // The last chunk ends its line, so there is nothing unfinished
+        // to discard.
+        let g = ChunkGuard::install(&[false, true]);
+
+        unsafe { sb_text_restart_cmdline() };
+
+        assert_eq!(unsafe { *LAST_MSGCHUNK.get_mut() }, g.ptr(1), "nothing discarded");
+        assert_eq!(unsafe { *DO_CLEAR_SB_TEXT.get_mut() }, SbClearT::CmdlineBusy);
+    }
+
+    #[test]
+    fn sb_text_restart_cmdline_discards_an_unfinished_line() {
+        // Chunk 0 ends a line; chunks 1 and 2 form an unfinished one,
+        // so both are discarded and chunk 0 becomes the last.
+        let g = ChunkGuard::install(&[true, false, false]);
+        let survivor = g.ptr(0);
+
+        unsafe { sb_text_restart_cmdline() };
+
+        assert_eq!(unsafe { *LAST_MSGCHUNK.get_mut() }, survivor);
+        assert!(
+            unsafe { (*survivor).sb_next }.is_null(),
+            "the survivor's forward link is cleared"
+        );
+    }
+
+    #[test]
+    fn sb_text_start_cmdline_marks_end_of_line_at_the_outer_level() {
+        // Not already busy: the current line is finished off rather
+        // than discarded.
+        let g = ChunkGuard::install(&[false, false]);
+
+        unsafe { sb_text_start_cmdline() };
+
+        assert!(unsafe { (*g.ptr(1)).sb_eol }, "the line is closed off");
+        assert_eq!(unsafe { *DO_CLEAR_SB_TEXT.get_mut() }, SbClearT::CmdlineBusy);
+    }
+
+    #[test]
+    fn sb_text_start_cmdline_discards_when_already_busy() {
+        // Recursive command line: the previous level's unfinished line
+        // is discarded instead, since it is redrawn on return.
+        let g = ChunkGuard::install(&[true, false]);
+        let survivor = g.ptr(0);
+        unsafe { *DO_CLEAR_SB_TEXT.get_mut() = SbClearT::CmdlineBusy };
+
+        unsafe { sb_text_start_cmdline() };
+
+        assert_eq!(
+            unsafe { *LAST_MSGCHUNK.get_mut() },
+            survivor,
+            "the unfinished chunk was discarded"
+        );
+    }
 
     #[test]
     fn msg_check_flags_a_full_last_line() {
