@@ -104,12 +104,113 @@ pub fn handle_mkdir_p_arg(eap: &crate::ex_cmds_defs::ExargT, fname: &[u8]) -> i3
     crate::vim_defs::OK
 }
 
+/// The previous `:substitute` replacement string (`old_sub`).
+///
+/// The original owns raw pointers and frees the outgoing value when a
+/// new one is stored; here the old value is simply dropped by
+/// replacement, which is the whole of that bookkeeping.
+static OLD_SUB: crate::globals::GlobalCell<crate::ex_cmds_defs::SubReplacementString> =
+    crate::globals::GlobalCell::new(crate::ex_cmds_defs::SubReplacementString {
+        sub: None,
+        timestamp: 0,
+        additional_data: None,
+    });
+
+/// Get the previously used replacement string
+/// (`sub_get_replacement`).
+///
+/// # Safety
+/// Reads the `OLD_SUB` file-static.
+#[must_use]
+pub unsafe fn sub_get_replacement() -> crate::ex_cmds_defs::SubReplacementString {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { OLD_SUB.get_mut() }.clone()
+}
+
+/// Set the previously used replacement string
+/// (`sub_set_replacement`).
+///
+/// # Safety
+/// Mutates the `OLD_SUB` file-static.
+pub unsafe fn sub_set_replacement(sub: crate::ex_cmds_defs::SubReplacementString) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *OLD_SUB.get_mut() = sub };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn globals_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::globals::global_state_test_lock()
+    }
+
+    #[test]
+    fn sub_replacement_round_trips_through_its_setter() {
+        let _guard = globals_test_lock();
+        let previous = unsafe { sub_get_replacement() };
+
+        unsafe {
+            sub_set_replacement(crate::ex_cmds_defs::SubReplacementString {
+                sub: Some(b"replacement".to_vec()),
+                timestamp: 1234,
+                additional_data: None,
+            });
+        }
+
+        let got = unsafe { sub_get_replacement() };
+        assert_eq!(got.sub.as_deref(), Some(&b"replacement"[..]));
+        assert_eq!(got.timestamp, 1234);
+
+        unsafe { sub_set_replacement(previous) };
+    }
+
+    #[test]
+    fn sub_set_replacement_discards_the_earlier_value() {
+        // The original frees the outgoing string here; replacing the
+        // owned value is the whole of that bookkeeping.
+        let _guard = globals_test_lock();
+        let previous = unsafe { sub_get_replacement() };
+
+        unsafe {
+            sub_set_replacement(crate::ex_cmds_defs::SubReplacementString {
+                sub: Some(b"first".to_vec()),
+                timestamp: 1,
+                additional_data: None,
+            });
+            sub_set_replacement(crate::ex_cmds_defs::SubReplacementString {
+                sub: Some(b"second".to_vec()),
+                timestamp: 2,
+                additional_data: None,
+            });
+        }
+
+        let got = unsafe { sub_get_replacement() };
+        assert_eq!(got.sub.as_deref(), Some(&b"second"[..]));
+        assert_eq!(got.timestamp, 2);
+
+        unsafe { sub_set_replacement(previous) };
+    }
+
+    #[test]
+    fn sub_replacement_starts_out_unset() {
+        // A session that has never run :substitute has no previous
+        // replacement string.
+        let _guard = globals_test_lock();
+        let previous = unsafe { sub_get_replacement() };
+
+        unsafe {
+            sub_set_replacement(crate::ex_cmds_defs::SubReplacementString {
+                sub: None,
+                timestamp: 0,
+                additional_data: None,
+            });
+        }
+        let got = unsafe { sub_get_replacement() };
+        assert_eq!(got.sub, None);
+        assert_eq!(got.timestamp, 0);
+
+        unsafe { sub_set_replacement(previous) };
     }
 
     #[cfg(not(unix))]
