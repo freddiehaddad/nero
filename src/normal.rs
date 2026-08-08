@@ -15,6 +15,99 @@
 //!
 //! Deferred: everything else in the file.
 
+/// `|`: move to a specific screen column (`nv_pipe`).
+///
+/// `w_set_curswant` is deliberately left false: `w_curswant` must
+/// record the column the user ASKED for, not the one actually reached.
+/// Those differ when the line is too short, and keeping the requested
+/// column is what lets a later vertical move return to it.
+///
+/// # Safety
+/// Reads `GLOBALS.curwin`, which must be valid and non-null. Forwarded
+/// from [`crate::insert::beginline`]/[`crate::cursor::coladvance`]'s
+/// own safety docs.
+pub unsafe fn nv_pipe(cap: &mut crate::normal_defs::CmdargT) {
+    // SAFETY: cap.oap is a raw pointer in this crate's CmdargT.
+    unsafe {
+        (*cap.oap).motion_type = crate::normal_defs::MotionType::CharWise;
+        (*cap.oap).inclusive = false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::insert::beginline(0) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if cap.count0 > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            crate::cursor::coladvance(curwin, cap.count0 - 1);
+            (*curwin).w_curswant = cap.count0 - 1;
+        }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_curswant = 0 };
+    }
+
+    // Keep curswant at the column we wanted to go to, not where we
+    // ended up; those differ if the line is too short.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_set_curswant = false };
+}
+
+/// Move the cursor off a trailing NUL after an operator
+/// (`adjust_cursor`).
+///
+/// The cursor cannot remain on the NUL when the column is past the
+/// start, the selection semantics do not allow it, and `'virtualedit'`
+/// permits neither free positioning nor one-past-the-end. All four
+/// conditions must hold together; any one of them makes sitting on the
+/// NUL legitimate.
+///
+/// # Safety
+/// Reads `GLOBALS.curwin`/`GLOBALS.Visual`, which must be valid.
+/// Forwarded from [`crate::cursor::gchar_cursor`]/
+/// [`crate::mbyte::mb_adjust_cursor`]'s own safety docs.
+pub unsafe fn adjust_cursor(oap: &mut crate::normal_defs::OpargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*curwin).w_cursor.col } == 0 {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::cursor::gchar_cursor() } != i32::from(crate::ascii_defs::NUL) {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let visual_active = unsafe { crate::globals::GLOBALS.get_mut() }.Visual.active;
+    // SAFETY: forwarded from this function's own safety doc.
+    let sel_is_old = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_sel
+        .as_deref()
+        .is_some_and(|s| s.first() == Some(&b'o'));
+    if visual_active && !sel_is_old {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if crate::state::virtual_active(unsafe { &*curwin }) {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let ve = crate::option::get_ve_flags(unsafe { &*curwin });
+    if ve & crate::option_vars::opt_ve_flag::ONEMORE != 0 {
+        return;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curwin).w_cursor.col -= 1 };
+    // Prevent the cursor from moving onto a trail byte.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+    oap.inclusive = true;
+}
+
 /// Step `pp` back one character, undoing an exclusive-selection
 /// adjustment (`unadjust_for_sel_inner`).
 ///
@@ -449,6 +542,108 @@ pub fn is_ident(line: &[u8], offset: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nv_pipe_records_the_requested_column_not_the_reached_one() {
+        // w_set_curswant stays false so w_curswant keeps the column
+        // the user ASKED for. Those differ when the line is too short
+        // (cross-verified: `99|` on a 10-char line lands at col 10),
+        // and keeping the request is what lets a later vertical move
+        // return to it.
+        //
+        // coladvance reads the real cursor line, so the buffer needs
+        // actual memline content rather than a bare default.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_buf) = (g.curwin, g.curbuf);
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_set_curswant: true,
+            ..Default::default()
+        };
+        win.w_cursor.lnum = 1;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = &mut win;
+        g.curbuf = &mut buf;
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, b"abcdefghij\0") },
+            crate::vim_defs::OK
+        );
+
+        let mut oap = crate::normal_defs::OpargT {
+            motion_type: crate::normal_defs::MotionType::LineWise,
+            inclusive: true,
+            ..Default::default()
+        };
+        let mut cap =
+            crate::normal_defs::CmdargT { oap: &mut oap, count0: 5, ..Default::default() };
+
+        unsafe { nv_pipe(&mut cap) };
+
+        assert_eq!(oap.motion_type, crate::normal_defs::MotionType::CharWise);
+        assert!(!oap.inclusive);
+        // count0 - 1, i.e. the 0-based column asked for.
+        assert_eq!(win.w_curswant, 4);
+        assert_eq!(win.w_cursor.col, 4);
+        assert!(!win.w_set_curswant, "the requested column must be preserved");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.curbuf = prev_buf;
+    }
+
+    #[test]
+    fn nv_pipe_with_no_count_goes_to_column_zero() {
+        // Cross-verified: `1|` lands at column 1 (0-based 0), and a
+        // bare `|` behaves the same way.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_curswant: 9,
+            ..Default::default()
+        };
+        win.w_cursor.lnum = 1;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win;
+
+        let mut oap = crate::normal_defs::OpargT::default();
+        let mut cap =
+            crate::normal_defs::CmdargT { oap: &mut oap, count0: 0, ..Default::default() };
+        unsafe { nv_pipe(&mut cap) };
+
+        assert_eq!(win.w_curswant, 0);
+        assert!(!win.w_set_curswant);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
+    }
+
+    #[test]
+    fn adjust_cursor_leaves_column_zero_alone() {
+        // The column must be past the start; at column 0 there is
+        // nowhere to step back to, so sitting on a NUL is legitimate.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf, ..Default::default() };
+        win.w_cursor.lnum = 1;
+        win.w_cursor.col = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win;
+
+        let mut oap = crate::normal_defs::OpargT { inclusive: false, ..Default::default() };
+        unsafe { adjust_cursor(&mut oap) };
+
+        assert_eq!(win.w_cursor.col, 0);
+        assert!(!oap.inclusive, "nothing was adjusted, so nothing is inclusive");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
+    }
 
     #[test]
     fn unadjust_for_sel_inner_gives_back_virtual_space_first() {
