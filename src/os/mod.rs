@@ -15,6 +15,7 @@ pub mod lang;
 pub mod os;
 pub mod os_defs;
 pub mod proc;
+pub mod signal;
 pub mod stdpaths;
 pub mod time;
 pub mod time_defs;
