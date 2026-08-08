@@ -154,6 +154,33 @@ pub fn qf_clean_dir_stack(stackptr: &mut Option<Box<DirStackT>>) {
     }
 }
 
+/// A window displaying a Vim help file in the current tabpage
+/// (`qf_find_help_win`).
+///
+/// Hidden and unfocusable floating windows are skipped: they cannot be
+/// jumped into, so they are not usable targets.
+///
+/// # Safety
+/// `GLOBALS.firstwin` and its `w_next` chain must be valid pointers to
+/// live `WinT`s, each with a valid `w_buffer`.
+#[must_use]
+pub unsafe fn qf_find_help_win() -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (buf, config) = unsafe { ((*wp).w_buffer, &(*wp).w_config) };
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_help = crate::buffer::bt_help(unsafe { buf.as_ref() });
+        if is_help && !config.hide && config.focusable {
+            return wp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+    std::ptr::null_mut()
+}
+
 /// Sentinel for "no quickfix list index" (`INVALID_QFIDX`).
 pub const INVALID_QFIDX: i32 = -1;
 /// Sentinel for "no quickfix window buffer" (`INVALID_QFBUFNR`).
@@ -748,6 +775,83 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_find_help_win ---
+
+    /// Boxed: these pointers are installed into GLOBALS, so they need
+    /// stable heap addresses.
+    fn help_win_fixture(
+        specs: &[(bool, bool, bool)],
+    ) -> (Vec<Box<BufT>>, Vec<Box<WinT>>) {
+        let mut bufs: Vec<Box<BufT>> = Vec::new();
+        let mut wins: Vec<Box<WinT>> = Vec::new();
+
+        for &(is_help, hide, focusable) in specs {
+            let mut buf = Box::new(BufT::default());
+            buf.b_help = is_help;
+            let buf_ptr = std::ptr::addr_of_mut!(*buf);
+            let mut win = Box::new(WinT { w_buffer: buf_ptr, ..Default::default() });
+            win.w_config.hide = hide;
+            win.w_config.focusable = focusable;
+            bufs.push(buf);
+            wins.push(win);
+        }
+
+        // Chain them in order.
+        for i in 0..wins.len() {
+            let next = if i + 1 < wins.len() {
+                std::ptr::addr_of_mut!(*wins[i + 1])
+            } else {
+                std::ptr::null_mut()
+            };
+            wins[i].w_next = next;
+        }
+        (bufs, wins)
+    }
+
+    fn with_windows<T>(wins: &mut [Box<WinT>], f: impl FnOnce() -> T) -> T {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = if wins.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            std::ptr::addr_of_mut!(*wins[0])
+        };
+        let r = f();
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+        r
+    }
+
+    #[test]
+    fn qf_find_help_win_finds_a_usable_help_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Non-help first, so a match on the SECOND window is required.
+        let (_bufs, mut wins) = help_win_fixture(&[(false, false, true), (true, false, true)]);
+        let want = std::ptr::addr_of_mut!(*wins[1]);
+
+        let found = with_windows(&mut wins, || unsafe { qf_find_help_win() });
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn qf_find_help_win_skips_hidden_and_unfocusable_help_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A hidden help window and an unfocusable one cannot be jumped
+        // into, so neither counts.
+        let (_bufs, mut wins) = help_win_fixture(&[(true, true, true), (true, false, false)]);
+
+        let found = with_windows(&mut wins, || unsafe { qf_find_help_win() });
+        assert!(found.is_null());
+    }
+
+    #[test]
+    fn qf_find_help_win_is_null_without_any_help_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (_bufs, mut wins) = help_win_fixture(&[(false, false, true)]);
+
+        let found = with_windows(&mut wins, || unsafe { qf_find_help_win() });
+        assert!(found.is_null());
+    }
 
     // --- qf_pop_dir / qf_clean_dir_stack ---
 
