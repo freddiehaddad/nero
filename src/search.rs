@@ -302,6 +302,55 @@ struct SearchPatterns {
 static SEARCH_PATTERNS: std::sync::LazyLock<crate::globals::GlobalCell<SearchPatterns>> =
     std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(SearchPatterns::default()));
 
+/// Record `pat` as the search or substitute pattern at `idx`
+/// (`save_re_pat`).
+///
+/// `idx` is `0`/`1` for the original's `RE_SEARCH`/`RE_SUBST`. The
+/// saved slot also becomes `RE_LAST`.
+///
+/// The original opens with a `spats[idx].pat == pat` pointer-identity
+/// guard. That exists purely to avoid a use-after-free: it frees the
+/// old buffer before copying the new one, so a self-assignment would
+/// read freed memory. Rust has no such hazard here - `pat` is a
+/// borrowed slice that cannot alias the `Vec` being replaced, and the
+/// new `Vec` is built before the assignment - so the guard has no
+/// counterpart. It is NOT reproduced as a value comparison, which
+/// would wrongly skip the timestamp/magic/`last_idx` updates whenever
+/// an equal-but-distinct pattern was saved.
+///
+/// # Safety
+/// Must not run concurrently with any other access to
+/// `SEARCH_PATTERNS`, `GLOBALS.Search`, or `OPTION_VARS`. Forwarded
+/// from [`crate::drawscreen::redraw_all_later`]/
+/// [`crate::ex_docmd::set_no_hlsearch`]'s own safety docs.
+pub unsafe fn save_re_pat(idx: usize, pat: &[u8], magic: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let no_smartcase = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_smartcase;
+
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let sp = unsafe { SEARCH_PATTERNS.get_mut() };
+        // Assigning drops the previous pattern, which is what the
+        // original's free_spat() does by hand.
+        sp.spats[idx].pat = Some(pat.to_vec());
+        sp.spats[idx].magic = magic;
+        sp.spats[idx].no_scs = no_smartcase;
+        sp.spats[idx].timestamp = crate::os::time::os_time();
+        sp.spats[idx].additional_data = None;
+        sp.last_idx = idx;
+    }
+
+    // If 'hlsearch' is set and the search pattern changed, redraw.
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+    if p_hls != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::drawscreen::redraw_all_later(crate::drawscreen::UPD_SOME_VALID) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::ex_docmd::set_no_hlsearch(false) };
+}
+
 /// Saved copy of [`SEARCH_PATTERNS`], plus the nesting depth that
 /// decides when a save/restore pair actually takes effect
 /// (`saved_spats`/`saved_spats_last_idx`/`saved_spats_no_hlsearch`/
@@ -721,6 +770,80 @@ pub unsafe fn set_last_search_pat(s: &[u8], is_substitute: bool, magic: bool, se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_re_pat_records_the_pattern_and_marks_it_last() {
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+        let prev_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+        let prev_scs = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_smartcase;
+        // Keep 'hlsearch' off so no redraw walk is attempted over an
+        // empty window chain.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 0;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_smartcase = true;
+
+        unsafe { save_re_pat(1, b"needle", true) };
+
+        let sp = unsafe { SEARCH_PATTERNS.get_mut() };
+        assert_eq!(sp.spats[1].pat.as_deref(), Some(&b"needle"[..]));
+        assert!(sp.spats[1].magic);
+        // no_scs is captured from Search.no_smartcase at save time.
+        assert!(sp.spats[1].no_scs);
+        assert_eq!(sp.last_idx, 1, "the saved slot becomes RE_LAST");
+        // ShaDa extra data belongs to the OLD pattern, so it is cleared.
+        assert!(sp.spats[1].additional_data.is_none());
+
+        *unsafe { SEARCH_PATTERNS.get_mut() } = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = prev_hls;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_smartcase = prev_scs;
+    }
+
+    #[test]
+    fn save_re_pat_rearms_hlsearch() {
+        // Cross-verified against real nvim: searching for a new
+        // pattern after :nohlsearch turns v:hlsearch back on.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+        let prev_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+        let prev_nohl = unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 0;
+
+        // Simulate :nohlsearch having suppressed highlighting.
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = true;
+        unsafe { save_re_pat(0, b"fresh", true) };
+        assert!(
+            !unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch,
+            "a new pattern must re-arm highlighting"
+        );
+
+        *unsafe { SEARCH_PATTERNS.get_mut() } = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = prev_hls;
+        unsafe { crate::globals::GLOBALS.get_mut() }.Search.no_hlsearch = prev_nohl;
+    }
+
+    #[test]
+    fn save_re_pat_replaces_an_equal_pattern_and_still_updates_state() {
+        // The original's pointer-identity guard is a use-after-free
+        // protection, NOT a value comparison - saving an equal but
+        // distinct pattern must still refresh magic/no_scs/last_idx.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev = unsafe { SEARCH_PATTERNS.get_mut() }.clone();
+        let prev_hls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = 0;
+
+        unsafe { save_re_pat(0, b"same", true) };
+        // Move RE_LAST elsewhere, then save the SAME text again.
+        unsafe { SEARCH_PATTERNS.get_mut() }.last_idx = 1;
+        unsafe { save_re_pat(0, b"same", false) };
+
+        let sp = unsafe { SEARCH_PATTERNS.get_mut() };
+        assert_eq!(sp.spats[0].pat.as_deref(), Some(&b"same"[..]));
+        assert!(!sp.spats[0].magic, "magic must be refreshed, not skipped");
+        assert_eq!(sp.last_idx, 0, "last_idx must be refreshed, not skipped");
+
+        *unsafe { SEARCH_PATTERNS.get_mut() } = prev;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_hls = prev_hls;
+    }
 
     #[test]
     fn save_restore_search_patterns_round_trips() {
