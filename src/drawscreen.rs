@@ -204,6 +204,74 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// Recompute `wp`'s sign-column width, reporting whether it changed
+/// (`win_redraw_signcols`).
+///
+/// @return whether a redraw is needed - either because the width
+///         actually moved, or because `'statuscolumn'` has to be
+///         rebuilt.
+///
+/// Three things happen in order, and each guards the next:
+/// - A window whose `'signcolumn'` really is variable ("auto:n" with
+///   n > 1, or any `'statuscolumn'`) switches the buffer into
+///   automatic sign counting, once.
+/// - Trailing empty buckets are trimmed off `b_signcols.max`, so the
+///   recorded maximum reflects signs that still exist.
+/// - The simple `auto:1` case short-circuits to "is there any sign at
+///   all", skipping the counted maximum entirely.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is likewise valid and non-null, for the whole call.
+pub unsafe fn win_redraw_signcols(wp: *mut WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        let buf = &mut *(*wp).w_buffer;
+        let has_stc = (*wp).w_onebuf_opt.wo_stc.as_deref().is_some_and(|s| !s.is_empty());
+
+        if !buf.b_signcols.autom
+            && (has_stc
+                || ((*wp).w_maxscwidth > 1 && (*wp).w_minscwidth != (*wp).w_maxscwidth))
+        {
+            buf.b_signcols.autom = true;
+            crate::decoration::buf_signcols_count_range(
+                buf,
+                0,
+                buf.b_ml.ml_line_count - 1,
+                crate::pos_defs::MAXLNUM,
+                crate::types_defs::TriState::False,
+            );
+        }
+
+        // Trim trailing empty buckets so the recorded maximum reflects
+        // signs that still exist.
+        while buf.b_signcols.max > 0
+            && buf.b_signcols.count[(buf.b_signcols.max - 1) as usize] == 0
+        {
+            buf.b_signcols.max -= 1;
+        }
+
+        let mut width = (*wp).w_maxscwidth.min(buf.b_signcols.max);
+        let rebuild_stc = buf.b_signcols.max != buf.b_signcols.last_max && has_stc;
+
+        if rebuild_stc {
+            (*wp).w_nrwidth_line_count = 0;
+        } else if (*wp).w_minscwidth == 0 && (*wp).w_maxscwidth == 1 {
+            // The simple auto:1 case: only "is there any sign at all".
+            width = i32::from(
+                crate::buffer::buf_meta_total(
+                    buf,
+                    crate::marktree_defs::MetaIndex::SignText,
+                ) > 0,
+            );
+        }
+
+        let scwidth = (*wp).w_scwidth;
+        (*wp).w_scwidth = (*wp).w_minscwidth.max(0).max(width);
+        (*wp).w_scwidth != scwidth || rebuild_stc
+    }
+}
+
 /// The width actually usable by the fold column, given that `col`
 /// columns are already spoken for (`compute_foldcolumn`).
 ///
@@ -845,6 +913,93 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win_redraw_signcols_trims_trailing_empty_buckets() {
+        // The recorded maximum must reflect signs that still exist, so
+        // trailing empty count buckets are trimmed off.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_signcols.max = 4;
+        buf.b_signcols.count[0] = 3; // only depth 1 is populated
+        buf.b_signcols.last_max = 4;
+
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_minscwidth: 1,
+            w_maxscwidth: 4,
+            w_scwidth: 0,
+            ..Default::default()
+        };
+
+        let changed = unsafe { win_redraw_signcols(&mut win) };
+        assert_eq!(buf.b_signcols.max, 1, "empty buckets above depth 1 are trimmed");
+        assert_eq!(win.w_scwidth, 1);
+        assert!(changed, "the width moved from 0 to 1");
+    }
+
+    #[test]
+    fn win_redraw_signcols_auto_one_only_asks_whether_any_sign_exists() {
+        // With minscwidth 0 and maxscwidth 1 the counted maximum is
+        // skipped entirely: the answer is just "is there any sign".
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        // A large recorded maximum that must NOT be used.
+        buf.b_signcols.max = 3;
+        buf.b_signcols.count[2] = 1;
+        buf.b_signcols.last_max = 3;
+
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_minscwidth: 0,
+            w_maxscwidth: 1,
+            w_scwidth: 9,
+            ..Default::default()
+        };
+
+        unsafe { win_redraw_signcols(&mut win) };
+        // No sign text in this buffer, so the width collapses to 0
+        // rather than following b_signcols.max.
+        assert_eq!(win.w_scwidth, 0);
+    }
+
+    #[test]
+    fn win_redraw_signcols_reports_no_change_when_the_width_is_stable() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        buf.b_signcols.max = 0;
+        buf.b_signcols.last_max = 0;
+
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_minscwidth: 2,
+            w_maxscwidth: 2,
+            // Already at what the computation will produce.
+            w_scwidth: 2,
+            ..Default::default()
+        };
+
+        assert!(!unsafe { win_redraw_signcols(&mut win) });
+        assert_eq!(win.w_scwidth, 2);
+    }
+
+    #[test]
+    fn win_redraw_signcols_never_goes_below_minscwidth() {
+        // w_minscwidth is a floor, even when no signs are present at
+        // all.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: &mut buf,
+            w_minscwidth: 3,
+            w_maxscwidth: 3,
+            w_scwidth: 0,
+            ..Default::default()
+        };
+
+        assert!(unsafe { win_redraw_signcols(&mut win) });
+        assert_eq!(win.w_scwidth, 3);
+    }
 
     #[test]
     fn compute_foldcolumn_caps_the_requested_width_by_available_space() {
