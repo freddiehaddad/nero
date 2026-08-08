@@ -81,6 +81,88 @@ mod bl {
 }
 pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
 
+/// Redraw the line spell-checking asked for, if any
+/// (`check_spell_redraw`).
+///
+/// The redraw may be skipped again, so the pending line number is
+/// cleared first.
+///
+/// # Safety
+/// `GLOBALS.curwin` must point at a live `WinT`, and
+/// [`crate::drawscreen::redraw_winline`]'s own safety doc applies.
+pub unsafe fn check_spell_redraw() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    if g.spell_redraw_lnum == 0 {
+        return;
+    }
+    let lnum = g.spell_redraw_lnum;
+    g.spell_redraw_lnum = 0;
+    let curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::redraw_winline(curwin, lnum) };
+}
+
+/// Like [`crate::change::del_char`], but never move before column
+/// `limit_col` (`del_char_after_col`).
+///
+/// Only matters when there are composing characters: adjusting the
+/// cursor to a character start can walk back past `limit_col`, so it
+/// is walked forward again when that happens.
+///
+/// @return whether something was deleted.
+///
+/// # Safety
+/// `GLOBALS.curwin` and its buffer must be live. Forwards
+/// [`crate::mbyte::mb_adjust_cursor`]/
+/// [`crate::cursor::get_cursor_pos_ptr`]/
+/// [`crate::change::del_bytes`]/[`crate::change::del_char`]'s own
+/// safety docs.
+pub unsafe fn del_char_after_col(limit_col: i32) -> bool {
+    if limit_col < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::change::del_char(false) };
+        return true;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let ecol = unsafe { (*curwin).w_cursor.col } + 1;
+
+    // Make sure the cursor is at the start of a character, but skip
+    // forward again when going too far back because of a composing
+    // character.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::mbyte::mb_adjust_cursor() };
+    loop {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*curwin).w_cursor.col } >= limit_col {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let l = crate::mbyte::utf_ptr2len(&unsafe { crate::cursor::get_cursor_pos_ptr() });
+        if l == 0 {
+            // End of line.
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*curwin).w_cursor.col += l };
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let at_nul = unsafe { crate::cursor::get_cursor_pos_ptr() }.first().is_none_or(|&c| c == 0);
+    // SAFETY: forwarded from this function's own safety doc.
+    let col = unsafe { (*curwin).w_cursor.col };
+    if at_nul || col == ecol {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::change::del_bytes(ecol - col, false, true) };
+    true
+}
+
 /// Whether a new undo point is still needed for the current insert
 /// (`ins_need_undo_get`).
 ///
@@ -754,6 +836,192 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    #[test]
+    fn check_spell_redraw_is_a_noop_when_no_line_is_pending() {
+        // A zero pending line means nothing to redraw, so curwin is
+        // never dereferenced on this path.
+        let _lock = global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.spell_redraw_lnum;
+        g.spell_redraw_lnum = 0;
+
+        unsafe { check_spell_redraw() };
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.spell_redraw_lnum, 0);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.spell_redraw_lnum = prev;
+    }
+
+    #[test]
+    fn check_spell_redraw_clears_the_pending_line_before_redrawing() {
+        // The pending line must be cleared first, since the redraw may
+        // itself be skipped again.
+        let _lock = global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_lnum) = (g.curwin, g.spell_redraw_lnum);
+        g.curwin = win_ptr;
+        g.spell_redraw_lnum = 4;
+
+        unsafe { check_spell_redraw() };
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.spell_redraw_lnum, 0);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.spell_redraw_lnum = prev_lnum;
+    }
+
+    /// Like [`buf_with_real_line`], but boxed and with a real undo
+    /// header installed.
+    ///
+    /// Boxing matters: `del_bytes` stores the buffer/window pointers
+    /// in globals, so they must have stable heap addresses rather than
+    /// stack ones. The undo header matters because `del_bytes` reaches
+    /// `u_save_cursor`, which otherwise tries to CREATE undo state
+    /// this fixture does not build. Mirrors `change.rs`'s own
+    /// `del_fixture`, which is the proven-stable shape for this.
+    fn del_buf(content: &[u8]) -> Box<BufT> {
+        let mut buf = Box::new(BufT::default());
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, content) },
+            OK
+        );
+        buf.b_u_curhead = Box::into_raw(Box::new(crate::undo_defs::UHeader::default()));
+        buf
+    }
+
+    fn close_del_buf(mut buf: Box<BufT>) {
+        unsafe {
+            if !buf.b_u_curhead.is_null() {
+                drop(Box::from_raw(buf.b_u_curhead));
+                buf.b_u_curhead = std::ptr::null_mut();
+            }
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// A boxed window positioned for the deletion fixtures above.
+    fn del_win(buf_ptr: *mut BufT, col: crate::pos_defs::ColnrT) -> Box<WinT> {
+        Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_cursor: crate::pos_defs::PosT { lnum: 1, col, coladd: 0 },
+            w_topline: 1,
+            w_botline: 2,
+            ..Default::default()
+        })
+    }
+
+    /// Sets everything the change/redraw machinery reads, not just
+    /// curbuf/curwin. `del_bytes` reaches `changed_bytes`, which walks
+    /// the window list from `firstwin` - leaving that pointing at a
+    /// window from an earlier test hangs the walk, so it must be set
+    /// too. Mirrors `change.rs`'s own `ChangedGuard` for the same
+    /// reason.
+    struct DelGuard {
+        prev_curwin: *mut WinT,
+        prev_curbuf: *mut BufT,
+        prev_firstwin: *mut WinT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_state: i32,
+        prev_must_redraw: i32,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DelGuard {
+        fn set(win: *mut WinT, buf: *mut BufT, tab: *mut crate::buffer_defs::TabpageT) -> Self {
+            let _lock = global_state_test_lock();
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = DelGuard {
+                prev_curwin: g.curwin,
+                prev_curbuf: g.curbuf,
+                prev_firstwin: g.firstwin,
+                prev_curtab: g.curtab,
+                prev_state: g.State,
+                prev_must_redraw: g.must_redraw,
+                _lock,
+            };
+            g.curwin = win;
+            g.curbuf = buf;
+            g.firstwin = win;
+            g.curtab = tab;
+            g.State = crate::state_defs::mode::NORMAL as i32;
+            g.must_redraw = 0;
+            g.cmdmod.cmod_flags = 0;
+            guard
+        }
+    }
+
+    impl Drop for DelGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curwin = self.prev_curwin;
+            g.curbuf = self.prev_curbuf;
+            g.firstwin = self.prev_firstwin;
+            g.curtab = self.prev_curtab;
+            g.State = self.prev_state;
+            g.must_redraw = self.prev_must_redraw;
+        }
+    }
+
+    #[test]
+    fn del_char_after_col_deletes_the_character_under_the_cursor() {
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = del_buf(b"abcd\0");
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = del_win(buf_ptr, 1);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = DelGuard::set(win_ptr, buf_ptr, &mut tp);
+
+        // limit_col 0 is <= the cursor column, so the walk-forward loop
+        // does nothing and the byte under the cursor is deleted.
+        assert!(unsafe { del_char_after_col(0) });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"acd\0".to_vec());
+
+        drop(_guard);
+        close_del_buf(buf);
+    }
+
+    #[test]
+    fn del_char_after_col_with_a_negative_limit_deletes_unconditionally() {
+        // A negative limit takes the plain del_char path, with no
+        // column clamping at all.
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = del_buf(b"abcd\0");
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = del_win(buf_ptr, 0);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = DelGuard::set(win_ptr, buf_ptr, &mut tp);
+
+        assert!(unsafe { del_char_after_col(-1) });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"bcd\0".to_vec());
+
+        drop(_guard);
+        close_del_buf(buf);
+    }
+
+    #[test]
+    fn del_char_after_col_reports_nothing_deleted_at_end_of_line() {
+        // Sitting on the terminating NUL, there is nothing to delete -
+        // and this path returns before reaching del_bytes at all.
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut buf = del_buf(b"ab\0");
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = del_win(buf_ptr, 2);
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = DelGuard::set(win_ptr, buf_ptr, &mut tp);
+
+        assert!(!unsafe { del_char_after_col(0) });
+        assert_eq!(unsafe { crate::memline::ml_get(1) }, b"ab\0".to_vec());
+
+        drop(_guard);
+        close_del_buf(buf);
     }
 
     // --- insert-state accessors ---
