@@ -220,6 +220,50 @@ pub fn profile_set_wait(wait: ProftimeT) {
     PROF_WAIT_TIME.store(wait, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The accumulated wait time for the current input wait
+/// (`wait_time`, a file-static in the original).
+static PROF_INPUT_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called when starting to wait for the user to type a character
+/// (`prof_input_start`).
+pub fn prof_input_start() {
+    PROF_INPUT_WAIT.store(profile_start(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Called when finished waiting for the user to type a character
+/// (`prof_input_end`).
+///
+/// The elapsed wait is added to the running total, so profiling
+/// reports exclude time spent blocked on the user.
+pub fn prof_input_end() {
+    let started = PROF_INPUT_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+    let waited = profile_end(started);
+    PROF_INPUT_WAIT.store(waited, std::sync::atomic::Ordering::Relaxed);
+    profile_set_wait(profile_add(profile_get_wait(), waited));
+}
+
+/// Compare two functions by total time, for sorting
+/// (`prof_total_cmp`).
+///
+/// The original is a `qsort` comparator taking `void *`; Rust's own
+/// `sort_by` takes the elements directly.
+#[must_use]
+pub fn prof_total_cmp(
+    p1: &crate::eval::typval_defs::UfuncT,
+    p2: &crate::eval::typval_defs::UfuncT,
+) -> i32 {
+    profile_cmp(p1.uf_tm_total, p2.uf_tm_total)
+}
+
+/// Compare two functions by self time, for sorting (`prof_self_cmp`).
+#[must_use]
+pub fn prof_self_cmp(
+    p1: &crate::eval::typval_defs::UfuncT,
+    p2: &crate::eval::typval_defs::UfuncT,
+) -> i32 {
+    profile_cmp(p1.uf_tm_self, p2.uf_tm_self)
+}
+
 /// Subtracts the passed waittime since `tm` (`profile_sub_wait`).
 ///
 /// Returns `tma - (waittime - tm)`.
@@ -267,6 +311,61 @@ pub fn profile_cmp(tm1: ProftimeT, tm2: ProftimeT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- prof_input_start / prof_input_end ---
+
+    #[test]
+    fn prof_input_end_accumulates_the_wait_into_the_running_total() {
+        let before = profile_get_wait();
+
+        prof_input_start();
+        prof_input_end();
+        let after_one = profile_get_wait();
+        assert!(after_one >= before, "the wait total never decreases");
+
+        prof_input_start();
+        prof_input_end();
+        let after_two = profile_get_wait();
+        assert!(after_two >= after_one, "a second wait accumulates too");
+
+        profile_set_wait(before);
+    }
+
+    // --- prof_total_cmp / prof_self_cmp ---
+
+    #[test]
+    fn prof_total_cmp_orders_by_total_time_descending() {
+        // profile_cmp is deliberately REVERSED: it returns >0 when the
+        // SECOND argument is larger, so sorting with it puts the
+        // slowest function first - which is what a profile report
+        // wants. Asserting conventional ascending order here would be
+        // wrong.
+        let a = crate::eval::typval_defs::UfuncT { uf_tm_total: 10, ..Default::default() };
+        let b = crate::eval::typval_defs::UfuncT { uf_tm_total: 20, ..Default::default() };
+
+        assert!(prof_total_cmp(&a, &b) > 0, "the larger total sorts first");
+        assert!(prof_total_cmp(&b, &a) < 0);
+        assert_eq!(prof_total_cmp(&a, &a), 0);
+    }
+
+    #[test]
+    fn prof_self_cmp_orders_by_self_time_not_total() {
+        // Self and total deliberately disagree, so a comparator using
+        // the wrong field would order these the other way.
+        let a = crate::eval::typval_defs::UfuncT {
+            uf_tm_total: 100,
+            uf_tm_self: 1,
+            ..Default::default()
+        };
+        let b = crate::eval::typval_defs::UfuncT {
+            uf_tm_total: 1,
+            uf_tm_self: 100,
+            ..Default::default()
+        };
+
+        assert!(prof_self_cmp(&a, &b) > 0, "b has the larger self time");
+        assert!(prof_total_cmp(&a, &b) < 0, "but a has the larger total");
+    }
 
     // --- get_profile_name / prof_def_func ---
 
