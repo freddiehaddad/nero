@@ -770,17 +770,21 @@ pub fn f_getcmdprompt(
 }
 
 /// `getcmdscreenpos()` - the cursor's screen position (1-based) in the
-/// command line (`f_getcmdscreenpos`, `ex_getln.c`) - always `0` today
-/// (no active command line), since `cmdline_is_active` is always
-/// `false`.
+/// command line (`f_getcmdscreenpos`, `ex_getln.c`).
+///
+/// Reads the already-computed `cmdspos` rather than recomputing it
+/// via [`cmd_screencol`], matching the original.
 pub fn f_getcmdscreenpos(
     _argvars: &[crate::eval::typval_defs::TypvalT],
     rettv: &mut crate::eval::typval_defs::TypvalT,
 ) {
-    let n: i64 = if cmdline_is_active() {
-        unimplemented!("getcmdscreenpos(): needs a real, live command-line-editing state")
-    } else {
+    // SAFETY: reads this module's own ccline file-static.
+    let p = unsafe { get_ccline_ptr() };
+    let n = if p.is_null() {
         0
+    } else {
+        // SAFETY: p is non-null and points at a live CmdlineInfo.
+        i64::from(unsafe { (*p).cmdspos }) + 1
     };
     rettv.value = crate::eval::typval_defs::TypvalValue::Number(n);
 }
@@ -1891,6 +1895,24 @@ mod tests {
             rettv.value,
             crate::eval::typval_defs::TypvalValue::String(None)
         );
+    }
+
+    #[test]
+    fn getcmdscreenpos_reports_the_screen_column_one_based() {
+        // Reads the already-computed cmdspos rather than recomputing
+        // it, matching the original.
+        let _guard = crate::globals::global_state_test_lock();
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        with_cmdline(
+            |cc| {
+                cc.cmdbuff = Some(b":echo".to_vec());
+                cc.cmdspos = 7;
+            },
+            || f_getcmdscreenpos(&[], &mut rettv),
+        );
+
+        assert_eq!(rettv.value, crate::eval::typval_defs::TypvalValue::Number(8));
     }
 
     #[test]
