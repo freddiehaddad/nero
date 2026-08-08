@@ -2330,6 +2330,55 @@ pub struct EncCanonEntry {
     pub prop: i32,
 }
 
+/// The screen character for `p`, using no more than `len` bytes
+/// (`utfc_ptrlen2schar`).
+///
+/// Like `utfc_ptr2schar`, but bounded by a known length rather than
+/// scanning to a NUL.
+///
+/// @return `(schar, firstc)` - the packed screen character, plus the
+///         first codepoint (the original's own `int *firstc`
+///         out-parameter). A `schar` of 0 means the sequence was
+///         invalid or truncated, in which case `firstc` is the raw
+///         leading byte rather than a decoded codepoint.
+///
+/// # Safety
+/// Forwarded from [`utfc_ptr2len_len`]'s own safety doc.
+#[must_use]
+pub unsafe fn utfc_ptrlen2schar(p: &[u8], len: i32) -> (crate::types_defs::ScharT, i32) {
+    let first_byte = p.first().copied().unwrap_or(0);
+    if (len == 1 && first_byte >= 0x80) || len == 0 {
+        // Invalid or truncated sequence.
+        return (0, i32::from(first_byte));
+    }
+
+    let c = utf_ptr2char(p);
+    let first_compose = utf_iscomposing_first(c);
+    let maxlen = crate::types_defs::MAX_SCHAR_SIZE as i32 - 1 - i32::from(first_compose);
+    let mut len = len;
+    if len > maxlen {
+        // SAFETY: forwarded from this function's own safety doc.
+        len = unsafe { utfc_ptr2len_len(p, maxlen as usize) };
+    }
+
+    let take = (len.max(0) as usize).min(p.len());
+    (schar_from_buf_first(&p[..take], first_compose), c)
+}
+
+/// The canonical encoding name at `idx`, for `ExpandGeneric`
+/// (`get_encoding_name`).
+///
+/// The original takes an unused `expand_T *xp` that has no equivalent
+/// here, and returns `NULL` past the end of the table; that becomes
+/// `None`.
+#[must_use]
+pub fn get_encoding_name(idx: i32) -> Option<&'static str> {
+    if idx < 0 || idx as usize >= ENC_CANON_TABLE.len() {
+        return None;
+    }
+    Some(ENC_CANON_TABLE[idx as usize].name)
+}
+
 /// Canonical encoding names and their properties (`enc_canon_table`).
 /// `"iso-8859-n"` is handled by `enc_canonize()` directly (not
 /// translated) - this table's own entries for those exist only to be
@@ -3311,6 +3360,60 @@ mod tests {
         assert_eq!(unsafe { mb_get_class(b"a") }, 2);
         assert_eq!(unsafe { mb_get_class(b" ") }, 0);
         assert_eq!(unsafe { mb_get_class("中".as_bytes()) }, 0x4e00);
+    }
+
+    // --- utfc_ptrlen2schar / get_encoding_name ---
+
+    #[test]
+    fn utfc_ptrlen2schar_decodes_a_plain_ascii_byte() {
+        let (sc, firstc) = unsafe { utfc_ptrlen2schar(b"a", 1) };
+        assert_eq!(firstc, i32::from(b'a'));
+        assert_ne!(sc, 0, "a valid single byte is a real screen char");
+    }
+
+    #[test]
+    fn utfc_ptrlen2schar_reports_a_truncated_sequence() {
+        // A lone continuation/lead byte with len 1, and a zero
+        // length, are both "invalid or truncated": schar is 0 and
+        // firstc is the RAW byte rather than a decoded codepoint.
+        let (sc, firstc) = unsafe { utfc_ptrlen2schar(b"\xe4", 1) };
+        assert_eq!(sc, 0);
+        assert_eq!(firstc, 0xe4);
+
+        let (sc, firstc) = unsafe { utfc_ptrlen2schar(b"a", 0) };
+        assert_eq!(sc, 0);
+        assert_eq!(firstc, i32::from(b'a'));
+    }
+
+    #[test]
+    fn utfc_ptrlen2schar_decodes_a_multibyte_character() {
+        let bytes = "é".as_bytes();
+        let (sc, firstc) = unsafe { utfc_ptrlen2schar(bytes, bytes.len() as i32) };
+        assert_eq!(firstc, 0xe9);
+        assert_ne!(sc, 0);
+    }
+
+    #[test]
+    fn utfc_ptrlen2schar_respects_the_given_length() {
+        // The same buffer decodes differently depending on how much of
+        // it the caller says is available - which is the whole point
+        // of this variant over utfc_ptr2schar.
+        let bytes = "é".as_bytes();
+        let (_sc_full, firstc_full) = unsafe { utfc_ptrlen2schar(bytes, bytes.len() as i32) };
+        let (sc_trunc, firstc_trunc) = unsafe { utfc_ptrlen2schar(bytes, 1) };
+        assert_eq!(firstc_full, 0xe9);
+        assert_eq!(sc_trunc, 0, "one byte of a two-byte sequence is truncated");
+        assert_eq!(firstc_trunc, i32::from(bytes[0]));
+    }
+
+    #[test]
+    fn get_encoding_name_reports_table_entries_and_nothing_past_the_end() {
+        assert_eq!(get_encoding_name(0), Some("latin1"));
+        let last = ENC_CANON_TABLE.len() as i32 - 1;
+        assert_eq!(get_encoding_name(last), Some(ENC_CANON_TABLE[last as usize].name));
+
+        assert_eq!(get_encoding_name(ENC_CANON_TABLE.len() as i32), None);
+        assert_eq!(get_encoding_name(-1), None);
     }
 
     #[test]
