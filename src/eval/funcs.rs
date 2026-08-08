@@ -3627,6 +3627,54 @@ unsafe fn f_win_getid(argvars: &[TypvalT], rettv: &mut TypvalT) {
     rettv.value = TypvalValue::Number(i64::from(unsafe { crate::window::win_getid(winnr, tabnr) }));
 }
 
+/// Parse the register-type prefix of a `setreg()` options string
+/// (`get_yank_type`).
+///
+/// Accepts `v`/`c` (character-wise), `V`/`l` (line-wise) and
+/// `b`/`CTRL-V` (block-wise). A block-wise marker may be followed by a
+/// width, as in `b10`.
+///
+/// @return `Some((yank_type, block_len, consumed))` on success, or
+///         `None` for `FAIL` when the leading character names no known
+///         type. `block_len` is `None` unless an explicit width was
+///         given.
+///
+/// The original advances a `char **pp` and fills two out-parameters;
+/// reporting how many bytes were consumed instead lets the caller keep
+/// a plain slice. Note it leaves `*pp` ON the last consumed byte
+/// rather than past it (the `stropt--` after the digits), so the
+/// consumed count here is likewise the index of that byte, not one
+/// past it - the caller advances by one afterwards either way.
+///
+/// Marked `#[allow(dead_code)]`: its only caller is `f_setreg`, which
+/// is not translated yet. Matches `alist_name`'s own precedent in this
+/// file for a helper landed ahead of its consumer.
+#[allow(dead_code)]
+#[must_use]
+fn get_yank_type(pp: &[u8]) -> Option<(crate::normal_defs::MotionType, Option<i32>, usize)> {
+    use crate::normal_defs::MotionType;
+
+    let first = *pp.first()?;
+    match first {
+        // Character-wise selection.
+        b'v' | b'c' => Some((MotionType::CharWise, None, 0)),
+        // Line-wise selection.
+        b'V' | b'l' => Some((MotionType::LineWise, None, 0)),
+        // Block-wise selection, optionally with an explicit width.
+        b'b' | crate::ascii_defs::CTRL_V => {
+            if pp.get(1).is_some_and(|&c| crate::ascii_defs::ascii_isdigit(i32::from(c))) {
+                let (width, adv) = crate::charset::getdigits_int(&pp[1..], false, 0);
+                // The original subtracts one from the parsed width, and
+                // steps back onto the last digit.
+                Some((MotionType::BlockWise, Some(width - 1), adv))
+            } else {
+                Some((MotionType::BlockWise, None, 0))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// `win_id2win({expr})` - the window-number (within the current tab
 /// page) of window-ID `{expr}` (`f_win_id2win`, `eval/window.c`), via
 /// the already-existing [`crate::window::win_id2win`].
@@ -7649,6 +7697,59 @@ unsafe fn get_xdg_var_list(xdg: crate::os::stdpaths::XdgVarType, rettv: &mut Typ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_yank_type_maps_each_character_wise_marker() {
+        // Cross-verified against real nvim: setreg(..., 'v') and
+        // setreg(..., 'c') both report getregtype() == 'v'.
+        use crate::normal_defs::MotionType;
+        for m in *b"vc" {
+            let (ty, len, used) = get_yank_type(&[m]).expect("a known type");
+            assert_eq!(ty, MotionType::CharWise);
+            assert_eq!(len, None);
+            assert_eq!(used, 0);
+        }
+    }
+
+    #[test]
+    fn get_yank_type_maps_each_line_wise_marker() {
+        // Cross-verified: 'V' and 'l' both report getregtype() == 'V'.
+        use crate::normal_defs::MotionType;
+        for m in *b"Vl" {
+            let (ty, len, _used) = get_yank_type(&[m]).expect("a known type");
+            assert_eq!(ty, MotionType::LineWise);
+            assert_eq!(len, None);
+        }
+    }
+
+    #[test]
+    fn get_yank_type_maps_block_wise_with_and_without_a_width() {
+        use crate::normal_defs::MotionType;
+
+        // Bare block-wise markers carry no width.
+        for m in [b'b', crate::ascii_defs::CTRL_V] {
+            let (ty, len, used) = get_yank_type(&[m]).expect("a known type");
+            assert_eq!(ty, MotionType::BlockWise);
+            assert_eq!(len, None);
+            assert_eq!(used, 0);
+        }
+
+        // Cross-verified: setreg(..., 'b10') reports "^V10", i.e. the
+        // width survives. The original stores width - 1.
+        let (ty, len, used) = get_yank_type(b"b10").expect("a known type");
+        assert_eq!(ty, MotionType::BlockWise);
+        assert_eq!(len, Some(9));
+        assert_eq!(used, 2, "both digits are consumed");
+    }
+
+    #[test]
+    fn get_yank_type_rejects_an_unknown_marker() {
+        assert!(get_yank_type(b"x").is_none());
+        assert!(get_yank_type(b"").is_none());
+        // A digit alone names no type - the width only follows a
+        // block-wise marker.
+        assert!(get_yank_type(b"10").is_none());
+    }
 
     fn num(n: crate::eval::typval_defs::VarnumberT) -> TypvalT {
         TypvalT { value: TypvalValue::Number(n), ..Default::default() }
