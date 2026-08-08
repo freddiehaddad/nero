@@ -81,6 +81,103 @@ mod bl {
 }
 pub use bl::{FIX as BL_FIX, SOL as BL_SOL, WHITE as BL_WHITE};
 
+/// Whether a new undo point is still needed for the current insert
+/// (`ins_need_undo_get`).
+///
+/// # Safety
+/// Reads `GLOBALS`.
+#[must_use]
+pub unsafe fn ins_need_undo_get() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Ins.need_undo
+}
+
+/// Whether C-indenting may still be applied for the current insert
+/// (`get_can_cindent`).
+///
+/// # Safety
+/// Reads `GLOBALS`.
+#[must_use]
+pub unsafe fn get_can_cindent() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Ins.can_cindent
+}
+
+/// Set whether C-indenting may still be applied (`set_can_cindent`).
+///
+/// # Safety
+/// Mutates `GLOBALS`.
+pub unsafe fn set_can_cindent(val: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.Ins.can_cindent = val;
+}
+
+/// The effective prompt for `buf` (`buf_prompt_text`).
+///
+/// Falls back to `"% "` when the buffer has no prompt of its own,
+/// matching the original's own default.
+///
+/// # Safety
+/// `buf` must point at a live `BufT`.
+#[must_use]
+pub unsafe fn buf_prompt_text(buf: *const crate::buffer_defs::BufT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { &(*buf).b_prompt_text } {
+        Some(text) => text.clone(),
+        None => b"% ".to_vec(),
+    }
+}
+
+/// The effective prompt for the current buffer (`prompt_text`).
+///
+/// # Safety
+/// `GLOBALS.curbuf` must point at a live `BufT`.
+#[must_use]
+pub unsafe fn prompt_text() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { buf_prompt_text(curbuf) }
+}
+
+/// Whether the cursor is in the editable part of the prompt line
+/// (`prompt_curpos_editable`).
+///
+/// # Safety
+/// `GLOBALS.curwin`/`GLOBALS.curbuf` must point at live objects.
+#[must_use]
+pub unsafe fn prompt_curpos_editable() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (curwin, curbuf) = (g.curwin, g.curbuf);
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor = unsafe { (*curwin).w_cursor };
+    // SAFETY: forwarded from this function's own safety doc.
+    let start = unsafe { (*curbuf).b_prompt_start.mark };
+
+    cursor.lnum > start.lnum || (cursor.lnum == start.lnum && cursor.col >= start.col)
+}
+
+/// Stop displaying the "$" of a change operator, and redraw the line
+/// it was on (`undisplay_dollar`).
+///
+/// # Safety
+/// `GLOBALS.curwin` must point at a live `WinT`, and
+/// [`crate::drawscreen::redraw_winline`]'s own safety doc applies.
+pub unsafe fn undisplay_dollar() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    if g.dollar_vcol < 0 {
+        return;
+    }
+    g.dollar_vcol = -1;
+    let curwin = g.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { (*curwin).w_cursor.lnum };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::redraw_winline(curwin, lnum) };
+}
+
 /// The last inserted text (`last_insert`, a file-static `String` in
 /// `insert.c`).
 ///
@@ -657,6 +754,135 @@ mod tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = Some(b"aBL".to_vec());
         assert_eq!(unsafe { get_nolist_virtcol() }, 7);
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_cpo = previous_cpo;
+    }
+
+    // --- insert-state accessors ---
+
+    #[test]
+    fn ins_need_undo_get_reflects_the_insert_state_flag() {
+        let _lock = global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.Ins.need_undo;
+
+        g.Ins.need_undo = true;
+        assert!(unsafe { ins_need_undo_get() });
+        unsafe { crate::globals::GLOBALS.get_mut() }.Ins.need_undo = false;
+        assert!(!unsafe { ins_need_undo_get() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Ins.need_undo = prev;
+    }
+
+    #[test]
+    fn can_cindent_round_trips_through_its_setter() {
+        let _lock = global_state_test_lock();
+        let prev = unsafe { crate::globals::GLOBALS.get_mut() }.Ins.can_cindent;
+
+        unsafe { set_can_cindent(true) };
+        assert!(unsafe { get_can_cindent() });
+        unsafe { set_can_cindent(false) };
+        assert!(!unsafe { get_can_cindent() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.Ins.can_cindent = prev;
+    }
+
+    #[test]
+    fn buf_prompt_text_falls_back_to_the_default_prompt() {
+        let buf = BufT::default();
+        assert_eq!(unsafe { buf_prompt_text(&buf) }, b"% ".to_vec());
+    }
+
+    #[test]
+    fn buf_prompt_text_reports_a_buffers_own_prompt() {
+        let buf = BufT { b_prompt_text: Some(b"> ".to_vec()), ..Default::default() };
+        assert_eq!(unsafe { buf_prompt_text(&buf) }, b"> ".to_vec());
+    }
+
+    #[test]
+    fn prompt_text_reads_the_current_buffer() {
+        let _lock = global_state_test_lock();
+        let mut buf = BufT { b_prompt_text: Some(b"$ ".to_vec()), ..Default::default() };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curbuf;
+        g.curbuf = buf_ptr;
+
+        assert_eq!(unsafe { prompt_text() }, b"$ ".to_vec());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+    }
+
+    #[test]
+    fn prompt_curpos_editable_compares_against_the_prompt_start_mark() {
+        let _lock = global_state_test_lock();
+        let mut buf = BufT::default();
+        buf.b_prompt_start.mark = crate::pos_defs::PosT { lnum: 3, col: 4, coladd: 0 };
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_buf, prev_win) = (g.curbuf, g.curwin);
+        g.curbuf = buf_ptr;
+        g.curwin = win_ptr;
+
+        // Before the prompt line entirely.
+        unsafe { (*win_ptr).w_cursor = crate::pos_defs::PosT { lnum: 2, col: 99, coladd: 0 } };
+        assert!(!unsafe { prompt_curpos_editable() });
+
+        // On the prompt line, but inside the prompt text itself.
+        unsafe { (*win_ptr).w_cursor = crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 } };
+        assert!(!unsafe { prompt_curpos_editable() });
+
+        // Exactly at the first editable column.
+        unsafe { (*win_ptr).w_cursor = crate::pos_defs::PosT { lnum: 3, col: 4, coladd: 0 } };
+        assert!(unsafe { prompt_curpos_editable() });
+
+        // Past the prompt line.
+        unsafe { (*win_ptr).w_cursor = crate::pos_defs::PosT { lnum: 4, col: 0, coladd: 0 } };
+        assert!(unsafe { prompt_curpos_editable() });
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curbuf = prev_buf;
+        g.curwin = prev_win;
+    }
+
+    #[test]
+    fn undisplay_dollar_is_a_noop_when_no_dollar_is_shown() {
+        // A negative dollar_vcol means nothing is displayed, so the
+        // redraw is skipped entirely - which also means curwin is
+        // never dereferenced on this path.
+        let _lock = global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.dollar_vcol;
+        g.dollar_vcol = -1;
+
+        unsafe { undisplay_dollar() };
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.dollar_vcol, -1);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.dollar_vcol = prev;
+    }
+
+    #[test]
+    fn undisplay_dollar_clears_the_column_and_redraws() {
+        let _lock = global_state_test_lock();
+        let mut buf = BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = WinT { w_buffer: buf_ptr, ..Default::default() };
+        win.w_cursor.lnum = 1;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_dollar) = (g.curwin, g.dollar_vcol);
+        g.curwin = win_ptr;
+        g.dollar_vcol = 12;
+
+        unsafe { undisplay_dollar() };
+
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.dollar_vcol, -1);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.dollar_vcol = prev_dollar;
     }
 
     // --- last_insert family ---
