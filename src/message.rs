@@ -119,6 +119,27 @@ static VERBOSE_FD: LazyLock<GlobalCell<Option<std::fs::File>>> =
 /// failure message is only given once (`verbose_did_open`).
 static VERBOSE_DID_OPEN: LazyLock<GlobalCell<bool>> = LazyLock::new(|| GlobalCell::new(false));
 
+/// Note that the last message line is full, so the user has to
+/// acknowledge it before the screen scrolls (`msg_check`).
+///
+/// Only relevant when messages are drawn on the screen grid: with an
+/// external messages UI attached there is no bottom line to overflow,
+/// so nothing is scheduled.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn msg_check() {
+    if crate::ui::ui_has(crate::ui::UiExtension::Messages) {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    if g.msg_row == g.Rows - 1 && g.msg_col >= g.sc_col {
+        g.need_wait_return = true;
+        g.redraw_cmdline = true;
+    }
+}
+
 /// Called when `'verbosefile'` is set: stop writing to the file
 /// (`verbose_stop`).
 ///
@@ -578,6 +599,74 @@ pub unsafe fn msg_starthere() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn msg_check_flags_a_full_last_line() {
+        // On the LAST row with the column at or past sc_col, the user
+        // must acknowledge before the screen scrolls.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, prow, pcol, psc, pwr, prc) =
+            (g.Rows, g.msg_row, g.msg_col, g.sc_col, g.need_wait_return, g.redraw_cmdline);
+
+        g.Rows = 30;
+        g.sc_col = 10;
+        g.msg_row = 29;
+        g.msg_col = 10;
+        g.need_wait_return = false;
+        g.redraw_cmdline = false;
+
+        unsafe { msg_check() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(g.need_wait_return);
+        assert!(g.redraw_cmdline);
+
+        g.Rows = pr;
+        g.msg_row = prow;
+        g.msg_col = pcol;
+        g.sc_col = psc;
+        g.need_wait_return = pwr;
+        g.redraw_cmdline = prc;
+    }
+
+    #[test]
+    fn msg_check_needs_both_the_last_row_and_the_column() {
+        // Either condition alone is not enough - a message that is not
+        // on the bottom line, or has not reached sc_col, will not
+        // scroll anything away.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pr, prow, pcol, psc, pwr, prc) =
+            (g.Rows, g.msg_row, g.msg_col, g.sc_col, g.need_wait_return, g.redraw_cmdline);
+
+        g.Rows = 30;
+        g.sc_col = 10;
+
+        // Not the last row.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.msg_row = 5;
+        g.msg_col = 20;
+        g.need_wait_return = false;
+        unsafe { msg_check() };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_wait_return);
+
+        // Last row, but the column has not reached sc_col.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.msg_row = 29;
+        g.msg_col = 9;
+        g.need_wait_return = false;
+        unsafe { msg_check() };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.need_wait_return);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Rows = pr;
+        g.msg_row = prow;
+        g.msg_col = pcol;
+        g.sc_col = psc;
+        g.need_wait_return = pwr;
+        g.redraw_cmdline = prc;
+    }
 
     /// Test-only helper letting tests bump the otherwise-private
     /// `MSG_ID_NEXT` counter, matching the established
