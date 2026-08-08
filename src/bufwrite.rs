@@ -8,9 +8,49 @@
 //!
 //! Translated: `make_bom` (build the byte-order-mark for a given
 //! encoding name, via `fileio.c`'s already-real `get_fio_flags`/
-//! `ucs2bytes`).
+//! `ucs2bytes`), plus the `Error_T` carrier and its `set_err*`
+//! constructors.
 //!
 //! Deferred: everything else in the file.
+
+/// A deferred write error, reported later by `emit_err` (`Error_T`).
+///
+/// `buf_write` collects a failure into one of these and emits it at a
+/// single exit point, rather than reporting from deep inside the write
+/// path.
+///
+/// The original's `bool alloc` field tracks whether `msg` needs
+/// freeing; an owned `Vec<u8>` makes that unnecessary, so it has no
+/// equivalent here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ErrorT {
+    /// Error number, e.g. `"E502"` (`num`). `None` for messages that
+    /// carry no number of their own.
+    pub num: Option<&'static [u8]>,
+    /// The message itself (`msg`).
+    pub msg: Option<Vec<u8>>,
+    /// A single numeric argument interpolated into `msg` (`arg`).
+    /// Zero means "no argument", matching the original.
+    pub arg: i32,
+}
+
+/// A numbered error with no argument (`set_err_num`).
+#[must_use]
+pub fn set_err_num(num: &'static [u8], msg: &[u8]) -> ErrorT {
+    ErrorT { num: Some(num), msg: Some(msg.to_vec()), arg: 0 }
+}
+
+/// An unnumbered error with no argument (`set_err`).
+#[must_use]
+pub fn set_err(msg: &[u8]) -> ErrorT {
+    ErrorT { num: None, msg: Some(msg.to_vec()), arg: 0 }
+}
+
+/// An unnumbered error carrying a numeric argument (`set_err_arg`).
+#[must_use]
+pub fn set_err_arg(msg: &[u8], arg: i32) -> ErrorT {
+    ErrorT { num: None, msg: Some(msg.to_vec()), arg }
+}
 
 /// Generate the byte-order mark for encoding `name` (`make_bom`).
 /// Returns an empty `Vec` when no BOM applies (Latin1, or an
@@ -41,6 +81,40 @@ pub unsafe fn make_bom(name: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    #[test]
+    fn set_err_num_carries_a_number_and_no_argument() {
+        let e = set_err_num(b"E502", b"is a directory");
+        assert_eq!(e.num, Some(&b"E502"[..]));
+        assert_eq!(e.msg.as_deref(), Some(&b"is a directory"[..]));
+        assert_eq!(e.arg, 0);
+    }
+
+    #[test]
+    fn set_err_carries_no_number_and_no_argument() {
+        let e = set_err(b"is not a file");
+        assert_eq!(e.num, None);
+        assert_eq!(e.msg.as_deref(), Some(&b"is not a file"[..]));
+        assert_eq!(e.arg, 0);
+    }
+
+    #[test]
+    fn set_err_arg_carries_an_argument_but_no_number() {
+        let e = set_err_arg(b"conversion failed in line %ld", 42);
+        assert_eq!(e.num, None);
+        assert_eq!(e.msg.as_deref(), Some(&b"conversion failed in line %ld"[..]));
+        assert_eq!(e.arg, 42);
+    }
+
+    #[test]
+    fn a_default_error_carries_nothing_at_all() {
+        // Zero is the original's own "no argument" sentinel, so the
+        // default must not look like a real argument.
+        let e = ErrorT::default();
+        assert_eq!(e.num, None);
+        assert_eq!(e.msg, None);
+        assert_eq!(e.arg, 0);
+    }
 
     #[test]
     fn make_bom_utf8() {
