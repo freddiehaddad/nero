@@ -204,6 +204,31 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// Invalidate every window's allocated grid and schedule a full
+/// redraw (`screen_invalidate_highlights`).
+///
+/// Called when highlight definitions change: the cached grid contents
+/// carry resolved attributes, so they cannot be reused.
+///
+/// As elsewhere in this crate, `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is
+/// walked as `GLOBALS.firstwin`/`w_next`.
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid, live
+/// `WinT` pointers. Forwarded from [`redraw_later`]'s own safety doc.
+pub unsafe fn screen_invalidate_highlights() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            redraw_later(wp, UPD_NOT_VALID);
+            (*wp).w_grid_alloc.valid = false;
+            wp = (*wp).w_next;
+        }
+    }
+}
+
 /// Whether the cursor line should be concealed in `wp`
 /// (`conceal_cursor_line`).
 ///
@@ -738,6 +763,34 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_invalidate_highlights_clears_every_windows_grid() {
+        // Cached grid contents carry resolved attributes, so a
+        // highlight change must invalidate them AND schedule a redraw
+        // for every window - not just the first.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_first = g.firstwin;
+
+        let mut second = crate::buffer_defs::WinT::default();
+        second.w_grid_alloc.valid = true;
+        let mut first = crate::buffer_defs::WinT {
+            w_next: &mut second,
+            ..Default::default()
+        };
+        first.w_grid_alloc.valid = true;
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = &mut first;
+        unsafe { screen_invalidate_highlights() };
+
+        assert!(!first.w_grid_alloc.valid);
+        assert!(!second.w_grid_alloc.valid, "the walk must reach every window");
+        assert_eq!(first.w_redr_type, UPD_NOT_VALID);
+        assert_eq!(second.w_redr_type, UPD_NOT_VALID);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_first;
+    }
 
     #[test]
     fn conceal_cursor_line_is_false_for_an_empty_or_unset_option() {
