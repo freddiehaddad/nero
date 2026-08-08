@@ -186,6 +186,72 @@ static PENDING_MODE_INFO_UPDATE: crate::globals::GlobalCell<bool> =
 static CURSOR_GRID_HANDLE: crate::globals::GlobalCell<crate::types_defs::HandleT> =
     crate::globals::GlobalCell::new(crate::grid::DEFAULT_GRID_HANDLE);
 
+/// The cursor-shape mode index last sent to the UIs (`ui_mode_idx`).
+///
+/// Starts at `-1`, which matches no real mode, so the first check
+/// always reports a change and sends the initial shape.
+static UI_MODE_IDX: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+/// Whether a cursor-shape update is still owed to the UIs
+/// (`pending_mode_update`).
+static PENDING_MODE_UPDATE: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
+
+/// Move the cursor to `new_row`/`new_col` on grid `grid_handle`
+/// (`ui_grid_cursor_goto`).
+///
+/// A move to where the cursor already is, on the grid it is already
+/// on, is skipped entirely - so no redundant update is queued.
+///
+/// # Safety
+/// Mutates the cursor file-statics.
+pub unsafe fn ui_grid_cursor_goto(
+    grid_handle: crate::types_defs::HandleT,
+    new_row: i32,
+    new_col: i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if new_row == *CURSOR_ROW.get_mut()
+            && new_col == *CURSOR_COL.get_mut()
+            && grid_handle == *CURSOR_GRID_HANDLE.get_mut()
+        {
+            return;
+        }
+
+        *CURSOR_ROW.get_mut() = new_row;
+        *CURSOR_COL.get_mut() = new_col;
+        *CURSOR_GRID_HANDLE.get_mut() = grid_handle;
+        *PENDING_CURSOR_UPDATE.get_mut() = true;
+    }
+}
+
+/// Update the cursor shape if the mode changed
+/// (`ui_cursor_shape_no_check_conceal`).
+///
+/// Does nothing before the screen is up, since there is no UI to tell.
+///
+/// # Safety
+/// Reads `GLOBALS`, forwards
+/// [`crate::cursor_shape::cursor_get_mode_idx`]'s own safety doc, and
+/// mutates the mode file-statics.
+pub unsafe fn ui_cursor_shape_no_check_conceal() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { crate::globals::GLOBALS.get_mut() }.full_screen {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let new_mode_idx = i32::try_from(unsafe { crate::cursor_shape::cursor_get_mode_idx() })
+        .unwrap_or(-1);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if new_mode_idx != *UI_MODE_IDX.get_mut() {
+            *UI_MODE_IDX.get_mut() = new_mode_idx;
+            *PENDING_MODE_UPDATE.get_mut() = true;
+        }
+    }
+}
+
 /// The cursor's current row (`ui_current_row`).
 ///
 /// # Safety
@@ -400,6 +466,128 @@ mod tests {
         let r = f();
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tgc = prev;
         r
+    }
+
+    #[test]
+    fn ui_grid_cursor_goto_moves_and_flags_an_update() {
+        let _lock = crate::globals::global_state_test_lock();
+        let grid = unsafe { *CURSOR_GRID_HANDLE.get_mut() };
+        unsafe { *PENDING_CURSOR_UPDATE.get_mut() = false };
+
+        unsafe { ui_grid_cursor_goto(grid, 4, 9) };
+
+        let (row, col, pending) = unsafe {
+            (ui_current_row(), ui_current_col(), *PENDING_CURSOR_UPDATE.get_mut())
+        };
+        unsafe {
+            *CURSOR_ROW.get_mut() = 0;
+            *CURSOR_COL.get_mut() = 0;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
+        assert_eq!((row, col), (4, 9));
+        assert!(pending);
+    }
+
+    #[test]
+    fn ui_grid_cursor_goto_skips_a_move_that_changes_nothing() {
+        // Same row, same column, same grid: no update should be
+        // queued, or every redraw would send a redundant one.
+        let _lock = crate::globals::global_state_test_lock();
+        let grid = unsafe { *CURSOR_GRID_HANDLE.get_mut() };
+        unsafe {
+            *CURSOR_ROW.get_mut() = 4;
+            *CURSOR_COL.get_mut() = 9;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
+
+        unsafe { ui_grid_cursor_goto(grid, 4, 9) };
+        let pending = unsafe { *PENDING_CURSOR_UPDATE.get_mut() };
+
+        unsafe {
+            *CURSOR_ROW.get_mut() = 0;
+            *CURSOR_COL.get_mut() = 0;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
+        assert!(!pending);
+    }
+
+    #[test]
+    fn ui_grid_cursor_goto_reacts_to_a_grid_change_alone() {
+        // Same position but a different grid IS a real move, so the
+        // grid must be part of the comparison.
+        let _lock = crate::globals::global_state_test_lock();
+        let grid = unsafe { *CURSOR_GRID_HANDLE.get_mut() };
+        unsafe {
+            *CURSOR_ROW.get_mut() = 4;
+            *CURSOR_COL.get_mut() = 9;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
+
+        unsafe { ui_grid_cursor_goto(grid + 1, 4, 9) };
+        let (pending, new_grid) =
+            unsafe { (*PENDING_CURSOR_UPDATE.get_mut(), *CURSOR_GRID_HANDLE.get_mut()) };
+
+        unsafe {
+            *CURSOR_ROW.get_mut() = 0;
+            *CURSOR_COL.get_mut() = 0;
+            *CURSOR_GRID_HANDLE.get_mut() = grid;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
+        assert!(pending);
+        assert_eq!(new_grid, grid + 1);
+    }
+
+    #[test]
+    fn ui_cursor_shape_does_nothing_before_the_screen_is_up() {
+        // Nothing to tell without a UI, so the mode index is left
+        // alone entirely.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_fs = g.full_screen;
+        g.full_screen = false;
+
+        let before = unsafe { *UI_MODE_IDX.get_mut() };
+        unsafe { *PENDING_MODE_UPDATE.get_mut() = false };
+        unsafe { ui_cursor_shape_no_check_conceal() };
+        let (after, pending) =
+            unsafe { (*UI_MODE_IDX.get_mut(), *PENDING_MODE_UPDATE.get_mut()) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.full_screen = prev_fs;
+        assert_eq!(after, before);
+        assert!(!pending);
+    }
+
+    #[test]
+    fn ui_cursor_shape_flags_an_update_only_when_the_mode_changes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_fs = g.full_screen;
+        g.full_screen = true;
+        let prev_idx = unsafe { *UI_MODE_IDX.get_mut() };
+
+        // Starting from -1 (no mode yet), the first call always
+        // reports a change.
+        unsafe {
+            *UI_MODE_IDX.get_mut() = -1;
+            *PENDING_MODE_UPDATE.get_mut() = false;
+            ui_cursor_shape_no_check_conceal();
+        }
+        let first = unsafe { *PENDING_MODE_UPDATE.get_mut() };
+
+        // A second call with the mode unchanged queues nothing.
+        unsafe {
+            *PENDING_MODE_UPDATE.get_mut() = false;
+            ui_cursor_shape_no_check_conceal();
+        }
+        let second = unsafe { *PENDING_MODE_UPDATE.get_mut() };
+
+        unsafe {
+            *UI_MODE_IDX.get_mut() = prev_idx;
+            *PENDING_MODE_UPDATE.get_mut() = false;
+            crate::globals::GLOBALS.get_mut().full_screen = prev_fs;
+        }
+        assert!(first, "the initial shape is always sent");
+        assert!(!second, "an unchanged mode queues nothing");
     }
 
     // ---- ui_mouse_has / cursor accessors ----
