@@ -21,16 +21,18 @@
 //! pattern (`vim_isprintc`/`vim_isbreak`/`vim_isidc`) rather than the
 //! general `g_chartab`-dependent mechanism.
 //!
-//! Also translated: [`cmdline_overstrike`]/[`cmdline_at_end`] - each
-//! reads a single narrow field of the original's own file-static
-//! `ccline` (`overstrike`/`cmdpos`/`cmdlen` respectively), modeled as
-//! their own standalone file-statics rather than a full `CmdlineInfo`
-//! struct, matching [`get_cmdline_firstc`]'s own already-established
-//! `CMDLINE_FIRSTC` precedent. Both always return their real, current
-//! answer for these fields' always-zero/false initial state (`true`
-//! for `cmdline_at_end`, `false` for `cmdline_overstrike`), since
-//! nothing in this crate can start real command-line editing yet -
-//! not a hardcoded shortcut.
+//! Also translated: the real `CmdlineInfo` file-static (`ccline`) and
+//! its accessor family - [`get_cmdline_info`],
+//! [`get_cmdline_last_prompt_id`], [`get_ccline_ptr`] - plus the
+//! narrow readers built on it: [`get_cmdline_firstc`],
+//! [`cmdline_overstrike`] and [`cmdline_at_end`]. Those three
+//! previously each had a standalone stand-in file-static
+//! (`CMDLINE_FIRSTC`/`CMDLINE_OVERSTRIKE`/`CMDLINE_CMDPOS`/
+//! `CMDLINE_CMDLEN`), documented as placeholders until the struct
+//! itself was translated; they now read the real thing. Their answers
+//! are unchanged, since nothing in this crate can start real
+//! command-line editing yet, so every field still reads as "no
+//! command line active".
 //!
 //! Also translated: [`cmdpreview_get_bufnr`]/[`cmdpreview_get_ns`] -
 //! trivial accessors over the original's own file-static
@@ -285,50 +287,135 @@ fn cmdline_is_active() -> bool {
 /// `CmdlineInfo` struct (not needed for this one field). Always `0`
 /// (NUL) today: a fresh, zero-initialized `ccline.cmdfirstc`, since
 /// nothing in this crate can start real command-line editing yet.
-static CMDLINE_FIRSTC: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+/// The current command-line editing state (`ccline`).
+///
+/// Replaces the several single-field statics this module previously
+/// used (`CMDLINE_FIRSTC`, `CMDLINE_OVERSTRIKE`, `CMDLINE_CMDPOS`,
+/// `CMDLINE_CMDLEN`), now that the real `CmdlineInfo` exists. Those
+/// were each documented as standing in for one `ccline` field until
+/// the struct itself was translated.
+///
+/// Zero-initialized, matching the original's own file-static: nothing
+/// in this crate can start real command-line editing yet, so every
+/// field still reads as "no command line active".
+static CCLINE: crate::globals::GlobalCell<crate::ex_getln_defs::CmdlineInfo> =
+    crate::globals::GlobalCell::new(crate::ex_getln_defs::CmdlineInfo {
+        cmdbuff: None,
+        cmdlen: 0,
+        cmdpos: 0,
+        cmdspos: 0,
+        cmdfirstc: 0,
+        cmdindent: 0,
+        cmdprompt: None,
+        hl_id: 0,
+        overstrike: 0,
+        xpc: std::ptr::null_mut(),
+        xp_context: 0,
+        xp_arg: None,
+        input_fn: 0,
+        cmdbuff_replaced: false,
+        prompt_id: 0,
+        highlight_callback: crate::eval::typval_defs::Callback::None,
+        last_colors: crate::ex_getln_defs::ColoredCmdline {
+            prompt_id: 0,
+            cmdbuff: None,
+            colors: Vec::new(),
+        },
+        level: 0,
+        prev_ccline: std::ptr::null_mut(),
+        special_char: 0,
+        special_shift: false,
+        redraw_state: crate::ex_getln_defs::CmdRedraw::None,
+        one_key: false,
+        mouse_used: std::ptr::null_mut(),
+    });
+
+/// The ID of the most recent command-line prompt (`last_prompt_id`).
+static LAST_PROMPT_ID: crate::globals::GlobalCell<u32> = crate::globals::GlobalCell::new(0);
+
+/// The current command-line info (`get_cmdline_info`).
+///
+/// # Safety
+/// Returns a pointer to the `CCLINE` file-static; the caller must not
+/// alias it.
+#[must_use]
+pub unsafe fn get_cmdline_info() -> *mut crate::ex_getln_defs::CmdlineInfo {
+    // SAFETY: forwarded from this function's own safety doc.
+    std::ptr::from_mut(unsafe { CCLINE.get_mut() })
+}
+
+/// The ID of the last command-line prompt
+/// (`get_cmdline_last_prompt_id`).
+///
+/// # Safety
+/// Reads the `LAST_PROMPT_ID` file-static.
+#[must_use]
+pub unsafe fn get_cmdline_last_prompt_id() -> u32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *LAST_PROMPT_ID.get_mut() }
+}
+
+/// The command-line info to actually use (`get_ccline_ptr`).
+///
+/// `save_cmdline` may clear `ccline` and move the previous value into
+/// `ccline.prev_ccline`, so the live state is not always `ccline`
+/// itself. Null when no command line is active at all.
+///
+/// # Safety
+/// Reads `GLOBALS` and the `CCLINE` file-static, and follows
+/// `prev_ccline`, which must be null or point at a live
+/// `CmdlineInfo`.
+#[must_use]
+pub unsafe fn get_ccline_ptr() -> *mut crate::ex_getln_defs::CmdlineInfo {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State;
+    if state as u32 & crate::state_defs::mode::CMDLINE == 0 {
+        return std::ptr::null_mut();
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    if ccline.cmdbuff.is_some() {
+        return std::ptr::from_mut(ccline);
+    }
+
+    let prev = ccline.prev_ccline;
+    // SAFETY: forwarded from this function's own safety doc.
+    if !prev.is_null() && unsafe { (*prev).cmdbuff.is_some() } {
+        return prev;
+    }
+    std::ptr::null_mut()
+}
 
 /// `get_cmdline_firstc()` - the leading character of the current
 /// command line, or `0` (NUL) when none is active (`ex_getln.c`).
-/// Always `0` today - see `CMDLINE_FIRSTC`'s own doc comment.
+///
+/// Still `0` today, since nothing in this crate can start real
+/// command-line editing - but now read from the real `ccline` rather
+/// than a stand-in static.
+#[must_use]
 pub fn get_cmdline_firstc() -> i32 {
-    // SAFETY: a plain `i32` copy-out read, no aliasing hazard.
-    unsafe { *CMDLINE_FIRSTC.get_mut() }
+    // SAFETY: a plain `i32` copy-out read of the file-static.
+    unsafe { CCLINE.get_mut() }.cmdfirstc
 }
-
-/// `ccline.overstrike` - whether the command line is in Insert
-/// (`false`) or Replace (`true`) submode, read via
-/// [`cmdline_overstrike`]. Modeled as its own file-static, matching
-/// [`CMDLINE_FIRSTC`]'s own established precedent for a single
-/// `ccline` field. Always `false` today, since nothing in this crate
-/// can start real command-line editing yet.
-static CMDLINE_OVERSTRIKE: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
 
 /// Return `true` if the command line is in Replace mode
-/// (`cmdline_overstrike`). Always `false` today - see
-/// `CMDLINE_OVERSTRIKE`'s own doc comment.
+/// (`cmdline_overstrike`).
 #[must_use]
 pub fn cmdline_overstrike() -> bool {
-    // SAFETY: a plain `bool` copy-out read, no aliasing hazard.
-    unsafe { *CMDLINE_OVERSTRIKE.get_mut() }
+    // SAFETY: a plain copy-out read of the file-static.
+    unsafe { CCLINE.get_mut() }.overstrike != 0
 }
-
-/// `ccline.cmdpos`/`ccline.cmdlen` - the cursor's byte position in,
-/// and the total byte length of, the command line, read via
-/// [`cmdline_at_end`]. Modeled as their own file-statics, matching
-/// [`CMDLINE_FIRSTC`]'s own established precedent. Both always `0`
-/// today, since nothing in this crate can start real command-line
-/// editing yet.
-static CMDLINE_CMDPOS: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
-static CMDLINE_CMDLEN: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
 /// Return `true` if the cursor is at the end of the command line
-/// (`cmdline_at_end`). Always `true` today (`0 >= 0`) - see
-/// `CMDLINE_CMDPOS`'s own doc comment.
+/// (`cmdline_at_end`).
 #[must_use]
 pub fn cmdline_at_end() -> bool {
-    // SAFETY: plain `i32` copy-out reads, no aliasing hazard.
-    unsafe { *CMDLINE_CMDPOS.get_mut() >= *CMDLINE_CMDLEN.get_mut() }
+    // SAFETY: plain `i32` copy-out reads of the file-static.
+    let ccline = unsafe { CCLINE.get_mut() };
+    ccline.cmdpos >= ccline.cmdlen
 }
+
 
 /// `getcmdcomplpat()` - the current command-line completion pattern
 /// (`f_getcmdcomplpat`, `ex_getln.c`) - always empty today, since
@@ -864,9 +951,101 @@ mod tests {
     #[test]
     fn cmdline_at_end_is_true_by_default() {
         let _guard = crate::globals::global_state_test_lock();
-        // Both CMDLINE_CMDPOS and CMDLINE_CMDLEN default to 0, and
-        // 0 >= 0 is true.
+        // ccline's cmdpos and cmdlen both start at 0, and 0 >= 0.
         assert!(cmdline_at_end());
+    }
+
+    // --- ccline accessor family ---
+
+    #[test]
+    fn get_cmdline_info_reports_the_real_ccline_static() {
+        let _guard = crate::globals::global_state_test_lock();
+        let a = unsafe { get_cmdline_info() };
+        let b = unsafe { get_cmdline_info() };
+        assert!(!a.is_null());
+        assert_eq!(a, b, "the same file-static every time");
+    }
+
+    #[test]
+    fn get_cmdline_last_prompt_id_starts_at_zero() {
+        let _guard = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_cmdline_last_prompt_id() }, 0);
+    }
+
+    #[test]
+    fn get_ccline_ptr_is_null_outside_cmdline_mode() {
+        // Not in command-line mode at all: nothing to report, whatever
+        // ccline happens to hold.
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = 0;
+
+        let p = unsafe { get_ccline_ptr() };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn get_ccline_ptr_is_null_in_cmdline_mode_with_no_buffer() {
+        // In command-line mode, but neither ccline nor a saved
+        // previous one holds a real buffer.
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let p = unsafe { get_ccline_ptr() };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn get_ccline_ptr_reports_ccline_when_it_holds_a_buffer() {
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe { (*ccline).cmdbuff = Some(b":echo".to_vec()) };
+
+        let p = unsafe { get_ccline_ptr() };
+
+        unsafe { (*ccline).cmdbuff = None };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        assert_eq!(p, ccline);
+    }
+
+    #[test]
+    fn get_ccline_ptr_falls_back_to_the_saved_previous_state() {
+        // save_cmdline() clears ccline and moves the live state into
+        // prev_ccline, so the fallback is what keeps the accessors
+        // working across a recursive command line.
+        let _guard = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let mut saved = Box::new(crate::ex_getln_defs::CmdlineInfo {
+            cmdbuff: Some(b":saved".to_vec()),
+            ..Default::default()
+        });
+        let saved_ptr = std::ptr::addr_of_mut!(*saved);
+
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe {
+            (*ccline).cmdbuff = None;
+            (*ccline).prev_ccline = saved_ptr;
+        }
+
+        let p = unsafe { get_ccline_ptr() };
+
+        unsafe { (*ccline).prev_ccline = std::ptr::null_mut() };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+        assert_eq!(p, saved_ptr);
     }
 
     #[test]
