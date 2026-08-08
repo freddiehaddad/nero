@@ -417,6 +417,82 @@ pub fn cmdline_at_end() -> bool {
 }
 
 
+/// Allocate a new command-line buffer (`alloc_cmdbuff`).
+///
+/// Extra space is reserved beyond the requested length so that typing
+/// does not reallocate on every character - the original's own
+/// rationale, kept because it is a real allocation strategy rather
+/// than an artefact. It becomes the `Vec`'s capacity here, since this
+/// crate has no separate `cmdbufflen` field (see `CmdlineInfo`'s own
+/// doc comment).
+///
+/// # Safety
+/// Mutates the `CCLINE` file-static.
+pub unsafe fn alloc_cmdbuff(len: i32) {
+    // Give some extra space to avoid having to allocate all the time.
+    let len = if len < 80 { 100 } else { len + 20 };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { CCLINE.get_mut() }.cmdbuff = Some(Vec::with_capacity(len.max(0) as usize));
+}
+
+/// Deallocate the command-line buffer (`dealloc_cmdbuff`).
+///
+/// # Safety
+/// Mutates the `CCLINE` file-static.
+pub unsafe fn dealloc_cmdbuff() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    ccline.cmdbuff = None;
+    ccline.cmdlen = 0;
+}
+
+/// Save the current command-line state into `ccp` and start a fresh
+/// one (`save_cmdline`).
+///
+/// The saved state is linked as the new state's `prev_ccline`, so
+/// [`get_ccline_ptr`] can still find the live command line. The new
+/// state's `cmdbuff` is left unset, which is precisely the signal
+/// that `ccline` is not itself in use.
+///
+/// # Safety
+/// `ccp` must point at a live [`crate::ex_getln_defs::CmdlineInfo`]
+/// that outlives the save/restore pair, and mutates the `CCLINE`
+/// file-static.
+pub unsafe fn save_cmdline(ccp: *mut crate::ex_getln_defs::CmdlineInfo) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let ccline = unsafe { CCLINE.get_mut() };
+    // Moving out and leaving the default behind is exactly the
+    // original's "copy out, then CLEAR_FIELD" pair, without the
+    // window in which both hold the same owned pointers.
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *ccp = std::mem::take(ccline) };
+    ccline.prev_ccline = ccp;
+    // Signal that ccline is not in use.
+    ccline.cmdbuff = None;
+}
+
+/// Restore the command-line state saved by [`save_cmdline`]
+/// (`restore_cmdline`).
+///
+/// # Safety
+/// `ccp` must point at a live `CmdlineInfo` previously filled by
+/// [`save_cmdline`], and mutates the `CCLINE` file-static.
+pub unsafe fn restore_cmdline(ccp: *mut crate::ex_getln_defs::CmdlineInfo) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let restored = unsafe { std::mem::take(&mut *ccp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { CCLINE.get_mut() } = restored;
+}
+
+/// Reset the command-line state entirely (`cmdline_init`).
+///
+/// # Safety
+/// Mutates the `CCLINE` file-static.
+pub unsafe fn cmdline_init() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { CCLINE.get_mut() } = crate::ex_getln_defs::CmdlineInfo::default();
+}
+
 /// The screen width of the command-line character at byte offset
 /// `idx` (`cmdline_charsize`).
 ///
@@ -1072,6 +1148,115 @@ mod tests {
 
         // SAFETY: forwarded from the lock reasoning above.
         unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    // --- cmdline buffer lifecycle and save/restore ---
+
+    #[test]
+    fn alloc_cmdbuff_reserves_extra_space() {
+        let _guard = crate::globals::global_state_test_lock();
+
+        unsafe { alloc_cmdbuff(10) };
+        let small = unsafe { CCLINE.get_mut() }.cmdbuff.as_ref().unwrap().capacity();
+        unsafe { alloc_cmdbuff(200) };
+        let large = unsafe { CCLINE.get_mut() }.cmdbuff.as_ref().unwrap().capacity();
+        unsafe { cmdline_init() };
+
+        // Short requests round up to a floor; long ones get a margin.
+        assert!(small >= 100, "small={small}");
+        assert!(large >= 220, "large={large}");
+    }
+
+    #[test]
+    fn dealloc_cmdbuff_clears_the_buffer_and_length() {
+        let _guard = crate::globals::global_state_test_lock();
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe {
+            (*ccline).cmdbuff = Some(b"echo".to_vec());
+            (*ccline).cmdlen = 4;
+        }
+
+        unsafe { dealloc_cmdbuff() };
+
+        let (buff, len) = unsafe { ((*ccline).cmdbuff.clone(), (*ccline).cmdlen) };
+        unsafe { cmdline_init() };
+        assert_eq!(buff, None);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn cmdline_init_resets_everything() {
+        let _guard = crate::globals::global_state_test_lock();
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe {
+            (*ccline).cmdbuff = Some(b"echo".to_vec());
+            (*ccline).cmdlen = 4;
+            (*ccline).cmdfirstc = i32::from(b':');
+            (*ccline).level = 3;
+        }
+
+        unsafe { cmdline_init() };
+
+        let cc = unsafe { &*ccline };
+        assert_eq!(cc.cmdbuff, None);
+        assert_eq!(cc.cmdlen, 0);
+        assert_eq!(cc.cmdfirstc, 0);
+        assert_eq!(cc.level, 0);
+    }
+
+    #[test]
+    fn save_cmdline_moves_the_state_out_and_links_it_back() {
+        let _guard = crate::globals::global_state_test_lock();
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe {
+            (*ccline).cmdbuff = Some(b":first".to_vec());
+            (*ccline).cmdlen = 6;
+            (*ccline).cmdfirstc = i32::from(b':');
+        }
+
+        let mut saved = Box::new(crate::ex_getln_defs::CmdlineInfo::default());
+        let saved_ptr = std::ptr::addr_of_mut!(*saved);
+        unsafe { save_cmdline(saved_ptr) };
+
+        // The old state moved into the save slot...
+        assert_eq!(saved.cmdbuff.as_deref(), Some(&b":first"[..]));
+        assert_eq!(saved.cmdlen, 6);
+        // ...and ccline is fresh, with cmdbuff unset as the "not in
+        // use" signal, but linked back to what was saved.
+        let cc = unsafe { &*ccline };
+        assert_eq!(cc.cmdbuff, None);
+        assert_eq!(cc.cmdlen, 0);
+        assert_eq!(cc.prev_ccline, saved_ptr);
+
+        unsafe { cmdline_init() };
+    }
+
+    #[test]
+    fn save_and_restore_cmdline_round_trip() {
+        // This pair is what makes a recursive command line (CTRL-R =)
+        // work, so the round trip is the behaviour that matters.
+        let _guard = crate::globals::global_state_test_lock();
+        let ccline = unsafe { get_cmdline_info() };
+        unsafe {
+            (*ccline).cmdbuff = Some(b":outer".to_vec());
+            (*ccline).cmdlen = 6;
+            (*ccline).cmdfirstc = i32::from(b':');
+        }
+
+        let mut saved = Box::new(crate::ex_getln_defs::CmdlineInfo::default());
+        let saved_ptr = std::ptr::addr_of_mut!(*saved);
+
+        unsafe { save_cmdline(saved_ptr) };
+        // Something else uses the command line in between.
+        unsafe { (*ccline).cmdbuff = Some(b"=inner".to_vec()) };
+        unsafe { restore_cmdline(saved_ptr) };
+
+        let cc = unsafe { &*ccline };
+        assert_eq!(cc.cmdbuff.as_deref(), Some(&b":outer"[..]));
+        assert_eq!(cc.cmdlen, 6);
+        assert_eq!(cc.cmdfirstc, i32::from(b':'));
+
+        unsafe { cmdline_init() };
     }
 
     // --- cmdline column helpers ---
