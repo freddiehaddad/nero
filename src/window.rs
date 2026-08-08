@@ -1569,6 +1569,65 @@ pub unsafe fn rows_avail() -> i32 {
     rows - p_ch - tabline - global_stl
 }
 
+/// Reset a window to the "empty buffer" starting state
+/// (`win_init_empty`).
+///
+/// Called when a window is given a fresh buffer: every cached view
+/// position goes back to the top, and `w_valid` is cleared so nothing
+/// stale is trusted.
+///
+/// Note `w_pcmark` is set to line 1 rather than cleared - the
+/// original's own comment says so explicitly - while `w_prev_pcmark`
+/// IS cleared to line 0. The asymmetry is deliberate.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` whose own
+/// `w_buffer` is likewise valid and non-null, for the whole call.
+/// Forwarded from [`crate::drawscreen::redraw_later`]'s own safety doc.
+pub unsafe fn win_init_empty(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_NOT_VALID) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*wp).w_lines_valid = 0;
+        (*wp).w_cursor.lnum = 1;
+        (*wp).w_cursor.col = 0;
+        (*wp).w_curswant = 0;
+        (*wp).w_cursor.coladd = 0;
+        // pcmark not cleared but set to line 1.
+        (*wp).w_pcmark.lnum = 1;
+        (*wp).w_pcmark.col = 0;
+        (*wp).w_prev_pcmark.lnum = 0;
+        (*wp).w_prev_pcmark.col = 0;
+        (*wp).w_topline = 1;
+        (*wp).w_topfill = 0;
+        (*wp).w_botline = 2;
+        (*wp).w_valid = 0;
+        (*wp).w_s = &raw mut (*(*wp).w_buffer).b_s;
+    }
+}
+
+/// Give `wp` a fresh leaf frame of its own (`new_frame`).
+///
+/// The frame is heap-allocated and ownership handed to `wp.w_frame`,
+/// matching the original's `xcalloc`; the window's own teardown frees
+/// it again.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT` for the
+/// whole call. Any frame already in `wp.w_frame` is overwritten
+/// without being freed - the original does the same, relying on this
+/// only ever being called for a window that has none yet.
+pub unsafe fn new_frame(wp: *mut WinT) {
+    let frp = Box::into_raw(Box::new(crate::buffer_defs::FrameT {
+        fr_layout: crate::buffer_defs::FR_LEAF,
+        fr_win: wp,
+        ..Default::default()
+    }));
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_frame = frp };
+}
+
 /// Size the first window and the top frame to fill the screen
 /// (`win_init_size`), used when the layout is a single window.
 ///
@@ -5262,6 +5321,82 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn win_init_empty_resets_the_view_to_the_top() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_lines_valid: 9,
+            w_curswant: 5,
+            w_topline: 40,
+            w_topfill: 3,
+            w_botline: 99,
+            w_valid: 0xff,
+            w_buffer: &mut buf,
+            ..Default::default()
+        };
+        win.w_cursor.lnum = 40;
+        win.w_cursor.col = 7;
+        win.w_cursor.coladd = 2;
+        win.w_pcmark.lnum = 40;
+        win.w_pcmark.col = 7;
+        win.w_prev_pcmark.lnum = 30;
+        win.w_prev_pcmark.col = 3;
+
+        unsafe { win_init_empty(&mut win) };
+
+        assert_eq!(win.w_lines_valid, 0);
+        assert_eq!(win.w_cursor.lnum, 1);
+        assert_eq!(win.w_cursor.col, 0);
+        assert_eq!(win.w_cursor.coladd, 0);
+        assert_eq!(win.w_curswant, 0);
+        assert_eq!(win.w_topline, 1);
+        assert_eq!(win.w_topfill, 0);
+        assert_eq!(win.w_botline, 2);
+        assert_eq!(win.w_valid, 0);
+        // w_s points at the buffer's own syntax block.
+        assert!(std::ptr::eq(win.w_s, &raw mut buf.b_s));
+    }
+
+    #[test]
+    fn win_init_empty_sets_pcmark_to_line_one_but_clears_prev_pcmark() {
+        // The asymmetry is deliberate and called out in the original's
+        // own comment: pcmark is SET to line 1, not cleared, while
+        // prev_pcmark really does go to line 0.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT { w_buffer: &mut buf, ..Default::default() };
+        win.w_pcmark.lnum = 40;
+        win.w_pcmark.col = 7;
+        win.w_prev_pcmark.lnum = 30;
+        win.w_prev_pcmark.col = 3;
+
+        unsafe { win_init_empty(&mut win) };
+
+        assert_eq!(win.w_pcmark.lnum, 1);
+        assert_eq!(win.w_pcmark.col, 0);
+        assert_eq!(win.w_prev_pcmark.lnum, 0);
+        assert_eq!(win.w_prev_pcmark.col, 0);
+    }
+
+    #[test]
+    fn new_frame_gives_the_window_a_leaf_frame_pointing_back_at_it() {
+        let mut win = crate::buffer_defs::WinT::default();
+        let wp = &raw mut win;
+        unsafe { new_frame(wp) };
+
+        assert!(!win.w_frame.is_null());
+        // SAFETY: new_frame just allocated this frame.
+        let frp = unsafe { &*win.w_frame };
+        assert_eq!(frp.fr_layout, crate::buffer_defs::FR_LEAF);
+        assert!(std::ptr::eq(frp.fr_win, wp));
+
+        // Reclaim what new_frame allocated - the real caller's window
+        // teardown does this.
+        // SAFETY: the frame came from Box::into_raw in new_frame.
+        drop(unsafe { Box::from_raw(win.w_frame) });
     }
 
     #[test]
