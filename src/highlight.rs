@@ -26,6 +26,60 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Global highlight namespace (`ns_hl_global`).
+pub static NS_HL_GLOBAL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+/// Highlight namespace for the current window (`ns_hl_win`).
+pub static NS_HL_WIN: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+/// Highlight namespace specified in a fast callback (`ns_hl_fast`).
+///
+/// Negative means no fast-callback namespace is in effect, which is
+/// what lets per-window highlight overrides apply.
+pub static NS_HL_FAST: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+
+/// The currently active UI highlight attribute for each `HlfT`
+/// (`hl_attr_active`).
+pub static HL_ATTR_ACTIVE: crate::globals::GlobalCell<
+    [i32; crate::highlight_defs::HlfT::Count as usize],
+> = crate::globals::GlobalCell::new([0; crate::highlight_defs::HlfT::Count as usize]);
+
+/// The background highlight attribute for window `wp`
+/// (`win_bg_attr`).
+///
+/// A window-local override wins, but only when no fast-callback
+/// highlight namespace is in effect. Otherwise the global `Normal`
+/// attribute applies, except that a non-current window uses
+/// `NormalNC` when one is defined.
+///
+/// # Safety
+/// `wp` must point at a live `WinT`, and reads `GLOBALS` plus the
+/// `NS_HL_FAST`/`HL_ATTR_ACTIVE` file-statics.
+#[must_use]
+pub unsafe fn win_bg_attr(wp: *const crate::buffer_defs::WinT) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    let is_curwin = std::ptr::eq(wp, curwin);
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *NS_HL_FAST.get_mut() } < 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let local = unsafe {
+            if is_curwin { (*wp).w_hl_attr_normal } else { (*wp).w_hl_attr_normalnc }
+        };
+        if local != 0 {
+            return local;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let active = unsafe { HL_ATTR_ACTIVE.get_mut() };
+    let inactive = active[crate::highlight_defs::HlfT::Inactive as usize];
+    if is_curwin || inactive == 0 {
+        active[crate::highlight_defs::HlfT::None as usize]
+    } else {
+        inactive
+    }
+}
+
 /// Cterm color of the `Normal` highlight group's foreground
 /// (`cterm_normal_fg_color`).
 pub static CTERM_NORMAL_FG_COLOR: crate::globals::GlobalCell<i32> =
@@ -247,6 +301,90 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- win_bg_attr ----
+
+    /// Boxed: the window pointer is compared against GLOBALS.curwin.
+    fn bg_attr_win(normal: i32, normalnc: i32) -> Box<crate::buffer_defs::WinT> {
+        Box::new(crate::buffer_defs::WinT {
+            w_hl_attr_normal: normal,
+            w_hl_attr_normalnc: normalnc,
+            ..Default::default()
+        })
+    }
+
+    fn with_bg_attr_state<T>(
+        curwin: *mut crate::buffer_defs::WinT,
+        ns_fast: i32,
+        none_attr: i32,
+        inactive_attr: i32,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_win = g.curwin;
+        g.curwin = curwin;
+
+        let prev_fast = unsafe { *NS_HL_FAST.get_mut() };
+        unsafe { *NS_HL_FAST.get_mut() = ns_fast };
+
+        let prev_active = unsafe { *HL_ATTR_ACTIVE.get_mut() };
+        unsafe {
+            let a = HL_ATTR_ACTIVE.get_mut();
+            a[crate::highlight_defs::HlfT::None as usize] = none_attr;
+            a[crate::highlight_defs::HlfT::Inactive as usize] = inactive_attr;
+        }
+
+        let r = f();
+
+        unsafe {
+            *HL_ATTR_ACTIVE.get_mut() = prev_active;
+            *NS_HL_FAST.get_mut() = prev_fast;
+            crate::globals::GLOBALS.get_mut().curwin = prev_win;
+        }
+        r
+    }
+
+    #[test]
+    fn win_bg_attr_prefers_a_window_local_override() {
+        let mut win = bg_attr_win(42, 43);
+        let wp = std::ptr::addr_of_mut!(*win);
+        // Current window: uses w_hl_attr_normal.
+        let got = with_bg_attr_state(wp, -1, 7, 8, || unsafe { win_bg_attr(wp) });
+        assert_eq!(got, 42);
+
+        // Not the current window: uses w_hl_attr_normalnc instead.
+        let got = with_bg_attr_state(std::ptr::null_mut(), -1, 7, 8, || unsafe { win_bg_attr(wp) });
+        assert_eq!(got, 43);
+    }
+
+    #[test]
+    fn win_bg_attr_ignores_the_local_override_during_a_fast_callback() {
+        // A non-negative ns_hl_fast means a fast-callback namespace is
+        // in effect, which suppresses per-window overrides entirely.
+        let mut win = bg_attr_win(42, 43);
+        let wp = std::ptr::addr_of_mut!(*win);
+
+        let got = with_bg_attr_state(wp, 1, 7, 8, || unsafe { win_bg_attr(wp) });
+        assert_eq!(got, 7, "falls through to the global Normal attribute");
+    }
+
+    #[test]
+    fn win_bg_attr_uses_normalnc_for_a_non_current_window() {
+        // With no window-local override, a non-current window picks up
+        // the Inactive attribute - but only when one is defined.
+        let mut win = bg_attr_win(0, 0);
+        let wp = std::ptr::addr_of_mut!(*win);
+
+        let with_inactive =
+            with_bg_attr_state(std::ptr::null_mut(), -1, 7, 8, || unsafe { win_bg_attr(wp) });
+        assert_eq!(with_inactive, 8);
+
+        // Undefined Inactive falls back to the normal attribute.
+        let without_inactive =
+            with_bg_attr_state(std::ptr::null_mut(), -1, 7, 0, || unsafe { win_bg_attr(wp) });
+        assert_eq!(without_inactive, 7);
+    }
 
     // ---- hl_set_default_colors / get_colors_force ----
 
