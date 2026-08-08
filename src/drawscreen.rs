@@ -204,6 +204,108 @@ pub unsafe fn vsep_connected(wp: *mut crate::buffer_defs::WinT, corner: WindowCo
     }
 }
 
+/// Mark every status line and window bar for redraw
+/// (`status_redraw_all`).
+///
+/// A window is marked when it has a status line of its own, OR is the
+/// current window, OR has a window bar. With a GLOBAL statusline no
+/// window owns one, which is why the current window is included
+/// unconditionally.
+///
+/// As elsewhere in this crate, `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is
+/// walked as `GLOBALS.firstwin`/`w_next`.
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid, live
+/// `WinT` pointers. Forwarded from
+/// [`crate::window::global_stl_height`]/[`redraw_later`]'s own safety
+/// docs.
+pub unsafe fn status_redraw_all() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_stl_global = unsafe { crate::window::global_stl_height() } != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (mut wp, curwin) = (g.firstwin, g.curwin);
+
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            if (!is_stl_global && (*wp).w_status_height != 0)
+                || wp == curwin
+                || (*wp).w_winbar_height != 0
+            {
+                (*wp).w_redr_status = true;
+                redraw_later(wp, UPD_VALID);
+            }
+            wp = (*wp).w_next;
+        }
+    }
+}
+
+/// Mark every status line and window bar showing `buf` for redraw
+/// (`status_redraw_buf`).
+///
+/// Note the condition differs from [`status_redraw_all`]'s in a way
+/// that is easy to miss: here the current window only qualifies when
+/// the statusline IS global. A non-global setup relies on the window
+/// owning a status line of its own instead.
+///
+/// Finally, when `'ruler'` is on and the current window has no status
+/// line of its own and was not already marked, the command line's
+/// ruler is scheduled instead - otherwise a buffer change would leave
+/// a stale ruler on screen.
+///
+/// # Safety
+/// Same as [`status_redraw_all`]; also requires `GLOBALS.curwin` to be
+/// valid and non-null.
+pub unsafe fn status_redraw_buf(buf: *const BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let is_stl_global = unsafe { crate::window::global_stl_height() } != 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (mut wp, curwin) = (g.firstwin, g.curwin);
+
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            if std::ptr::eq((*wp).w_buffer, buf)
+                && ((!is_stl_global && (*wp).w_status_height != 0)
+                    || (is_stl_global && wp == curwin)
+                    || (*wp).w_winbar_height != 0)
+            {
+                (*wp).w_redr_status = true;
+                redraw_later(wp, UPD_VALID);
+            }
+            wp = (*wp).w_next;
+        }
+    }
+
+    // Redraw the ruler if it is in the command line and was not marked
+    // for redraw above.
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_ru = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if p_ru != 0 && (*curwin).w_status_height == 0 && !(*curwin).w_redr_status {
+            crate::globals::GLOBALS.get_mut().redraw_cmdline = true;
+            redraw_later(curwin, UPD_VALID);
+        }
+    }
+}
+
+/// Mark every status line and window bar of the current buffer for
+/// redraw (`status_redraw_curbuf`).
+///
+/// # Safety
+/// Same as [`status_redraw_buf`]; also requires `GLOBALS.curbuf` to be
+/// valid and non-null.
+pub unsafe fn status_redraw_curbuf() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { status_redraw_buf(curbuf) };
+}
+
 /// While computing a statusline and the like we do not want any
 /// `w_redr_type` or `must_redraw` to be set (`redraw_not_allowed`).
 pub static REDRAW_NOT_ALLOWED: GlobalCell<bool> = GlobalCell::new(false);
@@ -594,6 +696,131 @@ pub unsafe fn comp_col() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_redraw_all_marks_status_winbar_and_curwin() {
+        // A window qualifies when it has a status line of its own, OR
+        // is the current window, OR has a window bar.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first, prev_cur) = (g.firstwin, g.curwin);
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        // p_ls != 3 means no GLOBAL statusline, so each window's own
+        // w_status_height is what counts.
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 2;
+
+        let mut plain = crate::buffer_defs::WinT::default();
+        let mut winbar = crate::buffer_defs::WinT {
+            w_winbar_height: 1,
+            w_next: &mut plain,
+            ..Default::default()
+        };
+        let mut with_status = crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_next: &mut winbar,
+            ..Default::default()
+        };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = &mut with_status;
+        g.curwin = std::ptr::null_mut();
+
+        unsafe { status_redraw_all() };
+
+        assert!(with_status.w_redr_status, "own status line qualifies");
+        assert!(winbar.w_redr_status, "window bar qualifies");
+        assert!(!plain.w_redr_status, "a plain non-current window does not");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = prev_first;
+        g.curwin = prev_cur;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    #[test]
+    fn status_redraw_buf_only_marks_windows_showing_that_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first, prev_cur) = (g.firstwin, g.curwin);
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 2;
+        let prev_ru = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru;
+
+        let mut target = crate::buffer_defs::BufT::default();
+        let mut other = crate::buffer_defs::BufT::default();
+
+        let mut wrong_buf = crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_buffer: &mut other,
+            ..Default::default()
+        };
+        let mut right_buf = crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_buffer: &mut target,
+            w_next: &mut wrong_buf,
+            ..Default::default()
+        };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = &mut right_buf;
+        g.curwin = &mut right_buf;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 0;
+
+        unsafe { status_redraw_buf(&target) };
+
+        assert!(right_buf.w_redr_status);
+        assert!(!wrong_buf.w_redr_status, "a window on another buffer is left alone");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = prev_first;
+        g.curwin = prev_cur;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = prev_ru;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
+
+    #[test]
+    fn status_redraw_buf_schedules_the_cmdline_ruler_when_needed() {
+        // With 'ruler' on and no status line of its own, the current
+        // window's ruler lives in the command line - so that has to be
+        // scheduled instead, or it would go stale.
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_first, prev_cur, prev_rc) = (g.firstwin, g.curwin, g.redraw_cmdline);
+        let prev_ls = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = 2;
+        let prev_ru = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru;
+
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_status_height: 0,
+            w_buffer: &mut buf,
+            ..Default::default()
+        };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = &mut win;
+        g.curwin = &mut win;
+        g.redraw_cmdline = false;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 1;
+
+        unsafe { status_redraw_buf(&buf) };
+        assert!(unsafe { crate::globals::GLOBALS.get_mut() }.redraw_cmdline);
+
+        // With 'ruler' off it must NOT be scheduled.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.redraw_cmdline = false;
+        win.w_redr_status = false;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = 0;
+        unsafe { status_redraw_buf(&buf) };
+        assert!(!unsafe { crate::globals::GLOBALS.get_mut() }.redraw_cmdline);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstwin = prev_first;
+        g.curwin = prev_cur;
+        g.redraw_cmdline = prev_rc;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ru = prev_ru;
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ls = prev_ls;
+    }
 
     #[test]
     fn w_endrow_and_w_endcol_are_just_past_the_window() {
