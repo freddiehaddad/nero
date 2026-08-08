@@ -4353,6 +4353,33 @@ pub unsafe fn tv_list_append_tv(l: *mut crate::eval::typval_defs::ListT, tv: &Ty
     unsafe { tv_list_append(l, li) };
 }
 
+/// Append an owned string to a list (`tv_list_append_allocated_string`).
+///
+/// The string is MOVED into the list, not copied - the list takes
+/// ownership, matching the original's own contract (its caller hands
+/// over an already-allocated buffer and must not free it afterwards).
+///
+/// `None` appends a null string, which the original represents as a
+/// `NULL v_string`.
+///
+/// # Safety
+/// `l` must be a valid, non-null pointer to a live `ListT`.
+pub unsafe fn tv_list_append_allocated_string(
+    l: *mut crate::eval::typval_defs::ListT,
+    str_: Option<Vec<u8>>,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        tv_list_append_owned_tv(
+            l,
+            TypvalT {
+                value: TypvalValue::String(str_),
+                v_lock: VarLockStatus::Unlocked,
+            },
+        );
+    }
+}
+
 /// Like [`tv_list_append_tv`], but `tv` is moved into the list rather
 /// than copied - it is no longer valid to use `tv` after this
 /// function returns. Returns a pointer to the newly-owned value
@@ -6793,6 +6820,37 @@ mod tests {
             assert!((*item3).li_next.is_null());
             assert_eq!((*l).lv_last, item3);
 
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_allocated_string_moves_the_string_in() {
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_allocated_string(l, Some(b"moved".to_vec()));
+            assert_eq!((*l).lv_len, 1);
+            let item = tv_list_find(l, 0);
+            assert!(!item.is_null());
+            assert!(
+                matches!(&(*item).li_tv.value, TypvalValue::String(Some(s)) if s == b"moved")
+            );
+            tv_list_free(l);
+        }
+    }
+
+    #[test]
+    fn tv_list_append_allocated_string_appends_a_null_string() {
+        // The original represents "no string" as a NULL v_string; this
+        // crate spells that None, and it must still append an ITEM.
+        let _lock = crate::globals::global_state_test_lock();
+        let l = tv_list_alloc(1);
+        unsafe {
+            tv_list_append_allocated_string(l, None);
+            assert_eq!((*l).lv_len, 1);
+            let item = tv_list_find(l, 0);
+            assert!(matches!(&(*item).li_tv.value, TypvalValue::String(None)));
             tv_list_free(l);
         }
     }
