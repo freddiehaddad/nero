@@ -1847,6 +1847,42 @@ pub unsafe fn get_snapshot_curwin_rec(ft: *mut crate::buffer_defs::FrameT) -> *m
     }
 }
 
+/// Recompute `wp`'s `'scroll'` from its current height
+/// (`win_comp_scroll`).
+///
+/// When the value actually changes, the option's script context is
+/// marked as coming from the window layout rather than from a user
+/// `:set` - which is what `:verbose set scroll` reports.
+///
+/// # Safety
+/// `wp` must point at a live [`WinT`], and
+/// [`win_default_scroll`]'s own safety doc applies.
+pub unsafe fn win_comp_scroll(wp: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let old_w_p_scr = unsafe { (*wp).w_onebuf_opt.wo_scr };
+    // SAFETY: forwarded from this function's own safety doc.
+    let new_scr = unsafe { win_default_scroll(wp) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_onebuf_opt.wo_scr = new_scr };
+
+    if new_scr == old_w_p_scr {
+        return;
+    }
+
+    // Used by "verbose set scroll".
+    let idx = crate::option_defs::WinOptIndex::Scroll as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let ctxs = unsafe { &mut (*wp).w_onebuf_opt.wo_script_ctx };
+    // The original indexes a fixed `[kWinOptCount]` array; this crate
+    // stands a growable `Vec` in for it (see `WinOptsT`'s own doc
+    // comment), so the slot is made to exist before it is written.
+    if ctxs.len() <= idx {
+        ctxs.resize_with(idx + 1, crate::eval::typval_defs::SctxT::default);
+    }
+    ctxs[idx].sc_sid = crate::globals::SID_WINLAYOUT;
+    ctxs[idx].sc_lnum = 0;
+}
+
 /// Remove `wp`'s status line (`win_remove_status_line`).
 ///
 /// The freed height goes back to the window itself, unless a
@@ -6161,6 +6197,79 @@ mod tests {
             g.lastwin = self.prev_lastwin;
             g.curwin = self.prev_curwin;
         }
+    }
+
+    #[test]
+    fn win_comp_scroll_sets_scroll_to_half_the_window_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_height: 10,
+            w_view_height: 10,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        unsafe { win_comp_scroll(win_ptr) };
+
+        let expected = unsafe { win_default_scroll(win_ptr) };
+        assert_eq!(win.w_onebuf_opt.wo_scr, expected);
+    }
+
+    #[test]
+    fn win_comp_scroll_marks_the_script_context_as_window_layout() {
+        // A changed value is attributed to the layout, not a user
+        // :set - which is what ":verbose set scroll" reports.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_height: 10,
+            w_view_height: 10,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        // Start from a value the recomputation will not agree with.
+        win.w_onebuf_opt.wo_scr = 999;
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        unsafe { win_comp_scroll(win_ptr) };
+
+        let idx = crate::option_defs::WinOptIndex::Scroll as usize;
+        let ctx = &win.w_onebuf_opt.wo_script_ctx[idx];
+        assert_eq!(ctx.sc_sid, crate::globals::SID_WINLAYOUT);
+        assert_eq!(ctx.sc_lnum, 0);
+    }
+
+    #[test]
+    fn win_comp_scroll_leaves_the_script_context_alone_when_nothing_changes() {
+        // Recomputing to the value already in effect must NOT
+        // re-attribute the option, or a mere layout pass would
+        // overwrite a genuine user :set.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_height: 10,
+            w_view_height: 10,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+
+        // Pre-set 'scroll' to exactly what the recomputation yields.
+        let settled = unsafe { win_default_scroll(win_ptr) };
+        win.w_onebuf_opt.wo_scr = settled;
+        win.w_onebuf_opt.wo_script_ctx.clear();
+
+        unsafe { win_comp_scroll(win_ptr) };
+
+        assert!(
+            win.w_onebuf_opt.wo_script_ctx.is_empty(),
+            "no change means no re-attribution"
+        );
     }
 
     #[test]
