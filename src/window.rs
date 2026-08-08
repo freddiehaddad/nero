@@ -1755,6 +1755,43 @@ pub unsafe fn check_snapshot_rec(
     }
 }
 
+/// Free the snapshot at `idx` in tab page `tp` and clear its slot
+/// (`clear_snapshot`).
+///
+/// Clearing the slot is what makes this safe to call twice: the
+/// recursive free would otherwise walk an already-freed tree.
+///
+/// # Safety
+/// `tp` must be a valid, non-null pointer to a live `TabpageT`, and
+/// `idx` must be within `SNAP_COUNT`. Forwarded from
+/// [`clear_snapshot_rec`]'s own safety doc.
+pub unsafe fn clear_snapshot(tp: *mut crate::buffer_defs::TabpageT, idx: usize) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        clear_snapshot_rec((*tp).tp_snapshot[idx]);
+        (*tp).tp_snapshot[idx] = std::ptr::null_mut();
+    }
+}
+
+/// The window that was current when snapshot `idx` was taken, or null
+/// (`get_snapshot_curwin`).
+///
+/// # Safety
+/// `GLOBALS.curtab` must be valid and non-null, and `idx` must be
+/// within `SNAP_COUNT`. Forwarded from [`get_snapshot_curwin_rec`]'s
+/// own safety doc.
+pub unsafe fn get_snapshot_curwin(idx: usize) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    let snap = unsafe { (*curtab).tp_snapshot[idx] };
+    if snap.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_snapshot_curwin_rec(snap) }
+}
+
 /// Free a snapshot frame tree (`clear_snapshot_rec`).
 ///
 /// Both the sibling chain and the child subtree are freed before the
@@ -5783,6 +5820,66 @@ mod tests {
         let g = unsafe { crate::globals::GLOBALS.get_mut() };
         g.Rows = prev_rows;
         g.firstwin = prev_first;
+    }
+
+    #[test]
+    fn clear_snapshot_frees_the_slot_and_is_safe_to_repeat() {
+        // Clearing the slot is what makes a second call safe: the
+        // recursive free would otherwise walk an already-freed tree.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let leaf = Box::into_raw(Box::new(crate::buffer_defs::FrameT::default()));
+        tp.tp_snapshot[0] = Box::into_raw(Box::new(crate::buffer_defs::FrameT {
+            fr_child: leaf,
+            ..Default::default()
+        }));
+
+        unsafe { clear_snapshot(&mut tp, 0) };
+        assert!(tp.tp_snapshot[0].is_null());
+
+        // A second clear must be a harmless no-op.
+        unsafe { clear_snapshot(&mut tp, 0) };
+        assert!(tp.tp_snapshot[0].is_null());
+    }
+
+    #[test]
+    fn get_snapshot_curwin_is_null_for_an_empty_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let prev_tab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = &mut tp;
+
+        assert!(unsafe { get_snapshot_curwin(0) }.is_null());
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_tab;
+    }
+
+    #[test]
+    fn get_snapshot_curwin_finds_the_recorded_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let mut win = crate::buffer_defs::WinT::default();
+
+        // Populate the snapshot BEFORE installing tp in GLOBALS: a
+        // later write through `tp` directly would invalidate the
+        // pointer already derived from it, which Miri (Tree Borrows)
+        // rejects. Same hazard option.rs documents for optval_from_varp.
+        tp.tp_snapshot[1] = Box::into_raw(Box::new(crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win,
+            ..Default::default()
+        }));
+
+        let prev_tab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = &mut tp;
+
+        let got = unsafe { get_snapshot_curwin(1) };
+        assert!(std::ptr::eq(got, &raw mut win));
+
+        // Restore curtab first, so the cleanup's own &mut tp has no
+        // live derived pointer to invalidate.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curtab = prev_tab;
+        unsafe { clear_snapshot(&mut tp, 1) };
     }
 
     #[test]
