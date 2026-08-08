@@ -1847,6 +1847,55 @@ pub unsafe fn get_snapshot_curwin_rec(ft: *mut crate::buffer_defs::FrameT) -> *m
     }
 }
 
+/// Remove `wp`'s status line (`win_remove_status_line`).
+///
+/// The freed height goes back to the window itself, unless a
+/// horizontal separator takes the status line's place instead.
+///
+/// # Safety
+/// `wp` must point at a live `WinT`. Forwards
+/// [`win_new_height`]/[`crate::drawscreen::comp_col`]'s own safety
+/// docs.
+pub unsafe fn win_remove_status_line(wp: *mut WinT, add_hsep: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_status_height = 0 };
+
+    if add_hsep {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*wp).w_hsep_height = 1 };
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let height = unsafe {
+            if (*wp).w_floating { (*wp).w_view_height } else { (*wp).w_height }
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { win_new_height(wp, height + STATUS_HEIGHT) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::drawscreen::comp_col() };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let click_defs = unsafe { &mut (*wp).w_status_click_defs };
+    crate::statusline::stl_clear_click_defs(click_defs);
+    // The original frees the array and zeroes its separate size field;
+    // this crate folds both into one `Vec`, so clearing it is the
+    // whole of that.
+    click_defs.clear();
+}
+
+/// Initialise the current window, when a new file is being edited
+/// (`curwin_init`).
+///
+/// # Safety
+/// `GLOBALS.curwin` must point at a live `WinT`, and
+/// [`win_init_empty`]'s own safety doc applies.
+pub unsafe fn curwin_init() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_init_empty(curwin) };
+}
+
 /// Reset a window to the "empty buffer" starting state
 /// (`win_init_empty`).
 ///
@@ -6069,6 +6118,160 @@ mod tests {
     #[test]
     fn clear_snapshot_rec_of_null_is_a_no_op() {
         unsafe { clear_snapshot_rec(std::ptr::null_mut()) };
+    }
+
+    /// `win_remove_status_line` calls `comp_col`, which reaches
+    /// `last_stl_height` and dereferences the GLOBAL `firstwin`.
+    /// Without setting it, the walk follows whatever window an earlier
+    /// test left behind - which segfaults once that window's storage
+    /// is gone. This installs `win` as the one and only window for the
+    /// duration.
+    struct StlGuard {
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+        prev_lastwin: *mut crate::buffer_defs::WinT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StlGuard {
+        fn set(win: *mut crate::buffer_defs::WinT) -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let guard = StlGuard {
+                prev_firstwin: g.firstwin,
+                prev_lastwin: g.lastwin,
+                prev_curwin: g.curwin,
+                _lock,
+            };
+            unsafe {
+                (*win).w_next = std::ptr::null_mut();
+                (*win).w_prev = std::ptr::null_mut();
+            }
+            g.firstwin = win;
+            g.lastwin = win;
+            g.curwin = win;
+            guard
+        }
+    }
+
+    impl Drop for StlGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.firstwin = self.prev_firstwin;
+            g.lastwin = self.prev_lastwin;
+            g.curwin = self.prev_curwin;
+        }
+    }
+
+    #[test]
+    fn win_remove_status_line_gives_the_height_back_to_the_window() {
+        // Boxed, not stack-allocated: these pointers are installed
+        // into GLOBALS, so they need stable heap addresses.
+        //
+        // w_view_height is pre-set to the height the window will HAVE
+        // after the status line is reclaimed. `win_new_height` reaches
+        // `win_set_inner_size`, which still has an `unimplemented!()`
+        // boundary for a genuine height CHANGE (it needs
+        // validate_cursor/set_fraction/win_comp_scroll/
+        // scroll_to_fraction). Lining the two up exercises everything
+        // this function itself does without crossing that boundary.
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_height: 10,
+            w_view_height: 10 + STATUS_HEIGHT,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        win.w_status_click_defs.push(crate::statusline_defs::StlClickDefinition::default());
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = StlGuard::set(win_ptr);
+
+        unsafe { win_remove_status_line(win_ptr, false) };
+
+        assert_eq!(win.w_status_height, 0);
+        assert_eq!(win.w_height, 10 + STATUS_HEIGHT, "the freed line goes back");
+        assert_eq!(win.w_hsep_height, 0, "no separator was asked for");
+        assert!(win.w_status_click_defs.is_empty());
+    }
+
+    #[test]
+    fn win_remove_status_line_can_put_a_separator_in_its_place() {
+        // With add_hsep the height is NOT given back - a horizontal
+        // separator occupies the row instead, so win_new_height is
+        // never called at all on this branch.
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_height: 10,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = StlGuard::set(win_ptr);
+
+        unsafe { win_remove_status_line(win_ptr, true) };
+
+        assert_eq!(win.w_status_height, 0);
+        assert_eq!(win.w_hsep_height, 1);
+        assert_eq!(win.w_height, 10, "height is unchanged in this branch");
+    }
+
+    #[test]
+    fn win_remove_status_line_uses_the_view_height_for_a_floating_window() {
+        // A floating window's own w_height is not the height the
+        // status line came out of; w_view_height is. The winbar height
+        // absorbs the difference so win_set_inner_size still sees no
+        // net change (see the first test's own comment).
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_status_height: 1,
+            w_floating: true,
+            w_height: 3,
+            w_view_height: 8,
+            w_winbar_height: STATUS_HEIGHT,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _guard = StlGuard::set(win_ptr);
+
+        unsafe { win_remove_status_line(win_ptr, false) };
+
+        assert_eq!(
+            win.w_height,
+            8 + STATUS_HEIGHT,
+            "the new height comes from w_view_height, not w_height"
+        );
+    }
+
+    #[test]
+    fn curwin_init_resets_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let mut win = crate::buffer_defs::WinT {
+            w_lines_valid: 9,
+            w_topline: 40,
+            w_buffer: &mut buf,
+            ..Default::default()
+        };
+        win.w_cursor.lnum = 40;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curwin;
+        g.curwin = win_ptr;
+
+        unsafe { curwin_init() };
+
+        assert_eq!(win.w_lines_valid, 0);
+        assert_eq!(win.w_topline, 1);
+        assert_eq!(win.w_cursor.lnum, 1);
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
     }
 
     #[test]
