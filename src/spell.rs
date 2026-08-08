@@ -204,6 +204,70 @@ pub unsafe fn init_spell_chartab() {
     }
 }
 
+/// The end of the word starting at `str`, supporting camelCase
+/// (`advance_camelcase_word`).
+///
+/// @return `(end_offset, is_camel_case)` - the byte offset just past
+///         the word, and whether the word was split at a camelCase
+///         boundary rather than ending naturally. The original writes
+///         that flag through a `bool *` out-parameter.
+///
+/// # Safety
+/// Forwards [`get_char_type`]/[`spell_iswordp`]'s own safety docs.
+#[must_use]
+pub unsafe fn advance_camelcase_word(str: &[u8], wp: &crate::buffer_defs::WinT) -> (usize, bool) {
+    if str.first().is_none_or(|&c| c == 0) {
+        return (0, false);
+    }
+
+    let c = crate::mbyte::utf_ptr2char(str);
+    // MB_PTR_ADV: step over one whole character, combining marks and
+    // all - which is why this uses utfc_ptr2len rather than
+    // utf_ptr2len.
+    let mut end = unsafe { crate::mbyte::utfc_ptr2len(str) }.max(1) as usize;
+
+    // At most the types of the last two characters are needed.
+    let mut last_last_type: i32 = -1;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut last_type = unsafe { get_char_type(c) };
+
+    while end < str.len() && str[end] != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { spell_iswordp(&str[end..], wp) } {
+            break;
+        }
+        let c = crate::mbyte::utf_ptr2char(&str[end..]);
+        // SAFETY: forwarded from this function's own safety doc.
+        let this_type = unsafe { get_char_type(c) };
+
+        if last_last_type == char_type::UPPER
+            && last_type == char_type::UPPER
+            && this_type == char_type::OTHER
+        {
+            // UpperUpperLower: the last uppercase letter belongs to
+            // the NEXT word, so back up over it.
+            // SAFETY: forwarded from this function's own safety doc.
+            let head = unsafe { crate::mbyte::utf_head_off(str, end - 1) };
+            end = end - 1 - head as usize;
+            return (end, true);
+        } else if (this_type == char_type::UPPER && last_type == char_type::OTHER)
+            || (this_type != last_type
+                && (this_type == char_type::DIGIT || last_type == char_type::DIGIT))
+        {
+            // LowerUpper, LowerDigit, UpperDigit, DigitUpper,
+            // DigitLower.
+            return (end, true);
+        }
+
+        last_last_type = last_type;
+        last_type = this_type;
+
+        end += unsafe { crate::mbyte::utfc_ptr2len(&str[end..]) }.max(1) as usize;
+    }
+
+    (end, false)
+}
+
 /// Character classes for [`get_char_type`] (an anonymous `enum` in the
 /// original).
 pub mod char_type {
@@ -938,6 +1002,91 @@ mod tests {
     /// `global_state_test_lock()`.
     fn reset_spelltab_ascii() {
         clear_spell_chartab(unsafe { SPELLTAB.get_mut() });
+    }
+
+    // --- advance_camelcase_word ---
+
+    /// A window plus an initialised spell table, so `spell_iswordp`
+    /// classifies ASCII letters/digits as word characters. The window
+    /// needs a real `SynblockT` for `w_s`, which `spell_iswordp`
+    /// dereferences.
+    fn camel_win(
+        syn: &mut crate::buffer_defs::SynblockT,
+    ) -> Box<crate::buffer_defs::WinT> {
+        unsafe { init_spell_chartab() };
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_s = std::ptr::addr_of_mut!(*syn);
+        win
+    }
+
+    #[test]
+    fn advance_camelcase_word_takes_a_whole_lowercase_word() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+        let (end, camel) = unsafe { advance_camelcase_word(b"hello world", &wp) };
+        assert_eq!(end, 5, "stops at the space, which is not a word character");
+        assert!(!camel, "no camelCase boundary was involved");
+    }
+
+    #[test]
+    fn advance_camelcase_word_splits_at_lower_upper() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+        let (end, camel) = unsafe { advance_camelcase_word(b"camelCase", &wp) };
+        assert_eq!(&b"camelCase"[..end], b"camel");
+        assert!(camel);
+    }
+
+    #[test]
+    fn advance_camelcase_word_backs_up_one_char_at_upper_upper_lower() {
+        // "HTTPServer": the final "S" of the run of capitals starts
+        // the next word, so the split leaves "HTTP" behind.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+        let (end, camel) = unsafe { advance_camelcase_word(b"HTTPServer", &wp) };
+        assert_eq!(&b"HTTPServer"[..end], b"HTTP");
+        assert!(camel);
+    }
+
+    #[test]
+    fn advance_camelcase_word_splits_around_digits_in_both_directions() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+
+        // LowerDigit
+        let (end, camel) = unsafe { advance_camelcase_word(b"abc123", &wp) };
+        assert_eq!(&b"abc123"[..end], b"abc");
+        assert!(camel);
+
+        // DigitLower
+        let (end, camel) = unsafe { advance_camelcase_word(b"123abc", &wp) };
+        assert_eq!(&b"123abc"[..end], b"123");
+        assert!(camel);
+    }
+
+    #[test]
+    fn advance_camelcase_word_on_an_empty_string_advances_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+        assert_eq!(unsafe { advance_camelcase_word(b"", &wp) }, (0, false));
+        assert_eq!(unsafe { advance_camelcase_word(b"\0", &wp) }, (0, false));
+    }
+
+    #[test]
+    fn advance_camelcase_word_keeps_an_all_caps_word_whole() {
+        // A run of capitals with nothing after it has no boundary to
+        // split at, so the UpperUpperLower back-up must not fire.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = crate::buffer_defs::SynblockT::default();
+        let wp = camel_win(&mut syn);
+        let (end, camel) = unsafe { advance_camelcase_word(b"HTTP", &wp) };
+        assert_eq!(end, 4);
+        assert!(!camel);
     }
 
     #[test]
