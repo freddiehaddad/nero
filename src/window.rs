@@ -1549,6 +1549,31 @@ pub unsafe fn snapshot_windows_scroll_size() {
     }
 }
 
+/// Whether the initial scroll-size snapshot has been taken
+/// (`did_initial_scroll_size_snapshot`, a `static` in the original).
+static DID_INITIAL_SCROLL_SIZE_SNAPSHOT: std::sync::LazyLock<crate::globals::GlobalCell<bool>> =
+    std::sync::LazyLock::new(|| crate::globals::GlobalCell::new(false));
+
+/// Take the initial scroll-size snapshot, once
+/// (`may_make_initial_scroll_size_snapshot`).
+///
+/// Guarded by a one-shot flag: only the FIRST call snapshots, so a
+/// later call cannot overwrite the baseline the `WinScrolled`
+/// autocommand compares against.
+///
+/// # Safety
+/// Forwarded from [`snapshot_windows_scroll_size`]'s own safety doc;
+/// also mutates the shared one-shot flag.
+pub unsafe fn may_make_initial_scroll_size_snapshot() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let done = unsafe { DID_INITIAL_SCROLL_SIZE_SNAPSHOT.get_mut() };
+    if !*done {
+        *done = true;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { snapshot_windows_scroll_size() };
+    }
+}
+
 /// Rows available to the window layout: everything except the command
 /// line, the tab line and a global status line (`ROWS_AVAIL`, a macro
 /// in the original).
@@ -5537,6 +5562,37 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn may_make_initial_scroll_size_snapshot_only_fires_once() {
+        // A one-shot guard: only the FIRST call snapshots, so a later
+        // call cannot overwrite the baseline WinScrolled compares
+        // against. The flag is shared, so it is saved and restored.
+        let _lock = crate::globals::global_state_test_lock();
+        let prev_done = *unsafe { DID_INITIAL_SCROLL_SIZE_SNAPSHOT.get_mut() };
+        let prev_first = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+
+        let mut win = crate::buffer_defs::WinT {
+            w_topline: 42,
+            w_last_topline: 0,
+            ..Default::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = &mut win;
+        *unsafe { DID_INITIAL_SCROLL_SIZE_SNAPSHOT.get_mut() } = false;
+
+        // First call takes the snapshot.
+        unsafe { may_make_initial_scroll_size_snapshot() };
+        assert_eq!(win.w_last_topline, 42);
+        assert!(*unsafe { DID_INITIAL_SCROLL_SIZE_SNAPSHOT.get_mut() });
+
+        // A later move must NOT be picked up by a second call.
+        win.w_topline = 99;
+        unsafe { may_make_initial_scroll_size_snapshot() };
+        assert_eq!(win.w_last_topline, 42, "the second call must be a no-op");
+
+        *unsafe { DID_INITIAL_SCROLL_SIZE_SNAPSHOT.get_mut() } = prev_done;
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev_first;
     }
 
     #[test]
