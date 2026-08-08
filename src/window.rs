@@ -1569,6 +1569,51 @@ pub unsafe fn rows_avail() -> i32 {
     rows - p_ch - tabline - global_stl
 }
 
+/// Look for a frame that can give up a line, starting at `fr`
+/// (`find_horizontally_resizable_frame`).
+///
+/// Walks upward while the current frame is already at its minimum
+/// height, so the frame returned is the nearest ancestor (or preceding
+/// sibling) with room to shrink. Returns null when even the top frame
+/// is at its minimum, meaning nothing can be resized.
+///
+/// The walk direction depends on the parent's layout: inside a COLUMN
+/// of frames it steps to the frame ABOVE, since that one shares the
+/// vertical space; anywhere else (a row, or already at the top of a
+/// column) it steps up to the parent.
+///
+/// # Safety
+/// `fr` must be a valid, non-null pointer to a live frame whose own
+/// `fr_parent`/`fr_prev` links are likewise valid or null, and whose
+/// ancestry reaches `GLOBALS.topframe`. Forwarded from
+/// [`frame_minheight`]'s own safety doc.
+pub unsafe fn find_horizontally_resizable_frame(
+    fr: *mut crate::buffer_defs::FrameT,
+) -> *mut crate::buffer_defs::FrameT {
+    let mut fp = fr;
+    // SAFETY: forwarded from this function's own safety doc.
+    let topframe = unsafe { crate::globals::GLOBALS.get_mut() }.topframe;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        while (*fp).fr_height <= frame_minheight(fp, std::ptr::null_mut()) {
+            if fp == topframe {
+                return std::ptr::null_mut();
+            }
+            // In a column of frames: go to the frame above. If already
+            // at the top, or in a row of frames: go to the parent.
+            if (*(*fp).fr_parent).fr_layout == crate::buffer_defs::FR_COL
+                && !(*fp).fr_prev.is_null()
+            {
+                fp = (*fp).fr_prev;
+            } else {
+                fp = (*fp).fr_parent;
+            }
+        }
+    }
+    fp
+}
+
 /// Record every window's current size so it can be restored later
 /// (`win_size_save`).
 ///
@@ -5492,6 +5537,124 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn find_horizontally_resizable_frame_returns_a_frame_with_room() {
+        // A frame taller than its minimum can give up a line, so it is
+        // returned immediately without any walking.
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_wmh, prev_wh) = (opts.p_wmh, opts.p_wh);
+        opts.p_wmh = 1;
+        opts.p_wh = 1;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_top, prev_cur) = (g.topframe, g.curwin);
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut top = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win,
+            fr_height: 10,
+            ..Default::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.topframe = &mut top;
+
+        let got = unsafe { find_horizontally_resizable_frame(&mut top) };
+        assert!(std::ptr::eq(got, &raw mut top));
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.topframe = prev_top;
+        g.curwin = prev_cur;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_wmh = prev_wmh;
+        opts.p_wh = prev_wh;
+    }
+
+    #[test]
+    fn find_horizontally_resizable_frame_is_null_when_topframe_is_minimal() {
+        // Reaching the top frame with no room left means nothing can
+        // be resized at all.
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_wmh, prev_wh) = (opts.p_wmh, opts.p_wh);
+        opts.p_wmh = 1;
+        opts.p_wh = 1;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_top, prev_cur) = (g.topframe, g.curwin);
+        g.curwin = std::ptr::null_mut();
+
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut top = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win,
+            // Exactly at the minimum, so it cannot give up a line.
+            fr_height: 1,
+            ..Default::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.topframe = &mut top;
+
+        assert!(unsafe { find_horizontally_resizable_frame(&mut top) }.is_null());
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.topframe = prev_top;
+        g.curwin = prev_cur;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_wmh = prev_wmh;
+        opts.p_wh = prev_wh;
+    }
+
+    #[test]
+    fn find_horizontally_resizable_frame_steps_to_the_frame_above_in_a_column() {
+        // Inside a COLUMN the walk goes to the frame ABOVE (fr_prev),
+        // since that one shares the vertical space - not straight up
+        // to the parent.
+        let _lock = crate::globals::global_state_test_lock();
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let (prev_wmh, prev_wh) = (opts.p_wmh, opts.p_wh);
+        opts.p_wmh = 1;
+        opts.p_wh = 1;
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_top, prev_cur) = (g.topframe, g.curwin);
+        g.curwin = std::ptr::null_mut();
+
+        let mut win_above = crate::buffer_defs::WinT::default();
+        let mut win_below = crate::buffer_defs::WinT::default();
+
+        let mut parent = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_height: 20,
+            ..Default::default()
+        };
+        // The frame above has room to shrink.
+        let mut above = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win_above,
+            fr_height: 10,
+            fr_parent: &mut parent,
+            ..Default::default()
+        };
+        // The starting frame is already minimal.
+        let mut below = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win_below,
+            fr_height: 1,
+            fr_parent: &mut parent,
+            fr_prev: &mut above,
+            ..Default::default()
+        };
+        unsafe { crate::globals::GLOBALS.get_mut() }.topframe = &mut parent;
+
+        let got = unsafe { find_horizontally_resizable_frame(&mut below) };
+        assert!(std::ptr::eq(got, &raw mut above), "must step to the frame ABOVE");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.topframe = prev_top;
+        g.curwin = prev_cur;
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        opts.p_wmh = prev_wmh;
+        opts.p_wh = prev_wh;
     }
 
     #[test]
