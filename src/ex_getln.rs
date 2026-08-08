@@ -77,6 +77,96 @@ const SHELL_ESC_CHARS: &[u8] = b" \t\n*?[{`$\\%#'\"|!<>();&";
 #[cfg(not(windows))]
 const BUFFER_ESC_CHARS: &[u8] = b" \t\n*?[`$\\%#'\"|!<";
 
+/// Parse a `"from,to"` number range from the front of `str_`
+/// (`get_list_range`).
+///
+/// @return `Some((num1, num2, consumed))` on success, where `consumed`
+///         is how many bytes were used, or `None` for `FAIL` -
+///         replacing the original's `char **str` in/out pointer plus
+///         two out-parameters. Each number is only reported when the
+///         input actually supplied it, so the caller's own defaults
+///         survive an absent part, exactly as upstream's untouched
+///         out-parameters do.
+///
+/// Three shapes are accepted: a lone number (which becomes BOTH ends),
+/// a full `"a,b"` pair, and a bare `",b"` with no first part. Only a
+/// `","` with nothing usable on either side fails, along with any
+/// value overflowing `i32`.
+#[must_use]
+pub fn get_list_range(str_: &[u8]) -> Option<(Option<i32>, Option<i32>, usize)> {
+    let mut pos = crate::charset::skipwhite(str_);
+    let (mut num1, mut num2) = (None, None);
+    let mut first = false;
+
+    // Parse the "from" part of the range.
+    if str_
+        .get(pos)
+        .is_some_and(|&c| c == b'-' || crate::ascii_defs::ascii_isdigit(i32::from(c)))
+    {
+        let mut len = 0;
+        let mut num = 0;
+        let mut overflow = false;
+        crate::charset::vim_str2nr(
+            &str_[pos..],
+            None,
+            Some(&mut len),
+            0,
+            Some(&mut num),
+            None,
+            0,
+            false,
+            Some(&mut overflow),
+        );
+        pos += len as usize;
+        // Overflow.
+        if overflow {
+            return None;
+        }
+        num1 = Some(i32::try_from(num).ok()?);
+        first = true;
+    }
+
+    pos += crate::charset::skipwhite(&str_[pos..]);
+
+    if str_.get(pos) == Some(&b',') {
+        // Parse the "to" part of the range.
+        pos += 1;
+        pos += crate::charset::skipwhite(&str_[pos..]);
+
+        let mut len = 0;
+        let mut num = 0;
+        let mut overflow = false;
+        crate::charset::vim_str2nr(
+            &str_[pos..],
+            None,
+            Some(&mut len),
+            0,
+            Some(&mut num),
+            None,
+            0,
+            false,
+            Some(&mut overflow),
+        );
+        if len > 0 {
+            pos += len as usize;
+            pos += crate::charset::skipwhite(&str_[pos..]);
+            // Overflow.
+            if overflow {
+                return None;
+            }
+            num2 = Some(i32::try_from(num).ok()?);
+        } else if !first {
+            // No number given at all.
+            return None;
+        }
+    } else if first {
+        // Only one number given: it is both ends of the range.
+        num2 = num1;
+    }
+
+    Some((num1, num2, pos))
+}
+
 /// Put a backslash before `s`, in place (`escape_fname`).
 pub fn escape_fname(s: &mut Vec<u8>) {
     s.insert(0, b'\\');
@@ -542,6 +632,73 @@ pub unsafe fn check_opt_wim() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_list_range_lone_number_becomes_both_ends() {
+        // A single number is used for BOTH ends of the range.
+        let (n1, n2, used) = get_list_range(b"7").expect("valid");
+        assert_eq!(n1, Some(7));
+        assert_eq!(n2, Some(7));
+        assert_eq!(used, 1);
+    }
+
+    #[test]
+    fn get_list_range_parses_a_full_pair() {
+        let (n1, n2, used) = get_list_range(b"3,9").expect("valid");
+        assert_eq!(n1, Some(3));
+        assert_eq!(n2, Some(9));
+        assert_eq!(used, 3);
+    }
+
+    #[test]
+    fn get_list_range_accepts_a_missing_first_part() {
+        // ",b" is valid: only the second end is supplied, and the
+        // first is left for the caller's own default.
+        let (n1, n2, _used) = get_list_range(b",9").expect("valid");
+        assert_eq!(n1, None, "an absent part must not be reported");
+        assert_eq!(n2, Some(9));
+    }
+
+    #[test]
+    fn get_list_range_rejects_a_comma_with_nothing_usable() {
+        // Neither side supplies a number, so there is no range at all.
+        assert!(get_list_range(b",").is_none());
+        assert!(get_list_range(b",x").is_none());
+    }
+
+    #[test]
+    fn get_list_range_skips_surrounding_whitespace() {
+        let (n1, n2, used) = get_list_range(b"  3 , 9  ").expect("valid");
+        assert_eq!(n1, Some(3));
+        assert_eq!(n2, Some(9));
+        // Trailing whitespace after the second number is consumed too.
+        assert_eq!(used, 9);
+    }
+
+    #[test]
+    fn get_list_range_accepts_a_negative_first_number() {
+        // A leading '-' starts the "from" part, so negative values
+        // parse rather than being treated as junk.
+        let (n1, n2, _used) = get_list_range(b"-5,-1").expect("valid");
+        assert_eq!(n1, Some(-5));
+        assert_eq!(n2, Some(-1));
+    }
+
+    #[test]
+    fn get_list_range_with_no_number_at_all_reports_nothing() {
+        // Not a failure: there is simply no range here, and the
+        // caller's own defaults stand.
+        let (n1, n2, used) = get_list_range(b"abc").expect("not a failure");
+        assert_eq!(n1, None);
+        assert_eq!(n2, None);
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn get_list_range_rejects_a_value_overflowing_i32() {
+        // The original returns FAIL for anything above INT_MAX.
+        assert!(get_list_range(b"99999999999999").is_none());
+    }
 
     #[test]
     fn escape_fname_prepends_a_backslash() {
