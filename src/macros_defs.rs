@@ -26,12 +26,21 @@
 //!   deferred to when each global is translated alongside its owning
 //!   subsystem; Rust models global mutable state explicitly (e.g. `static`
 //!   with interior mutability) rather than via a header trick.
-//! - `REPLACE_NORMAL(s)`: needs `REPLACE_FLAG`/`VREPLACE_FLAG` (state_defs.h /
-//!   insert.c, phase 7).
 //! - `UV_BUF_LEN`/`IO_COUNT`: platform read/write casts tied to libuv
 //!   (event/, phase 11).
 
 use crate::pos_defs::PosT;
+
+/// `REPLACE_NORMAL(s)`: whether state `s` is plain Replace mode.
+///
+/// Virtual-replace sets BOTH flags, so testing `REPLACE_FLAG` alone
+/// would wrongly include it - hence the explicit exclusion.
+#[inline]
+#[must_use]
+pub const fn replace_normal(s: u32) -> bool {
+    (s & crate::state_defs::mode::REPLACE_FLAG) != 0
+        && (s & crate::state_defs::mode::VREPLACE_FLAG) == 0
+}
 
 /// `RESET_BINDING(wp)`: clear a window's `'scrollbind'` and
 /// `'cursorbind'`.
@@ -128,6 +137,20 @@ pub fn empty_pos(a: &PosT) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replace_normal_excludes_virtual_replace() {
+        use crate::state_defs::mode;
+
+        // Plain Replace mode qualifies.
+        assert!(replace_normal(mode::REPLACE));
+        // Virtual-replace sets BOTH flags, so it must NOT qualify -
+        // testing REPLACE_FLAG alone would wrongly accept it.
+        assert!(!replace_normal(mode::VREPLACE));
+        // Neither flag set at all.
+        assert!(!replace_normal(mode::INSERT));
+        assert!(!replace_normal(mode::NORMAL));
+    }
 
     #[test]
     fn reset_binding_clears_both_bindings() {
