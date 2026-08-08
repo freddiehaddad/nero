@@ -26,6 +26,57 @@
 //!
 //! Deferred: everything else in the file.
 
+/// Interned font names, indexed by the value `hl_add_font_idx`
+/// returns (`fonts`).
+///
+/// The original is a hash set whose slot index doubles as the font's
+/// stable identity. A `Vec` gives the same guarantee - an index, once
+/// handed out, keeps naming the same font - without the separate key
+/// array, since the entry IS the name.
+static FONTS: crate::globals::GlobalCell<Vec<Vec<u8>>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
+/// Intern `font_name` and return its index (`hl_add_font_idx`).
+///
+/// Adding a name that is already interned returns its existing index
+/// rather than a new one, which is what makes the index a stable
+/// identity.
+///
+/// @return the font index, or `-1` for an empty name.
+///
+/// # Safety
+/// Mutates the `FONTS` file-static.
+pub unsafe fn hl_add_font_idx(font_name: &[u8]) -> i32 {
+    if font_name.is_empty() || font_name.first() == Some(&0) {
+        return -1;
+    }
+    // The original's NUL-terminated name stops at the first NUL.
+    let name = &font_name[..font_name.iter().position(|&c| c == 0).unwrap_or(font_name.len())];
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let fonts = unsafe { FONTS.get_mut() };
+    if let Some(i) = fonts.iter().position(|f| f == name) {
+        return i32::try_from(i).unwrap_or(-1);
+    }
+    fonts.push(name.to_vec());
+    i32::try_from(fonts.len() - 1).unwrap_or(-1)
+}
+
+/// The font name at `index` (`hl_get_font`).
+///
+/// `None` for an index that names no font.
+///
+/// # Safety
+/// Reads the `FONTS` file-static.
+#[must_use]
+pub unsafe fn hl_get_font(index: i32) -> Option<Vec<u8>> {
+    if index < 0 {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { FONTS.get_mut() }.get(index as usize).cloned()
+}
+
 /// Global highlight namespace (`ns_hl_global`).
 pub static NS_HL_GLOBAL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 /// Highlight namespace for the current window (`ns_hl_win`).
@@ -301,6 +352,82 @@ pub fn hl_combine_ae(char_ae: i32, prim_ae: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- hl_add_font_idx / hl_get_font ----
+
+    /// Restores the interning table, so tests cannot leak entries into
+    /// each other's index expectations.
+    struct FontsGuard {
+        prev: Vec<Vec<u8>>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FontsGuard {
+        fn new() -> Self {
+            let _lock = crate::globals::global_state_test_lock();
+            let prev = unsafe { FONTS.get_mut() }.clone();
+            unsafe { FONTS.get_mut().clear() };
+            FontsGuard { prev, _lock }
+        }
+    }
+
+    impl Drop for FontsGuard {
+        fn drop(&mut self) {
+            unsafe { *FONTS.get_mut() = std::mem::take(&mut self.prev) };
+        }
+    }
+
+    #[test]
+    fn hl_add_font_idx_returns_a_stable_index_for_the_same_name() {
+        // Re-adding an interned name must reuse its index - that is
+        // what makes the index a durable identity rather than a
+        // position in insertion order.
+        let _g = FontsGuard::new();
+
+        let a = unsafe { hl_add_font_idx(b"Fira Code") };
+        let b = unsafe { hl_add_font_idx(b"Cascadia") };
+        let a_again = unsafe { hl_add_font_idx(b"Fira Code") };
+
+        assert_ne!(a, b, "distinct names get distinct indices");
+        assert_eq!(a, a_again, "the same name reuses its index");
+    }
+
+    #[test]
+    fn hl_get_font_reads_back_what_was_interned() {
+        let _g = FontsGuard::new();
+
+        let a = unsafe { hl_add_font_idx(b"Fira Code") };
+        let b = unsafe { hl_add_font_idx(b"Cascadia") };
+
+        assert_eq!(unsafe { hl_get_font(a) }.as_deref(), Some(&b"Fira Code"[..]));
+        assert_eq!(unsafe { hl_get_font(b) }.as_deref(), Some(&b"Cascadia"[..]));
+    }
+
+    #[test]
+    fn hl_add_font_idx_rejects_an_empty_name() {
+        let _g = FontsGuard::new();
+        assert_eq!(unsafe { hl_add_font_idx(b"") }, -1);
+        assert_eq!(unsafe { hl_add_font_idx(b"\0") }, -1, "a leading NUL is empty too");
+    }
+
+    #[test]
+    fn hl_get_font_is_none_for_an_index_naming_no_font() {
+        let _g = FontsGuard::new();
+        assert_eq!(unsafe { hl_get_font(-1) }, None);
+        assert_eq!(unsafe { hl_get_font(0) }, None, "nothing interned yet");
+
+        let a = unsafe { hl_add_font_idx(b"Only") };
+        assert_eq!(unsafe { hl_get_font(a + 1) }, None, "past the end");
+    }
+
+    #[test]
+    fn hl_add_font_idx_stops_a_name_at_an_embedded_nul() {
+        // The original interns a NUL-terminated string, so trailing
+        // bytes past the NUL are not part of the name.
+        let _g = FontsGuard::new();
+        let a = unsafe { hl_add_font_idx(b"Mono\0junk") };
+        assert_eq!(unsafe { hl_get_font(a) }.as_deref(), Some(&b"Mono"[..]));
+    }
 
     // ---- win_bg_attr ----
 
