@@ -1569,6 +1569,61 @@ pub unsafe fn rows_avail() -> i32 {
     rows - p_ch - tabline - global_stl
 }
 
+/// Free a snapshot frame tree (`clear_snapshot_rec`).
+///
+/// Both the sibling chain and the child subtree are freed before the
+/// node itself, so no pointer is read after its owner is gone.
+///
+/// # Safety
+/// `fr` must be either null or a valid pointer to a frame tree whose
+/// nodes were each allocated as a `Box<FrameT>` (i.e. every
+/// `fr_next`/`fr_child` link must likewise be null or such an
+/// allocation). Every node in the tree is freed, so no pointer into it
+/// may be used afterwards.
+pub unsafe fn clear_snapshot_rec(fr: *mut crate::buffer_defs::FrameT) {
+    if fr.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        clear_snapshot_rec((*fr).fr_next);
+        clear_snapshot_rec((*fr).fr_child);
+        // Reclaims the Box allocation this node was created with.
+        drop(Box::from_raw(fr));
+    }
+}
+
+/// Traverse a snapshot to find the previous `curwin`
+/// (`get_snapshot_curwin_rec`).
+///
+/// Siblings are searched before children, and the node's own `fr_win`
+/// is only used when neither yielded a window - so the DEEPEST,
+/// last-visited branch wins. A leaf frame's `fr_win` is the window it
+/// holds; an interior frame's is null, which is exactly what makes the
+/// "keep looking" fallthrough work.
+///
+/// # Safety
+/// `ft` must be a valid, non-null pointer to a live snapshot frame
+/// whose own `fr_next`/`fr_child` links are likewise valid or null.
+pub unsafe fn get_snapshot_curwin_rec(ft: *mut crate::buffer_defs::FrameT) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        if !(*ft).fr_next.is_null() {
+            let wp = get_snapshot_curwin_rec((*ft).fr_next);
+            if !wp.is_null() {
+                return wp;
+            }
+        }
+        if !(*ft).fr_child.is_null() {
+            let wp = get_snapshot_curwin_rec((*ft).fr_child);
+            if !wp.is_null() {
+                return wp;
+            }
+        }
+        (*ft).fr_win
+    }
+}
+
 /// Reset a window to the "empty buffer" starting state
 /// (`win_init_empty`).
 ///
@@ -5321,6 +5376,90 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn get_snapshot_curwin_rec_prefers_siblings_then_children() {
+        // Siblings are searched before children, and a node's own
+        // fr_win is only used when neither yielded a window - so the
+        // deepest, last-visited branch wins.
+        let mut win_sibling = crate::buffer_defs::WinT::default();
+        let mut win_child = crate::buffer_defs::WinT::default();
+        let mut win_root = crate::buffer_defs::WinT::default();
+
+        let mut sibling = crate::buffer_defs::FrameT {
+            fr_win: &mut win_sibling,
+            ..Default::default()
+        };
+        let mut child = crate::buffer_defs::FrameT {
+            fr_win: &mut win_child,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_next: &mut sibling,
+            fr_child: &mut child,
+            fr_win: &mut win_root,
+            ..Default::default()
+        };
+
+        // The sibling is checked first, so its window is the answer.
+        let got = unsafe { get_snapshot_curwin_rec(&mut root) };
+        assert!(std::ptr::eq(got, &raw mut win_sibling));
+
+        // Without a sibling, the child is used.
+        root.fr_next = std::ptr::null_mut();
+        let got = unsafe { get_snapshot_curwin_rec(&mut root) };
+        assert!(std::ptr::eq(got, &raw mut win_child));
+
+        // With neither, the node's own window is the fallback.
+        root.fr_child = std::ptr::null_mut();
+        let got = unsafe { get_snapshot_curwin_rec(&mut root) };
+        assert!(std::ptr::eq(got, &raw mut win_root));
+    }
+
+    #[test]
+    fn get_snapshot_curwin_rec_falls_through_interior_frames() {
+        // An interior frame's fr_win is null, which is exactly what
+        // makes the "keep looking" fallthrough work: a null result
+        // from a subtree must not stop the search.
+        let mut win_deep = crate::buffer_defs::WinT::default();
+        let mut deep = crate::buffer_defs::FrameT {
+            fr_win: &mut win_deep,
+            ..Default::default()
+        };
+        // Interior node: no window of its own, only a child.
+        let mut interior = crate::buffer_defs::FrameT {
+            fr_child: &mut deep,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_child: &mut interior,
+            ..Default::default()
+        };
+
+        let got = unsafe { get_snapshot_curwin_rec(&mut root) };
+        assert!(std::ptr::eq(got, &raw mut win_deep));
+    }
+
+    #[test]
+    fn clear_snapshot_rec_frees_a_whole_tree() {
+        // Build a real heap-allocated tree the same way a snapshot
+        // would, then free it. Under Miri (without ignore-leaks) this
+        // proves every node is reclaimed exactly once.
+        let leaf = Box::into_raw(Box::new(crate::buffer_defs::FrameT::default()));
+        let sibling = Box::into_raw(Box::new(crate::buffer_defs::FrameT::default()));
+        let root = Box::into_raw(Box::new(crate::buffer_defs::FrameT {
+            fr_child: leaf,
+            fr_next: sibling,
+            ..Default::default()
+        }));
+
+        unsafe { clear_snapshot_rec(root) };
+    }
+
+    #[test]
+    fn clear_snapshot_rec_of_null_is_a_no_op() {
+        unsafe { clear_snapshot_rec(std::ptr::null_mut()) };
     }
 
     #[test]
