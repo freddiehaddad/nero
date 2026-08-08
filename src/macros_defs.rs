@@ -28,12 +28,27 @@
 //!   with interior mutability) rather than via a header trick.
 //! - `REPLACE_NORMAL(s)`: needs `REPLACE_FLAG`/`VREPLACE_FLAG` (state_defs.h /
 //!   insert.c, phase 7).
-//! - `RESET_BINDING(wp)`: needs `win_T` fields `w_p_scb`/`w_p_crb`
-//!   (buffer_defs.h, phase 3/8).
 //! - `UV_BUF_LEN`/`IO_COUNT`: platform read/write casts tied to libuv
 //!   (event/, phase 11).
 
 use crate::pos_defs::PosT;
+
+/// `RESET_BINDING(wp)`: clear a window's `'scrollbind'` and
+/// `'cursorbind'`.
+///
+/// Used when a window stops being tied to another - splitting off a
+/// new window, or entering a buffer that should not inherit the
+/// binding.
+///
+/// # Safety
+/// `wp` must point at a live [`crate::buffer_defs::WinT`].
+pub unsafe fn reset_binding(wp: *mut crate::buffer_defs::WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*wp).w_onebuf_opt.wo_scb = 0;
+        (*wp).w_onebuf_opt.wo_crb = 0;
+    }
+}
 
 /// `TOUPPER_LOC`/`TOLOWER_LOC`: toupper()/tolower() using the current C
 /// locale. Careful: only call with a character in the range 0-255, like the
@@ -113,6 +128,45 @@ pub fn empty_pos(a: &PosT) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_binding_clears_both_bindings() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_scb = 1;
+        win.w_onebuf_opt.wo_crb = 1;
+
+        unsafe { reset_binding(&mut win) };
+
+        assert_eq!(win.w_onebuf_opt.wo_scb, 0);
+        assert_eq!(win.w_onebuf_opt.wo_crb, 0);
+    }
+
+    #[test]
+    fn reset_binding_is_idempotent() {
+        // Clearing an already-cleared window is a no-op, not a toggle.
+        let mut win = crate::buffer_defs::WinT::default();
+
+        unsafe { reset_binding(&mut win) };
+        unsafe { reset_binding(&mut win) };
+
+        assert_eq!(win.w_onebuf_opt.wo_scb, 0);
+        assert_eq!(win.w_onebuf_opt.wo_crb, 0);
+    }
+
+    #[test]
+    fn reset_binding_clears_each_independently() {
+        // Only one binding set: the other must still end up cleared,
+        // so a version clearing just one field would fail.
+        let mut only_scb = crate::buffer_defs::WinT::default();
+        only_scb.w_onebuf_opt.wo_scb = 1;
+        unsafe { reset_binding(&mut only_scb) };
+        assert_eq!(only_scb.w_onebuf_opt.wo_scb, 0);
+
+        let mut only_crb = crate::buffer_defs::WinT::default();
+        only_crb.w_onebuf_opt.wo_crb = 1;
+        unsafe { reset_binding(&mut only_crb) };
+        assert_eq!(only_crb.w_onebuf_opt.wo_crb, 0);
+    }
 
     #[test]
     fn rgb_packs_channels() {
