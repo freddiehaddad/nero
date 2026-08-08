@@ -170,6 +170,52 @@ pub unsafe fn ui_rgb_attached() -> bool {
     })
 }
 
+/// The popup-menu height every attached UI can accommodate
+/// (`ui_pum_get_height`).
+///
+/// UIs reporting no height of their own are skipped; among those that
+/// do, the SMALLEST wins, so the menu fits in all of them. Zero means
+/// nothing was reported at all.
+///
+/// # Safety
+/// Every pointer in `UIS` must point at a live [`RemoteUI`].
+#[must_use]
+pub unsafe fn ui_pum_get_height() -> i32 {
+    let mut pum_height = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    for &ui in unsafe { UIS.get_mut() }.iter() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ui_pum_height = unsafe { (*ui).pum_nlines };
+        if ui_pum_height != 0 {
+            pum_height =
+                if pum_height == 0 { ui_pum_height } else { pum_height.min(ui_pum_height) };
+        }
+    }
+    pum_height
+}
+
+/// The popup-menu geometry reported back by a UI (`ui_pum_get_pos`).
+///
+/// @return `Some((width, height, row, col))` from the first UI that
+///         reports a position, or `None` when none does. The original
+///         writes those through four `double *` out-parameters.
+///
+/// # Safety
+/// Same as [`ui_pum_get_height`].
+#[must_use]
+pub unsafe fn ui_pum_get_pos() -> Option<(f64, f64, f64, f64)> {
+    // SAFETY: forwarded from this function's own safety doc.
+    for &ui in unsafe { UIS.get_mut() }.iter() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ui = unsafe { &*ui };
+        if !ui.pum_pos {
+            continue;
+        }
+        return Some((ui.pum_width, ui.pum_height, ui.pum_row, ui.pum_col));
+    }
+    None
+}
+
 /// UI extension/capability identifiers (`UIExtension`), mechanically
 /// transcribed from `ui_defs.h` for [`ui_has`]'s own parameter type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +296,64 @@ mod tests {
         let r = f();
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_tgc = prev;
         r
+    }
+
+    #[test]
+    fn ui_pum_get_height_takes_the_smallest_reported_height() {
+        // The menu must fit in every UI, so the smallest wins - and
+        // the smallest is deliberately NOT first, so an implementation
+        // that just took the first reported value would fail.
+        let mut a = gui(false);
+        let mut b = gui(false);
+        let mut c = gui(false);
+        a.pum_nlines = 20;
+        b.pum_nlines = 5;
+        c.pum_nlines = 12;
+        let _g = UisGuard::install(vec![a, b, c]);
+
+        assert_eq!(unsafe { ui_pum_get_height() }, 5);
+    }
+
+    #[test]
+    fn ui_pum_get_height_skips_uis_reporting_nothing() {
+        // A zero means "no height of my own", not "height zero", so it
+        // must not clamp the result down to zero.
+        let mut a = gui(false);
+        let mut b = gui(false);
+        a.pum_nlines = 0;
+        b.pum_nlines = 7;
+        let _g = UisGuard::install(vec![a, b]);
+
+        assert_eq!(unsafe { ui_pum_get_height() }, 7);
+    }
+
+    #[test]
+    fn ui_pum_get_height_is_zero_when_nothing_is_reported() {
+        let _g = UisGuard::install(vec![gui(false), tui(false)]);
+        assert_eq!(unsafe { ui_pum_get_height() }, 0);
+    }
+
+    #[test]
+    fn ui_pum_get_pos_reports_the_first_ui_that_has_one() {
+        // The first UI does not report a position, so a version that
+        // only looked at index 0 would find nothing.
+        let mut a = gui(false);
+        let mut b = gui(false);
+        a.pum_pos = false;
+        b.pum_pos = true;
+        b.pum_width = 12.0;
+        b.pum_height = 4.0;
+        b.pum_row = 2.5;
+        b.pum_col = 7.5;
+        let _g = UisGuard::install(vec![a, b]);
+
+        assert_eq!(unsafe { ui_pum_get_pos() }, Some((12.0, 4.0, 2.5, 7.5)));
+    }
+
+    #[test]
+    fn ui_pum_get_pos_is_none_when_no_ui_reports_one() {
+        let _g = UisGuard::install(vec![gui(false), tui(false)]);
+        assert_eq!(unsafe { ui_pum_get_pos() }, None);
     }
 
     #[test]
