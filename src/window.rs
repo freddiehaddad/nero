@@ -1569,6 +1569,48 @@ pub unsafe fn rows_avail() -> i32 {
     rows - p_ch - tabline - global_stl
 }
 
+/// Record every window's current size so it can be restored later
+/// (`win_size_save`).
+///
+/// The FIRST entry is the total number of lines available for windows,
+/// not a window size: a later restore compares it against the value at
+/// that time and gives up if the screen has since been resized. Each
+/// window then contributes two entries, width-plus-separator followed
+/// by height.
+///
+/// The original fills a `garray_T` out-parameter sized ahead of time
+/// via `ga_grow`; a returned `Vec<i32>` needs no pre-sizing and
+/// carries its own length.
+///
+/// As elsewhere in this crate, `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` is
+/// walked as `GLOBALS.firstwin`/`w_next`, the established
+/// simplification here.
+///
+/// # Safety
+/// `GLOBALS.firstwin`'s own `w_next` chain must consist of valid, live
+/// `WinT` pointers. Forwarded from [`rows_avail`]/[`global_stl_height`]
+/// /[`last_stl_height`]'s own safety docs.
+#[must_use]
+pub unsafe fn win_size_save() -> Vec<i32> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let total = unsafe { rows_avail() + global_stl_height() - last_stl_height(false) };
+
+    // First entry is the total lines available for windows.
+    let mut gap = vec![total];
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            gap.push((*wp).w_width + (*wp).w_vsep_width);
+            gap.push((*wp).w_height);
+            wp = (*wp).w_next;
+        }
+    }
+    gap
+}
+
 /// Recursively copy a frame tree's layout into a fresh snapshot
 /// (`make_snapshot_rec`).
 ///
@@ -5450,6 +5492,78 @@ mod tests {
         }
 
         unsafe { crate::globals::GLOBALS.get_mut() }.Rows = prev_rows;
+    }
+
+    #[test]
+    fn win_size_save_records_a_total_then_two_entries_per_window() {
+        // The FIRST entry is the total lines available for windows,
+        // not a window size - a later restore compares it against the
+        // value at that time. Each window then contributes exactly two
+        // entries: width-plus-separator, then height.
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
+
+        let mut second = crate::buffer_defs::WinT {
+            w_width: 30,
+            w_vsep_width: 0,
+            w_height: 9,
+            ..Default::default()
+        };
+        let mut first = crate::buffer_defs::WinT {
+            w_width: 40,
+            w_vsep_width: 1,
+            w_height: 10,
+            w_next: &mut second,
+            ..Default::default()
+        };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_rows, prev_first) = (g.Rows, g.firstwin);
+        g.Rows = 30;
+        g.firstwin = &mut first;
+
+        let sizes = unsafe { win_size_save() };
+
+        // 1 total + 2 windows x 2 entries.
+        assert_eq!(sizes.len(), 5);
+        // Width INCLUDES the vertical separator.
+        assert_eq!(sizes[1], 41);
+        assert_eq!(sizes[2], 10);
+        assert_eq!(sizes[3], 30);
+        assert_eq!(sizes[4], 9);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Rows = prev_rows;
+        g.firstwin = prev_first;
+    }
+
+    #[test]
+    fn win_size_save_with_a_single_window_has_three_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
+        let _guard = TablineGlobalsGuard::set(0, 0, tp_ptr);
+
+        let mut only = crate::buffer_defs::WinT {
+            w_width: 80,
+            w_height: 24,
+            ..Default::default()
+        };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_rows, prev_first) = (g.Rows, g.firstwin);
+        g.Rows = 30;
+        g.firstwin = &mut only;
+
+        let sizes = unsafe { win_size_save() };
+        assert_eq!(sizes.len(), 3);
+        assert_eq!(sizes[1], 80);
+        assert_eq!(sizes[2], 24);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.Rows = prev_rows;
+        g.firstwin = prev_first;
     }
 
     #[test]
