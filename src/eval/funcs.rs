@@ -425,6 +425,8 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"last_buffer_nr"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: crate::eval::deprecated::f_last_buffer_nr });
         m.insert(&b"tr"[..], EvalFuncDefT { min_argc: 3, max_argc: 3, base_arg: 1, func: f_tr });
         m.insert(&b"isdirectory"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_isdirectory });
+        m.insert(&b"executable"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_executable });
+        m.insert(&b"exepath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_exepath });
         m.insert(&b"isabsolutepath"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::eval::fs::f_isabsolutepath });
         m.insert(&b"browse"[..], EvalFuncDefT { min_argc: 4, max_argc: 4, base_arg: BASE_NONE, func: crate::eval::fs::f_browse });
         m.insert(&b"browsedir"[..], EvalFuncDefT { min_argc: 2, max_argc: 2, base_arg: BASE_NONE, func: crate::eval::fs::f_browsedir });
@@ -8428,6 +8430,8 @@ mod tests {
     #[test]
     fn new_builtins_are_all_registered() {
         for name in [
+            "executable",
+            "exepath",
             "and",
             "or",
             "xor",

@@ -85,6 +85,44 @@ fn bytes_to_path(name: &[u8]) -> Option<&std::path::Path> {
     std::str::from_utf8(name).ok().map(std::path::Path::new)
 }
 
+/// `executable({expr})` - whether `{expr}` names an executable
+/// (`f_executable`, `eval/fs.c`), via the already-existing
+/// [`crate::os::fs::os_can_exe`].
+///
+/// Checks `$PATH`, and also checks directly when the name carries a
+/// directory part.
+pub(crate) fn f_executable(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_string_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let (ok, _abs) = crate::os::fs::os_can_exe(&name, false, true);
+    rettv.value = TypvalValue::Number(i64::from(ok));
+}
+
+/// `exepath({expr})` - the full path of the executable `{expr}`
+/// (`f_exepath`, `eval/fs.c`), via the already-existing
+/// [`crate::os::fs::os_can_exe`].
+///
+/// An empty string when `{expr}` isn't executable, matching the
+/// original's own "leave the resolved path NULL" outcome.
+pub(crate) fn f_exepath(argvars: &[TypvalT], rettv: &mut TypvalT) {
+    if crate::eval::typval::tv_check_for_nonempty_string_arg(argvars, 0) == crate::vim_defs::FAIL {
+        return;
+    }
+    let name = crate::eval::typval::tv_get_string(&argvars[0]);
+    let (_ok, path) = crate::os::fs::os_can_exe(&name, true, true);
+
+    #[cfg(windows)]
+    let path = path.map(|mut p| {
+        // SAFETY: p is a plain owned byte buffer with no aliasing.
+        unsafe { crate::path::slash_adjust(&mut p) };
+        p
+    });
+
+    rettv.value = TypvalValue::String(path);
+}
+
 /// `isdirectory({path})` - whether `{path}` is a directory
 /// (`f_isdirectory`, `eval/fs.c`), via the already-existing
 /// [`crate::os::fs::os_isdir`].
@@ -1006,6 +1044,81 @@ mod tests {
     }
 
     // --- f_isabsolutepath ---
+
+    #[test]
+    fn executable_is_false_for_a_bogus_name() {
+        let mut rettv = TypvalT::default();
+        f_executable(&[string(b"nero_definitely_not_a_real_command_xyz")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Number(0));
+    }
+
+    #[test]
+    fn executable_is_true_for_a_real_executable_given_by_full_path() {
+        let dir = std::env::temp_dir().join("nero_f_executable_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(if cfg!(windows) { "tool.exe" } else { "tool" });
+        std::fs::write(&path, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut rettv = TypvalT::default();
+        f_executable(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        let got = rettv.value.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, TypvalValue::Number(1));
+    }
+
+    #[test]
+    fn executable_rejects_a_non_string_argument() {
+        // The type check fails before anything is searched, leaving
+        // rettv exactly as the caller set it up.
+        let mut rettv = TypvalT::default();
+        f_executable(&[TypvalT { value: TypvalValue::Number(7), ..Default::default() }], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
+
+    #[test]
+    fn exepath_is_empty_for_a_bogus_name() {
+        let mut rettv = TypvalT::default();
+        f_exepath(&[string(b"nero_definitely_not_a_real_command_xyz")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::String(None));
+    }
+
+    #[test]
+    fn exepath_reports_the_full_path_of_a_real_executable() {
+        let dir = std::env::temp_dir().join("nero_f_exepath_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(if cfg!(windows) { "gizmo.exe" } else { "gizmo" });
+        std::fs::write(&path, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut rettv = TypvalT::default();
+        f_exepath(&[string(path.to_str().unwrap().as_bytes())], &mut rettv);
+        let got = rettv.value.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let TypvalValue::String(Some(bytes)) = got else {
+            panic!("expected a resolved path, got {got:?}");
+        };
+        let s = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
+        assert!(s.ends_with(if cfg!(windows) { "gizmo.exe" } else { "gizmo" }), "{s}");
+    }
+
+    #[test]
+    fn exepath_rejects_an_empty_argument() {
+        let mut rettv = TypvalT::default();
+        f_exepath(&[string(b"")], &mut rettv);
+        assert_eq!(rettv.value, TypvalValue::Unknown);
+    }
 
     #[test]
     fn isabsolutepath_true_for_an_absolute_path() {
