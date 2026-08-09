@@ -99,6 +99,88 @@
 
 use crate::buffer_defs::b_flags;
 
+/// Skip over an Ex command's line-range specification, returning how
+/// many bytes were consumed and, if the range turned out to be
+/// incomplete, the completion context the caller should switch to
+/// (`skip_range`).
+///
+/// The original takes an `int *ctx` out-parameter it writes only in
+/// the two "ran off the end" cases; an `Option` return says the same
+/// thing without a nullable pointer, matching this crate's convention.
+///
+/// `None` therefore means "leave the context alone", NOT
+/// [`crate::cmdexpand_defs::ExpandContext::Nothing`] - the difference
+/// matters, since the original leaves a caller's existing context
+/// untouched for a well-formed range.
+#[must_use]
+pub fn skip_range(cmd: &[u8]) -> (usize, Option<crate::cmdexpand_defs::ExpandContext>) {
+    // Out of bounds stands in for the original's NUL terminator.
+    let at = |i: usize| -> u8 { cmd.get(i).copied().unwrap_or(0) };
+
+    let mut ctx = None;
+    let mut i = 0;
+    while matches!(
+        at(i),
+        b' ' | b'\t'
+            | b'0'..=b'9'
+            | b'.'
+            | b'$'
+            | b'%'
+            | b'\''
+            | b'/'
+            | b'?'
+            | b'-'
+            | b'+'
+            | b','
+            | b';'
+            | b'\\'
+    ) {
+        if at(i) == b'\\' {
+            // Only these three may be backslash-escaped here; anything
+            // else ends the range.
+            if matches!(at(i + 1), b'?' | b'/' | b'&') {
+                i += 1;
+            } else {
+                break;
+            }
+        } else if at(i) == b'\'' {
+            // A mark: step onto its name, which may not be there.
+            i += 1;
+            if at(i) == 0 {
+                ctx = Some(crate::cmdexpand_defs::ExpandContext::Nothing);
+            }
+        } else if at(i) == b'/' || at(i) == b'?' {
+            let delim = at(i);
+            i += 1;
+            while at(i) != 0 && at(i) != delim {
+                let c = at(i);
+                i += 1;
+                if c == b'\\' && at(i) != 0 {
+                    i += 1;
+                }
+            }
+            if at(i) == 0 {
+                // Unterminated search pattern.
+                ctx = Some(crate::cmdexpand_defs::ExpandContext::Nothing);
+            }
+        }
+        if at(i) != 0 {
+            i += 1;
+        }
+    }
+
+    // Skip ":" and white space.
+    i += skip_colon_white(&cmd[i.min(cmd.len())..], false);
+
+    // Skip "*" used for a Visual range.
+    if at(i) == b'*' {
+        i += 1;
+        i += crate::charset::skipwhite(&cmd[i.min(cmd.len())..]);
+    }
+
+    (i, ctx)
+}
+
 /// Resolve a buffer-relative address into a buffer number
 /// (`compute_buffer_local_count`).
 ///
@@ -868,6 +950,106 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- skip_range ----
+
+    #[test]
+    fn skip_range_consumes_a_plain_numeric_range() {
+        let cmd = b"1,5delete";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"delete");
+        assert_eq!(ctx, None, "a well-formed range leaves the context alone");
+    }
+
+    #[test]
+    fn skip_range_consumes_the_special_address_characters() {
+        let cmd = b".,$print";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"print");
+        assert_eq!(ctx, None);
+
+        let cmd = b"%s/a/b/";
+        let (len, _) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"s/a/b/");
+    }
+
+    #[test]
+    fn skip_range_consumes_a_mark_address() {
+        let cmd = b"'a,'byank";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"yank");
+        assert_eq!(ctx, None);
+    }
+
+    /// A `'` with no mark name after it ran off the end, so there is
+    /// nothing left to complete.
+    #[test]
+    fn skip_range_reports_nothing_for_a_dangling_mark() {
+        let (_, ctx) = skip_range(b"'");
+        assert_eq!(ctx, Some(crate::cmdexpand_defs::ExpandContext::Nothing));
+    }
+
+    #[test]
+    fn skip_range_consumes_a_search_address() {
+        let cmd = b"/pat/delete";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"delete");
+        assert_eq!(ctx, None);
+    }
+
+    /// A delimiter escaped inside the pattern does not end it, so the
+    /// search runs to the real closing delimiter.
+    #[test]
+    fn skip_range_ignores_an_escaped_delimiter_inside_a_search() {
+        let cmd = br"/a\/b/print";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"print");
+        assert_eq!(ctx, None);
+    }
+
+    /// An unterminated search pattern also ran off the end.
+    #[test]
+    fn skip_range_reports_nothing_for_an_unterminated_search() {
+        let (_, ctx) = skip_range(b"/pat");
+        assert_eq!(ctx, Some(crate::cmdexpand_defs::ExpandContext::Nothing));
+    }
+
+    /// Only `?`, `/` and `&` may follow a backslash here; anything
+    /// else ends the range rather than being consumed.
+    #[test]
+    fn skip_range_stops_at_a_backslash_that_escapes_something_else() {
+        let cmd = br"\xrest";
+        let (len, _) = skip_range(cmd);
+        assert_eq!(len, 0, "the range ends immediately");
+    }
+
+    #[test]
+    fn skip_range_consumes_a_backslash_search_repeat() {
+        let cmd = br"\/delete";
+        let (len, _) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"delete");
+    }
+
+    /// A leading colon and any whitespace after the range are skipped,
+    /// as is the `*` marking a Visual range.
+    #[test]
+    fn skip_range_skips_a_trailing_colon_and_visual_star() {
+        let cmd = b"1,5: delete";
+        let (len, _) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"delete");
+
+        let cmd = b"'<,'>* delete";
+        let (len, _) = skip_range(cmd);
+        assert_eq!(&cmd[len..], b"delete");
+    }
+
+    #[test]
+    fn skip_range_consumes_nothing_for_a_bare_command() {
+        let cmd = b"write";
+        let (len, ctx) = skip_range(cmd);
+        assert_eq!(len, 0);
+        assert_eq!(ctx, None);
+    }
 
     // ---- compute_buffer_local_count ----
 
