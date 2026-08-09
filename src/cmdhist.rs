@@ -73,6 +73,12 @@
 //! for somewhere to put it; an owned `Vec<u8>` needs no scratch space,
 //! so `xp` is not a parameter here at all.
 //!
+//! Also translated: [`hist_iter`], the iterator over one history
+//! ring that `shada.c`'s history merger drives. The original hands
+//! the caller an opaque `const void *` into the ring; an index is
+//! used here instead, which needs no sentinel arithmetic and cannot
+//! outlive a reallocation of the table.
+//!
 //! Deferred: `f_histdel`/`del_history_entry` (need the untranslated
 //! regex engine) and `ex_history` (needs message display).
 
@@ -642,6 +648,85 @@ pub fn get_histtype(name: &[u8], return_default: bool) -> HistoryType {
     HistoryType::Invalid
 }
 
+/// Iterate over the history ring of `history_type`, oldest entry
+/// first (`hist_iter`).
+///
+/// Pass `None` as `iter` to start; the returned `Option<usize>` is
+/// the state to pass on the next call, and `None` means iteration is
+/// finished. When `zero` is set, each entry is CLEARED as it is read
+/// (used while reading a ShaDa file, which takes ownership).
+///
+/// The original walks raw `histentry_T *` pointers around the ring
+/// and hands the caller an opaque `const void *`; an index into the
+/// ring is used here instead, which needs no sentinel arithmetic and
+/// cannot outlive a reallocation of the table.
+///
+/// The returned entry has `hisstr == None` when there was nothing to
+/// read - the original signals the same thing by clearing `*hist`
+/// up front, and its own caller (`shada_hist_iter`) tests exactly
+/// that field.
+///
+/// # Safety
+/// Must not run concurrently with any other access to the history
+/// tables.
+#[must_use]
+pub unsafe fn hist_iter(
+    iter: Option<usize>,
+    history_type: HistoryType,
+    zero: bool,
+) -> (HistentryT, Option<usize>) {
+    let t = history_type as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    let hisidx = (unsafe { HISIDX.get_mut() })[t];
+    if hisidx == -1 {
+        return (HistentryT::default(), None);
+    }
+
+    let hislen = get_hislen();
+    // SAFETY: forwarded from this function's own safety doc.
+    let table = &mut (unsafe { HISTORY.get_mut() })[t];
+    // The original's hstart/hlast/hend are indices 0, hisidx and
+    // hislen - 1 respectively.
+    let hlast = hisidx as usize;
+    let hend = (hislen - 1) as usize;
+    if hlast >= table.len() || hend >= table.len() {
+        return (HistentryT::default(), None);
+    }
+
+    let hiter = match iter {
+        Some(i) => i,
+        None => {
+            // Scan forward from the newest entry for the oldest
+            // occupied slot, wrapping at the end of the ring. If the
+            // ring holds nothing else, this lands back on hlast.
+            let mut hfirst = hlast;
+            loop {
+                hfirst += 1;
+                if hfirst > hend {
+                    hfirst = 0;
+                }
+                if table[hfirst].hisstr.is_some() || hfirst == hlast {
+                    break;
+                }
+            }
+            hfirst
+        }
+    };
+    if hiter >= table.len() {
+        return (HistentryT::default(), None);
+    }
+
+    let hist = table[hiter].clone();
+    if zero {
+        clear_hist_entry(&mut table[hiter]);
+    }
+    if hiter == hlast {
+        return (hist, None);
+    }
+    let next = if hiter + 1 > hend { 0 } else { hiter + 1 };
+    (hist, Some(next))
+}
+
 /// Gets the identifier of the newest entry in history table `histype`
 /// (`get_history_idx`), or `-1` when there is no such entry.
 ///
@@ -956,6 +1041,137 @@ pub(crate) mod tests {
         (history[idx], hisidx[idx], hisnum[idx]) = saved;
         set_hislen(old_hislen);
         result
+    }
+
+    // --- hist_iter ---
+
+    /// Collects a whole iteration into a list of entry texts, exactly
+    /// as `shada.c`'s own `hms_insert_whole_neovim_history` loop
+    /// drives it.
+    fn collect_hist_iter(t: HistoryType, zero: bool) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut iter = None;
+        loop {
+            let (entry, next) = unsafe { hist_iter(iter, t, zero) };
+            if let Some(s) = entry.hisstr {
+                out.push(s[..entry.hisstrlen].to_vec());
+            }
+            match next {
+                Some(n) => iter = Some(n),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn hist_iter_reports_nothing_for_an_empty_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (entry, next) = unsafe { hist_iter(None, HistoryType::Cmd, false) };
+        assert!(entry.hisstr.is_none());
+        assert_eq!(next, None);
+    }
+
+    /// A full ring is walked oldest-first and ENDS on the newest
+    /// entry (`hisidx`), which is the last one yielded.
+    #[test]
+    fn hist_iter_walks_a_full_ring_oldest_entry_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(
+            HistoryType::Cmd,
+            &[(b"one", 0), (b"two", 0), (b"three", 0)],
+            || {
+                // hisidx is 2 ("three"), so iteration starts by
+                // wrapping past the end to index 0 and finishes on
+                // index 2.
+                assert_eq!(
+                    collect_hist_iter(HistoryType::Cmd, false),
+                    vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+                );
+            },
+        );
+    }
+
+    /// With the newest entry NOT at the end of the ring, iteration
+    /// must wrap: the entries after `hisidx` are older and come
+    /// first. An implementation that simply scanned 0..len would
+    /// return them in the wrong order.
+    #[test]
+    fn hist_iter_wraps_around_the_ring_from_the_newest_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(
+            HistoryType::Cmd,
+            &[(b"c", 0), (b"d", 0), (b"a", 0), (b"b", 0)],
+            || {
+                // Move the newest entry to index 1, making indices
+                // 2 and 3 the OLDER half of the ring.
+                let hisidx = unsafe { HISIDX.get_mut() };
+                hisidx[HistoryType::Cmd as usize] = 1;
+                assert_eq!(
+                    collect_hist_iter(HistoryType::Cmd, false),
+                    vec![
+                        b"a".to_vec(),
+                        b"b".to_vec(),
+                        b"c".to_vec(),
+                        b"d".to_vec()
+                    ]
+                );
+            },
+        );
+    }
+
+    /// Empty slots ahead of the newest entry are skipped by the
+    /// initial scan - a partly filled ring must not yield them.
+    #[test]
+    fn hist_iter_skips_the_unused_slots_of_a_partly_filled_ring() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"x", 0), (b"y", 0), (b"z", 0)], || {
+            // Clear the tail of the ring, leaving only indices 0..=1
+            // occupied, with the newest at index 1.
+            let table = unsafe { HISTORY.get_mut() };
+            clear_hist_entry(&mut table[HistoryType::Cmd as usize][2]);
+            let hisidx = unsafe { HISIDX.get_mut() };
+            hisidx[HistoryType::Cmd as usize] = 1;
+            assert_eq!(
+                collect_hist_iter(HistoryType::Cmd, false),
+                vec![b"x".to_vec(), b"y".to_vec()]
+            );
+        });
+    }
+
+    /// `zero` empties each entry as it is read - this is what lets
+    /// the ShaDa reader take ownership of the strings.
+    #[test]
+    fn hist_iter_with_zero_clears_each_entry_as_it_is_read() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            assert_eq!(
+                collect_hist_iter(HistoryType::Cmd, true),
+                vec![b"one".to_vec(), b"two".to_vec()]
+            );
+            // Everything has been consumed.
+            let table = unsafe { HISTORY.get_mut() };
+            for entry in &table[HistoryType::Cmd as usize] {
+                assert!(entry.hisstr.is_none());
+            }
+        });
+    }
+
+    /// Without `zero` the table must be left untouched.
+    #[test]
+    fn hist_iter_without_zero_leaves_the_table_intact() {
+        let _lock = crate::globals::global_state_test_lock();
+        with_history(HistoryType::Cmd, &[(b"one", 0), (b"two", 0)], || {
+            let _ = collect_hist_iter(HistoryType::Cmd, false);
+            let table = unsafe { HISTORY.get_mut() };
+            assert_eq!(
+                table[HistoryType::Cmd as usize]
+                    .iter()
+                    .filter(|e| e.hisstr.is_some())
+                    .count(),
+                2
+            );
+        });
     }
 
     #[test]
