@@ -191,6 +191,87 @@ pub unsafe fn syn_add_cluster(name: Vec<u8>) -> i32 {
     len + SYNID_CLUSTER
 }
 
+/// What [`syn_combine_list`] should do with the second list
+/// (`CLUSTER_REPLACE`/`CLUSTER_ADD`/`CLUSTER_SUBTRACT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterOp {
+    /// replace the first list with the second (`CLUSTER_REPLACE`).
+    Replace,
+    /// add the second list to the first (`CLUSTER_ADD`).
+    Add,
+    /// subtract the second list from the first (`CLUSTER_SUBTRACT`).
+    Subtract,
+}
+
+/// Combine two syntax group-id lists in place (`syn_combine_list`).
+///
+/// `clstr2` is consumed, matching the original: it is either moved
+/// into `clstr1` or freed, and the caller must not use it again. A
+/// by-value `Vec` says exactly that, where the original's
+/// `int16_t **` leaves the caller holding a dangling pointer.
+///
+/// The original's empty lists are represented by a NULL pointer, never
+/// by a list holding only its terminator (an empty merge result is
+/// stored as NULL), so an empty `Vec` is the faithful equivalent of
+/// both.
+///
+/// Both lists are sorted, then merged in one pass. The original walks
+/// them twice - once to count, once to fill a freshly sized
+/// allocation - which a growable `Vec` makes unnecessary.
+pub fn syn_combine_list(clstr1: &mut Vec<i16>, clstr2: Vec<i16>, list_op: ClusterOp) {
+    // Handle degenerate cases.
+    if clstr2.is_empty() {
+        return;
+    }
+    if clstr1.is_empty() || list_op == ClusterOp::Replace {
+        if matches!(list_op, ClusterOp::Replace | ClusterOp::Add) {
+            *clstr1 = clstr2;
+        }
+        // Subtracting from an empty list leaves it empty, and drops
+        // `clstr2` - the original's `xfree` of the same.
+        return;
+    }
+
+    // For speed purposes, sort both lists.
+    let mut g1 = std::mem::take(clstr1);
+    let mut g2 = clstr2;
+    g1.sort_by(|a, b| syn_compare_stub(*a, *b).cmp(&0));
+    g2.sort_by(|a, b| syn_compare_stub(*a, *b).cmp(&0));
+
+    // Merge, always taking from the first list, and from the second
+    // only when adding.
+    let mut out: Vec<i16> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < g1.len() && j < g2.len() {
+        // We always want to add from the first list.
+        if g1[i] < g2[j] {
+            out.push(g1[i]);
+            i += 1;
+            continue;
+        }
+        // We only want to add from the second list if we're adding
+        // the lists.
+        if list_op == ClusterOp::Add {
+            out.push(g2[j]);
+        }
+        // An id present in both is consumed from the first too, which
+        // is what makes a subtract remove it.
+        if g1[i] == g2[j] {
+            i += 1;
+        }
+        j += 1;
+    }
+
+    // Now add the leftovers from whichever list didn't get finished
+    // first. As before, only take from the second when adding.
+    out.extend_from_slice(&g1[i..]);
+    if list_op == ClusterOp::Add {
+        out.extend_from_slice(&g2[j..]);
+    }
+
+    *clstr1 = out;
+}
+
 /// One syntax cluster - a named set of syntax group ids
 /// (`syn_cluster_T`).
 ///
@@ -387,6 +468,94 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- syn_combine_list ----
+
+    #[test]
+    fn syn_combine_list_leaves_the_first_list_alone_for_an_empty_second() {
+        let mut a = vec![3i16, 1];
+        syn_combine_list(&mut a, Vec::new(), ClusterOp::Add);
+        assert_eq!(a, vec![3, 1], "an empty second list is a no-op, unsorted");
+    }
+
+    #[test]
+    fn syn_combine_list_replace_overwrites_regardless_of_the_first_list() {
+        let mut a = vec![1i16, 2, 3];
+        syn_combine_list(&mut a, vec![9, 8], ClusterOp::Replace);
+        assert_eq!(a, vec![9, 8], "replace takes the second list verbatim");
+    }
+
+    #[test]
+    fn syn_combine_list_add_to_an_empty_first_list_takes_the_second() {
+        let mut a: Vec<i16> = Vec::new();
+        syn_combine_list(&mut a, vec![4, 2], ClusterOp::Add);
+        assert_eq!(a, vec![4, 2]);
+    }
+
+    /// Subtracting from an empty list leaves it empty rather than
+    /// adopting the second list.
+    #[test]
+    fn syn_combine_list_subtract_from_an_empty_first_list_stays_empty() {
+        let mut a: Vec<i16> = Vec::new();
+        syn_combine_list(&mut a, vec![4, 2], ClusterOp::Subtract);
+        assert!(a.is_empty());
+    }
+
+    /// Adding merges both lists in sorted order, and an id present in
+    /// both appears once, not twice.
+    #[test]
+    fn syn_combine_list_add_merges_sorted_and_deduplicates_the_overlap() {
+        let mut a = vec![5i16, 1, 3];
+        syn_combine_list(&mut a, vec![4, 3, 2], ClusterOp::Add);
+        assert_eq!(a, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn syn_combine_list_subtract_removes_only_the_shared_ids() {
+        let mut a = vec![5i16, 1, 3, 2];
+        syn_combine_list(&mut a, vec![3, 5], ClusterOp::Subtract);
+        assert_eq!(a, vec![1, 2]);
+    }
+
+    /// Ids in the second list that aren't in the first are simply
+    /// skipped by a subtract, not added.
+    #[test]
+    fn syn_combine_list_subtract_ignores_ids_absent_from_the_first() {
+        let mut a = vec![1i16, 2];
+        syn_combine_list(&mut a, vec![7, 9], ClusterOp::Subtract);
+        assert_eq!(a, vec![1, 2]);
+    }
+
+    /// Subtracting everything yields an empty list.
+    #[test]
+    fn syn_combine_list_subtract_can_empty_the_first_list() {
+        let mut a = vec![2i16, 1];
+        syn_combine_list(&mut a, vec![1, 2], ClusterOp::Subtract);
+        assert!(a.is_empty());
+    }
+
+    /// A duplicate within the first list is only cancelled once per
+    /// matching id in the second, matching the original's own
+    /// one-step-each merge.
+    #[test]
+    fn syn_combine_list_subtract_cancels_one_duplicate_per_match() {
+        let mut a = vec![5i16, 5, 1];
+        syn_combine_list(&mut a, vec![5], ClusterOp::Subtract);
+        assert_eq!(a, vec![1, 5], "only one of the two 5s is removed");
+    }
+
+    /// Leftovers from the first list are always kept; leftovers from
+    /// the second are kept only when adding.
+    #[test]
+    fn syn_combine_list_keeps_first_list_leftovers_but_not_second_on_subtract() {
+        let mut add = vec![1i16];
+        syn_combine_list(&mut add, vec![2, 3], ClusterOp::Add);
+        assert_eq!(add, vec![1, 2, 3]);
+
+        let mut sub = vec![1i16, 8, 9];
+        syn_combine_list(&mut sub, vec![2], ClusterOp::Subtract);
+        assert_eq!(sub, vec![1, 8, 9]);
     }
 
     // ---- syn_check_cluster / syn_add_cluster ----
