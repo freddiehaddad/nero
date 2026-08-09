@@ -34,6 +34,12 @@
 //! window pointer and its virtual column, with no observable effect,
 //! so reproducing it would add mutable statics for nothing.
 //!
+//! Also translated: [`get_lcs_ext`] (the `'listchars'` `"extends"`
+//! character) and [`foldcolumn_sep_char`] (the `'fillchars'`
+//! fold-level separator), both small `static` helpers of `win_line`'s
+//! own drawing loop with no design freedom, translated ahead of their
+//! real callers like the two above.
+//!
 //! Deferred: everything else in the file.
 
 use crate::buffer_defs::WinT;
@@ -46,6 +52,48 @@ pub fn use_cursor_line_highlight(wp: &WinT, lnum: LinenrT) -> bool {
     wp.w_onebuf_opt.wo_cul != 0
         && lnum == wp.w_cursorline
         && (wp.w_p_culopt_flags & crate::option_vars::opt_culopt_flag::NUMBER as u8) != 0
+}
+
+/// The `'listchars'` `"extends"` character to show that a line
+/// continues beyond the right of the screen (`get_lcs_ext`).
+///
+/// Returns `NUL` when nothing should be shown.
+#[must_use]
+pub fn get_lcs_ext(wp: &WinT) -> crate::types_defs::ScharT {
+    if wp.w_onebuf_opt.wo_wrap != 0 {
+        // Line never continues beyond the right of the screen with
+        // 'wrap'.
+        return 0;
+    }
+    if wp.w_onebuf_opt.wo_wrap_flags & crate::option_defs::opt_flags::INSECURE != 0 {
+        // If 'nowrap' was set from a modeline, forcibly use '>'.
+        return crate::grid::schar_from_ascii(b'>');
+    }
+    if wp.w_onebuf_opt.wo_list != 0 {
+        wp.w_p_lcs_chars.ext
+    } else {
+        0
+    }
+}
+
+/// The `'fillchars'` character separating fold levels in the fold
+/// column (`foldcolumn_sep_char`).
+///
+/// `first_level` is the fold level of the first (outermost) fold on
+/// the line and `i` the offset of the column being drawn within it.
+#[must_use]
+pub fn foldcolumn_sep_char(first_level: i32, i: i32, wp: &WinT) -> crate::types_defs::ScharT {
+    if first_level == 1 {
+        wp.w_p_fcs_chars.foldsep
+    } else if wp.w_p_fcs_chars.foldinner != 0 {
+        wp.w_p_fcs_chars.foldinner
+    } else if first_level + i <= 9 {
+        // Only a single-digit level fits in one cell; the guard above
+        // is what keeps this in '0'..='9'.
+        crate::grid::schar_from_ascii((b'0' as i32 + first_level + i) as u8)
+    } else {
+        crate::grid::schar_from_ascii(b'>')
+    }
 }
 
 /// Compute the margins between which `'cursorlineopt'`'s
@@ -99,6 +147,114 @@ pub fn get_rightmost_vcol(wp: &WinT, color_cols: Option<&[i32]>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- get_lcs_ext ----
+
+    /// With 'wrap' on, a line never runs off the right edge, so the
+    /// "extends" char must be suppressed even when 'list' is on and a
+    /// char is configured.
+    #[test]
+    fn lcs_ext_is_suppressed_while_wrapping() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 1;
+        wp.w_onebuf_opt.wo_list = 1;
+        wp.w_p_lcs_chars.ext = u32::from(b'#');
+        assert_eq!(get_lcs_ext(&wp), 0);
+    }
+
+    /// A 'nowrap' coming from a modeline forces '>' - overriding both
+    /// 'list' being off and any configured char.
+    #[test]
+    fn lcs_ext_is_forced_to_gt_when_nowrap_came_from_a_modeline() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 0;
+        wp.w_onebuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::INSECURE;
+        wp.w_onebuf_opt.wo_list = 0;
+        wp.w_p_lcs_chars.ext = u32::from(b'#');
+        assert_eq!(get_lcs_ext(&wp), crate::grid::schar_from_ascii(b'>'));
+    }
+
+    /// 'wrap' is checked BEFORE the insecure flag, so a wrapping
+    /// window ignores the modeline override entirely.
+    #[test]
+    fn lcs_ext_prefers_wrap_over_the_modeline_override() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 1;
+        wp.w_onebuf_opt.wo_wrap_flags = crate::option_defs::opt_flags::INSECURE;
+        assert_eq!(get_lcs_ext(&wp), 0);
+    }
+
+    #[test]
+    fn lcs_ext_uses_the_configured_char_only_with_list_on() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 0;
+        wp.w_p_lcs_chars.ext = u32::from(b'#');
+
+        wp.w_onebuf_opt.wo_list = 0;
+        assert_eq!(get_lcs_ext(&wp), 0);
+
+        wp.w_onebuf_opt.wo_list = 1;
+        assert_eq!(get_lcs_ext(&wp), u32::from(b'#'));
+    }
+
+    // ---- foldcolumn_sep_char ----
+
+    /// The outermost level uses 'foldsep', regardless of what
+    /// 'foldinner' is set to.
+    #[test]
+    fn foldcolumn_sep_uses_foldsep_at_the_first_level() {
+        let mut wp = WinT::default();
+        wp.w_p_fcs_chars.foldsep = u32::from(b'|');
+        wp.w_p_fcs_chars.foldinner = u32::from(b'!');
+        assert_eq!(foldcolumn_sep_char(1, 0, &wp), u32::from(b'|'));
+    }
+
+    /// Deeper levels use 'foldinner' when it is set - and NOT the
+    /// digit fallback, even though the level would fit in one cell.
+    #[test]
+    fn foldcolumn_sep_uses_foldinner_below_the_first_level() {
+        let mut wp = WinT::default();
+        wp.w_p_fcs_chars.foldsep = u32::from(b'|');
+        wp.w_p_fcs_chars.foldinner = u32::from(b'!');
+        assert_eq!(foldcolumn_sep_char(2, 0, &wp), u32::from(b'!'));
+    }
+
+    /// With 'foldinner' unset, the level itself is drawn as a digit.
+    #[test]
+    fn foldcolumn_sep_falls_back_to_the_level_digit() {
+        let mut wp = WinT::default();
+        wp.w_p_fcs_chars.foldsep = u32::from(b'|');
+        wp.w_p_fcs_chars.foldinner = 0;
+        assert_eq!(
+            foldcolumn_sep_char(2, 0, &wp),
+            crate::grid::schar_from_ascii(b'2')
+        );
+        // The offset within the fold advances the digit.
+        assert_eq!(
+            foldcolumn_sep_char(2, 3, &wp),
+            crate::grid::schar_from_ascii(b'5')
+        );
+        assert_eq!(
+            foldcolumn_sep_char(9, 0, &wp),
+            crate::grid::schar_from_ascii(b'9')
+        );
+    }
+
+    /// Past a single digit there is no room, so '>' is drawn. The
+    /// boundary is on first_level + i, not first_level alone.
+    #[test]
+    fn foldcolumn_sep_uses_gt_past_a_single_digit() {
+        let mut wp = WinT::default();
+        wp.w_p_fcs_chars.foldinner = 0;
+        assert_eq!(
+            foldcolumn_sep_char(10, 0, &wp),
+            crate::grid::schar_from_ascii(b'>')
+        );
+        assert_eq!(
+            foldcolumn_sep_char(9, 1, &wp),
+            crate::grid::schar_from_ascii(b'>')
+        );
+    }
 
     // ---- margin_columns_win ----
 
