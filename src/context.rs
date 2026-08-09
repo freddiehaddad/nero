@@ -24,6 +24,12 @@
 //! this "skipped `ctx_switch()`" usage pattern as a first-class,
 //! intentional no-op case - not an edge case being special-cased away.
 //!
+//! Also translated: [`ctx_saved_curwin`] (the window that was current
+//! when the outermost `ctx_switch()` began) and
+//! [`ctx_restore_curwin`] (restoring `curwin`/`curbuf`/`prevwin` from
+//! a `CtxSwitch`), both reachable now that
+//! `crate::window::win_find_by_handle` is real.
+//!
 //! `ctx_free` (frees a `Context`'s own `regs`/`jumps`/`bufs`/`gvars`/
 //! `funcs` fields) needs NO Rust equivalent at all: `context_defs.rs`'s
 //! `Context` already models every one of those fields as an owned
@@ -59,6 +65,66 @@ pub fn is_ctx_win(win: *mut crate::buffer_defs::WinT) -> bool {
     unsafe { CTX_WIN_VEC.get_mut() }.iter().any(|cw| cw.cw_used && std::ptr::eq(cw.cw_win, win))
 }
 
+/// `_ctx_saved_curwin` - the window that was current when the
+/// outermost `ctx_switch()` began.
+///
+/// Only ever set by `ctx_switch`/`ctx_restore` (neither translated),
+/// so this stays `0` in this crate today, matching this file's own
+/// established treatment of `CTX_WIN_VEC`.
+static CTX_SAVED_CURWIN: crate::globals::GlobalCell<crate::types_defs::HandleT> =
+    crate::globals::GlobalCell::new(0);
+
+/// The window that was current when the outermost `ctx_switch()`
+/// began, or null if no switch is in progress (`ctx_saved_curwin`).
+///
+/// A `0` handle is the "nothing saved" sentinel and is checked BEFORE
+/// the lookup, so it never reaches `win_find_by_handle`.
+///
+/// # Safety
+/// Forwarded from [`crate::window::win_find_by_handle`]'s own safety
+/// doc.
+#[must_use]
+pub unsafe fn ctx_saved_curwin() -> *mut crate::buffer_defs::WinT {
+    // SAFETY: a plain read through one exclusive borrow.
+    let handle = unsafe { *CTX_SAVED_CURWIN.get_mut() };
+    if handle == 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::window::win_find_by_handle(handle) }
+}
+
+/// Restore `curwin`/`curbuf` and `prevwin` from `cs`, entering
+/// `fallback` if the saved window no longer exists
+/// (`ctx_restore_curwin`).
+///
+/// Note the asymmetry the original has: `curwin` is only reassigned
+/// when a window was actually found (so a vanished window with no
+/// fallback leaves the current one alone), whereas `prevwin` is
+/// assigned unconditionally and so may legitimately become null.
+///
+/// # Safety
+/// Forwarded from [`crate::window::win_find_by_handle`]'s own safety
+/// doc; the resolved window's `w_buffer` must be valid.
+pub unsafe fn ctx_restore_curwin(cs: &CtxSwitch, fallback: *mut crate::buffer_defs::WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut save_curwin = unsafe { crate::window::win_find_by_handle(cs.cs_curwin) };
+    if save_curwin.is_null() {
+        save_curwin = fallback; // Hmm, original window disappeared.
+    }
+    if !save_curwin.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.curwin = save_curwin;
+        // SAFETY: forwarded from this function's own safety doc.
+        globals.curbuf = unsafe { &*save_curwin }.w_buffer;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let prevwin = unsafe { crate::window::win_find_by_handle(cs.cs_prevwin) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.prevwin = prevwin;
+}
+
 /// Undoes `ctx_switch()`: restores the previous location (if
 /// possible) and the kept state.
 ///
@@ -86,6 +152,130 @@ pub fn ctx_restore(cs: &CtxSwitch) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ctx_saved_curwin / ctx_restore_curwin ---
+
+    /// Saves and restores `curwin`/`curbuf`/`prevwin` across a test,
+    /// even through a panic, so a failing test cannot leave dangling
+    /// pointers in the globals for whichever test runs next.
+    struct CurwinGuard {
+        curwin: *mut crate::buffer_defs::WinT,
+        curbuf: *mut crate::buffer_defs::BufT,
+        prevwin: *mut crate::buffer_defs::WinT,
+        firstwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl CurwinGuard {
+        fn save() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                curwin: g.curwin,
+                curbuf: g.curbuf,
+                prevwin: g.prevwin,
+                firstwin: g.firstwin,
+            }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.curwin = self.curwin;
+            g.curbuf = self.curbuf;
+            g.prevwin = self.prevwin;
+            g.firstwin = self.firstwin;
+        }
+    }
+
+    /// A zero handle means "nothing saved" and must be answered
+    /// without ever consulting the window list.
+    #[test]
+    fn ctx_saved_curwin_is_null_when_nothing_was_saved() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { ctx_saved_curwin() }.is_null());
+    }
+
+    #[test]
+    fn ctx_restore_curwin_restores_the_saved_window_and_its_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.handle = 42;
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+        win.w_next = std::ptr::null_mut();
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = std::ptr::from_mut(&mut *win);
+        globals.curwin = std::ptr::null_mut();
+        globals.curbuf = std::ptr::null_mut();
+
+        let cs = CtxSwitch { cs_curwin: 42, cs_prevwin: 0, ..Default::default() };
+        unsafe { ctx_restore_curwin(&cs, std::ptr::null_mut()) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(std::ptr::eq(globals.curwin, std::ptr::from_mut(&mut *win)));
+        assert!(std::ptr::eq(globals.curbuf, std::ptr::from_mut(&mut *buf)));
+        // A zero prevwin handle resolves to nothing.
+        assert!(globals.prevwin.is_null());
+    }
+
+    /// When the saved window is gone, the fallback is entered instead.
+    #[test]
+    fn ctx_restore_curwin_enters_the_fallback_when_the_saved_window_vanished() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        let mut fallback = Box::new(crate::buffer_defs::WinT::default());
+        fallback.handle = 7;
+        fallback.w_buffer = std::ptr::from_mut(&mut *buf);
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = std::ptr::null_mut(); // no windows to find
+        globals.curwin = std::ptr::null_mut();
+
+        // Handle 999 does not exist.
+        let cs = CtxSwitch { cs_curwin: 999, cs_prevwin: 0, ..Default::default() };
+        unsafe { ctx_restore_curwin(&cs, std::ptr::from_mut(&mut *fallback)) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(std::ptr::eq(globals.curwin, std::ptr::from_mut(&mut *fallback)));
+        assert!(std::ptr::eq(globals.curbuf, std::ptr::from_mut(&mut *buf)));
+    }
+
+    /// The asymmetry: with the saved window gone AND no fallback,
+    /// `curwin` is left alone rather than being nulled - but
+    /// `prevwin` is assigned unconditionally and so does become null.
+    #[test]
+    fn ctx_restore_curwin_leaves_curwin_alone_but_still_clears_prevwin() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurwinGuard::save();
+
+        let mut existing = Box::new(crate::buffer_defs::WinT::default());
+        existing.handle = 3;
+        let mut stale_prev = Box::new(crate::buffer_defs::WinT::default());
+        stale_prev.handle = 4;
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        globals.firstwin = std::ptr::null_mut(); // nothing findable
+        globals.curwin = std::ptr::from_mut(&mut *existing);
+        globals.prevwin = std::ptr::from_mut(&mut *stale_prev);
+
+        let cs = CtxSwitch { cs_curwin: 999, cs_prevwin: 998, ..Default::default() };
+        unsafe { ctx_restore_curwin(&cs, std::ptr::null_mut()) };
+
+        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(
+            std::ptr::eq(globals.curwin, std::ptr::from_mut(&mut *existing)),
+            "curwin must survive a vanished window with no fallback"
+        );
+        assert!(
+            globals.prevwin.is_null(),
+            "prevwin is assigned unconditionally, so it may become null"
+        );
+    }
 
     #[test]
     fn ctx_restore_is_a_noop_for_a_default_zeroed_ctx_switch() {
