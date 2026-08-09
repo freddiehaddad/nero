@@ -379,6 +379,30 @@ pub unsafe fn screen_invalidate_highlights() {
     }
 }
 
+/// Whether a "press a number" prompt (as used by `:browse` and
+/// `inputlist()`) is currently waiting on the command line
+/// (`cmdline_number_prompt`).
+///
+/// A resize must not disturb such a prompt, so `screen_resize` bails
+/// out while one is up. It only applies to the built-in command line:
+/// an external messages UI draws the prompt itself and is unaffected.
+///
+/// # Safety
+/// Reads `GLOBALS.State` and the `ccline` file-static.
+#[must_use]
+pub unsafe fn cmdline_number_prompt() -> bool {
+    if crate::ui::ui_has(crate::ui::UiExtension::Messages) {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { crate::globals::GLOBALS.get_mut() }.State as u32;
+    if state & crate::state_defs::mode::CMDLINE == 0 {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    !unsafe { (*crate::ex_getln::get_cmdline_info()).mouse_used }.is_null()
+}
+
 /// The `'fillchars'` connector character to draw at one corner of a
 /// window, where its separators meet its neighbours'
 /// (`get_corner_sep_connector`).
@@ -1462,6 +1486,65 @@ mod tests {
             assert!(!unsafe { hsep_connected(&mut win, corner) });
             assert!(!unsafe { vsep_connected(&mut win, corner) });
         }
+    }
+
+    // ---- cmdline_number_prompt ----
+
+    /// Every condition must hold, so each test below satisfies the
+    /// others and breaks exactly one.
+    #[test]
+    fn cmdline_number_prompt_is_false_outside_cmdline_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::NORMAL as i32;
+
+        let ccline = unsafe { crate::ex_getln::get_cmdline_info() };
+        let prev_mouse = unsafe { (*ccline).mouse_used };
+        let mut used = Box::new(false);
+        unsafe { (*ccline).mouse_used = std::ptr::from_mut(&mut *used) };
+
+        assert!(!unsafe { cmdline_number_prompt() });
+
+        unsafe { (*ccline).mouse_used = prev_mouse };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    /// Without a pending mouse-click slot there is no number prompt,
+    /// even in cmdline mode.
+    #[test]
+    fn cmdline_number_prompt_is_false_without_a_mouse_used_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let ccline = unsafe { crate::ex_getln::get_cmdline_info() };
+        let prev_mouse = unsafe { (*ccline).mouse_used };
+        unsafe { (*ccline).mouse_used = std::ptr::null_mut() };
+
+        assert!(!unsafe { cmdline_number_prompt() });
+
+        unsafe { (*ccline).mouse_used = prev_mouse };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
+    }
+
+    #[test]
+    fn cmdline_number_prompt_is_true_in_cmdline_mode_with_a_mouse_used_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        g.State = crate::state_defs::mode::CMDLINE as i32;
+
+        let ccline = unsafe { crate::ex_getln::get_cmdline_info() };
+        let prev_mouse = unsafe { (*ccline).mouse_used };
+        let mut used = Box::new(false);
+        unsafe { (*ccline).mouse_used = std::ptr::from_mut(&mut *used) };
+
+        assert!(unsafe { cmdline_number_prompt() });
+
+        unsafe { (*ccline).mouse_used = prev_mouse };
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev_state;
     }
 
     // ---- get_corner_sep_connector / win_cursorline_standout ----
