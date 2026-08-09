@@ -241,9 +241,96 @@ pub unsafe fn spell_check_msm() -> i32 {
     OK
 }
 
+/// Turn a multi-byte string into a wide character string
+/// (`mb_str2wide`).
+///
+/// The result is NUL-terminated, matching the original's trailing
+/// `res[i] = NUL`, so callers that scan for a terminator still work.
+///
+/// Note what the original does with combining characters, which is
+/// preserved exactly: it reads the BASE character with
+/// `utf_ptr2char` but advances by `utfc_ptr2len`, which spans any
+/// combining characters that follow. Those are therefore consumed
+/// without being emitted, so the result can be shorter than the
+/// string's character count.
+///
+/// The original sizes its allocation up front from `mb_charlen`; a
+/// growable `Vec` makes that unnecessary, which also sidesteps the
+/// original's over-allocation whenever combining characters are
+/// dropped.
+///
+/// # Safety
+/// Touches `OPTION_VARS` via [`crate::mbyte::utfc_ptr2len`] - the
+/// same requirement as every other function that does so.
+#[must_use]
+pub unsafe fn mb_str2wide(s: &[u8]) -> Vec<i32> {
+    let mut res = Vec::new();
+    let mut p = 0usize;
+    while p < s.len() && s[p] != 0 {
+        res.push(crate::mbyte::utf_ptr2char(&s[p..]));
+        // SAFETY: forwarded from this function's own safety doc. The
+        // `max(1)` keeps a malformed byte from stalling the scan.
+        p += (unsafe { crate::mbyte::utfc_ptr2len(&s[p..]) }).max(1) as usize;
+    }
+    res.push(0);
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- mb_str2wide ---
+
+    #[test]
+    fn mb_str2wide_converts_ascii_and_nul_terminates() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { mb_str2wide(b"abc") }, vec![0x61, 0x62, 0x63, 0]);
+    }
+
+    /// An empty string yields just the terminator, not an empty
+    /// vector.
+    #[test]
+    fn mb_str2wide_returns_only_the_terminator_for_an_empty_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { mb_str2wide(b"") }, vec![0]);
+    }
+
+    /// Conversion stops at an embedded NUL, matching the original's
+    /// `*p != NUL` loop condition.
+    #[test]
+    fn mb_str2wide_stops_at_an_embedded_nul() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { mb_str2wide(b"ab\0cd") }, vec![0x61, 0x62, 0]);
+    }
+
+    /// Multi-byte characters become single code points, so the result
+    /// is shorter than the byte length.
+    #[test]
+    fn mb_str2wide_decodes_multibyte_characters_to_code_points() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "é" (U+00E9, 2 bytes) then "€" (U+20AC, 3 bytes).
+        let s = "aé€".as_bytes();
+        assert_eq!(s.len(), 6, "6 bytes but 3 characters");
+        assert_eq!(unsafe { mb_str2wide(s) }, vec![0x61, 0xE9, 0x20AC, 0]);
+    }
+
+    /// A combining character is consumed by the advance but never
+    /// emitted, since the original reads the base character with
+    /// `utf_ptr2char` while advancing by `utfc_ptr2len`. Only the
+    /// base "a" survives.
+    #[test]
+    fn mb_str2wide_drops_combining_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        // "a" followed by U+0301 COMBINING ACUTE ACCENT.
+        let s = "a\u{0301}b".as_bytes();
+        assert_eq!(s.len(), 4);
+        assert_eq!(
+            unsafe { mb_str2wide(s) },
+            vec![0x61, 0x62, 0],
+            "the combining accent is consumed, not emitted"
+        );
+    }
 
     // --- str_equal ---
 
