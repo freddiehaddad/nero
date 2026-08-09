@@ -99,6 +99,19 @@
 
 use crate::buffer_defs::b_flags;
 
+/// Whether `cmdidx` names a location-list command rather than its
+/// quickfix counterpart (`is_loclist_cmd`).
+///
+/// The test is deliberately the same one the original uses: every
+/// location-list command is spelled as its quickfix sibling with a
+/// leading `l` (`:lgrep` beside `:grep`, `:lopen` beside `:copen`), so
+/// the first letter alone decides it. An out-of-range or user command
+/// is not one.
+#[must_use]
+pub fn is_loclist_cmd(cmdidx: crate::ex_cmds_defs::CmdIdxT) -> bool {
+    crate::ex_cmds_defs::cmdname(cmdidx).is_some_and(|name| name.first() == Some(&b'l'))
+}
+
 /// Skip over an Ex command's line-range specification, returning how
 /// many bytes were consumed and, if the range turned out to be
 /// incomplete, the completion context the caller should switch to
@@ -950,6 +963,98 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- CMDNAMES / cmdname / is_loclist_cmd ----
+
+    /// The table is generated, so the tests verify its ALIGNMENT
+    /// rather than re-listing it: a table shifted by one would still
+    /// have the right length and contents, and only an index check
+    /// catches that.
+    #[test]
+    fn cmdnames_has_one_entry_per_command_index() {
+        use crate::ex_cmds_defs::{CmdIdxT, CMDNAMES};
+        assert_eq!(CMDNAMES.len(), CmdIdxT::SIZE as usize);
+    }
+
+    /// Spot-check entries spread across the table against the
+    /// discriminants they must line up with. These were chosen at the
+    /// start, middle and end so a shift anywhere shows up.
+    #[test]
+    fn cmdnames_line_up_with_their_command_indices() {
+        use crate::ex_cmds_defs::{cmdname, CmdIdxT};
+        assert_eq!(cmdname(CmdIdxT::append), Some(&b"append"[..]));
+        assert_eq!(cmdname(CmdIdxT::abbreviate), Some(&b"abbreviate"[..]));
+        assert_eq!(cmdname(CmdIdxT::fold), Some(&b"fold"[..]));
+        assert_eq!(cmdname(CmdIdxT::foldopen), Some(&b"foldopen"[..]));
+        assert_eq!(cmdname(CmdIdxT::foldclose), Some(&b"foldclose"[..]));
+        assert_eq!(cmdname(CmdIdxT::substitute), Some(&b"substitute"[..]));
+        assert_eq!(cmdname(CmdIdxT::yank), Some(&b"yank"[..]));
+        assert_eq!(cmdname(CmdIdxT::Next), Some(&b"Next"[..]));
+    }
+
+    /// The Rust-keyword commands are stored under their real names,
+    /// not the `r#`-escaped spelling their variants need.
+    #[test]
+    fn cmdnames_use_real_names_for_keyword_spelled_variants() {
+        use crate::ex_cmds_defs::{cmdname, CmdIdxT};
+        assert_eq!(cmdname(CmdIdxT::r#if), Some(&b"if"[..]));
+        assert_eq!(cmdname(CmdIdxT::r#while), Some(&b"while"[..]));
+        assert_eq!(cmdname(CmdIdxT::r#return), Some(&b"return"[..]));
+    }
+
+    /// The eight punctuation commands keep their real single-character
+    /// names, not the spelled-out variant identifiers.
+    #[test]
+    fn cmdnames_use_punctuation_for_the_symbol_commands() {
+        use crate::ex_cmds_defs::{cmdname, CmdIdxT};
+        assert_eq!(cmdname(CmdIdxT::bang), Some(&b"!"[..]));
+        assert_eq!(cmdname(CmdIdxT::pound), Some(&b"#"[..]));
+        assert_eq!(cmdname(CmdIdxT::and), Some(&b"&"[..]));
+        assert_eq!(cmdname(CmdIdxT::lshift), Some(&b"<"[..]));
+        assert_eq!(cmdname(CmdIdxT::equal), Some(&b"="[..]));
+        assert_eq!(cmdname(CmdIdxT::rshift), Some(&b">"[..]));
+        assert_eq!(cmdname(CmdIdxT::at), Some(&b"@"[..]));
+        assert_eq!(cmdname(CmdIdxT::tilde), Some(&b"~"[..]));
+    }
+
+    /// No entry may be empty - `is_loclist_cmd` reads the first byte
+    /// of every one of them.
+    #[test]
+    fn cmdnames_are_all_non_empty() {
+        use crate::ex_cmds_defs::CMDNAMES;
+        assert!(CMDNAMES.iter().all(|n| !n.is_empty()));
+    }
+
+    #[test]
+    fn cmdname_rejects_user_commands_and_the_size_sentinel() {
+        use crate::ex_cmds_defs::{cmdname, CmdIdxT};
+        assert_eq!(cmdname(CmdIdxT::USER), None);
+        assert_eq!(cmdname(CmdIdxT::USER_BUF), None);
+        assert_eq!(cmdname(CmdIdxT::SIZE), None);
+    }
+
+    /// Location-list commands are their quickfix siblings with a
+    /// leading `l`, so the pairs must land on opposite answers.
+    #[test]
+    fn is_loclist_cmd_separates_each_command_from_its_quickfix_sibling() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        for (loc, qf) in [
+            (CmdIdxT::lgrep, CmdIdxT::grep),
+            (CmdIdxT::lopen, CmdIdxT::copen),
+            (CmdIdxT::lnext, CmdIdxT::cnext),
+            (CmdIdxT::lwindow, CmdIdxT::cwindow),
+        ] {
+            assert!(is_loclist_cmd(loc), "{loc:?} is a location-list command");
+            assert!(!is_loclist_cmd(qf), "{qf:?} is a quickfix command");
+        }
+    }
+
+    #[test]
+    fn is_loclist_cmd_is_false_for_a_user_command() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        assert!(!is_loclist_cmd(CmdIdxT::USER));
+        assert!(!is_loclist_cmd(CmdIdxT::SIZE));
+    }
 
     // ---- skip_range ----
 

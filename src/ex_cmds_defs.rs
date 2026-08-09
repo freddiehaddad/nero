@@ -849,6 +849,182 @@ pub enum CmdIdxT {
     SIZE = 561,
 }
 
+/// The name of every Ex command, indexed by its [`CmdIdxT`]
+/// discriminant (`cmdnames[].cmd_name`).
+///
+/// The original's `cmdnames[]` entries also carry `cmd_argt`,
+/// `cmd_addr_type`, `cmd_func` and `cmd_preview_func`. Only the NAMES
+/// are translated here, because the function-pointer fields would each
+/// need a real translated `ex_*` handler and none exist yet (see this
+/// module's own doc comment). Name-only lookups - `is_loclist_cmd`,
+/// command-name matching, completion - need nothing more than this.
+///
+/// Mechanically transcribed from `src/nvim/ex_cmds.lua` (the single
+/// source the generated `ex_cmds_defs.generated.h` is built from) by a
+/// throwaway script, matching how `OptIndex` and [`CmdIdxT`] itself
+/// were produced. The script verified two things independently before
+/// emitting anything: that the table holds exactly
+/// [`CmdIdxT::SIZE`] entries, and that EVERY entry's name matches the
+/// `CmdIdxT` variant carrying that same discriminant - accounting for
+/// the Rust keywords spelled as raw identifiers (`r#break`) and the
+/// eight punctuation commands whose variants are spelled out
+/// (`bang`, `pound`, `and`, `lshift`, `equal`, `rshift`, `at`,
+/// `tilde`). Zero mismatches across all 561 entries.
+pub static CMDNAMES: [&[u8]; CmdIdxT::SIZE as usize] = [
+    b"append", b"abbreviate", b"abclear", b"aboveleft",
+    b"all", b"amenu", b"anoremenu", b"args",
+    b"argadd", b"argdelete", b"argdo", b"argdedupe",
+    b"argedit", b"argglobal", b"arglocal", b"argument",
+    b"ascii", b"autocmd", b"augroup", b"aunmenu",
+    b"buffer", b"bNext", b"ball", b"badd",
+    b"balt", b"bdelete", b"belowright", b"bfirst",
+    b"blast", b"bmodified", b"bnext", b"botright",
+    b"bprevious", b"brewind", b"break", b"breakadd",
+    b"breakdel", b"breaklist", b"browse", b"buffers",
+    b"bufdo", b"bunload", b"bwipeout", b"change",
+    b"cNext", b"cNfile", b"cabbrev", b"cabclear",
+    b"cabove", b"caddbuffer", b"caddexpr", b"caddfile",
+    b"cafter", b"call", b"catch", b"cbuffer",
+    b"cbefore", b"cbelow", b"cbottom", b"cc",
+    b"cclose", b"cd", b"cdo", b"center",
+    b"cexpr", b"cfile", b"cfdo", b"cfirst",
+    b"cgetfile", b"cgetbuffer", b"cgetexpr", b"chdir",
+    b"changes", b"checkhealth", b"checkpath", b"checktime",
+    b"chistory", b"clist", b"clast", b"close",
+    b"clearjumps", b"cmap", b"cmapclear", b"cmenu",
+    b"cnext", b"cnewer", b"cnfile", b"cnoremap",
+    b"cnoreabbrev", b"cnoremenu", b"copy", b"colder",
+    b"colorscheme", b"command", b"comclear", b"compiler",
+    b"continue", b"confirm", b"connect", b"const",
+    b"copen", b"cprevious", b"cpfile", b"cquit",
+    b"crewind", b"cunmap", b"cunabbrev", b"cunmenu",
+    b"cwindow", b"delete", b"delmarks", b"debug",
+    b"debuggreedy", b"defer", b"delcommand", b"delfunction",
+    b"detach", b"display", b"diffupdate", b"diffget",
+    b"diffoff", b"diffpatch", b"diffput", b"diffsplit",
+    b"diffthis", b"digraphs", b"djump", b"dlist",
+    b"doautocmd", b"doautoall", b"drop", b"dsearch",
+    b"dsplit", b"edit", b"earlier", b"echo",
+    b"echoerr", b"echohl", b"echomsg", b"echon",
+    b"else", b"elseif", b"emenu", b"endif",
+    b"endfunction", b"endfor", b"endtry", b"endwhile",
+    b"enew", b"eval", b"ex", b"execute",
+    b"exit", b"exusage", b"file", b"files",
+    b"filetype", b"filter", b"find", b"finally",
+    b"finish", b"first", b"fold", b"foldclose",
+    b"folddoopen", b"folddoclosed", b"foldopen", b"for",
+    b"function", b"fclose", b"global", b"goto",
+    b"grep", b"grepadd", b"gui", b"gvim",
+    b"help", b"helpclose", b"helpgrep", b"helptags",
+    b"highlight", b"hide", b"history", b"horizontal",
+    b"insert", b"iabbrev", b"iabclear", b"if",
+    b"ijump", b"ilist", b"imap", b"imapclear",
+    b"imenu", b"inoremap", b"inoreabbrev", b"inoremenu",
+    b"intro", b"iput", b"isearch", b"isplit",
+    b"iunmap", b"iunabbrev", b"iunmenu", b"join",
+    b"jumps", b"k", b"keepmarks", b"keepjumps",
+    b"keeppatterns", b"keepalt", b"list", b"lNext",
+    b"lNfile", b"last", b"labove", b"language",
+    b"laddexpr", b"laddbuffer", b"laddfile", b"lafter",
+    b"later", b"lbuffer", b"lbefore", b"lbelow",
+    b"lbottom", b"lcd", b"lchdir", b"lclose",
+    b"ldo", b"left", b"leftabove", b"let",
+    b"lexpr", b"lfile", b"lfdo", b"lfirst",
+    b"lgetfile", b"lgetbuffer", b"lgetexpr", b"lgrep",
+    b"lgrepadd", b"lhelpgrep", b"lhistory", b"ll",
+    b"llast", b"llist", b"lmap", b"lmapclear",
+    b"lmake", b"lnoremap", b"lnext", b"lnewer",
+    b"lnfile", b"loadview", b"loadkeymap", b"lockmarks",
+    b"lockvar", b"log", b"lolder", b"lopen",
+    b"lprevious", b"lpfile", b"lrewind", b"ltag",
+    b"lunmap", b"lua", b"luado", b"luafile",
+    b"lvimgrep", b"lvimgrepadd", b"lwindow", b"ls",
+    b"lsp", b"move", b"mark", b"make",
+    b"map", b"mapclear", b"marks", b"match",
+    b"menu", b"menutranslate", b"messages", b"mkexrc",
+    b"mksession", b"mkspell", b"mkvimrc", b"mkview",
+    b"mode", b"mzscheme", b"mzfile", b"next",
+    b"new", b"nmap", b"nmapclear", b"nmenu",
+    b"nnoremap", b"nnoremenu", b"noremap", b"noautocmd",
+    b"nohlsearch", b"noreabbrev", b"noremenu", b"noswapfile",
+    b"normal", b"number", b"nunmap", b"nunmenu",
+    b"oldfiles", b"omap", b"omapclear", b"omenu",
+    b"only", b"onoremap", b"onoremenu", b"options",
+    b"ounmap", b"ounmenu", b"ownsyntax", b"print",
+    b"packadd", b"packdel", b"packloadall", b"packupdate",
+    b"pbuffer", b"pclose", b"perl", b"perldo",
+    b"perlfile", b"pedit", b"pop", b"popup",
+    b"ppop", b"preserve", b"previous", b"profile",
+    b"profdel", b"psearch", b"ptag", b"ptNext",
+    b"ptfirst", b"ptjump", b"ptlast", b"ptnext",
+    b"ptprevious", b"ptrewind", b"ptselect", b"put",
+    b"pwd", b"python", b"pydo", b"pyfile",
+    b"py3", b"py3do", b"python3", b"py3file",
+    b"pyx", b"pyxdo", b"pythonx", b"pyxfile",
+    b"quit", b"quitall", b"qall", b"read",
+    b"recover", b"redo", b"redir", b"redraw",
+    b"redrawstatus", b"redrawtabline", b"registers", b"resize",
+    b"restart", b"retab", b"return", b"rewind",
+    b"right", b"rightbelow", b"rshada", b"runtime",
+    b"rundo", b"ruby", b"rubydo", b"rubyfile",
+    b"rviminfo", b"substitute", b"sNext", b"sargument",
+    b"sall", b"sandbox", b"saveas", b"sbuffer",
+    b"sbNext", b"sball", b"sbfirst", b"sblast",
+    b"sbmodified", b"sbnext", b"sbprevious", b"sbrewind",
+    b"scriptnames", b"scriptencoding", b"set", b"setfiletype",
+    b"setglobal", b"setlocal", b"sfind", b"sfirst",
+    b"simalt", b"sign", b"silent", b"sleep",
+    b"slast", b"smagic", b"smap", b"smapclear",
+    b"smenu", b"snext", b"snomagic", b"snoremap",
+    b"snoremenu", b"source", b"sort", b"split",
+    b"spellgood", b"spelldump", b"spellinfo", b"spellrepall",
+    b"spellrare", b"spellundo", b"spellwrong", b"sprevious",
+    b"srewind", b"stop", b"stag", b"startinsert",
+    b"startgreplace", b"startreplace", b"stopinsert", b"stjump",
+    b"stselect", b"sunhide", b"sunmap", b"sunmenu",
+    b"suspend", b"sview", b"swapname", b"syntax",
+    b"syntime", b"syncbind", b"t", b"tcd",
+    b"tchdir", b"tNext", b"tag", b"tags",
+    b"tab", b"tabclose", b"tabdo", b"tabedit",
+    b"tabfind", b"tabfirst", b"tabmove", b"tablast",
+    b"tabnext", b"tabnew", b"tabonly", b"tabprevious",
+    b"tabNext", b"tabrewind", b"tabs", b"tcl",
+    b"tcldo", b"tclfile", b"terminal", b"tfirst",
+    b"throw", b"tjump", b"tlast", b"tlmenu",
+    b"tlnoremenu", b"tlunmenu", b"tmenu", b"tmap",
+    b"tmapclear", b"tnext", b"tnoremap", b"topleft",
+    b"tprevious", b"trewind", b"trust", b"try",
+    b"tselect", b"tunmenu", b"tunmap", b"undo",
+    b"undojoin", b"undolist", b"unabbreviate", b"unhide",
+    b"uniq", b"unlet", b"unlockvar", b"unmap",
+    b"unmenu", b"unsilent", b"update", b"uptime",
+    b"vglobal", b"version", b"verbose", b"vertical",
+    b"visual", b"view", b"vimgrep", b"vimgrepadd",
+    b"viusage", b"vmap", b"vmapclear", b"vmenu",
+    b"vnoremap", b"vnew", b"vnoremenu", b"vsplit",
+    b"vunmap", b"vunmenu", b"write", b"wNext",
+    b"wall", b"while", b"winsize", b"wincmd",
+    b"windo", b"winpos", b"wnext", b"wprevious",
+    b"wq", b"wqall", b"wshada", b"wundo",
+    b"wviminfo", b"xit", b"xall", b"xmap",
+    b"xmapclear", b"xmenu", b"xnoremap", b"xnoremenu",
+    b"xunmap", b"xunmenu", b"yank", b"z",
+    b"!", b"#", b"&", b"<",
+    b"=", b">", b"@", b"~",
+    b"Next",
+];
+
+/// The name of the Ex command `cmdidx`, or `None` for a user command
+/// or an out-of-range index (`cmdnames[cmdidx].cmd_name`).
+#[must_use]
+pub fn cmdname(cmdidx: CmdIdxT) -> Option<&'static [u8]> {
+    let idx = cmdidx as i32;
+    if idx < 0 || idx >= CmdIdxT::SIZE as i32 {
+        return None;
+    }
+    Some(CMDNAMES[idx as usize])
+}
+
 /// Function pointer type for a command's implementation (`ex_func_T`).
 /// No real function currently populates a [`CommandDefinition`] with
 /// one of these yet (every `ex_*` command handler across the whole
