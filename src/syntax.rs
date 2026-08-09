@@ -20,6 +20,53 @@
 
 use crate::pos_defs::LposT;
 
+/// `syn_buf` - the buffer the syntax engine is currently highlighting.
+///
+/// Only ever set by `syn_update`/`syntax_start` (not translated), so
+/// this stays null in this crate today - the same treatment already
+/// given to `insexpand`'s own completion statics.
+static SYN_BUF: crate::globals::GlobalCell<*mut crate::buffer_defs::BufT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// `current_lnum` - the line the syntax engine is currently on.
+static CURRENT_LNUM: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
+    crate::globals::GlobalCell::new(0);
+
+/// The text of the current line in the syntax buffer
+/// (`syn_getcurline`).
+///
+/// Note this reads `syn_buf`, NOT `curbuf`: highlighting can run over
+/// a buffer other than the one being edited.
+///
+/// # Safety
+/// `SYN_BUF` must be a valid, non-null pointer to a live `BufT` - the
+/// original dereferences it without checking. Forwarded from
+/// [`crate::memline::ml_get_buf`]'s own safety doc.
+#[must_use]
+pub unsafe fn syn_getcurline() -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { *SYN_BUF.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { *CURRENT_LNUM.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::ml_get_buf(&mut *buf, lnum) }
+}
+
+/// The length of the current line in the syntax buffer
+/// (`syn_getcurline_len`).
+///
+/// # Safety
+/// Same as [`syn_getcurline`].
+#[must_use]
+pub unsafe fn syn_getcurline_len() -> crate::pos_defs::ColnrT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { *SYN_BUF.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { *CURRENT_LNUM.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::memline::ml_get_buf_len(&mut *buf, lnum) }
+}
+
 /// Clamp `pos` so it does not run past `limit` (`limit_pos`).
 ///
 /// A position on a LATER line is pulled back to `limit` entirely -
@@ -54,6 +101,98 @@ pub fn syn_compare_stub(s1: i16, s2: i16) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- syn_getcurline / syn_getcurline_len ----
+
+    /// Restores `SYN_BUF`/`CURRENT_LNUM` on drop, even through a
+    /// panic, so a failing test cannot leave a dangling pointer in
+    /// the global for whichever test runs next.
+    struct SynBufGuard {
+        buf: *mut crate::buffer_defs::BufT,
+        lnum: crate::pos_defs::LinenrT,
+    }
+
+    impl SynBufGuard {
+        fn install(buf: *mut crate::buffer_defs::BufT, lnum: crate::pos_defs::LinenrT) -> Self {
+            let me = Self {
+                buf: unsafe { *SYN_BUF.get_mut() },
+                lnum: unsafe { *CURRENT_LNUM.get_mut() },
+            };
+            unsafe { *SYN_BUF.get_mut() = buf };
+            unsafe { *CURRENT_LNUM.get_mut() = lnum };
+            me
+        }
+    }
+
+    impl Drop for SynBufGuard {
+        fn drop(&mut self) {
+            unsafe { *SYN_BUF.get_mut() = self.buf };
+            unsafe { *CURRENT_LNUM.get_mut() = self.lnum };
+        }
+    }
+
+    fn syntax_test_buf(line: &[u8]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        buf
+    }
+
+    fn close_syntax_test_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// These read `syn_buf`, NOT `curbuf` - highlighting can run over
+    /// a buffer other than the one being edited. The test points
+    /// `curbuf` at a DIFFERENT buffer so an implementation reading it
+    /// would return the wrong line.
+    #[test]
+    fn syn_getcurline_reads_the_syntax_buffer_not_the_current_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = syntax_test_buf(b"syntax line\0");
+        let mut other = syntax_test_buf(b"a different line\0");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_curbuf = g.curbuf;
+        g.curbuf = std::ptr::from_mut(&mut other);
+        let _guard = SynBufGuard::install(std::ptr::from_mut(&mut syn), 1);
+
+        assert_eq!(unsafe { syn_getcurline() }, b"syntax line\0");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_syntax_test_buf(syn);
+        close_syntax_test_buf(other);
+    }
+
+    /// The length excludes the terminator, unlike the text accessor
+    /// which carries it.
+    #[test]
+    fn syn_getcurline_len_reports_the_text_length() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = syntax_test_buf(b"abcde\0");
+        let _guard = SynBufGuard::install(std::ptr::from_mut(&mut syn), 1);
+
+        assert_eq!(unsafe { syn_getcurline_len() }, 5);
+
+        close_syntax_test_buf(syn);
+    }
+
+    #[test]
+    fn syn_getcurline_handles_an_empty_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut syn = syntax_test_buf(b"\0");
+        let _guard = SynBufGuard::install(std::ptr::from_mut(&mut syn), 1);
+
+        assert_eq!(unsafe { syn_getcurline_len() }, 0);
+
+        close_syntax_test_buf(syn);
+    }
 
     fn lpos(lnum: crate::pos_defs::LinenrT, col: crate::pos_defs::ColnrT) -> LposT {
         LposT { lnum, col }
