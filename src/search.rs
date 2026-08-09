@@ -220,6 +220,39 @@ pub unsafe fn linewhite(lnum: crate::pos_defs::LinenrT) -> bool {
     line.get(off).copied().unwrap_or(0) == 0
 }
 
+/// Read line `lnum` into a fresh buffer, truncated to
+/// [`crate::tag::LSIZE`], and return the copy
+/// (`get_line_and_copy`).
+///
+/// The copy exists because the callers (`find_pattern_in_path`) keep
+/// several lines alive at once, while `ml_get`'s own result is only
+/// valid until the next call.
+///
+/// The original writes into a caller-supplied `char[LSIZE]` and hands
+/// that same pointer back; an owned `Vec<u8>` is returned here
+/// instead, so no caller has to provide scratch space or trust a
+/// returned alias.
+///
+/// The truncation is real, not incidental: `xstrlcpy` copies at most
+/// `LSIZE - 1` bytes of the line plus a NUL, so a longer line is cut
+/// short. The trailing NUL is kept, matching what
+/// [`crate::memline::ml_get`] itself returns in this crate.
+///
+/// # Safety
+/// Forwarded from [`crate::memline::ml_get`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_line_and_copy(lnum: crate::pos_defs::LinenrT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::memline::ml_get(lnum) };
+    // The text up to (not including) the terminator, as xstrlcpy sees it.
+    let text_len = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    let keep = text_len.min(crate::tag::LSIZE - 1);
+    let mut out = Vec::with_capacity(keep + 1);
+    out.extend_from_slice(&line[..keep]);
+    out.push(0);
+    out
+}
+
 /// Offset applied to the last search pattern (`SearchOffset`, from
 /// `search.h`).
 ///
@@ -1101,6 +1134,65 @@ mod tests {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
+    }
+
+    // ---- get_line_and_copy ----
+
+    #[test]
+    fn get_line_and_copy_returns_the_line_text() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = test_buf_with_line(b"hello world\0");
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf =
+            &mut buf as *mut crate::buffer_defs::BufT;
+
+        assert_eq!(unsafe { get_line_and_copy(1) }, b"hello world\0");
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
+    }
+
+    /// The truncation is real, not incidental: the original's
+    /// `xstrlcpy` into a `char[LSIZE]` copies at most `LSIZE - 1`
+    /// bytes plus a NUL, so an over-long line is cut short rather than
+    /// overflowing the buffer.
+    #[test]
+    fn get_line_and_copy_truncates_an_over_long_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut long = vec![b'x'; crate::tag::LSIZE + 50];
+        long.push(0);
+        let mut buf = test_buf_with_line(&long);
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf =
+            &mut buf as *mut crate::buffer_defs::BufT;
+
+        let got = unsafe { get_line_and_copy(1) };
+        assert_eq!(got.len(), crate::tag::LSIZE, "LSIZE - 1 bytes plus the NUL");
+        assert_eq!(got[crate::tag::LSIZE - 1], 0, "still NUL-terminated");
+        assert!(got[..crate::tag::LSIZE - 1].iter().all(|&b| b == b'x'));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
+    }
+
+    /// A line exactly at the limit is left whole - the cut is at
+    /// `LSIZE - 1` bytes of text, not one byte earlier.
+    #[test]
+    fn get_line_and_copy_leaves_a_line_at_the_limit_intact() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut exact = vec![b'y'; crate::tag::LSIZE - 1];
+        exact.push(0);
+        let mut buf = test_buf_with_line(&exact);
+        let prev_curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf =
+            &mut buf as *mut crate::buffer_defs::BufT;
+
+        let got = unsafe { get_line_and_copy(1) };
+        assert_eq!(got.len(), crate::tag::LSIZE);
+        assert!(got[..crate::tag::LSIZE - 1].iter().all(|&b| b == b'y'));
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        close_test_buf(buf);
     }
 
     #[test]
