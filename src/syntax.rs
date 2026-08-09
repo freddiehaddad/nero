@@ -126,6 +126,71 @@ pub unsafe fn syn_scl_namen2id(linep: &[u8], len: usize) -> i32 {
     unsafe { syn_scl_name2id(&linep[..len.min(linep.len())]) }
 }
 
+/// Find a syntax cluster by name, creating it when it doesn't exist
+/// yet, and return its group ID (`syn_check_cluster`).
+///
+/// Returns `0` on failure. `pp` may run on past the name, so `len`
+/// bounds it; the original copies those bytes out first, while a
+/// subslice does the same without allocating.
+///
+/// # Safety
+/// Same as [`syn_scl_name2id`].
+pub unsafe fn syn_check_cluster(pp: &[u8], len: usize) -> i32 {
+    // Matches the original's own `xstrnsave`: the stored name is
+    // NUL-terminated, like every other string in the cluster table.
+    let name = crate::strings::xstrnsave(pp, len.min(pp.len()));
+    // SAFETY: forwarded from this function's own safety doc.
+    let id = unsafe { syn_scl_name2id(&name) };
+    if id == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { syn_add_cluster(name) }
+    } else {
+        id
+    }
+}
+
+/// Append a new syntax cluster and return its group ID
+/// (`syn_add_cluster`).
+///
+/// Returns `0` when the cluster table is already full. The original's
+/// `E848` message is omitted (message display is not translated),
+/// keeping the same `0` return and the same untouched table.
+///
+/// The original's first-call growarray init (`ga_itemsize`/
+/// `ga_set_growsize`) has no counterpart here: `TypedGarrayT` owns a
+/// real `Vec<SynClusterT>`, so there is no item size to record, and
+/// growth is the `Vec`'s own business.
+///
+/// # Safety
+/// Same as [`syn_scl_name2id`].
+pub unsafe fn syn_add_cluster(name: Vec<u8>) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let block = unsafe { &mut *(*crate::globals::GLOBALS.get_mut().curwin).w_s };
+
+    let len = block.b_syn_clusters.ga_len();
+    if len >= MAX_CLUSTER_ID {
+        return 0;
+    }
+
+    let name_u = crate::strings::vim_strsave_up(&name);
+    // The spell cluster ids are recorded before `name` is moved into
+    // the table.
+    if crate::strings::vim_stricmp(&name, b"Spell") == 0 {
+        block.b_spell_cluster_id = len + SYNID_CLUSTER;
+    }
+    if crate::strings::vim_stricmp(&name, b"NoSpell") == 0 {
+        block.b_nospell_cluster_id = len + SYNID_CLUSTER;
+    }
+
+    block.b_syn_clusters.items.push(SynClusterT {
+        scl_name: Some(name),
+        scl_name_u: Some(name_u),
+        scl_list: Vec::new(),
+    });
+
+    len + SYNID_CLUSTER
+}
+
 /// One syntax cluster - a named set of syntax group ids
 /// (`syn_cluster_T`).
 ///
@@ -134,11 +199,18 @@ pub unsafe fn syn_scl_namen2id(linep: &[u8], len: usize) -> i32 {
 /// `scl_list` is a plain `Vec` rather than the original's
 /// separately-counted `int16_t *`, since a `Vec` carries its own
 /// length.
+///
+/// Both name fields are NUL-terminated, matching the original: it
+/// builds `scl_name` with `xstrnsave` and `scl_name_u` with
+/// `vim_strsave_up`, and this crate's equivalents of both append a
+/// NUL. Anything comparing against these must account for it - the
+/// lookups do so by uppercasing the needle through the same
+/// `vim_strsave_up`, so both sides carry a NUL and match.
 #[derive(Debug, Clone, Default)]
 pub struct SynClusterT {
-    /// syntax cluster name (`scl_name`).
+    /// syntax cluster name, NUL-terminated (`scl_name`).
     pub scl_name: Option<Vec<u8>>,
-    /// uppercase of `scl_name` (`scl_name_u`).
+    /// uppercase of `scl_name`, NUL-terminated (`scl_name_u`).
     pub scl_name_u: Option<Vec<u8>>,
     /// IDs in this syntax cluster (`scl_list`).
     pub scl_list: Vec<i16>,
@@ -317,54 +389,200 @@ mod tests {
         close_syntax_test_buf(syn);
     }
 
+    // ---- syn_check_cluster / syn_add_cluster ----
+
+    /// Reads back the cluster table's names, for asserting that an
+    /// add really did (or didn't) happen. Names are stored
+    /// NUL-terminated, so the expected values carry a NUL too.
+    fn cluster_names(block: &crate::buffer_defs::SynblockT) -> Vec<Vec<u8>> {
+        block
+            .b_syn_clusters
+            .items
+            .iter()
+            .map(|c| c.scl_name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn syn_check_cluster_returns_an_existing_cluster_without_adding() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"alpha", b"beta"]);
+
+        let id = unsafe { syn_check_cluster(b"beta", 4) };
+        assert_eq!(id, SYNID_CLUSTER + 1);
+        assert_eq!(
+            cluster_names(fx.block()),
+            vec![b"alpha\0".to_vec(), b"beta\0".to_vec()],
+            "an existing cluster must not be appended a second time"
+        );
+    }
+
+    /// The lookup is case-insensitive, so a differently-cased name
+    /// finds the existing cluster rather than creating a new one.
+    #[test]
+    fn syn_check_cluster_matches_an_existing_cluster_case_insensitively() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"alpha"]);
+
+        assert_eq!(unsafe { syn_check_cluster(b"ALPHA", 5) }, SYNID_CLUSTER);
+        assert_eq!(fx.block().b_syn_clusters.ga_len(), 1);
+    }
+
+    #[test]
+    fn syn_check_cluster_appends_a_new_cluster_when_there_is_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"alpha"]);
+
+        let id = unsafe { syn_check_cluster(b"gamma", 5) };
+        assert_eq!(id, SYNID_CLUSTER + 1);
+
+        let block = fx.block();
+        assert_eq!(cluster_names(block), vec![b"alpha\0".to_vec(), b"gamma\0".to_vec()]);
+        // The new entry carries both its name and the uppercase form
+        // the lookup matches against, each NUL-terminated.
+        let added = block.b_syn_clusters.get(1).unwrap();
+        assert_eq!(added.scl_name_u.as_deref(), Some(b"GAMMA\0".as_slice()));
+        assert!(added.scl_list.is_empty());
+        // ...and is immediately findable.
+        assert_eq!(unsafe { syn_scl_name2id(b"gamma") }, SYNID_CLUSTER + 1);
+    }
+
+    /// `len` bounds the name, so trailing text in the buffer is not
+    /// part of the cluster that gets created.
+    #[test]
+    fn syn_check_cluster_uses_only_the_first_len_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+
+        assert_eq!(unsafe { syn_check_cluster(b"abc,rest", 3) }, SYNID_CLUSTER);
+        assert_eq!(cluster_names(fx.block()), vec![b"abc\0".to_vec()]);
+    }
+
+    /// Adding the "Spell"/"NoSpell" clusters records their ids on the
+    /// syntax block, case-insensitively, and the two are kept apart.
+    #[test]
+    fn syn_add_cluster_records_the_spell_cluster_ids() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"filler"]);
+
+        assert_eq!(fx.block().b_spell_cluster_id, 0);
+        assert_eq!(fx.block().b_nospell_cluster_id, 0);
+
+        let spell = unsafe { syn_add_cluster(b"sPeLl".to_vec()) };
+        let nospell = unsafe { syn_add_cluster(b"NOSPELL".to_vec()) };
+
+        assert_eq!(spell, SYNID_CLUSTER + 1);
+        assert_eq!(nospell, SYNID_CLUSTER + 2);
+        let block = fx.block();
+        assert_eq!(block.b_spell_cluster_id, SYNID_CLUSTER + 1);
+        // "NoSpell" must not have overwritten the "Spell" id.
+        assert_eq!(block.b_nospell_cluster_id, SYNID_CLUSTER + 2);
+    }
+
+    /// An ordinary cluster name leaves both spell ids alone.
+    #[test]
+    fn syn_add_cluster_leaves_the_spell_ids_alone_for_other_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+
+        assert_eq!(unsafe { syn_add_cluster(b"Spelling".to_vec()) }, SYNID_CLUSTER);
+        let block = fx.block();
+        assert_eq!(block.b_spell_cluster_id, 0);
+        assert_eq!(block.b_nospell_cluster_id, 0);
+    }
+
+    /// A full table refuses the add (returning 0) and is left
+    /// untouched, rather than growing past the id space.
+    #[test]
+    fn syn_add_cluster_refuses_to_grow_past_max_cluster_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+
+        // Fill the table right up to the limit.
+        {
+            let block = fx.block_mut();
+            block
+                .b_syn_clusters
+                .items
+                .resize_with(MAX_CLUSTER_ID as usize, SynClusterT::default);
+        }
+
+        assert_eq!(unsafe { syn_add_cluster(b"toomany".to_vec()) }, 0);
+        assert_eq!(
+            fx.block().b_syn_clusters.ga_len(),
+            MAX_CLUSTER_ID,
+            "a refused add must not append anything"
+        );
+    }
+
     // ---- syn_scl_name2id / syn_scl_namen2id ----
 
-    /// Installs a syntax block with the given cluster names as
-    /// `curwin->w_s`, restoring `curwin` on drop even through a panic.
-    struct SynBlockGuard {
-        prev: *mut crate::buffer_defs::WinT,
+    /// A window whose syntax block holds the given clusters,
+    /// installed as `curwin` for the fixture's lifetime.
+    ///
+    /// Both the window and the block are handed to raw pointers via
+    /// `Box::into_raw` rather than kept as live `Box` bindings. That
+    /// matters: the code under test writes through
+    /// `curwin->w_s`, and under Tree Borrows such a write through a
+    /// derived pointer would disable an owning `Box`'s own tag,
+    /// making that `Box`'s eventual drop undefined behaviour. Owning
+    /// the allocations as raw pointers and reclaiming them here
+    /// keeps every access in one lineage.
+    struct ClusterFixture {
+        win: *mut crate::buffer_defs::WinT,
+        block: *mut crate::buffer_defs::SynblockT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
     }
 
-    impl SynBlockGuard {
-        fn install(win: *mut crate::buffer_defs::WinT) -> Self {
+    impl ClusterFixture {
+        /// Builds the clusters exactly as the real creation path
+        /// stores them: both name fields NUL-terminated.
+        fn new(names: &[&[u8]]) -> Self {
+            let mut block = Box::new(crate::buffer_defs::SynblockT::default());
+            block.b_syn_clusters.items = names
+                .iter()
+                .map(|n| SynClusterT {
+                    scl_name: Some(crate::strings::xstrnsave(n, n.len())),
+                    scl_name_u: Some(crate::strings::vim_strsave_up(n)),
+                    scl_list: Vec::new(),
+                })
+                .collect();
+            let block = Box::into_raw(block);
+
+            let mut win = Box::new(crate::buffer_defs::WinT::default());
+            win.w_s = block;
+            let win = Box::into_raw(win);
+
             let g = unsafe { crate::globals::GLOBALS.get_mut() };
-            let me = Self { prev: g.curwin };
+            let prev_curwin = g.curwin;
             g.curwin = win;
-            me
+            Self { win, block, prev_curwin }
+        }
+
+        fn block(&self) -> &crate::buffer_defs::SynblockT {
+            unsafe { &*self.block }
+        }
+
+        #[allow(clippy::mut_from_ref)]
+        fn block_mut(&self) -> &mut crate::buffer_defs::SynblockT {
+            unsafe { &mut *self.block }
         }
     }
 
-    impl Drop for SynBlockGuard {
+    impl Drop for ClusterFixture {
         fn drop(&mut self) {
-            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.prev;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.prev_curwin;
+            unsafe {
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.block));
+            }
         }
-    }
-
-    /// Builds a window whose syntax block holds clusters with the
-    /// given names, each with its uppercase form precomputed exactly
-    /// as the real cluster-creation path does.
-    fn win_with_clusters(
-        names: &[&[u8]],
-    ) -> (Box<crate::buffer_defs::WinT>, Box<crate::buffer_defs::SynblockT>) {
-        let mut block = Box::new(crate::buffer_defs::SynblockT::default());
-        block.b_syn_clusters.items = names
-            .iter()
-            .map(|n| SynClusterT {
-                scl_name: Some((*n).to_vec()),
-                scl_name_u: Some(crate::strings::vim_strsave_up(n)),
-                scl_list: Vec::new(),
-            })
-            .collect();
-        let mut win = Box::new(crate::buffer_defs::WinT::default());
-        win.w_s = std::ptr::from_mut(&mut *block);
-        (win, block)
     }
 
     #[test]
     fn syn_scl_name2id_returns_zero_when_there_are_no_clusters() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, _block) = win_with_clusters(&[]);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let _fx = ClusterFixture::new(&[]);
         assert_eq!(unsafe { syn_scl_name2id(b"nope") }, 0);
     }
 
@@ -374,8 +592,7 @@ mod tests {
     #[test]
     fn syn_scl_name2id_offsets_the_index_past_the_cluster_base() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, _block) = win_with_clusters(&[b"first", b"second"]);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let _fx = ClusterFixture::new(&[b"first", b"second"]);
 
         assert_eq!(unsafe { syn_scl_name2id(b"first") }, SYNID_CLUSTER);
         assert_eq!(unsafe { syn_scl_name2id(b"second") }, SYNID_CLUSTER + 1);
@@ -387,8 +604,7 @@ mod tests {
     #[test]
     fn syn_scl_name2id_ignores_case() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, _block) = win_with_clusters(&[b"myCluster"]);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let _fx = ClusterFixture::new(&[b"myCluster"]);
 
         assert_eq!(unsafe { syn_scl_name2id(b"MYCLUSTER") }, SYNID_CLUSTER);
         assert_eq!(unsafe { syn_scl_name2id(b"mycluster") }, SYNID_CLUSTER);
@@ -400,8 +616,7 @@ mod tests {
     #[test]
     fn syn_scl_name2id_prefers_the_last_of_two_duplicate_names() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, _block) = win_with_clusters(&[b"dup", b"other", b"dup"]);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let _fx = ClusterFixture::new(&[b"dup", b"other", b"dup"]);
         assert_eq!(unsafe { syn_scl_name2id(b"dup") }, SYNID_CLUSTER + 2);
     }
 
@@ -410,10 +625,8 @@ mod tests {
     #[test]
     fn syn_scl_name2id_skips_a_cleared_cluster() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, mut block) = win_with_clusters(&[b"alpha", b"beta"]);
-        syn_clear_cluster(&mut block.b_syn_clusters.items[1]);
-        win.w_s = std::ptr::from_mut(&mut *block);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let fx = ClusterFixture::new(&[b"alpha", b"beta"]);
+        syn_clear_cluster(&mut fx.block_mut().b_syn_clusters.items[1]);
 
         assert_eq!(unsafe { syn_scl_name2id(b"alpha") }, SYNID_CLUSTER);
         assert_eq!(unsafe { syn_scl_name2id(b"beta") }, 0);
@@ -424,8 +637,7 @@ mod tests {
     #[test]
     fn syn_scl_namen2id_uses_only_the_first_len_bytes() {
         let _lock = crate::globals::global_state_test_lock();
-        let (mut win, _block) = win_with_clusters(&[b"abc"]);
-        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        let _fx = ClusterFixture::new(&[b"abc"]);
 
         assert_eq!(unsafe { syn_scl_namen2id(b"abcdef", 3) }, SYNID_CLUSTER);
         assert_eq!(unsafe { syn_scl_namen2id(b"abcdef", 6) }, 0);
