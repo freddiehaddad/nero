@@ -1773,6 +1773,67 @@ pub unsafe fn clear_snapshot(tp: *mut crate::buffer_defs::TabpageT, idx: usize) 
     }
 }
 
+/// Give `win` a buffer again if an autocommand took its own away
+/// (`win_unclose_buffer`).
+///
+/// A window with no buffer cannot be displayed, so it is handed the
+/// first buffer in the list as a last resort and reset to the empty
+/// starting state.
+///
+/// The original also takes a `bufref_T` it never reads in this
+/// function, so it has no counterpart here.
+///
+/// # Safety
+/// `win` must be a valid, non-null pointer to a live `WinT`, and
+/// `GLOBALS.firstbuf` must be valid and non-null whenever `win` has no
+/// buffer. Forwarded from [`win_init_empty`]'s own safety doc.
+pub unsafe fn win_unclose_buffer(win: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { &*win }.w_buffer.is_null() {
+        return;
+    }
+    // If the buffer was removed from the window we have to give it
+    // any buffer.
+    // SAFETY: forwarded from this function's own safety doc.
+    let firstbuf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*win).w_buffer = firstbuf;
+        (*firstbuf).b_nwindows += 1;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    if std::ptr::eq(win, curwin) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = firstbuf;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { win_init_empty(win) };
+}
+
+/// Take a snapshot of the current window layout into slot `idx`
+/// (`make_snapshot`), replacing whatever that slot held.
+///
+/// The previous snapshot is cleared FIRST, so repeated snapshots into
+/// the same slot cannot leak the earlier tree.
+///
+/// # Safety
+/// `GLOBALS.curtab` and `GLOBALS.topframe` must be valid and non-null,
+/// and `idx` must be within `SNAP_COUNT`. Forwarded from
+/// [`clear_snapshot`]/[`make_snapshot_rec`]'s own safety docs.
+pub unsafe fn make_snapshot(idx: usize) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { clear_snapshot(curtab, idx) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let topframe = unsafe { crate::globals::GLOBALS.get_mut() }.topframe;
+    // SAFETY: forwarded from this function's own safety doc.
+    let snap = unsafe { make_snapshot_rec(topframe) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*curtab).tp_snapshot[idx] = snap };
+}
+
 /// The window that was current when snapshot `idx` was taken, or null
 /// (`get_snapshot_curwin`).
 ///
@@ -3972,6 +4033,130 @@ pub unsafe fn win_find_tabpage(win: *const WinT) -> *mut crate::buffer_defs::Tab
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- make_snapshot / win_unclose_buffer ----
+
+    /// A window that still HAS a buffer must be left completely
+    /// alone - no reference count bump, no reset.
+    #[test]
+    fn win_unclose_buffer_leaves_a_window_that_still_has_a_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut own_buf = Box::new(crate::buffer_defs::BufT::default());
+        let mut first = Box::new(crate::buffer_defs::BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *own_buf);
+        win.w_cursor.lnum = 42;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc) = (g.firstbuf, g.curwin);
+        g.firstbuf = std::ptr::from_mut(&mut *first);
+        g.curwin = std::ptr::null_mut();
+
+        unsafe { win_unclose_buffer(std::ptr::from_mut(&mut *win)) };
+
+        assert!(std::ptr::eq(win.w_buffer, std::ptr::from_mut(&mut *own_buf)));
+        assert_eq!(first.b_nwindows, 0, "the fallback must not be touched");
+        assert_eq!(win.w_cursor.lnum, 42, "the window must not be reset");
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.firstbuf = pf;
+        g.curwin = pc;
+    }
+
+    /// A window whose buffer was taken away gets the first buffer and
+    /// is reset to the empty starting state.
+    #[test]
+    fn win_unclose_buffer_hands_a_bufferless_window_the_first_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first = Box::new(crate::buffer_defs::BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::null_mut();
+        win.w_cursor.lnum = 42;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc, pb) = (g.firstbuf, g.curwin, g.curbuf);
+        g.firstbuf = std::ptr::from_mut(&mut *first);
+        // A DIFFERENT window is current, so curbuf must not change.
+        let mut other = Box::new(crate::buffer_defs::WinT::default());
+        g.curwin = std::ptr::from_mut(&mut *other);
+        g.curbuf = std::ptr::null_mut();
+
+        unsafe { win_unclose_buffer(std::ptr::from_mut(&mut *win)) };
+
+        assert!(std::ptr::eq(win.w_buffer, std::ptr::from_mut(&mut *first)));
+        assert_eq!(first.b_nwindows, 1, "the new window must be counted");
+        assert_eq!(win.w_cursor.lnum, 1, "win_init_empty resets the cursor");
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(g.curbuf.is_null(), "curbuf belongs to the CURRENT window only");
+
+        g.firstbuf = pf;
+        g.curwin = pc;
+        g.curbuf = pb;
+    }
+
+    /// When the rescued window IS the current one, `curbuf` has to
+    /// follow it, or the two would disagree.
+    #[test]
+    fn win_unclose_buffer_updates_curbuf_for_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first = Box::new(crate::buffer_defs::BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::null_mut();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pf, pc, pb) = (g.firstbuf, g.curwin, g.curbuf);
+        g.firstbuf = std::ptr::from_mut(&mut *first);
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curbuf = std::ptr::null_mut();
+
+        unsafe { win_unclose_buffer(std::ptr::from_mut(&mut *win)) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert!(std::ptr::eq(g.curbuf, std::ptr::from_mut(&mut *first)));
+
+        g.firstbuf = pf;
+        g.curwin = pc;
+        g.curbuf = pb;
+    }
+
+    /// Repeated snapshots into one slot must free the earlier tree
+    /// rather than leaking it, which is why the slot is cleared first.
+    #[test]
+    fn make_snapshot_replaces_the_previous_snapshot_in_the_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        let mut top = Box::new(crate::buffer_defs::FrameT {
+            fr_win: std::ptr::from_mut(&mut *win),
+            fr_width: 11,
+            fr_height: 7,
+            ..Default::default()
+        });
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pt, ptf) = (g.curtab, g.topframe);
+        g.curtab = std::ptr::from_mut(&mut *tp);
+        g.topframe = std::ptr::from_mut(&mut *top);
+
+        unsafe { make_snapshot(0) };
+        let first_snap = tp.tp_snapshot[0];
+        assert!(!first_snap.is_null());
+        assert_eq!(unsafe { &*first_snap }.fr_width, 11);
+        assert_eq!(unsafe { &*first_snap }.fr_height, 7);
+
+        // A second snapshot must install a NEW tree, not append to or
+        // reuse the old one.
+        top.fr_width = 22;
+        unsafe { make_snapshot(0) };
+        let second_snap = tp.tp_snapshot[0];
+        assert!(!second_snap.is_null());
+        assert_eq!(unsafe { &*second_snap }.fr_width, 22);
+
+        unsafe { clear_snapshot(std::ptr::from_mut(&mut *tp), 0) };
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curtab = pt;
+        g.topframe = ptf;
+    }
 
     // ---- frame_comp_pos / int_cmp ----
 
