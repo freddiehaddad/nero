@@ -99,9 +99,13 @@ impl<T> Default for TypedGarrayT<T> {
 impl<T> TypedGarrayT<T> {
     /// `GA_INIT(sizeof(T), growsize)` - the item size is carried by
     /// the type itself, so only the grow size is a parameter.
+    ///
+    /// `const` so a growarray file-static (e.g. `digraph`'s
+    /// `USER_DIGRAPHS`) can be initialised directly, matching the
+    /// original's own static `garray_T` initialisers.
     #[inline]
     #[must_use]
-    pub fn new(growsize: i32) -> Self {
+    pub const fn new(growsize: i32) -> Self {
         TypedGarrayT { ga_growsize: growsize, items: Vec::new() }
     }
 
