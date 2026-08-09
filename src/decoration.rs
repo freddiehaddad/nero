@@ -38,7 +38,9 @@
 //! functions.
 //!
 //! Also translated: [`sign_item_cmp`], the comparator ordering the
-//! signs shown on one line.
+//! signs shown on one line, and [`may_force_numberwidth_recompute`],
+//! which invalidates the cached number-column width in every window
+//! whose `'signcolumn'` is `"number"` and shows the changed buffer.
 //!
 //! Also translated: [`DecorState`] (with [`DecorRangeSlot`], from
 //! `decoration.h`) and its `decor_state` file-static, plus the two
@@ -358,6 +360,55 @@ pub unsafe fn decor_redraw_end(state: &mut DecorState) {
     state.win = std::ptr::null_mut();
 }
 
+/// Force a recompute of the number column's width in every window
+/// showing `buf`, when placing or unplacing a sign could have changed
+/// it (`may_force_numberwidth_recompute`).
+///
+/// Only windows with `'signcolumn'` set to `"number"` are affected -
+/// there the sign shares the number column, so its presence changes
+/// the width. `unplace` forces the recompute unconditionally, since
+/// removing a sign can only ever shrink the column; when placing, the
+/// recompute is only needed while the column is still narrower than
+/// two cells.
+///
+/// The original's `FOR_ALL_TAB_WINDOWS(tp, wp)` walk is reproduced
+/// here directly, following this crate's established idiom
+/// (`optionstr.rs`/`move.rs`).
+///
+/// # Safety
+/// `GLOBALS.first_tabpage`'s own `tp_next` chain, and each tabpage's
+/// window list, must consist of valid, live pointers.
+pub unsafe fn may_force_numberwidth_recompute(buf: *const BufT, unplace: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut tp = unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage;
+    while !tp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let is_curtab = std::ptr::eq(tp, unsafe { crate::globals::GLOBALS.get_mut() }.curtab);
+        let mut wp = if is_curtab {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*tp }.tp_firstwin
+        };
+        while !wp.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            if std::ptr::eq(w.w_buffer, buf)
+                && w.w_minscwidth == crate::option_vars::SCL_NUM
+                && (w.w_onebuf_opt.wo_nu != 0 || w.w_onebuf_opt.wo_rnu != 0)
+                && (unplace || w.w_nrwidth_width < 2)
+            {
+                w.w_nrwidth_line_count = 0;
+            }
+            // SAFETY: forwarded from this function's own safety doc.
+            wp = unsafe { &*wp }.w_next;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        tp = unsafe { &*tp }.tp_next;
+    }
+}
+
 /// Comparator ordering the signs shown on one line (`sign_item_cmp`).
 ///
 /// Sorts DESCENDING on all three keys in turn - priority, then id,
@@ -523,6 +574,156 @@ mod tests {
             attr_id: 0,
             draw_col: DECOR_DRAW_COL_UNDECIDED,
         }
+    }
+
+    // --- may_force_numberwidth_recompute ---
+
+    /// Installs a single-window, single-tabpage layout into the
+    /// globals for the duration of a test and restores the previous
+    /// pointers on drop, even through a panic - so a failing test
+    /// cannot leave dangling window/tabpage pointers in the globals
+    /// for whichever test runs next.
+    struct SingleWindowLayoutGuard {
+        prev_first_tabpage: *mut crate::buffer_defs::TabpageT,
+        prev_curtab: *mut crate::buffer_defs::TabpageT,
+        prev_firstwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl SingleWindowLayoutGuard {
+        fn install(
+            win: *mut crate::buffer_defs::WinT,
+            tp: *mut crate::buffer_defs::TabpageT,
+        ) -> Self {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            let me = Self {
+                prev_first_tabpage: globals.first_tabpage,
+                prev_curtab: globals.curtab,
+                prev_firstwin: globals.firstwin,
+            };
+            globals.first_tabpage = tp;
+            globals.curtab = tp;
+            globals.firstwin = win;
+            me
+        }
+    }
+
+    impl Drop for SingleWindowLayoutGuard {
+        fn drop(&mut self) {
+            let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+            globals.first_tabpage = self.prev_first_tabpage;
+            globals.curtab = self.prev_curtab;
+            globals.firstwin = self.prev_firstwin;
+        }
+    }
+
+    /// Builds a window that satisfies every condition, so each test
+    /// below can break exactly one of them.
+    fn numberwidth_win(buf: *mut BufT) -> Box<crate::buffer_defs::WinT> {
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_minscwidth: crate::option_vars::SCL_NUM,
+            w_nrwidth_width: 1,
+            w_nrwidth_line_count: 42,
+            ..Default::default()
+        });
+        win.w_buffer = buf;
+        win.w_onebuf_opt.wo_nu = 1;
+        win
+    }
+
+    #[test]
+    fn numberwidth_recompute_is_forced_for_a_matching_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut win = numberwidth_win(std::ptr::from_mut(&mut *buf));
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        let _g = SingleWindowLayoutGuard::install(
+            std::ptr::from_mut(&mut *win),
+            std::ptr::from_mut(&mut *tp),
+        );
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), false) };
+        assert_eq!(win.w_nrwidth_line_count, 0);
+    }
+
+    /// A window showing a DIFFERENT buffer must be left alone.
+    #[test]
+    fn numberwidth_recompute_skips_windows_on_another_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut other = Box::new(BufT::default());
+        let mut win = numberwidth_win(std::ptr::from_mut(&mut *buf));
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        let _g = SingleWindowLayoutGuard::install(
+            std::ptr::from_mut(&mut *win),
+            std::ptr::from_mut(&mut *tp),
+        );
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *other), true) };
+        assert_eq!(win.w_nrwidth_line_count, 42);
+    }
+
+    /// Only 'signcolumn' == "number" shares the number column, so any
+    /// other value means a sign cannot change its width.
+    #[test]
+    fn numberwidth_recompute_skips_windows_without_signcolumn_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut win = numberwidth_win(std::ptr::from_mut(&mut *buf));
+        win.w_minscwidth = 1;
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        let _g = SingleWindowLayoutGuard::install(
+            std::ptr::from_mut(&mut *win),
+            std::ptr::from_mut(&mut *tp),
+        );
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), true) };
+        assert_eq!(win.w_nrwidth_line_count, 42);
+    }
+
+    /// With neither 'number' nor 'relativenumber' there is no number
+    /// column at all; 'relativenumber' alone is enough.
+    #[test]
+    fn numberwidth_recompute_needs_either_number_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut win = numberwidth_win(std::ptr::from_mut(&mut *buf));
+        win.w_onebuf_opt.wo_nu = 0;
+        win.w_onebuf_opt.wo_rnu = 0;
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        let g = SingleWindowLayoutGuard::install(
+            std::ptr::from_mut(&mut *win),
+            std::ptr::from_mut(&mut *tp),
+        );
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), true) };
+        assert_eq!(win.w_nrwidth_line_count, 42);
+
+        win.w_onebuf_opt.wo_rnu = 1;
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), true) };
+        assert_eq!(win.w_nrwidth_line_count, 0);
+        drop(g);
+    }
+
+    /// The `unplace` asymmetry: removing a sign can only shrink the
+    /// column, so it always recomputes. PLACING one only matters
+    /// while the column is still narrower than two cells - an
+    /// implementation ignoring `unplace` would skip this window.
+    #[test]
+    fn numberwidth_recompute_always_runs_when_unplacing_but_not_when_placing_into_a_wide_column() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut win = numberwidth_win(std::ptr::from_mut(&mut *buf));
+        win.w_nrwidth_width = 5;
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        let g = SingleWindowLayoutGuard::install(
+            std::ptr::from_mut(&mut *win),
+            std::ptr::from_mut(&mut *tp),
+        );
+
+        // Placing into an already-wide column: nothing to do.
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), false) };
+        assert_eq!(win.w_nrwidth_line_count, 42);
+
+        // Unplacing from the very same window: always recompute.
+        unsafe { may_force_numberwidth_recompute(std::ptr::from_mut(&mut *buf), true) };
+        assert_eq!(win.w_nrwidth_line_count, 0);
+        drop(g);
     }
 
     // --- decor_state_invalidate / decor_redraw_end ---
