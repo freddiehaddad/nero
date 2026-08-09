@@ -28,6 +28,13 @@
 //! [`wild_action`] and [`wild_flags`]), the `EW_*` group they map
 //! into (in `path.rs`), and [`map_wildopts_to_ewflags`].
 //!
+//! Also translated: the two `ExpandGeneric()` callbacks driven by a
+//! file-static sub-command tag - [`get_filetypecmd_arg`] and
+//! [`get_breakadd_arg`], with their [`FILETYPE_EXPAND_WHAT`]/
+//! [`BREAKPT_EXPAND_WHAT`] state. Candidate sets verified against a
+//! real `nvim` (v0.13.0-dev) via
+//! `getcompletion('breakadd ', 'cmdline')` and friends.
+//!
 //! Deferred: everything else - `nextwild`/`copy_substring_from_pos`/
 //! `is_regex_match`/`concat_pattern_with_buffer_match`/
 //! `expand_pattern_in_buf` (the completion/search machinery),
@@ -224,6 +231,100 @@ pub fn map_wildopts_to_ewflags(options: i32) -> i32 {
         flags |= ew_flags::ALLLINKS;
     }
     flags
+}
+
+/// Which set of `:filetype` values completion should offer
+/// (`filetype_expand_what`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FiletypeExpandWhat {
+    /// expand all `:filetype` values (`EXP_FILETYPECMD_ALL`).
+    #[default]
+    All,
+    /// expand `plugin on off` (`EXP_FILETYPECMD_PLUGIN`).
+    Plugin,
+    /// expand `indent on off` (`EXP_FILETYPECMD_INDENT`).
+    Indent,
+    /// expand `on off` (`EXP_FILETYPECMD_ONOFF`).
+    OnOff,
+}
+
+/// Which sub-commands the breakpoint completion should offer
+/// (`breakpt_expand_what`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BreakptExpandWhat {
+    /// expand `:breakadd` sub-commands (`EXP_BREAKPT_ADD`).
+    #[default]
+    Add,
+    /// expand `:breakdel` sub-commands (`EXP_BREAKPT_DEL`).
+    Del,
+    /// expand `:profdel` sub-commands (`EXP_PROFDEL`).
+    ProfDel,
+}
+
+/// `filetype_expand_what` - set by `set_context_in_filetype_cmd`
+/// before `ExpandGeneric()` calls [`get_filetypecmd_arg`].
+pub static FILETYPE_EXPAND_WHAT: crate::globals::GlobalCell<FiletypeExpandWhat> =
+    crate::globals::GlobalCell::new(FiletypeExpandWhat::All);
+
+/// `breakpt_expand_what` - set by `set_context_in_breakadd_cmd`
+/// before `ExpandGeneric()` calls [`get_breakadd_arg`].
+pub static BREAKPT_EXPAND_WHAT: crate::globals::GlobalCell<BreakptExpandWhat> =
+    crate::globals::GlobalCell::new(BreakptExpandWhat::Add);
+
+/// The possible arguments of `:filetype {plugin,indent}`
+/// (`get_filetypecmd_arg`), for the sub-command recorded in
+/// [`FILETYPE_EXPAND_WHAT`].
+///
+/// Returns `None` past the end, which is how `ExpandGeneric()` learns
+/// to stop.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// [`FILETYPE_EXPAND_WHAT`].
+#[must_use]
+pub unsafe fn get_filetypecmd_arg(idx: i32) -> Option<&'static str> {
+    if idx < 0 {
+        return None;
+    }
+    let idx = idx as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { *FILETYPE_EXPAND_WHAT.get_mut() } {
+        FiletypeExpandWhat::All => {
+            ["detect", "indent", "plugin", "on", "off"].get(idx).copied()
+        }
+        FiletypeExpandWhat::Plugin => ["plugin", "on", "off"].get(idx).copied(),
+        FiletypeExpandWhat::Indent => ["indent", "on", "off"].get(idx).copied(),
+        FiletypeExpandWhat::OnOff => ["on", "off"].get(idx).copied(),
+    }
+}
+
+/// The possible arguments of `:breakadd`/`:breakdel`/`:profdel`
+/// (`get_breakadd_arg`), for the sub-command recorded in
+/// [`BREAKPT_EXPAND_WHAT`].
+///
+/// All three share one four-entry table and differ only in where they
+/// start and how far they run: `:breakadd` offers all four,
+/// `:breakdel` drops `"expr"`, and `:profdel` drops `"expr"` and
+/// `"here"`.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// [`BREAKPT_EXPAND_WHAT`].
+#[must_use]
+pub unsafe fn get_breakadd_arg(idx: i32) -> Option<&'static str> {
+    if !(0..=3).contains(&idx) {
+        return None;
+    }
+    let opts = ["expr", "file", "func", "here"];
+    let idx = idx as usize;
+    // SAFETY: forwarded from this function's own safety doc.
+    match unsafe { *BREAKPT_EXPAND_WHAT.get_mut() } {
+        BreakptExpandWhat::Add => opts.get(idx).copied(),
+        // breakdel {func, file, here}
+        BreakptExpandWhat::Del => (idx <= 2).then(|| opts[idx + 1]),
+        // profdel {func, file}
+        BreakptExpandWhat::ProfDel => (idx <= 1).then(|| opts[idx + 1]),
+    }
 }
 
 /// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
@@ -522,6 +623,125 @@ mod tests {
             ..crate::cmdexpand_defs::ExpandT::default()
         });
         assert!(!unsafe { cmdline_compl_is_fuzzy() });
+    }
+
+    // --- get_filetypecmd_arg / get_breakadd_arg ---
+
+    /// Installs a `FILETYPE_EXPAND_WHAT` value and restores it on
+    /// drop, even through a panic.
+    struct FiletypeWhatGuard(FiletypeExpandWhat);
+
+    impl FiletypeWhatGuard {
+        fn set(v: FiletypeExpandWhat) -> Self {
+            let cell = unsafe { FILETYPE_EXPAND_WHAT.get_mut() };
+            let me = Self(*cell);
+            *cell = v;
+            me
+        }
+    }
+
+    impl Drop for FiletypeWhatGuard {
+        fn drop(&mut self) {
+            *unsafe { FILETYPE_EXPAND_WHAT.get_mut() } = self.0;
+        }
+    }
+
+    /// Installs a `BREAKPT_EXPAND_WHAT` value and restores it on
+    /// drop, even through a panic.
+    struct BreakptWhatGuard(BreakptExpandWhat);
+
+    impl BreakptWhatGuard {
+        fn set(v: BreakptExpandWhat) -> Self {
+            let cell = unsafe { BREAKPT_EXPAND_WHAT.get_mut() };
+            let me = Self(*cell);
+            *cell = v;
+            me
+        }
+    }
+
+    impl Drop for BreakptWhatGuard {
+        fn drop(&mut self) {
+            *unsafe { BREAKPT_EXPAND_WHAT.get_mut() } = self.0;
+        }
+    }
+
+    fn collect_filetypecmd_args() -> Vec<&'static str> {
+        (0..).map_while(|i| unsafe { get_filetypecmd_arg(i) }).collect()
+    }
+
+    fn collect_breakadd_args() -> Vec<&'static str> {
+        (0..).map_while(|i| unsafe { get_breakadd_arg(i) }).collect()
+    }
+
+    /// The candidate SETS below were read out of a real `nvim`
+    /// (v0.13.0-dev) via `getcompletion('breakadd ', 'cmdline')` and
+    /// friends. `getcompletion()` sorts its result, so the ORDER
+    /// asserted here comes from the original's own tables instead.
+    #[test]
+    fn breakadd_offers_every_breakpoint_kind() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = BreakptWhatGuard::set(BreakptExpandWhat::Add);
+        assert_eq!(collect_breakadd_args(), ["expr", "file", "func", "here"]);
+    }
+
+    /// `:breakdel` drops "expr" - it starts one entry INTO the shared
+    /// table rather than at the top of it.
+    #[test]
+    fn breakdel_drops_the_expr_kind() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = BreakptWhatGuard::set(BreakptExpandWhat::Del);
+        assert_eq!(collect_breakadd_args(), ["file", "func", "here"]);
+    }
+
+    /// `:profdel` drops both "expr" and "here" - same shifted start
+    /// as `:breakdel`, but one entry shorter.
+    #[test]
+    fn profdel_drops_the_expr_and_here_kinds() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = BreakptWhatGuard::set(BreakptExpandWhat::ProfDel);
+        assert_eq!(collect_breakadd_args(), ["file", "func"]);
+    }
+
+    #[test]
+    fn breakadd_arg_refuses_a_negative_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = BreakptWhatGuard::set(BreakptExpandWhat::Add);
+        assert_eq!(unsafe { get_breakadd_arg(-1) }, None);
+    }
+
+    #[test]
+    fn filetype_cmd_offers_every_value_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = FiletypeWhatGuard::set(FiletypeExpandWhat::All);
+        assert_eq!(
+            collect_filetypecmd_args(),
+            ["detect", "indent", "plugin", "on", "off"]
+        );
+    }
+
+    /// Once a sub-command is known, the remaining candidates are the
+    /// ones that still make sense after it.
+    #[test]
+    fn filetype_cmd_narrows_to_the_pending_subcommand() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        let g = FiletypeWhatGuard::set(FiletypeExpandWhat::Plugin);
+        assert_eq!(collect_filetypecmd_args(), ["plugin", "on", "off"]);
+        drop(g);
+
+        let g = FiletypeWhatGuard::set(FiletypeExpandWhat::Indent);
+        assert_eq!(collect_filetypecmd_args(), ["indent", "on", "off"]);
+        drop(g);
+
+        let _g = FiletypeWhatGuard::set(FiletypeExpandWhat::OnOff);
+        assert_eq!(collect_filetypecmd_args(), ["on", "off"]);
+    }
+
+    #[test]
+    fn filetypecmd_arg_refuses_a_negative_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = FiletypeWhatGuard::set(FiletypeExpandWhat::All);
+        assert_eq!(unsafe { get_filetypecmd_arg(-1) }, None);
     }
 
     // --- map_wildopts_to_ewflags ---
