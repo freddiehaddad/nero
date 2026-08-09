@@ -99,6 +99,53 @@
 
 use crate::buffer_defs::b_flags;
 
+/// Clamp a zero line number in the command's range up to line 1,
+/// unless the command explicitly permits zero (`correct_range`).
+///
+/// Line 0 is meaningful for a few commands (`:0read` inserts above
+/// the first line, for instance), which is what the `EX_ZEROR` flag
+/// marks; for everything else it would be an invalid address.
+pub fn correct_range(eap: &mut crate::ex_cmds_defs::ExargT) {
+    if eap.argt & crate::ex_cmds_defs::ex_flags::ZEROR != 0 {
+        return; // zero line number allowed
+    }
+    if eap.line1 == 0 {
+        eap.line1 = 1;
+    }
+    if eap.line2 == 0 {
+        eap.line2 = 1;
+    }
+}
+
+/// Consume any trailing `l`/`p`/`#` print flags from the start of
+/// `arg`, returning the accumulated `EXFLAG_*` bits and how many
+/// bytes were consumed (`get_flags`).
+///
+/// The original advances `eap->arg` in place and ORs into
+/// `eap->flags`; returning the pair instead keeps the parsing
+/// separate from the mutation, matching this crate's preference for
+/// returning values over out-parameters.
+///
+/// Note `#` is the fallback rather than a tested case in the
+/// original, reached because the surrounding loop only admits those
+/// three characters in the first place.
+#[must_use]
+pub fn get_flags(arg: &[u8]) -> (i32, usize) {
+    use crate::ex_cmds_defs::exflag;
+    let mut flags = 0;
+    let mut i = 0;
+    while i < arg.len() && matches!(arg[i], b'l' | b'p' | b'#') {
+        flags |= match arg[i] {
+            b'l' => exflag::LIST,
+            b'p' => exflag::PRINT,
+            _ => exflag::NR,
+        };
+        i += 1;
+        i += crate::charset::skipwhite(&arg[i..]);
+    }
+    (flags, i)
+}
+
 /// `:fold` - create a fold over the command's own line range
 /// (`ex_fold`).
 ///
@@ -743,6 +790,82 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- correct_range / get_flags ----
+
+    #[test]
+    fn correct_range_clamps_zero_addresses_up_to_line_one() {
+        let mut eap = crate::ex_cmds_defs::ExargT { line1: 0, line2: 0, argt: 0, ..Default::default() };
+        correct_range(&mut eap);
+        assert_eq!((eap.line1, eap.line2), (1, 1));
+    }
+
+    /// Only a ZERO address is clamped - a real line number must be
+    /// left exactly as given.
+    #[test]
+    fn correct_range_leaves_nonzero_addresses_alone() {
+        let mut eap =
+            crate::ex_cmds_defs::ExargT { line1: 0, line2: 7, argt: 0, ..Default::default() };
+        correct_range(&mut eap);
+        assert_eq!((eap.line1, eap.line2), (1, 7));
+    }
+
+    /// Commands flagged EX_ZEROR genuinely accept line 0 (`:0read`
+    /// inserts above the first line), so the clamp must not fire.
+    #[test]
+    fn correct_range_keeps_zero_when_the_command_allows_it() {
+        let mut eap = crate::ex_cmds_defs::ExargT {
+            line1: 0,
+            line2: 0,
+            argt: crate::ex_cmds_defs::ex_flags::ZEROR,
+            ..Default::default()
+        };
+        correct_range(&mut eap);
+        assert_eq!((eap.line1, eap.line2), (0, 0));
+    }
+
+    #[test]
+    fn get_flags_recognizes_each_print_flag() {
+        use crate::ex_cmds_defs::exflag;
+        assert_eq!(get_flags(b"l"), (exflag::LIST, 1));
+        assert_eq!(get_flags(b"p"), (exflag::PRINT, 1));
+        assert_eq!(get_flags(b"#"), (exflag::NR, 1));
+    }
+
+    #[test]
+    fn get_flags_accumulates_several_flags() {
+        use crate::ex_cmds_defs::exflag;
+        let (flags, len) = get_flags(b"lp#");
+        assert_eq!(flags, exflag::LIST | exflag::PRINT | exflag::NR);
+        assert_eq!(len, 3);
+    }
+
+    /// Whitespace BETWEEN flags is skipped, so the run continues past
+    /// it rather than stopping at the first space.
+    #[test]
+    fn get_flags_skips_whitespace_between_flags() {
+        use crate::ex_cmds_defs::exflag;
+        let (flags, len) = get_flags(b"l p");
+        assert_eq!(flags, exflag::LIST | exflag::PRINT);
+        assert_eq!(len, 3);
+    }
+
+    /// Anything else ends the run immediately, consuming nothing.
+    #[test]
+    fn get_flags_stops_at_the_first_non_flag() {
+        assert_eq!(get_flags(b"xyz"), (0, 0));
+        assert_eq!(get_flags(b""), (0, 0));
+    }
+
+    /// Trailing text after the flags is left for the caller.
+    #[test]
+    fn get_flags_reports_only_the_consumed_prefix() {
+        use crate::ex_cmds_defs::exflag;
+        let arg = b"lp rest";
+        let (flags, len) = get_flags(arg);
+        assert_eq!(flags, exflag::LIST | exflag::PRINT);
+        assert_eq!(&arg[len..], b"rest");
+    }
 
     // ---- ex_fold / ex_foldopen ----
 
