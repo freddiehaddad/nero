@@ -327,6 +327,82 @@ pub unsafe fn get_breakadd_arg(idx: i32) -> Option<&'static str> {
     }
 }
 
+/// The tail of a completion match, for display in the wildmenu
+/// (`showmatches_gettail`).
+///
+/// Returns a byte OFFSET into `s` rather than the original's interior
+/// pointer, matching this crate's convention (e.g.
+/// [`crate::path::path_tail`]).
+///
+/// With `eager` set, the tail starts after the LAST path separator.
+/// Otherwise the tail only moves when a real byte is seen AFTER a
+/// separator, so a TRAILING separator never takes effect and the
+/// tail stays at the previous component.
+#[must_use]
+pub fn showmatches_gettail(s: &[u8], eager: bool) -> usize {
+    let mut t = 0;
+    let mut had_sep = false;
+
+    let mut p = 0;
+    while p < s.len() && s[p] != 0 {
+        let is_sep = crate::path::vim_ispathsep(i32::from(s[p]))
+            // On Windows a backslash may be escaping the next byte
+            // rather than separating a path component.
+            && !(cfg!(windows) && crate::charset::rem_backslash(&s[p..]));
+        if is_sep {
+            if eager {
+                t = p + 1;
+            } else {
+                had_sep = true;
+            }
+        } else if had_sep {
+            t = p;
+            had_sep = false;
+        }
+        p += (crate::mbyte::utf_ptr2len(&s[p..]).max(1)) as usize;
+    }
+    t
+}
+
+/// Whether only the tail of completion matches needs to be shown
+/// (`expand_showtail`).
+///
+/// False when not completing file names - where a `"/"` may mean
+/// something else entirely - or when the leading path contains a
+/// wildcard, since then the matches' directories genuinely differ and
+/// the tails alone would be ambiguous.
+#[must_use]
+pub fn expand_showtail(
+    xp_context: crate::cmdexpand_defs::ExpandContext,
+    xp_pattern: &[u8],
+) -> bool {
+    use crate::cmdexpand_defs::ExpandContext as E;
+    if !matches!(xp_context, E::Files | E::Shellcmd | E::Directories) {
+        return false;
+    }
+
+    let end = crate::path::path_tail(xp_pattern);
+    if end == 0 {
+        // there is no path separator
+        return false;
+    }
+
+    let mut s = 0;
+    while s < end {
+        // Skip escaped wildcards. Only when the backslash is not a
+        // path separator: on DOS the '*' in "path\*\file" must not be
+        // skipped.
+        if crate::charset::rem_backslash(&xp_pattern[s..]) {
+            s += 2;
+        } else if matches!(xp_pattern[s], b'*' | b'?' | b'[') {
+            return false;
+        } else {
+            s += 1;
+        }
+    }
+    true
+}
+
 /// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
 ///
 /// Returns `None` past the end, which is how `ExpandGeneric()` learns
@@ -623,6 +699,98 @@ mod tests {
             ..crate::cmdexpand_defs::ExpandT::default()
         });
         assert!(!unsafe { cmdline_compl_is_fuzzy() });
+    }
+
+    // --- showmatches_gettail / expand_showtail ---
+
+    #[test]
+    fn gettail_eager_starts_after_the_last_separator() {
+        let s = b"one/two/three";
+        assert_eq!(&s[showmatches_gettail(s, true)..], b"three");
+    }
+
+    #[test]
+    fn gettail_returns_the_whole_string_without_a_separator() {
+        let s = b"plain";
+        assert_eq!(showmatches_gettail(s, true), 0);
+        assert_eq!(showmatches_gettail(s, false), 0);
+    }
+
+    /// A TRAILING separator is where the two modes genuinely diverge,
+    /// hand-traced against the original: eager jumps past it, leaving
+    /// an empty tail, while non-eager only commits the tail when it
+    /// sees a real byte AFTER a separator - so the trailing one never
+    /// takes effect and the tail stays at the previous component.
+    #[test]
+    fn gettail_handles_a_trailing_separator_differently_per_mode() {
+        let s = b"one/two/";
+        assert_eq!(&s[showmatches_gettail(s, false)..], b"two/");
+        assert_eq!(showmatches_gettail(s, true), s.len());
+    }
+
+    /// The two modes genuinely differ on a run of separators: eager
+    /// jumps past the LAST one immediately, while non-eager only
+    /// commits when it sees the next real byte. Both land in the same
+    /// place here, but the intermediate handling differs, so this
+    /// checks a case with content after the run.
+    #[test]
+    fn gettail_skips_a_run_of_separators_in_both_modes() {
+        let s = b"a//b";
+        assert_eq!(&s[showmatches_gettail(s, true)..], b"b");
+        assert_eq!(&s[showmatches_gettail(s, false)..], b"b");
+    }
+
+    #[test]
+    fn gettail_advances_over_multibyte_characters() {
+        // A 3-byte character must be stepped over whole; walking it
+        // byte-by-byte could mistake a continuation byte for a
+        // separator on some inputs.
+        let s = "dir/\u{4f60}\u{597d}".as_bytes();
+        assert_eq!(&s[showmatches_gettail(s, true)..], "\u{4f60}\u{597d}".as_bytes());
+    }
+
+    #[test]
+    fn showtail_is_false_when_not_completing_file_names() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        // Same pattern that would otherwise qualify.
+        assert!(!expand_showtail(E::Commands, b"dir/file"));
+        assert!(!expand_showtail(E::Colors, b"dir/file"));
+    }
+
+    #[test]
+    fn showtail_is_true_for_a_plain_directory_prefix() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        for ctx in [E::Files, E::Shellcmd, E::Directories] {
+            assert!(expand_showtail(ctx, b"dir/file"), "{ctx:?}");
+        }
+    }
+
+    /// Without a path separator there is no directory prefix to hide,
+    /// so the tail is not shown.
+    #[test]
+    fn showtail_is_false_without_a_path_separator() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        assert!(!expand_showtail(E::Files, b"file"));
+    }
+
+    /// A wildcard in the LEADING path means the matches come from
+    /// genuinely different directories, so their tails alone would be
+    /// ambiguous.
+    #[test]
+    fn showtail_is_false_with_a_wildcard_in_the_leading_path() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        assert!(!expand_showtail(E::Files, b"d*r/file"));
+        assert!(!expand_showtail(E::Files, b"d?r/file"));
+        assert!(!expand_showtail(E::Files, b"d[ab]r/file"));
+    }
+
+    /// A wildcard in the TAIL is fine - only the leading path is
+    /// scanned. An implementation scanning the whole pattern would
+    /// wrongly refuse here.
+    #[test]
+    fn showtail_ignores_a_wildcard_in_the_tail() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        assert!(expand_showtail(E::Files, b"dir/fi*le"));
     }
 
     // --- get_filetypecmd_arg / get_breakadd_arg ---
