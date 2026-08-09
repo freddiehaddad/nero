@@ -18,6 +18,10 @@
 //! `get_*_arg` callbacks in that group stay deferred: they run Lua
 //! (`get_arg1_from_lua`/`nlua_exec`).
 //!
+//! Also translated: the `compl_match_array` file-static (as
+//! `COMPL_MATCH_ARRAY`, over the newly-real
+//! [`crate::popupmenu::PumitemT`]) and [`cmdline_pum_active`].
+//!
 //! Deferred: everything else - `nextwild`/`copy_substring_from_pos`/
 //! `is_regex_match`/`concat_pattern_with_buffer_match`/
 //! `expand_pattern_in_buf` (the completion/search machinery),
@@ -56,6 +60,44 @@ pub unsafe fn cmdline_compl_use_pum(need_wildmenu: bool) -> bool {
     }
     ui_has(UiExtension::Wildmenu)
         || (ui_has(UiExtension::Cmdline) && ui_has(UiExtension::Popupmenu))
+}
+
+/// `compl_match_array` - the currently displayed list of cmdline
+/// completion entries in the popup menu. `None` when there is no
+/// popup menu, matching the original's `NULL`.
+///
+/// Only ever set by `cmdline_pum_display`'s own array-building loop
+/// (needing the real `expand_T` match list, not yet translated) and
+/// cleared by `cmdline_pum_remove`, so this stays `None` in this
+/// crate today - matching `crate::popupmenu::PUM_IS_VISIBLE`'s own
+/// established treatment.
+///
+/// The original's companion `compl_match_arraysize` has no
+/// counterpart: a `Vec` carries its own length.
+///
+/// Note `Some(Vec::new())` is deliberately reachable and is NOT the
+/// same as `None`: the original builds the array with
+/// `xmalloc(sizeof(pumitem_T) * numMatches)`, and neovim's `xmalloc`
+/// returns a non-NULL pointer even for a zero-size request, so an
+/// empty match list still leaves `compl_match_array` non-NULL.
+static COMPL_MATCH_ARRAY: crate::globals::GlobalCell<Option<Vec<crate::popupmenu::PumitemT>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Whether the cmdline completion popup menu is currently displayed
+/// (`cmdline_pum_active`).
+///
+/// Both halves matter: the popup menu can be visible for INSERT-mode
+/// completion (`insexpand.c`) while no cmdline completion is running,
+/// in which case `compl_match_array` is still NULL and this is false.
+///
+/// # Safety
+/// Must not run concurrently with any write to
+/// `crate::popupmenu`'s own `pum_is_visible` or to
+/// `COMPL_MATCH_ARRAY`.
+#[must_use]
+pub unsafe fn cmdline_pum_active() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::popupmenu::pum_visible() && unsafe { COMPL_MATCH_ARRAY.get_mut() }.is_some()
 }
 
 /// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
@@ -184,6 +226,73 @@ mod tests {
         fn drop(&mut self) {
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.wop_flags = self.saved;
         }
+    }
+
+    /// Installs a `COMPL_MATCH_ARRAY` value for the duration of a
+    /// test and restores the previous one on drop, even through a
+    /// panic.
+    struct ComplMatchArrayGuard {
+        saved: Option<Vec<crate::popupmenu::PumitemT>>,
+    }
+
+    impl ComplMatchArrayGuard {
+        fn set(value: Option<Vec<crate::popupmenu::PumitemT>>) -> Self {
+            let slot = unsafe { COMPL_MATCH_ARRAY.get_mut() };
+            let saved = std::mem::replace(slot, value);
+            Self { saved }
+        }
+    }
+
+    impl Drop for ComplMatchArrayGuard {
+        fn drop(&mut self) {
+            *unsafe { COMPL_MATCH_ARRAY.get_mut() } = self.saved.take();
+        }
+    }
+
+    // --- cmdline_pum_active ---
+
+    #[test]
+    fn cmdline_pum_is_inactive_with_no_match_array_even_when_the_pum_is_visible() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pum = crate::popupmenu::tests::PumVisibleGuard::set(true);
+        let _arr = ComplMatchArrayGuard::set(None);
+        // The popup menu is visible for INSERT-mode completion; no
+        // cmdline completion is running, so this must be false.
+        assert!(!unsafe { cmdline_pum_active() });
+    }
+
+    #[test]
+    fn cmdline_pum_is_inactive_with_a_match_array_when_the_pum_is_not_visible() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pum = crate::popupmenu::tests::PumVisibleGuard::set(false);
+        let _arr = ComplMatchArrayGuard::set(Some(vec![crate::popupmenu::PumitemT {
+            pum_text: b"match".to_vec(),
+            ..crate::popupmenu::PumitemT::default()
+        }]));
+        assert!(!unsafe { cmdline_pum_active() });
+    }
+
+    #[test]
+    fn cmdline_pum_is_active_only_when_both_hold() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pum = crate::popupmenu::tests::PumVisibleGuard::set(true);
+        let _arr = ComplMatchArrayGuard::set(Some(vec![crate::popupmenu::PumitemT {
+            pum_text: b"match".to_vec(),
+            ..crate::popupmenu::PumitemT::default()
+        }]));
+        assert!(unsafe { cmdline_pum_active() });
+    }
+
+    #[test]
+    fn an_empty_match_array_still_counts_as_present() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _pum = crate::popupmenu::tests::PumVisibleGuard::set(true);
+        // The original allocates with xmalloc(sizeof(pumitem_T) * 0),
+        // which returns a NON-NULL pointer, so a zero-length match
+        // list still leaves compl_match_array != NULL. Testing
+        // emptiness instead of presence would wrongly report false.
+        let _arr = ComplMatchArrayGuard::set(Some(Vec::new()));
+        assert!(unsafe { cmdline_pum_active() });
     }
 
     /// Every expected value below was read out of a real `nvim`
