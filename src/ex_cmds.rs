@@ -104,6 +104,59 @@ pub fn handle_mkdir_p_arg(eap: &crate::ex_cmds_defs::ExargT, fname: &[u8]) -> i3
     crate::vim_defs::OK
 }
 
+/// The previous `:!` shell command (`prevcmd`).
+///
+/// Only ever set by `do_bang` (not yet translated), so this stays
+/// `None` in this crate today. `None` models the original's own NULL,
+/// which is what `prevcmd_is_set` reports on.
+static PREVCMD: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Release the remembered `:!` shell command
+/// (`free_prev_shellcmd`).
+///
+/// The original's `xfree` becomes a plain `None` assignment: dropping
+/// the owned value is what frees it.
+///
+/// # Safety
+/// Mutates the `PREVCMD` file-static.
+pub unsafe fn free_prev_shellcmd() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { PREVCMD.get_mut() } = None;
+}
+
+/// Whether a previous `:!` command has been remembered
+/// (`prevcmd_is_set`).
+///
+/// The original also emits `E34: No previous command` when there is
+/// none; that message display is omitted here, matching this crate's
+/// established "skip the deferred message-display side effect, keep
+/// the exact same pass/fail outcome" policy (e.g.
+/// `arglist::check_arglist_locked`).
+///
+/// # Safety
+/// Reads the `PREVCMD` file-static.
+#[must_use]
+pub unsafe fn prevcmd_is_set() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { PREVCMD.get_mut() }.is_some()
+}
+
+/// Whether writing files is currently disabled by `'write'`
+/// (`not_writing`).
+///
+/// Note the INVERTED sense: this returns `true` when writing is NOT
+/// allowed, so callers can use it as a guard. The original also emits
+/// `E142` in that case; that message display is omitted, as above.
+///
+/// # Safety
+/// Reads `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn not_writing() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write == 0
+}
+
 /// The previous `:substitute` replacement string (`old_sub`).
 ///
 /// The original owns raw pointers and frees the outgoing value when a
@@ -143,6 +196,91 @@ mod tests {
 
     fn globals_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::globals::global_state_test_lock()
+    }
+
+    // ---- prevcmd / free_prev_shellcmd / prevcmd_is_set / not_writing ----
+
+    /// Restores `PREVCMD` and `'write'` on drop, even through a panic.
+    struct ExCmdsGuard {
+        prevcmd: Option<Vec<u8>>,
+        p_write: i32,
+    }
+
+    impl ExCmdsGuard {
+        fn save() -> Self {
+            Self {
+                prevcmd: unsafe { PREVCMD.get_mut() }.take(),
+                p_write: unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write,
+            }
+        }
+    }
+
+    impl Drop for ExCmdsGuard {
+        fn drop(&mut self) {
+            *unsafe { PREVCMD.get_mut() } = self.prevcmd.take();
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write = self.p_write;
+        }
+    }
+
+    #[test]
+    fn prevcmd_is_unset_until_a_shell_command_is_remembered() {
+        let _guard = globals_test_lock();
+        let _g = ExCmdsGuard::save();
+        *unsafe { PREVCMD.get_mut() } = None;
+        assert!(!unsafe { prevcmd_is_set() });
+
+        *unsafe { PREVCMD.get_mut() } = Some(b"ls -l".to_vec());
+        assert!(unsafe { prevcmd_is_set() });
+    }
+
+    /// An EMPTY previous command still counts as set - the original
+    /// tests the pointer for NULL, not the string for emptiness, so
+    /// `:!` with an empty command is remembered.
+    #[test]
+    fn prevcmd_counts_an_empty_command_as_set() {
+        let _guard = globals_test_lock();
+        let _g = ExCmdsGuard::save();
+        *unsafe { PREVCMD.get_mut() } = Some(Vec::new());
+        assert!(unsafe { prevcmd_is_set() });
+    }
+
+    #[test]
+    fn free_prev_shellcmd_releases_the_remembered_command() {
+        let _guard = globals_test_lock();
+        let _g = ExCmdsGuard::save();
+        *unsafe { PREVCMD.get_mut() } = Some(b"ls -l".to_vec());
+
+        unsafe { free_prev_shellcmd() };
+
+        assert!(!unsafe { prevcmd_is_set() });
+        assert_eq!(*unsafe { PREVCMD.get_mut() }, None);
+    }
+
+    /// Freeing twice must be safe - the original's `xfree(NULL)` is a
+    /// no-op too.
+    #[test]
+    fn free_prev_shellcmd_is_safe_to_repeat() {
+        let _guard = globals_test_lock();
+        let _g = ExCmdsGuard::save();
+        *unsafe { PREVCMD.get_mut() } = Some(b"ls".to_vec());
+        unsafe { free_prev_shellcmd() };
+        unsafe { free_prev_shellcmd() };
+        assert!(!unsafe { prevcmd_is_set() });
+    }
+
+    /// The sense is INVERTED: `not_writing()` is true when writing is
+    /// DISABLED. Reading it as "writing is allowed" would invert every
+    /// caller's guard, so both directions are asserted.
+    #[test]
+    fn not_writing_is_true_only_when_the_write_option_is_off() {
+        let _guard = globals_test_lock();
+        let _g = ExCmdsGuard::save();
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write = 1;
+        assert!(!unsafe { not_writing() }, "'write' on means writing IS allowed");
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write = 0;
+        assert!(unsafe { not_writing() }, "'write' off means writing is disabled");
     }
 
     #[test]
