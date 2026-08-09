@@ -217,6 +217,50 @@ pub unsafe fn qf_find_help_win() -> *mut WinT {
     std::ptr::null_mut()
 }
 
+/// Attach location list stack `qi` to window `wp` (`win_set_loclist`).
+///
+/// The stack's reference count is incremented, since the window now
+/// holds a reference to it.
+///
+/// # Safety
+/// `wp` and `qi` must be valid, non-null pointers to a live `WinT`
+/// and `QfInfoT`.
+pub unsafe fn win_set_loclist(wp: *mut WinT, qi: *mut crate::types_defs::QfInfoT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        (*wp).w_llist = qi;
+        (*qi).qf_refcount += 1;
+    }
+}
+
+/// Find a NON-quickfix window in the current tabpage using location
+/// list stack `ll` (`qf_find_win_with_loclist`), or null if there is
+/// none.
+///
+/// Quickfix/location-list windows are deliberately skipped: this
+/// looks for the window whose file the list belongs to, not the
+/// window displaying the list itself.
+///
+/// # Safety
+/// `GLOBALS.firstwin` and its `w_next` chain must be valid pointers to
+/// live `WinT`s, each with a valid `w_buffer`.
+#[must_use]
+pub unsafe fn qf_find_win_with_loclist(ll: *const crate::types_defs::QfInfoT) -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let (llist, buf) = unsafe { ((*wp).w_llist, (*wp).w_buffer) };
+        // SAFETY: forwarded from this function's own safety doc.
+        if std::ptr::eq(llist, ll) && !crate::buffer::bt_quickfix(unsafe { buf.as_ref() }) {
+            return wp;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+    std::ptr::null_mut()
+}
+
 /// Sentinel for "no quickfix list index" (`INVALID_QFIDX`).
 pub const INVALID_QFIDX: i32 = -1;
 /// Sentinel for "no quickfix window buffer" (`INVALID_QFBUFNR`).
@@ -1001,6 +1045,112 @@ mod tests {
         let r = f();
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
         r
+    }
+
+    // --- win_set_loclist / qf_find_win_with_loclist ---
+
+    /// Builds windows with the given `(w_llist, is_quickfix_buffer)`
+    /// specs, boxed for stable addresses since they go into GLOBALS.
+    fn loclist_win_fixture(
+        specs: &[(*mut crate::types_defs::QfInfoT, bool)],
+    ) -> (Vec<Box<BufT>>, Vec<Box<WinT>>) {
+        let mut bufs: Vec<Box<BufT>> = Vec::new();
+        let mut wins: Vec<Box<WinT>> = Vec::new();
+
+        for &(llist, is_qf) in specs {
+            let mut buf = Box::new(BufT::default());
+            if is_qf {
+                buf.b_p_bt = Some(b"quickfix".to_vec());
+            }
+            let buf_ptr = std::ptr::addr_of_mut!(*buf);
+            let win = Box::new(WinT { w_buffer: buf_ptr, w_llist: llist, ..Default::default() });
+            bufs.push(buf);
+            wins.push(win);
+        }
+
+        for i in 0..wins.len() {
+            let next = if i + 1 < wins.len() {
+                std::ptr::addr_of_mut!(*wins[i + 1])
+            } else {
+                std::ptr::null_mut()
+            };
+            wins[i].w_next = next;
+        }
+        (bufs, wins)
+    }
+
+    #[test]
+    fn win_set_loclist_attaches_the_stack_and_takes_a_reference() {
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+        let mut win = Box::new(WinT::default());
+
+        unsafe { win_set_loclist(std::ptr::addr_of_mut!(*win), qi_ptr) };
+
+        assert_eq!(win.w_llist, qi_ptr);
+        assert_eq!(qi.qf_refcount, 1, "the window now holds a reference");
+
+        // A second window attaching bumps it again.
+        let mut win2 = Box::new(WinT::default());
+        unsafe { win_set_loclist(std::ptr::addr_of_mut!(*win2), qi_ptr) };
+        assert_eq!(qi.qf_refcount, 2);
+    }
+
+    #[test]
+    fn find_win_with_loclist_finds_the_matching_non_quickfix_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+
+        // A non-matching window first, so a match on the SECOND is
+        // required.
+        let (_bufs, mut wins) =
+            loclist_win_fixture(&[(std::ptr::null_mut(), false), (qi_ptr, false)]);
+        let want = std::ptr::addr_of_mut!(*wins[1]);
+
+        let found = with_windows(&mut wins, || unsafe { qf_find_win_with_loclist(qi_ptr) });
+        assert_eq!(found, want);
+    }
+
+    /// A quickfix window using the very same list must be SKIPPED -
+    /// this looks for the window whose file the list belongs to, not
+    /// the window displaying the list. An implementation that only
+    /// compared the list pointer would wrongly return the first one.
+    #[test]
+    fn find_win_with_loclist_skips_quickfix_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+
+        let (_bufs, mut wins) = loclist_win_fixture(&[(qi_ptr, true), (qi_ptr, false)]);
+        let want = std::ptr::addr_of_mut!(*wins[1]);
+
+        let found = with_windows(&mut wins, || unsafe { qf_find_win_with_loclist(qi_ptr) });
+        assert_eq!(found, want, "the quickfix window must be skipped");
+    }
+
+    #[test]
+    fn find_win_with_loclist_is_null_when_only_quickfix_windows_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+
+        let (_bufs, mut wins) = loclist_win_fixture(&[(qi_ptr, true)]);
+        let found = with_windows(&mut wins, || unsafe { qf_find_win_with_loclist(qi_ptr) });
+        assert!(found.is_null());
+    }
+
+    #[test]
+    fn find_win_with_loclist_is_null_for_a_different_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let mut other = Box::new(crate::types_defs::QfInfoT::default());
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+        let other_ptr = std::ptr::addr_of_mut!(*other);
+
+        let (_bufs, mut wins) = loclist_win_fixture(&[(other_ptr, false)]);
+        let found = with_windows(&mut wins, || unsafe { qf_find_win_with_loclist(qi_ptr) });
+        assert!(found.is_null());
     }
 
     #[test]
