@@ -67,6 +67,65 @@ pub unsafe fn syn_getcurline_len() -> crate::pos_defs::ColnrT {
     unsafe { crate::memline::ml_get_buf_len(&mut *buf, lnum) }
 }
 
+/// Syntax group ID for `contains=TOP` (`SYNID_TOP`).
+pub const SYNID_TOP: i32 = 21000;
+/// Syntax group ID for `contains=CONTAINED` (`SYNID_CONTAINED`).
+pub const SYNID_CONTAINED: i32 = 22000;
+/// First syntax group ID for clusters (`SYNID_CLUSTER`).
+pub const SYNID_CLUSTER: i32 = 23000;
+/// Maximum number of clusters before the group ID overflows
+/// (`MAX_CLUSTER_ID`).
+pub const MAX_CLUSTER_ID: i32 = 32767 - SYNID_CLUSTER;
+
+/// Find a syntax cluster by name and return its group ID, or `0` when
+/// there is none (`syn_scl_name2id`).
+///
+/// The comparison is case-INSENSITIVE, done by uppercasing the needle
+/// once and matching it against each cluster's precomputed
+/// `scl_name_u` - the original notes this avoids repeated `stricmp`
+/// calls, which are slow on some systems.
+///
+/// The scan runs BACKWARDS, so with duplicate names the LAST entry
+/// wins.
+///
+/// # Safety
+/// `GLOBALS.curwin` must be valid and non-null, as must its `w_s`
+/// syntax block.
+#[must_use]
+pub unsafe fn syn_scl_name2id(name: &[u8]) -> i32 {
+    let name_u = crate::strings::vim_strsave_up(name);
+    // SAFETY: forwarded from this function's own safety doc.
+    let block = unsafe { &*(*crate::globals::GLOBALS.get_mut().curwin).w_s };
+
+    let mut i = block.b_syn_clusters.ga_len() - 1;
+    while i >= 0 {
+        let matched = block
+            .b_syn_clusters
+            .get(i)
+            .and_then(|c| c.scl_name_u.as_deref())
+            .is_some_and(|u| u == name_u.as_slice());
+        if matched {
+            break;
+        }
+        i -= 1;
+    }
+    if i < 0 { 0 } else { i + SYNID_CLUSTER }
+}
+
+/// Like [`syn_scl_name2id`], but takes the name as a slice that may
+/// run on past its end (`syn_scl_namen2id`).
+///
+/// The original copies out `len` bytes first; a subslice does the
+/// same without allocating.
+///
+/// # Safety
+/// Same as [`syn_scl_name2id`].
+#[must_use]
+pub unsafe fn syn_scl_namen2id(linep: &[u8], len: usize) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { syn_scl_name2id(&linep[..len.min(linep.len())]) }
+}
+
 /// One syntax cluster - a named set of syntax group ids
 /// (`syn_cluster_T`).
 ///
@@ -256,6 +315,126 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- syn_scl_name2id / syn_scl_namen2id ----
+
+    /// Installs a syntax block with the given cluster names as
+    /// `curwin->w_s`, restoring `curwin` on drop even through a panic.
+    struct SynBlockGuard {
+        prev: *mut crate::buffer_defs::WinT,
+    }
+
+    impl SynBlockGuard {
+        fn install(win: *mut crate::buffer_defs::WinT) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let me = Self { prev: g.curwin };
+            g.curwin = win;
+            me
+        }
+    }
+
+    impl Drop for SynBlockGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.prev;
+        }
+    }
+
+    /// Builds a window whose syntax block holds clusters with the
+    /// given names, each with its uppercase form precomputed exactly
+    /// as the real cluster-creation path does.
+    fn win_with_clusters(
+        names: &[&[u8]],
+    ) -> (Box<crate::buffer_defs::WinT>, Box<crate::buffer_defs::SynblockT>) {
+        let mut block = Box::new(crate::buffer_defs::SynblockT::default());
+        block.b_syn_clusters.items = names
+            .iter()
+            .map(|n| SynClusterT {
+                scl_name: Some((*n).to_vec()),
+                scl_name_u: Some(crate::strings::vim_strsave_up(n)),
+                scl_list: Vec::new(),
+            })
+            .collect();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_s = std::ptr::from_mut(&mut *block);
+        (win, block)
+    }
+
+    #[test]
+    fn syn_scl_name2id_returns_zero_when_there_are_no_clusters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, _block) = win_with_clusters(&[]);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        assert_eq!(unsafe { syn_scl_name2id(b"nope") }, 0);
+    }
+
+    /// The id is the cluster's index OFFSET past `SYNID_CLUSTER`, so
+    /// even the first cluster never collides with a real highlight
+    /// group id.
+    #[test]
+    fn syn_scl_name2id_offsets_the_index_past_the_cluster_base() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, _block) = win_with_clusters(&[b"first", b"second"]);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+
+        assert_eq!(unsafe { syn_scl_name2id(b"first") }, SYNID_CLUSTER);
+        assert_eq!(unsafe { syn_scl_name2id(b"second") }, SYNID_CLUSTER + 1);
+        assert_eq!(unsafe { syn_scl_name2id(b"missing") }, 0);
+    }
+
+    /// Matching is case-INSENSITIVE, via each cluster's precomputed
+    /// uppercase name.
+    #[test]
+    fn syn_scl_name2id_ignores_case() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, _block) = win_with_clusters(&[b"myCluster"]);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+
+        assert_eq!(unsafe { syn_scl_name2id(b"MYCLUSTER") }, SYNID_CLUSTER);
+        assert_eq!(unsafe { syn_scl_name2id(b"mycluster") }, SYNID_CLUSTER);
+        assert_eq!(unsafe { syn_scl_name2id(b"MyCluster") }, SYNID_CLUSTER);
+    }
+
+    /// The scan runs BACKWARDS, so with duplicate names the LAST
+    /// entry wins. A forward scan would return the first.
+    #[test]
+    fn syn_scl_name2id_prefers_the_last_of_two_duplicate_names() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, _block) = win_with_clusters(&[b"dup", b"other", b"dup"]);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+        assert_eq!(unsafe { syn_scl_name2id(b"dup") }, SYNID_CLUSTER + 2);
+    }
+
+    /// A cluster whose name was cleared is skipped rather than
+    /// matching an empty needle.
+    #[test]
+    fn syn_scl_name2id_skips_a_cleared_cluster() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, mut block) = win_with_clusters(&[b"alpha", b"beta"]);
+        syn_clear_cluster(&mut block.b_syn_clusters.items[1]);
+        win.w_s = std::ptr::from_mut(&mut *block);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+
+        assert_eq!(unsafe { syn_scl_name2id(b"alpha") }, SYNID_CLUSTER);
+        assert_eq!(unsafe { syn_scl_name2id(b"beta") }, 0);
+    }
+
+    /// The length-limited form stops at `len`, ignoring whatever
+    /// follows in the buffer.
+    #[test]
+    fn syn_scl_namen2id_uses_only_the_first_len_bytes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (mut win, _block) = win_with_clusters(&[b"abc"]);
+        let _g = SynBlockGuard::install(std::ptr::from_mut(&mut *win));
+
+        assert_eq!(unsafe { syn_scl_namen2id(b"abcdef", 3) }, SYNID_CLUSTER);
+        assert_eq!(unsafe { syn_scl_namen2id(b"abcdef", 6) }, 0);
+    }
+
+    #[test]
+    fn synid_constants_match_the_original() {
+        assert_eq!((SYNID_TOP, SYNID_CONTAINED, SYNID_CLUSTER), (21000, 22000, 23000));
+        assert_eq!(MAX_CLUSTER_ID, 32767 - 23000);
     }
 
     // ---- SynClusterT / syn_clear_cluster ----
