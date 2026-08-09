@@ -104,6 +104,57 @@ pub fn handle_mkdir_p_arg(eap: &crate::ex_cmds_defs::ExargT, fname: &[u8]) -> i3
     crate::vim_defs::OK
 }
 
+/// `sort_lc` - `:sort` should use locale collation.
+///
+/// Only ever set by `ex_sort` (not yet translated), so this stays
+/// `false` in this crate today.
+static SORT_LC: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// `sort_ic` - `:sort` should ignore case.
+///
+/// Only ever set by `ex_sort` (not yet translated), so this stays
+/// `false` in this crate today.
+static SORT_IC: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
+
+/// Comparator ordering two lines for `:sort` (`string_compare`).
+///
+/// Three modes, checked in the original's own order: locale collation
+/// wins outright, then case-insensitive, then a plain byte
+/// comparison. Note `sort_lc` takes priority over `sort_ic`, so
+/// `:sort il` collates rather than folding case.
+///
+/// Returns a negative/zero/positive `i32`, matching `qsort`'s own
+/// convention and this crate's established comparator shape.
+///
+/// # Panics
+/// If `SORT_LC` is ever `true`. That branch is `strcoll`, whose
+/// locale-aware collation has no counterpart in this crate; it is
+/// unreachable today because only `ex_sort`, not translated, can set
+/// the flag - the same treatment as `popupmenu::pum_get_height`'s own
+/// external-UI branch.
+///
+/// # Safety
+/// Reads the `SORT_LC`/`SORT_IC` file-statics.
+#[must_use]
+pub unsafe fn string_compare(s1: &[u8], s2: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *SORT_LC.get_mut() } {
+        unimplemented!(
+            "string_compare: the locale-collation branch needs strcoll, which has no \
+             counterpart in this crate - unreachable until ex_sort is translated"
+        );
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *SORT_IC.get_mut() } {
+        return crate::strings::vim_stricmp(s1, s2);
+    }
+    match s1.cmp(s2) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// The screen width of the cursor line's own text, ignoring trailing
 /// whitespace, and whether that text contains a TAB (`linelen`).
 ///
@@ -265,6 +316,71 @@ mod tests {
             *unsafe { PREVCMD.get_mut() } = self.prevcmd.take();
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write = self.p_write;
         }
+    }
+
+    // ---- string_compare ----
+
+    /// Restores the sort-mode flags on drop, even through a panic.
+    struct SortFlagsGuard {
+        lc: bool,
+        ic: bool,
+    }
+
+    impl SortFlagsGuard {
+        fn set(lc: bool, ic: bool) -> Self {
+            let me = Self {
+                lc: unsafe { *SORT_LC.get_mut() },
+                ic: unsafe { *SORT_IC.get_mut() },
+            };
+            unsafe { *SORT_LC.get_mut() = lc };
+            unsafe { *SORT_IC.get_mut() = ic };
+            me
+        }
+    }
+
+    impl Drop for SortFlagsGuard {
+        fn drop(&mut self) {
+            unsafe { *SORT_LC.get_mut() = self.lc };
+            unsafe { *SORT_IC.get_mut() = self.ic };
+        }
+    }
+
+    #[test]
+    fn string_compare_orders_bytewise_by_default() {
+        let _guard = globals_test_lock();
+        let _g = SortFlagsGuard::set(false, false);
+        assert!(unsafe { string_compare(b"abc", b"abd") } < 0);
+        assert!(unsafe { string_compare(b"abd", b"abc") } > 0);
+        assert_eq!(unsafe { string_compare(b"abc", b"abc") }, 0);
+    }
+
+    /// Without the ignore-case flag, upper and lower case differ - and
+    /// uppercase sorts FIRST, since it has the lower byte value.
+    #[test]
+    fn string_compare_is_case_sensitive_by_default() {
+        let _guard = globals_test_lock();
+        let _g = SortFlagsGuard::set(false, false);
+        assert!(unsafe { string_compare(b"ABC", b"abc") } < 0);
+        assert_ne!(unsafe { string_compare(b"ABC", b"abc") }, 0);
+    }
+
+    /// With the flag set, the same pair compares equal.
+    #[test]
+    fn string_compare_folds_case_when_ignore_case_is_set() {
+        let _guard = globals_test_lock();
+        let _g = SortFlagsGuard::set(false, true);
+        assert_eq!(unsafe { string_compare(b"ABC", b"abc") }, 0);
+        assert!(unsafe { string_compare(b"abc", b"ABD") } < 0);
+    }
+
+    /// Locale collation is checked FIRST, so it wins even when the
+    /// ignore-case flag is also set (`:sort il`).
+    #[test]
+    #[should_panic(expected = "locale-collation branch")]
+    fn string_compare_prefers_locale_collation_over_ignore_case() {
+        let _guard = globals_test_lock();
+        let _g = SortFlagsGuard::set(true, true);
+        let _ = unsafe { string_compare(b"abc", b"abc") };
     }
 
     // ---- linelen ----
