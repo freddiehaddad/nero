@@ -108,6 +108,55 @@ pub unsafe fn adjust_cursor(oap: &mut crate::normal_defs::OpargT) {
     oap.inclusive = true;
 }
 
+/// Undo the `'selection'` == `"exclusive"` adjustment on whichever
+/// end of the Visual area the cursor is NOT on (`unadjust_for_sel`).
+///
+/// Returns whether the position backed up to the previous line.
+///
+/// Nothing is undone unless `'selection'` is actually exclusive AND
+/// the two ends genuinely differ - a collapsed selection has nothing
+/// to give back.
+///
+/// The end that moves is the LATER of the two: with the cursor after
+/// the start it is the cursor that was pushed forward, otherwise it
+/// is the start. Picking the wrong one would shrink the selection
+/// from the wrong side.
+///
+/// # Safety
+/// Reads `GLOBALS.curwin`/`GLOBALS.curbuf`/`GLOBALS.Visual`, which
+/// must be valid and non-null. Forwarded from
+/// [`unadjust_for_sel_inner`]'s own safety doc.
+pub unsafe fn unadjust_for_sel() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    if opts.p_sel.as_deref().and_then(|s| s.first().copied()) != Some(b'e') {
+        return false;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let visual_start = globals.Visual.start;
+    let curwin = globals.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor = unsafe { &*curwin }.w_cursor;
+
+    if crate::mark_defs::equalpos(visual_start, cursor) {
+        return false;
+    }
+
+    if crate::mark_defs::lt(visual_start, cursor) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { unadjust_for_sel_inner(&mut (*curwin).w_cursor) }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        let start = unsafe {
+            std::ptr::addr_of_mut!((*crate::globals::GLOBALS.as_ptr()).Visual.start)
+        };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { unadjust_for_sel_inner(&mut *start) }
+    }
+}
+
 /// Step `pp` back one character, undoing an exclusive-selection
 /// adjustment (`unadjust_for_sel_inner`).
 ///
@@ -810,6 +859,138 @@ mod tests {
         assert!(!oap.inclusive, "nothing was adjusted, so nothing is inclusive");
 
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
+    }
+
+    // ---- unadjust_for_sel ----
+
+    /// Saves/restores the globals `unadjust_for_sel` reads and writes.
+    struct SelGuard {
+        p_sel: Option<Vec<u8>>,
+        visual: crate::normal_defs::VisualState,
+        curwin: *mut crate::buffer_defs::WinT,
+        curbuf: *mut crate::buffer_defs::BufT,
+    }
+
+    impl SelGuard {
+        fn save() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                p_sel: unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel.take(),
+                visual: g.Visual,
+                curwin: g.curwin,
+                curbuf: g.curbuf,
+            }
+        }
+    }
+
+    impl Drop for SelGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = self.p_sel.take();
+            g.Visual = self.visual;
+            g.curwin = self.curwin;
+            g.curbuf = self.curbuf;
+        }
+    }
+
+    /// Installs an exclusive selection running from `start` to the
+    /// cursor, and returns the boxed window/buffer keeping them alive.
+    fn exclusive_selection(
+        start: crate::pos_defs::PosT,
+        cursor: crate::pos_defs::PosT,
+    ) -> (Box<crate::buffer_defs::WinT>, Box<crate::buffer_defs::BufT>) {
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        buf.b_ml.ml_line_count = 100;
+        let mut win = Box::new(crate::buffer_defs::WinT {
+            w_cursor: cursor,
+            w_buffer: std::ptr::null_mut(),
+            ..Default::default()
+        });
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = Some(b"exclusive".to_vec());
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curbuf = std::ptr::from_mut(&mut *buf);
+        g.Visual.start = start;
+        (win, buf)
+    }
+
+    /// With the cursor AFTER the start, it is the cursor that was
+    /// pushed forward, so the cursor is what steps back.
+    ///
+    /// Both ends carry a `coladd`, so `unadjust_for_sel_inner` takes
+    /// its virtual-space branch and never reads buffer text - keeping
+    /// this test about WHICH end moves, which is all this function
+    /// decides.
+    #[test]
+    fn unadjust_for_sel_backs_up_the_cursor_when_it_is_the_later_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = SelGuard::save();
+        let (win, _buf) = exclusive_selection(
+            crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 3 },
+            crate::pos_defs::PosT { lnum: 5, col: 7, coladd: 3 },
+        );
+
+        assert!(!unsafe { unadjust_for_sel() });
+        assert_eq!(win.w_cursor.coladd, 2, "the cursor steps back");
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start.coladd,
+            3,
+            "the start must be untouched"
+        );
+    }
+
+    /// With the cursor BEFORE the start, the start is the later end
+    /// and is what steps back instead. An implementation that always
+    /// moved the cursor would shrink the selection from the wrong
+    /// side.
+    #[test]
+    fn unadjust_for_sel_backs_up_the_start_when_it_is_the_later_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = SelGuard::save();
+        let (win, _buf) = exclusive_selection(
+            crate::pos_defs::PosT { lnum: 5, col: 7, coladd: 3 },
+            crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 3 },
+        );
+
+        assert!(!unsafe { unadjust_for_sel() });
+        assert_eq!(
+            unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start.coladd,
+            2,
+            "the start steps back"
+        );
+        assert_eq!(win.w_cursor.coladd, 3, "the cursor must be untouched");
+    }
+
+    /// An inclusive 'selection' never adjusted anything, so there is
+    /// nothing to undo.
+    #[test]
+    fn unadjust_for_sel_does_nothing_unless_selection_is_exclusive() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = SelGuard::save();
+        let (win, _buf) = exclusive_selection(
+            crate::pos_defs::PosT { lnum: 5, col: 2, coladd: 3 },
+            crate::pos_defs::PosT { lnum: 5, col: 7, coladd: 3 },
+        );
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sel = Some(b"inclusive".to_vec());
+
+        assert!(!unsafe { unadjust_for_sel() });
+        assert_eq!(win.w_cursor.coladd, 3, "nothing may move");
+    }
+
+    /// A collapsed selection has nothing to give back, even with an
+    /// exclusive 'selection'.
+    #[test]
+    fn unadjust_for_sel_does_nothing_when_both_ends_are_equal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = SelGuard::save();
+        let same = crate::pos_defs::PosT { lnum: 5, col: 4, coladd: 3 };
+        let (win, _buf) = exclusive_selection(same, same);
+
+        assert!(!unsafe { unadjust_for_sel() });
+        assert_eq!(win.w_cursor.coladd, 3);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.Visual.start.coladd, 3);
     }
 
     #[test]
