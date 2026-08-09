@@ -262,6 +262,80 @@ impl Default for ComplT {
     }
 }
 
+/// The match currently shown in the completion menu
+/// (`compl_shown_match`).
+///
+/// A raw pointer into the intrusive match list, matching the
+/// original. Only ever set by the completion-source dispatch
+/// machinery (not translated), so this stays null in this crate
+/// today - the same treatment as `COMPL_STARTED` and friends.
+static COMPL_SHOWN_MATCH: GlobalCell<*mut ComplT> = GlobalCell::new(std::ptr::null_mut());
+
+/// Whether the shown match spans more than one line
+/// (`ins_compl_has_multiple`).
+///
+/// A multi-line match is stored as one string containing newlines,
+/// so this is a search for a newline rather than a count.
+///
+/// # Safety
+/// `COMPL_SHOWN_MATCH` must be a valid, non-null pointer - the
+/// original dereferences it without checking, so a null there is
+/// already a contract violation.
+#[must_use]
+pub unsafe fn ins_compl_has_multiple() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*shown }
+        .cp_str
+        .as_deref()
+        .is_some_and(|s| s.contains(&b'\n'))
+}
+
+/// Whether there is a shown match to move away from
+/// (`ins_compl_has_shown_match`).
+///
+/// True when no match is shown at all, OR when the shown match is not
+/// the only one. A single match links to ITSELF in the circular list,
+/// which is what the self-comparison detects.
+///
+/// # Safety
+/// `COMPL_SHOWN_MATCH`, if non-null, must be a valid pointer.
+#[must_use]
+pub unsafe fn ins_compl_has_shown_match() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    if shown.is_null() {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    !std::ptr::eq(shown, unsafe { &*shown }.cp_next)
+}
+
+/// Whether the shown match is long enough to still cover the text
+/// typed so far (`ins_compl_long_shown_match`).
+///
+/// # Safety
+/// `COMPL_SHOWN_MATCH`, if non-null, must be a valid pointer;
+/// `GLOBALS.curwin` must be valid and non-null.
+#[must_use]
+pub unsafe fn ins_compl_long_shown_match() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let shown = unsafe { *COMPL_SHOWN_MATCH.get_mut() };
+    if shown.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(text) = unsafe { &*shown }.cp_str.as_deref() else {
+        return false;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let cursor_col = unsafe { &*crate::globals::GLOBALS.get_mut().curwin }.w_cursor.col;
+    // SAFETY: forwarded from this function's own safety doc.
+    let compl_col = unsafe { *COMPL_COL.get_mut() };
+    i64::try_from(text.len()).unwrap_or(i64::MAX) > i64::from(cursor_col - compl_col)
+}
+
 /// Whether `match` is the original text, from before the expansion
 /// began (`match_at_original_text`).
 #[must_use]
@@ -1229,6 +1303,117 @@ pub unsafe fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    // ---- compl_shown_match predicates ----
+
+    /// Installs a shown match and restores the previous pointer on
+    /// drop, even through a panic, so a failing test cannot leave a
+    /// dangling pointer in the global for the next test.
+    struct ShownMatchGuard {
+        saved: *mut ComplT,
+        saved_col: crate::pos_defs::ColnrT,
+        saved_curwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl ShownMatchGuard {
+        fn install(m: *mut ComplT) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let me = Self {
+                saved: unsafe { *COMPL_SHOWN_MATCH.get_mut() },
+                saved_col: unsafe { *COMPL_COL.get_mut() },
+                saved_curwin: g.curwin,
+            };
+            unsafe { *COMPL_SHOWN_MATCH.get_mut() = m };
+            me
+        }
+    }
+
+    impl Drop for ShownMatchGuard {
+        fn drop(&mut self) {
+            unsafe { *COMPL_SHOWN_MATCH.get_mut() = self.saved };
+            unsafe { *COMPL_COL.get_mut() = self.saved_col };
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.saved_curwin;
+        }
+    }
+
+    fn with_text(text: &[u8]) -> Box<ComplT> {
+        Box::new(ComplT { cp_str: Some(text.to_vec()), ..ComplT::default() })
+    }
+
+    /// A multi-line match is one string containing newlines, not a
+    /// separate count.
+    #[test]
+    fn ins_compl_has_multiple_detects_a_newline_in_the_shown_match() {
+        let _lock = global_state_test_lock();
+        let mut single = with_text(b"one line");
+        let _g = ShownMatchGuard::install(std::ptr::from_mut(&mut *single));
+        assert!(!unsafe { ins_compl_has_multiple() });
+
+        let mut multi = with_text(b"first\nsecond");
+        unsafe { *COMPL_SHOWN_MATCH.get_mut() = std::ptr::from_mut(&mut *multi) };
+        assert!(unsafe { ins_compl_has_multiple() });
+    }
+
+    /// With no match shown there is nothing to be stuck on, so this
+    /// reports true.
+    #[test]
+    fn ins_compl_has_shown_match_is_true_with_no_match_at_all() {
+        let _lock = global_state_test_lock();
+        let _g = ShownMatchGuard::install(std::ptr::null_mut());
+        assert!(unsafe { ins_compl_has_shown_match() });
+    }
+
+    /// A LONE match links to itself in the circular list; that
+    /// self-link is exactly what marks "there is nowhere else to go".
+    /// Comparing against null instead would wrongly report true here.
+    #[test]
+    fn ins_compl_has_shown_match_is_false_for_a_single_self_linked_match() {
+        let _lock = global_state_test_lock();
+        let mut only = with_text(b"only");
+        let ptr = std::ptr::from_mut(&mut *only);
+        only.cp_next = ptr;
+        let _g = ShownMatchGuard::install(ptr);
+        assert!(!unsafe { ins_compl_has_shown_match() });
+    }
+
+    #[test]
+    fn ins_compl_has_shown_match_is_true_when_another_match_follows() {
+        let _lock = global_state_test_lock();
+        let mut second = with_text(b"second");
+        let mut first = with_text(b"first");
+        first.cp_next = std::ptr::from_mut(&mut *second);
+        let _g = ShownMatchGuard::install(std::ptr::from_mut(&mut *first));
+        assert!(unsafe { ins_compl_has_shown_match() });
+    }
+
+    #[test]
+    fn ins_compl_long_shown_match_is_false_without_a_match() {
+        let _lock = global_state_test_lock();
+        let _g = ShownMatchGuard::install(std::ptr::null_mut());
+        assert!(!unsafe { ins_compl_long_shown_match() });
+    }
+
+    /// The comparison is against how much has been TYPED
+    /// (cursor column minus the completion start), not against the
+    /// cursor column alone.
+    #[test]
+    fn ins_compl_long_shown_match_compares_against_the_typed_length() {
+        let _lock = global_state_test_lock();
+        let mut m = with_text(b"abcde"); // 5 bytes
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        let _g = ShownMatchGuard::install(std::ptr::from_mut(&mut *m));
+
+        win.w_cursor.col = 13;
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::from_mut(&mut *win);
+        // Completion starts at column 10, so 3 bytes are typed; a
+        // 5-byte match is longer than that.
+        unsafe { *COMPL_COL.get_mut() = 10 };
+        assert!(unsafe { ins_compl_long_shown_match() });
+
+        // Now 7 bytes are typed, which the 5-byte match cannot cover.
+        unsafe { *COMPL_COL.get_mut() = 6 };
+        assert!(!unsafe { ins_compl_long_shown_match() });
+    }
 
     // ---- ComplT accessors and comparators ----
 
