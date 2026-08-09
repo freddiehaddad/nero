@@ -30,6 +30,13 @@
 //! and `wp.w_onebuf_opt.wo_cole`, are both already real. Used by
 //! `move.c`'s `check_top_offset`.
 //!
+//! Also translated: [`DecorRange`] (with [`DecorRangeKind`] and
+//! [`DecorRangeData`], from `decoration.h`) plus the two predicates
+//! it unblocks, [`decor_virt_pos`] and [`decor_virt_pos_kind`].
+//! Translated ahead of the redraw pass that populates them, since
+//! `DecorRange` is the type gating most of this file's remaining
+//! functions.
+//!
 //! Deferred: everything else in the file - real virtual-text/
 //! highlight/conceal rendering, needing the marktree query machinery
 //! and decoration-provider Lua callbacks, neither translated.
@@ -40,6 +47,143 @@ use crate::buffer_defs::WinT;
 use crate::decoration_defs::VirtLines;
 use crate::types_defs::TriState;
 use crate::marktree_defs::MetaIndex;
+
+/// Which flavour of decoration a [`DecorRange`] carries
+/// (`DecorRangeKindEnum`/`DecorRangeKind`).
+///
+/// The original stores this as a separate `uint8_t` tag beside an
+/// untagged union, which lets the two disagree. Here it is derived
+/// from the payload instead (see [`DecorRange::kind`]), so they
+/// cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecorRangeKind {
+    Highlight,
+    Sign,
+    VirtText,
+    VirtLines,
+    UIWatched,
+}
+
+/// The payload of a [`DecorRange`] (the original's `data` union).
+///
+/// Modeled as a safe tagged enum, matching
+/// `decoration_defs.rs`'s own `DecorVirtTextEnumData` precedent:
+/// a `DecorRange` is never stored compactly inline in the marktree,
+/// so there is no memory-layout reason to prefer an untagged union.
+///
+/// Note the original's `kind` tag is NOT one-to-one with its union
+/// members - `kDecorKindHighlight` and `kDecorKindSign` both read
+/// `data.sh`, and `kDecorKindVirtText` and `kDecorKindVirtLines` both
+/// read `data.vt`. This enum keeps all five cases distinct so the
+/// tag can be derived rather than tracked separately, which is what
+/// makes the two impossible to desynchronize.
+#[derive(Debug, Clone)]
+pub enum DecorRangeData {
+    /// `kDecorKindHighlight`, reading the original's `data.sh`.
+    Highlight(crate::decoration_defs::DecorSignHighlight),
+    /// `kDecorKindSign`, reading the original's `data.sh`.
+    Sign(crate::decoration_defs::DecorSignHighlight),
+    /// `kDecorKindVirtText`, reading the original's `data.vt`.
+    VirtText(*mut crate::decoration_defs::DecorVirtText),
+    /// `kDecorKindVirtLines`, reading the original's `data.vt`.
+    VirtLines(*mut crate::decoration_defs::DecorVirtText),
+    /// `kDecorKindUIWatched`, reading the original's `data.ui`.
+    UIWatched {
+        ns_id: u32,
+        mark_id: u32,
+        pos: crate::decoration_defs::VirtTextPos,
+    },
+}
+
+/// `draw_col`: draw the virtual text on the current screen line after
+/// deciding where.
+pub const DECOR_DRAW_COL_UNDECIDED: i32 = -1;
+/// `draw_col`: the virtual text may be drawn at a position yet to be
+/// assigned.
+pub const DECOR_DRAW_COL_DEFERRED: i32 = -3;
+/// `draw_col`: the virtual text has just been added.
+pub const DECOR_DRAW_COL_JUST_ADDED: i32 = -10;
+
+/// One decoration active over a screen range, as collected by the
+/// redraw pass (`DecorRange`).
+///
+/// The `vt` pointer inside [`DecorRangeData`] is a borrowed raw
+/// pointer into decoration storage, matching the original: it stays a
+/// raw pointer per this crate's convention for aliasing cases. The
+/// original's own warning applies unchanged - the `next` pointer of a
+/// borrowed `DecorVirtText` MUST NOT be followed from here, because
+/// these are separate ranges and `vt->next` may already point into
+/// freelist memory.
+#[derive(Debug, Clone)]
+pub struct DecorRange {
+    pub start_row: i32,
+    pub start_col: i32,
+    pub end_row: i32,
+    pub end_col: i32,
+    /// range insertion order (`ordering`).
+    pub ordering: i32,
+    pub priority_internal: crate::decoration_defs::DecorPriorityInternal,
+    /// ephemeral decoration, free memory immediately (`owned`).
+    pub owned: bool,
+    /// the decoration itself; also carries the original's `kind` tag
+    /// (see [`DecorRange::kind`]).
+    pub data: DecorRangeData,
+    /// cached lookup of `inl.hl_id` if it was a highlight (`attr_id`).
+    pub attr_id: i32,
+    /// Screen column to draw the virtual text; see the
+    /// `DECOR_DRAW_COL_*` constants for the negative sentinels, and
+    /// `i32::MIN` for "should no longer be drawn" (`draw_col`).
+    pub draw_col: i32,
+}
+
+impl DecorRange {
+    /// The original's `kind` field, derived from the payload instead
+    /// of stored alongside it.
+    #[must_use]
+    pub fn kind(&self) -> DecorRangeKind {
+        match self.data {
+            DecorRangeData::Highlight(_) => DecorRangeKind::Highlight,
+            DecorRangeData::Sign(_) => DecorRangeKind::Sign,
+            DecorRangeData::VirtText(_) => DecorRangeKind::VirtText,
+            DecorRangeData::VirtLines(_) => DecorRangeKind::VirtLines,
+            DecorRangeData::UIWatched { .. } => DecorRangeKind::UIWatched,
+        }
+    }
+}
+
+/// Whether `decor` has a virtual position - i.e. is virtual text or
+/// a UI-watched mark (`decor_virt_pos`).
+#[must_use]
+pub fn decor_virt_pos(decor: &DecorRange) -> bool {
+    matches!(
+        decor.kind(),
+        DecorRangeKind::VirtText | DecorRangeKind::UIWatched
+    )
+}
+
+/// Where `decor`'s virtual text is positioned relative to the line
+/// (`decor_virt_pos_kind`).
+///
+/// Decorations with no virtual position at all report
+/// [`crate::decoration_defs::VirtTextPos::EndOfLine`]; the original
+/// notes that value is never used for them and is just "whatever".
+/// Note virtual LINES take that fallback too, even though they carry
+/// the same `DecorVirtText` payload as virtual text - the original
+/// tests `kind == kDecorKindVirtText` specifically, so reading `pos`
+/// off the payload whenever one is present would be wrong.
+///
+/// # Safety
+/// If `decor` is virtual text, its borrowed `DecorVirtText` pointer
+/// must be valid.
+#[must_use]
+pub unsafe fn decor_virt_pos_kind(decor: &DecorRange) -> crate::decoration_defs::VirtTextPos {
+    match decor.data {
+        // SAFETY: forwarded from this function's own safety doc.
+        DecorRangeData::VirtText(vt) => unsafe { (*vt).pos },
+        DecorRangeData::UIWatched { pos, .. } => pos,
+        _ => crate::decoration_defs::VirtTextPos::EndOfLine,
+    }
+}
 
 /// Called by draw, move and plines code to determine whether a line
 /// is concealed. Scans the marktree for `conceal_line` marks on `row`
@@ -157,6 +301,143 @@ pub fn buf_signcols_count_range(buf: &mut BufT, row1: i32, row2: i32, add: i32, 
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, WinoptT};
+    use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
+
+    fn range_with(data: DecorRangeData) -> DecorRange {
+        DecorRange {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 0,
+            ordering: 0,
+            priority_internal: crate::decoration_defs::DECOR_PRIORITY_BASE,
+            owned: false,
+            data,
+            attr_id: 0,
+            draw_col: DECOR_DRAW_COL_UNDECIDED,
+        }
+    }
+
+    #[test]
+    fn decor_range_kind_is_derived_from_its_payload() {
+        assert_eq!(
+            range_with(DecorRangeData::Highlight(DecorSignHighlight::default())).kind(),
+            DecorRangeKind::Highlight
+        );
+        assert_eq!(
+            range_with(DecorRangeData::Sign(DecorSignHighlight::default())).kind(),
+            DecorRangeKind::Sign
+        );
+        assert_eq!(
+            range_with(DecorRangeData::VirtText(std::ptr::null_mut())).kind(),
+            DecorRangeKind::VirtText
+        );
+        assert_eq!(
+            range_with(DecorRangeData::VirtLines(std::ptr::null_mut())).kind(),
+            DecorRangeKind::VirtLines
+        );
+        assert_eq!(
+            range_with(DecorRangeData::UIWatched {
+                ns_id: 1,
+                mark_id: 2,
+                pos: VirtTextPos::Inline,
+            })
+            .kind(),
+            DecorRangeKind::UIWatched
+        );
+    }
+
+    /// Highlight and Sign share one union member in the original, as
+    /// do VirtText and VirtLines; the derived tag must still tell each
+    /// pair apart.
+    #[test]
+    fn decor_range_kind_separates_the_payload_sharing_pairs() {
+        assert_ne!(
+            range_with(DecorRangeData::Highlight(DecorSignHighlight::default())).kind(),
+            range_with(DecorRangeData::Sign(DecorSignHighlight::default())).kind()
+        );
+        assert_ne!(
+            range_with(DecorRangeData::VirtText(std::ptr::null_mut())).kind(),
+            range_with(DecorRangeData::VirtLines(std::ptr::null_mut())).kind()
+        );
+    }
+
+    #[test]
+    fn only_virt_text_and_ui_watched_have_a_virtual_position() {
+        assert!(decor_virt_pos(&range_with(DecorRangeData::VirtText(
+            std::ptr::null_mut()
+        ))));
+        assert!(decor_virt_pos(&range_with(DecorRangeData::UIWatched {
+            ns_id: 0,
+            mark_id: 0,
+            pos: VirtTextPos::EndOfLine,
+        })));
+        // Virtual LINES carry the same payload type as virtual text
+        // but are not virtually positioned.
+        assert!(!decor_virt_pos(&range_with(DecorRangeData::VirtLines(
+            std::ptr::null_mut()
+        ))));
+        assert!(!decor_virt_pos(&range_with(DecorRangeData::Highlight(
+            DecorSignHighlight::default()
+        ))));
+        assert!(!decor_virt_pos(&range_with(DecorRangeData::Sign(
+            DecorSignHighlight::default()
+        ))));
+    }
+
+    #[test]
+    fn virt_pos_kind_reads_the_position_out_of_virtual_text() {
+        let mut vt = Box::new(DecorVirtText {
+            pos: VirtTextPos::RightAlign,
+            ..DecorVirtText::default()
+        });
+        let range = range_with(DecorRangeData::VirtText(std::ptr::from_mut(&mut *vt)));
+        assert_eq!(
+            unsafe { decor_virt_pos_kind(&range) },
+            VirtTextPos::RightAlign
+        );
+    }
+
+    #[test]
+    fn virt_pos_kind_reads_the_position_out_of_a_ui_watched_mark() {
+        let range = range_with(DecorRangeData::UIWatched {
+            ns_id: 7,
+            mark_id: 9,
+            pos: VirtTextPos::WinCol,
+        });
+        assert_eq!(unsafe { decor_virt_pos_kind(&range) }, VirtTextPos::WinCol);
+    }
+
+    /// The original tests `kind == kDecorKindVirtText` specifically,
+    /// so virtual LINES fall through to the unused end-of-line
+    /// fallback even though their payload has a perfectly readable
+    /// `pos`. An implementation that read `pos` whenever a
+    /// `DecorVirtText` was present would return `Overlay` here.
+    #[test]
+    fn virt_pos_kind_does_not_read_the_position_out_of_virtual_lines() {
+        let mut vt = Box::new(DecorVirtText {
+            pos: VirtTextPos::Overlay,
+            ..DecorVirtText::virt_lines_init()
+        });
+        let range = range_with(DecorRangeData::VirtLines(std::ptr::from_mut(&mut *vt)));
+        assert_eq!(
+            unsafe { decor_virt_pos_kind(&range) },
+            VirtTextPos::EndOfLine
+        );
+    }
+
+    #[test]
+    fn virt_pos_kind_falls_back_for_decorations_with_no_virtual_position() {
+        for data in [
+            DecorRangeData::Highlight(DecorSignHighlight::default()),
+            DecorRangeData::Sign(DecorSignHighlight::default()),
+        ] {
+            assert_eq!(
+                unsafe { decor_virt_pos_kind(&range_with(data)) },
+                VirtTextPos::EndOfLine
+            );
+        }
+    }
 
     /// The default buffer has `autom == false`, so the guard's very
     /// first operand already ends the call - this is the shape every
