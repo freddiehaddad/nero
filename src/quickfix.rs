@@ -634,6 +634,49 @@ pub unsafe fn qf_stack_get_bufnr() -> i32 {
         .qf_bufnr
 }
 
+/// Whether the quickfix/location list with id `qf_id` still exists
+/// (`qflist_valid`).
+///
+/// Used after running autocommands, which may have freed the list out
+/// from under a command in progress. With `wp` null the global
+/// quickfix stack is checked; otherwise the window's own location list
+/// stack is, and a window that no longer exists fails immediately.
+///
+/// # Safety
+/// `wp`, if non-null, must be a pointer that
+/// [`crate::window::win_valid`] can safely inspect; touches `QL_INFO`.
+#[must_use]
+pub unsafe fn qflist_valid(wp: *const WinT, qf_id: u32) -> bool {
+    if wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ql = unsafe { QL_INFO.get_mut() };
+        return ql.as_ref().is_some_and(|qi| stack_has_list_id(qi, qf_id));
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { crate::window::win_valid(wp) } {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc; `wp` was
+    // just confirmed to be a live window.
+    let qi = unsafe { (*wp).w_llist };
+    if qi.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    stack_has_list_id(unsafe { &*qi }, qf_id)
+}
+
+/// Whether any of the LIVE lists on `qi` has id `qf_id`.
+///
+/// Only the first `qf_listcount` lists are live; slots beyond that are
+/// stale leftovers and must not match, which is why this cannot simply
+/// scan the whole vector.
+fn stack_has_list_id(qi: &crate::types_defs::QfInfoT, qf_id: u32) -> bool {
+    let live = usize::try_from(qi.qf_listcount).unwrap_or(0).min(qi.qf_lists.len());
+    qi.qf_lists[..live].iter().any(|qfl| qfl.qf_id == qf_id)
+}
+
 /// Counter handing out the unique id for each new list (`last_qf_id`).
 static LAST_QF_ID: crate::globals::GlobalCell<u32> = crate::globals::GlobalCell::new(0);
 
@@ -1086,6 +1129,114 @@ mod tests {
         let r = f();
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
         r
+    }
+
+    // --- qflist_valid ---
+
+    #[test]
+    fn qflist_valid_is_false_when_the_global_stack_is_uninitialized() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = None;
+        assert!(!unsafe { qflist_valid(std::ptr::null(), 1) });
+    }
+
+    #[test]
+    fn qflist_valid_finds_a_live_list_on_the_global_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+
+        let mut qi = qf_alloc_stack(QfltypeT::Quickfix, 3);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_listcount = 2;
+        *unsafe { QL_INFO.get_mut() } = Some(qi);
+
+        assert!(unsafe { qflist_valid(std::ptr::null(), 11) });
+        assert!(unsafe { qflist_valid(std::ptr::null(), 22) });
+        assert!(!unsafe { qflist_valid(std::ptr::null(), 33) });
+    }
+
+    /// Slots past `qf_listcount` are stale leftovers, not live lists.
+    /// An implementation scanning the whole vector would wrongly
+    /// report the id below as still valid.
+    #[test]
+    fn qflist_valid_ignores_slots_beyond_the_live_count() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+
+        let mut qi = qf_alloc_stack(QfltypeT::Quickfix, 3);
+        qi.qf_lists[0].qf_id = 11;
+        // A leftover id in a slot that is no longer live.
+        qi.qf_lists[2].qf_id = 99;
+        qi.qf_listcount = 1;
+        *unsafe { QL_INFO.get_mut() } = Some(qi);
+
+        assert!(unsafe { qflist_valid(std::ptr::null(), 11) });
+        assert!(!unsafe { qflist_valid(std::ptr::null(), 99) });
+    }
+
+    /// With a window given, its OWN location list stack is consulted -
+    /// not the global quickfix stack.
+    #[test]
+    fn qflist_valid_uses_the_windows_own_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+
+        // The global stack holds a different id, so a lookup that
+        // fell back to it would give the wrong answer.
+        let mut global = qf_alloc_stack(QfltypeT::Quickfix, 1);
+        global.qf_lists[0].qf_id = 11;
+        global.qf_listcount = 1;
+        *unsafe { QL_INFO.get_mut() } = Some(global);
+
+        let mut ll = Box::new(qf_alloc_stack(QfltypeT::Location, 1));
+        ll.qf_lists[0].qf_id = 77;
+        ll.qf_listcount = 1;
+
+        let (_bufs, mut wins) =
+            loclist_win_fixture(&[(std::ptr::addr_of_mut!(*ll), false)]);
+        let wp = std::ptr::addr_of_mut!(*wins[0]);
+
+        let (found77, found11) = with_windows(&mut wins, || unsafe {
+            (qflist_valid(wp, 77), qflist_valid(wp, 11))
+        });
+        assert!(found77, "the window's own list must be found");
+        assert!(!found11, "the global stack must not be consulted");
+    }
+
+    /// A window with no location list at all has nothing to validate.
+    #[test]
+    fn qflist_valid_is_false_for_a_window_without_a_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (_bufs, mut wins) = loclist_win_fixture(&[(std::ptr::null_mut(), false)]);
+        let wp = std::ptr::addr_of_mut!(*wins[0]);
+        let got = with_windows(&mut wins, || unsafe { qflist_valid(wp, 1) });
+        assert!(!got);
+    }
+
+    /// A window that no longer exists fails before its stack is even
+    /// looked at - an autocmd may have closed it.
+    #[test]
+    fn qflist_valid_is_false_for_a_window_that_no_longer_exists() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut ll = Box::new(qf_alloc_stack(QfltypeT::Location, 1));
+        ll.qf_lists[0].qf_id = 77;
+        ll.qf_listcount = 1;
+
+        let (_bufs, mut wins) =
+            loclist_win_fixture(&[(std::ptr::addr_of_mut!(*ll), false)]);
+        let wp = std::ptr::addr_of_mut!(*wins[0]);
+
+        // The window is NOT installed in the window list, so
+        // win_valid rejects it even though its stack holds the id.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstwin;
+        g.firstwin = std::ptr::null_mut();
+        let got = unsafe { qflist_valid(wp, 77) };
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
+
+        assert!(!got);
     }
 
     // --- ql_info / qf_init_stack / qf_stack_get_bufnr ---
