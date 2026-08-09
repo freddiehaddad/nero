@@ -881,6 +881,21 @@ pub unsafe fn linetabsize_col(startvcol: i32, s: &[u8]) -> i32 {
     }
 }
 
+/// The number of screen cells `s` will take, starting at virtual
+/// column zero (`linetabsize_str`).
+///
+/// A one-line wrapper over [`linetabsize_col`] in the original too
+/// (`plines.h`), kept as its own function so call sites read the same
+/// as upstream.
+///
+/// # Safety
+/// Forwarded from [`linetabsize_col`]'s own safety doc.
+#[must_use]
+pub unsafe fn linetabsize_str(s: &[u8]) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { linetabsize_col(0, s) }
+}
+
 /// Return the number of cells line `lnum` of window `wp` will take on
 /// the screen, taking into account the size of a tab and inline
 /// virtual text. Doesn't count the size of `'listchars'` "eol"

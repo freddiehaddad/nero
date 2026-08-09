@@ -104,6 +104,51 @@ pub fn handle_mkdir_p_arg(eap: &crate::ex_cmds_defs::ExargT, fname: &[u8]) -> i3
     crate::vim_defs::OK
 }
 
+/// The screen width of the cursor line's own text, ignoring trailing
+/// whitespace, and whether that text contains a TAB (`linelen`).
+///
+/// Returns `(len, has_tab)`. The original writes `has_tab` through an
+/// optional out-parameter; returning it is this crate's convention.
+///
+/// The measured span runs from the START of the line (leading
+/// whitespace included, since it still occupies screen cells) up to
+/// just past the LAST non-blank. The TAB search, by contrast, starts
+/// at the first non-blank - so a line indented with tabs but holding
+/// none in its text reports `false`.
+///
+/// The original brackets this with a temporary NUL poked over the
+/// character after the last non-blank; a subslice does the same job
+/// here without mutating the line.
+///
+/// # Safety
+/// Forwarded from [`crate::cursor::get_cursor_line_ptr`]/
+/// [`crate::plines::linetabsize_str`]'s own safety docs.
+#[must_use]
+pub unsafe fn linelen() -> (i32, bool) {
+    // Get the line. If it's empty bail out early (could be the empty
+    // string for an unloaded buffer).
+    // SAFETY: forwarded from this function's own safety doc.
+    let line = unsafe { crate::cursor::get_cursor_line_ptr() };
+    if line.first().copied().unwrap_or(0) == 0 {
+        return (0, false);
+    }
+
+    // Find the first non-blank character.
+    let first = crate::charset::skipwhite(&line);
+    // Find the character after the last non-blank character, treating
+    // the NUL terminator as the end of the text.
+    let text_end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    let mut last = text_end;
+    while last > first && crate::ascii_defs::ascii_iswhite(i32::from(line[last - 1])) {
+        last -= 1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { crate::plines::linetabsize_str(&line[..last]) };
+    let has_tab = line[first..last].contains(&crate::ascii_defs::TAB);
+    (len, has_tab)
+}
+
 /// The previous `:!` shell command (`prevcmd`).
 ///
 /// Only ever set by `do_bang` (not yet translated), so this stays
@@ -220,6 +265,99 @@ mod tests {
             *unsafe { PREVCMD.get_mut() } = self.prevcmd.take();
             unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_write = self.p_write;
         }
+    }
+
+    // ---- linelen ----
+
+    fn linelen_buf(line: &[u8]) -> crate::buffer_defs::BufT {
+        let mut buf = crate::buffer_defs::BufT::default();
+        assert_eq!(unsafe { crate::memline::ml_open(&mut buf) }, crate::vim_defs::OK);
+        assert_eq!(
+            unsafe { crate::memline::ml_replace_buf_len(&mut buf, 1, line) },
+            crate::vim_defs::OK
+        );
+        buf
+    }
+
+    fn close_linelen_buf(buf: crate::buffer_defs::BufT) {
+        unsafe {
+            let mfp = Box::from_raw(buf.b_ml.ml_mfp);
+            crate::memfile::mf_close(*mfp, false);
+        }
+    }
+
+    /// Runs `linelen` against `line` as the cursor line.
+    fn linelen_of(line: &[u8]) -> (i32, bool) {
+        let mut buf = linelen_buf(line);
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_cursor.lnum = 1;
+        win.w_buffer = std::ptr::from_mut(&mut buf);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pw, pb) = (g.curwin, g.curbuf);
+        g.curwin = std::ptr::from_mut(&mut win);
+        g.curbuf = std::ptr::from_mut(&mut buf);
+
+        let got = unsafe { linelen() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = pw;
+        g.curbuf = pb;
+        close_linelen_buf(buf);
+        got
+    }
+
+    #[test]
+    fn linelen_measures_plain_text() {
+        let _guard = globals_test_lock();
+        assert_eq!(linelen_of(b"abcde"), (5, false));
+    }
+
+    #[test]
+    fn linelen_reports_zero_for_an_empty_line() {
+        let _guard = globals_test_lock();
+        assert_eq!(linelen_of(b""), (0, false));
+    }
+
+    /// Trailing whitespace is excluded from the width.
+    #[test]
+    fn linelen_ignores_trailing_whitespace() {
+        let _guard = globals_test_lock();
+        assert_eq!(linelen_of(b"abc   ").0, 3);
+    }
+
+    /// LEADING whitespace still occupies screen cells, so it counts
+    /// toward the width even though trailing whitespace does not.
+    #[test]
+    fn linelen_counts_leading_whitespace_but_not_trailing() {
+        let _guard = globals_test_lock();
+        // Two leading spaces + 3 characters = 5 cells; the trailing
+        // spaces are dropped.
+        assert_eq!(linelen_of(b"  abc  ").0, 5);
+    }
+
+    /// A TAB inside the text is reported.
+    #[test]
+    fn linelen_reports_an_embedded_tab() {
+        let _guard = globals_test_lock();
+        assert!(linelen_of(b"ab\tcd").1);
+    }
+
+    /// The TAB search starts at the FIRST NON-BLANK, so a line
+    /// indented with tabs but holding none in its text reports false.
+    /// Searching the whole line instead would wrongly report true.
+    #[test]
+    fn linelen_does_not_count_an_indenting_tab_as_embedded() {
+        let _guard = globals_test_lock();
+        assert!(!linelen_of(b"\tabc").1, "an indenting TAB is not embedded");
+    }
+
+    /// ...and a TRAILING tab is past the last non-blank, so it is
+    /// excluded too.
+    #[test]
+    fn linelen_does_not_count_a_trailing_tab_as_embedded() {
+        let _guard = globals_test_lock();
+        assert!(!linelen_of(b"abc\t").1);
     }
 
     #[test]
