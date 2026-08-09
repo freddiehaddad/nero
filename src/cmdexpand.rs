@@ -20,7 +20,9 @@
 //!
 //! Also translated: the `compl_match_array` file-static (as
 //! `COMPL_MATCH_ARRAY`, over the newly-real
-//! [`crate::popupmenu::PumitemT`]) and [`cmdline_pum_active`].
+//! [`crate::popupmenu::PumitemT`]) and [`cmdline_pum_active`], plus
+//! [`cmdline_compl_pattern`] and [`cmdline_compl_is_fuzzy`], which
+//! read the real `ccline.xpc` expansion state.
 //!
 //! Deferred: everything else - `nextwild`/`copy_substring_from_pos`/
 //! `is_regex_match`/`concat_pattern_with_buffer_match`/
@@ -98,6 +100,48 @@ static COMPL_MATCH_ARRAY: crate::globals::GlobalCell<Option<Vec<crate::popupmenu
 pub unsafe fn cmdline_pum_active() -> bool {
     // SAFETY: forwarded from this function's own safety doc.
     crate::popupmenu::pum_visible() && unsafe { COMPL_MATCH_ARRAY.get_mut() }.is_some()
+}
+
+/// The string cmdline completion is currently expanding
+/// (`cmdline_compl_pattern`), or `None` when no cmdline completion
+/// state exists.
+///
+/// The original returns a borrowed `char *` into the live `expand_T`;
+/// an owned copy is returned here instead, since the pointer's target
+/// is reachable only through a raw pointer in a file-static and the
+/// original's own callers use it strictly read-only.
+///
+/// Both of the original's NULL results collapse into `None`: a NULL
+/// `xpc` and a NULL `xp_orig` are indistinguishable to every caller,
+/// each of which tests only `leader == NULL`.
+///
+/// # Safety
+/// Touches the `ccline` file-static and, if set, its `xpc` pointer.
+#[must_use]
+pub unsafe fn cmdline_compl_pattern() -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let xp = unsafe { (*crate::ex_getln::get_cmdline_info()).xpc };
+    if xp.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own safety doc; `xp` was
+    // just checked non-null.
+    unsafe { (*xp).xp_orig.clone() }
+}
+
+/// Whether fuzzy cmdline completion is active
+/// (`cmdline_compl_is_fuzzy`).
+///
+/// # Safety
+/// Touches the `ccline` file-static and, if set, its `xpc` pointer,
+/// plus `crate::option_vars::OPTION_VARS`.
+#[must_use]
+pub unsafe fn cmdline_compl_is_fuzzy() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let xp = unsafe { (*crate::ex_getln::get_cmdline_info()).xpc };
+    // SAFETY: forwarded from this function's own safety doc; `xp` is
+    // checked non-null before it is read.
+    !xp.is_null() && cmdline_fuzzy_completion_supported(unsafe { (*xp).xp_context })
 }
 
 /// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
@@ -293,6 +337,109 @@ mod tests {
         // emptiness instead of presence would wrongly report false.
         let _arr = ComplMatchArrayGuard::set(Some(Vec::new()));
         assert!(unsafe { cmdline_pum_active() });
+    }
+
+    /// Installs a boxed `ExpandT` as `ccline.xpc` for the duration of
+    /// a test, restoring the previous pointer and reclaiming the box
+    /// on drop - even through a panic, so a failing test cannot leave
+    /// a dangling pointer in the `ccline` file-static for whichever
+    /// test runs next.
+    ///
+    /// The `ExpandT` is boxed (never a stack local) because its
+    /// address is stored in a global.
+    struct XpcGuard {
+        saved: *mut crate::cmdexpand_defs::ExpandT,
+        installed: *mut crate::cmdexpand_defs::ExpandT,
+    }
+
+    impl XpcGuard {
+        fn install(xp: crate::cmdexpand_defs::ExpandT) -> Self {
+            let installed = Box::into_raw(Box::new(xp));
+            let ccline = unsafe { crate::ex_getln::get_cmdline_info() };
+            let saved = unsafe { (*ccline).xpc };
+            unsafe { (*ccline).xpc = installed };
+            Self { saved, installed }
+        }
+    }
+
+    impl Drop for XpcGuard {
+        fn drop(&mut self) {
+            let ccline = unsafe { crate::ex_getln::get_cmdline_info() };
+            unsafe { (*ccline).xpc = self.saved };
+            drop(unsafe { Box::from_raw(self.installed) });
+        }
+    }
+
+    // --- cmdline_compl_pattern / cmdline_compl_is_fuzzy ---
+
+    #[test]
+    fn compl_pattern_is_absent_with_no_expansion_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        // ccline.xpc is NULL by default: no cmdline completion state.
+        assert_eq!(unsafe { cmdline_compl_pattern() }, None);
+    }
+
+    #[test]
+    fn compl_pattern_reports_the_originally_expanded_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _xpc = XpcGuard::install(crate::cmdexpand_defs::ExpandT {
+            xp_orig: Some(b"col".to_vec()),
+            ..crate::cmdexpand_defs::ExpandT::default()
+        });
+        assert_eq!(unsafe { cmdline_compl_pattern() }, Some(b"col".to_vec()));
+    }
+
+    #[test]
+    fn compl_pattern_is_absent_when_the_state_exists_but_holds_no_original() {
+        let _lock = crate::globals::global_state_test_lock();
+        // A non-NULL xpc with a NULL xp_orig must still read as
+        // absent - the original returns NULL in both cases.
+        let _xpc = XpcGuard::install(crate::cmdexpand_defs::ExpandT::default());
+        assert_eq!(unsafe { cmdline_compl_pattern() }, None);
+    }
+
+    #[test]
+    fn compl_is_not_fuzzy_with_no_expansion_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        // Even with 'wildoptions' fuzzy ON, a NULL xpc means no
+        // cmdline completion is running at all.
+        let _guard = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::FUZZY);
+        assert!(!unsafe { cmdline_compl_is_fuzzy() });
+    }
+
+    #[test]
+    fn compl_is_fuzzy_follows_the_context_when_state_exists() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WopFlagsGuard::set(crate::option_vars::opt_wop_flag::FUZZY);
+
+        // A context that opts out of fuzzy matching stays non-fuzzy
+        // even with the 'wildoptions' flag on...
+        let opted_out = XpcGuard::install(crate::cmdexpand_defs::ExpandT {
+            xp_context: E::Files,
+            ..crate::cmdexpand_defs::ExpandT::default()
+        });
+        assert!(!unsafe { cmdline_compl_is_fuzzy() });
+        drop(opted_out);
+
+        // ...while a context that defers to 'wildoptions' is fuzzy.
+        let _deferring = XpcGuard::install(crate::cmdexpand_defs::ExpandT {
+            xp_context: E::Commands,
+            ..crate::cmdexpand_defs::ExpandT::default()
+        });
+        assert!(unsafe { cmdline_compl_is_fuzzy() });
+    }
+
+    #[test]
+    fn compl_is_not_fuzzy_when_wildoptions_omits_it() {
+        use crate::cmdexpand_defs::ExpandContext as E;
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = WopFlagsGuard::set(0);
+        let _xpc = XpcGuard::install(crate::cmdexpand_defs::ExpandT {
+            xp_context: E::Commands,
+            ..crate::cmdexpand_defs::ExpandT::default()
+        });
+        assert!(!unsafe { cmdline_compl_is_fuzzy() });
     }
 
     /// Every expected value below was read out of a real `nvim`
