@@ -99,6 +99,48 @@
 
 use crate::buffer_defs::b_flags;
 
+/// `:fold` - create a fold over the command's own line range
+/// (`ex_fold`).
+///
+/// A no-op unless manual folding is currently allowed, which is what
+/// keeps `:fold` from fighting an automatic `'foldmethod'`.
+///
+/// The original builds its two positions with column 1; that column
+/// is never read by `fold_create` (only `lnum` is), so it is
+/// reproduced rather than relied upon.
+///
+/// # Safety
+/// Forwarded from [`crate::fold::fold_manual_allowed`]/
+/// [`crate::fold::fold_create`]'s own safety docs;
+/// `GLOBALS.curwin` must be valid and non-null.
+pub unsafe fn ex_fold(eap: &crate::ex_cmds_defs::ExargT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { crate::fold::fold_manual_allowed(true) } {
+        return;
+    }
+    let start = crate::pos_defs::PosT { lnum: eap.line1, col: 1, coladd: 0 };
+    let end = crate::pos_defs::PosT { lnum: eap.line2, col: 1, coladd: 0 };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::fold::fold_create(curwin, start, end) };
+}
+
+/// `:foldopen` and `:foldclose` (`ex_foldopen`).
+///
+/// Which of the two is being run is decided by the command index, and
+/// `!` makes the operation recursive.
+///
+/// # Safety
+/// Forwarded from [`crate::fold::op_fold_range`]'s own safety doc.
+pub unsafe fn ex_foldopen(eap: &crate::ex_cmds_defs::ExargT) {
+    let start = crate::pos_defs::PosT { lnum: eap.line1, col: 1, coladd: 0 };
+    let end = crate::pos_defs::PosT { lnum: eap.line2, col: 1, coladd: 0 };
+    let opening = eap.cmdidx == crate::ex_cmds_defs::CmdIdxT::foldopen;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::fold::op_fold_range(start, end, opening, eap.forceit) };
+}
+
 /// Return true if the current buffer is locked because it is being used
 /// for evaluating an expression from `'foldexpr'`, `'formatexpr'`, or
 /// similar option-expression contexts, via `:normal`'s temporary
@@ -701,6 +743,119 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- ex_fold / ex_foldopen ----
+
+    /// Restores `curwin` on drop, even through a panic.
+    struct ExCurwinGuard {
+        previous: *mut crate::buffer_defs::WinT,
+    }
+
+    impl ExCurwinGuard {
+        fn set(new_curwin: *mut crate::buffer_defs::WinT) -> Self {
+            let previous = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = new_curwin;
+            Self { previous }
+        }
+    }
+
+    impl Drop for ExCurwinGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.previous;
+        }
+    }
+
+    /// A window with manual folding enabled, matching `fold.rs`'s own
+    /// fixture for `fold_create`.
+    fn manual_fold_win(buf: &mut BufT) -> crate::buffer_defs::WinT {
+        buf.b_ml.ml_line_count = 40;
+        crate::buffer_defs::WinT {
+            w_buffer: std::ptr::from_mut(buf),
+            w_onebuf_opt: crate::buffer_defs::WinoptT {
+                wo_fen: 1,
+                wo_fdm: Some(b"manual".to_vec()),
+                wo_fml: 0,
+                wo_fdl: 99,
+                ..Default::default()
+            },
+            w_foldinvalid: false,
+            ..Default::default()
+        }
+    }
+
+    fn fold_eap(
+        cmdidx: crate::ex_cmds_defs::CmdIdxT,
+        line1: crate::pos_defs::LinenrT,
+        line2: crate::pos_defs::LinenrT,
+        forceit: bool,
+    ) -> crate::ex_cmds_defs::ExargT {
+        crate::ex_cmds_defs::ExargT { cmdidx, line1, line2, forceit, ..Default::default() }
+    }
+
+    #[test]
+    fn ex_fold_creates_a_fold_over_the_command_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _g = ExCurwinGuard::set(win_ptr);
+
+        assert!(win.w_folds.is_empty());
+        unsafe { ex_fold(&fold_eap(crate::ex_cmds_defs::CmdIdxT::fold, 5, 10, false)) };
+
+        assert_eq!(win.w_folds.len(), 1);
+        assert_eq!(win.w_folds[0].fd_top, 5);
+        assert_eq!(win.w_folds[0].fd_len, 6, "lines 5..=10 inclusive");
+    }
+
+    /// Manual folding must be ALLOWED first; with an automatic
+    /// 'foldmethod' the command is a no-op rather than silently
+    /// creating a fold the method would fight over.
+    #[test]
+    fn ex_fold_is_a_no_op_when_manual_folding_is_not_allowed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        // 'foldmethod' is no longer manual/marker.
+        win.w_onebuf_opt.wo_fdm = Some(b"indent".to_vec());
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _g = ExCurwinGuard::set(win_ptr);
+
+        unsafe { ex_fold(&fold_eap(crate::ex_cmds_defs::CmdIdxT::fold, 5, 10, false)) };
+        assert!(win.w_folds.is_empty(), "no fold may be created");
+    }
+
+    /// `:foldopen` opens and `:foldclose` closes - the direction comes
+    /// from the command index, so an implementation ignoring it would
+    /// get one of these backwards.
+    #[test]
+    fn ex_foldopen_direction_follows_the_command_index() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = BufT::default();
+        let mut win = manual_fold_win(&mut buf);
+        let win_ptr = std::ptr::from_mut(&mut win);
+        let _g = ExCurwinGuard::set(win_ptr);
+
+        // Build a real fold to act on, then confirm each command
+        // moves it in its own direction.
+        unsafe { ex_fold(&fold_eap(CmdIdxT::fold, 5, 10, false)) };
+        assert_eq!(win.w_folds.len(), 1);
+
+        unsafe { ex_foldopen(&fold_eap(CmdIdxT::foldopen, 5, 10, false)) };
+        assert_eq!(
+            win.w_folds[0].fd_flags,
+            crate::fold::fd_flags::FD_OPEN,
+            ":foldopen must open"
+        );
+
+        unsafe { ex_foldopen(&fold_eap(CmdIdxT::foldclose, 5, 10, false)) };
+        assert_eq!(
+            win.w_folds[0].fd_flags,
+            crate::fold::fd_flags::FD_CLOSED,
+            ":foldclose must close"
+        );
+    }
 
     /// Points `GLOBALS.curbuf` at `buf` for the guard's lifetime,
     /// restoring the previous value on drop. Callers must hold
