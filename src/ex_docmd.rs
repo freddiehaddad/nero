@@ -99,6 +99,84 @@
 
 use crate::buffer_defs::b_flags;
 
+/// Resolve a buffer-relative address into a buffer number
+/// (`compute_buffer_local_count`).
+///
+/// Walks the buffer list from the entry at `lnum`, stepping `offset`
+/// buffers forward (or backward, when negative). For
+/// [`CmdAddrT::LoadedBuffers`](crate::ex_cmds_defs::CmdAddrT) unloaded
+/// buffers do not count, so they are stepped over; a final pass then
+/// walks BACK if the search still landed on an unloaded buffer, which
+/// is what keeps the result a genuinely loaded one.
+///
+/// Returns the buffer's `handle` - the field the original also names
+/// `b_fnum` via `#define b_fnum handle`.
+///
+/// # Safety
+/// `GLOBALS.firstbuf` must be a valid, non-null pointer to a live
+/// `BufT` whose `b_next`/`b_prev` chain is likewise valid.
+#[must_use]
+pub unsafe fn compute_buffer_local_count(
+    addr_type: crate::ex_cmds_defs::CmdAddrT,
+    lnum: crate::pos_defs::LinenrT,
+    offset: i32,
+) -> i32 {
+    let loaded_only = addr_type == crate::ex_cmds_defs::CmdAddrT::LoadedBuffers;
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut buf = unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf;
+
+    // Find the buffer the address starts from.
+    // SAFETY: forwarded from this function's own safety doc.
+    while !unsafe { &*buf }.b_next.is_null()
+        && i64::from(unsafe { &*buf }.handle) < i64::from(lnum)
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        buf = unsafe { &*buf }.b_next;
+    }
+
+    let step = |b: *mut crate::buffer_defs::BufT, back: bool| -> *mut crate::buffer_defs::BufT {
+        // SAFETY: forwarded from this function's own safety doc.
+        if back { unsafe { &*b }.b_prev } else { unsafe { &*b }.b_next }
+    };
+
+    let mut count = offset;
+    while count != 0 {
+        count += if count < 0 { 1 } else { -1 };
+        let nextbuf = step(buf, offset < 0);
+        if nextbuf.is_null() {
+            break;
+        }
+        buf = nextbuf;
+        if loaded_only {
+            // skip over unloaded buffers
+            // SAFETY: forwarded from this function's own safety doc.
+            while unsafe { &*buf }.b_ml.ml_mfp.is_null() {
+                let nextbuf = step(buf, offset < 0);
+                if nextbuf.is_null() {
+                    break;
+                }
+                buf = nextbuf;
+            }
+        }
+    }
+
+    // We might have gone too far; the last buffer is not loaded. Note
+    // the direction is REVERSED here relative to the walk above.
+    if loaded_only {
+        // SAFETY: forwarded from this function's own safety doc.
+        while unsafe { &*buf }.b_ml.ml_mfp.is_null() {
+            let nextbuf = step(buf, offset >= 0);
+            if nextbuf.is_null() {
+                break;
+            }
+            buf = nextbuf;
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { &*buf }.handle
+}
+
 /// Clamp a zero line number in the command's range up to line 1,
 /// unless the command explicitly permits zero (`correct_range`).
 ///
@@ -790,6 +868,121 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- compute_buffer_local_count ----
+
+    /// Builds a chained buffer list with the given handles, boxed for
+    /// stable addresses since they go into GLOBALS. `loaded` decides
+    /// whether each buffer gets a non-null `ml_mfp`.
+    fn buffer_chain(specs: &[(i32, bool)]) -> Vec<Box<BufT>> {
+        let mut bufs: Vec<Box<BufT>> = specs
+            .iter()
+            .map(|&(handle, loaded)| {
+                let mut b = Box::new(BufT { handle, ..Default::default() });
+                if loaded {
+                    // Any non-null pointer marks the buffer loaded;
+                    // it is never dereferenced here.
+                    b.b_ml.ml_mfp = std::ptr::dangling_mut();
+                }
+                b
+            })
+            .collect();
+
+        for i in 0..bufs.len() {
+            let next = if i + 1 < bufs.len() { std::ptr::from_mut(&mut *bufs[i + 1]) } else { std::ptr::null_mut() };
+            bufs[i].b_next = next;
+        }
+        for i in (0..bufs.len()).rev() {
+            let prev = if i > 0 { std::ptr::from_mut(&mut *bufs[i - 1]) } else { std::ptr::null_mut() };
+            bufs[i].b_prev = prev;
+        }
+        bufs
+    }
+
+    fn with_buffers<T>(bufs: &mut [Box<BufT>], f: impl FnOnce() -> T) -> T {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.firstbuf;
+        g.firstbuf = std::ptr::from_mut(&mut *bufs[0]);
+        let r = f();
+        unsafe { crate::globals::GLOBALS.get_mut() }.firstbuf = prev;
+        r
+    }
+
+    #[test]
+    fn buffer_local_count_with_no_offset_stays_on_the_addressed_buffer() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut bufs = buffer_chain(&[(1, true), (2, true), (3, true)]);
+        let got = with_buffers(&mut bufs, || unsafe {
+            compute_buffer_local_count(CmdAddrT::Buffers, 2, 0)
+        });
+        assert_eq!(got, 2);
+    }
+
+    #[test]
+    fn buffer_local_count_steps_forward_and_backward() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut bufs = buffer_chain(&[(1, true), (2, true), (3, true)]);
+        let (fwd, back) = with_buffers(&mut bufs, || unsafe {
+            (
+                compute_buffer_local_count(CmdAddrT::Buffers, 1, 2),
+                compute_buffer_local_count(CmdAddrT::Buffers, 3, -2),
+            )
+        });
+        assert_eq!(fwd, 3);
+        assert_eq!(back, 1);
+    }
+
+    /// Running off the end stops at the last buffer rather than
+    /// walking past it.
+    #[test]
+    fn buffer_local_count_clamps_at_the_ends_of_the_list() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut bufs = buffer_chain(&[(1, true), (2, true), (3, true)]);
+        let (fwd, back) = with_buffers(&mut bufs, || unsafe {
+            (
+                compute_buffer_local_count(CmdAddrT::Buffers, 1, 99),
+                compute_buffer_local_count(CmdAddrT::Buffers, 3, -99),
+            )
+        });
+        assert_eq!(fwd, 3);
+        assert_eq!(back, 1);
+    }
+
+    /// With ADDR_LOADED_BUFFERS an unloaded buffer does not count, so
+    /// stepping one forward skips past it. Plain ADDR_BUFFERS lands on
+    /// it, which is what makes the two address types differ.
+    #[test]
+    fn buffer_local_count_skips_unloaded_buffers_only_for_loaded_addressing() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut bufs = buffer_chain(&[(1, true), (2, false), (3, true)]);
+        let (loaded, any) = with_buffers(&mut bufs, || unsafe {
+            (
+                compute_buffer_local_count(CmdAddrT::LoadedBuffers, 1, 1),
+                compute_buffer_local_count(CmdAddrT::Buffers, 1, 1),
+            )
+        });
+        assert_eq!(loaded, 3, "the unloaded buffer must be skipped");
+        assert_eq!(any, 2, "plain buffer addressing counts it");
+    }
+
+    /// The final correction pass walks in the REVERSED direction: a
+    /// forward search that overshot onto an unloaded buffer backs up.
+    /// Here every buffer past the first is unloaded, so stepping
+    /// forward runs off the end and must come back to buffer 1.
+    #[test]
+    fn buffer_local_count_backs_up_when_it_lands_on_an_unloaded_buffer() {
+        use crate::ex_cmds_defs::CmdAddrT;
+        let _lock = crate::globals::global_state_test_lock();
+        let mut bufs = buffer_chain(&[(1, true), (2, false), (3, false)]);
+        let got = with_buffers(&mut bufs, || unsafe {
+            compute_buffer_local_count(CmdAddrT::LoadedBuffers, 1, 1)
+        });
+        assert_eq!(got, 1, "must back up to the loaded buffer");
+    }
 
     // ---- correct_range / get_flags ----
 
