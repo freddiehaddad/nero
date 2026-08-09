@@ -99,6 +99,58 @@
 
 use crate::buffer_defs::b_flags;
 
+/// `prev_dir` - the directory `:cd -` returns to, at global scope.
+///
+/// Only ever set by `post_chdir` (not yet translated), so this stays
+/// `None` in this crate today.
+static PREV_DIR: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// The previous directory for the given chdir scope (`get_prevdir`),
+/// i.e. where `:cd -` would return to at that scope.
+///
+/// Window and tabpage scopes each keep their own; every other scope
+/// (global included) falls back to the single `prev_dir` static, which
+/// is why the original's `switch` has a `default` rather than a case
+/// per scope.
+///
+/// # Safety
+/// Touches `GLOBALS.curwin`/`curtab` (which must be valid and
+/// non-null for the window and tabpage scopes) and `PREV_DIR`.
+#[must_use]
+pub unsafe fn get_prevdir(scope: crate::vim_defs::CdScope) -> Option<Vec<u8>> {
+    match scope {
+        crate::vim_defs::CdScope::Tabpage => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curtab = unsafe { crate::globals::GLOBALS.get_mut() }.curtab;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*curtab }.tp_prevdir.clone()
+        }
+        crate::vim_defs::CdScope::Window => {
+            // SAFETY: forwarded from this function's own safety doc.
+            let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { &*curwin }.w_prevdir.clone()
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        _ => unsafe { PREV_DIR.get_mut() }.clone(),
+    }
+}
+
+/// Release the directories remembered for `:cd -` (`free_cd_dir`).
+///
+/// The original's two `XFREE_CLEAR`s become plain `None` assignments -
+/// dropping the owned values is what frees them.
+///
+/// # Safety
+/// Touches `PREV_DIR` and `GLOBALS.globaldir`.
+pub unsafe fn free_cd_dir() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { PREV_DIR.get_mut() } = None;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = None;
+}
+
 /// Whether `cmdidx` names a location-list command rather than its
 /// quickfix counterpart (`is_loclist_cmd`).
 ///
@@ -963,6 +1015,111 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- get_prevdir / free_cd_dir ----
+
+    /// Restores `PREV_DIR`, `globaldir`, `curwin` and `curtab` on
+    /// drop, even through a panic.
+    struct PrevDirGuard {
+        prev_dir: Option<Vec<u8>>,
+        globaldir: Option<Vec<u8>>,
+        curwin: *mut crate::buffer_defs::WinT,
+        curtab: *mut crate::buffer_defs::TabpageT,
+    }
+
+    impl PrevDirGuard {
+        fn save() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                prev_dir: unsafe { PREV_DIR.get_mut() }.take(),
+                globaldir: g.globaldir.take(),
+                curwin: g.curwin,
+                curtab: g.curtab,
+            }
+        }
+    }
+
+    impl Drop for PrevDirGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            *unsafe { PREV_DIR.get_mut() } = self.prev_dir.take();
+            g.globaldir = self.globaldir.take();
+            g.curwin = self.curwin;
+            g.curtab = self.curtab;
+        }
+    }
+
+    /// Each scope reads its OWN previous directory. All three are set
+    /// to different values at once so a lookup returning the wrong
+    /// one is visible rather than coincidentally right.
+    #[test]
+    fn get_prevdir_reads_the_directory_belonging_to_each_scope() {
+        use crate::vim_defs::CdScope;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevDirGuard::save();
+
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_prevdir = Some(b"/win".to_vec());
+        let mut tp = Box::new(crate::buffer_defs::TabpageT::default());
+        tp.tp_prevdir = Some(b"/tab".to_vec());
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curtab = std::ptr::from_mut(&mut *tp);
+        *unsafe { PREV_DIR.get_mut() } = Some(b"/global".to_vec());
+
+        assert_eq!(unsafe { get_prevdir(CdScope::Window) }, Some(b"/win".to_vec()));
+        assert_eq!(unsafe { get_prevdir(CdScope::Tabpage) }, Some(b"/tab".to_vec()));
+        assert_eq!(unsafe { get_prevdir(CdScope::Global) }, Some(b"/global".to_vec()));
+    }
+
+    /// Global is the `default` arm rather than a case of its own, so
+    /// every remaining scope - including `Invalid` - shares the same
+    /// static.
+    #[test]
+    fn get_prevdir_falls_back_to_the_shared_static_for_other_scopes() {
+        use crate::vim_defs::CdScope;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevDirGuard::save();
+        *unsafe { PREV_DIR.get_mut() } = Some(b"/shared".to_vec());
+
+        assert_eq!(unsafe { get_prevdir(CdScope::Global) }, Some(b"/shared".to_vec()));
+        assert_eq!(unsafe { get_prevdir(CdScope::Invalid) }, Some(b"/shared".to_vec()));
+    }
+
+    #[test]
+    fn get_prevdir_is_absent_when_nothing_was_recorded() {
+        use crate::vim_defs::CdScope;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevDirGuard::save();
+        *unsafe { PREV_DIR.get_mut() } = None;
+        assert_eq!(unsafe { get_prevdir(CdScope::Global) }, None);
+    }
+
+    /// Both directories are released, and the per-scope ones are
+    /// deliberately left alone - the original frees only these two.
+    #[test]
+    fn free_cd_dir_releases_both_global_directories() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevDirGuard::save();
+
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_prevdir = Some(b"/win".to_vec());
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.globaldir = Some(b"/cwd".to_vec());
+        *unsafe { PREV_DIR.get_mut() } = Some(b"/global".to_vec());
+
+        unsafe { free_cd_dir() };
+
+        assert_eq!(*unsafe { PREV_DIR.get_mut() }, None);
+        assert_eq!(unsafe { crate::globals::GLOBALS.get_mut() }.globaldir, None);
+        assert_eq!(
+            win.w_prevdir,
+            Some(b"/win".to_vec()),
+            "a window's own previous directory is not this function's to free"
+        );
+    }
 
     // ---- CMDNAMES / cmdname / is_loclist_cmd ----
 
