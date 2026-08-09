@@ -573,10 +573,11 @@ pub fn qf_free_list_stack_items(qi: &mut crate::types_defs::QfInfoT) {
 /// one of two places: the file-static `ql_info_actual` singleton for a
 /// quickfix stack, or a fresh allocation whose `qf_refcount` starts at
 /// one for a location list. That choice is a storage decision
-/// belonging to `qf_init_stack`/the per-window `w_llist` fields,
-/// neither of which is translated yet, so it is left to the caller
-/// here. The refcount difference between the two IS preserved, since
-/// it is part of the returned value rather than of where it lives.
+/// belonging to the caller - [`qf_init_stack`] now makes it for the
+/// quickfix stack by installing the result into `QL_INFO`, while the
+/// location-list side still awaits the per-window `w_llist` wiring.
+/// The refcount difference between the two IS preserved here, since it
+/// is part of the returned value rather than of where it lives.
 #[must_use]
 pub fn qf_alloc_stack(qfltype: QfltypeT, n: i32) -> crate::types_defs::QfInfoT {
     let count = usize::try_from(n).unwrap_or(0);
@@ -591,6 +592,46 @@ pub fn qf_alloc_stack(qfltype: QfltypeT, n: i32) -> crate::types_defs::QfInfoT {
         qfl_type: qfltype,
         qf_bufnr: INVALID_QFBUFNR,
     }
+}
+
+/// `ql_info_actual` - the global quickfix list stack.
+///
+/// The original keeps a file-static struct plus a `ql_info` pointer
+/// that is null until `qf_init_stack` runs, so "not yet initialized"
+/// is distinguishable from "initialized but empty". `Option` models
+/// that pointer directly.
+static QL_INFO: crate::globals::GlobalCell<Option<crate::types_defs::QfInfoT>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Initialize the global quickfix stack from `'chistory'`
+/// (`qf_init_stack`).
+///
+/// # Safety
+/// Touches `QL_INFO` and reads `crate::option_vars::OPTION_VARS`.
+pub unsafe fn qf_init_stack() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let p_chi = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_chi;
+    let stack = qf_alloc_stack(QfltypeT::Quickfix, i32::try_from(p_chi).unwrap_or(0));
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { QL_INFO.get_mut() } = Some(stack);
+}
+
+/// The global quickfix stack's own window buffer number
+/// (`qf_stack_get_bufnr`).
+///
+/// # Safety
+/// Touches `QL_INFO`.
+///
+/// # Panics
+/// If the global stack has not been initialized yet, matching the
+/// original's own `assert(ql_info != NULL)`.
+#[must_use]
+pub unsafe fn qf_stack_get_bufnr() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { QL_INFO.get_mut() }
+        .as_ref()
+        .expect("qf_stack_get_bufnr: the global quickfix stack is not initialized")
+        .qf_bufnr
 }
 
 /// Counter handing out the unique id for each new list (`last_qf_id`).
@@ -1045,6 +1086,82 @@ mod tests {
         let r = f();
         unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = prev;
         r
+    }
+
+    // --- ql_info / qf_init_stack / qf_stack_get_bufnr ---
+
+    /// Restores `QL_INFO` on drop, even through a panic, so a failing
+    /// test cannot leave a half-built global stack behind.
+    struct QlInfoGuard(Option<crate::types_defs::QfInfoT>);
+
+    impl QlInfoGuard {
+        fn save() -> Self {
+            Self(unsafe { QL_INFO.get_mut() }.take())
+        }
+    }
+
+    impl Drop for QlInfoGuard {
+        fn drop(&mut self) {
+            *unsafe { QL_INFO.get_mut() } = self.0.take();
+        }
+    }
+
+    /// The original's `ql_info` pointer starts NULL, so "not yet
+    /// initialized" is a distinct state from "initialized but empty" -
+    /// which is why reading the buffer number before initialization
+    /// trips the original's own assert.
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn qf_stack_get_bufnr_panics_before_initialization() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        *unsafe { QL_INFO.get_mut() } = None;
+        let _ = unsafe { qf_stack_get_bufnr() };
+    }
+
+    #[test]
+    fn qf_init_stack_builds_a_quickfix_stack_sized_by_chistory() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_chi = opts.p_chi;
+        opts.p_chi = 7;
+
+        unsafe { qf_init_stack() };
+
+        let qi = unsafe { QL_INFO.get_mut() }.as_ref().expect("initialized");
+        assert_eq!(qi.qf_maxcount, 7);
+        assert_eq!(qi.qf_lists.len(), 7);
+        assert_eq!(qi.qfl_type, QfltypeT::Quickfix);
+        // An initialized stack still holds no lists yet - distinct
+        // from being uninitialized.
+        assert_eq!(qi.qf_listcount, 0);
+        // The quickfix stack is a singleton in the original, so it is
+        // NOT reference-counted like a location list.
+        assert_eq!(qi.qf_refcount, 0);
+        assert_eq!(qi.qf_bufnr, INVALID_QFBUFNR);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_chi = prev_chi;
+    }
+
+    #[test]
+    fn qf_stack_get_bufnr_reports_the_initialized_stacks_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+
+        let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        let prev_chi = opts.p_chi;
+        opts.p_chi = 2;
+        unsafe { qf_init_stack() };
+
+        assert_eq!(unsafe { qf_stack_get_bufnr() }, INVALID_QFBUFNR);
+
+        // A real buffer number is reported once one is assigned.
+        unsafe { QL_INFO.get_mut() }.as_mut().unwrap().qf_bufnr = 12;
+        assert_eq!(unsafe { qf_stack_get_bufnr() }, 12);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_chi = prev_chi;
     }
 
     // --- win_set_loclist / qf_find_win_with_loclist ---
