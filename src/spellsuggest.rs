@@ -188,10 +188,222 @@ pub fn bytes2offset(p: &[u8]) -> (i32, usize) {
     (nr, i)
 }
 
+/// Mix of upper and lower case, e.g. `macaRONI` (`WF_MIXCAP`).
+///
+/// Defined locally in `spellsuggest.c` rather than in `spell_defs.h`
+/// alongside the other `WF_*` flags, so it lives here rather than in
+/// [`crate::spell`].
+pub const WF_MIXCAP: i32 = 0x20;
+
+/// Like [`crate::spell::captype`], but for a `WF_KEEPCAP` word also
+/// add [`crate::spell::WF_ONECAP`] when the word starts with a
+/// capital, so `make_case_word` can turn `WOrd` into `Word`
+/// (`badword_captype`).
+///
+/// Also adds [`crate::spell::WF_ALLCAP`] for a word like `WOrD`, and
+/// [`WF_MIXCAP`] when both cases appear at least twice.
+///
+/// `end` bounds the word. The original declares both arguments
+/// non-null and always passes a real end pointer, so this takes a
+/// plain `usize` rather than an `Option`; it is clamped to `word`'s
+/// length so a too-large bound cannot read past the slice.
+///
+/// Note the counting loop walks EVERY character in the range, not
+/// only word characters - unlike [`crate::spell::captype`], which
+/// skips non-word characters. That asymmetry is the original's.
+///
+/// # Safety
+/// Same as [`crate::spell::captype`]: `GLOBALS.curwin` must be valid
+/// and non-null, as must its `w_s` syntax block.
+#[must_use]
+pub unsafe fn badword_captype(word: &[u8], end: usize) -> i32 {
+    let end = end.min(word.len());
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut flags = unsafe { crate::spell::captype(word, Some(end)) };
+
+    if (flags & crate::spell::WF_KEEPCAP) == 0 {
+        return flags;
+    }
+
+    // Count the number of UPPER and lower case letters.
+    let mut l = 0i32;
+    let mut u = 0i32;
+    let mut first = false;
+    let mut p = 0usize;
+    while p < end {
+        let c = crate::mbyte::utf_ptr2char(&word[p..]);
+        // SAFETY: `spell_is_upper` only touches `OPTION_VARS`.
+        if unsafe { crate::spell::spell_is_upper(c) } {
+            u += 1;
+            if p == 0 {
+                first = true;
+            }
+        } else {
+            l += 1;
+        }
+        // SAFETY: `p` is in bounds, since `end <= word.len()`.
+        p += (unsafe { crate::mbyte::utfc_ptr2len(&word[p..]) }).max(1) as usize;
+    }
+
+    // If there are more UPPER than lower case letters suggest an
+    // ALLCAP word. Otherwise, if the first letter is UPPER then
+    // suggest ONECAP. Exception: "ALl" most likely should be "All",
+    // require three upper case letters.
+    if u > l && u > 2 {
+        flags |= crate::spell::WF_ALLCAP;
+    } else if first {
+        flags |= crate::spell::WF_ONECAP;
+    }
+
+    if u >= 2 && l >= 2 {
+        // maCARONI maCAroni
+        flags |= WF_MIXCAP;
+    }
+
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    // ---- badword_captype ----
+
+    /// A window with an initialised spell table installed as `curwin`,
+    /// so `captype` classifies ASCII letters as word characters.
+    /// Without the table every byte is a non-word character and
+    /// `captype` returns 0, which would make these tests vacuous.
+    ///
+    /// Owns both allocations as raw pointers rather than live `Box`
+    /// bindings, since the code under test reads through
+    /// `curwin`/`w_s`.
+    struct BadwordFixture {
+        win: *mut crate::buffer_defs::WinT,
+        syn: *mut crate::buffer_defs::SynblockT,
+        prev_curwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl BadwordFixture {
+        fn new() -> Self {
+            unsafe { crate::spell::init_spell_chartab() };
+            let syn = Box::into_raw(Box::new(crate::buffer_defs::SynblockT::default()));
+            let mut win = Box::new(crate::buffer_defs::WinT::default());
+            win.w_s = syn;
+            let win = Box::into_raw(win);
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_curwin = g.curwin;
+            g.curwin = win;
+            Self { win, syn, prev_curwin }
+        }
+    }
+
+    impl Drop for BadwordFixture {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.curwin = self.prev_curwin;
+            unsafe {
+                drop(Box::from_raw(self.win));
+                drop(Box::from_raw(self.syn));
+            }
+        }
+    }
+
+    /// Words that aren't KEEPCAP are passed straight through, with
+    /// none of the extra flags applied.
+    #[test]
+    fn badword_captype_passes_through_non_keepcap_words() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        for word in [b"word".as_slice(), b"Word".as_slice(), b"WORD".as_slice()] {
+            let plain = unsafe { crate::spell::captype(word, Some(word.len())) };
+            assert_eq!(
+                unsafe { badword_captype(word, word.len()) },
+                plain,
+                "non-KEEPCAP word {word:?} must be unchanged"
+            );
+            assert_eq!(plain & crate::spell::WF_KEEPCAP, 0);
+            assert_eq!(plain & WF_MIXCAP, 0);
+        }
+    }
+
+    /// "WOrd" is KEEPCAP with 2 upper and 2 lower, so it gains ONECAP
+    /// (first letter is capital, and 2 is not more than 2) and
+    /// MIXCAP.
+    #[test]
+    fn badword_captype_adds_onecap_and_mixcap_for_wo_rd() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        let flags = unsafe { badword_captype(b"WOrd", 4) };
+        assert_ne!(flags & crate::spell::WF_KEEPCAP, 0, "still KEEPCAP");
+        assert_ne!(flags & crate::spell::WF_ONECAP, 0, "starts with a capital");
+        assert_ne!(flags & WF_MIXCAP, 0, "2 upper and 2 lower");
+        assert_eq!(flags & crate::spell::WF_ALLCAP, 0, "not more upper than lower");
+    }
+
+    /// "WOrD" has 3 upper and 1 lower, so upper wins on both counts
+    /// and it gains ALLCAP rather than ONECAP. MIXCAP needs at least
+    /// two of EACH, so a single lower letter does not earn it.
+    #[test]
+    fn badword_captype_adds_allcap_for_wo_r_d() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        let flags = unsafe { badword_captype(b"WOrD", 4) };
+        assert_ne!(flags & crate::spell::WF_ALLCAP, 0, "3 upper vs 1 lower");
+        assert_eq!(flags & crate::spell::WF_ONECAP, 0, "ALLCAP wins over ONECAP");
+        assert_eq!(flags & WF_MIXCAP, 0, "only one lower letter");
+    }
+
+    /// The documented "ALl" exception: upper does outnumber lower,
+    /// but three upper case letters are required for ALLCAP, so this
+    /// gets ONECAP instead.
+    #[test]
+    fn badword_captype_requires_three_capitals_for_allcap() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        let flags = unsafe { badword_captype(b"ALl", 3) };
+        assert_ne!(flags & crate::spell::WF_KEEPCAP, 0);
+        assert_eq!(flags & crate::spell::WF_ALLCAP, 0, "only 2 capitals");
+        assert_ne!(flags & crate::spell::WF_ONECAP, 0);
+    }
+
+    /// "maCARONI" is KEEPCAP but does NOT start with a capital, so it
+    /// gets neither ONECAP nor (with 6 upper vs 2 lower) misses
+    /// ALLCAP - upper outnumbers lower and exceeds two.
+    #[test]
+    fn badword_captype_adds_allcap_and_mixcap_for_macaroni() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        let flags = unsafe { badword_captype(b"maCARONI", 8) };
+        assert_ne!(flags & crate::spell::WF_ALLCAP, 0, "6 upper vs 2 lower");
+        assert_ne!(flags & WF_MIXCAP, 0, "at least 2 of each case");
+        assert_eq!(flags & crate::spell::WF_ONECAP, 0, "does not start capital");
+    }
+
+    /// `end` bounds the word: the bytes past it take no part in the
+    /// counting.
+    #[test]
+    fn badword_captype_uses_only_the_first_end_bytes() {
+        let _lock = global_state_test_lock();
+        let _fx = BadwordFixture::new();
+
+        // Counting all of "WOrdXYZ" would reach 5 upper vs 2 lower and
+        // earn ALLCAP; bounded to "WOrd" it must not.
+        let bounded = unsafe { badword_captype(b"WOrdXYZ", 4) };
+        let full = unsafe { badword_captype(b"WOrdXYZ", 7) };
+        assert_eq!(bounded & crate::spell::WF_ALLCAP, 0);
+        assert_ne!(full & crate::spell::WF_ALLCAP, 0);
+    }
+
+    #[test]
+    fn wf_mixcap_matches_the_original() {
+        assert_eq!(WF_MIXCAP, 0x20);
+    }
 
     fn set_p_sps(value: &[u8]) {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_sps = Some(value.to_vec());
