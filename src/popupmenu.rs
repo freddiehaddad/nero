@@ -44,6 +44,12 @@
 //! unreachable for the same reason `pum_visible` itself never returns
 //! `true`.
 //!
+//! Also translated: [`PumitemT`] (`pumitem_T`, from `popupmenu.h`) -
+//! one popup menu entry. Translated ahead of `pum_display`, its own
+//! real consumer, to unblock `cmdexpand.c`'s `compl_match_array`
+//! (hence `cmdline_pum_active`), matching this crate's established
+//! "translate the blocking type first" approach.
+//!
 //! Deferred: everything else in the file.
 
 use crate::globals::GlobalCell;
@@ -65,6 +71,39 @@ static PUM_EXTERNAL: GlobalCell<bool> = GlobalCell::new(false);
 /// `pum_show_popupmenu`, neither translated, so this stays `0`
 /// forever in this crate today.
 static PUM_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
+
+/// One popup menu entry (`pumitem_T`).
+///
+/// The original's four text fields are `char *` that the popup menu
+/// does NOT own - `pum_display`'s own callers build the array out of
+/// borrowed pointers into the completion state and free the array (but
+/// not the strings) in `pum_undisplay`. Owned `Vec<u8>`s are used here
+/// instead: this crate's established idiom for a C string field, and
+/// the borrow relationship the original relies on cannot be expressed
+/// without tying the item's lifetime to the completion state that
+/// outlives it.
+///
+/// `pum_kind`/`pum_extra`/`pum_info` are genuinely optional (the
+/// original leaves them `NULL` when a completion source supplies no
+/// kind/menu/info text), so they are `Option`; `pum_text` is always
+/// present.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PumitemT {
+    /// main menu text (`pum_text`).
+    pub pum_text: Vec<u8>,
+    /// extra kind text, may be truncated (`pum_kind`).
+    pub pum_kind: Option<Vec<u8>>,
+    /// extra menu text, may be truncated (`pum_extra`).
+    pub pum_extra: Option<Vec<u8>>,
+    /// extra info (`pum_info`).
+    pub pum_info: Option<Vec<u8>>,
+    /// index of the completion source in `'complete'` (`pum_cpt_source_idx`).
+    pub pum_cpt_source_idx: i32,
+    /// highlight attribute for abbr (`pum_user_abbr_hlattr`).
+    pub pum_user_abbr_hlattr: i32,
+    /// highlight attribute for kind (`pum_user_kind_hlattr`).
+    pub pum_user_kind_hlattr: i32,
+}
 
 /// State for `pum_ext_select_item` (`pum_want`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -231,6 +270,36 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             set_pum_is_visible(false);
         }
+    }
+
+    #[test]
+    fn pumitem_default_leaves_every_optional_text_field_absent() {
+        // The original never default-constructs a pumitem_T (each
+        // field is assigned explicitly from the completion state), so
+        // what matters here is only that the three genuinely-optional
+        // texts start ABSENT rather than as an empty string: the
+        // popup menu distinguishes "this source supplied no kind text"
+        // from "this source supplied an empty kind text" when laying
+        // out the kind/menu columns.
+        let item = PumitemT::default();
+        assert!(item.pum_text.is_empty());
+        assert_eq!(item.pum_kind, None);
+        assert_eq!(item.pum_extra, None);
+        assert_eq!(item.pum_info, None);
+        assert_eq!(item.pum_cpt_source_idx, 0);
+        assert_eq!(item.pum_user_abbr_hlattr, 0);
+        assert_eq!(item.pum_user_kind_hlattr, 0);
+    }
+
+    #[test]
+    fn pumitem_absent_kind_is_distinct_from_an_empty_kind() {
+        let absent = PumitemT { pum_text: b"foo".to_vec(), ..PumitemT::default() };
+        let empty = PumitemT {
+            pum_text: b"foo".to_vec(),
+            pum_kind: Some(Vec::new()),
+            ..PumitemT::default()
+        };
+        assert_ne!(absent, empty);
     }
 
     #[test]
