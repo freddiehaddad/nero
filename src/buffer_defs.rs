@@ -368,8 +368,13 @@ pub struct SynblockT {
     pub b_syn_spell: i32,
     /// table for syntax patterns
     pub b_syn_patterns: GarrayT,
-    /// table for syntax clusters
-    pub b_syn_clusters: GarrayT,
+    /// table for syntax clusters (`b_syn_clusters`).
+    ///
+    /// A [`crate::garray_defs::TypedGarrayT`] rather than the
+    /// original's byte-erased `garray_T`, because a
+    /// [`crate::syntax::SynClusterT`] owns its two names and its
+    /// member-id list.
+    pub b_syn_clusters: crate::garray_defs::TypedGarrayT<crate::syntax::SynClusterT>,
     /// `@Spell` cluster ID or 0
     pub b_spell_cluster_id: i32,
     /// `@NoSpell` cluster ID or 0
@@ -468,7 +473,7 @@ impl Default for SynblockT {
             b_syn_foldlevel: 0,
             b_syn_spell: 0,
             b_syn_patterns: GarrayT::default(),
-            b_syn_clusters: GarrayT::default(),
+            b_syn_clusters: crate::garray_defs::TypedGarrayT::default(),
             b_spell_cluster_id: 0,
             b_nospell_cluster_id: 0,
             b_syn_containedin: 0,

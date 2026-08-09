@@ -67,6 +67,37 @@ pub unsafe fn syn_getcurline_len() -> crate::pos_defs::ColnrT {
     unsafe { crate::memline::ml_get_buf_len(&mut *buf, lnum) }
 }
 
+/// One syntax cluster - a named set of syntax group ids
+/// (`syn_cluster_T`).
+///
+/// All three fields are owned by the original (each is `xfree`d in
+/// `syn_clear_cluster`), so they become owned Rust values.
+/// `scl_list` is a plain `Vec` rather than the original's
+/// separately-counted `int16_t *`, since a `Vec` carries its own
+/// length.
+#[derive(Debug, Clone, Default)]
+pub struct SynClusterT {
+    /// syntax cluster name (`scl_name`).
+    pub scl_name: Option<Vec<u8>>,
+    /// uppercase of `scl_name` (`scl_name_u`).
+    pub scl_name_u: Option<Vec<u8>>,
+    /// IDs in this syntax cluster (`scl_list`).
+    pub scl_list: Vec<i16>,
+}
+
+/// Release everything one syntax cluster owns
+/// (`syn_clear_cluster`).
+///
+/// The original's three `xfree`s become plain resets: dropping the
+/// owned values is what frees them. Note the ENTRY itself is left in
+/// place - the original frees only its members, leaving the slot for
+/// the caller to remove or reuse.
+pub fn syn_clear_cluster(cluster: &mut SynClusterT) {
+    cluster.scl_name = None;
+    cluster.scl_name_u = None;
+    cluster.scl_list = Vec::new();
+}
+
 /// Split a `:syntax` argument into its group NAME and the rest
 /// (`get_group_name`).
 ///
@@ -225,6 +256,65 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- SynClusterT / syn_clear_cluster ----
+
+    /// The original frees only the cluster's MEMBERS, leaving the
+    /// entry itself in the table for the caller to remove or reuse -
+    /// so this is not a removal, and the slot must survive.
+    #[test]
+    fn syn_clear_cluster_releases_the_members_but_keeps_the_entry() {
+        let mut block = crate::buffer_defs::SynblockT::default();
+        block.b_syn_clusters.items = vec![
+            SynClusterT {
+                scl_name: Some(b"myCluster".to_vec()),
+                scl_name_u: Some(b"MYCLUSTER".to_vec()),
+                scl_list: vec![3, 7, 11],
+            },
+            SynClusterT {
+                scl_name: Some(b"other".to_vec()),
+                scl_name_u: Some(b"OTHER".to_vec()),
+                scl_list: vec![1],
+            },
+        ];
+
+        syn_clear_cluster(&mut block.b_syn_clusters.items[0]);
+
+        assert_eq!(
+            block.b_syn_clusters.ga_len(),
+            2,
+            "the entry stays in the table"
+        );
+        let cleared = &block.b_syn_clusters.items[0];
+        assert_eq!(cleared.scl_name, None);
+        assert_eq!(cleared.scl_name_u, None);
+        assert!(cleared.scl_list.is_empty());
+
+        // The neighbouring cluster must be untouched.
+        let kept = &block.b_syn_clusters.items[1];
+        assert_eq!(kept.scl_name, Some(b"other".to_vec()));
+        assert_eq!(kept.scl_list, vec![1]);
+    }
+
+    #[test]
+    fn syn_clear_cluster_is_safe_to_repeat() {
+        let mut c = SynClusterT {
+            scl_name: Some(b"x".to_vec()),
+            scl_name_u: Some(b"X".to_vec()),
+            scl_list: vec![1, 2],
+        };
+        syn_clear_cluster(&mut c);
+        syn_clear_cluster(&mut c);
+        assert_eq!(c.scl_name, None);
+        assert!(c.scl_list.is_empty());
+    }
+
+    #[test]
+    fn syn_clusters_start_empty() {
+        let block = crate::buffer_defs::SynblockT::default();
+        assert!(block.b_syn_clusters.is_empty());
+        assert_eq!(block.b_syn_clusters.ga_len(), 0);
     }
 
     // ---- get_group_name ----
