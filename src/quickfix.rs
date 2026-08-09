@@ -936,9 +936,142 @@ pub fn qf_fmt_text(gap: &mut GarrayT, text: &[u8]) {
     }
 }
 
+/// Find the first window in the current tab page showing a normal
+/// buffer (`qf_find_win_with_normal_buf`).
+///
+/// Returns null when every window shows a special buffer (quickfix,
+/// help, terminal and so on).
+///
+/// The original's `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` resolves to a
+/// walk from `GLOBALS.firstwin`, matching the same simplification
+/// already established elsewhere in this crate (e.g. `buffer.rs`'s
+/// `wininfo_other_tab_diff`).
+///
+/// # Safety
+/// Touches `GLOBALS.firstwin` and walks `w_next`/`w_buffer` - the
+/// same requirement as every other function that walks the window
+/// list.
+#[must_use]
+pub unsafe fn qf_find_win_with_normal_buf() -> *mut WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let win = unsafe { &*wp };
+        let buf = if win.w_buffer.is_null() {
+            None
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            Some(unsafe { &*win.w_buffer })
+        };
+        if crate::buffer::bt_normal(buf) {
+            return wp;
+        }
+        wp = win.w_next;
+    }
+    std::ptr::null_mut()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_find_win_with_normal_buf ---
+
+    /// A window list installed as `GLOBALS.firstwin`, owning every
+    /// allocation as a raw pointer so writes through the walked
+    /// pointers cannot invalidate a live `Box` tag.
+    struct WinListFixture {
+        wins: Vec<*mut WinT>,
+        bufs: Vec<*mut BufT>,
+        prev_firstwin: *mut WinT,
+    }
+
+    impl WinListFixture {
+        /// Builds one window per entry, linked through `w_next`.
+        /// `true` gives that window a normal buffer, `false` a
+        /// non-normal one (`'buftype'` set).
+        fn new(normal: &[bool]) -> Self {
+            let mut wins = Vec::new();
+            let mut bufs = Vec::new();
+            for &is_normal in normal {
+                let mut buf = Box::new(BufT::default());
+                buf.b_p_bt = if is_normal {
+                    Some(Vec::new())
+                } else {
+                    Some(b"quickfix".to_vec())
+                };
+                let buf = Box::into_raw(buf);
+                bufs.push(buf);
+
+                let mut win = Box::new(WinT::default());
+                win.w_buffer = buf;
+                wins.push(Box::into_raw(win));
+            }
+            for i in 0..wins.len().saturating_sub(1) {
+                unsafe { &mut *wins[i] }.w_next = wins[i + 1];
+            }
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_firstwin = g.firstwin;
+            g.firstwin = wins.first().copied().unwrap_or(std::ptr::null_mut());
+            Self { wins, bufs, prev_firstwin }
+        }
+    }
+
+    impl Drop for WinListFixture {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = self.prev_firstwin;
+            for &w in &self.wins {
+                unsafe { drop(Box::from_raw(w)) };
+            }
+            for &b in &self.bufs {
+                unsafe { drop(Box::from_raw(b)) };
+            }
+        }
+    }
+
+    #[test]
+    fn qf_find_win_with_normal_buf_returns_null_for_no_windows() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = WinListFixture::new(&[]);
+        assert!(unsafe { qf_find_win_with_normal_buf() }.is_null());
+    }
+
+    #[test]
+    fn qf_find_win_with_normal_buf_returns_null_when_none_are_normal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _fx = WinListFixture::new(&[false, false]);
+        assert!(unsafe { qf_find_win_with_normal_buf() }.is_null());
+    }
+
+    /// Returns the FIRST normal window, not merely any of them, so a
+    /// reversed or last-wins walk would fail.
+    #[test]
+    fn qf_find_win_with_normal_buf_returns_the_first_normal_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = WinListFixture::new(&[false, true, true]);
+        let found = unsafe { qf_find_win_with_normal_buf() };
+        assert_eq!(found, fx.wins[1], "the first normal window, skipping [0]");
+    }
+
+    #[test]
+    fn qf_find_win_with_normal_buf_finds_a_normal_window_at_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = WinListFixture::new(&[false, false, true]);
+        assert_eq!(unsafe { qf_find_win_with_normal_buf() }, fx.wins[2]);
+    }
+
+    /// A window with no buffer at all is skipped rather than
+    /// dereferenced.
+    #[test]
+    fn qf_find_win_with_normal_buf_skips_a_window_without_a_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = WinListFixture::new(&[false, true]);
+        let first = fx.wins[0];
+        unsafe { &mut *first }.w_buffer = std::ptr::null_mut();
+        assert_eq!(unsafe { qf_find_win_with_normal_buf() }, fx.wins[1]);
+    }
 
     // --- qf_sync_win_to_llw ---
 
