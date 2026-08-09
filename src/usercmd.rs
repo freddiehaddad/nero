@@ -38,6 +38,12 @@
 //! against `COMMAND_COMPLETE`'s 46 entries, confirming that
 //! `EXPAND_USER_LUA`'s `"<Lua function>"` really is blanked out.
 //!
+//! Also translated: [`UcmdT`] (`ucmd_T`, from `usercmd.h`), the
+//! global [`UCMDS`] registry and the per-buffer `b_ucmds` list (both
+//! [`crate::garray_defs::TypedGarrayT`]s, since a `UcmdT` owns its
+//! name/replacement/completion-argument/description strings), plus
+//! [`get_user_commands`] and [`expand_user_command_name`].
+//!
 //! Deferred: everything else - `uc_add_command`/`ex_command`/
 //! `ex_comclear`/`ex_delcommand`/`do_ucmd`/`uc_list`/`uc_scan_attr`
 //! (the real user-command registry and its `:command`-parsing
@@ -46,6 +52,121 @@
 use crate::ascii_defs::ascii_iswhite;
 use crate::ex_docmd::ends_excmd;
 use crate::macros_defs::{ascii_isalnum, ascii_isalpha};
+
+/// One user-defined command (`ucmd_T`, from `usercmd.h`).
+///
+/// The four `char *` fields are owned strings in the original (each is
+/// `xfree`d when the command is removed), so they become owned
+/// `Option<Vec<u8>>` here - `uc_rep` and `uc_compl_arg` are genuinely
+/// optional, and `uc_name`/`uc_desc` are modelled the same way for
+/// consistency with how the original leaves them NULL before a command
+/// is fully built.
+#[derive(Debug, Clone, Default)]
+pub struct UcmdT {
+    /// The command name (`uc_name`).
+    pub uc_name: Option<Vec<u8>>,
+    /// The argument type (`uc_argt`).
+    pub uc_argt: u32,
+    /// The command's replacement string (`uc_rep`).
+    pub uc_rep: Option<Vec<u8>>,
+    /// The default value for a range/count (`uc_def`).
+    pub uc_def: i64,
+    /// Completion type (`uc_compl`).
+    pub uc_compl: i32,
+    /// The command's address type (`uc_addr_type`).
+    pub uc_addr_type: crate::ex_cmds_defs::CmdAddrT,
+    /// SCTX where the command was defined (`uc_script_ctx`).
+    pub uc_script_ctx: crate::eval::typval_defs::SctxT,
+    /// Completion argument, if any (`uc_compl_arg`).
+    pub uc_compl_arg: Option<Vec<u8>>,
+    /// Reference to a Lua completion function (`uc_compl_luaref`).
+    pub uc_compl_luaref: crate::types_defs::LuaRef,
+    /// Reference to a Lua preview function (`uc_preview_luaref`).
+    pub uc_preview_luaref: crate::types_defs::LuaRef,
+    /// Reference to a Lua function (`uc_luaref`).
+    pub uc_luaref: crate::types_defs::LuaRef,
+    /// Command description (`uc_desc`).
+    pub uc_desc: Option<Vec<u8>>,
+}
+
+/// `-buffer`: local to the current buffer (`UC_BUFFER`).
+pub const UC_BUFFER: i32 = 1;
+
+/// The global user-command registry (`ucmds`).
+///
+/// A [`crate::garray_defs::TypedGarrayT`] rather than the original's
+/// byte-erased `garray_T`, because a [`UcmdT`] owns its name,
+/// replacement text, completion argument and description - see
+/// `TypedGarrayT`'s own doc comment.
+///
+/// Only ever populated by `uc_add_command` (not yet translated), so
+/// this stays empty in this crate today.
+pub static UCMDS: std::sync::LazyLock<
+    crate::globals::GlobalCell<crate::garray_defs::TypedGarrayT<UcmdT>>,
+> = std::sync::LazyLock::new(|| {
+    crate::globals::GlobalCell::new(crate::garray_defs::TypedGarrayT::default())
+});
+
+/// The name of user command `idx`, for `ExpandGeneric()`
+/// (`get_user_commands`).
+///
+/// Buffer-local commands come first, then the global ones. A global
+/// command whose name is also defined buffer-locally is reported as an
+/// EMPTY name rather than being skipped: the original returns `""` so
+/// the index numbering stays aligned with the caller's own iteration,
+/// while the entry itself contributes nothing to completion.
+///
+/// Returns `None` past the end, which is how `ExpandGeneric()` learns
+/// to stop.
+///
+/// # Safety
+/// Forwarded from [`crate::window::prevwin_curwin`]'s own safety doc;
+/// the resolved window's `w_buffer` must be valid and non-null.
+#[must_use]
+pub unsafe fn get_user_commands(idx: i32) -> Option<Vec<u8>> {
+    if idx < 0 {
+        return None;
+    }
+    // In cmdwin, the alternative buffer should be used.
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*(*crate::window::prevwin_curwin()).w_buffer };
+    let buf_len = buf.b_ucmds.ga_len();
+
+    if idx < buf_len {
+        return buf.b_ucmds.get(idx).and_then(|uc| uc.uc_name.clone());
+    }
+
+    let idx = idx - buf_len;
+    // SAFETY: forwarded from this function's own safety doc.
+    let ucmds = unsafe { UCMDS.get_mut() };
+    if idx >= ucmds.ga_len() {
+        return None;
+    }
+    let name = ucmds.get(idx).and_then(|uc| uc.uc_name.clone())?;
+
+    // A global command is overruled by a buffer-local one.
+    let overruled = buf
+        .b_ucmds
+        .items
+        .iter()
+        .any(|uc| uc.uc_name.as_deref() == Some(name.as_slice()));
+    if overruled {
+        return Some(Vec::new());
+    }
+    Some(name)
+}
+
+/// The name of the user command at completion index `idx`, which is
+/// numbered past the end of the built-in commands
+/// (`expand_user_command_name`).
+///
+/// # Safety
+/// Forwarded from [`get_user_commands`]'s own safety doc.
+#[must_use]
+pub unsafe fn expand_user_command_name(idx: i32) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_user_commands(idx - crate::ex_cmds_defs::CmdIdxT::SIZE as i32) }
+}
 
 /// Splits a byte string by unescaped whitespace (space & tab), used for
 /// `<f-args>` on Lua command callbacks. Similar to the original's
@@ -483,6 +604,144 @@ pub fn uc_validate_name(name: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ucmds / get_user_commands / expand_user_command_name ---
+
+    /// Restores the global registry, `curwin`, `curbuf` and `prevwin`
+    /// on drop, even through a panic.
+    struct UcmdsGuard {
+        ucmds: Vec<UcmdT>,
+        curwin: *mut crate::buffer_defs::WinT,
+        curbuf: *mut crate::buffer_defs::BufT,
+        prevwin: *mut crate::buffer_defs::WinT,
+    }
+
+    impl UcmdsGuard {
+        fn save() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            Self {
+                ucmds: std::mem::take(&mut unsafe { UCMDS.get_mut() }.items),
+                curwin: g.curwin,
+                curbuf: g.curbuf,
+                prevwin: g.prevwin,
+            }
+        }
+    }
+
+    impl Drop for UcmdsGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            unsafe { UCMDS.get_mut() }.items = std::mem::take(&mut self.ucmds);
+            g.curwin = self.curwin;
+            g.curbuf = self.curbuf;
+            g.prevwin = self.prevwin;
+        }
+    }
+
+    fn named(name: &[u8]) -> UcmdT {
+        UcmdT { uc_name: Some(name.to_vec()), ..UcmdT::default() }
+    }
+
+    /// Installs a current window over a buffer holding `buf_cmds`, and
+    /// `global_cmds` in the global registry.
+    ///
+    /// `curbuf` is set too: `prevwin_curwin` consults `is_in_cmdwin`,
+    /// which dereferences it, so leaving it null faults.
+    fn with_user_commands(
+        buf_cmds: &[&[u8]],
+        global_cmds: &[&[u8]],
+    ) -> (Box<crate::buffer_defs::WinT>, Box<crate::buffer_defs::BufT>) {
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        buf.b_ucmds.items = buf_cmds.iter().map(|n| named(n)).collect();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+
+        unsafe { UCMDS.get_mut() }.items = global_cmds.iter().map(|n| named(n)).collect();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curbuf = std::ptr::from_mut(&mut *buf);
+        g.prevwin = std::ptr::null_mut();
+        (win, buf)
+    }
+
+    /// Buffer-local commands come first, then the global ones, as one
+    /// continuous index sequence.
+    #[test]
+    fn user_commands_list_buffer_local_before_global() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne", b"BufTwo"], &[b"GlobalOne"]);
+
+        assert_eq!(unsafe { get_user_commands(0) }, Some(b"BufOne".to_vec()));
+        assert_eq!(unsafe { get_user_commands(1) }, Some(b"BufTwo".to_vec()));
+        assert_eq!(unsafe { get_user_commands(2) }, Some(b"GlobalOne".to_vec()));
+    }
+
+    #[test]
+    fn user_commands_stop_past_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne"], &[b"GlobalOne"]);
+
+        assert_eq!(unsafe { get_user_commands(2) }, None);
+        assert_eq!(unsafe { get_user_commands(99) }, None);
+    }
+
+    /// A global command overruled by a buffer-local one of the same
+    /// name is reported as an EMPTY name, NOT skipped: the original
+    /// returns `""` so the caller's index numbering stays aligned,
+    /// while the entry contributes nothing to completion. Skipping it
+    /// would shift every later index by one.
+    #[test]
+    fn user_commands_report_an_overruled_global_as_an_empty_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Shared"], &[b"Shared", b"AfterShared"]);
+
+        assert_eq!(unsafe { get_user_commands(0) }, Some(b"Shared".to_vec()));
+        assert_eq!(
+            unsafe { get_user_commands(1) },
+            Some(Vec::new()),
+            "the overruled global is empty, not absent"
+        );
+        assert_eq!(
+            unsafe { get_user_commands(2) },
+            Some(b"AfterShared".to_vec()),
+            "later indices must not shift"
+        );
+    }
+
+    #[test]
+    fn user_commands_are_absent_with_no_commands_defined() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[], &[]);
+        assert_eq!(unsafe { get_user_commands(0) }, None);
+    }
+
+    /// The expansion index is offset past the built-in commands, so
+    /// index `CMD_SIZE` is the FIRST user command.
+    #[test]
+    fn expand_user_command_name_is_offset_past_the_builtins() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne"], &[]);
+
+        let base = crate::ex_cmds_defs::CmdIdxT::SIZE as i32;
+        assert_eq!(
+            unsafe { expand_user_command_name(base) },
+            Some(b"BufOne".to_vec())
+        );
+        assert_eq!(unsafe { expand_user_command_name(base + 1) }, None);
+    }
+
+    #[test]
+    fn ucmds_registry_starts_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        unsafe { UCMDS.get_mut() }.items.clear();
+        assert!(unsafe { UCMDS.get_mut() }.is_empty());
+    }
 
     /// Runs `uc_split_args_iter` to completion, collecting every token
     /// as an owned `Vec<u8>` for easy assertion. Mirrors the real

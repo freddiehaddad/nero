@@ -151,6 +151,31 @@ pub unsafe fn free_cd_dir() {
     unsafe { crate::globals::GLOBALS.get_mut() }.globaldir = None;
 }
 
+/// The name of the command at completion index `idx`, for
+/// `ExpandGeneric()` (`get_command_name`).
+///
+/// Indices below [`crate::ex_cmds_defs::CmdIdxT::SIZE`] name a
+/// built-in command; everything past that runs on into the
+/// user-defined commands, which is why the two tables are numbered as
+/// one continuous sequence.
+///
+/// # Safety
+/// Forwarded from [`crate::usercmd::expand_user_command_name`]'s own
+/// safety doc.
+#[must_use]
+pub unsafe fn get_command_name(idx: i32) -> Option<Vec<u8>> {
+    if idx >= crate::ex_cmds_defs::CmdIdxT::SIZE as i32 {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { crate::usercmd::expand_user_command_name(idx) };
+    }
+    if idx < 0 {
+        return None;
+    }
+    crate::ex_cmds_defs::CMDNAMES
+        .get(idx as usize)
+        .map(|name| name.to_vec())
+}
+
 /// Whether `cmdidx` names a location-list command rather than its
 /// quickfix counterpart (`is_loclist_cmd`).
 ///
@@ -1015,6 +1040,53 @@ pub unsafe fn ex_nohlsearch(_eap: &crate::ex_cmds_defs::ExargT) {
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    // ---- get_command_name ----
+
+    /// Below `CMD_SIZE` the built-in table answers directly.
+    #[test]
+    fn get_command_name_returns_builtin_names_by_index() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(
+            unsafe { get_command_name(CmdIdxT::append as i32) },
+            Some(b"append".to_vec())
+        );
+        assert_eq!(
+            unsafe { get_command_name(CmdIdxT::yank as i32) },
+            Some(b"yank".to_vec())
+        );
+    }
+
+    /// The built-in and user tables are numbered as ONE continuous
+    /// sequence, so the index just past the last built-in is the first
+    /// user command - here there are none, so it reports nothing
+    /// rather than running off the built-in table.
+    #[test]
+    fn get_command_name_runs_on_into_the_user_commands() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (pw, pb) = (g.curwin, g.curbuf);
+        let mut buf = Box::new(BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curbuf = std::ptr::from_mut(&mut *buf);
+
+        assert_eq!(unsafe { get_command_name(CmdIdxT::SIZE as i32) }, None);
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = pw;
+        g.curbuf = pb;
+    }
+
+    #[test]
+    fn get_command_name_rejects_a_negative_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { get_command_name(-1) }, None);
+    }
 
     // ---- get_prevdir / free_cd_dir ----
 

@@ -1026,8 +1026,13 @@ pub struct BufT {
     pub b_maphash: [*mut MapblockT; MAX_MAPHASH as usize],
     /// First abbreviation local to a buffer.
     pub b_first_abbr: *mut MapblockT,
-    /// User commands local to the buffer.
-    pub b_ucmds: GarrayT,
+    /// User commands local to the buffer (`b_ucmds`).
+    ///
+    /// A [`crate::garray_defs::TypedGarrayT`] rather than the
+    /// original's byte-erased `garray_T`, because a
+    /// [`crate::usercmd::UcmdT`] owns its name, replacement text,
+    /// completion argument and description.
+    pub b_ucmds: crate::garray_defs::TypedGarrayT<crate::usercmd::UcmdT>,
     /// start and end of an operator, also used for `'[` and `']`
     pub b_op_start: PosT,
     /// used for `Ins.start_orig`
@@ -1544,7 +1549,7 @@ impl Default for BufT {
             b_chartab: [0; 4],
             b_maphash: [std::ptr::null_mut(); MAX_MAPHASH as usize],
             b_first_abbr: std::ptr::null_mut(),
-            b_ucmds: GarrayT::default(),
+            b_ucmds: crate::garray_defs::TypedGarrayT::default(),
             b_op_start: PosT::default(),
             b_op_start_orig: PosT::default(),
             b_op_end: PosT::default(),
