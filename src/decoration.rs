@@ -37,6 +37,9 @@
 //! `DecorRange` is the type gating most of this file's remaining
 //! functions.
 //!
+//! Also translated: [`sign_item_cmp`], the comparator ordering the
+//! signs shown on one line.
+//!
 //! Deferred: everything else in the file - real virtual-text/
 //! highlight/conceal rendering, needing the marktree query machinery
 //! and decoration-provider Lua callbacks, neither translated.
@@ -185,6 +188,40 @@ pub unsafe fn decor_virt_pos_kind(decor: &DecorRange) -> crate::decoration_defs:
     }
 }
 
+/// Comparator ordering the signs shown on one line (`sign_item_cmp`).
+///
+/// Sorts DESCENDING on all three keys in turn - priority, then id,
+/// then `sign_add_id` - so the highest-priority sign is placed first
+/// and, among equal priorities, the most recently added sign wins.
+/// Note the original's own comparisons are written the "wrong way
+/// round" (`s1 < s2 ? 1 : -1`) precisely to get that descending
+/// order out of `qsort`.
+///
+/// Returns a negative/zero/positive `i32`, matching `qsort`'s own
+/// convention and this crate's established comparator shape (e.g.
+/// `cmdexpand::sort_func_compare`).
+///
+/// # Panics
+/// If either item has no `DecorSignHighlight`. The original
+/// dereferences `sh` unconditionally, so a null there is already a
+/// contract violation; this makes it a loud one.
+#[must_use]
+pub fn sign_item_cmp(s1: &crate::sign_defs::SignItem, s2: &crate::sign_defs::SignItem) -> i32 {
+    let sh1 = s1.sh.as_ref().expect("sign_item_cmp: SignItem without a DecorSignHighlight");
+    let sh2 = s2.sh.as_ref().expect("sign_item_cmp: SignItem without a DecorSignHighlight");
+
+    if sh1.priority != sh2.priority {
+        return if sh1.priority < sh2.priority { 1 } else { -1 };
+    }
+    if s1.id != s2.id {
+        return if s1.id < s2.id { 1 } else { -1 };
+    }
+    if sh1.sign_add_id != sh2.sign_add_id {
+        return if sh1.sign_add_id < sh2.sign_add_id { 1 } else { -1 };
+    }
+    0
+}
+
 /// Called by draw, move and plines code to determine whether a line
 /// is concealed. Scans the marktree for `conceal_line` marks on `row`
 /// and invokes any `_on_conceal_line` decoration provider callbacks,
@@ -316,6 +353,76 @@ mod tests {
             attr_id: 0,
             draw_col: DECOR_DRAW_COL_UNDECIDED,
         }
+    }
+
+    // --- sign_item_cmp ---
+
+    fn sign_item(priority: u16, id: u32, sign_add_id: i32) -> crate::sign_defs::SignItem {
+        crate::sign_defs::SignItem {
+            sh: Some(Box::new(DecorSignHighlight {
+                priority,
+                sign_add_id,
+                ..DecorSignHighlight::default()
+            })),
+            id,
+        }
+    }
+
+    /// Priority is the FIRST key and sorts descending: the
+    /// higher-priority sign must be placed first. An ascending
+    /// comparator returns the opposite sign here.
+    #[test]
+    fn sign_item_cmp_puts_the_higher_priority_sign_first() {
+        let high = sign_item(20, 1, 1);
+        let low = sign_item(10, 1, 1);
+        assert!(sign_item_cmp(&high, &low) < 0);
+        assert!(sign_item_cmp(&low, &high) > 0);
+    }
+
+    /// Id only breaks a priority tie, and also descending.
+    #[test]
+    fn sign_item_cmp_breaks_a_priority_tie_on_the_higher_id() {
+        let newer = sign_item(10, 2, 1);
+        let older = sign_item(10, 1, 1);
+        assert!(sign_item_cmp(&newer, &older) < 0);
+        assert!(sign_item_cmp(&older, &newer) > 0);
+    }
+
+    /// A lower priority must lose even when its id is higher, proving
+    /// the keys are applied in order rather than combined.
+    #[test]
+    fn sign_item_cmp_prefers_priority_over_id() {
+        let high_prio_low_id = sign_item(20, 1, 1);
+        let low_prio_high_id = sign_item(10, 99, 1);
+        assert!(sign_item_cmp(&high_prio_low_id, &low_prio_high_id) < 0);
+    }
+
+    #[test]
+    fn sign_item_cmp_breaks_a_full_tie_on_the_higher_sign_add_id() {
+        let newer = sign_item(10, 1, 5);
+        let older = sign_item(10, 1, 2);
+        assert!(sign_item_cmp(&newer, &older) < 0);
+        assert!(sign_item_cmp(&older, &newer) > 0);
+    }
+
+    #[test]
+    fn sign_item_cmp_is_zero_only_when_all_three_keys_match() {
+        assert_eq!(sign_item_cmp(&sign_item(10, 1, 1), &sign_item(10, 1, 1)), 0);
+    }
+
+    /// Sorting a real list with this comparator must place the signs
+    /// in the order the sign column actually draws them.
+    #[test]
+    fn sign_item_cmp_sorts_a_list_highest_priority_first() {
+        let mut items = [
+            sign_item(10, 1, 1),
+            sign_item(30, 2, 1),
+            sign_item(20, 3, 1),
+        ];
+        items.sort_by(|a, b| sign_item_cmp(a, b).cmp(&0));
+        let priorities: Vec<u16> =
+            items.iter().map(|i| i.sh.as_ref().unwrap().priority).collect();
+        assert_eq!(priorities, vec![30, 20, 10]);
     }
 
     #[test]
