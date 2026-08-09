@@ -45,12 +45,19 @@
 //! entry's own name, which is exactly the per-item freeing the
 //! original's `GA_DEEP_CLEAR` does by hand.
 //!
+//! Also translated: [`alist_name`] (one entry's display name - the
+//! associated buffer's own name if it has one, else the name as
+//! originally given) and [`get_arglist_name`], the `:argument`
+//! completion callback. Both became possible once `al_ga` gained real
+//! item storage; `alist_name` previously lived in `eval/funcs.rs` as a
+//! caller-less helper and now sits with the rest of `arglist.c`.
+//!
 //! Deferred: everything else - `get_arglist`/`alist_expand`/`alist_add`/
 //! `alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/`ex_args`/
 //! `ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing real
 //! buffer/window/path-expansion machinery.
 
-use crate::arglist_defs::AlistT;
+use crate::arglist_defs::{AentryT, AlistT};
 use crate::globals::GlobalCell;
 
 /// This flag is set whenever the argument list is being changed and
@@ -232,10 +239,57 @@ pub fn do_one_arg(str: &mut [u8]) -> usize {
     next
 }
 
+/// Get the display name for one argument-list entry (`alist_name`).
+///
+/// The associated buffer's own name if it has one, else the name as
+/// originally given. The buffer's name wins because `:cd` can change
+/// what a relative argument resolves to, while the buffer holds the
+/// already-expanded path.
+///
+/// # Safety
+/// Forwarded from [`crate::buffer::buflist_findnr`]'s own safety doc.
+#[must_use]
+pub unsafe fn alist_name(aep: &AentryT) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let bp = unsafe { crate::buffer::buflist_findnr(aep.ae_fnum) };
+    if bp.is_null() {
+        return aep.ae_fname.clone();
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    match &unsafe { &*bp }.b_fname {
+        Some(name) => name.clone(),
+        None => aep.ae_fname.clone(),
+    }
+}
+
+/// The `idx`'th argument-list name, for `:argument` completion
+/// (`get_arglist_name`).
+///
+/// Returns `None` past the end, which is how `ExpandGeneric()` learns
+/// to stop.
+///
+/// The original reads the CURRENT window's arglist through the
+/// `ARGLIST`/`ARGCOUNT` macros; that window is passed explicitly here
+/// rather than reached through a global.
+///
+/// # Safety
+/// `wp.w_alist` must be a valid, live `AlistT` pointer, and
+/// forwarded from [`alist_name`]'s own safety doc.
+#[must_use]
+pub unsafe fn get_arglist_name(wp: &crate::buffer_defs::WinT, idx: i32) -> Option<Vec<u8>> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let al = unsafe { &*wp.w_alist };
+    // The original's `idx >= ARGCOUNT` check; `get` additionally
+    // rejects a negative index, which the original would turn into a
+    // wild pointer read.
+    let aep = al.al_ga.get(idx)?;
+    // SAFETY: forwarded from this function's own safety doc.
+    Some(unsafe { alist_name(aep) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arglist_defs::AentryT;
 
     /// RAII guard resetting `ARGLIST_LOCKED` to its default (`false`)
     /// when dropped, so a test that locks it can't leak that state into
@@ -303,6 +357,74 @@ mod tests {
         assert!(check_arglist_locked().is_ok());
         let _guard = lock_arglist();
         assert!(check_arglist_locked().is_err());
+    }
+
+    // --- alist_name / get_arglist_name ---
+
+    /// Builds a window whose arglist holds `n` real entries. The
+    /// `AlistT` is boxed because its address goes into `w_alist`.
+    ///
+    /// Buffer numbers are deliberately NONZERO and unmatched: zero is
+    /// a special value meaning "the current window's alternate file",
+    /// which would send `buflist_findnr` through `curwin` instead of
+    /// simply finding no buffer.
+    fn win_with_arglist(
+        n: usize,
+    ) -> (Box<crate::buffer_defs::WinT>, Box<AlistT>) {
+        let mut al = Box::new(AlistT::default());
+        al.al_ga.items = (0..n)
+            .map(|i| AentryT {
+                ae_fname: format!("file{i}.txt").into_bytes(),
+                ae_fnum: i32::try_from(i).unwrap() + 1000,
+            })
+            .collect();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_alist = std::ptr::from_mut(&mut *al);
+        (win, al)
+    }
+
+    /// With no buffer of that number, the name as originally given is
+    /// what comes back.
+    #[test]
+    fn alist_name_falls_back_to_the_name_as_given() {
+        let _lock = crate::globals::global_state_test_lock();
+        let aep = AentryT { ae_fname: b"as/given.txt".to_vec(), ae_fnum: 1000 };
+        assert_eq!(unsafe { alist_name(&aep) }, b"as/given.txt");
+    }
+
+    #[test]
+    fn get_arglist_name_reports_each_entry_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (win, _al) = win_with_arglist(3);
+        assert_eq!(unsafe { get_arglist_name(&win, 0) }, Some(b"file0.txt".to_vec()));
+        assert_eq!(unsafe { get_arglist_name(&win, 1) }, Some(b"file1.txt".to_vec()));
+        assert_eq!(unsafe { get_arglist_name(&win, 2) }, Some(b"file2.txt".to_vec()));
+    }
+
+    /// Past the end there is nothing, which is how `ExpandGeneric()`
+    /// learns to stop.
+    #[test]
+    fn get_arglist_name_stops_past_the_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (win, _al) = win_with_arglist(2);
+        assert_eq!(unsafe { get_arglist_name(&win, 2) }, None);
+        assert_eq!(unsafe { get_arglist_name(&win, 99) }, None);
+    }
+
+    /// A negative index must not wrap into a huge `usize` and read
+    /// wildly - the original would index the array with it directly.
+    #[test]
+    fn get_arglist_name_rejects_a_negative_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (win, _al) = win_with_arglist(3);
+        assert_eq!(unsafe { get_arglist_name(&win, -1) }, None);
+    }
+
+    #[test]
+    fn get_arglist_name_is_empty_for_an_empty_arglist() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (win, _al) = win_with_arglist(0);
+        assert_eq!(unsafe { get_arglist_name(&win, 0) }, None);
     }
 
     #[test]

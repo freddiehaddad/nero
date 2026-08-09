@@ -7508,25 +7508,6 @@ unsafe fn f_arglistid(argvars: &[TypvalT], rettv: &mut TypvalT) {
     });
 }
 
-/// Get the display name for one argument-list entry (`alist_name`,
-/// `arglist.c`) - the associated buffer's own name if it has one, else
-/// the name as originally given.
-///
-/// # Safety
-/// Forwarded from [`crate::buffer::buflist_findnr`]'s own safety doc.
-unsafe fn alist_name(aep: &crate::arglist_defs::AentryT) -> Vec<u8> {
-    // SAFETY: forwarded from this function's own safety doc.
-    let bp = unsafe { crate::buffer::buflist_findnr(aep.ae_fnum) };
-    if bp.is_null() {
-        return aep.ae_fname.clone();
-    }
-    // SAFETY: forwarded from this function's own safety doc.
-    match &unsafe { &*bp }.b_fname {
-        Some(name) => name.clone(),
-        None => aep.ae_fname.clone(),
-    }
-}
-
 /// Build the `List` of argument-list file names `argv()` (with no
 /// `{nr}` given) returns (`get_arglist_as_rettv`, `arglist.c`).
 ///
@@ -7555,7 +7536,7 @@ unsafe fn get_arglist_as_rettv(
             break;
         };
         // SAFETY: forwarded from this function's own safety doc.
-        let name = unsafe { alist_name(aep) };
+        let name = unsafe { crate::arglist::alist_name(aep) };
         // SAFETY: `l` was freshly allocated just above.
         unsafe { crate::eval::typval::tv_list_append_string(l, Some(&name)) };
     }
@@ -7623,7 +7604,7 @@ unsafe fn f_argv(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         if let Some(aep) = unsafe { &*arglist }.al_ga.get(idx) {
             // SAFETY: forwarded from this function's own safety doc.
-            rettv.value = TypvalValue::String(Some(unsafe { alist_name(aep) }));
+            rettv.value = TypvalValue::String(Some(unsafe { crate::arglist::alist_name(aep) }));
         }
     } else if idx == -1 {
         // SAFETY: forwarded from this function's own safety doc.
@@ -17282,12 +17263,17 @@ mod tests {
 
     /// Builds an arglist holding `n` real entries, each owning its own
     /// file name.
+    ///
+    /// Buffer numbers are deliberately NONZERO and unmatched: zero is
+    /// a special value meaning "the current window's alternate file",
+    /// which would send `buflist_findnr` through `curwin` rather than
+    /// simply finding no buffer.
     fn alist_with(n: usize) -> crate::arglist_defs::AlistT {
         let mut al = crate::arglist_defs::AlistT::default();
         al.al_ga.items = (0..n)
             .map(|i| crate::arglist_defs::AentryT {
                 ae_fname: format!("file{i}.txt").into_bytes(),
-                ae_fnum: 0,
+                ae_fnum: i32::try_from(i).unwrap() + 1000,
             })
             .collect();
         al
