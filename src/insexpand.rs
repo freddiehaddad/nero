@@ -174,6 +174,167 @@ pub const CPT_INFO: i32 = 3;
 /// Number of `CPT_*` entries (`CPT_COUNT`).
 pub const CPT_COUNT: i32 = 4;
 
+/// Flags on a completion match (`cp_flags_T`).
+pub mod cp_flags {
+    /// the original text, from when the expansion began
+    /// (`CP_ORIGINAL_TEXT`).
+    pub const ORIGINAL_TEXT: i32 = 1;
+    /// `cp_fname` is allocated (`CP_FREE_FNAME`).
+    pub const FREE_FNAME: i32 = 2;
+    /// use `CONT_S_IPOS` for `compl_cont_status` (`CP_CONT_S_IPOS`).
+    pub const CONT_S_IPOS: i32 = 4;
+    /// `ins_compl_equal()` always returns true (`CP_EQUAL`).
+    pub const EQUAL: i32 = 8;
+    /// `ins_compl_equal` ignores case (`CP_ICASE`).
+    pub const ICASE: i32 = 16;
+    /// use `fast_breakcheck` instead of `os_breakcheck` (`CP_FAST`).
+    pub const FAST: i32 = 32;
+}
+
+/// One Insert-mode completion match (`compl_T`/`struct compl_S`).
+///
+/// The matches form an intrusive, circular doubly-linked list, so
+/// `cp_next`/`cp_prev`/`cp_match_next` stay raw pointers - this
+/// crate's convention for intrusive lists, and the same treatment
+/// already given to the buffer and window chains.
+///
+/// The owned text fields become owned `Option<Vec<u8>>`. Note
+/// `cp_fname` is owned only when `cp_flags` has
+/// [`cp_flags::FREE_FNAME`]; modelling it as owned regardless is
+/// safe because the borrowed case merely copies a little more, and
+/// there is no way to express "sometimes borrowed" here without
+/// tying every match's lifetime to the source that produced it.
+#[derive(Debug)]
+pub struct ComplT {
+    pub cp_next: *mut ComplT,
+    pub cp_prev: *mut ComplT,
+    /// matched next `ComplT` (`cp_match_next`).
+    pub cp_match_next: *mut ComplT,
+    /// matched text (`cp_str`).
+    pub cp_str: Option<Vec<u8>>,
+    /// text for the menu, indexed by the `CPT_*` constants
+    /// (`cp_text`).
+    pub cp_text: [Option<Vec<u8>>; CPT_COUNT as usize],
+    pub cp_user_data: crate::eval::typval_defs::TypvalT,
+    /// file containing the match (`cp_fname`).
+    pub cp_fname: Option<Vec<u8>>,
+    /// commit characters; may be absent (`cp_commit_chars`).
+    pub cp_commit_chars: Option<Vec<u8>>,
+    /// [`cp_flags`] values (`cp_flags`).
+    pub cp_flags: i32,
+    /// sequence number (`cp_number`).
+    pub cp_number: i32,
+    /// preselect item (`cp_preselect`).
+    pub cp_preselect: bool,
+    /// fuzzy match score or proximity score (`cp_score`).
+    pub cp_score: i32,
+    /// collected by `compl_match_array` (`cp_in_match_array`).
+    pub cp_in_match_array: bool,
+    /// highlight attribute for abbr (`cp_user_abbr_hlattr`).
+    pub cp_user_abbr_hlattr: i32,
+    /// highlight attribute for kind (`cp_user_kind_hlattr`).
+    pub cp_user_kind_hlattr: i32,
+    /// index of this match's source in `'complete'`
+    /// (`cp_cpt_source_idx`).
+    pub cp_cpt_source_idx: i32,
+}
+
+impl Default for ComplT {
+    fn default() -> Self {
+        ComplT {
+            cp_next: std::ptr::null_mut(),
+            cp_prev: std::ptr::null_mut(),
+            cp_match_next: std::ptr::null_mut(),
+            cp_str: None,
+            cp_text: [None, None, None, None],
+            cp_user_data: crate::eval::typval_defs::TypvalT::default(),
+            cp_fname: None,
+            cp_commit_chars: None,
+            cp_flags: 0,
+            cp_number: 0,
+            cp_preselect: false,
+            cp_score: 0,
+            cp_in_match_array: false,
+            cp_user_abbr_hlattr: 0,
+            cp_user_kind_hlattr: 0,
+            cp_cpt_source_idx: 0,
+        }
+    }
+}
+
+/// Whether `match` is the original text, from before the expansion
+/// began (`match_at_original_text`).
+#[must_use]
+pub fn match_at_original_text(m: &ComplT) -> bool {
+    m.cp_flags & cp_flags::ORIGINAL_TEXT != 0
+}
+
+/// The next match in the list (`cp_get_next`).
+#[must_use]
+pub fn cp_get_next(m: &ComplT) -> *mut ComplT {
+    m.cp_next
+}
+
+/// Link `next` after `m` (`cp_set_next`).
+pub fn cp_set_next(m: &mut ComplT, next: *mut ComplT) {
+    m.cp_next = next;
+}
+
+/// The previous match in the list (`cp_get_prev`).
+#[must_use]
+pub fn cp_get_prev(m: &ComplT) -> *mut ComplT {
+    m.cp_prev
+}
+
+/// Link `prev` before `m` (`cp_set_prev`).
+pub fn cp_set_prev(m: &mut ComplT, prev: *mut ComplT) {
+    m.cp_prev = prev;
+}
+
+/// Comparator ordering fuzzy-completion matches (`cp_compare_fuzzy`).
+///
+/// DESCENDING by score, so the best fuzzy match comes first. Note the
+/// original writes its comparisons against `b` first, which is what
+/// produces that descending order out of `qsort`.
+///
+/// Returns a negative/zero/positive `i32`, matching `qsort`'s own
+/// convention and this crate's established comparator shape.
+#[must_use]
+pub fn cp_compare_fuzzy(a: &ComplT, b: &ComplT) -> i32 {
+    if b.cp_score > a.cp_score {
+        1
+    } else if b.cp_score < a.cp_score {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Comparator ordering matches by proximity (`cp_compare_nearest`).
+///
+/// ASCENDING by score - the opposite of [`cp_compare_fuzzy`] - so the
+/// nearest match comes first.
+///
+/// A match with no score at all
+/// ([`crate::fuzzy::FUZZY_SCORE_NONE`]) compares EQUAL to everything,
+/// which leaves such entries where they already are rather than
+/// sorting them to one end.
+#[must_use]
+pub fn cp_compare_nearest(a: &ComplT, b: &ComplT) -> i32 {
+    if a.cp_score == crate::fuzzy::FUZZY_SCORE_NONE
+        || b.cp_score == crate::fuzzy::FUZZY_SCORE_NONE
+    {
+        return 0;
+    }
+    if a.cp_score > b.cp_score {
+        1
+    } else if a.cp_score < b.cp_score {
+        -1
+    } else {
+        0
+    }
+}
+
 /// Which Ctrl-X mode are we in? (`ctrl_x_mode`). Always
 /// [`CTRL_X_NORMAL`] today - see this module's own doc comment.
 static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
@@ -1068,6 +1229,104 @@ pub unsafe fn set_ref_in_insexpand_funcs(copy_id: i32) -> bool {
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    // ---- ComplT accessors and comparators ----
+
+    fn scored(score: i32) -> ComplT {
+        ComplT { cp_score: score, ..ComplT::default() }
+    }
+
+    #[test]
+    fn match_at_original_text_reads_only_its_own_flag() {
+        let plain = ComplT::default();
+        assert!(!match_at_original_text(&plain));
+
+        let original = ComplT { cp_flags: cp_flags::ORIGINAL_TEXT, ..ComplT::default() };
+        assert!(match_at_original_text(&original));
+
+        // Another flag set on its own must not be mistaken for it.
+        let other = ComplT { cp_flags: cp_flags::ICASE | cp_flags::FAST, ..ComplT::default() };
+        assert!(!match_at_original_text(&other));
+
+        // ...and it is still detected alongside other flags.
+        let both = ComplT {
+            cp_flags: cp_flags::ORIGINAL_TEXT | cp_flags::ICASE,
+            ..ComplT::default()
+        };
+        assert!(match_at_original_text(&both));
+    }
+
+    #[test]
+    fn cp_link_accessors_round_trip() {
+        let mut a = ComplT::default();
+        let mut b = ComplT::default();
+        let b_ptr = std::ptr::from_mut(&mut b);
+
+        assert!(cp_get_next(&a).is_null());
+        assert!(cp_get_prev(&a).is_null());
+
+        cp_set_next(&mut a, b_ptr);
+        cp_set_prev(&mut a, b_ptr);
+        assert_eq!(cp_get_next(&a), b_ptr);
+        assert_eq!(cp_get_prev(&a), b_ptr);
+    }
+
+    /// Fuzzy ordering is DESCENDING: the best match sorts first.
+    #[test]
+    fn cp_compare_fuzzy_puts_the_higher_score_first() {
+        let high = scored(100);
+        let low = scored(10);
+        assert!(cp_compare_fuzzy(&high, &low) < 0);
+        assert!(cp_compare_fuzzy(&low, &high) > 0);
+        assert_eq!(cp_compare_fuzzy(&scored(5), &scored(5)), 0);
+    }
+
+    /// Proximity ordering is ASCENDING - the exact OPPOSITE of the
+    /// fuzzy comparator. Sharing one direction between the two would
+    /// break one of them, so this asserts they genuinely disagree on
+    /// the same pair.
+    #[test]
+    fn cp_compare_nearest_puts_the_lower_score_first() {
+        let near = scored(1);
+        let far = scored(50);
+        assert!(cp_compare_nearest(&near, &far) < 0);
+        assert!(cp_compare_nearest(&far, &near) > 0);
+        assert_eq!(cp_compare_nearest(&scored(7), &scored(7)), 0);
+
+        // The two comparators disagree on the same pair, by design.
+        assert!(
+            cp_compare_nearest(&near, &far).signum() != cp_compare_fuzzy(&near, &far).signum()
+        );
+    }
+
+    /// An unscored match compares EQUAL to everything, leaving it
+    /// where it is rather than sorting it to one end. Since
+    /// `FUZZY_SCORE_NONE` is `i32::MIN`, a comparator missing this
+    /// check would sort such entries to the very front.
+    #[test]
+    fn cp_compare_nearest_treats_an_unscored_match_as_equal() {
+        let none = scored(crate::fuzzy::FUZZY_SCORE_NONE);
+        let real = scored(50);
+        assert_eq!(cp_compare_nearest(&none, &real), 0);
+        assert_eq!(cp_compare_nearest(&real, &none), 0);
+        assert_eq!(cp_compare_nearest(&none, &none), 0);
+    }
+
+    #[test]
+    fn cp_compare_fuzzy_sorts_a_list_best_first() {
+        let mut items = [scored(10), scored(90), scored(50)];
+        items.sort_by(|a, b| cp_compare_fuzzy(a, b).cmp(&0));
+        let scores: Vec<i32> = items.iter().map(|m| m.cp_score).collect();
+        assert_eq!(scores, vec![90, 50, 10]);
+    }
+
+    #[test]
+    fn cp_compare_nearest_sorts_a_list_closest_first() {
+        let mut items = [scored(10), scored(90), scored(50)];
+        items.sort_by(|a, b| cp_compare_nearest(a, b).cmp(&0));
+        let scores: Vec<i32> = items.iter().map(|m| m.cp_score).collect();
+        assert_eq!(scores, vec![10, 50, 90]);
+    }
 
     /// RAII guard temporarily overriding `CTRL_X_MODE`, restoring the
     /// previous value on drop (even on test panic).
