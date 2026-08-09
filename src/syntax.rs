@@ -67,6 +67,39 @@ pub unsafe fn syn_getcurline_len() -> crate::pos_defs::ColnrT {
     unsafe { crate::memline::ml_get_buf_len(&mut *buf, lnum) }
 }
 
+/// Split a `:syntax` argument into its group NAME and the rest
+/// (`get_group_name`).
+///
+/// Returns `(name_end, rest)`, both byte offsets into `arg`:
+/// `name_end` is just past the group name, and `rest` is the first
+/// argument after it. `None` means there were not enough arguments.
+///
+/// The original writes `name_end` through an out-parameter and
+/// returns `rest`; returning both is this crate's convention. Note
+/// `name_end` is still meaningful to the caller when this returns
+/// `None`, but the original leaves it written in that case too, so
+/// nothing is lost by only returning it on success - no caller reads
+/// it after a failure.
+///
+/// The emptiness test deliberately checks for a NUL rather than for
+/// the end of a command: the first argument may be a pattern, in
+/// which case `|` is a legitimate part of it and must not terminate
+/// the scan.
+#[must_use]
+pub fn get_group_name(arg: &[u8]) -> Option<(usize, usize)> {
+    let name_end = crate::charset::skiptowhite(arg);
+    let rest = name_end + crate::charset::skipwhite(&arg[name_end.min(arg.len())..]);
+
+    // Check if there are enough arguments. The first argument may be
+    // a pattern, where '|' is allowed, so only check for NUL.
+    let first = arg.first().copied().unwrap_or(0);
+    let at_rest = arg.get(rest).copied().unwrap_or(0);
+    if crate::ex_docmd::ends_excmd(first) || at_rest == 0 {
+        return None;
+    }
+    Some((name_end, rest))
+}
+
 /// Clamp `pos` so it does not run past `limit` (`limit_pos`).
 ///
 /// A position on a LATER line is pulled back to `limit` entirely -
@@ -192,6 +225,59 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- get_group_name ----
+
+    #[test]
+    fn get_group_name_splits_the_name_from_the_rest() {
+        let arg = b"myGroup keyword foo";
+        let (name_end, rest) = get_group_name(arg).expect("two arguments given");
+        assert_eq!(&arg[..name_end], b"myGroup");
+        assert_eq!(&arg[rest..], b"keyword foo");
+    }
+
+    #[test]
+    fn get_group_name_skips_extra_whitespace_before_the_rest() {
+        let arg = b"myGroup   \t keyword";
+        let (name_end, rest) = get_group_name(arg).expect("two arguments given");
+        assert_eq!(&arg[..name_end], b"myGroup");
+        assert_eq!(&arg[rest..], b"keyword");
+    }
+
+    /// A name with nothing after it is not enough arguments.
+    #[test]
+    fn get_group_name_rejects_a_lone_group_name() {
+        assert_eq!(get_group_name(b"myGroup"), None);
+        assert_eq!(get_group_name(b"myGroup   "), None);
+    }
+
+    /// An argument that starts by ending the command has no name at
+    /// all.
+    #[test]
+    fn get_group_name_rejects_an_empty_argument() {
+        assert_eq!(get_group_name(b""), None);
+        assert_eq!(get_group_name(b"\" a comment"), None);
+    }
+
+    /// A `|` is a legitimate part of a syntax PATTERN, so it must not
+    /// terminate the scan even though it ends an Ex command
+    /// elsewhere. The original checks the rest for NUL specifically
+    /// for this reason; using `ends_excmd` on the rest instead would
+    /// wrongly reject this.
+    #[test]
+    fn get_group_name_accepts_a_pattern_containing_a_bar() {
+        let arg = b"myGroup /a\\|b/";
+        let (name_end, rest) = get_group_name(arg).expect("a bar is part of the pattern");
+        assert_eq!(&arg[..name_end], b"myGroup");
+        assert_eq!(&arg[rest..], b"/a\\|b/");
+    }
+
+    /// ...but a `|` as the very FIRST character still ends the
+    /// command, since that check is on `arg` rather than on the rest.
+    #[test]
+    fn get_group_name_rejects_a_leading_bar() {
+        assert_eq!(get_group_name(b"| next"), None);
     }
 
     fn lpos(lnum: crate::pos_defs::LinenrT, col: crate::pos_defs::ColnrT) -> LposT {
