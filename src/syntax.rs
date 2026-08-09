@@ -439,6 +439,28 @@ pub fn limit_pos(pos: &mut LposT, limit: &LposT) {
     }
 }
 
+/// Reset one syntax item's timing counters (`syn_clear_time`).
+pub fn syn_clear_time(st: &mut crate::buffer_defs::SynTimeT) {
+    st.total = crate::profile::profile_zero();
+    st.slowest = crate::profile::profile_zero();
+    st.count = 0;
+    st.match_ = 0;
+}
+
+/// Clamp `pos` so it does not run past `limit`, treating a zero line
+/// number as "unset" (`limit_pos_zero`).
+///
+/// An unset position adopts `limit` wholesale rather than being
+/// clamped, since line 0 would otherwise always compare as earlier
+/// than `limit` and so be left alone by [`limit_pos`].
+pub fn limit_pos_zero(pos: &mut LposT, limit: &LposT) {
+    if pos.lnum == 0 {
+        *pos = *limit;
+    } else {
+        limit_pos(pos, limit);
+    }
+}
+
 /// Comparator ordering two syntax cluster ids ascending
 /// (`syn_compare_stub`).
 ///
@@ -549,6 +571,57 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- limit_pos_zero / syn_clear_time ----
+
+    /// An unset position (line 0) adopts the limit wholesale. Plain
+    /// `limit_pos` would leave it alone, since line 0 always compares
+    /// as earlier.
+    #[test]
+    fn limit_pos_zero_adopts_the_limit_for_an_unset_position() {
+        let limit = LposT { lnum: 7, col: 3 };
+        let mut pos = LposT { lnum: 0, col: 99 };
+        limit_pos_zero(&mut pos, &limit);
+        assert_eq!((pos.lnum, pos.col), (7, 3));
+
+        // Contrast: limit_pos leaves the same position untouched.
+        let mut plain = LposT { lnum: 0, col: 99 };
+        limit_pos(&mut plain, &limit);
+        assert_eq!((plain.lnum, plain.col), (0, 99));
+    }
+
+    /// With a set line number it behaves exactly like `limit_pos`.
+    #[test]
+    fn limit_pos_zero_defers_to_limit_pos_for_a_set_position() {
+        let limit = LposT { lnum: 7, col: 3 };
+
+        let mut later = LposT { lnum: 9, col: 1 };
+        limit_pos_zero(&mut later, &limit);
+        assert_eq!((later.lnum, later.col), (7, 3), "later line pulled back");
+
+        let mut same = LposT { lnum: 7, col: 8 };
+        limit_pos_zero(&mut same, &limit);
+        assert_eq!((same.lnum, same.col), (7, 3), "same line, column clamped");
+
+        let mut earlier = LposT { lnum: 2, col: 99 };
+        limit_pos_zero(&mut earlier, &limit);
+        assert_eq!((earlier.lnum, earlier.col), (2, 99), "earlier line untouched");
+    }
+
+    #[test]
+    fn syn_clear_time_resets_every_counter() {
+        let mut st = crate::buffer_defs::SynTimeT {
+            total: 1234,
+            slowest: 567,
+            count: 89,
+            match_: 10,
+        };
+        syn_clear_time(&mut st);
+        assert_eq!(st.total, crate::profile::profile_zero());
+        assert_eq!(st.slowest, crate::profile::profile_zero());
+        assert_eq!(st.count, 0);
+        assert_eq!(st.match_, 0);
     }
 
     // ---- syn_incl_toplevel ----
