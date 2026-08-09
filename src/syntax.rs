@@ -77,6 +77,87 @@ pub const SYNID_CLUSTER: i32 = 23000;
 /// (`MAX_CLUSTER_ID`).
 pub const MAX_CLUSTER_ID: i32 = 32767 - SYNID_CLUSTER;
 
+/// Per-syntax-item flags (the `HL_*` group in `syntax.h`).
+///
+/// These are OR'd together into a single `int`, so they are plain
+/// constants in a module rather than an enum - matching the
+/// `opt_flags`/`xp_bs` precedent already used in this crate for the
+/// original's other bit-flag groups.
+pub mod hl_flags {
+    /// not used on toplevel (`HL_CONTAINED`).
+    pub const CONTAINED: i32 = 0x01;
+    /// has no highlighting (`HL_TRANSP`).
+    pub const TRANSP: i32 = 0x02;
+    /// match within one line only (`HL_ONELINE`).
+    pub const ONELINE: i32 = 0x04;
+    /// end pattern that matches with `$` (`HL_HAS_EOL`).
+    pub const HAS_EOL: i32 = 0x08;
+    /// sync point after this item, syncing only (`HL_SYNC_HERE`).
+    pub const SYNC_HERE: i32 = 0x10;
+    /// sync point at current line, syncing only (`HL_SYNC_THERE`).
+    pub const SYNC_THERE: i32 = 0x20;
+    /// use match ID instead of item ID (`HL_MATCH`).
+    pub const MATCH: i32 = 0x40;
+    /// nextgroup can skip newlines (`HL_SKIPNL`).
+    pub const SKIPNL: i32 = 0x80;
+    /// nextgroup can skip white space (`HL_SKIPWHITE`).
+    pub const SKIPWHITE: i32 = 0x100;
+    /// nextgroup can skip empty lines (`HL_SKIPEMPTY`).
+    pub const SKIPEMPTY: i32 = 0x200;
+    /// end match always kept (`HL_KEEPEND`).
+    pub const KEEPEND: i32 = 0x400;
+    /// exclude NL from match (`HL_EXCLUDENL`).
+    pub const EXCLUDENL: i32 = 0x800;
+    /// only used for displaying, not syncing (`HL_DISPLAY`).
+    pub const DISPLAY: i32 = 0x1000;
+    /// define fold (`HL_FOLD`).
+    pub const FOLD: i32 = 0x2000;
+    /// ignore a keepend (`HL_EXTEND`).
+    pub const EXTEND: i32 = 0x4000;
+    /// match continued from previous line (`HL_MATCHCONT`).
+    pub const MATCHCONT: i32 = 0x8000;
+    /// transparent item without contains arg (`HL_TRANS_CONT`).
+    pub const TRANS_CONT: i32 = 0x10000;
+    /// can be concealed (`HL_CONCEAL`).
+    pub const CONCEAL: i32 = 0x20000;
+    /// can be concealed (`HL_CONCEALENDS`).
+    pub const CONCEALENDS: i32 = 0x40000;
+    /// toplevel item in included syntax, allowed by `contains=TOP`
+    /// (`HL_INCLUDED_TOPLEVEL`).
+    pub const INCLUDED_TOPLEVEL: i32 = 0x80000;
+}
+
+/// Adjust a syntax item declared in a `:syn include`d file
+/// (`syn_incl_toplevel`).
+///
+/// Sets the contained flag, and if the item is not already contained,
+/// adds it to the top-level group when there is one.
+///
+/// The original allocates a two-element, zero-terminated list to hand
+/// to `syn_combine_list` (which then frees it); a one-element `Vec`
+/// carries the same content, since this crate's group-id lists are
+/// length-bounded rather than zero-terminated.
+///
+/// # Safety
+/// `GLOBALS.curwin` must be valid and non-null, as must its `w_s`
+/// syntax block.
+pub unsafe fn syn_incl_toplevel(id: i32, flagsp: &mut i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let block = unsafe { &mut *(*crate::globals::GLOBALS.get_mut().curwin).w_s };
+
+    if (*flagsp & hl_flags::CONTAINED) != 0 || block.b_syn_topgrp == 0 {
+        return;
+    }
+    *flagsp |= hl_flags::CONTAINED | hl_flags::INCLUDED_TOPLEVEL;
+
+    if block.b_syn_topgrp >= SYNID_CLUSTER {
+        let tlg_id = (block.b_syn_topgrp - SYNID_CLUSTER) as usize;
+        let mut list = std::mem::take(&mut block.b_syn_clusters.items[tlg_id].scl_list);
+        syn_combine_list(&mut list, vec![id as i16], ClusterOp::Add);
+        block.b_syn_clusters.items[tlg_id].scl_list = list;
+    }
+}
+
 /// Find a syntax cluster by name and return its group ID, or `0` when
 /// there is none (`syn_scl_name2id`).
 ///
@@ -468,6 +549,107 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- syn_incl_toplevel ----
+
+    #[test]
+    fn syn_incl_toplevel_does_nothing_for_an_already_contained_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"top"]);
+        fx.block_mut().b_syn_topgrp = SYNID_CLUSTER;
+
+        let mut flags = hl_flags::CONTAINED | hl_flags::FOLD;
+        unsafe { syn_incl_toplevel(42, &mut flags) };
+
+        assert_eq!(flags, hl_flags::CONTAINED | hl_flags::FOLD, "flags untouched");
+        assert!(
+            fx.block().b_syn_clusters.get(0).unwrap().scl_list.is_empty(),
+            "no group added"
+        );
+    }
+
+    #[test]
+    fn syn_incl_toplevel_does_nothing_without_a_top_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"top"]);
+        fx.block_mut().b_syn_topgrp = 0;
+
+        let mut flags = 0;
+        unsafe { syn_incl_toplevel(42, &mut flags) };
+
+        assert_eq!(flags, 0);
+        assert!(fx.block().b_syn_clusters.get(0).unwrap().scl_list.is_empty());
+    }
+
+    /// A top group below `SYNID_CLUSTER` is a plain highlight group,
+    /// not a cluster, so the flags are set but no list is touched.
+    #[test]
+    fn syn_incl_toplevel_sets_flags_only_for_a_non_cluster_top_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"top"]);
+        fx.block_mut().b_syn_topgrp = SYNID_TOP;
+
+        let mut flags = 0;
+        unsafe { syn_incl_toplevel(42, &mut flags) };
+
+        assert_eq!(flags, hl_flags::CONTAINED | hl_flags::INCLUDED_TOPLEVEL);
+        assert!(fx.block().b_syn_clusters.get(0).unwrap().scl_list.is_empty());
+    }
+
+    /// The real path: the item is added to the top-level cluster's own
+    /// group list, and the flags are set.
+    #[test]
+    fn syn_incl_toplevel_adds_the_item_to_the_top_cluster() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"zero", b"top"]);
+        // The second cluster is the top group.
+        fx.block_mut().b_syn_topgrp = SYNID_CLUSTER + 1;
+
+        let mut flags = hl_flags::FOLD;
+        unsafe { syn_incl_toplevel(42, &mut flags) };
+
+        assert_eq!(
+            flags,
+            hl_flags::FOLD | hl_flags::CONTAINED | hl_flags::INCLUDED_TOPLEVEL
+        );
+        let block = fx.block();
+        assert_eq!(block.b_syn_clusters.get(1).unwrap().scl_list, vec![42]);
+        // The other cluster is left alone.
+        assert!(block.b_syn_clusters.get(0).unwrap().scl_list.is_empty());
+    }
+
+    /// Adding merges into whatever the cluster already held, keeping
+    /// it sorted and free of duplicates.
+    #[test]
+    fn syn_incl_toplevel_merges_into_an_existing_group_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[b"top"]);
+        fx.block_mut().b_syn_topgrp = SYNID_CLUSTER;
+        fx.block_mut().b_syn_clusters.items[0].scl_list = vec![10, 50];
+
+        let mut flags = 0;
+        unsafe { syn_incl_toplevel(42, &mut flags) };
+        assert_eq!(fx.block().b_syn_clusters.get(0).unwrap().scl_list, vec![10, 42, 50]);
+
+        // Adding the same id again does not duplicate it.
+        let mut flags2 = 0;
+        unsafe { syn_incl_toplevel(42, &mut flags2) };
+        assert_eq!(fx.block().b_syn_clusters.get(0).unwrap().scl_list, vec![10, 42, 50]);
+    }
+
+    #[test]
+    fn hl_flag_values_match_the_original() {
+        // Spot-check the ends and a few in between; each is a
+        // distinct single bit.
+        assert_eq!(hl_flags::CONTAINED, 0x01);
+        assert_eq!(hl_flags::TRANSP, 0x02);
+        assert_eq!(hl_flags::MATCH, 0x40);
+        assert_eq!(hl_flags::KEEPEND, 0x400);
+        assert_eq!(hl_flags::FOLD, 0x2000);
+        assert_eq!(hl_flags::TRANS_CONT, 0x1_0000);
+        assert_eq!(hl_flags::CONCEALENDS, 0x4_0000);
+        assert_eq!(hl_flags::INCLUDED_TOPLEVEL, 0x8_0000);
     }
 
     // ---- syn_combine_list ----
