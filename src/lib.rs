@@ -144,6 +144,7 @@ pub mod statusline_defs;
 pub mod strings;
 pub mod syntax;
 pub mod tag;
+pub mod terminal;
 pub mod testing;
 pub mod textformat;
 pub mod textobject;
