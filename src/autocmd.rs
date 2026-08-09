@@ -181,6 +181,50 @@ pub fn has_cursorhold() -> bool {
     has_event(if normal_busy { EventT::CursorHold } else { EventT::CursorHoldI })
 }
 
+/// `did_cursorhold` - set once a `CursorHold` has been triggered, so
+/// it does not fire repeatedly without intervening input.
+///
+/// Starts `true`, matching the original's own
+/// `INIT( = true)` - NOT the `false` a zero-initialized `bool` would
+/// give. That means no `CursorHold` can fire until something has
+/// cleared it (the input/normal/insert loops, none translated), which
+/// is why [`trigger_cursorhold`] is always `false` today.
+pub static DID_CURSORHOLD: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(true);
+
+/// Whether a `CursorHold` autocommand should be triggered right now
+/// (`trigger_cursorhold`).
+///
+/// Every condition must hold: the event has not already fired, an
+/// autocommand for the real mode is actually defined, no register is
+/// being recorded into, no typeahead is pending, and insert-mode
+/// completion is not active. Only then, and only in
+/// `MODE_NORMAL_BUSY` or any Insert mode, does it trigger.
+///
+/// # Safety
+/// Touches [`DID_CURSORHOLD`], `crate::globals::GLOBALS`, the
+/// typeahead buffer and the completion state.
+#[must_use]
+pub unsafe fn trigger_cursorhold() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *DID_CURSORHOLD.get_mut() } {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let reg_recording = unsafe { crate::globals::GLOBALS.get_mut() }.reg_recording;
+    // SAFETY: forwarded from this function's own safety doc.
+    if !has_cursorhold()
+        || reg_recording != 0
+        || crate::input::typebuf_len() != 0
+        || unsafe { crate::insexpand::ins_compl_active() }
+    {
+        return false;
+    }
+    let state = crate::state::get_real_state();
+    state == crate::state_defs::mode::NORMAL_BUSY as i32
+        || (state as u32 & crate::state_defs::mode::INSERT) != 0
+}
+
 /// Block executing autocommands until [`unblock_autocmds`] is called
 /// the same number of times (`block_autocmds`).
 pub fn block_autocmds() {
@@ -821,6 +865,137 @@ mod tests {
         fn drop(&mut self) {
             (unsafe { AUTOCMDS.get_mut() })[self.event as usize].clear();
         }
+    }
+
+    // --- trigger_cursorhold ---
+
+    /// Installs a `DID_CURSORHOLD` value and restores it on drop,
+    /// even through a panic.
+    struct DidCursorholdGuard(bool);
+
+    impl DidCursorholdGuard {
+        fn set(v: bool) -> Self {
+            let cell = unsafe { DID_CURSORHOLD.get_mut() };
+            let me = Self(*cell);
+            *cell = v;
+            me
+        }
+    }
+
+    impl Drop for DidCursorholdGuard {
+        fn drop(&mut self) {
+            *unsafe { DID_CURSORHOLD.get_mut() } = self.0;
+        }
+    }
+
+    /// The original's `INIT( = true)` is deliberate, not incidental:
+    /// a zero-initialized `false` would let a CursorHold fire before
+    /// any input had ever been seen.
+    #[test]
+    fn did_cursorhold_starts_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(unsafe { *DID_CURSORHOLD.get_mut() });
+    }
+
+    /// Because `did_cursorhold` starts set and nothing translated yet
+    /// clears it, no CursorHold can currently fire - even with the
+    /// autocommand defined and the mode correct.
+    #[test]
+    fn trigger_cursorhold_is_false_while_already_triggered() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::NORMAL_BUSY as i32;
+
+        let _d = DidCursorholdGuard::set(true);
+        let _e = EventGuard::set(EventT::CursorHold);
+        assert!(!unsafe { trigger_cursorhold() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    #[test]
+    fn trigger_cursorhold_fires_in_normal_busy_mode_once_cleared() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::NORMAL_BUSY as i32;
+
+        let _d = DidCursorholdGuard::set(false);
+        let _e = EventGuard::set(EventT::CursorHold);
+        assert!(unsafe { trigger_cursorhold() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    /// Insert mode is matched by BIT, not by equality, so any Insert
+    /// sub-mode qualifies - and it uses the CursorHoldI event.
+    #[test]
+    fn trigger_cursorhold_fires_in_insert_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::INSERT as i32;
+
+        let _d = DidCursorholdGuard::set(false);
+        let _e = EventGuard::set(EventT::CursorHoldI);
+        assert!(unsafe { trigger_cursorhold() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    /// Recording a register suppresses CursorHold, so a macro records
+    /// only what the user actually typed.
+    #[test]
+    fn trigger_cursorhold_is_suppressed_while_recording_a_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev_state = g.State;
+        let prev_reg = g.reg_recording;
+        g.State = crate::state_defs::mode::NORMAL_BUSY as i32;
+        g.reg_recording = b'q' as i32;
+
+        let _d = DidCursorholdGuard::set(false);
+        let _e = EventGuard::set(EventT::CursorHold);
+        assert!(!unsafe { trigger_cursorhold() });
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.State = prev_state;
+        g.reg_recording = prev_reg;
+    }
+
+    /// A mode with no matching autocommand must not trigger, even
+    /// with everything else satisfied.
+    #[test]
+    fn trigger_cursorhold_is_false_without_a_matching_autocommand() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::NORMAL_BUSY as i32;
+
+        let _d = DidCursorholdGuard::set(false);
+        // Only the INSERT-mode event is defined, but we are in
+        // Normal mode.
+        let _e = EventGuard::set(EventT::CursorHoldI);
+        assert!(!unsafe { trigger_cursorhold() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
+    }
+
+    /// Visual mode is neither NORMAL_BUSY nor Insert, so it does not
+    /// qualify even with the event defined and the flag cleared.
+    #[test]
+    fn trigger_cursorhold_is_false_in_a_non_qualifying_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.State;
+        g.State = crate::state_defs::mode::NORMAL as i32;
+
+        let _d = DidCursorholdGuard::set(false);
+        let _e = EventGuard::set(EventT::CursorHoldI);
+        assert!(!unsafe { trigger_cursorhold() });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.State = prev;
     }
 
     #[test]
