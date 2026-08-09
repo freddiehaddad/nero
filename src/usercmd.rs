@@ -107,6 +107,84 @@ pub static UCMDS: std::sync::LazyLock<
     crate::globals::GlobalCell::new(crate::garray_defs::TypedGarrayT::default())
 });
 
+/// Release everything one user command owns (`free_ucmd`).
+///
+/// The original's four `xfree`s and three `NLUA_CLEAR_REF`s become
+/// plain resets: dropping the owned strings is what frees them, and
+/// the Lua references go back to the "no reference" sentinel. The
+/// original does NOT clear the non-owning scalar fields, so neither
+/// does this - it is not a full reset to `Default`.
+pub fn free_ucmd(cmd: &mut UcmdT) {
+    /// `LUA_NOREF` - a missing Lua reference. Declared locally,
+    /// matching this crate's established per-module pattern (e.g.
+    /// `eval/typval.rs`, `decoration_provider.rs`).
+    const LUA_NOREF: crate::types_defs::LuaRef = -1;
+
+    cmd.uc_name = None;
+    cmd.uc_rep = None;
+    cmd.uc_compl_arg = None;
+    cmd.uc_desc = None;
+    cmd.uc_compl_luaref = LUA_NOREF;
+    cmd.uc_luaref = LUA_NOREF;
+    cmd.uc_preview_luaref = LUA_NOREF;
+}
+
+/// Free every command in `gap` and empty it (`uc_clear`).
+pub fn uc_clear(gap: &mut crate::garray_defs::TypedGarrayT<UcmdT>) {
+    for cmd in &mut gap.items {
+        free_ucmd(cmd);
+    }
+    gap.ga_clear();
+}
+
+/// `:comclear` - remove all user-defined commands, global and
+/// buffer-local (`ex_comclear`).
+///
+/// # Safety
+/// Touches [`UCMDS`] and `GLOBALS.curbuf`, which must be valid if
+/// non-null.
+pub unsafe fn ex_comclear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    uc_clear(unsafe { UCMDS.get_mut() });
+    // SAFETY: forwarded from this function's own safety doc.
+    let curbuf = unsafe { crate::globals::GLOBALS.get_mut() }.curbuf;
+    if !curbuf.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        uc_clear(&mut unsafe { &mut *curbuf }.b_ucmds);
+    }
+}
+
+/// The name of user command `idx` within one specific registry, chosen
+/// by `cmdidx` (`get_user_command_name`).
+///
+/// Unlike [`get_user_commands`], the two registries are indexed
+/// SEPARATELY here: `CMD_USER` addresses the global list and
+/// `CMD_USER_BUF` the buffer-local one, each from index 0.
+///
+/// # Safety
+/// Forwarded from [`crate::window::prevwin_curwin`]'s own safety doc
+/// for the buffer-local case.
+#[must_use]
+pub unsafe fn get_user_command_name(
+    idx: i32,
+    cmdidx: crate::ex_cmds_defs::CmdIdxT,
+) -> Option<Vec<u8>> {
+    if idx < 0 {
+        return None;
+    }
+    if cmdidx == crate::ex_cmds_defs::CmdIdxT::USER {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { UCMDS.get_mut() }.get(idx).and_then(|uc| uc.uc_name.clone());
+    }
+    if cmdidx == crate::ex_cmds_defs::CmdIdxT::USER_BUF {
+        // In cmdwin, the alternative buffer should be used.
+        // SAFETY: forwarded from this function's own safety doc.
+        let buf = unsafe { &*(*crate::window::prevwin_curwin()).w_buffer };
+        return buf.b_ucmds.get(idx).and_then(|uc| uc.uc_name.clone());
+    }
+    None
+}
+
 /// The name of user command `idx`, for `ExpandGeneric()`
 /// (`get_user_commands`).
 ///
@@ -662,6 +740,116 @@ mod tests {
         g.curbuf = std::ptr::from_mut(&mut *buf);
         g.prevwin = std::ptr::null_mut();
         (win, buf)
+    }
+
+    // --- free_ucmd / uc_clear / ex_comclear / get_user_command_name ---
+
+    /// The two registries are indexed SEPARATELY here, unlike
+    /// `get_user_commands` which numbers them as one sequence. Both
+    /// lists are populated so a lookup hitting the wrong one is
+    /// visible rather than coincidentally right.
+    #[test]
+    fn get_user_command_name_indexes_each_registry_from_zero() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne"], &[b"GlobalOne"]);
+
+        assert_eq!(
+            unsafe { get_user_command_name(0, CmdIdxT::USER) },
+            Some(b"GlobalOne".to_vec())
+        );
+        assert_eq!(
+            unsafe { get_user_command_name(0, CmdIdxT::USER_BUF) },
+            Some(b"BufOne".to_vec())
+        );
+    }
+
+    #[test]
+    fn get_user_command_name_is_absent_past_each_registrys_end() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne"], &[b"GlobalOne"]);
+
+        assert_eq!(unsafe { get_user_command_name(1, CmdIdxT::USER) }, None);
+        assert_eq!(unsafe { get_user_command_name(1, CmdIdxT::USER_BUF) }, None);
+        assert_eq!(unsafe { get_user_command_name(-1, CmdIdxT::USER) }, None);
+    }
+
+    /// Any other command index addresses neither registry.
+    #[test]
+    fn get_user_command_name_is_absent_for_a_builtin_command_index() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"BufOne"], &[b"GlobalOne"]);
+        assert_eq!(unsafe { get_user_command_name(0, CmdIdxT::append) }, None);
+    }
+
+    /// `free_ucmd` releases what the command OWNS and resets its Lua
+    /// references, but deliberately leaves the plain scalar fields
+    /// alone - the original frees only the owned members, so this is
+    /// not a reset to `Default`.
+    #[test]
+    fn free_ucmd_releases_owned_fields_but_not_the_scalars() {
+        let mut cmd = UcmdT {
+            uc_name: Some(b"Foo".to_vec()),
+            uc_rep: Some(b"echo".to_vec()),
+            uc_compl_arg: Some(b"arg".to_vec()),
+            uc_desc: Some(b"desc".to_vec()),
+            uc_luaref: 7,
+            uc_compl_luaref: 8,
+            uc_preview_luaref: 9,
+            uc_argt: 0x1234,
+            uc_def: 42,
+            ..UcmdT::default()
+        };
+        free_ucmd(&mut cmd);
+
+        assert_eq!(cmd.uc_name, None);
+        assert_eq!(cmd.uc_rep, None);
+        assert_eq!(cmd.uc_compl_arg, None);
+        assert_eq!(cmd.uc_desc, None);
+        assert_eq!((cmd.uc_luaref, cmd.uc_compl_luaref, cmd.uc_preview_luaref), (-1, -1, -1));
+        assert_eq!(cmd.uc_argt, 0x1234, "a non-owning field is left alone");
+        assert_eq!(cmd.uc_def, 42);
+    }
+
+    #[test]
+    fn uc_clear_empties_the_whole_registry() {
+        let mut ga = crate::garray_defs::TypedGarrayT::<UcmdT> {
+            items: vec![named(b"One"), named(b"Two")],
+            ..Default::default()
+        };
+        uc_clear(&mut ga);
+        assert!(ga.is_empty());
+        assert_eq!(ga.ga_len(), 0);
+    }
+
+    /// `:comclear` clears BOTH registries, not just the global one.
+    #[test]
+    fn ex_comclear_clears_both_registries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, buf) = with_user_commands(&[b"BufOne"], &[b"GlobalOne"]);
+
+        unsafe { ex_comclear() };
+
+        assert!(unsafe { UCMDS.get_mut() }.is_empty(), "the global registry");
+        assert!(buf.b_ucmds.is_empty(), "the buffer-local registry");
+    }
+
+    /// A null `curbuf` must not fault - the original guards it too.
+    #[test]
+    fn ex_comclear_tolerates_no_current_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        unsafe { UCMDS.get_mut() }.items = vec![named(b"GlobalOne")];
+        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = std::ptr::null_mut();
+
+        unsafe { ex_comclear() };
+        assert!(unsafe { UCMDS.get_mut() }.is_empty());
     }
 
     /// Buffer-local commands come first, then the global ones, as one
