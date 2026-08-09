@@ -1932,6 +1932,93 @@ pub unsafe fn curwin_init() {
     unsafe { win_init_empty(curwin) };
 }
 
+/// Set the position of a frame and every window inside it
+/// (`frame_comp_pos`).
+///
+/// `row`/`col` are in-out: they enter holding the frame's own top-left
+/// corner and leave advanced past it, so successive sibling frames
+/// stack correctly. They stay out-parameters here (rather than
+/// becoming return values, this crate's usual preference) because the
+/// recursion threads a single running position through the whole tree.
+///
+/// A leaf frame's window is only touched when its position actually
+/// CHANGED; the redraw flags are set solely in that case, exactly as
+/// the original does, so an unchanged layout costs no redraws.
+///
+/// # Safety
+/// `topfrp` must be a valid, non-null pointer to a live `FrameT` whose
+/// own `fr_child`/`fr_next` chain (if any) consists entirely of valid,
+/// live pointers, and whose `fr_win` (if non-null) is a valid, live
+/// `WinT`. Forwarded from [`crate::drawscreen::redraw_later`]'s own
+/// safety doc.
+pub unsafe fn frame_comp_pos(
+    topfrp: *mut crate::buffer_defs::FrameT,
+    row: &mut i32,
+    col: &mut i32,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { &*topfrp }.fr_win;
+    if !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &mut *wp };
+        if w.w_winrow != *row || w.w_wincol != *col {
+            // position changed, redraw
+            w.w_winrow = *row;
+            w.w_wincol = *col;
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { crate::drawscreen::redraw_later(wp, crate::drawscreen::UPD_NOT_VALID) };
+            // SAFETY: forwarded from this function's own safety doc.
+            let w = unsafe { &mut *wp };
+            w.w_redr_status = true;
+            w.w_pos_changed = true;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        let w = unsafe { &*wp };
+        let h = w.w_height + w.w_hsep_height + w.w_status_height;
+        // SAFETY: forwarded from this function's own safety doc.
+        let fr_height = unsafe { &*topfrp }.fr_height;
+        *row += if h > fr_height { fr_height } else { h };
+        *col += w.w_width + w.w_vsep_width;
+        return;
+    }
+
+    let startrow = *row;
+    let startcol = *col;
+    // SAFETY: forwarded from this function's own safety doc.
+    let (fr_layout, mut frp) = {
+        let f = unsafe { &*topfrp };
+        (f.fr_layout, f.fr_child)
+    };
+    // The original's own FOR_ALL_FRAMES walk over fr_child/fr_next.
+    while !frp.is_null() {
+        if fr_layout == crate::buffer_defs::FR_ROW {
+            *row = startrow; // all frames are at the same row
+        } else {
+            *col = startcol; // all frames are at the same col
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { frame_comp_pos(frp, row, col) };
+        // SAFETY: forwarded from this function's own safety doc.
+        frp = unsafe { &*frp }.fr_next;
+    }
+}
+
+/// Comparator ordering two plain `int`s ascending (`int_cmp`), used
+/// when sorting the parsed `'colorcolumn'` columns.
+///
+/// Returns a negative/zero/positive `i32`, matching `qsort`'s own
+/// convention and this crate's established comparator shape.
+#[must_use]
+pub fn int_cmp(a: i32, b: i32) -> i32 {
+    if a == b {
+        0
+    } else if a < b {
+        -1
+    } else {
+        1
+    }
+}
+
 /// Reset a window to the "empty buffer" starting state
 /// (`win_init_empty`).
 ///
@@ -3885,6 +3972,165 @@ pub unsafe fn win_find_tabpage(win: *const WinT) -> *mut crate::buffer_defs::Tab
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- frame_comp_pos / int_cmp ----
+
+    #[test]
+    fn int_cmp_orders_ascending() {
+        assert!(int_cmp(1, 2) < 0);
+        assert!(int_cmp(2, 1) > 0);
+        assert_eq!(int_cmp(3, 3), 0);
+        // Negative values must not confuse the comparison.
+        assert!(int_cmp(-5, 1) < 0);
+        assert!(int_cmp(1, -5) > 0);
+    }
+
+    #[test]
+    fn int_cmp_sorts_a_list_ascending() {
+        let mut v = [30, -1, 10, 20];
+        v.sort_by(|a, b| int_cmp(*a, *b).cmp(&0));
+        assert_eq!(v, [-1, 10, 20, 30]);
+    }
+
+    /// A leaf frame places its window and advances the running
+    /// position by the window's full height (including separator and
+    /// status line) and width (including the vertical separator).
+    #[test]
+    fn frame_comp_pos_places_a_leaf_and_advances_the_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_winrow: -1,
+            w_wincol: -1,
+            w_height: 5,
+            w_hsep_height: 1,
+            w_status_height: 1,
+            w_width: 20,
+            w_vsep_width: 1,
+            ..Default::default()
+        };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: &mut win as *mut crate::buffer_defs::WinT,
+            fr_height: 99, // taller than the window, so h wins
+            ..Default::default()
+        };
+
+        let (mut row, mut col) = (3, 4);
+        unsafe { frame_comp_pos(&mut leaf, &mut row, &mut col) };
+
+        assert_eq!((win.w_winrow, win.w_wincol), (3, 4));
+        assert_eq!(row, 3 + 5 + 1 + 1);
+        assert_eq!(col, 4 + 20 + 1);
+        assert!(win.w_pos_changed, "a moved window must be flagged");
+        assert!(win.w_redr_status);
+    }
+
+    /// The advance is CLAMPED to the frame's own height: a window
+    /// taller than its frame must not push the running row past it.
+    #[test]
+    fn frame_comp_pos_clamps_the_row_advance_to_the_frame_height() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_height: 50,
+            w_status_height: 1,
+            ..Default::default()
+        };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: &mut win as *mut crate::buffer_defs::WinT,
+            fr_height: 10,
+            ..Default::default()
+        };
+
+        let (mut row, mut col) = (0, 0);
+        unsafe { frame_comp_pos(&mut leaf, &mut row, &mut col) };
+        assert_eq!(row, 10, "clamped to fr_height, not 51");
+    }
+
+    /// An UNCHANGED position must not set the redraw flags - that is
+    /// what keeps a no-op layout pass from repainting everything.
+    #[test]
+    fn frame_comp_pos_does_not_flag_a_window_that_did_not_move() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT {
+            w_winrow: 3,
+            w_wincol: 4,
+            w_height: 5,
+            ..Default::default()
+        };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: &mut win as *mut crate::buffer_defs::WinT,
+            fr_height: 99,
+            ..Default::default()
+        };
+
+        let (mut row, mut col) = (3, 4);
+        unsafe { frame_comp_pos(&mut leaf, &mut row, &mut col) };
+
+        assert!(!win.w_pos_changed, "an unmoved window must not be flagged");
+        assert!(!win.w_redr_status);
+        // The position still advances, though.
+        assert_eq!(row, 8);
+    }
+
+    /// In a ROW layout the children share one row and march right, so
+    /// the row is reset for each child while the column accumulates.
+    #[test]
+    fn frame_comp_pos_lays_a_row_out_side_by_side() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = crate::buffer_defs::WinT { w_height: 5, w_width: 10, ..Default::default() };
+        let mut win2 = crate::buffer_defs::WinT { w_height: 5, w_width: 10, ..Default::default() };
+        let mut leaf2 = crate::buffer_defs::FrameT {
+            fr_win: &mut win2 as *mut crate::buffer_defs::WinT,
+            fr_height: 5,
+            ..Default::default()
+        };
+        let mut leaf1 = crate::buffer_defs::FrameT {
+            fr_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            fr_height: 5,
+            fr_next: &mut leaf2 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_ROW,
+            fr_child: &mut leaf1 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+
+        let (mut row, mut col) = (0, 0);
+        unsafe { frame_comp_pos(&mut root, &mut row, &mut col) };
+
+        assert_eq!((win1.w_winrow, win1.w_wincol), (0, 0));
+        assert_eq!((win2.w_winrow, win2.w_wincol), (0, 10), "same row, next column");
+    }
+
+    /// In a COL layout the children share one column and stack down.
+    #[test]
+    fn frame_comp_pos_lays_a_column_out_stacked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win1 = crate::buffer_defs::WinT { w_height: 5, w_width: 10, ..Default::default() };
+        let mut win2 = crate::buffer_defs::WinT { w_height: 5, w_width: 10, ..Default::default() };
+        let mut leaf2 = crate::buffer_defs::FrameT {
+            fr_win: &mut win2 as *mut crate::buffer_defs::WinT,
+            fr_height: 5,
+            ..Default::default()
+        };
+        let mut leaf1 = crate::buffer_defs::FrameT {
+            fr_win: &mut win1 as *mut crate::buffer_defs::WinT,
+            fr_height: 5,
+            fr_next: &mut leaf2 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+        let mut root = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            fr_child: &mut leaf1 as *mut crate::buffer_defs::FrameT,
+            ..Default::default()
+        };
+
+        let (mut row, mut col) = (0, 0);
+        unsafe { frame_comp_pos(&mut root, &mut row, &mut col) };
+
+        assert_eq!((win1.w_winrow, win1.w_wincol), (0, 0));
+        assert_eq!((win2.w_winrow, win2.w_wincol), (5, 0), "next row, same column");
+    }
 
     #[test]
     fn min_columns_min_lines_status_height_match_c_enum() {
