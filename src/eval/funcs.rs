@@ -7229,10 +7229,10 @@ unsafe fn f_argc(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         let w = unsafe { &*curwin };
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { &*w.w_alist }.al_ga.ga_len
+        unsafe { &*w.w_alist }.al_ga.ga_len()
     } else if matches!(argvars[0].value, TypvalValue::Number(-1)) {
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len()
     } else {
         // SAFETY: forwarded from this function's own safety doc.
         let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[0]) };
@@ -7242,7 +7242,7 @@ unsafe fn f_argc(argvars: &[TypvalT], rettv: &mut TypvalT) {
             // SAFETY: forwarded from this function's own safety doc.
             let w = unsafe { &*wp };
             // SAFETY: forwarded from this function's own safety doc.
-            unsafe { &*w.w_alist }.al_ga.ga_len
+            unsafe { &*w.w_alist }.al_ga.ga_len()
         }
     };
     rettv.value = TypvalValue::Number(i64::from(count));
@@ -7541,7 +7541,7 @@ unsafe fn alist_name(aep: &crate::arglist_defs::AentryT) -> Vec<u8> {
 /// currently construct in a real running session (nothing populates
 /// an arglist's own items yet - `al_ga`'s real `AentryT`-typed item
 /// storage doesn't exist, a distinct, narrower gap from "no real
-/// caller": `f_argc`'s own tests already demonstrate `al_ga.ga_len`
+/// caller": `f_argc`'s own tests already demonstrate `al_ga.ga_len()`
 /// CAN be set directly for testing purposes, so this isn't provably
 /// unreachable the same way e.g. `AUTOCMDS` is - `unimplemented!()`s
 /// if a nonzero `argcount` is ever actually passed, rather than
@@ -7575,7 +7575,7 @@ unsafe fn f_argv(argvars: &[TypvalT], rettv: &mut TypvalT) {
         // SAFETY: forwarded from this function's own safety doc.
         let alist = unsafe { &*wp }.w_alist;
         // SAFETY: forwarded from this function's own safety doc.
-        unsafe { &*alist }.al_ga.ga_len
+        unsafe { &*alist }.al_ga.ga_len()
     }
 
     if argvars.is_empty() {
@@ -7598,7 +7598,7 @@ unsafe fn f_argv(argvars: &[TypvalT], rettv: &mut TypvalT) {
         (true, unsafe { win_argcount(curwin) })
     } else if matches!(argvars[1].value, TypvalValue::Number(-1)) {
         // SAFETY: forwarded from this function's own safety doc.
-        (true, unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len)
+        (true, unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len())
     } else {
         // SAFETY: forwarded from this function's own safety doc.
         let wp = unsafe { crate::window::find_win_by_nr_or_id(&argvars[1]) };
@@ -17264,13 +17264,23 @@ mod tests {
 
     // --- f_argc / f_argidx ---
 
+    /// Builds an arglist holding `n` real entries, each owning its own
+    /// file name.
+    fn alist_with(n: usize) -> crate::arglist_defs::AlistT {
+        let mut al = crate::arglist_defs::AlistT::default();
+        al.al_ga.items = (0..n)
+            .map(|i| crate::arglist_defs::AentryT {
+                ae_fname: format!("file{i}.txt").into_bytes(),
+                ae_fnum: 0,
+            })
+            .collect();
+        al
+    }
+
     #[test]
     fn argc_no_args_uses_curwin_alist() {
         let _lock = crate::globals::global_state_test_lock();
-        let mut alist = crate::arglist_defs::AlistT {
-            al_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
-            ..Default::default()
-        };
+        let mut alist = alist_with(3);
         let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
         let mut tp = crate::buffer_defs::TabpageT::default();
         let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
@@ -17286,14 +17296,17 @@ mod tests {
         let mut tp = crate::buffer_defs::TabpageT::default();
         let mut win = focusable_win(1);
         let _guard = WinGlobalsGuard::set(&mut win, &mut tp);
-        let prev_len = unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len;
-        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len = 5;
+        let prev = std::mem::take(
+            &mut unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.items,
+        );
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.items =
+            alist_with(5).al_ga.items;
 
         let mut rettv = TypvalT::default();
         unsafe { f_argc(&[num(-1)], &mut rettv) };
         assert_eq!(rettv.value, TypvalValue::Number(5));
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.ga_len = prev_len;
+        unsafe { crate::globals::GLOBALS.get_mut() }.global_alist.al_ga.items = prev;
     }
 
     #[test]
@@ -17662,13 +17675,12 @@ mod tests {
 
     #[test]
     fn argv_in_range_index_is_unimplemented() {
-        // A real AentryT read isn't supported yet (al_ga has no typed
-        // item accessor) - forcing a nonzero, in-range al_ga.ga_len
-        // (the same test-only fabrication f_argc's own tests already
-        // use) must panic rather than silently reading garbage.
+        // A real AentryT read isn't wired up yet, so an in-range
+        // index must panic rather than silently returning nothing.
+        // The arglist now holds REAL entries (typed storage), so this
+        // is no longer a fabricated length.
         let _lock = crate::globals::global_state_test_lock();
-        let mut alist =
-            crate::arglist_defs::AlistT { al_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() }, ..Default::default() };
+        let mut alist = alist_with(3);
         let mut win = crate::buffer_defs::WinT { w_alist: &mut alist as *mut crate::arglist_defs::AlistT, ..focusable_win(1) };
         let mut tp = crate::buffer_defs::TabpageT::default();
         let _guard = WinGlobalsGuard::set(&mut win, &mut tp);

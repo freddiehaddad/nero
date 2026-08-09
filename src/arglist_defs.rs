@@ -1,14 +1,20 @@
 //! Translated from `src/nvim/arglist_defs.h`.
 
-use crate::garray_defs::GarrayT;
+use crate::garray_defs::TypedGarrayT;
 
 /// Argument list: Array of file names (`alist_T`).
 /// Used for the global argument list and the argument lists local to a
 /// window.
 #[derive(Default)]
 pub struct AlistT {
-    /// growarray with the array of file names
-    pub al_ga: GarrayT,
+    /// growarray with the array of file names (`al_ga`).
+    ///
+    /// The original is a byte-erased `garray_T`. It is a
+    /// [`TypedGarrayT`] here because [`AentryT`] owns its `ae_fname`
+    /// string, so its bytes cannot live in a byte buffer without
+    /// leaking or double-freeing that allocation - see
+    /// [`TypedGarrayT`]'s own doc comment.
+    pub al_ga: TypedGarrayT<AentryT>,
     /// number of windows using this arglist
     pub al_refcount: i32,
     /// id of this arglist

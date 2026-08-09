@@ -35,24 +35,22 @@
 //! `alist_unlink` on the old value itself, first, before ever calling
 //! this function).
 //!
-//! `al_ga` is stored (see `arglist_defs.rs`) as a byte-erased `GarrayT`,
-//! matching the original's own generic growarray machinery, with no
-//! typed accessor yet for reading/writing real `AentryT` bytes through
-//! it (a gap already documented at `eval/funcs.rs`'s own `f_argv`/
-//! `get_arglist_as_rettv`, which `unimplemented!()` on that exact case) -
-//! so nothing in this crate can currently place a real `AentryT`'s bytes
-//! into `al_ga` in the first place. This means the original's
-//! `GA_DEEP_CLEAR` (which individually frees each entry's own `ae_fname`
-//! before resetting the growarray) has no observable per-item work to
-//! do for any `al_ga` this crate can actually construct today - calling
-//! `ga_clear` alone is behaviorally equivalent.
+//! `al_ga` holds real [`AentryT`] values (see `arglist_defs.rs`),
+//! stored in a [`crate::garray_defs::TypedGarrayT`] rather than the
+//! original's byte-erased `garray_T`. An `AentryT` owns its
+//! `ae_fname` string, so its bytes cannot live in a byte buffer
+//! without leaking or double-freeing that allocation - see
+//! `TypedGarrayT`'s own doc comment for the full reasoning. Because
+//! the items are owned properly, clearing the growarray drops each
+//! entry's own name, which is exactly the per-item freeing the
+//! original's `GA_DEEP_CLEAR` does by hand.
 //!
 //! Deferred: everything else - `get_arglist`/`alist_expand`/`alist_add`/
 //! `alist_set`/`get_arglist_exp`/`set_arglist`/`do_arglist`/`ex_args`/
 //! `ex_next`/`ex_previous`/`ex_argument`/`ex_all`, all needing real
 //! buffer/window/path-expansion machinery.
 
-use crate::arglist_defs::{AentryT, AlistT};
+use crate::arglist_defs::AlistT;
 use crate::globals::GlobalCell;
 
 /// This flag is set whenever the argument list is being changed and
@@ -77,8 +75,13 @@ fn check_arglist_locked() -> Result<(), ()> {
 
 /// Clears an argument list: frees all file names and resets it to zero
 /// entries (`alist_clear`). A no-op while the argument list is currently
-/// locked (see this module's own doc comment for why no per-item
-/// `AentryT` freeing is needed here today).
+/// Clears an argument list: frees all file names and resets it to zero
+/// entries (`alist_clear`). A no-op while the argument list is currently
+/// locked.
+///
+/// Now that `al_ga` holds real [`AentryT`] values, clearing it drops
+/// each entry's own `ae_fname` - which is exactly the per-item freeing
+/// the original's `GA_DEEP_CLEAR` does by hand.
 pub fn alist_clear(al: &mut AlistT) {
     if check_arglist_locked().is_err() {
         return;
@@ -88,8 +91,11 @@ pub fn alist_clear(al: &mut AlistT) {
 
 /// Initializes an argument list's growarray for [`AentryT`] items,
 /// 5 at a time (`alist_init`).
+///
+/// The original also passes `sizeof(aentry_T)`; the item size is
+/// carried by the type here, so only the grow size remains.
 pub fn alist_init(al: &mut AlistT) {
-    al.al_ga.ga_init(std::mem::size_of::<AentryT>() as i32, 5);
+    al.al_ga.ga_init(5);
 }
 
 /// Removes a reference from an argument list. Ignored when `al` is the
@@ -229,6 +235,7 @@ pub fn do_one_arg(str: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arglist_defs::AentryT;
 
     /// RAII guard resetting `ARGLIST_LOCKED` to its default (`false`)
     /// when dropped, so a test that locks it can't leak that state into
@@ -246,12 +253,19 @@ mod tests {
         ArglistLockedGuard
     }
 
+    /// Three real entries, each owning its own file name - the case
+    /// the old byte-erased growarray could not represent at all.
+    fn three_entries() -> Vec<AentryT> {
+        (0..3)
+            .map(|i| AentryT { ae_fname: format!("file{i}.txt").into_bytes(), ae_fnum: 0 })
+            .collect()
+    }
+
     #[test]
     fn alist_init_sets_up_the_growarray() {
         let _lock = crate::globals::global_state_test_lock();
         let mut al = AlistT::default();
         alist_init(&mut al);
-        assert_eq!(al.al_ga.ga_itemsize, std::mem::size_of::<AentryT>() as i32);
         assert_eq!(al.al_ga.ga_growsize, 5);
         assert!(al.al_ga.is_empty());
     }
@@ -261,11 +275,13 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut al = AlistT::default();
         alist_init(&mut al);
-        al.al_ga.ga_len = 3;
+        al.al_ga.items = three_entries();
+        assert_eq!(al.al_ga.ga_len(), 3);
         alist_clear(&mut al);
         assert!(al.al_ga.is_empty());
-        // ga_clear preserves itemsize/growsize (only resets len/data).
-        assert_eq!(al.al_ga.ga_itemsize, std::mem::size_of::<AentryT>() as i32);
+        assert_eq!(al.al_ga.ga_len(), 0);
+        // ga_clear preserves the grow size (only the items are reset).
+        assert_eq!(al.al_ga.ga_growsize, 5);
     }
 
     #[test]
@@ -273,11 +289,12 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut al = AlistT::default();
         alist_init(&mut al);
-        al.al_ga.ga_len = 3;
+        al.al_ga.items = three_entries();
         let _guard = lock_arglist();
         alist_clear(&mut al);
         // Unchanged: the lock check returned early before ga_clear.
-        assert_eq!(al.al_ga.ga_len, 3);
+        assert_eq!(al.al_ga.ga_len(), 3);
+        assert_eq!(al.al_ga.items[1].ae_fname, b"file1.txt");
     }
 
     #[test]
@@ -354,7 +371,7 @@ mod tests {
         let al = unsafe { &*al_ptr };
         assert_eq!(al.al_refcount, 1);
         assert!(al.al_ga.is_empty());
-        assert_eq!(al.al_ga.ga_itemsize, std::mem::size_of::<AentryT>() as i32);
+        assert_eq!(al.al_ga.ga_growsize, 5);
         assert!(al.id > 0);
 
         // Clean up: free the allocated `AlistT` (this test's own
