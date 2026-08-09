@@ -37,6 +37,11 @@
 //! `DecorRange` is the type gating most of this file's remaining
 //! functions.
 //!
+//! Also translated: [`decor_put_vt`] (heap-allocating a virtual-text
+//! node and linking it ahead of an existing chain) and
+//! [`decor_virt_line_wrap`] (whether a virtual line wraps onto extra
+//! rows).
+//!
 //! Also translated: [`sign_item_cmp`], the comparator ordering the
 //! signs shown on one line, and [`may_force_numberwidth_recompute`],
 //! which invalidates the cached number-column width in every window
@@ -409,6 +414,37 @@ pub unsafe fn may_force_numberwidth_recompute(buf: *const BufT, unplace: bool) {
     }
 }
 
+/// Heap-allocate a copy of `vt`, linked ahead of `next`
+/// (`decor_put_vt`).
+///
+/// The original returns a raw `xmalloc`ed pointer the caller becomes
+/// responsible for; here ownership is expressed directly, since this
+/// crate already models `DecorVirtText::next` as an owning
+/// `Option<Box<_>>`.
+#[must_use]
+pub fn decor_put_vt(
+    vt: crate::decoration_defs::DecorVirtText,
+    next: Option<Box<crate::decoration_defs::DecorVirtText>>,
+) -> Box<crate::decoration_defs::DecorVirtText> {
+    let mut decor_alloc = Box::new(vt);
+    decor_alloc.next = next;
+    decor_alloc
+}
+
+/// Whether a virtual line wraps onto extra rows rather than being
+/// truncated or scrolled (`decor_virt_line_wrap`).
+///
+/// `Auto` defers to the window's own `'wrap'`; `Wrap` always wraps.
+/// `Trunc` and `Scroll` never do.
+#[must_use]
+pub fn decor_virt_line_wrap(
+    wp: &WinT,
+    overflow: crate::decoration_defs::VirtLineOverflow,
+) -> bool {
+    use crate::decoration_defs::VirtLineOverflow as O;
+    overflow == O::Wrap || (overflow == O::Auto && wp.w_onebuf_opt.wo_wrap != 0)
+}
+
 /// Comparator ordering the signs shown on one line (`sign_item_cmp`).
 ///
 /// Sorts DESCENDING on all three keys in turn - priority, then id,
@@ -574,6 +610,58 @@ mod tests {
             attr_id: 0,
             draw_col: DECOR_DRAW_COL_UNDECIDED,
         }
+    }
+
+    // --- decor_put_vt / decor_virt_line_wrap ---
+
+    #[test]
+    fn decor_put_vt_links_the_new_node_ahead_of_the_existing_chain() {
+        let tail = decor_put_vt(
+            DecorVirtText { col: 2, ..DecorVirtText::default() },
+            None,
+        );
+        let head = decor_put_vt(
+            DecorVirtText { col: 1, ..DecorVirtText::default() },
+            Some(tail),
+        );
+        assert_eq!(head.col, 1);
+        let next = head.next.as_ref().expect("chain should continue");
+        assert_eq!(next.col, 2);
+        assert!(next.next.is_none());
+    }
+
+    /// The `next` argument REPLACES whatever link the value being
+    /// copied happened to carry.
+    #[test]
+    fn decor_put_vt_overwrites_the_next_link_of_its_input() {
+        let stale = decor_put_vt(
+            DecorVirtText { col: 9, ..DecorVirtText::default() },
+            None,
+        );
+        let vt = DecorVirtText { col: 1, next: Some(stale), ..DecorVirtText::default() };
+        let node = decor_put_vt(vt, None);
+        assert!(node.next.is_none());
+    }
+
+    /// `Wrap` always wraps and `Auto` follows the window's 'wrap',
+    /// while `Trunc`/`Scroll` never do - so 'wrap' must not be
+    /// consulted for them.
+    #[test]
+    fn virt_line_wrap_follows_the_overflow_mode_and_only_then_the_wrap_option() {
+        use crate::decoration_defs::VirtLineOverflow as O;
+        let mut wp = crate::buffer_defs::WinT::default();
+
+        for wrap in [0, 1] {
+            wp.w_onebuf_opt.wo_wrap = wrap;
+            assert!(decor_virt_line_wrap(&wp, O::Wrap));
+            assert!(!decor_virt_line_wrap(&wp, O::Trunc));
+            assert!(!decor_virt_line_wrap(&wp, O::Scroll));
+        }
+
+        wp.w_onebuf_opt.wo_wrap = 0;
+        assert!(!decor_virt_line_wrap(&wp, O::Auto));
+        wp.w_onebuf_opt.wo_wrap = 1;
+        assert!(decor_virt_line_wrap(&wp, O::Auto));
     }
 
     // --- may_force_numberwidth_recompute ---
