@@ -132,6 +132,39 @@ pub unsafe fn estack_push(
     stack.len() - 1
 }
 
+/// Add a user function to the execution stack
+/// (`estack_push_ufunc`).
+///
+/// The frame's name is the function's EXPANDED name when it has one
+/// (`<SNR>`-resolved, for a script-local function), falling back to
+/// the plain name otherwise - so a stack trace shows the resolved
+/// form a user can act on.
+///
+/// The original guards against `estack_push` returning NULL; here it
+/// always yields a valid index, so the guard has no counterpart.
+///
+/// # Safety
+/// Must not run concurrently with any other access to `EXESTACK`.
+/// `ufunc` must be a valid, non-null pointer to a live `UfuncT` that
+/// outlives the frame, since the frame borrows both its name and the
+/// pointer itself.
+pub unsafe fn estack_push_ufunc(
+    ufunc: *mut crate::eval::typval_defs::UfuncT,
+    lnum: crate::pos_defs::LinenrT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let f = unsafe { &mut *ufunc };
+    let name: *mut u8 = match f.uf_name_exp.as_mut() {
+        Some(exp) => exp.as_mut_ptr(),
+        None => f.uf_name.as_mut_ptr(),
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    let idx = unsafe { estack_push(crate::runtime_defs::EtypeT::Ufunc, name, lnum) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let stack = unsafe { EXESTACK.get_mut() };
+    stack[idx].es_info = crate::runtime_defs::EsInfo::Ufunc(ufunc);
+}
+
 /// Take an item off the execution stack (`estack_pop`).
 ///
 /// The base `ETYPE_TOP` frame installed by [`estack_init`] is never
@@ -456,6 +489,75 @@ mod tests {
         assert_eq!(stack[0].es_type, crate::runtime_defs::EtypeT::Top);
         assert!(stack[0].es_name.is_null());
         assert_eq!(stack[0].es_lnum, 0);
+    }
+
+    // ---- estack_push_ufunc ----
+
+    fn test_ufunc(name: &[u8], exp: Option<&[u8]>) -> Box<crate::eval::typval_defs::UfuncT> {
+        let mut f = Box::new(crate::eval::typval_defs::UfuncT::default());
+        f.uf_name = name.to_vec();
+        f.uf_name_exp = exp.map(<[u8]>::to_vec);
+        f
+    }
+
+    /// The frame records the function itself, so a stack trace can
+    /// reach back to it.
+    #[test]
+    fn estack_push_ufunc_records_the_function_in_the_frame() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+
+        let mut f = test_ufunc(b"Foo", None);
+        let f_ptr = std::ptr::from_mut(&mut *f);
+        unsafe { estack_push_ufunc(f_ptr, 42) };
+
+        let stack = unsafe { EXESTACK.get_mut() };
+        let top = stack.last().expect("a frame was pushed");
+        assert_eq!(top.es_type, crate::runtime_defs::EtypeT::Ufunc);
+        assert_eq!(top.es_lnum, 42);
+        match top.es_info {
+            crate::runtime_defs::EsInfo::Ufunc(p) => assert_eq!(p, f_ptr),
+            other => panic!("expected the Ufunc variant, got {other:?}"),
+        }
+    }
+
+    /// With no expanded name, the plain name is used.
+    #[test]
+    fn estack_push_ufunc_uses_the_plain_name_when_there_is_no_expanded_one() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+
+        let mut f = test_ufunc(b"Foo", None);
+        unsafe { estack_push_ufunc(std::ptr::from_mut(&mut *f), 1) };
+
+        let stack = unsafe { EXESTACK.get_mut() };
+        let name = stack.last().unwrap().es_name;
+        assert_eq!(name, f.uf_name.as_mut_ptr());
+    }
+
+    /// The EXPANDED name wins when present - that is the
+    /// `<SNR>`-resolved form a stack trace should show. An
+    /// implementation always taking `uf_name` would point at the
+    /// unresolved one.
+    #[test]
+    fn estack_push_ufunc_prefers_the_expanded_name() {
+        let _lock = global_state_test_lock();
+        let _guard = ExestackGuard::new();
+        unsafe { estack_init() };
+
+        let mut f = test_ufunc(b"Foo", Some(b"<SNR>7_Foo"));
+        unsafe { estack_push_ufunc(std::ptr::from_mut(&mut *f), 1) };
+
+        let stack = unsafe { EXESTACK.get_mut() };
+        let name = stack.last().unwrap().es_name;
+        assert_eq!(
+            name,
+            f.uf_name_exp.as_mut().unwrap().as_mut_ptr(),
+            "the expanded name must win"
+        );
+        assert_ne!(name, f.uf_name.as_mut_ptr());
     }
 
     #[test]
