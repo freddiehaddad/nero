@@ -40,6 +40,11 @@
 //! Also translated: [`sign_item_cmp`], the comparator ordering the
 //! signs shown on one line.
 //!
+//! Also translated: [`DecorState`] (with [`DecorRangeSlot`], from
+//! `decoration.h`) and its `decor_state` file-static, plus the two
+//! functions they unblock, [`decor_state_invalidate`] and
+//! [`decor_redraw_end`].
+//!
 //! Deferred: everything else in the file - real virtual-text/
 //! highlight/conceal rendering, needing the marktree query machinery
 //! and decoration-provider Lua callbacks, neither translated.
@@ -186,6 +191,171 @@ pub unsafe fn decor_virt_pos_kind(decor: &DecorRange) -> crate::decoration_defs:
         DecorRangeData::UIWatched { pos, .. } => pos,
         _ => crate::decoration_defs::VirtTextPos::EndOfLine,
     }
+}
+
+/// One slot in [`DecorState`]'s range storage (`DecorRangeSlot`).
+///
+/// Ranges can be removed in any order, so freed slots are tracked
+/// with a freelist chained through the slot itself; the head index
+/// lives in `DecorState::free_slot_i`.
+///
+/// The original overlays the two uses in an untagged union. A safe
+/// tagged enum is used here for the same reason as
+/// [`DecorRangeData`]: these slots live in a plain growable vector,
+/// never packed into the marktree, so nothing depends on their
+/// layout.
+#[derive(Debug, Clone)]
+pub enum DecorRangeSlot {
+    /// An occupied slot holding a live range (`range`).
+    Range(DecorRange),
+    /// A freed slot; holds the index of the next free slot, or
+    /// [`DECOR_NO_FREE_SLOT`] at the end of the chain (`next_free_i`).
+    Free(i32),
+}
+
+/// `free_slot_i`/`next_free_i` sentinel meaning "no freed slots".
+pub const DECOR_NO_FREE_SLOT: i32 = -1;
+
+/// The decoration state built up while redrawing one window
+/// (`DecorState`).
+///
+/// `itr` is a one-element array in the original purely so it can be
+/// passed as a pointer while remaining an embedded member; a plain
+/// field achieves the same in Rust, matching
+/// `marktree_defs.rs`'s own treatment of `MarkTree::id2node`.
+#[derive(Debug)]
+pub struct DecorState {
+    pub itr: crate::marktree_defs::MarkTreeIter,
+    pub slots: Vec<DecorRangeSlot>,
+    /// Indices into `slots`. Entries in `[0, current_end)` point to
+    /// ranges starting before the current position, sorted by
+    /// priority then insertion order; entries in
+    /// `[future_begin, ranges_i.len())` point to ranges starting
+    /// after it, sorted by starting position (`ranges_i`).
+    pub ranges_i: Vec<i32>,
+    pub current_end: i32,
+    pub future_begin: i32,
+    /// Head of the [`DecorRangeSlot::Free`] chain, or
+    /// [`DECOR_NO_FREE_SLOT`] if none are freed (`free_slot_i`).
+    pub free_slot_i: i32,
+    /// Counter used to keep track of range insertion order
+    /// (`new_range_ordering`).
+    pub new_range_ordering: i32,
+    pub win: *mut WinT,
+    pub top_row: i32,
+    pub row: i32,
+    pub col_last: i32,
+    pub current: i32,
+    pub eol_col: i32,
+    pub conceal: i32,
+    pub conceal_char: crate::types_defs::ScharT,
+    pub conceal_attr: i32,
+    pub spell: TriState,
+    pub running_decor_provider: bool,
+    pub itr_valid: bool,
+}
+
+impl Default for DecorState {
+    /// The original's `decor_state INIT( = { 0 })` - every field
+    /// zeroed, which for `free_slot_i` means slot 0, NOT
+    /// [`DECOR_NO_FREE_SLOT`]. That is harmless in the original
+    /// because the freelist is only consulted once `slots` is
+    /// non-empty, and it is reset properly by the redraw pass.
+    ///
+    /// Note `spell` is [`TriState::False`] (the zero value) and
+    /// deliberately NOT `TriState::default()`, which is
+    /// `TriState::None` (`-1`) and would mean "no spell decision
+    /// recorded" rather than "spell checking off".
+    fn default() -> Self {
+        DecorState {
+            itr: crate::marktree_defs::MarkTreeIter::default(),
+            slots: Vec::new(),
+            ranges_i: Vec::new(),
+            current_end: 0,
+            future_begin: 0,
+            free_slot_i: 0,
+            new_range_ordering: 0,
+            win: std::ptr::null_mut(),
+            top_row: 0,
+            row: 0,
+            col_last: 0,
+            current: 0,
+            eol_col: 0,
+            conceal: 0,
+            conceal_char: 0,
+            conceal_attr: 0,
+            spell: TriState::False,
+            running_decor_provider: false,
+            itr_valid: false,
+        }
+    }
+}
+
+/// `decor_state` - the decoration state for the window currently
+/// being redrawn.
+pub static DECOR_STATE: crate::globals::GlobalCell<DecorState> =
+    crate::globals::GlobalCell::new(DecorState {
+        itr: crate::marktree_defs::MarkTreeIter {
+            pos: crate::marktree_defs::MtPos { row: 0, col: 0 },
+            lvl: 0,
+            x: std::ptr::null_mut(),
+            i: 0,
+            s: [crate::marktree_defs::MarkTreeIterFrame { oldcol: 0, i: 0 };
+                crate::marktree_defs::MT_MAX_DEPTH],
+            intersect_idx: 0,
+            intersect_pos: crate::marktree_defs::MtPos { row: 0, col: 0 },
+            intersect_pos_x: crate::marktree_defs::MtPos { row: 0, col: 0 },
+        },
+        slots: Vec::new(),
+        ranges_i: Vec::new(),
+        current_end: 0,
+        future_begin: 0,
+        free_slot_i: 0,
+        new_range_ordering: 0,
+        win: std::ptr::null_mut(),
+        top_row: 0,
+        row: 0,
+        col_last: 0,
+        current: 0,
+        eol_col: 0,
+        conceal: 0,
+        conceal_char: 0,
+        conceal_attr: 0,
+        spell: TriState::False,
+        running_decor_provider: false,
+        itr_valid: false,
+    });
+
+/// Invalidate the cached marktree iterator if the decoration state is
+/// currently pointed at `buf` (`decor_state_invalidate`).
+///
+/// Only the window's OWN buffer matters: a change to some other
+/// buffer cannot disturb this window's iterator, so the state is left
+/// alone.
+///
+/// # Safety
+/// `DECOR_STATE.win`, if non-null, must point to a live `WinT` whose
+/// `w_buffer` is valid.
+pub unsafe fn decor_state_invalidate(buf: *const BufT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { DECOR_STATE.get_mut() };
+    if state.win.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc; `win`
+    // was just checked non-null.
+    if std::ptr::eq(unsafe { (*state.win).w_buffer }, buf) {
+        state.itr_valid = false;
+    }
+}
+
+/// Finish the redraw pass for a window, detaching the decoration
+/// state from it (`decor_redraw_end`).
+///
+/// # Safety
+/// Touches the `decor_state` file-static.
+pub unsafe fn decor_redraw_end(state: &mut DecorState) {
+    state.win = std::ptr::null_mut();
 }
 
 /// Comparator ordering the signs shown on one line (`sign_item_cmp`).
@@ -353,6 +523,112 @@ mod tests {
             attr_id: 0,
             draw_col: DECOR_DRAW_COL_UNDECIDED,
         }
+    }
+
+    // --- decor_state_invalidate / decor_redraw_end ---
+
+    /// Installs a window pointer into `DECOR_STATE` for the duration
+    /// of a test and restores the previous one on drop, even through
+    /// a panic, so a failing test cannot leave a dangling pointer in
+    /// the file-static for whichever test runs next.
+    struct DecorStateWinGuard {
+        saved_win: *mut crate::buffer_defs::WinT,
+        saved_valid: bool,
+    }
+
+    impl DecorStateWinGuard {
+        fn install(win: *mut crate::buffer_defs::WinT, itr_valid: bool) -> Self {
+            let state = unsafe { DECOR_STATE.get_mut() };
+            let me = Self { saved_win: state.win, saved_valid: state.itr_valid };
+            state.win = win;
+            state.itr_valid = itr_valid;
+            me
+        }
+    }
+
+    impl Drop for DecorStateWinGuard {
+        fn drop(&mut self) {
+            let state = unsafe { DECOR_STATE.get_mut() };
+            state.win = self.saved_win;
+            state.itr_valid = self.saved_valid;
+        }
+    }
+
+    #[test]
+    fn decor_state_spell_defaults_to_off_not_undecided() {
+        // The original zero-initializes decor_state, and TriState's
+        // zero value is False. TriState::default() is None (-1),
+        // which would mean "undecided" instead.
+        assert_eq!(DecorState::default().spell, TriState::False);
+    }
+
+    #[test]
+    fn decor_state_invalidate_ignores_a_state_with_no_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let _guard = DecorStateWinGuard::install(std::ptr::null_mut(), true);
+        unsafe { decor_state_invalidate(std::ptr::from_mut(&mut *buf)) };
+        assert!(unsafe { DECOR_STATE.get_mut() }.itr_valid);
+    }
+
+    #[test]
+    fn decor_state_invalidate_clears_the_iterator_for_its_own_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+        let _guard = DecorStateWinGuard::install(std::ptr::from_mut(&mut *win), true);
+        unsafe { decor_state_invalidate(std::ptr::from_mut(&mut *buf)) };
+        assert!(!unsafe { DECOR_STATE.get_mut() }.itr_valid);
+    }
+
+    /// A change to some OTHER buffer cannot disturb this window's
+    /// iterator. An implementation that invalidated unconditionally
+    /// would needlessly discard it here.
+    #[test]
+    fn decor_state_invalidate_leaves_the_iterator_alone_for_another_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut own_buf = Box::new(BufT::default());
+        let mut other_buf = Box::new(BufT::default());
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *own_buf);
+        let _guard = DecorStateWinGuard::install(std::ptr::from_mut(&mut *win), true);
+        unsafe { decor_state_invalidate(std::ptr::from_mut(&mut *other_buf)) };
+        assert!(unsafe { DECOR_STATE.get_mut() }.itr_valid);
+    }
+
+    #[test]
+    fn decor_redraw_end_detaches_the_state_from_its_window() {
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        let mut state = DecorState { win: std::ptr::from_mut(&mut *win), ..DecorState::default() };
+        unsafe { decor_redraw_end(&mut state) };
+        assert!(state.win.is_null());
+    }
+
+    #[test]
+    fn decor_range_slot_models_the_freelist_chain() {
+        // A freed slot carries the index of the next free slot; the
+        // end of the chain is the sentinel, not slot 0.
+        let slots = [
+            DecorRangeSlot::Free(2),
+            DecorRangeSlot::Range(range_with(DecorRangeData::VirtText(std::ptr::null_mut()))),
+            DecorRangeSlot::Free(DECOR_NO_FREE_SLOT),
+        ];
+        let mut i = 0;
+        let mut visited = Vec::new();
+        loop {
+            match slots[i as usize] {
+                DecorRangeSlot::Free(next) => {
+                    visited.push(i);
+                    if next == DECOR_NO_FREE_SLOT {
+                        break;
+                    }
+                    i = next;
+                }
+                DecorRangeSlot::Range(_) => panic!("walked into an occupied slot"),
+            }
+        }
+        assert_eq!(visited, vec![0, 2]);
     }
 
     // --- sign_item_cmp ---
