@@ -72,6 +72,22 @@ static PUM_EXTERNAL: GlobalCell<bool> = GlobalCell::new(false);
 /// forever in this crate today.
 static PUM_HEIGHT: GlobalCell<i32> = GlobalCell::new(0);
 
+/// `pum_first` - the index of the first displayed popup-menu item,
+/// i.e. the scroll offset. Reset by [`pum_clear`]; otherwise only set
+/// by `pum_display`/`pum_set_selected`, neither translated.
+static PUM_FIRST: GlobalCell<i32> = GlobalCell::new(0);
+
+/// `pum_invalid` - whether the popup menu must be redrawn because the
+/// screen was cleared. Set by [`pum_invalidate`]; only cleared by
+/// `pum_display`, not translated.
+static PUM_INVALID: GlobalCell<bool> = GlobalCell::new(false);
+
+/// `pum_size` - the total number of items in the popup menu. Only ever
+/// set by `pum_display`, not translated, so this stays `0` forever in
+/// this crate today - matching `PUM_HEIGHT`'s own established
+/// treatment.
+static PUM_SIZE: GlobalCell<i32> = GlobalCell::new(0);
+
 /// One popup menu entry (`pumitem_T`).
 ///
 /// The original's four text fields are `char *` that the popup menu
@@ -129,6 +145,47 @@ pub static PUM_WANT: GlobalCell<PumWant> = GlobalCell::new(PumWant {
     insert: false,
     finish: false,
 });
+
+/// Clear the popup menu (`pum_clear`).
+///
+/// Currently only resets the offset to the first displayed item, as
+/// the original's own comment notes.
+pub fn pum_clear() {
+    // SAFETY: a plain write through one borrow of this file's static.
+    unsafe {
+        *PUM_FIRST.get_mut() = 0;
+    }
+}
+
+/// Record that the screen was cleared, so the popup menu is redrawn
+/// next time (`pum_invalidate`).
+pub fn pum_invalidate() {
+    // SAFETY: a plain write through one borrow of this file's static.
+    unsafe {
+        *PUM_INVALID.get_mut() = true;
+    }
+}
+
+/// Request that an attached UI select popup-menu item `item`
+/// (`pum_ext_select_item`).
+///
+/// Ignored unless the menu is visible and `item` is in range: `-1`
+/// (meaning "no selection") or a real item index. Note the original
+/// guards on `pum_size`, the TOTAL item count, not on `pum_height`,
+/// the number currently on screen.
+pub fn pum_ext_select_item(item: i32, insert: bool, finish: bool) {
+    // SAFETY: a plain read through one borrow of this file's static.
+    let size = unsafe { *PUM_SIZE.get_mut() };
+    if !pum_visible() || item < -1 || item >= size {
+        return;
+    }
+    // SAFETY: a plain write through one borrow of this file's static.
+    let want = unsafe { PUM_WANT.get_mut() };
+    want.active = true;
+    want.item = item;
+    want.insert = insert;
+    want.finish = finish;
+}
 
 /// `true` if the popup menu is currently displayed (`pum_visible`).
 #[must_use]
@@ -270,6 +327,144 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             set_pum_is_visible(false);
         }
+    }
+
+    // ---- pum_clear / pum_invalidate / pum_ext_select_item ----
+
+    /// Restores `PUM_FIRST`, `PUM_INVALID`, `PUM_SIZE` and `PUM_WANT`
+    /// on drop, even through a panic.
+    struct PumStateGuard {
+        first: i32,
+        invalid: bool,
+        size: i32,
+        want: PumWant,
+    }
+
+    impl PumStateGuard {
+        fn save() -> Self {
+            unsafe {
+                Self {
+                    first: *PUM_FIRST.get_mut(),
+                    invalid: *PUM_INVALID.get_mut(),
+                    size: *PUM_SIZE.get_mut(),
+                    want: *PUM_WANT.get_mut(),
+                }
+            }
+        }
+
+        fn set_size(size: i32) {
+            unsafe { *PUM_SIZE.get_mut() = size };
+        }
+    }
+
+    impl Drop for PumStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *PUM_FIRST.get_mut() = self.first;
+                *PUM_INVALID.get_mut() = self.invalid;
+                *PUM_SIZE.get_mut() = self.size;
+                *PUM_WANT.get_mut() = self.want;
+            }
+        }
+    }
+
+    #[test]
+    fn pum_clear_resets_the_scroll_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+
+        unsafe { *PUM_FIRST.get_mut() = 7 };
+        pum_clear();
+        assert_eq!(unsafe { *PUM_FIRST.get_mut() }, 0);
+    }
+
+    #[test]
+    fn pum_invalidate_sets_the_invalid_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+
+        unsafe { *PUM_INVALID.get_mut() = false };
+        pum_invalidate();
+        assert!(unsafe { *PUM_INVALID.get_mut() });
+    }
+
+    /// Nothing is recorded while the menu is not visible.
+    #[test]
+    fn pum_ext_select_item_is_ignored_when_the_menu_is_hidden() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+        let _v = PumVisibleGuard::set(false);
+        PumStateGuard::set_size(5);
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+
+        pum_ext_select_item(2, true, true);
+        assert!(!unsafe { PUM_WANT.get_mut() }.active);
+    }
+
+    /// A visible menu records the whole request.
+    #[test]
+    fn pum_ext_select_item_records_the_request() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+        let _v = PumVisibleGuard::set(true);
+        PumStateGuard::set_size(5);
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+
+        pum_ext_select_item(3, true, false);
+        let want = unsafe { *PUM_WANT.get_mut() };
+        assert_eq!(
+            (want.active, want.item, want.insert, want.finish),
+            (true, 3, true, false)
+        );
+    }
+
+    /// `-1` means "no selection" and is explicitly in range, while
+    /// anything below it is not.
+    #[test]
+    fn pum_ext_select_item_accepts_minus_one_but_not_below() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+        let _v = PumVisibleGuard::set(true);
+        PumStateGuard::set_size(5);
+
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+        pum_ext_select_item(-1, false, false);
+        assert!(unsafe { PUM_WANT.get_mut() }.active, "-1 is in range");
+
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+        pum_ext_select_item(-2, false, false);
+        assert!(!unsafe { PUM_WANT.get_mut() }.active, "-2 is out of range");
+    }
+
+    /// The upper bound is `pum_size` exclusive, so the last valid
+    /// index is `size - 1`.
+    #[test]
+    fn pum_ext_select_item_bounds_the_index_by_pum_size() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+        let _v = PumVisibleGuard::set(true);
+        PumStateGuard::set_size(5);
+
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+        pum_ext_select_item(4, false, false);
+        assert!(unsafe { PUM_WANT.get_mut() }.active, "size - 1 is in range");
+
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+        pum_ext_select_item(5, false, false);
+        assert!(!unsafe { PUM_WANT.get_mut() }.active, "size itself is not");
+    }
+
+    /// With no items at all every index is out of range, including 0.
+    #[test]
+    fn pum_ext_select_item_rejects_any_item_when_the_menu_is_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PumStateGuard::save();
+        let _v = PumVisibleGuard::set(true);
+        PumStateGuard::set_size(0);
+        unsafe { *PUM_WANT.get_mut() = PumWant::default() };
+
+        pum_ext_select_item(0, false, false);
+        assert!(!unsafe { PUM_WANT.get_mut() }.active);
     }
 
     #[test]
