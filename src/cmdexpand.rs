@@ -24,6 +24,10 @@
 //! [`cmdline_compl_pattern`] and [`cmdline_compl_is_fuzzy`], which
 //! read the real `ccline.xpc` expansion state.
 //!
+//! Also translated: the `WILD_*` groups from `cmdexpand.h` (as
+//! [`wild_action`] and [`wild_flags`]), the `EW_*` group they map
+//! into (in `path.rs`), and [`map_wildopts_to_ewflags`].
+//!
 //! Deferred: everything else - `nextwild`/`copy_substring_from_pos`/
 //! `is_regex_match`/`concat_pattern_with_buffer_match`/
 //! `expand_pattern_in_buf` (the completion/search machinery),
@@ -142,6 +146,84 @@ pub unsafe fn cmdline_compl_is_fuzzy() -> bool {
     // SAFETY: forwarded from this function's own safety doc; `xp` is
     // checked non-null before it is read.
     !xp.is_null() && cmdline_fuzzy_completion_supported(unsafe { (*xp).xp_context })
+}
+
+/// Values for `nextwild()` and `ExpandOne()` - which step of
+/// wildcard expansion to perform. See `ExpandOne()` for meaning.
+pub mod wild_action {
+    pub const FREE: i32 = 1;
+    pub const EXPAND_FREE: i32 = 2;
+    pub const EXPAND_KEEP: i32 = 3;
+    pub const NEXT: i32 = 4;
+    pub const PREV: i32 = 5;
+    pub const ALL: i32 = 6;
+    pub const LONGEST: i32 = 7;
+    pub const ALL_KEEP: i32 = 8;
+    pub const CANCEL: i32 = 9;
+    pub const APPLY: i32 = 10;
+    pub const PAGEUP: i32 = 11;
+    pub const PAGEDOWN: i32 = 12;
+    pub const PUM_WANT: i32 = 13;
+}
+
+/// `WILD_*` option bit flags, passed alongside a [`wild_action`]
+/// value.
+pub mod wild_flags {
+    pub const LIST_NOTFOUND: i32 = 0x01;
+    pub const HOME_REPLACE: i32 = 0x02;
+    pub const USE_NL: i32 = 0x04;
+    pub const NO_BEEP: i32 = 0x08;
+    pub const ADD_SLASH: i32 = 0x10;
+    pub const KEEP_ALL: i32 = 0x20;
+    pub const SILENT: i32 = 0x40;
+    pub const ESCAPE: i32 = 0x80;
+    pub const ICASE: i32 = 0x100;
+    pub const ALLLINKS: i32 = 0x200;
+    pub const USE_COMPLETESLASH: i32 = 0x400;
+    /// sets `EW_NOERROR` (`WILD_NOERROR`).
+    pub const NOERROR: i32 = 0x800;
+    pub const BUFLASTUSED: i32 = 0x1000;
+    /// `BUF_DIFF_FILTER` - the one member of this group that is not
+    /// spelled `WILD_*` in the original.
+    pub const BUF_DIFF_FILTER: i32 = 0x2000;
+    pub const NOSELECT: i32 = 0x4000;
+    pub const MAY_EXPAND_PATTERN: i32 = 0x8000;
+    /// called from `wildtrigger()` (`WILD_FUNC_TRIGGER`).
+    pub const FUNC_TRIGGER: i32 = 0x10000;
+    pub const NOINSERT: i32 = 0x20000;
+    pub const USE_SHELLSLASH: i32 = 0x40000;
+}
+
+/// Translate the caller's `WILD_*` options into the `EW_*` flags
+/// `expand_wildcards()` understands (`map_wildopts_to_ewflags`).
+///
+/// Only six of the `WILD_*` flags have an `EW_*` counterpart; the
+/// rest steer cmdline completion itself and are deliberately dropped
+/// here. `EW_DIR` is always set - directories are always included.
+#[must_use]
+pub fn map_wildopts_to_ewflags(options: i32) -> i32 {
+    use crate::path::ew_flags;
+    // include directories
+    let mut flags = ew_flags::DIR;
+    if options & wild_flags::LIST_NOTFOUND != 0 {
+        flags |= ew_flags::NOTFOUND;
+    }
+    if options & wild_flags::ADD_SLASH != 0 {
+        flags |= ew_flags::ADDSLASH;
+    }
+    if options & wild_flags::KEEP_ALL != 0 {
+        flags |= ew_flags::KEEPALL;
+    }
+    if options & wild_flags::SILENT != 0 {
+        flags |= ew_flags::SILENT;
+    }
+    if options & wild_flags::NOERROR != 0 {
+        flags |= ew_flags::NOERROR;
+    }
+    if options & wild_flags::ALLLINKS != 0 {
+        flags |= ew_flags::ALLLINKS;
+    }
+    flags
 }
 
 /// The possible arguments of `:retab {-indentonly}` (`get_retab_arg`).
@@ -440,6 +522,108 @@ mod tests {
             ..crate::cmdexpand_defs::ExpandT::default()
         });
         assert!(!unsafe { cmdline_compl_is_fuzzy() });
+    }
+
+    // --- map_wildopts_to_ewflags ---
+
+    /// EW_DIR is unconditional: directories are always included, even
+    /// with no options at all.
+    #[test]
+    fn wildopts_always_include_directories() {
+        assert_eq!(map_wildopts_to_ewflags(0), crate::path::ew_flags::DIR);
+    }
+
+    #[test]
+    fn wildopts_map_each_translated_flag_to_its_ew_counterpart() {
+        use crate::path::ew_flags;
+        for (wild, ew) in [
+            (wild_flags::LIST_NOTFOUND, ew_flags::NOTFOUND),
+            (wild_flags::ADD_SLASH, ew_flags::ADDSLASH),
+            (wild_flags::KEEP_ALL, ew_flags::KEEPALL),
+            (wild_flags::SILENT, ew_flags::SILENT),
+            (wild_flags::NOERROR, ew_flags::NOERROR),
+            (wild_flags::ALLLINKS, ew_flags::ALLLINKS),
+        ] {
+            assert_eq!(map_wildopts_to_ewflags(wild), ew_flags::DIR | ew);
+        }
+    }
+
+    /// The `WILD_*` and `EW_*` bit values are NOT the same, so a
+    /// pass-through implementation must fail. `WILD_SILENT` is 0x40
+    /// but `EW_SILENT` is 0x20, and `WILD_ALLLINKS` is 0x200 while
+    /// `EW_ALLLINKS` is 0x1000.
+    #[test]
+    fn wildopts_are_translated_rather_than_passed_through() {
+        assert_ne!(wild_flags::SILENT, crate::path::ew_flags::SILENT);
+        assert_ne!(wild_flags::ALLLINKS, crate::path::ew_flags::ALLLINKS);
+        assert_eq!(
+            map_wildopts_to_ewflags(wild_flags::SILENT),
+            crate::path::ew_flags::DIR | crate::path::ew_flags::SILENT
+        );
+    }
+
+    /// Flags that steer cmdline completion itself have no `EW_*`
+    /// counterpart and must be dropped, not leaked into the result.
+    #[test]
+    fn wildopts_drop_the_untranslated_flags() {
+        let untranslated = wild_flags::HOME_REPLACE
+            | wild_flags::USE_NL
+            | wild_flags::NO_BEEP
+            | wild_flags::ESCAPE
+            | wild_flags::ICASE
+            | wild_flags::USE_COMPLETESLASH
+            | wild_flags::BUFLASTUSED
+            | wild_flags::NOSELECT
+            | wild_flags::NOINSERT;
+        assert_eq!(
+            map_wildopts_to_ewflags(untranslated),
+            crate::path::ew_flags::DIR
+        );
+    }
+
+    #[test]
+    fn wildopts_combine_several_flags_at_once() {
+        use crate::path::ew_flags;
+        let got = map_wildopts_to_ewflags(
+            wild_flags::LIST_NOTFOUND | wild_flags::SILENT | wild_flags::HOME_REPLACE,
+        );
+        assert_eq!(
+            got,
+            ew_flags::DIR | ew_flags::NOTFOUND | ew_flags::SILENT
+        );
+    }
+
+    /// Every value in each group must be distinct - a duplicated bit
+    /// would silently conflate two flags.
+    #[test]
+    fn wild_flag_values_are_all_distinct() {
+        let all = [
+            wild_flags::LIST_NOTFOUND,
+            wild_flags::HOME_REPLACE,
+            wild_flags::USE_NL,
+            wild_flags::NO_BEEP,
+            wild_flags::ADD_SLASH,
+            wild_flags::KEEP_ALL,
+            wild_flags::SILENT,
+            wild_flags::ESCAPE,
+            wild_flags::ICASE,
+            wild_flags::ALLLINKS,
+            wild_flags::USE_COMPLETESLASH,
+            wild_flags::NOERROR,
+            wild_flags::BUFLASTUSED,
+            wild_flags::BUF_DIFF_FILTER,
+            wild_flags::NOSELECT,
+            wild_flags::MAY_EXPAND_PATTERN,
+            wild_flags::FUNC_TRIGGER,
+            wild_flags::NOINSERT,
+            wild_flags::USE_SHELLSLASH,
+        ];
+        let mut seen = 0i32;
+        for f in all {
+            assert!(f.count_ones() == 1, "{f:#x} is not a single bit");
+            assert_eq!(seen & f, 0, "{f:#x} duplicates an earlier flag");
+            seen |= f;
+        }
     }
 
     /// Every expected value below was read out of a real `nvim`

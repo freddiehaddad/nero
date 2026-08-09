@@ -325,6 +325,53 @@ pub fn add_pathsep(p: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Flags for [`expand_wildcards`](crate::path) and friends (`EW_*`).
+///
+/// Note the original's own remark that `NOTFOUND` and `SILENT` are
+/// mostly mutually exclusive: `NOTFOUND` is used when executing
+/// commands, `SILENT` for interactive expanding.
+pub mod ew_flags {
+    /// include directory names (`EW_DIR`).
+    pub const DIR: i32 = 0x01;
+    /// include file names (`EW_FILE`).
+    pub const FILE: i32 = 0x02;
+    /// include not found names (`EW_NOTFOUND`).
+    pub const NOTFOUND: i32 = 0x04;
+    /// append slash to directory name (`EW_ADDSLASH`).
+    pub const ADDSLASH: i32 = 0x08;
+    /// keep all matches (`EW_KEEPALL`).
+    pub const KEEPALL: i32 = 0x10;
+    /// don't print "1 returned" from shell (`EW_SILENT`).
+    pub const SILENT: i32 = 0x20;
+    /// executable files (`EW_EXEC`).
+    pub const EXEC: i32 = 0x40;
+    /// search in `'path'` too (`EW_PATH`).
+    pub const PATH: i32 = 0x80;
+    /// ignore case (`EW_ICASE`).
+    pub const ICASE: i32 = 0x100;
+    /// no error for bad regexp (`EW_NOERROR`).
+    pub const NOERROR: i32 = 0x200;
+    /// add match with literal name if it exists (`EW_NOTWILD`).
+    pub const NOTWILD: i32 = 0x400;
+    /// do not escape `$`, `$var` is expanded (`EW_KEEPDOLLAR`).
+    pub const KEEPDOLLAR: i32 = 0x800;
+    /// also links not pointing to an existing file (`EW_ALLLINKS`).
+    pub const ALLLINKS: i32 = 0x1000;
+    /// called from `expand_shellcmd()`, don't check if the executable
+    /// is in `$PATH` (`EW_SHELLCMD`).
+    pub const SHELLCMD: i32 = 0x2000;
+    /// also files starting with a dot (`EW_DODOT`).
+    pub const DODOT: i32 = 0x4000;
+    /// no matches is not an error (`EW_EMPTYOK`).
+    pub const EMPTYOK: i32 = 0x8000;
+    /// do not expand environment variables (`EW_NOTENV`).
+    pub const NOTENV: i32 = 0x10000;
+    /// search in `'cdpath'` too (`EW_CDPATH`).
+    pub const CDPATH: i32 = 0x20000;
+    /// do not invoke breakcheck (`EW_NOBREAK`).
+    pub const NOBREAK: i32 = 0x40000;
+}
+
 /// `path_is_url()` has found `":/"` (`URL_SLASH`).
 pub const URL_SLASH: i32 = 1;
 /// `path_is_url()` has found `":\"` (`URL_BACKSLASH`).
