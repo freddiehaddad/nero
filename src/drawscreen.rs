@@ -379,6 +379,66 @@ pub unsafe fn screen_invalidate_highlights() {
     }
 }
 
+/// The `'fillchars'` connector character to draw at one corner of a
+/// window, where its separators meet its neighbours'
+/// (`get_corner_sep_connector`).
+///
+/// Two windows are always connected either vertically or
+/// horizontally, so a corner that is not vertically connected is
+/// assumed to be horizontally connected - the original states this
+/// explicitly, and it is why there is no "neither" case.
+///
+/// # Safety
+/// Forwarded from [`vsep_connected`]/[`hsep_connected`]'s own safety
+/// docs.
+#[must_use]
+pub unsafe fn get_corner_sep_connector(
+    wp: *mut crate::buffer_defs::WinT,
+    corner: WindowCorner,
+) -> crate::types_defs::ScharT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let fcs = unsafe { &*wp }.w_p_fcs_chars;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { vsep_connected(wp, corner) } {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { hsep_connected(wp, corner) } {
+            fcs.verthoriz
+        } else if matches!(corner, WindowCorner::TopLeft | WindowCorner::BottomLeft) {
+            fcs.vertright
+        } else {
+            fcs.vertleft
+        }
+    } else if matches!(corner, WindowCorner::TopLeft | WindowCorner::TopRight) {
+        fcs.horizdown
+    } else {
+        fcs.horizup
+    }
+}
+
+/// Whether the cursor line needs its own highlighting in `wp`
+/// (`win_cursorline_standout`).
+///
+/// True with `'cursorline'` set, or - only in the CURRENT window -
+/// when concealing is active and the cursor line itself is NOT
+/// concealed, since the cursor line is then shown unconcealed and so
+/// already differs from its neighbours.
+///
+/// # Safety
+/// Reads `GLOBALS.curwin`. Forwarded from [`conceal_cursor_line`]'s
+/// own safety doc.
+#[must_use]
+pub unsafe fn win_cursorline_standout(wp: &WinT) -> bool {
+    if wp.w_onebuf_opt.wo_cul != 0 {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    std::ptr::eq(std::ptr::from_ref(wp), curwin)
+        && wp.w_onebuf_opt.wo_cole > 0
+        && !unsafe { conceal_cursor_line(wp) }
+}
+
 /// Whether the cursor line should be concealed in `wp`
 /// (`conceal_cursor_line`).
 ///
@@ -1402,6 +1462,162 @@ mod tests {
             assert!(!unsafe { hsep_connected(&mut win, corner) });
             assert!(!unsafe { vsep_connected(&mut win, corner) });
         }
+    }
+
+    // ---- get_corner_sep_connector / win_cursorline_standout ----
+
+    /// A lone window is connected on neither axis. The original
+    /// treats "not vertically connected" as "horizontally connected"
+    /// rather than having a third case, so the horizontal connectors
+    /// are what come back - chosen by whether the corner is on the
+    /// TOP or the BOTTOM.
+    #[test]
+    fn corner_sep_connector_falls_back_to_the_horizontal_connectors() {
+        // A lone window needs a real leaf frame: the separator walk
+        // starts at w_frame and would deref a null one.
+        let mut win = crate::buffer_defs::WinT::default();
+        let mut frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut win,
+            ..Default::default()
+        };
+        win.w_frame = &mut frame;
+        win.w_p_fcs_chars.horizdown = 1;
+        win.w_p_fcs_chars.horizup = 2;
+        win.w_p_fcs_chars.vertright = 3;
+        win.w_p_fcs_chars.vertleft = 4;
+        win.w_p_fcs_chars.verthoriz = 5;
+
+        assert_eq!(unsafe { get_corner_sep_connector(&mut win, WindowCorner::TopLeft) }, 1);
+        assert_eq!(unsafe { get_corner_sep_connector(&mut win, WindowCorner::TopRight) }, 1);
+        assert_eq!(unsafe { get_corner_sep_connector(&mut win, WindowCorner::BottomLeft) }, 2);
+        assert_eq!(unsafe { get_corner_sep_connector(&mut win, WindowCorner::BottomRight) }, 2);
+    }
+
+    /// With a genuine vertical connection but no horizontal one, the
+    /// connector is a T pointing sideways, picked by whether the
+    /// corner is on the LEFT or the RIGHT.
+    #[test]
+    fn corner_sep_connector_uses_the_sideways_tees_when_only_vertically_connected() {
+        // Two windows side by side, as in vsep_connected's own test.
+        let mut left_win = crate::buffer_defs::WinT { w_wincol: 0, w_width: 40, ..Default::default() };
+        let mut right_win =
+            crate::buffer_defs::WinT { w_wincol: 41, w_width: 39, ..Default::default() };
+        left_win.w_p_fcs_chars.vertright = 3;
+        left_win.w_p_fcs_chars.vertleft = 4;
+        left_win.w_p_fcs_chars.verthoriz = 5;
+        left_win.w_p_fcs_chars.horizdown = 1;
+        left_win.w_p_fcs_chars.horizup = 2;
+
+        let mut parent = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_COL,
+            ..Default::default()
+        };
+        let mut right_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut right_win,
+            fr_width: 39,
+            fr_parent: &mut parent,
+            ..Default::default()
+        };
+        let mut left_frame = crate::buffer_defs::FrameT {
+            fr_layout: crate::buffer_defs::FR_LEAF,
+            fr_win: &mut left_win,
+            fr_width: 40,
+            fr_parent: &mut parent,
+            fr_next: &mut right_frame,
+            ..Default::default()
+        };
+        // The downward walk stops immediately (the sibling is already
+        // a leaf), so parent.fr_child is deliberately not wired up.
+        left_win.w_frame = &mut left_frame;
+
+        // Vertically connected, not horizontally: a LEFT corner gets
+        // the right-pointing tee, a RIGHT corner the left-pointing one.
+        assert!(unsafe { vsep_connected(&mut left_win, WindowCorner::BottomRight) });
+        assert!(!unsafe { hsep_connected(&mut left_win, WindowCorner::BottomRight) });
+        assert_eq!(
+            unsafe { get_corner_sep_connector(&mut left_win, WindowCorner::BottomRight) },
+            4
+        );
+    }
+
+    /// 'cursorline' alone is enough, in ANY window - the conceal
+    /// branch never gets a say.
+    #[test]
+    fn cursorline_standout_is_true_with_cursorline_set() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_cul = 1;
+        // Not the current window, and no concealing.
+        assert!(unsafe { win_cursorline_standout(&win) });
+    }
+
+    /// The conceal branch applies ONLY to the current window: another
+    /// window with the same settings must not stand out.
+    #[test]
+    fn cursorline_standout_conceal_branch_is_limited_to_the_current_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_cul = 0;
+        win.w_onebuf_opt.wo_cole = 2;
+        win.w_onebuf_opt.wo_cocu = Some(Vec::new()); // never conceal the cursor line
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curwin;
+
+        // Some OTHER window is current.
+        let mut other = Box::new(crate::buffer_defs::WinT::default());
+        g.curwin = std::ptr::from_mut(&mut *other);
+        assert!(!unsafe { win_cursorline_standout(&win) });
+
+        // Now it is the current one.
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        assert!(unsafe { win_cursorline_standout(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
+    }
+
+    /// With concealing on but the cursor line itself concealed, there
+    /// is nothing to make it stand out.
+    #[test]
+    fn cursorline_standout_is_false_when_the_cursor_line_is_itself_concealed() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_cul = 0;
+        win.w_onebuf_opt.wo_cole = 2;
+        // "n" conceals the cursor line in Normal mode.
+        win.w_onebuf_opt.wo_cocu = Some(b"n".to_vec());
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let (prev_win, prev_state) = (g.curwin, g.State);
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.State = crate::state_defs::mode::NORMAL as i32;
+
+        assert!(!unsafe { win_cursorline_standout(&win) });
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = prev_win;
+        g.State = prev_state;
+    }
+
+    /// Without concealing at all there is no second route to standing
+    /// out.
+    #[test]
+    fn cursorline_standout_is_false_without_cursorline_or_conceal() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_onebuf_opt.wo_cul = 0;
+        win.w_onebuf_opt.wo_cole = 0;
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curwin;
+        g.curwin = std::ptr::from_mut(&mut *win);
+
+        assert!(!unsafe { win_cursorline_standout(&win) });
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
     }
 
     #[test]
