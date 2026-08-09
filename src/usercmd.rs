@@ -107,6 +107,145 @@ pub static UCMDS: std::sync::LazyLock<
     crate::globals::GlobalCell::new(crate::garray_defs::TypedGarrayT::default())
 });
 
+/// Search for a user command matching the start of `eap.cmd`
+/// (`find_ucmd`).
+///
+/// On a match, records the registry in `eap.cmdidx`
+/// ([`crate::ex_cmds_defs::CmdIdxT::USER`] or `USER_BUF`), the flags
+/// in `eap.argt`, the index within that registry in `eap.useridx`,
+/// and the address type in `eap.addr_type`.
+///
+/// `p` is the byte OFFSET into `eap.cmd` just past the typed command
+/// name (possibly including a count); the original passes a pointer
+/// into the same buffer. Returns the offset just after the matched
+/// command, `None` when nothing matched usefully.
+///
+/// Buffer-local commands are searched before global ones. A second
+/// match makes the command ambiguous - except that a buffer-local
+/// partial match does NOT block a later global FULL match, which is
+/// why an ambiguous buffer-local hit only sets a flag and keeps
+/// searching, while an ambiguous global hit gives up at once.
+///
+/// # Safety
+/// Forwarded from [`crate::window::prevwin_curwin`]'s own safety doc;
+/// touches [`UCMDS`].
+pub unsafe fn find_ucmd(
+    eap: &mut crate::ex_cmds_defs::ExargT,
+    p: usize,
+    full: Option<&mut bool>,
+    xp: Option<&mut crate::cmdexpand_defs::ExpandT>,
+    complp: Option<&mut i32>,
+) -> Option<usize> {
+    let cmd = eap.cmd.clone().unwrap_or_default();
+    let len = p;
+    let mut matchlen = 0usize;
+    let mut found = false;
+    let mut possible = false;
+    // Found an ambiguous buffer-local command; only a full-match
+    // global one is accepted after this.
+    let mut amb_local = false;
+
+    let mut full = full;
+    let mut xp = xp;
+    let mut complp = complp;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { &*(*crate::window::prevwin_curwin()).w_buffer };
+    // Buffer-local commands first, then global ones.
+    let buf_items = buf.b_ucmds.items.clone();
+    // SAFETY: forwarded from this function's own safety doc.
+    let global_items = unsafe { UCMDS.get_mut() }.items.clone();
+
+    for (is_global, items) in [(false, &buf_items), (true, &global_items)] {
+        let mut broke_early = false;
+        for (j, uc) in items.iter().enumerate() {
+            let name = uc.uc_name.as_deref().unwrap_or(&[]);
+            // How much of the typed text matches this command's name.
+            let mut k = 0usize;
+            while k < len && k < name.len() && cmd.get(k) == name.get(k) {
+                k += 1;
+            }
+            let name_exhausted = k >= name.len();
+            let next_is_digit = cmd
+                .get(k)
+                .copied()
+                .is_some_and(|c| crate::ascii_defs::ascii_isdigit(i32::from(c)));
+
+            if !(k == len || (name_exhausted && next_is_digit)) {
+                continue;
+            }
+
+            // A second match makes it ambiguous - but a buffer-local
+            // partial match must not block a global full match.
+            if k == len && found && !name_exhausted {
+                if is_global {
+                    return None;
+                }
+                amb_local = true;
+            }
+
+            if !found || (k == len && name_exhausted) {
+                // Matching only up to a digit leaves open that another
+                // command including that digit is the better match.
+                if k == len {
+                    found = true;
+                } else {
+                    possible = true;
+                }
+
+                eap.cmdidx = if is_global {
+                    crate::ex_cmds_defs::CmdIdxT::USER
+                } else {
+                    crate::ex_cmds_defs::CmdIdxT::USER_BUF
+                };
+                eap.argt = uc.uc_argt;
+                eap.useridx = i32::try_from(j).unwrap_or(0);
+                eap.addr_type = uc.uc_addr_type;
+
+                if let Some(complp) = complp.as_deref_mut() {
+                    *complp = uc.uc_compl;
+                }
+                if let Some(xp) = xp.as_deref_mut() {
+                    xp.xp_luaref = uc.uc_compl_luaref;
+                    xp.xp_arg = uc.uc_compl_arg.clone();
+                    xp.xp_script_ctx = uc.uc_script_ctx;
+                    xp.xp_script_ctx.sc_lnum += crate::runtime::sourcing_lnum();
+                }
+                matchlen = k;
+
+                // An exact match ends the search; do not look for
+                // further abbreviations.
+                if k == len && name_exhausted {
+                    if let Some(full) = full.as_deref_mut() {
+                        *full = true;
+                    }
+                    amb_local = false;
+                    broke_early = true;
+                    break;
+                }
+            }
+        }
+        if broke_early {
+            break;
+        }
+    }
+
+    // Only ambiguous matches were found.
+    if amb_local {
+        if let Some(xp) = xp {
+            xp.xp_context = crate::cmdexpand_defs::ExpandContext::Unsuccessful;
+        }
+        return None;
+    }
+
+    // The match may be followed immediately by a number; step back to
+    // point at it.
+    if found || possible {
+        return Some(p + matchlen - len);
+    }
+    Some(p)
+}
+
 /// Release everything one user command owns (`free_ucmd`).
 ///
 /// The original's four `xfree`s and three `NLUA_CLEAR_REF`s become
@@ -743,6 +882,157 @@ mod tests {
     }
 
     // --- free_ucmd / uc_clear / ex_comclear / get_user_command_name ---
+
+    // --- find_ucmd ---
+
+    fn ucmd_eap(cmd: &[u8]) -> crate::ex_cmds_defs::ExargT {
+        crate::ex_cmds_defs::ExargT { cmd: Some(cmd.to_vec()), ..Default::default() }
+    }
+
+    #[test]
+    fn find_ucmd_matches_a_buffer_local_command_exactly() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Foo"], &[]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let mut full = false;
+        let got = unsafe { find_ucmd(&mut eap, 3, Some(&mut full), None, None) };
+
+        assert_eq!(got, Some(3));
+        assert!(full, "an exact match reports a full match");
+        assert_eq!(eap.cmdidx, CmdIdxT::USER_BUF);
+        assert_eq!(eap.useridx, 0);
+    }
+
+    #[test]
+    fn find_ucmd_matches_a_global_command_when_no_buffer_local_one_does() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[], &[b"Other", b"Foo"]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let mut full = false;
+        let got = unsafe { find_ucmd(&mut eap, 3, Some(&mut full), None, None) };
+
+        assert_eq!(got, Some(3));
+        assert!(full);
+        assert_eq!(eap.cmdidx, CmdIdxT::USER);
+        assert_eq!(eap.useridx, 1, "the index within the GLOBAL registry");
+    }
+
+    /// Buffer-local commands are searched first, so one shadows a
+    /// global command of the same name.
+    #[test]
+    fn find_ucmd_prefers_a_buffer_local_command_over_a_global_one() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Foo"], &[b"Foo"]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let got = unsafe { find_ucmd(&mut eap, 3, None, None, None) };
+        assert_eq!(got, Some(3));
+        assert_eq!(eap.cmdidx, CmdIdxT::USER_BUF);
+    }
+
+    /// A unique abbreviation matches, and the command's own
+    /// attributes are copied out.
+    #[test]
+    fn find_ucmd_accepts_a_unique_abbreviation_and_copies_the_attributes() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+
+        let mut buf = Box::new(crate::buffer_defs::BufT::default());
+        buf.b_ucmds.items = vec![UcmdT {
+            uc_name: Some(b"Foobar".to_vec()),
+            uc_argt: 0x99,
+            uc_compl: 7,
+            uc_addr_type: crate::ex_cmds_defs::CmdAddrT::Buffers,
+            ..UcmdT::default()
+        }];
+        let mut win = Box::new(crate::buffer_defs::WinT::default());
+        win.w_buffer = std::ptr::from_mut(&mut *buf);
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        g.curwin = std::ptr::from_mut(&mut *win);
+        g.curbuf = std::ptr::from_mut(&mut *buf);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let mut complp = 0;
+        let got = unsafe { find_ucmd(&mut eap, 3, None, None, Some(&mut complp)) };
+
+        assert_eq!(got, Some(3));
+        assert_eq!(eap.argt, 0x99);
+        assert_eq!(eap.addr_type, crate::ex_cmds_defs::CmdAddrT::Buffers);
+        assert_eq!(complp, 7);
+    }
+
+    /// Two GLOBAL commands sharing a prefix are genuinely ambiguous,
+    /// so the lookup gives up at once.
+    #[test]
+    fn find_ucmd_rejects_an_ambiguous_global_abbreviation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[], &[b"Foobar", b"Foobaz"]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        assert_eq!(unsafe { find_ucmd(&mut eap, 3, None, None, None) }, None);
+    }
+
+    /// Two ambiguous BUFFER-LOCAL commands set the unsuccessful
+    /// completion context rather than returning silently.
+    #[test]
+    fn find_ucmd_reports_an_ambiguous_buffer_local_abbreviation() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Foobar", b"Foobaz"], &[]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        let got = unsafe { find_ucmd(&mut eap, 3, None, Some(&mut xp), None) };
+
+        assert_eq!(got, None);
+        assert_eq!(xp.xp_context, crate::cmdexpand_defs::ExpandContext::Unsuccessful);
+    }
+
+    /// The asymmetry that motivates `amb_local`: an ambiguous
+    /// BUFFER-LOCAL abbreviation must NOT block a global command that
+    /// matches in full. An implementation that gave up on the first
+    /// ambiguity, as it does for the global registry, would fail here.
+    #[test]
+    fn find_ucmd_lets_a_full_global_match_win_over_an_ambiguous_buffer_local_one() {
+        use crate::ex_cmds_defs::CmdIdxT;
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Foobar", b"Foobaz"], &[b"Foo"]);
+
+        let mut eap = ucmd_eap(b"Foo");
+        let mut full = false;
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+        let got = unsafe { find_ucmd(&mut eap, 3, Some(&mut full), Some(&mut xp), None) };
+
+        assert_eq!(got, Some(3), "the full global match wins");
+        assert!(full);
+        assert_eq!(eap.cmdidx, CmdIdxT::USER);
+        assert_ne!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::Unsuccessful,
+            "the buffer-local ambiguity must have been cleared"
+        );
+    }
+
+    /// With nothing matching, the offset comes back unchanged.
+    #[test]
+    fn find_ucmd_returns_the_offset_unchanged_when_nothing_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = UcmdsGuard::save();
+        let (_win, _buf) = with_user_commands(&[b"Foo"], &[b"Bar"]);
+
+        let mut eap = ucmd_eap(b"Zzz");
+        assert_eq!(unsafe { find_ucmd(&mut eap, 3, None, None, None) }, Some(3));
+    }
 
     /// The two registries are indexed SEPARATELY here, unlike
     /// `get_user_commands` which numbers them as one sequence. Both
