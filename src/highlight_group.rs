@@ -487,6 +487,62 @@ pub unsafe fn restore_cterm_colors() {
     }
 }
 
+/// The `idx`-th name offered when completing a highlight group
+/// (`get_highlight_name_ext`), or `None` past the end.
+///
+/// The completion list is the group table followed by up to four
+/// keyword entries, each included only when the corresponding
+/// `include_*` counter says so. That layout means the keywords' own
+/// indices SHIFT with the counters, which is why each arm adds the
+/// preceding counters rather than a fixed offset.
+///
+/// A cleared group yields an empty name rather than being skipped:
+/// entries are never removed from the table, so the caller filters
+/// them out by the empty result instead of the indices moving.
+///
+/// `idx` is a 0-BASED index into that completion list, not a group ID.
+///
+/// # Safety
+/// Reads the [`HL_TABLE`] file-static and `GLOBALS`' `include_*`
+/// counters.
+#[must_use]
+pub unsafe fn get_highlight_name_ext(idx: i32, skip_cleared: bool) -> Option<Vec<u8>> {
+    if idx < 0 {
+        return None;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let table = unsafe { HL_TABLE.get_mut() };
+    let len = table.ga_len();
+
+    // Items are never removed from the table, so cleared ones are
+    // reported as an empty name rather than shifting the indices.
+    if skip_cleared && idx < len && table.items[idx as usize].sg_cleared {
+        return Some(Vec::new());
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    let (none, default, link) = (g.include_none, g.include_default, g.include_link);
+
+    if idx == len && none != 0 {
+        return Some(b"none".to_vec());
+    }
+    if idx == len + none && default != 0 {
+        return Some(b"default".to_vec());
+    }
+    if idx == len + none + default && link != 0 {
+        return Some(b"link".to_vec());
+    }
+    if idx == len + none + default + 1 && link != 0 {
+        return Some(b"clear".to_vec());
+    }
+    if idx >= len {
+        return None;
+    }
+    Some(table.items[idx as usize].sg_name.clone())
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -1090,6 +1146,123 @@ mod tests {
             assert_eq!(*crate::highlight::CTERM_NORMAL_FG_COLOR.get_mut(), 0);
             assert_eq!(*crate::highlight::CTERM_NORMAL_BG_COLOR.get_mut(), 0);
         }
+    }
+
+    // --- get_highlight_name_ext ---
+
+    /// Sets the three completion-inclusion counters, restoring them on
+    /// drop even through a panic.
+    struct IncludeGuard {
+        none: i32,
+        default_: i32,
+        link: i32,
+    }
+
+    impl IncludeGuard {
+        fn set(none: i32, default_: i32, link: i32) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let me = Self {
+                none: g.include_none,
+                default_: g.include_default,
+                link: g.include_link,
+            };
+            g.include_none = none;
+            g.include_default = default_;
+            g.include_link = link;
+            me
+        }
+    }
+
+    impl Drop for IncludeGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.include_none = self.none;
+            g.include_default = self.default_;
+            g.include_link = self.link;
+        }
+    }
+
+    #[test]
+    fn get_highlight_name_ext_lists_the_groups_then_stops() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A", b"B"]);
+        let _i = IncludeGuard::set(0, 0, 0);
+
+        assert_eq!(unsafe { get_highlight_name_ext(0, false) }, Some(b"A".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(1, false) }, Some(b"B".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(2, false) }, None, "past the end");
+        assert_eq!(unsafe { get_highlight_name_ext(-1, false) }, None);
+    }
+
+    /// The keyword entries sit AFTER the groups, and their indices
+    /// shift with the counters rather than being fixed. With every
+    /// counter on, the order is none, default, link, clear.
+    #[test]
+    fn get_highlight_name_ext_appends_the_keywords_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        let _i = IncludeGuard::set(1, 1, 1);
+
+        assert_eq!(unsafe { get_highlight_name_ext(1, false) }, Some(b"none".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(2, false) }, Some(b"default".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(3, false) }, Some(b"link".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(4, false) }, Some(b"clear".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(5, false) }, None);
+    }
+
+    /// With "none" excluded, the remaining keywords MOVE DOWN by one -
+    /// the indices are relative to the counters, not fixed slots.
+    #[test]
+    fn get_highlight_name_ext_shifts_the_keywords_when_none_is_excluded() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        let _i = IncludeGuard::set(0, 1, 1);
+
+        assert_eq!(
+            unsafe { get_highlight_name_ext(1, false) },
+            Some(b"default".to_vec()),
+            "default takes the slot none would have used"
+        );
+        assert_eq!(unsafe { get_highlight_name_ext(2, false) }, Some(b"link".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(3, false) }, Some(b"clear".to_vec()));
+    }
+
+    /// "clear" is offered only alongside "link", since both are gated
+    /// on the same counter.
+    #[test]
+    fn get_highlight_name_ext_omits_link_and_clear_together() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        let _i = IncludeGuard::set(1, 1, 0);
+
+        assert_eq!(unsafe { get_highlight_name_ext(1, false) }, Some(b"none".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(2, false) }, Some(b"default".to_vec()));
+        assert_eq!(unsafe { get_highlight_name_ext(3, false) }, None, "no link");
+        assert_eq!(unsafe { get_highlight_name_ext(4, false) }, None, "no clear");
+    }
+
+    /// A cleared group yields an EMPTY name rather than being skipped,
+    /// so the indices of later entries do not move.
+    #[test]
+    fn get_highlight_name_ext_reports_a_cleared_group_as_empty() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A", b"B"]);
+        let _i = IncludeGuard::set(0, 0, 0);
+
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_cleared = true;
+
+        assert_eq!(
+            unsafe { get_highlight_name_ext(0, true) },
+            Some(Vec::new()),
+            "empty, not skipped"
+        );
+        assert_eq!(
+            unsafe { get_highlight_name_ext(1, true) },
+            Some(b"B".to_vec()),
+            "the next entry keeps its index"
+        );
+        // Without skip_cleared the real name still comes through.
+        assert_eq!(unsafe { get_highlight_name_ext(0, false) }, Some(b"A".to_vec()));
     }
 
     #[test]
