@@ -104,6 +104,41 @@ pub struct HlGroup {
 pub static HL_TABLE: GlobalCell<TypedGarrayT<HlGroup>> =
     GlobalCell::new(TypedGarrayT::new(10));
 
+/// Index from a group's UPPERCASE name to its 1-based ID
+/// (`highlight_unames`).
+///
+/// Kept as a real map rather than folded into a scan over
+/// [`HL_TABLE`], matching the original: it exists precisely so name
+/// lookups do not walk the table, and its keys are the uppercase
+/// forms so lookups are case-insensitive without repeated folding.
+pub static HIGHLIGHT_UNAMES: std::sync::LazyLock<GlobalCell<crate::map::Map<Vec<u8>, i32>>> =
+    std::sync::LazyLock::new(|| GlobalCell::new(crate::map::Map::new()));
+
+/// Look up a highlight group by name and return its 1-based ID, or
+/// `0` when there is no such group (`syn_name2id_len`).
+///
+/// The lookup is case-INSENSITIVE: the needle is uppercased and
+/// matched against [`HIGHLIGHT_UNAMES`]'s uppercase keys.
+///
+/// An empty name, or one longer than [`MAX_SYN_NAME`], is rejected
+/// outright - the original guards this because it uppercases into a
+/// fixed `MAX_SYN_NAME + 1` stack buffer. That buffer is unnecessary
+/// here, but the bound is part of the observable contract, so it is
+/// kept rather than silently accepting longer names.
+///
+/// # Safety
+/// Reads the [`HIGHLIGHT_UNAMES`] file-static.
+#[must_use]
+pub unsafe fn syn_name2id_len(name: &[u8]) -> i32 {
+    if name.is_empty() || name.len() > MAX_SYN_NAME {
+        return 0;
+    }
+    let name_u = crate::strings::vim_strsave_up(name);
+    // SAFETY: forwarded from this function's own safety doc. A missing
+    // key yields 0, which is the original's own "no such group".
+    unsafe { HIGHLIGHT_UNAMES.get_mut() }.get_or_default(&name_u)
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -132,10 +167,11 @@ pub unsafe fn syn_id2name(id: i32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Installs a table of groups with the given names, restoring the
-    /// previous table on drop even through a panic.
+    /// Installs a table of groups AND the matching uppercase name
+    /// index, restoring both on drop even through a panic.
     struct HlTableGuard {
         saved: Vec<HlGroup>,
+        saved_names: crate::map::Map<Vec<u8>, i32>,
     }
 
     impl HlTableGuard {
@@ -150,13 +186,22 @@ mod tests {
                     ..Default::default()
                 })
                 .collect();
-            Self { saved }
+
+            let unames = unsafe { HIGHLIGHT_UNAMES.get_mut() };
+            let saved_names = std::mem::replace(unames, crate::map::Map::new());
+            for (i, n) in names.iter().enumerate() {
+                // IDs are 1-based, matching syn_id2name.
+                unames.insert(crate::strings::vim_strsave_up(n), i as i32 + 1);
+            }
+            Self { saved, saved_names }
         }
     }
 
     impl Drop for HlTableGuard {
         fn drop(&mut self) {
             unsafe { HL_TABLE.get_mut() }.items = std::mem::take(&mut self.saved);
+            *unsafe { HIGHLIGHT_UNAMES.get_mut() } =
+                std::mem::replace(&mut self.saved_names, crate::map::Map::new());
         }
     }
 
@@ -202,6 +247,57 @@ mod tests {
     #[test]
     fn sg_set_flag_values_match_the_original() {
         assert_eq!((sg_set::CTERM, sg_set::GUI, sg_set::LINK), (2, 4, 8));
+    }
+
+    // --- syn_name2id_len ---
+
+    /// Lookup is case-insensitive and returns the same 1-based IDs
+    /// that [`syn_id2name`] maps back.
+    #[test]
+    fn syn_name2id_len_is_case_insensitive_and_round_trips() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Normal", b"Comment"]);
+
+        assert_eq!(unsafe { syn_name2id_len(b"Normal") }, 1);
+        assert_eq!(unsafe { syn_name2id_len(b"NORMAL") }, 1);
+        assert_eq!(unsafe { syn_name2id_len(b"normal") }, 1);
+        assert_eq!(unsafe { syn_name2id_len(b"Comment") }, 2);
+
+        // Round-trip: the ID maps back to the ORIGINAL-cased name.
+        let id = unsafe { syn_name2id_len(b"cOmMeNt") };
+        assert_eq!(unsafe { syn_id2name(id) }, b"Comment".to_vec());
+    }
+
+    #[test]
+    fn syn_name2id_len_returns_zero_for_an_unknown_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Normal"]);
+        assert_eq!(unsafe { syn_name2id_len(b"Nope") }, 0);
+    }
+
+    /// An empty name is rejected rather than matching anything.
+    #[test]
+    fn syn_name2id_len_rejects_an_empty_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Normal"]);
+        assert_eq!(unsafe { syn_name2id_len(b"") }, 0);
+    }
+
+    /// The `MAX_SYN_NAME` bound is part of the contract: a name of
+    /// exactly that length is accepted, one byte longer is rejected.
+    #[test]
+    fn syn_name2id_len_bounds_the_name_length_exactly() {
+        let _lock = crate::globals::global_state_test_lock();
+        let at_limit = vec![b'a'; MAX_SYN_NAME];
+        let too_long = vec![b'a'; MAX_SYN_NAME + 1];
+        let _g = HlTableGuard::with_names(&[&at_limit, &too_long]);
+
+        assert_eq!(unsafe { syn_name2id_len(&at_limit) }, 1, "exactly at the limit");
+        assert_eq!(
+            unsafe { syn_name2id_len(&too_long) },
+            0,
+            "one byte past the limit is rejected, even though it is in the table"
+        );
     }
 
     #[test]
