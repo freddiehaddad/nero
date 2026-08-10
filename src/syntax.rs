@@ -439,6 +439,144 @@ pub fn limit_pos(pos: &mut LposT, limit: &LposT) {
     }
 }
 
+/// Walk `off` characters from byte index `col` in `line`, forwards for
+/// a positive `off` and backwards for a negative one, and return the
+/// resulting byte index.
+///
+/// Shared by [`syn_add_start_off`] and [`syn_add_end_off`], which the
+/// original spells out twice. Walking stops at the line's NUL going
+/// forwards and at its start going backwards, so the result is always
+/// a valid index. Movement is per CHARACTER, not per byte.
+fn walk_off(line: &[u8], col: usize, off: i32) -> usize {
+    let mut p = col.min(line.len());
+    if off > 0 {
+        let mut n = off;
+        while n > 0 && line.get(p).copied().unwrap_or(0) != 0 {
+            // SAFETY: `utfc_ptr2len` only touches `OPTION_VARS`.
+            p += (unsafe { crate::mbyte::utfc_ptr2len(&line[p..]) }).max(1) as usize;
+            p = p.min(line.len());
+            n -= 1;
+        }
+    } else if off < 0 {
+        let mut n = off;
+        while n < 0 && p > 0 {
+            // SAFETY: `utf_head_off` only reads the slice it is given.
+            let back = unsafe { crate::mbyte::utf_head_off(line, p - 1) };
+            p -= back as usize + 1;
+            n += 1;
+        }
+    }
+    p
+}
+
+/// Compute the END position of a match, applying pattern offset `idx`
+/// (`syn_add_end_off`).
+///
+/// The offset is measured from the match's START when the low flag bit
+/// for `idx` is set (and then `extra` is added), otherwise from its
+/// END. `extra` exists for the `matchgroup` case.
+///
+/// Note the difference from [`syn_add_start_off`]: when the resulting
+/// line runs past the end of the buffer this sets the column to `0`
+/// and SKIPS the offset walk entirely, because the original's second
+/// test is an `else if`. It also leaves the line number past the end
+/// rather than clamping it.
+///
+/// # Safety
+/// `SYN_BUF` must be a valid, non-null pointer to a live `BufT`.
+pub unsafe fn syn_add_end_off(
+    result: &mut LposT,
+    regmatch: &crate::regexp_defs::RegmmatchT,
+    spp: &SynpatT,
+    idx: usize,
+    extra: i32,
+) {
+    let (lnum, mut col, off) = if spp.sp_off_flags & (1 << idx) != 0 {
+        (
+            regmatch.startpos[0].lnum,
+            regmatch.startpos[0].col,
+            spp.sp_offsets[idx] + extra,
+        )
+    } else {
+        (regmatch.endpos[0].lnum, regmatch.endpos[0].col, spp.sp_offsets[idx])
+    };
+    result.lnum = lnum;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { *SYN_BUF.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*buf }.b_ml.ml_line_count;
+
+    // Don't go past the end of the line. Matters for "rs=e+2" when
+    // there is a matchgroup. Watch out for a match with the last NL in
+    // the buffer.
+    if result.lnum > line_count {
+        col = 0;
+    } else if off != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf, result.lnum) };
+        col = walk_off(&line, col as usize, off) as crate::pos_defs::ColnrT;
+    }
+    result.col = col;
+}
+
+/// Compute the START position of a match, applying pattern offset
+/// `idx` (`syn_add_start_off`).
+///
+/// The offset is measured from the match's END when the HIGH flag bit
+/// for `idx` is set - the original shifts by `SPO_COUNT`, so each
+/// offset has a separate "from which end" bit - otherwise from its
+/// start.
+///
+/// Unlike [`syn_add_end_off`], a line past the end of the buffer is
+/// CLAMPED to the last line (a `\n` at the end of the pattern can take
+/// the match below it), the column set to that line's length, and the
+/// offset walk still runs.
+///
+/// # Safety
+/// Same as [`syn_add_end_off`].
+pub unsafe fn syn_add_start_off(
+    result: &mut LposT,
+    regmatch: &crate::regexp_defs::RegmmatchT,
+    spp: &SynpatT,
+    idx: usize,
+    extra: i32,
+) {
+    let (lnum, mut col, off) = if spp.sp_off_flags & (1 << (idx + spo::COUNT)) != 0 {
+        (
+            regmatch.endpos[0].lnum,
+            regmatch.endpos[0].col,
+            spp.sp_offsets[idx] + extra,
+        )
+    } else {
+        (
+            regmatch.startpos[0].lnum,
+            regmatch.startpos[0].col,
+            spp.sp_offsets[idx],
+        )
+    };
+    result.lnum = lnum;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let buf = unsafe { *SYN_BUF.get_mut() };
+    // SAFETY: forwarded from this function's own safety doc.
+    let line_count = unsafe { &*buf }.b_ml.ml_line_count;
+
+    if result.lnum > line_count {
+        // A "\n" at the end of the pattern may take us below the last
+        // line.
+        result.lnum = line_count;
+        // SAFETY: forwarded from this function's own safety doc.
+        col = unsafe { crate::memline::ml_get_buf_len(&mut *buf, result.lnum) };
+    }
+    if off != 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        let line = unsafe { crate::memline::ml_get_buf(&mut *buf, result.lnum) };
+        col = walk_off(&line, col as usize, off) as crate::pos_defs::ColnrT;
+    }
+    result.col = col;
+}
+
 /// Pattern-offset slots in [`SynpatT::sp_offsets`] (`SPO_*`).
 pub mod spo {
     /// match start offset (`SPO_MS_OFF`).
@@ -705,6 +843,163 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- syn_add_start_off / syn_add_end_off ----
+
+    /// A match spanning the given start/end positions on line 1.
+    fn offset_match(
+        start_col: crate::pos_defs::ColnrT,
+        end_col: crate::pos_defs::ColnrT,
+    ) -> crate::regexp_defs::RegmmatchT {
+        let mut rm = crate::regexp_defs::RegmmatchT::default();
+        rm.startpos[0] = LposT { lnum: 1, col: start_col };
+        rm.endpos[0] = LposT { lnum: 1, col: end_col };
+        rm
+    }
+
+    /// A pattern with one offset slot set, and optionally its
+    /// "measure from the other end" flag bit.
+    fn offset_pattern(idx: usize, off: i32, flag_bit: Option<usize>) -> SynpatT {
+        let mut spp = SynpatT::default();
+        spp.sp_offsets[idx] = off;
+        if let Some(bit) = flag_bit {
+            spp.sp_off_flags = 1 << bit;
+        }
+        spp
+    }
+
+    /// Without its flag bit, an end offset is measured from the
+    /// match's END; the offset moves by CHARACTERS.
+    #[test]
+    fn syn_add_end_off_measures_from_the_match_end_by_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abcdefgh\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let rm = offset_match(2, 5);
+        let spp = offset_pattern(spo::ME_OFF, 2, None);
+        let mut result = LposT::default();
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 0) };
+
+        assert_eq!((result.lnum, result.col), (1, 7), "end 5 plus 2 characters");
+        close_syntax_test_buf(buf);
+    }
+
+    /// With its LOW flag bit set, the offset is measured from the
+    /// match's START instead, and `extra` is added.
+    #[test]
+    fn syn_add_end_off_measures_from_the_start_when_flagged() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abcdefgh\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let rm = offset_match(2, 5);
+        let spp = offset_pattern(spo::ME_OFF, 1, Some(spo::ME_OFF));
+        let mut result = LposT::default();
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 3) };
+
+        assert_eq!(result.col, 6, "start 2 plus offset 1 plus extra 3");
+        close_syntax_test_buf(buf);
+    }
+
+    /// A negative offset walks backwards, and stops at the start of
+    /// the line rather than running before it.
+    #[test]
+    fn syn_add_end_off_walks_backwards_and_stops_at_the_line_start() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abcdefgh\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let rm = offset_match(0, 3);
+        let mut result = LposT::default();
+
+        let spp = offset_pattern(spo::ME_OFF, -2, None);
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 0) };
+        assert_eq!(result.col, 1, "3 back 2");
+
+        let spp = offset_pattern(spo::ME_OFF, -99, None);
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 0) };
+        assert_eq!(result.col, 0, "clamped at the line start");
+        close_syntax_test_buf(buf);
+    }
+
+    /// Walking forwards stops at the end of the line.
+    #[test]
+    fn syn_add_end_off_stops_at_the_line_end() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abc\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let rm = offset_match(0, 1);
+        let spp = offset_pattern(spo::ME_OFF, 99, None);
+        let mut result = LposT::default();
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 0) };
+
+        assert_eq!(result.col, 3, "stopped at the NUL");
+        close_syntax_test_buf(buf);
+    }
+
+    /// A line past the end of the buffer zeroes the column and SKIPS
+    /// the offset walk - the original's second test is an `else if` -
+    /// and the line number is NOT clamped.
+    #[test]
+    fn syn_add_end_off_zeroes_the_column_past_the_last_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abc\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let mut rm = crate::regexp_defs::RegmmatchT::default();
+        rm.endpos[0] = LposT { lnum: 99, col: 2 };
+        let spp = offset_pattern(spo::ME_OFF, 2, None);
+        let mut result = LposT::default();
+        unsafe { syn_add_end_off(&mut result, &rm, &spp, spo::ME_OFF, 0) };
+
+        assert_eq!(result.col, 0, "column zeroed, offset not applied");
+        assert_eq!(result.lnum, 99, "line NOT clamped, unlike syn_add_start_off");
+        close_syntax_test_buf(buf);
+    }
+
+    /// A start offset uses the HIGH flag bit - shifted by SPO_COUNT -
+    /// so each offset has its own "from which end" bit.
+    #[test]
+    fn syn_add_start_off_uses_the_high_flag_bit() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abcdefgh\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let rm = offset_match(2, 5);
+        let mut result = LposT::default();
+
+        // Low bit alone must NOT switch it to measuring from the end.
+        let spp = offset_pattern(spo::MS_OFF, 1, Some(spo::MS_OFF));
+        unsafe { syn_add_start_off(&mut result, &rm, &spp, spo::MS_OFF, 3) };
+        assert_eq!(result.col, 3, "still from the start: 2 plus 1");
+
+        // The high bit does.
+        let spp = offset_pattern(spo::MS_OFF, 1, Some(spo::MS_OFF + spo::COUNT));
+        unsafe { syn_add_start_off(&mut result, &rm, &spp, spo::MS_OFF, 3) };
+        assert_eq!(result.col, 8, "from the end: 5 plus 1 plus extra 3, clamped");
+        close_syntax_test_buf(buf);
+    }
+
+    /// A line past the end is CLAMPED to the last line and the column
+    /// set to its length - the opposite of syn_add_end_off.
+    #[test]
+    fn syn_add_start_off_clamps_past_the_last_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = syntax_test_buf(b"abc\0");
+        let _g = SynBufGuard::install(std::ptr::from_mut(&mut buf), 1);
+
+        let mut rm = crate::regexp_defs::RegmmatchT::default();
+        rm.startpos[0] = LposT { lnum: 99, col: 0 };
+        let spp = offset_pattern(spo::MS_OFF, 0, None);
+        let mut result = LposT::default();
+        unsafe { syn_add_start_off(&mut result, &rm, &spp, spo::MS_OFF, 0) };
+
+        assert_eq!(result.lnum, 1, "clamped to the last line");
+        assert_eq!(result.col, 3, "column set to that line's length");
+        close_syntax_test_buf(buf);
     }
 
     // ---- syntax_present / syntime_clear ----
