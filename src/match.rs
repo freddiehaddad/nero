@@ -80,22 +80,29 @@ pub fn check_cur_search_hl(wp: &WinT, shl: &mut crate::buffer_defs::MatchT) {
         && (cursor.lnum < shl.lnum + linecount || cursor.col < shl.rm.endpos[0].col);
 }
 
+/// Whether `prevcol` sits where match `hl` would highlight a
+/// character just past the end of the line.
+///
+/// Shared by [`get_prevcol_hl_flag`] between the search highlight and
+/// each entry in the window's match list, which the original spells
+/// out twice with identical conditions.
+fn prevcol_starts_match(hl: &crate::buffer_defs::MatchT, prevcol: crate::pos_defs::ColnrT) -> bool {
+    !hl.is_addpos
+        && (prevcol == hl.startcol
+            || (prevcol > hl.startcol && hl.endcol == crate::pos_defs::MAXCOL))
+}
+
 /// Whether a character just past the end of the line should be
 /// highlighted (`get_prevcol_hl_flag`).
 ///
-/// True when the match started exactly at the end of the line, or
+/// True when a match started exactly at the end of the line, or
 /// continues into the next line (so the match includes the line
-/// break).
-///
-/// Only the always-taken "no matches exist" fast path of the
-/// `w_match_head` loop is translated (see this module's own doc
-/// comment): nothing currently translated can populate that list, so
-/// the loop cannot find anything and the answer rests entirely on
-/// `search_hl`. A debug assertion records that expectation rather
-/// than letting a future real list be silently ignored.
+/// break). The search highlight is checked first, then every entry in
+/// the window's own match list.
 ///
 /// # Safety
-/// `wp` must be a valid reference to a live `WinT`.
+/// `wp` must be a valid reference to a live `WinT`, and its
+/// `w_match_head` chain must consist of live `MatchitemT`s.
 #[must_use]
 pub unsafe fn get_prevcol_hl_flag(
     wp: &WinT,
@@ -110,47 +117,84 @@ pub unsafe fn get_prevcol_hl_flag(
         prevcol += 1;
     }
 
-    debug_assert!(
-        wp.w_match_head.is_null(),
-        "get_prevcol_hl_flag: real matchitem_T support not yet translated"
-    );
+    if prevcol_starts_match(search_hl, prevcol) {
+        return true;
+    }
 
-    !search_hl.is_addpos
-        && (prevcol == search_hl.startcol
-            || (prevcol > search_hl.startcol && search_hl.endcol == crate::pos_defs::MAXCOL))
+    let mut cur = wp.w_match_head;
+    while !cur.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let item = unsafe { &*cur };
+        if prevcol_starts_match(&item.mit_hl, prevcol) {
+            return true;
+        }
+        cur = item.mit_next;
+    }
+    false
 }
 
-/// The highlight attribute for a search match starting just before
-/// `col`, if any (`get_search_match_hl`).
+/// Priority of the `'hlsearch'` highlight, against which a match
+/// list entry's own `mit_priority` is ordered (`SEARCH_HL_PRIORITY`).
+pub const SEARCH_HL_PRIORITY: i32 = 0;
+
+/// The highlight attribute for a match starting just before `col`, if
+/// any (`get_search_match_hl`).
 ///
-/// Returns `None` when no match starts there, leaving the caller's
+/// Returns `None` when nothing starts there, leaving the caller's
 /// current attribute alone - the original signals this by simply not
 /// writing to its `char_attr` out-parameter, which becomes a returned
 /// `Option` here, matching this crate's convention.
 ///
-/// Only the always-taken "no matches exist" fast path is translated
-/// (see this module's own doc comment). With an empty `w_match_head`
-/// the original's loop runs exactly once, selects `search_hl`, applies
-/// the column test and exits, so that is all that remains. Note the
-/// original's `shl == search_hl || !shl->is_addpos` guard is
-/// unconditionally true on this path, since `shl` IS `search_hl` -
-/// so an addpos flag does not suppress the attribute here, unlike in
-/// [`get_prevcol_hl_flag`].
+/// The search highlight is not simply checked first: it is processed
+/// at its PRIORITY POSITION among the window's match list, which the
+/// original expresses with a single loop that visits the list in order
+/// and slots `search_hl` in before the first entry whose
+/// `mit_priority` exceeds [`SEARCH_HL_PRIORITY`] (or at the end).
+/// Later-visited entries overwrite earlier ones, so the LAST
+/// applicable attribute wins.
+///
+/// One asymmetry is the original's: an `is_addpos` entry from the list
+/// is skipped, but `search_hl` itself is used even when its own
+/// `is_addpos` is set, because the guard is
+/// `shl == search_hl || !shl->is_addpos`.
 ///
 /// # Safety
-/// `wp` must be a valid reference to a live `WinT`.
+/// `wp` must be a valid reference to a live `WinT`, and its
+/// `w_match_head` chain must consist of live `MatchitemT`s.
 #[must_use]
 pub unsafe fn get_search_match_hl(
     wp: &WinT,
     search_hl: &crate::buffer_defs::MatchT,
     col: crate::pos_defs::ColnrT,
 ) -> Option<i32> {
-    debug_assert!(
-        wp.w_match_head.is_null(),
-        "get_search_match_hl: real matchitem_T support not yet translated"
-    );
+    let mut result = None;
+    let mut cur = wp.w_match_head;
+    let mut shl_done = false;
 
-    (col - 1 == search_hl.startcol).then_some(search_hl.attr)
+    while !cur.is_null() || !shl_done {
+        // SAFETY: forwarded from this function's own safety doc.
+        let take_search_hl = !shl_done
+            && (cur.is_null() || unsafe { &*cur }.mit_priority > SEARCH_HL_PRIORITY);
+
+        let hl: &crate::buffer_defs::MatchT = if take_search_hl {
+            shl_done = true;
+            search_hl
+        } else {
+            // SAFETY: forwarded from this function's own safety doc;
+            // `cur` is non-null whenever this branch is taken.
+            unsafe { &(*cur).mit_hl }
+        };
+
+        if col - 1 == hl.startcol && (take_search_hl || !hl.is_addpos) {
+            result = Some(hl.attr);
+        }
+
+        if !take_search_hl && !cur.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            cur = unsafe { (*cur).mit_next };
+        }
+    }
+    result
 }
 
 /// Clear all matches for window `wp` (`clear_matches`).
@@ -398,6 +442,85 @@ mod tests {
         assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 2) }, None);
     }
 
+    /// A list entry is visited too, not just the search highlight.
+    #[test]
+    fn get_search_match_hl_finds_an_entry_in_the_window_list() {
+        let fx = MatchListFixture::new(&[1]);
+        let search_hl = crate::buffer_defs::MatchT {
+            startcol: 100,
+            attr: 1,
+            ..Default::default()
+        };
+
+        let first = fx.items[0];
+        unsafe { &mut *first }.mit_hl.startcol = 5;
+        unsafe { &mut *first }.mit_hl.attr = 77;
+
+        let wp = unsafe { &*fx.win };
+        assert_eq!(unsafe { get_search_match_hl(wp, &search_hl, 6) }, Some(77));
+    }
+
+    /// An `is_addpos` entry from the LIST is skipped - unlike
+    /// `search_hl` itself, which is used even when its own
+    /// `is_addpos` is set.
+    #[test]
+    fn get_search_match_hl_skips_an_addpos_entry_from_the_list() {
+        let fx = MatchListFixture::new(&[1]);
+        let search_hl = crate::buffer_defs::MatchT {
+            startcol: 100,
+            attr: 1,
+            ..Default::default()
+        };
+
+        let first = fx.items[0];
+        unsafe { &mut *first }.mit_hl.startcol = 5;
+        unsafe { &mut *first }.mit_hl.attr = 77;
+        unsafe { &mut *first }.mit_hl.is_addpos = true;
+
+        let wp = unsafe { &*fx.win };
+        assert_eq!(unsafe { get_search_match_hl(wp, &search_hl, 6) }, None);
+    }
+
+    /// The search highlight is processed at its PRIORITY position,
+    /// not simply first or last, and the last applicable attribute
+    /// wins. A low-priority entry is visited BEFORE `search_hl`, so
+    /// `search_hl` overrides it; a high-priority entry is visited
+    /// AFTER, so it overrides `search_hl`.
+    #[test]
+    fn get_search_match_hl_orders_the_search_highlight_by_priority() {
+        let search_hl = crate::buffer_defs::MatchT {
+            startcol: 5,
+            attr: 1,
+            ..Default::default()
+        };
+
+        // Priority 0 is NOT greater than SEARCH_HL_PRIORITY, so this
+        // entry is visited first and search_hl wins.
+        let low = MatchListFixture::new(&[1]);
+        let low_item = low.items[0];
+        unsafe { &mut *low_item }.mit_priority = SEARCH_HL_PRIORITY;
+        unsafe { &mut *low_item }.mit_hl.startcol = 5;
+        unsafe { &mut *low_item }.mit_hl.attr = 77;
+        assert_eq!(
+            unsafe { get_search_match_hl(&*low.win, &search_hl, 6) },
+            Some(1),
+            "search_hl is visited last and wins"
+        );
+
+        // Priority 1 IS greater, so search_hl is slotted in first and
+        // the entry overrides it.
+        let high = MatchListFixture::new(&[1]);
+        let high_item = high.items[0];
+        unsafe { &mut *high_item }.mit_priority = SEARCH_HL_PRIORITY + 1;
+        unsafe { &mut *high_item }.mit_hl.startcol = 5;
+        unsafe { &mut *high_item }.mit_hl.attr = 77;
+        assert_eq!(
+            unsafe { get_search_match_hl(&*high.win, &search_hl, 6) },
+            Some(77),
+            "the higher-priority entry is visited last and wins"
+        );
+    }
+
     // --- get_prevcol_hl_flag ---
 
     /// A search-highlight match with the given start and end columns.
@@ -472,6 +595,42 @@ mod tests {
         // With leftcol set the bump happens again.
         wp.w_leftcol = 5;
         assert!(unsafe { get_prevcol_hl_flag(&wp, &shl, 4) });
+    }
+
+    /// An entry in the window's own match list also triggers the
+    /// flag, not just the search highlight - this is the loop the
+    /// previous fast path skipped entirely.
+    #[test]
+    fn get_prevcol_hl_flag_finds_a_match_in_the_window_list() {
+        let fx = MatchListFixture::new(&[1, 2]);
+        // The search highlight itself must not match.
+        let search_hl = prevcol_hl(100, 200);
+
+        // Give the SECOND list entry the interesting columns, so a
+        // walk that only looked at the head would miss it.
+        let second = fx.items[1];
+        unsafe { &mut *second }.mit_hl.startcol = 5;
+        unsafe { &mut *second }.mit_hl.endcol = 9;
+
+        let wp = unsafe { &*fx.win };
+        assert!(unsafe { get_prevcol_hl_flag(wp, &search_hl, 5) });
+        assert!(!unsafe { get_prevcol_hl_flag(wp, &search_hl, 4) });
+    }
+
+    /// An addpos entry in the list is skipped, exactly as an addpos
+    /// search highlight is.
+    #[test]
+    fn get_prevcol_hl_flag_skips_an_addpos_entry_in_the_list() {
+        let fx = MatchListFixture::new(&[1]);
+        let search_hl = prevcol_hl(100, 200);
+
+        let first = fx.items[0];
+        unsafe { &mut *first }.mit_hl.startcol = 5;
+        unsafe { &mut *first }.mit_hl.endcol = 9;
+        unsafe { &mut *first }.mit_hl.is_addpos = true;
+
+        let wp = unsafe { &*fx.win };
+        assert!(!unsafe { get_prevcol_hl_flag(wp, &search_hl, 5) });
     }
 
     // --- check_cur_search_hl ---
