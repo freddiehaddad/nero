@@ -1519,6 +1519,53 @@ pub unsafe fn global_stl_height() -> i32 {
     }
 }
 
+/// Recompute the position of every window in the current tab page
+/// (`win_comp_pos`).
+///
+/// Returns the row just past the last window, i.e. the row where a
+/// global statusline would sit.
+///
+/// Floating windows are not laid out here - they hang off the end of
+/// the window list and keep their own configured positions - but one
+/// anchored to a window that just moved must be told to reposition
+/// itself, which is what the `w_pos_changed` flag does. The walk runs
+/// BACKWARDS from `lastwin` and stops at the first non-floating
+/// window, since floats are all at the end of the list.
+///
+/// # Safety
+/// `GLOBALS.topframe` must be a valid, non-null pointer to a live
+/// `FrameT` (forwarded to [`frame_comp_pos`]), and `GLOBALS.lastwin`'s
+/// own `w_prev` chain must consist of live `WinT`s. Also touches
+/// `OPTION_VARS` via [`tabline_height`]/[`global_stl_height`].
+pub unsafe fn win_comp_pos() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut row = unsafe { tabline_height() };
+    let mut col = 0;
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let topframe = unsafe { crate::globals::GLOBALS.get_mut() }.topframe;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { frame_comp_pos(topframe, &mut row, &mut col) };
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.lastwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let win = unsafe { &mut *wp };
+        if !win.w_floating {
+            break;
+        }
+        // A float might be anchored to a window that just moved.
+        if win.w_config.relative == crate::buffer_defs::FloatRelative::Window {
+            win.w_pos_changed = true;
+        }
+        wp = win.w_prev;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    row + unsafe { global_stl_height() }
+}
+
 /// Remember every window's current scroll position and size, so a
 /// later comparison can tell what moved
 /// (`snapshot_windows_scroll_size`).
@@ -4175,6 +4222,211 @@ mod tests {
         let mut v = [30, -1, 10, 20];
         v.sort_by(|a, b| int_cmp(*a, *b).cmp(&0));
         assert_eq!(v, [-1, 10, 20, 30]);
+    }
+
+    // --- win_comp_pos ---
+
+    /// Restores `topframe`/`lastwin`/`first_tabpage` and the option
+    /// values `win_comp_pos` reads, even through a panic.
+    struct WinCompPosGuard {
+        topframe: *mut crate::buffer_defs::FrameT,
+        lastwin: *mut crate::buffer_defs::WinT,
+        first_tabpage: *mut crate::buffer_defs::TabpageT,
+        p_ls: i64,
+        p_stal: i64,
+    }
+
+    impl WinCompPosGuard {
+        fn save() -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            Self {
+                topframe: g.topframe,
+                lastwin: g.lastwin,
+                first_tabpage: g.first_tabpage,
+                p_ls: ov.p_ls,
+                p_stal: ov.p_stal,
+            }
+        }
+    }
+
+    impl Drop for WinCompPosGuard {
+        fn drop(&mut self) {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            g.topframe = self.topframe;
+            g.lastwin = self.lastwin;
+            g.first_tabpage = self.first_tabpage;
+            let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            ov.p_ls = self.p_ls;
+            ov.p_stal = self.p_stal;
+        }
+    }
+
+    /// Sets the two options so `tabline_height` and
+    /// `global_stl_height` both return 0, isolating the frame walk.
+    fn silence_tabline_and_global_stl() {
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_stal = 0; // no tabline
+        ov.p_ls = 2; // not 3, so no global statusline
+    }
+
+    /// Installs `tp` as the only tab page. `tabline_height`
+    /// dereferences `first_tabpage` unconditionally, so every
+    /// `win_comp_pos` test needs one.
+    fn install_single_tabpage(tp: &mut crate::buffer_defs::TabpageT) {
+        unsafe { crate::globals::GLOBALS.get_mut() }.first_tabpage = std::ptr::from_mut(tp);
+    }
+
+    #[test]
+    fn win_comp_pos_lays_out_the_frame_and_returns_the_end_row() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = WinCompPosGuard::save();
+        silence_tabline_and_global_stl();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        install_single_tabpage(&mut tp);
+
+        let mut win = crate::buffer_defs::WinT {
+            w_winrow: -1,
+            w_wincol: -1,
+            w_height: 5,
+            w_status_height: 1,
+            w_width: 20,
+            ..Default::default()
+        };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: std::ptr::from_mut(&mut win),
+            fr_height: 99,
+            ..Default::default()
+        };
+
+        let gl = unsafe { crate::globals::GLOBALS.get_mut() };
+        gl.topframe = std::ptr::from_mut(&mut leaf);
+        gl.lastwin = std::ptr::null_mut();
+
+        let end = unsafe { win_comp_pos() };
+
+        assert_eq!((win.w_winrow, win.w_wincol), (0, 0), "laid out at the origin");
+        assert_eq!(end, 5 + 1, "height plus its status line");
+    }
+
+    /// The tabline offsets the starting row and the global statusline
+    /// is added to the result, so both options feed the return value.
+    #[test]
+    fn win_comp_pos_accounts_for_the_tabline_and_global_statusline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = WinCompPosGuard::save();
+        let ov = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+        ov.p_stal = 2; // tabline always shown -> height 1
+        ov.p_ls = 3; // global statusline -> height 1
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        install_single_tabpage(&mut tp);
+
+        let mut win = crate::buffer_defs::WinT {
+            w_height: 5,
+            w_width: 20,
+            ..Default::default()
+        };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: std::ptr::from_mut(&mut win),
+            fr_height: 99,
+            ..Default::default()
+        };
+
+        let gl = unsafe { crate::globals::GLOBALS.get_mut() };
+        gl.topframe = std::ptr::from_mut(&mut leaf);
+        gl.lastwin = std::ptr::null_mut();
+
+        let end = unsafe { win_comp_pos() };
+
+        assert_eq!(win.w_winrow, 1, "pushed down by the tabline");
+        assert_eq!(end, 1 + 5 + 1, "tabline + height + global statusline");
+    }
+
+    /// A float anchored to a WINDOW is flagged to reposition; one
+    /// anchored to the editor is not.
+    #[test]
+    fn win_comp_pos_flags_only_window_relative_floats() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = WinCompPosGuard::save();
+        silence_tabline_and_global_stl();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        install_single_tabpage(&mut tp);
+
+        let mut win = crate::buffer_defs::WinT { w_height: 1, ..Default::default() };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: std::ptr::from_mut(&mut win),
+            ..Default::default()
+        };
+
+        let mut editor_float = crate::buffer_defs::WinT {
+            w_floating: true,
+            ..Default::default()
+        };
+        editor_float.w_config.relative = crate::buffer_defs::FloatRelative::Editor;
+
+        let mut win_float = crate::buffer_defs::WinT {
+            w_floating: true,
+            w_prev: std::ptr::from_mut(&mut editor_float),
+            ..Default::default()
+        };
+        win_float.w_config.relative = crate::buffer_defs::FloatRelative::Window;
+
+        let gl = unsafe { crate::globals::GLOBALS.get_mut() };
+        gl.topframe = std::ptr::from_mut(&mut leaf);
+        gl.lastwin = std::ptr::from_mut(&mut win_float);
+
+        unsafe { win_comp_pos() };
+
+        assert!(win_float.w_pos_changed, "window-relative float reflagged");
+        assert!(!editor_float.w_pos_changed, "editor-relative float left alone");
+    }
+
+    /// The backwards walk STOPS at the first non-floating window, so a
+    /// float sitting before it in the list is never reached.
+    #[test]
+    fn win_comp_pos_stops_the_float_walk_at_the_first_normal_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = WinCompPosGuard::save();
+        silence_tabline_and_global_stl();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        install_single_tabpage(&mut tp);
+
+        let mut win = crate::buffer_defs::WinT { w_height: 1, ..Default::default() };
+        let mut leaf = crate::buffer_defs::FrameT {
+            fr_win: std::ptr::from_mut(&mut win),
+            ..Default::default()
+        };
+
+        // Ordered w_prev-wards: unreachable float <- normal <- float.
+        let mut unreachable = crate::buffer_defs::WinT {
+            w_floating: true,
+            ..Default::default()
+        };
+        unreachable.w_config.relative = crate::buffer_defs::FloatRelative::Window;
+
+        let mut normal = crate::buffer_defs::WinT {
+            w_prev: std::ptr::from_mut(&mut unreachable),
+            ..Default::default()
+        };
+
+        let mut last_float = crate::buffer_defs::WinT {
+            w_floating: true,
+            w_prev: std::ptr::from_mut(&mut normal),
+            ..Default::default()
+        };
+        last_float.w_config.relative = crate::buffer_defs::FloatRelative::Window;
+
+        let gl = unsafe { crate::globals::GLOBALS.get_mut() };
+        gl.topframe = std::ptr::from_mut(&mut leaf);
+        gl.lastwin = std::ptr::from_mut(&mut last_float);
+
+        unsafe { win_comp_pos() };
+
+        assert!(last_float.w_pos_changed, "the trailing float is reached");
+        assert!(
+            !unreachable.w_pos_changed,
+            "the walk must stop at the normal window, not run past it"
+        );
     }
 
     /// A leaf frame places its window and advances the running
