@@ -73,6 +73,7 @@ pub mod hashtab_defs;
 pub mod help;
 pub mod highlight;
 pub mod highlight_defs;
+pub mod highlight_group;
 pub mod iconv_defs;
 pub mod indent;
 pub mod indent_c;
