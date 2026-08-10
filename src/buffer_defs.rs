@@ -562,7 +562,7 @@ pub struct SynblockT {
     pub b_sst_lasttick: DisptickT,
 
     /// Cache for `in_id_list()`; see `idl_cache_T` in `syntax.c`.
-    pub b_idlist_cache: *mut std::ffi::c_void,
+    pub b_idlist_cache: *mut crate::syntax::IdlCacheT,
 
     // for spell checking
     /// list of pointers to `slang_T`, see `spell.c`

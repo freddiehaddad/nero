@@ -439,6 +439,80 @@ pub fn limit_pos(pos: &mut LposT, limit: &LposT) {
     }
 }
 
+/// Number of entries in a syntax block's `in_id_list` result cache
+/// (`IDL_CACHE_SIZE`).
+pub const IDL_CACHE_SIZE: usize = 16;
+
+/// One cached `in_id_list` resolution (`idl_entry_T`).
+///
+/// `idl_key` is the list this entry resolves. It is NON-OWNING: the
+/// original compares it by POINTER identity against the caller's list
+/// and never frees it, so it stays a raw pointer here rather than
+/// becoming an owned `Vec`. Only `idl_ids` is owned.
+///
+/// The original's separate `idl_count` has no counterpart - `idl_ids`
+/// is a `Vec` and carries its own length.
+#[derive(Debug, Default, Clone)]
+pub struct IdlEntryT {
+    /// the list this entry resolves, null when unused (`idl_key`).
+    pub idl_key: *const i16,
+    /// sorted, cluster-expanded group IDs (`idl_ids`).
+    pub idl_ids: Vec<i16>,
+    /// leading `ALLBUT`/`TOP`/`CONTAINED` item, or `0`
+    /// (`idl_marker`).
+    pub idl_marker: i16,
+    /// `false` means not cacheable, so the slow path must be used
+    /// (`idl_usable`).
+    pub idl_usable: bool,
+}
+
+/// A syntax block's `in_id_list` result cache (`idl_cache_T`).
+#[derive(Debug)]
+pub struct IdlCacheT {
+    /// the cached entries (`ent`).
+    pub ent: [IdlEntryT; IDL_CACHE_SIZE],
+    /// round-robin replacement index (`round`).
+    pub round: i32,
+    /// index of the last returned entry, the fast path (`last`).
+    pub last: i32,
+}
+
+impl Default for IdlCacheT {
+    /// An empty cache. Written out rather than derived because
+    /// `[T; 16]` only derives `Default` for `T: Copy`, and
+    /// [`IdlEntryT`] owns a `Vec`.
+    fn default() -> Self {
+        IdlCacheT {
+            ent: std::array::from_fn(|_| IdlEntryT::default()),
+            round: 0,
+            last: 0,
+        }
+    }
+}
+
+/// Release a syntax block's `in_id_list` cache (`idl_cache_clear`).
+///
+/// The original frees each entry's `idl_ids` and then the cache
+/// itself; reclaiming the `Box` does both, since every owned field
+/// drops with it. `idl_key` is deliberately not freed - it never was,
+/// being a borrowed pointer to the caller's list.
+///
+/// Does nothing when no cache has been built yet.
+///
+/// # Safety
+/// `block.b_idlist_cache`, when non-null, must have been allocated
+/// with `Box::into_raw` - this reclaims it with `Box::from_raw`.
+pub unsafe fn idl_cache_clear(block: &mut crate::buffer_defs::SynblockT) {
+    if block.b_idlist_cache.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        drop(Box::from_raw(block.b_idlist_cache));
+    }
+    block.b_idlist_cache = std::ptr::null_mut();
+}
+
 /// Prepare the syntax pattern table for its first use
 /// (`init_syn_patterns`).
 ///
@@ -893,6 +967,58 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- idl cache ----
+
+    #[test]
+    fn idl_cache_clear_is_a_noop_without_a_cache() {
+        let mut block = crate::buffer_defs::SynblockT::default();
+        assert!(block.b_idlist_cache.is_null());
+        unsafe { idl_cache_clear(&mut block) };
+        assert!(block.b_idlist_cache.is_null());
+    }
+
+    /// Clearing releases the cache and nulls the field, so a second
+    /// call is safe rather than freeing twice.
+    #[test]
+    fn idl_cache_clear_releases_the_cache_and_is_idempotent() {
+        let mut block = crate::buffer_defs::SynblockT::default();
+
+        let mut cache = IdlCacheT::default();
+        // Give two entries owned payloads, so a missed free shows up
+        // under Miri's leak check rather than passing silently.
+        cache.ent[0].idl_ids = vec![1, 2, 3];
+        cache.ent[3].idl_ids = vec![4, 5];
+        cache.last = 3;
+        block.b_idlist_cache = Box::into_raw(Box::new(cache));
+
+        unsafe { idl_cache_clear(&mut block) };
+        assert!(block.b_idlist_cache.is_null());
+
+        // Safe to repeat.
+        unsafe { idl_cache_clear(&mut block) };
+        assert!(block.b_idlist_cache.is_null());
+    }
+
+    /// A default cache starts empty: no keys, no IDs, and not usable
+    /// until something fills it in.
+    #[test]
+    fn idl_cache_default_starts_empty() {
+        let cache = IdlCacheT::default();
+        assert_eq!(cache.ent.len(), IDL_CACHE_SIZE);
+        assert_eq!((cache.round, cache.last), (0, 0));
+        for e in &cache.ent {
+            assert!(e.idl_key.is_null());
+            assert!(e.idl_ids.is_empty());
+            assert_eq!(e.idl_marker, 0);
+            assert!(!e.idl_usable);
+        }
+    }
+
+    #[test]
+    fn idl_cache_size_matches_the_original() {
+        assert_eq!(IDL_CACHE_SIZE, 16);
     }
 
     // ---- init_syn_patterns / idl_id_cmp / reset_expand_highlight ----
