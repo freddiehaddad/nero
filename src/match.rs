@@ -50,6 +50,28 @@ pub unsafe fn get_optional_window(argvars: &[TypvalT], idx: usize) -> *mut WinT 
     unsafe { crate::window::find_win_by_nr_or_id(arg) }
 }
 
+/// Record whether the cursor sits inside the match `shl`
+/// (`check_cur_search_hl`), used to pick the `CurSearch` highlight.
+///
+/// The match may span several lines: `linecount` is how many lines it
+/// covers, derived from sub-match 0's own start and end positions,
+/// whose line numbers are RELATIVE to `shl.lnum`.
+///
+/// The column tests apply only at the edges. On the first line the
+/// cursor must be at or after the start column, and on the last line
+/// strictly before the end column; on any line in between, the whole
+/// line is inside the match and the column is irrelevant. The end
+/// column is exclusive, the start column inclusive.
+pub fn check_cur_search_hl(wp: &WinT, shl: &mut crate::buffer_defs::MatchT) {
+    let linecount = shl.rm.endpos[0].lnum - shl.rm.startpos[0].lnum;
+    let cursor = wp.w_cursor;
+
+    shl.has_cursor = cursor.lnum >= shl.lnum
+        && cursor.lnum <= shl.lnum + linecount
+        && (cursor.lnum > shl.lnum || cursor.col >= shl.rm.startpos[0].col)
+        && (cursor.lnum < shl.lnum + linecount || cursor.col < shl.rm.endpos[0].col);
+}
+
 /// Clear all matches for window `wp` (`clear_matches`).
 ///
 /// Only the always-taken "no matches exist" fast path is translated
@@ -159,6 +181,105 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- check_cur_search_hl ---
+
+    /// A match starting at `lnum`, spanning `linecount` further lines,
+    /// from `start_col` to `end_col` (end exclusive).
+    fn hl_match(
+        lnum: crate::pos_defs::LinenrT,
+        linecount: crate::pos_defs::LinenrT,
+        start_col: crate::pos_defs::ColnrT,
+        end_col: crate::pos_defs::ColnrT,
+    ) -> crate::buffer_defs::MatchT {
+        let mut shl = crate::buffer_defs::MatchT { lnum, ..Default::default() };
+        // Sub-match 0 positions are relative to the match's own first
+        // line, so the start line is always 0.
+        shl.rm.startpos[0] = crate::pos_defs::LposT { lnum: 0, col: start_col };
+        shl.rm.endpos[0] = crate::pos_defs::LposT { lnum: linecount, col: end_col };
+        shl
+    }
+
+    fn win_at(
+        lnum: crate::pos_defs::LinenrT,
+        col: crate::pos_defs::ColnrT,
+    ) -> WinT {
+        let mut wp = WinT::default();
+        wp.w_cursor.lnum = lnum;
+        wp.w_cursor.col = col;
+        wp
+    }
+
+    fn has_cursor(
+        cursor_lnum: crate::pos_defs::LinenrT,
+        cursor_col: crate::pos_defs::ColnrT,
+        shl: &crate::buffer_defs::MatchT,
+    ) -> bool {
+        let wp = win_at(cursor_lnum, cursor_col);
+        let mut shl = *shl;
+        check_cur_search_hl(&wp, &mut shl);
+        shl.has_cursor
+    }
+
+    /// On a single-line match the start column is INCLUSIVE and the
+    /// end column EXCLUSIVE.
+    #[test]
+    fn check_cur_search_hl_bounds_a_single_line_match_by_column() {
+        let shl = hl_match(10, 0, 4, 8);
+
+        assert!(!has_cursor(10, 3, &shl), "before the start column");
+        assert!(has_cursor(10, 4, &shl), "start column is inclusive");
+        assert!(has_cursor(10, 7, &shl), "last column inside");
+        assert!(!has_cursor(10, 8, &shl), "end column is exclusive");
+    }
+
+    #[test]
+    fn check_cur_search_hl_rejects_lines_outside_the_match() {
+        let shl = hl_match(10, 2, 4, 8);
+        assert!(!has_cursor(9, 6, &shl), "line before the match");
+        assert!(!has_cursor(13, 6, &shl), "line after the match");
+    }
+
+    /// On the FIRST line only the start column applies, so a column
+    /// past the end column is still inside a multi-line match.
+    #[test]
+    fn check_cur_search_hl_applies_only_the_start_column_on_the_first_line() {
+        let shl = hl_match(10, 2, 4, 8);
+        assert!(!has_cursor(10, 3, &shl), "before the start column");
+        assert!(has_cursor(10, 4, &shl), "at the start column");
+        assert!(has_cursor(10, 99, &shl), "end column must not apply here");
+    }
+
+    /// On the LAST line only the end column applies, so a column
+    /// before the start column is still inside.
+    #[test]
+    fn check_cur_search_hl_applies_only_the_end_column_on_the_last_line() {
+        let shl = hl_match(10, 2, 4, 8);
+        assert!(has_cursor(12, 0, &shl), "start column must not apply here");
+        assert!(has_cursor(12, 7, &shl), "last column inside");
+        assert!(!has_cursor(12, 8, &shl), "end column is exclusive");
+    }
+
+    /// On a line strictly between the first and last, the whole line
+    /// is inside regardless of column.
+    #[test]
+    fn check_cur_search_hl_ignores_the_column_on_a_middle_line() {
+        let shl = hl_match(10, 2, 4, 8);
+        assert!(has_cursor(11, 0, &shl));
+        assert!(has_cursor(11, 999, &shl));
+    }
+
+    /// The flag is cleared as well as set, so a stale `true` from a
+    /// previous match does not survive.
+    #[test]
+    fn check_cur_search_hl_clears_a_stale_flag() {
+        let mut shl = hl_match(10, 0, 4, 8);
+        shl.has_cursor = true;
+
+        let wp = win_at(20, 0); // nowhere near the match
+        check_cur_search_hl(&wp, &mut shl);
+        assert!(!shl.has_cursor);
+    }
 
     fn focusable_win(handle: crate::types_defs::HandleT) -> WinT {
         WinT {

@@ -343,6 +343,65 @@ pub struct SynTimeT {
     pub match_: i32,
 }
 
+/// Highlighting state for one `'hlsearch'`, `:match` or match-function
+/// match (`match_T`).
+///
+/// One instance exists per window for `:match` and the match
+/// functions, while `'hlsearch'` uses a single shared one for all
+/// windows.
+///
+/// `buf` stays a raw pointer, matching this crate's convention for the
+/// original's non-owning back-references.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchT {
+    /// the regexp program plus the last match found, which may
+    /// continue on the next line (`rm`).
+    pub rm: crate::regexp_defs::RegmmatchT,
+    /// the buffer to search for a match (`buf`).
+    pub buf: *mut BufT,
+    /// the line to search for a match (`lnum`).
+    pub lnum: crate::pos_defs::LinenrT,
+    /// attributes to be used for a match (`attr`).
+    pub attr: i32,
+    /// attributes currently active in `win_line` (`attr_cur`).
+    pub attr_cur: i32,
+    /// first line to search for a multi-line pattern (`first_lnum`).
+    pub first_lnum: crate::pos_defs::LinenrT,
+    /// in `win_line`, the char where highlighting starts (`startcol`).
+    pub startcol: crate::pos_defs::ColnrT,
+    /// in `win_line`, the char where highlighting ends (`endcol`).
+    pub endcol: crate::pos_defs::ColnrT,
+    /// position specified directly by `matchaddpos()` (`is_addpos`).
+    pub is_addpos: bool,
+    /// whether the cursor is inside the match, used for `CurSearch`
+    /// (`has_cursor`).
+    pub has_cursor: bool,
+    /// for a time limit (`tm`).
+    pub tm: crate::types_defs::ProftimeT,
+}
+
+impl Default for MatchT {
+    /// A zeroed match, matching the original's `{0}` initialisers.
+    ///
+    /// Written out rather than derived because `buf` is a raw pointer,
+    /// which has no `Default`.
+    fn default() -> Self {
+        MatchT {
+            rm: crate::regexp_defs::RegmmatchT::default(),
+            buf: std::ptr::null_mut(),
+            lnum: 0,
+            attr: 0,
+            attr_cur: 0,
+            first_lnum: 0,
+            startcol: 0,
+            endcol: 0,
+            is_addpos: false,
+            has_cursor: false,
+            tm: 0,
+        }
+    }
+}
+
 /// These are items normally related to a buffer. But when using
 /// `":ownsyntax"` a window may have its own instance (`synblock_T`).
 ///
