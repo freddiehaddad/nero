@@ -3361,9 +3361,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = crate::buffer_defs::BufT::default();
         let ptr: *mut crate::buffer_defs::BufT = &mut buf;
-        let globals = unsafe { GLOBALS.get_mut() };
-        let prev = globals.curbuf;
-        globals.curbuf = ptr;
+        let mut _cb = unsafe { CurbufGuard::install(ptr) };
 
         unsafe { (*ptr).b_ml.ml_flags = 0 };
         assert!(!unsafe { ml_line_alloced() });
@@ -3371,7 +3369,7 @@ mod tests {
         unsafe { (*ptr).b_ml.ml_flags = crate::memline_defs::ML_LINE_DIRTY };
         assert!(unsafe { ml_line_alloced() });
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev;
+        _cb.restore_now();
     }
 
     #[test]
@@ -3379,9 +3377,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = crate::buffer_defs::BufT::default();
         let ptr: *mut crate::buffer_defs::BufT = &mut buf;
-        let globals = unsafe { GLOBALS.get_mut() };
-        let prev = globals.curbuf;
-        globals.curbuf = ptr;
+        let mut _cb = unsafe { CurbufGuard::install(ptr) };
 
         // ML_ALLOCATED is deliberately NOT consulted, so the answer
         // matches a build without ML_GET_ALLOC_LINES.
@@ -3395,7 +3391,7 @@ mod tests {
         }
         assert!(unsafe { ml_line_alloced() });
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev;
+        _cb.restore_now();
     }
 
     #[test]
@@ -3524,14 +3520,12 @@ mod tests {
         let mut buf = BufT::default();
         assert_eq!(unsafe { ml_open(&mut buf) }, crate::vim_defs::OK);
         let buf_ptr: *mut BufT = &mut buf;
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev = g.curbuf;
-        g.curbuf = buf_ptr;
+        let mut _cb = unsafe { CurbufGuard::install(buf_ptr) };
 
         assert_eq!(unsafe { ml_replace_len(1, b"replaced\0") }, crate::vim_defs::OK);
         assert_eq!(unsafe { ml_get_buf(&mut *buf_ptr, 1) }, b"replaced\0");
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+        _cb.restore_now();
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
@@ -3830,11 +3824,8 @@ mod tests {
                 w_buffer: &mut buf as *mut BufT,
                 ..Default::default()
             };
-            let globals = crate::globals::GLOBALS.get_mut();
-            let prev_buf = globals.curbuf;
-            let prev_win = globals.curwin;
-            globals.curbuf = &mut buf as *mut BufT;
-            globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
+            let mut _cw = CurwinGuard::install(&mut win as *mut crate::buffer_defs::WinT);
 
             assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
@@ -3853,9 +3844,9 @@ mod tests {
             assert_eq!(w.w_cursor.lnum, 3);
             assert_eq!(w.w_cursor.col, 3);
 
-            let globals = crate::globals::GLOBALS.get_mut();
-            globals.curbuf = prev_buf;
-            globals.curwin = prev_win;
+            _cb.restore_now();
+
+            _cw.restore_now();
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
@@ -3881,9 +3872,7 @@ mod tests {
             assert_eq!(ml_open(&mut buf), OK);
             // This function flushes through the GLOBAL curbuf, so it
             // has to point at the buffer under test.
-            let globals = crate::globals::GLOBALS.get_mut();
-            let prev = globals.curbuf;
-            globals.curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
@@ -3898,7 +3887,7 @@ mod tests {
             // Two past is not available at all.
             assert_eq!(ml_find_line_or_offset(&mut buf, 5, None, false), -1);
 
-            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            _cb.restore_now();
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
@@ -3915,9 +3904,7 @@ mod tests {
         buf.b_p_eol = 1;
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
-            let globals = crate::globals::GLOBALS.get_mut();
-            let prev = globals.curbuf;
-            globals.curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
@@ -3933,7 +3920,7 @@ mod tests {
             assert_eq!(ml_find_line_or_offset(&mut buf, 2, None, true), 4);
             assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, true), 12);
 
-            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            _cb.restore_now();
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
@@ -3952,9 +3939,7 @@ mod tests {
         buf.b_p_eol = 1;
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
-            let globals = crate::globals::GLOBALS.get_mut();
-            let prev = globals.curbuf;
-            globals.curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
@@ -3965,7 +3950,7 @@ mod tests {
             let mut off = 7;
             assert_eq!(ml_find_line_or_offset(&mut buf, 0, Some(&mut off), false), 3);
 
-            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            _cb.restore_now();
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
@@ -3984,9 +3969,7 @@ mod tests {
         buf.b_p_eol = 0;
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
-            let globals = crate::globals::GLOBALS.get_mut();
-            let prev = globals.curbuf;
-            globals.curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_replace_buf_len(&mut buf, 1, b"abc\0"), OK);
             assert_eq!(ml_append_buf(&mut buf, 1, b"de\0", 3, false), OK);
@@ -3997,7 +3980,7 @@ mod tests {
             assert_eq!(ml_find_line_or_offset(&mut buf, 3, None, false), 7);
             assert_eq!(ml_find_line_or_offset(&mut buf, 4, None, false), 11);
 
-            crate::globals::GLOBALS.get_mut().curbuf = prev;
+            _cb.restore_now();
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
         }
@@ -4008,9 +3991,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = test_buf();
         // curbuf must be valid: this function flushes through it.
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev = globals.curbuf;
-        globals.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         // No ml_open, so ml_chunksize is empty and ml_mfp is null.
         assert_eq!(unsafe { ml_find_line_or_offset(&mut buf, 1, None, false) }, -1);
@@ -4018,7 +3999,7 @@ mod tests {
         // 1 and 2, but ml_mfp is null here, so this is -1 too.
         assert_eq!(unsafe { ml_find_line_or_offset(&mut buf, 1, None, true) }, -1);
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = prev;
+        _cb.restore_now();
     }
 
     fn test_buf() -> BufT {
@@ -4349,15 +4330,14 @@ mod tests {
         let mut buf = build_three_line_two_block_memline();
         unsafe {
             let _guard = crate::globals::global_state_test_lock();
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_delete(3), OK);
             assert_eq!(buf.b_ml.ml_line_count, 2);
             assert_eq!(ml_get(1), b"hello\0".to_vec());
             assert_eq!(ml_get(2), b"world\0".to_vec());
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
 
             // Root pointer block should now have exactly 1 entry left
             // (bnum 2, 2 lines) - bnum 3's data block was freed and
@@ -4386,8 +4366,7 @@ mod tests {
         let mut buf = build_three_line_two_block_memline();
         unsafe {
             let _guard = crate::globals::global_state_test_lock();
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             assert_eq!(ml_delete(1), OK); // delete "hello"
             assert_eq!(buf.b_ml.ml_line_count, 2);
@@ -4398,7 +4377,7 @@ mod tests {
             assert_eq!(buf.b_ml.ml_line_count, 1);
             assert_eq!(ml_get(1), b"foo\0".to_vec());
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
 
             // Root pointer block should now have exactly 1 entry,
             // shifted down from index 1 to index 0 (bnum 3, 1 line).
@@ -4459,13 +4438,12 @@ mod tests {
     fn ml_get_matches_ml_get_buf_via_curbuf() {
         let _guard = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
-        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
-        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         let result = unsafe { ml_get(2) };
         assert_eq!(result, b"world\0".to_vec());
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        _cb.restore_now();
         close_test_memline(buf);
     }
 
@@ -4497,8 +4475,7 @@ mod tests {
     fn ml_get_len_and_ml_get_pos_len_via_curbuf() {
         let _guard = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
-        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
-        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         unsafe {
             assert_eq!(ml_get_len(2), 5); // "world"
@@ -4507,7 +4484,7 @@ mod tests {
             assert_eq!(ml_get_pos(&pos), b"rld\0".to_vec());
         }
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        _cb.restore_now();
         close_test_memline(buf);
     }
 
@@ -4515,8 +4492,7 @@ mod tests {
     fn gchar_pos_returns_the_codepoint_at_a_position() {
         let _guard = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
-        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
-        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         unsafe {
             // "world", col 0 = 'w'.
@@ -4528,7 +4504,7 @@ mod tests {
             assert_eq!(gchar_pos(&pos), i32::from(b'd'));
         }
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        _cb.restore_now();
         close_test_memline(buf);
     }
 
@@ -4536,8 +4512,7 @@ mod tests {
     fn gchar_pos_returns_nul_past_the_end_of_the_line() {
         let _guard = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
-        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
-        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         unsafe {
             // "world" has length 5, so col 5 is the trailing NUL.
@@ -4549,7 +4524,7 @@ mod tests {
             assert_eq!(gchar_pos(&pos), 0);
         }
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        _cb.restore_now();
         close_test_memline(buf);
     }
 
@@ -4557,15 +4532,14 @@ mod tests {
     fn gchar_pos_returns_nul_when_col_is_maxcol() {
         let _guard = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
-        let prev_curbuf = unsafe { GLOBALS.get_mut() }.curbuf;
-        unsafe { GLOBALS.get_mut() }.curbuf = &mut buf as *mut BufT;
+        let mut _cb = unsafe { CurbufGuard::install(&mut buf as *mut BufT) };
 
         unsafe {
             let pos = crate::pos_defs::PosT { lnum: 2, col: crate::pos_defs::MAXCOL, coladd: 0 };
             assert_eq!(gchar_pos(&pos), 0);
         }
 
-        unsafe { GLOBALS.get_mut() }.curbuf = prev_curbuf;
+        _cb.restore_now();
         close_test_memline(buf);
     }
 
@@ -4692,11 +4666,10 @@ mod tests {
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
 
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
             assert_eq!(ml_delete(0), FAIL);
             assert_eq!(ml_delete(99), FAIL);
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
             assert_eq!(buf.b_ml.ml_line_count, 1);
 
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
@@ -4727,11 +4700,10 @@ mod tests {
         unsafe {
             assert_eq!(ml_open(&mut buf), OK);
 
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
             assert_eq!(ml_replace(1, b"xyz\0"), OK);
             assert_eq!(ml_get(1), b"xyz\0".to_vec());
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
 
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
@@ -4743,15 +4715,14 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // "hello": col 0 -> 1 -> ... -> 4 all stay on the same line.
             let mut pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
             assert_eq!(inc(&mut pos), 0);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 1, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4761,8 +4732,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // "hello" has 5 real chars (col 0..4); col 4 is the last
             // real char ('o'), moving onto col 5 lands on the NUL.
@@ -4774,7 +4744,7 @@ mod tests {
             assert_eq!(inc(&mut pos), 1);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4784,15 +4754,14 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // "foo" (lnum 3) is the last line, 3 chars long.
             let mut pos = crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 };
             assert_eq!(inc(&mut pos), -1); // already on the NUL, no next line
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 }); // untouched
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4802,8 +4771,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // Same starting point as inc_moves_onto_nul_then_crosses_to_
             // next_line, but incl() does both inc() calls in one step.
@@ -4811,7 +4779,7 @@ mod tests {
             assert_eq!(incl(&mut pos), 1);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 0, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4821,14 +4789,13 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             let mut pos = crate::pos_defs::PosT { lnum: 2, col: 3, coladd: 5 };
             assert_eq!(dec(&mut pos), 0);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 2, col: 2, coladd: 0 }); // coladd cleared
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4838,8 +4805,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // Crossing to the previous line lands at that line's own
             // length/NUL position (matching the original's own `lp->col
@@ -4850,7 +4816,7 @@ mod tests {
             assert_eq!(dec(&mut pos), 1);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 5, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4860,15 +4826,14 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             let mut pos = crate::pos_defs::PosT { lnum: 1, col: 0, coladd: 0 };
             assert_eq!(dec(&mut pos), -1);
             assert_eq!(pos.lnum, 1);
             assert_eq!(pos.col, 0);
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4878,8 +4843,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // MAXCOL means "past end of line" - dec() brings it back to
             // exactly the line's own length (the NUL position, matching
@@ -4890,7 +4854,7 @@ mod tests {
             assert_eq!(dec(&mut pos), 0);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 3, col: 3, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
         close_test_memline(buf);
     }
@@ -4900,8 +4864,7 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let mut buf = build_three_line_two_block_memline();
         unsafe {
-            let prev_curbuf = GLOBALS.get_mut().curbuf;
-            GLOBALS.get_mut().curbuf = &mut buf as *mut BufT;
+            let mut _cb = CurbufGuard::install(&mut buf as *mut BufT);
 
             // Starting at "world"'s first char (lnum 2, col 0): a plain
             // dec() would cross to "hello"'s own NUL position (col 5,
@@ -4912,7 +4875,7 @@ mod tests {
             assert_eq!(decl(&mut pos), 0);
             assert_eq!(pos, crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 });
 
-            GLOBALS.get_mut().curbuf = prev_curbuf;
+            _cb.restore_now();
         }
 
         close_test_memline(buf);
@@ -5043,6 +5006,36 @@ mod tests {
         assert_eq!(unsafe { GLOBALS.get_mut() }.curbuf, later);
 
         unsafe { GLOBALS.get_mut() }.curbuf = std::ptr::null_mut();
+    }
+
+    /// The `curwin` counterpart of [`CurbufGuard`], for the same
+    /// unwind-safety reason.
+    struct CurwinGuard {
+        prev: *mut crate::buffer_defs::WinT,
+        restored: bool,
+    }
+
+    impl CurwinGuard {
+        unsafe fn install(win: *mut crate::buffer_defs::WinT) -> Self {
+            let g = unsafe { GLOBALS.get_mut() };
+            let me = Self { prev: g.curwin, restored: false };
+            g.curwin = win;
+            me
+        }
+
+        /// Restore `curwin` now rather than at drop. Idempotent.
+        fn restore_now(&mut self) {
+            if !self.restored {
+                unsafe { GLOBALS.get_mut() }.curwin = self.prev;
+                self.restored = true;
+            }
+        }
+    }
+
+    impl Drop for CurwinGuard {
+        fn drop(&mut self) {
+            self.restore_now();
+        }
     }
 
     unsafe fn marked_fixture(buf: &mut BufT) -> CurbufGuard {
