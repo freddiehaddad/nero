@@ -199,18 +199,41 @@ pub unsafe fn get_search_match_hl(
 
 /// Clear all matches for window `wp` (`clear_matches`).
 ///
-/// Only the always-taken "no matches exist" fast path is translated
-/// (see this module's own doc comment) - the original's own
-/// `redraw_later(wp, UPD_SOME_VALID)` call at the end is omitted
-/// (a pure redraw-scheduling side effect, matching this crate's
-/// established policy), leaving this function's ENTIRE currently-
-/// reachable behavior a real, faithful no-op.
+/// A real teardown of the list now that
+/// [`crate::buffer_defs::MatchitemT`] is a real struct. The original's
+/// four frees per entry become one: dropping the reconstituted `Box`
+/// releases the entry, its pattern and its position array together.
+///
+/// The one thing NOT freed is `mit_match.regprog`, which needs
+/// `vim_regfree` (part of the untranslated regex engine). That is not
+/// a leak in any reachable state: nothing here can compile a regexp,
+/// so `regprog` is always null, and the original's own
+/// `vim_regfree(NULL)` is itself a no-op. A debug assertion pins that,
+/// so a future entry carrying a real program cannot be silently
+/// dropped.
+///
+/// The original's trailing `redraw_later(wp, UPD_SOME_VALID)` is
+/// omitted, matching this crate's established policy for pure
+/// redraw-scheduling side effects.
 ///
 /// # Safety
-/// `wp` must be a valid, non-null pointer to a live `WinT`.
+/// `wp` must be a valid, non-null pointer to a live `WinT`, and every
+/// entry in its `w_match_head` chain must have been allocated with
+/// `Box::into_raw` - this reclaims them with `Box::from_raw`.
 pub unsafe fn clear_matches(wp: *mut WinT) {
     // SAFETY: forwarded from this function's own safety doc.
-    debug_assert!(unsafe { &*wp }.w_match_head.is_null(), "clear_matches: real matchitem_T support not yet translated");
+    let win = unsafe { &mut *wp };
+    while !win.w_match_head.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let item = unsafe { Box::from_raw(win.w_match_head) };
+        debug_assert!(
+            item.mit_match.regprog.is_null(),
+            "clear_matches: freeing a compiled regexp needs vim_regfree"
+        );
+        win.w_match_head = item.mit_next;
+        // Dropping `item` frees the entry, its pattern and its
+        // position array.
+    }
 }
 
 /// `"clearmatches([{win}])"` function (`f_clearmatches`).
@@ -321,6 +344,63 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- clear_matches ---
+
+    /// Builds a window owning a real match list, WITHOUT an RAII
+    /// guard: `clear_matches` takes ownership of every entry, so a
+    /// fixture that also freed them would double-free.
+    fn win_with_owned_matches(ids: &[i32]) -> Box<WinT> {
+        let items: Vec<*mut crate::buffer_defs::MatchitemT> = ids
+            .iter()
+            .map(|&mit_id| {
+                Box::into_raw(Box::new(crate::buffer_defs::MatchitemT {
+                    mit_id,
+                    // Owned payloads, so a missed free shows up under
+                    // Miri's leak check rather than passing silently.
+                    mit_pattern: Some(b"pat".to_vec()),
+                    mit_pos_array: vec![crate::buffer_defs::LlposT::default(); 3],
+                    ..Default::default()
+                }))
+            })
+            .collect();
+        for i in 0..items.len().saturating_sub(1) {
+            let cur = items[i];
+            unsafe { &mut *cur }.mit_next = items[i + 1];
+        }
+        Box::new(WinT {
+            w_match_head: items.first().copied().unwrap_or(std::ptr::null_mut()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn clear_matches_empties_the_list() {
+        let mut wp = win_with_owned_matches(&[1, 2, 3]);
+        assert!(!wp.w_match_head.is_null());
+
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+
+        assert!(wp.w_match_head.is_null(), "the whole chain is released");
+    }
+
+    #[test]
+    fn clear_matches_is_a_noop_on_an_empty_list() {
+        let mut wp = win_with_owned_matches(&[]);
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+        assert!(wp.w_match_head.is_null());
+    }
+
+    /// Clearing twice is safe: the second call sees an empty list
+    /// rather than walking freed entries.
+    #[test]
+    fn clear_matches_is_idempotent() {
+        let mut wp = win_with_owned_matches(&[1, 2]);
+        let ptr = std::ptr::from_mut(&mut *wp);
+        unsafe { clear_matches(ptr) };
+        unsafe { clear_matches(ptr) };
+        assert!(wp.w_match_head.is_null());
+    }
 
     // --- get_match ---
 
