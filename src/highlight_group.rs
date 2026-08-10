@@ -288,6 +288,53 @@ pub unsafe fn syn_name2id(name: &[u8]) -> i32 {
     unsafe { syn_name2id_len(name) }
 }
 
+/// The number of highlight groups currently defined
+/// (`highlight_num_groups`).
+///
+/// # Safety
+/// Reads the [`HL_TABLE`] file-static.
+#[must_use]
+pub unsafe fn highlight_num_groups() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { HL_TABLE.get_mut() }.ga_len()
+}
+
+/// The name of the highlight group at table index `id`
+/// (`highlight_group_name`).
+///
+/// **`id` is 0-BASED here**, unlike [`syn_id2name`]'s 1-based group
+/// ID: the original indexes `hl_table[id]` directly rather than
+/// `hl_table[id - 1]`. That difference is real and deliberate - this
+/// is an index into the table, not a group ID - so it is preserved
+/// rather than harmonised.
+///
+/// The original does no bounds check and relies on the caller passing
+/// a valid index; indexing here panics instead of reading out of
+/// bounds, which is the same contract for every valid input and
+/// strictly safer for an invalid one.
+///
+/// # Safety
+/// Reads the [`HL_TABLE`] file-static. `id` must be a valid index,
+/// i.e. `0 <= id < highlight_num_groups()`.
+#[must_use]
+pub unsafe fn highlight_group_name(id: i32) -> Vec<u8> {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { HL_TABLE.get_mut() }.items[id as usize].sg_name.clone()
+}
+
+/// The ID of the group that the group at table index `id` links to,
+/// or `0` when it links to nothing (`highlight_link_id`).
+///
+/// `id` is 0-BASED, exactly as in [`highlight_group_name`].
+///
+/// # Safety
+/// Same as [`highlight_group_name`].
+#[must_use]
+pub unsafe fn highlight_link_id(id: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { HL_TABLE.get_mut() }.items[id as usize].sg_link
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -580,6 +627,51 @@ mod tests {
         let id = unsafe { syn_name2id(b"@capture") };
         assert_ne!(id, 0, "@ name resolves");
         assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 1, "because it was created");
+    }
+
+    // --- highlight_num_groups / highlight_group_name / highlight_link_id ---
+
+    #[test]
+    fn highlight_num_groups_counts_the_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A", b"B", b"C"]);
+        assert_eq!(unsafe { highlight_num_groups() }, 3);
+    }
+
+    #[test]
+    fn highlight_num_groups_is_zero_for_an_empty_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+        assert_eq!(unsafe { highlight_num_groups() }, 0);
+    }
+
+    /// `highlight_group_name` indexes the table DIRECTLY, so it is
+    /// 0-based, while `syn_id2name` takes a 1-based group ID. The two
+    /// therefore disagree by one for the same entry, and that is the
+    /// original's behaviour rather than a mistake.
+    #[test]
+    fn highlight_group_name_is_zero_based_unlike_syn_id2name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"First", b"Second"]);
+
+        assert_eq!(unsafe { highlight_group_name(0) }, b"First".to_vec());
+        assert_eq!(unsafe { highlight_group_name(1) }, b"Second".to_vec());
+
+        // Same entry, different convention.
+        assert_eq!(unsafe { syn_id2name(1) }, b"First".to_vec());
+        assert_eq!(unsafe { syn_id2name(2) }, b"Second".to_vec());
+    }
+
+    #[test]
+    fn highlight_link_id_reports_the_link_target() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A", b"B"]);
+
+        assert_eq!(unsafe { highlight_link_id(0) }, 0, "unlinked by default");
+
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_link = 2;
+        assert_eq!(unsafe { highlight_link_id(0) }, 2);
+        assert_eq!(unsafe { highlight_link_id(1) }, 0, "the other is untouched");
     }
 
     #[test]
