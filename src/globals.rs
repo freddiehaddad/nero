@@ -1296,6 +1296,67 @@ pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Installs a value into one of [`GLOBALS`]' pointer fields and
+/// restores the previous one on drop - including when a test unwinds
+/// part-way through.
+///
+/// This is not merely tidiness. Tests routinely install a pointer to a
+/// STACK buffer, window or tab page into a global. Restoring only at
+/// the end of the body means a failing assertion unwinds with that
+/// global still pointing at memory about to die, and the next test to
+/// read it corrupts the heap - turning one clean assertion failure
+/// into an unrelated crash elsewhere. Holding
+/// [`global_state_test_lock`] does not help, since the lock is
+/// deliberately poison-tolerant.
+///
+/// [`Self::restore_now`] exists because the restore POINT is
+/// load-bearing in some tests (for example `ml_close` must not run
+/// with the test buffer still installed). It is idempotent, so the
+/// eventual drop is a no-op and cannot clobber a value installed
+/// after it.
+#[cfg(test)]
+pub(crate) struct GlobalPtrGuard<T: 'static> {
+    slot: fn(&mut Globals) -> &mut *mut T,
+    prev: *mut T,
+    restored: bool,
+}
+
+#[cfg(test)]
+impl<T: 'static> GlobalPtrGuard<T> {
+    /// Install `value` into the field selected by `slot`.
+    ///
+    /// # Safety
+    /// Touches [`GLOBALS`]; the caller must hold
+    /// [`global_state_test_lock`].
+    pub(crate) unsafe fn install(
+        slot: fn(&mut Globals) -> &mut *mut T,
+        value: *mut T,
+    ) -> Self {
+        // SAFETY: forwarded from this function's own safety doc.
+        let g = unsafe { GLOBALS.get_mut() };
+        let prev = *slot(g);
+        *slot(g) = value;
+        Self { slot, prev, restored: false }
+    }
+
+    /// Restore the field now rather than at drop. Idempotent.
+    pub(crate) fn restore_now(&mut self) {
+        if !self.restored {
+            // SAFETY: same requirement as `install`.
+            let g = unsafe { GLOBALS.get_mut() };
+            *(self.slot)(g) = self.prev;
+            self.restored = true;
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T: 'static> Drop for GlobalPtrGuard<T> {
+    fn drop(&mut self) {
+        self.restore_now();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

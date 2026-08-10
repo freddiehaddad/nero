@@ -2170,8 +2170,7 @@ mod tests {
         win.w_cursor.lnum = 5;
         win.w_valid_cursor.lnum = 1; // > 0 and different from w_cursor.lnum
 
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         // catch_unwind (rather than #[should_panic]) so curwin is
         // always restored before this test returns, even though the
@@ -2181,7 +2180,7 @@ mod tests {
             check_cursor_moved(&mut win as *mut WinT);
         }));
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
 
         let err = result.expect_err("expected check_cursor_moved to panic");
         let msg = err
@@ -2378,15 +2377,14 @@ mod tests {
         win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 };
         win.w_set_curswant = true;
 
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { update_curswant_force() };
 
         assert_eq!(win.w_curswant, 4);
         assert!(!win.w_set_curswant);
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
         unsafe {
             let mfp = Box::from_raw(buf.b_ml.ml_mfp);
             crate::memfile::mf_close(*mfp, false);
@@ -2402,14 +2400,13 @@ mod tests {
         win.w_set_curswant = false;
         win.w_curswant = 99;
 
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { update_curswant() };
 
         assert_eq!(win.w_curswant, 99); // untouched
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2449,14 +2446,13 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_valid = i32::from(w_valid::VALID_WROW) | i32::from(w_valid::VALID_BOTLINE);
 
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { changed_line_abv_curs() };
 
         assert_eq!(win.w_valid, i32::from(w_valid::VALID_BOTLINE));
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     // --- validate_botline_win / comp_botline ---
@@ -2876,12 +2872,11 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 0;
         win.w_onebuf_opt.wo_sop = 3;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { use_scrolloffpad(&win) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2891,12 +2886,11 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 0;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { use_scrolloffpad(&win) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2906,12 +2900,11 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(unsafe { use_scrolloffpad(&win) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2922,12 +2915,11 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 0; // use_scrolloffpad() false
         win.w_onebuf_opt.wo_sop = 3;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2938,12 +2930,11 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 0) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     #[test]
@@ -2954,15 +2945,14 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win as *mut WinT;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         // lnum(9) > line_count(10) - so(2) = 8 -> true.
         assert!(unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
         // lnum(8) > line_count(10) - so(2) = 8 -> false (not strictly greater).
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 8, 2) });
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
     }
 
     // --- vcol2col / virtcol2col ---
@@ -3504,12 +3494,11 @@ mod tests {
         // subsequent read, matching this crate's established Tree
         // Borrows discipline.
         let win_ptr = &mut win as *mut WinT;
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = win_ptr;
+        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, win_ptr) };
 
         unsafe { cursor_correct_sms(win_ptr) };
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_curwin;
+        _cw.restore_now();
 
         // Hand-traced: width1=width2=20 (no col_off), skipcol=30,
         // 'scrolloff'=0 -> so_cols=0. overlap = sms_marker_overlap
