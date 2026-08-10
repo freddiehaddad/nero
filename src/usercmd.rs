@@ -955,9 +955,21 @@ mod tests {
         }];
         let mut win = Box::new(crate::buffer_defs::WinT::default());
         win.w_buffer = std::ptr::from_mut(&mut *buf);
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = std::ptr::from_mut(&mut *win);
-        g.curbuf = std::ptr::from_mut(&mut *buf);
+        // Guarded: both globals point at Boxes that die with this
+        // function, so leaving them installed dangles them for every
+        // later test.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                std::ptr::from_mut(&mut *win),
+            )
+        };
+        let _cb = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                std::ptr::from_mut(&mut *buf),
+            )
+        };
 
         let mut eap = ucmd_eap(b"Foo");
         let mut complp = 0;
@@ -1136,7 +1148,12 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         let _g = UcmdsGuard::save();
         unsafe { UCMDS.get_mut() }.items = vec![named(b"GlobalOne")];
-        unsafe { crate::globals::GLOBALS.get_mut() }.curbuf = std::ptr::null_mut();
+        // Guarded: this previously left `curbuf` null for every later
+        // test, and an assertion failure below would have left it null
+        // even with a manual restore at the end.
+        let _cb = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, std::ptr::null_mut())
+        };
 
         unsafe { ex_comclear() };
         assert!(unsafe { UCMDS.get_mut() }.is_empty());

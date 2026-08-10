@@ -1067,19 +1067,26 @@ mod tests {
         use crate::ex_cmds_defs::CmdIdxT;
         let _lock = crate::globals::global_state_test_lock();
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let (pw, pb) = (g.curwin, g.curbuf);
         let mut buf = Box::new(BufT::default());
         let mut win = Box::new(crate::buffer_defs::WinT::default());
         win.w_buffer = std::ptr::from_mut(&mut *buf);
-        g.curwin = std::ptr::from_mut(&mut *win);
-        g.curbuf = std::ptr::from_mut(&mut *buf);
+        // Guarded: both globals point at Boxes that die with this
+        // function, so an assertion failure would otherwise leave
+        // them dangling for the next test.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                std::ptr::from_mut(&mut *win),
+            )
+        };
+        let _cb = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                std::ptr::from_mut(&mut *buf),
+            )
+        };
 
         assert_eq!(unsafe { get_command_name(CmdIdxT::SIZE as i32) }, None);
-
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = pw;
-        g.curbuf = pb;
     }
 
     #[test]

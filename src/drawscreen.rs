@@ -1092,9 +1092,12 @@ mod tests {
         // column can never squeeze the text area away.
         let _lock = crate::globals::global_state_test_lock();
         let prev_wmw = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw;
-        let prev_cur = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = 1;
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::null_mut();
+        // Guarded: an assertion failure below would otherwise leave
+        // `curwin` overwritten for whatever test runs next.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut())
+        };
 
         // Plenty of room: the requested width wins.
         let mut win = crate::buffer_defs::WinT { w_view_width: 80, ..Default::default() };
@@ -1107,7 +1110,6 @@ mod tests {
         // 10 - (7 + 1) == 2
         assert_eq!(unsafe { compute_foldcolumn(&mut win, 7) }, 2);
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_cur;
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = prev_wmw;
     }
 
@@ -1117,22 +1119,25 @@ mod tests {
         // usable column; any other window does not get that floor.
         let _lock = crate::globals::global_state_test_lock();
         let prev_wmw = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw;
-        let prev_cur = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = 0;
+        // One guard covers the whole body: it captures the ORIGINAL
+        // `curwin` here, so the deliberate reassignment below still
+        // ends up restored, on the unwind path too.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut())
+        };
 
         let mut win = crate::buffer_defs::WinT { w_view_width: 10, ..Default::default() };
         win.w_onebuf_opt.wo_fdc = Some(b"9".to_vec());
 
         // Not the current window: wmw is 0, so 10 - (0 + 0) == 10,
         // capped by the requested 9.
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = std::ptr::null_mut();
         assert_eq!(unsafe { compute_foldcolumn(&mut win, 0) }, 9);
 
         // The current window: wmw becomes 1, so 10 - (0 + 1) == 9.
         unsafe { crate::globals::GLOBALS.get_mut() }.curwin = &mut win;
         assert_eq!(unsafe { compute_foldcolumn(&mut win, 2) }, 7);
 
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_cur;
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_wmw = prev_wmw;
     }
 
@@ -1646,20 +1651,22 @@ mod tests {
         win.w_onebuf_opt.wo_cole = 2;
         win.w_onebuf_opt.wo_cocu = Some(Vec::new()); // never conceal the cursor line
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev = g.curwin;
-
-        // Some OTHER window is current.
         let mut other = Box::new(crate::buffer_defs::WinT::default());
-        g.curwin = std::ptr::from_mut(&mut *other);
+        // Guarded: both windows are Boxes that die with this function.
+        // The guard captures the ORIGINAL `curwin`, so the deliberate
+        // reassignment below still ends up restored, on unwind too.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                std::ptr::from_mut(&mut *other),
+            )
+        };
         assert!(!unsafe { win_cursorline_standout(&win) });
 
         // Now it is the current one.
         let g = unsafe { crate::globals::GLOBALS.get_mut() };
         g.curwin = std::ptr::from_mut(&mut *win);
         assert!(unsafe { win_cursorline_standout(&win) });
-
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
     }
 
     /// With concealing on but the cursor line itself concealed, there

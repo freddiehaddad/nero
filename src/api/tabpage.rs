@@ -162,19 +162,19 @@ mod tests {
 
         let mut win = WinT { handle: 77, ..Default::default() };
         let win_ptr = std::ptr::addr_of_mut!(win);
-        // SAFETY: single-threaded test, restored below.
-        let prev_curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        // SAFETY: same as above.
-        unsafe { crate::globals::GLOBALS.get_mut().curwin = win_ptr };
+        // Guarded rather than restored by hand: `win` is a local, so
+        // an assertion failure below would otherwise leave `curwin`
+        // dangling for whatever test runs next.
+        // SAFETY: single-threaded test holding the global state lock.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr)
+        };
 
         let handle = fx.handle();
         let mut err = Error::default();
         // SAFETY: `fx`/`win` set up a valid GLOBALS.first_tabpage/
         // curtab/curwin.
         let win_handle = unsafe { nvim_tabpage_get_win(handle, &mut err) };
-
-        // SAFETY: restoring exactly what was overwritten above.
-        unsafe { crate::globals::GLOBALS.get_mut().curwin = prev_curwin };
 
         assert_eq!(win_handle, 77);
         assert!(!err.is_set());

@@ -1716,9 +1716,14 @@ mod tests {
             w_cursor: crate::pos_defs::PosT { lnum: 1, col: 10, coladd: 0 },
             ..Default::default()
         };
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev_win = globals.curwin;
-        globals.curwin = &mut win as *mut crate::buffer_defs::WinT;
+        // Guarded: `win` is a local, so an assertion failure below
+        // would otherwise leave `curwin` dangling for the next test.
+        let _cw = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curwin,
+                &mut win as *mut crate::buffer_defs::WinT,
+            )
+        };
         let prev_col = unsafe { *COMPL_COL.get_mut() };
 
         unsafe { *COMPL_COL.get_mut() = 4 };
@@ -1729,7 +1734,6 @@ mod tests {
         assert_eq!(unsafe { get_compl_len() }, 0);
 
         unsafe { *COMPL_COL.get_mut() = prev_col };
-        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev_win;
     }
 
     /// Saves and restores the completion leader/original-text pair.
