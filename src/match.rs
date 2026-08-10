@@ -112,6 +112,39 @@ pub unsafe fn get_prevcol_hl_flag(
             || (prevcol > search_hl.startcol && search_hl.endcol == crate::pos_defs::MAXCOL))
 }
 
+/// The highlight attribute for a search match starting just before
+/// `col`, if any (`get_search_match_hl`).
+///
+/// Returns `None` when no match starts there, leaving the caller's
+/// current attribute alone - the original signals this by simply not
+/// writing to its `char_attr` out-parameter, which becomes a returned
+/// `Option` here, matching this crate's convention.
+///
+/// Only the always-taken "no matches exist" fast path is translated
+/// (see this module's own doc comment). With an empty `w_match_head`
+/// the original's loop runs exactly once, selects `search_hl`, applies
+/// the column test and exits, so that is all that remains. Note the
+/// original's `shl == search_hl || !shl->is_addpos` guard is
+/// unconditionally true on this path, since `shl` IS `search_hl` -
+/// so an addpos flag does not suppress the attribute here, unlike in
+/// [`get_prevcol_hl_flag`].
+///
+/// # Safety
+/// `wp` must be a valid reference to a live `WinT`.
+#[must_use]
+pub unsafe fn get_search_match_hl(
+    wp: &WinT,
+    search_hl: &crate::buffer_defs::MatchT,
+    col: crate::pos_defs::ColnrT,
+) -> Option<i32> {
+    debug_assert!(
+        wp.w_match_head.is_null(),
+        "get_search_match_hl: real matchitem_T support not yet translated"
+    );
+
+    (col - 1 == search_hl.startcol).then_some(search_hl.attr)
+}
+
 /// Clear all matches for window `wp` (`clear_matches`).
 ///
 /// Only the always-taken "no matches exist" fast path is translated
@@ -221,6 +254,50 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- get_search_match_hl ---
+
+    /// The attribute applies to the column just AFTER the match's
+    /// start column, since the original compares `col - 1`.
+    #[test]
+    fn get_search_match_hl_returns_the_attribute_one_past_the_start_column() {
+        let wp = WinT::default();
+        let shl = crate::buffer_defs::MatchT {
+            startcol: 5,
+            attr: 42,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 6) }, Some(42));
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 5) }, None, "off by one");
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 7) }, None);
+    }
+
+    /// On this path `shl` IS `search_hl`, so the original's
+    /// `shl == search_hl || !shl->is_addpos` guard is unconditionally
+    /// true and an addpos match still yields its attribute - unlike
+    /// `get_prevcol_hl_flag`, where addpos does suppress.
+    #[test]
+    fn get_search_match_hl_is_not_suppressed_by_addpos() {
+        let wp = WinT::default();
+        let shl = crate::buffer_defs::MatchT {
+            startcol: 5,
+            attr: 7,
+            is_addpos: true,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 6) }, Some(7));
+    }
+
+    /// A zero attribute is still a real answer, distinct from "no
+    /// match starts here".
+    #[test]
+    fn get_search_match_hl_distinguishes_a_zero_attribute_from_no_match() {
+        let wp = WinT::default();
+        let shl = crate::buffer_defs::MatchT { startcol: 0, attr: 0, ..Default::default() };
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 1) }, Some(0));
+        assert_eq!(unsafe { get_search_match_hl(&wp, &shl, 2) }, None);
+    }
 
     // --- get_prevcol_hl_flag ---
 
