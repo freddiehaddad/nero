@@ -177,12 +177,6 @@ pub struct QfInfoT {
 pub struct MapblockT {
     _private: (),
 }
-/// Placeholder for `matchitem_T` (`struct matchitem`) - see
-/// `src/nvim/buffer_defs.h` (phase 7: needs `regmmatch_T`, same blocker as
-/// `match_T`/`llpos_T`, which are deferred for the same reason).
-pub struct MatchitemT {
-    _private: (),
-}
 /// Placeholder for `AutoPatCmd` (`struct AutoPatCmd_S`) - see
 /// `src/nvim/autocmd_defs.h` (phase 6).
 pub struct AutoPatCmdT {

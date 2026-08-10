@@ -2,28 +2,36 @@
 //!
 //! `match.c` implements the `:match`/`matchadd()`/`matchaddpos()`
 //! highlighting-match subsystem, keyed on `WinT.w_match_head` (a
-//! linked list of `matchitem_T` entries). `matchitem_T` itself is
-//! still an opaque placeholder (`crate::types_defs::MatchitemT`, see
-//! `buffer_defs.rs`'s own doc comment) - it needs `regmmatch_T`/
-//! `regexp_defs.h` (the real regex engine, phase 7), so this crate
-//! cannot yet construct or read a real match entry's own fields.
+//! linked list of `matchitem_T` entries).
 //!
-//! However, since NOTHING currently translated can ever populate
-//! `w_match_head` (it starts, and can only currently stay, `NULL`),
-//! every function whose real body's own "iterate existing matches"
-//! loop is gated on `w_match_head != NULL` degrades to its own
-//! always-taken "no matches exist" fast path - the SAME
-//! "always-real-fast-path" pattern already established elsewhere in
-//! this crate (e.g. `autocmd.rs`'s `AUTOCMDS`). Translated on this
-//! basis: `get_optional_window` (`eval/funcs.c`), `clear_matches`/
-//! `f_clearmatches`/`f_getmatches`/`get_match`/`f_matcharg`
-//! (`matcharg()` - its own `m != NULL` branch, needing `syn_id2name`/
-//! the highlight-group registry, is never reached since `get_match`
-//! always returns `null`).
+//! `matchitem_T` is now a REAL struct
+//! ([`crate::buffer_defs::MatchitemT`]): its former blocker,
+//! `regmmatch_T`, is itself real (see `regexp_defs.rs`), holding the
+//! still-opaque compiled program only as a pointer nothing here
+//! dereferences. So a match entry's fields can now be read and built,
+//! and [`get_match`] is a real walk of the list rather than a fast
+//! path.
 //!
-//! Deferred: `matchadd()`/`matchaddpos()`/`matchdelete()`/`getmatches()`'s
-//! own item-conversion loop body, `:match`/`:2match`/`:3match`, and
-//! everything else needing real `matchitem_T` fields.
+//! What remains missing is not the TYPE but the machinery that
+//! populates the list: nothing currently translated adds an entry, so
+//! `w_match_head` is still empty in practice. Functions whose real
+//! body needs more than the walk itself therefore still take their
+//! "no matches exist" path, each guarded by a `debug_assert!` on
+//! `w_match_head` being empty so a future real list cannot be
+//! silently ignored: `clear_matches`/`f_clearmatches`/`f_getmatches`
+//! (needs the item-to-Dict conversion), `f_matcharg` (its reporting
+//! branch needs `syn_id2name`, the highlight-group registry), and
+//! `get_prevcol_hl_flag`/`get_search_match_hl` (their loops over the
+//! list).
+//!
+//! Also translated: `get_optional_window` (`eval/funcs.c`), and the
+//! search-highlight helpers `check_cur_search_hl`/
+//! `get_prevcol_hl_flag`/`get_search_match_hl`, unblocked by
+//! `match_T`.
+//!
+//! Deferred: `matchadd()`/`matchaddpos()`/`matchdelete()`,
+//! `getmatches()`'s own item-conversion loop body, and
+//! `:match`/`:2match`/`:3match` - the list-BUILDING side.
 
 use crate::buffer_defs::WinT;
 use crate::eval::typval_defs::TypvalT;
@@ -201,32 +209,42 @@ pub unsafe fn f_getmatches(argvars: &[TypvalT], rettv: &mut TypvalT) {
     let _ = l;
 }
 
-/// Find match `id` for window `wp` (`get_match`). Always returns
-/// `null` today: the original's own loop walks `wp.w_match_head`
-/// looking for a `mit_id == id` entry, but since nothing in this
-/// crate can currently populate that list, its own loop condition
-/// (`cur != NULL && ...`) is false on the very first check - see this
-/// module's own doc comment.
+/// Find match `id` for window `wp` (`get_match`), or `null` when the
+/// window has no match with that ID.
+///
+/// A real walk of `wp.w_match_head` now that
+/// [`crate::buffer_defs::MatchitemT`] is a real struct rather than an
+/// opaque placeholder; the previous always-null fast path is retired.
 ///
 /// # Safety
-/// `wp` must be a valid, non-null pointer to a live `WinT`.
+/// `wp` must be a valid, non-null pointer to a live `WinT`, and its
+/// `w_match_head` chain must consist of live `MatchitemT`s.
 #[must_use]
-pub unsafe fn get_match(wp: *mut WinT, _id: i32) -> *mut crate::types_defs::MatchitemT {
+pub unsafe fn get_match(wp: *mut WinT, id: i32) -> *mut crate::buffer_defs::MatchitemT {
     // SAFETY: forwarded from this function's own safety doc.
-    debug_assert!(unsafe { &*wp }.w_match_head.is_null(), "get_match: real matchitem_T support not yet translated");
-    std::ptr::null_mut()
+    let mut cur = unsafe { &*wp }.w_match_head;
+    while !cur.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let item = unsafe { &*cur };
+        if item.mit_id == id {
+            break;
+        }
+        cur = item.mit_next;
+    }
+    cur
 }
 
 /// `"matcharg({nr})"` function (`f_matcharg`) - the highlight group
 /// name and pattern for match `{nr}` (`1`-`3`, for `:match`/`:2match`/
 /// `:3match`), as a 2-element `List`.
 ///
-/// Since [`get_match`] always returns `null` today, this is ALWAYS a
-/// `[v:null, v:null]`-equivalent (2 null strings) List for `{nr}` in
-/// `1..=3` - the original's own `m != NULL` branch (needing
-/// `syn_id2name`, the highlight-group registry, not translated) is
-/// never reached. An out-of-range `{nr}` gets an empty List, matching
-/// the original's own `tv_list_alloc_ret(rettv, 0)` for that case.
+/// Always a `[v:null, v:null]`-equivalent (2 null strings) List for
+/// `{nr}` in `1..=3`. The original's own `m != NULL` branch needs
+/// `syn_id2name` (the highlight-group registry, not translated), so it
+/// cannot be filled in yet - and nothing translated populates
+/// `w_match_head`, so [`get_match`] finds nothing to report anyway.
+/// An out-of-range `{nr}` gets an empty List, matching the original's
+/// own `tv_list_alloc_ret(rettv, 0)` for that case.
 ///
 /// # Safety
 /// Touches `crate::globals::GLOBALS.curwin`. Forwarded from
@@ -239,9 +257,14 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
     if in_range {
         // SAFETY: forwarded from this function's own safety doc.
         let win = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
-        // SAFETY: forwarded from this function's own safety doc.
-        let m = unsafe { get_match(win, id as i32) };
-        debug_assert!(m.is_null(), "f_matcharg: real matchitem_T support not yet translated");
+        // The real reporting branch needs `syn_id2name`; assert on the
+        // condition that actually holds today - an empty match list -
+        // rather than on `get_match`'s result, which is now a real
+        // walk and no longer null by construction.
+        debug_assert!(
+            unsafe { &*win }.w_match_head.is_null(),
+            "f_matcharg: reporting a real match needs syn_id2name"
+        );
         // SAFETY: `l` was just freshly allocated above.
         unsafe {
             crate::eval::typval::tv_list_append_string(l, None);
@@ -254,6 +277,82 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- get_match ---
+
+    /// A window owning a real match list, all allocations held as raw
+    /// pointers so writes through the walked chain cannot invalidate
+    /// a live `Box` tag.
+    struct MatchListFixture {
+        win: *mut WinT,
+        items: Vec<*mut crate::buffer_defs::MatchitemT>,
+    }
+
+    impl MatchListFixture {
+        /// One entry per ID, linked through `mit_next` in order.
+        fn new(ids: &[i32]) -> Self {
+            let items: Vec<*mut crate::buffer_defs::MatchitemT> = ids
+                .iter()
+                .map(|&mit_id| {
+                    Box::into_raw(Box::new(crate::buffer_defs::MatchitemT {
+                        mit_id,
+                        ..Default::default()
+                    }))
+                })
+                .collect();
+            for i in 0..items.len().saturating_sub(1) {
+                let cur = items[i];
+                unsafe { &mut *cur }.mit_next = items[i + 1];
+            }
+
+            let win = Box::into_raw(Box::new(WinT {
+                w_match_head: items.first().copied().unwrap_or(std::ptr::null_mut()),
+                ..Default::default()
+            }));
+            Self { win, items }
+        }
+    }
+
+    impl Drop for MatchListFixture {
+        fn drop(&mut self) {
+            unsafe {
+                drop(Box::from_raw(self.win));
+                for &it in &self.items {
+                    drop(Box::from_raw(it));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn get_match_returns_null_for_an_empty_list() {
+        let fx = MatchListFixture::new(&[]);
+        assert!(unsafe { get_match(fx.win, 1) }.is_null());
+    }
+
+    #[test]
+    fn get_match_returns_null_when_no_entry_has_that_id() {
+        let fx = MatchListFixture::new(&[4, 5, 6]);
+        assert!(unsafe { get_match(fx.win, 7) }.is_null());
+    }
+
+    /// Finds the entry with the matching ID wherever it sits in the
+    /// chain - first, middle or last.
+    #[test]
+    fn get_match_finds_the_entry_anywhere_in_the_chain() {
+        let fx = MatchListFixture::new(&[4, 5, 6]);
+        assert_eq!(unsafe { get_match(fx.win, 4) }, fx.items[0], "first");
+        assert_eq!(unsafe { get_match(fx.win, 5) }, fx.items[1], "middle");
+        assert_eq!(unsafe { get_match(fx.win, 6) }, fx.items[2], "last");
+    }
+
+    /// With duplicate IDs the FIRST match wins, since the walk stops
+    /// as soon as it finds one.
+    #[test]
+    fn get_match_returns_the_first_of_two_duplicate_ids() {
+        let fx = MatchListFixture::new(&[9, 9]);
+        assert_eq!(unsafe { get_match(fx.win, 9) }, fx.items[0]);
+    }
 
     // --- get_search_match_hl ---
 

@@ -40,7 +40,7 @@ use crate::os::time_defs::Timestamp;
 use crate::pos_defs::{ColnrT, LinenrT, PosT};
 use crate::sign_defs::SIGN_SHOW_MAX;
 use crate::statusline_defs::{StcClicks, StlClickDefinition};
-use crate::types_defs::{HandleT, LuaRef, MapblockT, MatchitemT, OptInt, ProftimeT, QfInfoT, TerminalT};
+use crate::types_defs::{HandleT, LuaRef, MapblockT, OptInt, ProftimeT, QfInfoT, TerminalT};
 use crate::undo_defs::{UHeader, VisualinfoT};
 
 /// Reference to a buffer that stores the value of `buf_free_count`.
@@ -398,6 +398,83 @@ impl Default for MatchT {
             is_addpos: false,
             has_cursor: false,
             tm: 0,
+        }
+    }
+}
+
+/// Same as [`crate::pos_defs::LposT`], but with an additional length
+/// field (`llpos_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LlposT {
+    /// line number
+    pub lnum: crate::pos_defs::LinenrT,
+    /// column number
+    pub col: crate::pos_defs::ColnrT,
+    /// length: `0` means to the end of line
+    pub len: i32,
+}
+
+/// One entry in a window's match list, as created by `:match` or
+/// `matchadd()`/`matchaddpos()` (`matchitem_T`, `struct matchitem`).
+///
+/// Entries form an intrusive singly-linked list through `mit_next`,
+/// rooted at `WinT::w_match_head`, so that field stays a raw pointer.
+///
+/// An entry is defined EITHER by a pattern (`mit_pattern` present) OR
+/// by a list of positions (`mit_pos_array` non-empty), never both.
+/// The original signals "no pattern" with a NUL first byte and counts
+/// positions in a separate `mit_pos_count`; here the pattern is an
+/// `Option` and the positions a `Vec`, which carries its own count.
+#[derive(Debug)]
+pub struct MatchitemT {
+    /// next entry in the window's match list (`mit_next`).
+    pub mit_next: *mut MatchitemT,
+    /// match ID (`mit_id`).
+    pub mit_id: i32,
+    /// match priority (`mit_priority`).
+    pub mit_priority: i32,
+    /// pattern to highlight (`mit_pattern`), absent when this entry is
+    /// defined by positions instead.
+    pub mit_pattern: Option<Vec<u8>>,
+    /// regexp program for the pattern (`mit_match`).
+    pub mit_match: crate::regexp_defs::RegmmatchT,
+    /// the positions themselves (`mit_pos_array`), empty when this
+    /// entry is defined by a pattern instead. Replaces the original's
+    /// separately-counted `mit_pos_count`.
+    pub mit_pos_array: Vec<LlposT>,
+    /// internal position counter (`mit_pos_cur`).
+    pub mit_pos_cur: i32,
+    /// top buffer line (`mit_toplnum`).
+    pub mit_toplnum: crate::pos_defs::LinenrT,
+    /// bottom buffer line (`mit_botlnum`).
+    pub mit_botlnum: crate::pos_defs::LinenrT,
+    /// state for doing the actual highlighting (`mit_hl`).
+    pub mit_hl: MatchT,
+    /// highlight group ID (`mit_hlg_id`).
+    pub mit_hlg_id: i32,
+    /// `cchar` for Conceal highlighting (`mit_conceal_char`).
+    pub mit_conceal_char: i32,
+}
+
+impl Default for MatchitemT {
+    /// A zeroed entry, matching the original's own `{0}` init.
+    ///
+    /// Written out rather than derived because `mit_next` is a raw
+    /// pointer, which has no `Default`.
+    fn default() -> Self {
+        MatchitemT {
+            mit_next: std::ptr::null_mut(),
+            mit_id: 0,
+            mit_priority: 0,
+            mit_pattern: None,
+            mit_match: crate::regexp_defs::RegmmatchT::default(),
+            mit_pos_array: Vec::new(),
+            mit_pos_cur: 0,
+            mit_toplnum: 0,
+            mit_botlnum: 0,
+            mit_hl: MatchT::default(),
+            mit_hlg_id: 0,
+            mit_conceal_char: 0,
         }
     }
 }
