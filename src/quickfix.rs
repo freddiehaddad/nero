@@ -233,6 +233,38 @@ pub unsafe fn win_set_loclist(wp: *mut WinT, qi: *mut crate::types_defs::QfInfoT
     }
 }
 
+/// Propagate a location-list window's `'lhistory'` back to the window
+/// that owns the location list (`qf_sync_llw_to_win`).
+///
+/// The reverse direction of [`qf_sync_win_to_llw`]: that one pushes a
+/// normal window's value out to its location-list window, this one
+/// pulls a location-list window's value back to the normal window.
+/// Note the asymmetry in how each finds its partner - this one
+/// delegates to [`qf_find_win_with_loclist`], which deliberately skips
+/// quickfix windows, so the value lands on the window owning the file
+/// rather than on another list window.
+///
+/// Does nothing when no such window exists.
+///
+/// # Safety
+/// `llw` must point at a live `WinT`. Also carries
+/// [`qf_find_win_with_loclist`]'s own requirement that
+/// `GLOBALS.firstwin`'s `w_next` chain consists of live windows with
+/// valid buffers.
+pub unsafe fn qf_sync_llw_to_win(llw: *mut WinT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let llist_ref = unsafe { (*llw).w_llist_ref };
+    // SAFETY: forwarded from this function's own safety doc.
+    let wp = unsafe { qf_find_win_with_loclist(llist_ref) };
+    if wp.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let lhi = unsafe { (*llw).w_onebuf_opt.wo_lhi };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*wp).w_onebuf_opt.wo_lhi = lhi };
+}
+
 /// Find a NON-quickfix window in the current tabpage using location
 /// list stack `ll` (`qf_find_win_with_loclist`), or null if there is
 /// none.
@@ -1071,6 +1103,143 @@ mod tests {
         let first = fx.wins[0];
         unsafe { &mut *first }.w_buffer = std::ptr::null_mut();
         assert_eq!(unsafe { qf_find_win_with_normal_buf() }, fx.wins[1]);
+    }
+
+    // --- qf_sync_llw_to_win ---
+
+    /// A location list plus a window chain, all owned as raw pointers
+    /// so that writes through the walked pointers cannot invalidate a
+    /// live `Box`'s tag.
+    struct LlwFixture {
+        list: *mut crate::types_defs::QfInfoT,
+        wins: Vec<*mut WinT>,
+        bufs: Vec<*mut BufT>,
+        prev_firstwin: *mut WinT,
+    }
+
+    impl LlwFixture {
+        /// One window per `(is_quickfix, llist_matches)` entry, linked
+        /// through `w_next` and installed as `firstwin`.
+        fn new(spec: &[(bool, bool)]) -> Self {
+            let list = Box::into_raw(Box::new(crate::types_defs::QfInfoT::default()));
+            let mut wins = Vec::new();
+            let mut bufs = Vec::new();
+
+            for &(is_quickfix, llist_matches) in spec {
+                let mut buf = Box::new(BufT::default());
+                buf.b_p_bt = if is_quickfix {
+                    Some(b"quickfix".to_vec())
+                } else {
+                    Some(Vec::new())
+                };
+                let buf = Box::into_raw(buf);
+                bufs.push(buf);
+
+                let win = Box::new(WinT {
+                    w_buffer: buf,
+                    w_llist: if llist_matches { list } else { std::ptr::null_mut() },
+                    ..Default::default()
+                });
+                wins.push(Box::into_raw(win));
+            }
+            for i in 0..wins.len().saturating_sub(1) {
+                unsafe { &mut *wins[i] }.w_next = wins[i + 1];
+            }
+
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let prev_firstwin = g.firstwin;
+            g.firstwin = wins.first().copied().unwrap_or(std::ptr::null_mut());
+            Self { list, wins, bufs, prev_firstwin }
+        }
+
+        /// A standalone location-list window, NOT part of the chain,
+        /// referring to this fixture's list via `w_llist_ref`.
+        fn make_llw(&self, lhi: i64) -> *mut WinT {
+            let mut win = Box::new(WinT { w_llist_ref: self.list, ..Default::default() });
+            win.w_onebuf_opt.wo_lhi = lhi;
+            Box::into_raw(win)
+        }
+
+        fn lhi(win: *mut WinT) -> i64 {
+            unsafe { &*win }.w_onebuf_opt.wo_lhi
+        }
+    }
+
+    impl Drop for LlwFixture {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.firstwin = self.prev_firstwin;
+            unsafe {
+                for &w in &self.wins {
+                    drop(Box::from_raw(w));
+                }
+                for &b in &self.bufs {
+                    drop(Box::from_raw(b));
+                }
+                drop(Box::from_raw(self.list));
+            }
+        }
+    }
+
+    #[test]
+    fn qf_sync_llw_to_win_copies_lhistory_to_the_owning_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        // One ordinary window owning the list.
+        let fx = LlwFixture::new(&[(false, true)]);
+        let llw = fx.make_llw(42);
+
+        unsafe { qf_sync_llw_to_win(llw) };
+
+        assert_eq!(LlwFixture::lhi(fx.wins[0]), 42);
+        unsafe { drop(Box::from_raw(llw)) };
+    }
+
+    /// No window refers to the list, so nothing is written.
+    #[test]
+    fn qf_sync_llw_to_win_is_a_noop_when_no_window_owns_the_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = LlwFixture::new(&[(false, false)]);
+        let llw = fx.make_llw(42);
+
+        unsafe { qf_sync_llw_to_win(llw) };
+
+        assert_eq!(LlwFixture::lhi(fx.wins[0]), 0, "untouched");
+        unsafe { drop(Box::from_raw(llw)) };
+    }
+
+    /// A quickfix window referring to the same list is NOT the target:
+    /// the value belongs on the window owning the file. Here the
+    /// quickfix window comes first in the chain, so a search that
+    /// failed to skip it would write to the wrong window.
+    #[test]
+    fn qf_sync_llw_to_win_skips_a_quickfix_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = LlwFixture::new(&[(true, true), (false, true)]);
+        let llw = fx.make_llw(42);
+
+        unsafe { qf_sync_llw_to_win(llw) };
+
+        assert_eq!(LlwFixture::lhi(fx.wins[0]), 0, "quickfix window skipped");
+        assert_eq!(LlwFixture::lhi(fx.wins[1]), 42, "ordinary window written");
+        unsafe { drop(Box::from_raw(llw)) };
+    }
+
+    /// The original passes `w_llist_ref` through with no null check,
+    /// so a window with no list reference matches the first ordinary
+    /// window that also has none. Pinned to record that no guard was
+    /// invented here.
+    #[test]
+    fn qf_sync_llw_to_win_passes_a_null_list_reference_through_unguarded() {
+        let _lock = crate::globals::global_state_test_lock();
+        // The window's w_llist is null, matching a null w_llist_ref.
+        let fx = LlwFixture::new(&[(false, false)]);
+        let mut llw = Box::new(WinT::default());
+        llw.w_onebuf_opt.wo_lhi = 7;
+        let llw = Box::into_raw(llw);
+
+        unsafe { qf_sync_llw_to_win(llw) };
+
+        assert_eq!(LlwFixture::lhi(fx.wins[0]), 7);
+        unsafe { drop(Box::from_raw(llw)) };
     }
 
     // --- qf_sync_win_to_llw ---
