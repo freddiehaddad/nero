@@ -426,7 +426,7 @@ pub struct SynblockT {
     /// `SYNSPL_*` values
     pub b_syn_spell: i32,
     /// table for syntax patterns
-    pub b_syn_patterns: GarrayT,
+    pub b_syn_patterns: crate::garray_defs::TypedGarrayT<crate::syntax::SynpatT>,
     /// table for syntax clusters (`b_syn_clusters`).
     ///
     /// A [`crate::garray_defs::TypedGarrayT`] rather than the
@@ -531,7 +531,7 @@ impl Default for SynblockT {
             b_syn_ic: 0,
             b_syn_foldlevel: 0,
             b_syn_spell: 0,
-            b_syn_patterns: GarrayT::default(),
+            b_syn_patterns: crate::garray_defs::TypedGarrayT::default(),
             b_syn_clusters: crate::garray_defs::TypedGarrayT::default(),
             b_spell_cluster_id: 0,
             b_nospell_cluster_id: 0,

@@ -439,6 +439,140 @@ pub fn limit_pos(pos: &mut LposT, limit: &LposT) {
     }
 }
 
+/// Pattern-offset slots in [`SynpatT::sp_offsets`] (`SPO_*`).
+pub mod spo {
+    /// match start offset (`SPO_MS_OFF`).
+    pub const MS_OFF: usize = 0;
+    /// match end offset (`SPO_ME_OFF`).
+    pub const ME_OFF: usize = 1;
+    /// highlight start offset (`SPO_HS_OFF`).
+    pub const HS_OFF: usize = 2;
+    /// highlight end offset (`SPO_HE_OFF`).
+    pub const HE_OFF: usize = 3;
+    /// region start offset (`SPO_RS_OFF`).
+    pub const RS_OFF: usize = 4;
+    /// region end offset (`SPO_RE_OFF`).
+    pub const RE_OFF: usize = 5;
+    /// leading context offset (`SPO_LC_OFF`).
+    pub const LC_OFF: usize = 6;
+    /// number of offset slots (`SPO_COUNT`).
+    pub const COUNT: usize = 7;
+}
+
+/// What kind of item a [`SynpatT`] is (`SPTYPE_*`).
+pub mod sptype {
+    /// match keyword with this group ID (`SPTYPE_MATCH`).
+    pub const MATCH: u8 = 1;
+    /// match a regexp, start of item (`SPTYPE_START`).
+    pub const START: u8 = 2;
+    /// match a regexp, end of item (`SPTYPE_END`).
+    pub const END: u8 = 3;
+    /// match a regexp, skip within item (`SPTYPE_SKIP`).
+    pub const SKIP: u8 = 4;
+}
+
+/// The syntax-group identity of one item, as passed to `in_id_list`
+/// (`struct sp_syn`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpSyn {
+    /// `":syn include"` unique tag (`inc_tag`).
+    pub inc_tag: i32,
+    /// highlight group ID of the item (`id`).
+    pub id: i16,
+    /// `contained in` group IDs (`cont_in_list`).
+    ///
+    /// A `Vec` rather than the original's zero-terminated
+    /// `int16_t *`, matching [`SynClusterT::scl_list`].
+    pub cont_in_list: Vec<i16>,
+}
+
+/// One syntax pattern item (`synpat_T`).
+///
+/// A start/skip/end item consists of n start patterns, one skip
+/// pattern and m end patterns; for the latter two the patterns are
+/// always consecutive (start-skip-end).
+///
+/// The original's three owned pointers become owned Rust values:
+/// `sp_pattern` a `Vec<u8>` and both group-ID lists `Vec<i16>`,
+/// matching [`SynClusterT`]. `sp_prog` stays a raw pointer to the
+/// still-opaque `RegprogT`, exactly as [`crate::regexp_defs::RegmmatchT`]
+/// does - nothing translated dereferences it.
+///
+/// The original notes its field ORDER is chosen to reduce padding.
+/// That is a C layout concern with no observable behaviour, so the
+/// fields are grouped for readability here instead.
+#[derive(Debug, Default)]
+pub struct SynpatT {
+    /// see [`sptype`] (`sp_type`).
+    pub sp_type: u8,
+    /// this item is used for syncing (`sp_syncing`).
+    pub sp_syncing: bool,
+    /// highlight group ID of the pattern (`sp_syn_match_id`).
+    pub sp_syn_match_id: i16,
+    /// which offsets are set, and from which end (`sp_off_flags`).
+    pub sp_off_flags: i16,
+    /// the offsets themselves, indexed by [`spo`] (`sp_offsets`).
+    pub sp_offsets: [i32; spo::COUNT],
+    /// see [`hl_flags`] (`sp_flags`).
+    pub sp_flags: i32,
+    /// conceal substitute character (`sp_cchar`).
+    pub sp_cchar: i32,
+    /// ignore-case flag for `sp_prog` (`sp_ic`).
+    pub sp_ic: i32,
+    /// sync item index, syncing only (`sp_sync_idx`).
+    pub sp_sync_idx: i32,
+    /// ID of the last line where this was tried (`sp_line_id`).
+    pub sp_line_id: i32,
+    /// next match in the `sp_line_id` line (`sp_startcol`).
+    pub sp_startcol: i32,
+    /// `contains` group IDs (`sp_cont_list`).
+    pub sp_cont_list: Vec<i16>,
+    /// `nextgroup` group IDs (`sp_next_list`).
+    pub sp_next_list: Vec<i16>,
+    /// the item's own syntax identity (`sp_syn`).
+    pub sp_syn: SpSyn,
+    /// the regexp to match, as a pattern (`sp_pattern`).
+    pub sp_pattern: Vec<u8>,
+    /// the regexp to match, as a compiled program (`sp_prog`).
+    pub sp_prog: *mut crate::types_defs::RegprogT,
+    /// timing for this pattern (`sp_time`).
+    pub sp_time: crate::buffer_defs::SynTimeT,
+}
+
+/// Whether any syntax items are defined for the syntax block `block`
+/// (`syntax_present`).
+///
+/// The original takes a window and reaches through `w_s`; this takes
+/// the syntax block directly, since that is all it reads and the
+/// callers already have one in hand.
+pub fn syntax_present(block: &crate::buffer_defs::SynblockT) -> bool {
+    block.b_syn_patterns.ga_len() != 0
+        || block.b_syn_clusters.ga_len() != 0
+        || block.b_keywtab.ht_used > 0
+        || block.b_keywtab_ic.ht_used > 0
+}
+
+/// Clear the syntax timing for the current buffer (`syntime_clear`).
+///
+/// Does nothing when no syntax is active. The original's
+/// "No Syntax items defined for this buffer" message is omitted,
+/// matching this crate's established policy of skipping message
+/// display while keeping identical state and control flow.
+///
+/// # Safety
+/// `GLOBALS.curwin` must be valid and non-null, as must its `w_s`
+/// syntax block.
+pub unsafe fn syntime_clear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let block = unsafe { &mut *(*crate::globals::GLOBALS.get_mut().curwin).w_s };
+    if !syntax_present(block) {
+        return;
+    }
+    for spp in &mut block.b_syn_patterns.items {
+        syn_clear_time(&mut spp.sp_time);
+    }
+}
+
 /// Reset one syntax item's timing counters (`syn_clear_time`).
 pub fn syn_clear_time(st: &mut crate::buffer_defs::SynTimeT) {
     st.total = crate::profile::profile_zero();
@@ -571,6 +705,87 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- syntax_present / syntime_clear ----
+
+    #[test]
+    fn syntax_present_is_false_for_an_empty_syntax_block() {
+        let block = crate::buffer_defs::SynblockT::default();
+        assert!(!syntax_present(&block));
+    }
+
+    /// Any ONE of the four sources of syntax items is enough, so a
+    /// check that missed one would fail here.
+    #[test]
+    fn syntax_present_is_true_for_each_source_on_its_own() {
+        let mut by_pattern = crate::buffer_defs::SynblockT::default();
+        by_pattern.b_syn_patterns.items.push(SynpatT::default());
+        assert!(syntax_present(&by_pattern), "patterns alone");
+
+        let mut by_cluster = crate::buffer_defs::SynblockT::default();
+        by_cluster.b_syn_clusters.items.push(SynClusterT::default());
+        assert!(syntax_present(&by_cluster), "clusters alone");
+
+        let mut by_keyword = crate::buffer_defs::SynblockT::default();
+        by_keyword.b_keywtab.ht_used = 1;
+        assert!(syntax_present(&by_keyword), "keyword table alone");
+
+        let mut by_keyword_ic = crate::buffer_defs::SynblockT::default();
+        by_keyword_ic.b_keywtab_ic.ht_used = 1;
+        assert!(syntax_present(&by_keyword_ic), "ignore-case keyword table alone");
+    }
+
+    /// A pattern with recorded timings has them all reset.
+    #[test]
+    fn syntime_clear_resets_every_pattern() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+
+        let block = fx.block_mut();
+        for total in [111u64, 222] {
+            block.b_syn_patterns.items.push(SynpatT {
+                sp_time: crate::buffer_defs::SynTimeT {
+                    total,
+                    slowest: total,
+                    count: 5,
+                    match_: 3,
+                },
+                ..Default::default()
+            });
+        }
+
+        unsafe { syntime_clear() };
+
+        for spp in &fx.block().b_syn_patterns.items {
+            assert_eq!(spp.sp_time.total, crate::profile::profile_zero());
+            assert_eq!(spp.sp_time.slowest, crate::profile::profile_zero());
+            assert_eq!(spp.sp_time.count, 0);
+            assert_eq!(spp.sp_time.match_, 0);
+        }
+    }
+
+    /// With no syntax at all the function returns early. Nothing
+    /// observable changes either way here, but the early return is
+    /// what keeps the original from printing its "no items" message,
+    /// so the guard is exercised deliberately.
+    #[test]
+    fn syntime_clear_returns_early_without_syntax() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+        assert!(!syntax_present(fx.block()));
+        unsafe { syntime_clear() };
+        assert!(fx.block().b_syn_patterns.items.is_empty());
+    }
+
+    #[test]
+    fn spo_and_sptype_values_match_the_original() {
+        assert_eq!((spo::MS_OFF, spo::ME_OFF, spo::HS_OFF, spo::HE_OFF), (0, 1, 2, 3));
+        assert_eq!((spo::RS_OFF, spo::RE_OFF, spo::LC_OFF, spo::COUNT), (4, 5, 6, 7));
+        assert_eq!(
+            (sptype::MATCH, sptype::START, sptype::END, sptype::SKIP),
+            (1, 2, 3, 4)
+        );
     }
 
     // ---- limit_pos_zero / syn_clear_time ----
