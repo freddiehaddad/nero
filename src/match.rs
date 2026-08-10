@@ -72,6 +72,46 @@ pub fn check_cur_search_hl(wp: &WinT, shl: &mut crate::buffer_defs::MatchT) {
         && (cursor.lnum < shl.lnum + linecount || cursor.col < shl.rm.endpos[0].col);
 }
 
+/// Whether a character just past the end of the line should be
+/// highlighted (`get_prevcol_hl_flag`).
+///
+/// True when the match started exactly at the end of the line, or
+/// continues into the next line (so the match includes the line
+/// break).
+///
+/// Only the always-taken "no matches exist" fast path of the
+/// `w_match_head` loop is translated (see this module's own doc
+/// comment): nothing currently translated can populate that list, so
+/// the loop cannot find anything and the answer rests entirely on
+/// `search_hl`. A debug assertion records that expectation rather
+/// than letting a future real list be silently ignored.
+///
+/// # Safety
+/// `wp` must be a valid reference to a live `WinT`.
+#[must_use]
+pub unsafe fn get_prevcol_hl_flag(
+    wp: &WinT,
+    search_hl: &crate::buffer_defs::MatchT,
+    curcol: crate::pos_defs::ColnrT,
+) -> bool {
+    let mut prevcol = curcol;
+
+    // We're not really at that column when skipping some text.
+    let skipped = if wp.w_onebuf_opt.wo_wrap != 0 { wp.w_skipcol } else { wp.w_leftcol };
+    if skipped > prevcol {
+        prevcol += 1;
+    }
+
+    debug_assert!(
+        wp.w_match_head.is_null(),
+        "get_prevcol_hl_flag: real matchitem_T support not yet translated"
+    );
+
+    !search_hl.is_addpos
+        && (prevcol == search_hl.startcol
+            || (prevcol > search_hl.startcol && search_hl.endcol == crate::pos_defs::MAXCOL))
+}
+
 /// Clear all matches for window `wp` (`clear_matches`).
 ///
 /// Only the always-taken "no matches exist" fast path is translated
@@ -181,6 +221,82 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- get_prevcol_hl_flag ---
+
+    /// A search-highlight match with the given start and end columns.
+    fn prevcol_hl(
+        startcol: crate::pos_defs::ColnrT,
+        endcol: crate::pos_defs::ColnrT,
+    ) -> crate::buffer_defs::MatchT {
+        crate::buffer_defs::MatchT { startcol, endcol, ..Default::default() }
+    }
+
+    /// True exactly when the column reaches the match's start column.
+    #[test]
+    fn get_prevcol_hl_flag_is_true_at_the_match_start_column() {
+        let wp = WinT::default();
+        let shl = prevcol_hl(5, 9);
+
+        assert!(!unsafe { get_prevcol_hl_flag(&wp, &shl, 4) }, "before the start");
+        assert!(unsafe { get_prevcol_hl_flag(&wp, &shl, 5) }, "at the start");
+        // Past the start only counts when the match runs to MAXCOL.
+        assert!(!unsafe { get_prevcol_hl_flag(&wp, &shl, 6) }, "past, but not MAXCOL");
+    }
+
+    /// A match ending at MAXCOL continues into the next line, so any
+    /// column past its start highlights.
+    #[test]
+    fn get_prevcol_hl_flag_is_true_past_the_start_when_the_match_runs_to_maxcol() {
+        let wp = WinT::default();
+        let shl = prevcol_hl(5, crate::pos_defs::MAXCOL);
+        assert!(unsafe { get_prevcol_hl_flag(&wp, &shl, 6) });
+        assert!(!unsafe { get_prevcol_hl_flag(&wp, &shl, 4) }, "still not before");
+    }
+
+    /// A position added by `matchaddpos()` never gets this treatment.
+    #[test]
+    fn get_prevcol_hl_flag_is_false_for_an_addpos_match() {
+        let wp = WinT::default();
+        let mut shl = prevcol_hl(5, 9);
+        shl.is_addpos = true;
+        assert!(!unsafe { get_prevcol_hl_flag(&wp, &shl, 5) });
+    }
+
+    /// With `'wrap'` set the skipped text is `w_skipcol`; the column
+    /// is bumped by one when it lies before that, which can bring it
+    /// up to the match start.
+    #[test]
+    fn get_prevcol_hl_flag_uses_skipcol_when_wrapping() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 1;
+        wp.w_skipcol = 5;
+        wp.w_leftcol = 0; // would NOT trigger the bump
+        let shl = prevcol_hl(5, 9);
+
+        // curcol 4 is bumped to 5 by skipcol, reaching the start.
+        assert!(unsafe { get_prevcol_hl_flag(&wp, &shl, 4) });
+    }
+
+    /// Without `'wrap'` it is `w_leftcol` instead, so a `w_skipcol`
+    /// that would have bumped is ignored.
+    #[test]
+    fn get_prevcol_hl_flag_uses_leftcol_when_not_wrapping() {
+        let mut wp = WinT::default();
+        wp.w_onebuf_opt.wo_wrap = 0;
+        wp.w_skipcol = 5; // ignored in this mode
+        wp.w_leftcol = 0;
+        let shl = prevcol_hl(5, 9);
+
+        assert!(
+            !unsafe { get_prevcol_hl_flag(&wp, &shl, 4) },
+            "skipcol must not apply when 'wrap' is off"
+        );
+
+        // With leftcol set the bump happens again.
+        wp.w_leftcol = 5;
+        assert!(unsafe { get_prevcol_hl_flag(&wp, &shl, 4) });
+    }
 
     // --- check_cur_search_hl ---
 
