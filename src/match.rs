@@ -13,25 +13,26 @@
 //! path.
 //!
 //! What remains missing is not the TYPE but the machinery that
-//! populates the list: nothing currently translated adds an entry, so
-//! `w_match_head` is still empty in practice. Functions whose real
-//! body needs more than the walk itself therefore still take their
-//! "no matches exist" path, each guarded by a `debug_assert!` on
-//! `w_match_head` being empty so a future real list cannot be
-//! silently ignored: `clear_matches`/`f_clearmatches`/`f_getmatches`
-//! (needs the item-to-Dict conversion), `f_matcharg` (its reporting
-//! branch needs `syn_id2name`, the highlight-group registry), and
-//! `get_prevcol_hl_flag`/`get_search_match_hl` (their loops over the
-//! list).
+//! POPULATES the list: nothing currently translated adds an entry, so
+//! `w_match_head` is empty in practice today. That is a matter of
+//! reachable state rather than of missing translation - every
+//! list-reading function here now walks the chain for real, and their
+//! tests build real lists to prove it.
 //!
-//! Also translated: `get_optional_window` (`eval/funcs.c`), and the
+//! Translated: `get_optional_window` (`eval/funcs.c`); the list
+//! readers `get_match`/`f_getmatches`; the list mutators
+//! `match_delete`/`clear_matches`/`f_clearmatches`; and the
 //! search-highlight helpers `check_cur_search_hl`/
-//! `get_prevcol_hl_flag`/`get_search_match_hl`, unblocked by
-//! `match_T`.
+//! `get_prevcol_hl_flag`/`get_search_match_hl`.
 //!
-//! Deferred: `matchadd()`/`matchaddpos()`/`matchdelete()`,
-//! `getmatches()`'s own item-conversion loop body, and
-//! `:match`/`:2match`/`:3match` - the list-BUILDING side.
+//! Still incomplete: `f_matcharg`, whose reporting branch needs more
+//! of the highlight-group registry than `syn_id2name` alone; it is
+//! guarded by a `debug_assert!` on the list being empty so a future
+//! real entry cannot be silently mis-reported.
+//!
+//! Deferred: `matchadd()`/`matchaddpos()`/`match_add()` and
+//! `:match`/`:2match`/`:3match` - the list-BUILDING side, which needs
+//! `vim_regcomp` for the pattern form.
 
 use crate::buffer_defs::WinT;
 use crate::eval::typval_defs::TypvalT;
@@ -323,19 +324,93 @@ pub unsafe fn f_clearmatches(argvars: &[TypvalT], _rettv: &mut TypvalT) {
 ///
 /// # Safety
 /// Forwarded from [`get_optional_window`]'s own safety doc.
+/// `"getmatches([{win}])"` function (`f_getmatches`) - every match in
+/// the window, as a List of Dicts.
+///
+/// Each entry reports its group, priority and ID; a pattern entry adds
+/// `"pattern"`, while a `matchaddpos()` entry adds one `"posN"` list
+/// per position. A conceal character, when set, is added as
+/// `"conceal"`.
+///
+/// Deviates from the original in ONE respect, deliberately. The
+/// original decides "was this added with `matchaddpos()`" by testing
+/// `mit_match.regprog == NULL`. Nothing in this crate compiles a
+/// regexp yet, so `regprog` is always null and that test would
+/// misclassify EVERY entry as position-based. The pattern itself is
+/// the equivalent discriminator - `match_add` sets `mit_pattern` and
+/// compiles `regprog` together, and `matchaddpos` leaves both unset -
+/// so this tests `mit_pattern` instead, which is both faithful to the
+/// original's intent and correct in the current state.
+///
+/// A position entry stops at the first zero `lnum`, matching the
+/// original's own early break.
+///
+/// # Safety
+/// Forwarded from [`get_optional_window`]'s own safety doc; the
+/// window's `w_match_head` chain must consist of live `MatchitemT`s.
 pub unsafe fn f_getmatches(argvars: &[TypvalT], rettv: &mut TypvalT) {
     // SAFETY: `rettv` is freshly default-initialized by the caller.
     let l = unsafe {
-        crate::eval::typval::tv_list_alloc_ret(rettv, crate::eval::typval_defs::ListLenSpecials::MayKnow as isize)
+        crate::eval::typval::tv_list_alloc_ret(
+            rettv,
+            crate::eval::typval_defs::ListLenSpecials::MayKnow as isize,
+        )
     };
     // SAFETY: forwarded from this function's own safety doc.
     let win = unsafe { get_optional_window(argvars, 0) };
     if win.is_null() {
         return;
     }
+
     // SAFETY: forwarded from this function's own safety doc.
-    debug_assert!(unsafe { &*win }.w_match_head.is_null(), "f_getmatches: real matchitem_T support not yet translated");
-    let _ = l;
+    let mut cur = unsafe { &*win }.w_match_head;
+    while !cur.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let item = unsafe { &*cur };
+        let dict = crate::eval::typval::tv_dict_alloc();
+        // SAFETY: freshly allocated just above.
+        let d = unsafe { &mut *dict };
+
+        if let Some(pattern) = item.mit_pattern.as_deref() {
+            crate::eval::typval::tv_dict_add_str(d, b"pattern", Some(pattern));
+        } else {
+            for (i, llpos) in item.mit_pos_array.iter().enumerate() {
+                if llpos.lnum == 0 {
+                    break;
+                }
+                let sub = crate::eval::typval::tv_list_alloc(
+                    1 + if llpos.col > 0 { 2 } else { 0 },
+                );
+                // SAFETY: `sub` was freshly allocated just above.
+                unsafe {
+                    crate::eval::typval::tv_list_append_number(sub, i64::from(llpos.lnum));
+                    if llpos.col > 0 {
+                        crate::eval::typval::tv_list_append_number(sub, i64::from(llpos.col));
+                        crate::eval::typval::tv_list_append_number(sub, i64::from(llpos.len));
+                    }
+                }
+                let key = format!("pos{}", i + 1);
+                // SAFETY: `sub` is a live list this dict now owns.
+                unsafe { crate::eval::typval::tv_dict_add_list(d, key.as_bytes(), sub) };
+            }
+        }
+
+        // SAFETY: reads the highlight-group table.
+        let group = unsafe { crate::highlight_group::syn_id2name(item.mit_hlg_id) };
+        crate::eval::typval::tv_dict_add_str(d, b"group", Some(&group));
+        crate::eval::typval::tv_dict_add_nr(d, b"priority", i64::from(item.mit_priority));
+        crate::eval::typval::tv_dict_add_nr(d, b"id", i64::from(item.mit_id));
+
+        if item.mit_conceal_char != 0 {
+            let mut buf = [0u8; crate::mbyte_defs::MB_MAXCHAR + 1];
+            let len = crate::mbyte::utf_char2bytes(item.mit_conceal_char, &mut buf);
+            crate::eval::typval::tv_dict_add_str(d, b"conceal", Some(&buf[..len as usize]));
+        }
+
+        // SAFETY: `l` was freshly allocated, `dict` is live.
+        unsafe { crate::eval::typval::tv_list_append_dict(l, dict) };
+        cur = item.mit_next;
+    }
 }
 
 /// Find match `id` for window `wp` (`get_match`), or `null` when the
@@ -406,6 +481,204 @@ pub unsafe fn f_matcharg(argvars: &[TypvalT], rettv: &mut TypvalT) {
 mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
+
+    // --- f_getmatches ---
+
+    /// Runs `f_getmatches` against a window and returns the resulting
+    /// List, or null when the call produced no list.
+    unsafe fn getmatches_list(wp: *mut WinT) -> *mut crate::eval::typval_defs::ListT {
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let prev = g.curwin;
+        g.curwin = wp;
+
+        let mut rettv = TypvalT::default();
+        unsafe { f_getmatches(&[], &mut rettv) };
+
+        unsafe { crate::globals::GLOBALS.get_mut() }.curwin = prev;
+        match rettv.value {
+            TypvalValue::List(l) => l,
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    /// Reads a Dict's string entry back, for asserting on the
+    /// converted output.
+    unsafe fn dict_str(d: *mut crate::eval::typval_defs::DictT, key: &[u8]) -> Option<Vec<u8>> {
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), key)?;
+        match &unsafe { &*item }.di_tv.value {
+            TypvalValue::String(s) => s.clone(),
+            _ => None,
+        }
+    }
+
+    /// Reads a Dict's number entry back.
+    unsafe fn dict_nr(d: *mut crate::eval::typval_defs::DictT, key: &[u8]) -> Option<i64> {
+        let item = crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), key)?;
+        match unsafe { &*item }.di_tv.value {
+            TypvalValue::Number(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Whether a Dict has an entry under `key`.
+    unsafe fn dict_has(d: *mut crate::eval::typval_defs::DictT, key: &[u8]) -> bool {
+        crate::eval::typval::tv_dict_find(Some(unsafe { &mut *d }), key).is_some()
+    }
+
+    /// The first Dict in the returned List.
+    unsafe fn first_dict(
+        l: *mut crate::eval::typval_defs::ListT,
+    ) -> *mut crate::eval::typval_defs::DictT {
+        let item = unsafe { crate::eval::typval::tv_list_first(l) };
+        assert!(!item.is_null(), "expected at least one match");
+        match unsafe { &*item }.li_tv.value {
+            TypvalValue::Dict(d) => d,
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn f_getmatches_returns_an_empty_list_without_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut wp = win_with_owned_matches(&[]);
+        let l = unsafe { getmatches_list(std::ptr::from_mut(&mut *wp)) };
+        assert!(!l.is_null());
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 0);
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+    }
+
+    /// A pattern entry reports its pattern, group, priority and id.
+    #[test]
+    fn f_getmatches_converts_a_pattern_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _hl = HlTableFixture::with_names(&[b"Search"]);
+
+        let mut wp = win_with_owned_matches(&[7]);
+        let head = wp.w_match_head;
+        unsafe { &mut *head }.mit_pattern = Some(b"foo".to_vec());
+        unsafe { &mut *head }.mit_priority = 12;
+        unsafe { &mut *head }.mit_hlg_id = 1;
+        unsafe { &mut *head }.mit_pos_array.clear();
+
+        let l = unsafe { getmatches_list(std::ptr::from_mut(&mut *wp)) };
+        let d = unsafe { first_dict(l) };
+
+        assert_eq!(unsafe { dict_str(d, b"pattern") }, Some(b"foo".to_vec()));
+        assert_eq!(unsafe { dict_str(d, b"group") }, Some(b"Search".to_vec()));
+        assert_eq!(unsafe { dict_nr(d, b"priority") }, Some(12));
+        assert_eq!(unsafe { dict_nr(d, b"id") }, Some(7));
+        assert_eq!(unsafe { dict_str(d, b"pos1") }, None, "not a position entry");
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// A position entry reports one "posN" list per position, and NOT
+    /// a "pattern" key. This is the branch the original selects with
+    /// `regprog == NULL`, which cannot be used here.
+    #[test]
+    fn f_getmatches_converts_a_position_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _hl = HlTableFixture::with_names(&[b"Search"]);
+
+        let mut wp = win_with_owned_matches(&[3]);
+        let head = wp.w_match_head;
+        unsafe { &mut *head }.mit_pattern = None;
+        unsafe { &mut *head }.mit_hlg_id = 1;
+        unsafe { &mut *head }.mit_pos_array = vec![
+            crate::buffer_defs::LlposT { lnum: 5, col: 0, len: 0 },
+            crate::buffer_defs::LlposT { lnum: 6, col: 2, len: 3 },
+        ];
+
+        let l = unsafe { getmatches_list(std::ptr::from_mut(&mut *wp)) };
+        let d = unsafe { first_dict(l) };
+
+        assert_eq!(unsafe { dict_str(d, b"pattern") }, None, "no pattern key");
+        assert!(
+            unsafe { dict_has(d, b"pos1") },
+            "pos1 present"
+        );
+        assert!(
+            unsafe { dict_has(d, b"pos2") },
+            "pos2 present"
+        );
+        assert_eq!(unsafe { dict_str(d, b"group") }, Some(b"Search".to_vec()));
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Positions stop at the first zero line number, so a trailing
+    /// unused slot is not reported.
+    #[test]
+    fn f_getmatches_stops_positions_at_a_zero_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _hl = HlTableFixture::with_names(&[b"Search"]);
+
+        let mut wp = win_with_owned_matches(&[1]);
+        let head = wp.w_match_head;
+        unsafe { &mut *head }.mit_pattern = None;
+        unsafe { &mut *head }.mit_hlg_id = 1;
+        unsafe { &mut *head }.mit_pos_array = vec![
+            crate::buffer_defs::LlposT { lnum: 5, col: 0, len: 0 },
+            crate::buffer_defs::LlposT { lnum: 0, col: 0, len: 0 },
+            crate::buffer_defs::LlposT { lnum: 9, col: 0, len: 0 },
+        ];
+
+        let l = unsafe { getmatches_list(std::ptr::from_mut(&mut *wp)) };
+        let d = unsafe { first_dict(l) };
+
+        assert!(unsafe { dict_has(d, b"pos1") });
+        assert!(
+            !unsafe { dict_has(d, b"pos3") },
+            "the entry after the zero line must not be reported"
+        );
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Every entry in the chain is converted, not just the head.
+    #[test]
+    fn f_getmatches_converts_every_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _hl = HlTableFixture::with_names(&[b"Search"]);
+
+        let mut wp = win_with_owned_matches(&[1, 2, 3]);
+        let l = unsafe { getmatches_list(std::ptr::from_mut(&mut *wp)) };
+        assert_eq!(unsafe { crate::eval::typval::tv_list_len(l) }, 3);
+
+        unsafe { crate::eval::typval::tv_list_unref(l) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Installs a highlight table so `syn_id2name` resolves group
+    /// names, restoring the previous table on drop.
+    struct HlTableFixture {
+        saved: Vec<crate::highlight_group::HlGroup>,
+    }
+
+    impl HlTableFixture {
+        fn with_names(names: &[&[u8]]) -> Self {
+            let table = unsafe { crate::highlight_group::HL_TABLE.get_mut() };
+            let saved = std::mem::take(&mut table.items);
+            table.items = names
+                .iter()
+                .map(|n| crate::highlight_group::HlGroup {
+                    sg_name: (*n).to_vec(),
+                    ..Default::default()
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for HlTableFixture {
+        fn drop(&mut self) {
+            unsafe { crate::highlight_group::HL_TABLE.get_mut() }.items =
+                std::mem::take(&mut self.saved);
+        }
+    }
 
     // --- match_delete ---
 
