@@ -111,8 +111,26 @@ pub static HL_TABLE: GlobalCell<TypedGarrayT<HlGroup>> =
 /// [`HL_TABLE`], matching the original: it exists precisely so name
 /// lookups do not walk the table, and its keys are the uppercase
 /// forms so lookups are case-insensitive without repeated folding.
+///
+/// Keys hold the uppercase name with NO trailing NUL, and so does
+/// each group's own `sg_name_u`. The original stores both as
+/// NUL-terminated C strings, but its map keys are `cstr_t`, hashed by
+/// content up to the NUL, so the terminator is not part of the
+/// logical key there either. A Rust `Vec<u8>` key would include it,
+/// which is why every writer and reader here must agree to leave it
+/// off - uppercase with [`crate::strings::vim_strup`], never
+/// `vim_strsave_up`, which appends one.
 pub static HIGHLIGHT_UNAMES: std::sync::LazyLock<GlobalCell<crate::map::Map<Vec<u8>, i32>>> =
     std::sync::LazyLock::new(|| GlobalCell::new(crate::map::Map::new()));
+
+/// Uppercase `name` into a fresh buffer with no trailing NUL, the
+/// form [`HIGHLIGHT_UNAMES`] keys and `sg_name_u` both use.
+#[must_use]
+fn upper_name(name: &[u8]) -> Vec<u8> {
+    let mut out = name.to_vec();
+    crate::strings::vim_strup(&mut out);
+    out
+}
 
 /// Look up a highlight group by name and return its 1-based ID, or
 /// `0` when there is no such group (`syn_name2id_len`).
@@ -133,10 +151,141 @@ pub unsafe fn syn_name2id_len(name: &[u8]) -> i32 {
     if name.is_empty() || name.len() > MAX_SYN_NAME {
         return 0;
     }
-    let name_u = crate::strings::vim_strsave_up(name);
+    let name_u = upper_name(name);
     // SAFETY: forwarded from this function's own safety doc. A missing
     // key yields 0, which is the original's own "no such group".
     unsafe { HIGHLIGHT_UNAMES.get_mut() }.get_or_default(&name_u)
+}
+
+/// Maximum value for a highlight ID (`MAX_HL_ID`).
+pub const MAX_HL_ID: i32 = 20000;
+
+/// "no colour index" sentinel (`kColorIdxNone`).
+pub const COLOR_IDX_NONE: i32 = -1;
+
+/// Append a new highlight group and return its 1-based ID, or `0` on
+/// failure (`syn_add_group`).
+///
+/// Rejects a name containing an unprintable character (`E669`) or any
+/// character outside ASCII alphanumerics, `_`, `.`, `@` and `-`. The
+/// `.` and `@` are allowed for tree-sitter capture names. Both
+/// messages are omitted, matching this crate's policy, keeping the
+/// same `0` return.
+///
+/// A scoped `@a.b` name records its parent `@a` in `sg_parent`,
+/// creating that parent on demand - which is why this and
+/// [`syn_check_group`] are mutually recursive, exactly as in the
+/// original.
+///
+/// The original's first-call growarray init and its `ga_grow(300)`
+/// pre-size are dropped: a `Vec` owns and grows its own storage, and
+/// the pre-size is purely an allocation hint.
+///
+/// # Safety
+/// Touches the [`HL_TABLE`] and [`HIGHLIGHT_UNAMES`] file-statics, and
+/// reads the charset tables via `vim_isprintc`.
+pub unsafe fn syn_add_group(name: &[u8]) -> i32 {
+    // Check that the name is valid.
+    for &b in name {
+        let c = i32::from(b);
+        // SAFETY: forwarded from this function's own safety doc.
+        if !unsafe { crate::charset::vim_isprintc(c) } {
+            return 0;
+        }
+        if !crate::macros_defs::ascii_isalnum(c)
+            && b != b'_'
+            && b != b'.'
+            && b != b'@'
+            && b != b'-'
+        {
+            return 0;
+        }
+    }
+
+    // A scoped "@a.b" group records "@a" as its parent, creating it if
+    // it does not exist yet.
+    let mut scoped_parent = 0;
+    if name.len() > 1 && name[0] == b'@' {
+        let delim = crate::memory::xmemrchr(name, b'.');
+        if let Some(delim) = delim {
+            // SAFETY: forwarded from this function's own safety doc.
+            scoped_parent = unsafe { syn_check_group(&name[..delim]) };
+        }
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let table = unsafe { HL_TABLE.get_mut() };
+    if table.ga_len() >= MAX_HL_ID {
+        return 0;
+    }
+
+    let name_u = upper_name(name);
+
+    table.items.push(HlGroup {
+        sg_name: name.to_vec(),
+        sg_name_u: name_u.clone(),
+        // Cleared until the caller adds settings.
+        sg_cleared: true,
+        sg_rgb_fg: -1,
+        sg_rgb_bg: -1,
+        sg_rgb_sp: -1,
+        sg_rgb_fg_idx: COLOR_IDX_NONE,
+        sg_rgb_bg_idx: COLOR_IDX_NONE,
+        sg_rgb_sp_idx: COLOR_IDX_NONE,
+        sg_blend: -1,
+        sg_parent: scoped_parent,
+        ..Default::default()
+    });
+
+    // The ID is the index plus one.
+    let id = table.ga_len();
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { HIGHLIGHT_UNAMES.get_mut() }.insert(name_u, id);
+    id
+}
+
+/// Look up a highlight group by name, creating it if it does not
+/// exist yet, and return its 1-based ID (`syn_check_group`).
+///
+/// Returns `0` on failure, including a name longer than
+/// [`MAX_SYN_NAME`] (the original's own length check, whose message is
+/// omitted).
+///
+/// # Safety
+/// Same as [`syn_add_group`].
+pub unsafe fn syn_check_group(name: &[u8]) -> i32 {
+    if name.len() > MAX_SYN_NAME {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let id = unsafe { syn_name2id_len(name) };
+    if id == 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { syn_add_group(name) }
+    } else {
+        id
+    }
+}
+
+/// Look up a highlight group by name and return its 1-based ID
+/// (`syn_name2id`).
+///
+/// A name beginning with `@` is a tree-sitter capture and is looked up
+/// through [`syn_check_group`], which CREATES it when absent - so this
+/// can have a side effect for those names, unlike for ordinary ones.
+/// That asymmetry is the original's: looking up `@aaa.bbb` has to
+/// consider `@aaa` as well.
+///
+/// # Safety
+/// Same as [`syn_add_group`].
+#[must_use]
+pub unsafe fn syn_name2id(name: &[u8]) -> i32 {
+    if name.first() == Some(&b'@') {
+        // SAFETY: forwarded from this function's own safety doc.
+        return unsafe { syn_check_group(name) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { syn_name2id_len(name) }
 }
 
 /// The name of highlight group `id`, or an empty name when there is no
@@ -182,7 +331,7 @@ mod tests {
                 .iter()
                 .map(|n| HlGroup {
                     sg_name: (*n).to_vec(),
-                    sg_name_u: crate::strings::vim_strsave_up(n),
+                    sg_name_u: upper_name(n),
                     ..Default::default()
                 })
                 .collect();
@@ -191,7 +340,7 @@ mod tests {
             let saved_names = std::mem::replace(unames, crate::map::Map::new());
             for (i, n) in names.iter().enumerate() {
                 // IDs are 1-based, matching syn_id2name.
-                unames.insert(crate::strings::vim_strsave_up(n), i as i32 + 1);
+                unames.insert(upper_name(n), i as i32 + 1);
             }
             Self { saved, saved_names }
         }
@@ -298,6 +447,145 @@ mod tests {
             0,
             "one byte past the limit is rejected, even though it is in the table"
         );
+    }
+
+    // --- syn_add_group / syn_check_group / syn_name2id ---
+
+    /// A new group is appended with a 1-based ID and the defaults the
+    /// original sets explicitly (cleared, colours unset).
+    #[test]
+    fn syn_add_group_appends_with_the_documented_defaults() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        let id = unsafe { syn_add_group(b"MyGroup") };
+        assert_eq!(id, 1, "IDs are 1-based");
+        assert_eq!(unsafe { syn_id2name(1) }, b"MyGroup".to_vec());
+        assert_eq!(unsafe { syn_name2id_len(b"mygroup") }, 1, "index updated too");
+
+        let table = unsafe { HL_TABLE.get_mut() };
+        let g = &table.items[0];
+        assert!(g.sg_cleared, "cleared until settings are added");
+        assert_eq!((g.sg_rgb_fg, g.sg_rgb_bg, g.sg_rgb_sp), (-1, -1, -1));
+        assert_eq!(g.sg_rgb_fg_idx, COLOR_IDX_NONE);
+        assert_eq!(g.sg_blend, -1);
+        assert_eq!(g.sg_name_u, b"MYGROUP".to_vec());
+    }
+
+    /// The name charset is exactly ASCII alphanumerics plus `_`, `.`,
+    /// `@` and `-`; anything else is refused.
+    #[test]
+    fn syn_add_group_accepts_only_the_documented_characters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        for ok in [
+            b"Plain".as_slice(),
+            b"with_underscore".as_slice(),
+            b"with.dot".as_slice(),
+            b"@capture".as_slice(),
+            b"with-dash".as_slice(),
+            b"digits123".as_slice(),
+        ] {
+            assert_ne!(unsafe { syn_add_group(ok) }, 0, "{ok:?} should be accepted");
+        }
+
+        for bad in [
+            b"has space".as_slice(),
+            b"has#hash".as_slice(),
+            b"has/slash".as_slice(),
+        ] {
+            assert_eq!(unsafe { syn_add_group(bad) }, 0, "{bad:?} should be refused");
+        }
+    }
+
+    /// An unprintable character is refused (the original's E669).
+    #[test]
+    fn syn_add_group_refuses_an_unprintable_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+        assert_eq!(unsafe { syn_add_group(b"bad\x01name") }, 0);
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 0, "nothing appended");
+    }
+
+    /// A scoped `@a.b` group records `@a` as its parent, CREATING that
+    /// parent on demand - the mutual recursion with syn_check_group.
+    #[test]
+    fn syn_add_group_creates_the_scoped_parent_on_demand() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        let child = unsafe { syn_add_group(b"@aaa.bbb") };
+        let parent = unsafe { syn_name2id_len(b"@aaa") };
+
+        assert_ne!(parent, 0, "the parent was created as a side effect");
+        assert_ne!(child, 0);
+        let table = unsafe { HL_TABLE.get_mut() };
+        let child_group = &table.items[(child - 1) as usize];
+        assert_eq!(child_group.sg_parent, parent, "parent recorded on the child");
+        // The parent is created FIRST, so it gets the lower ID.
+        assert!(parent < child);
+    }
+
+    /// A group with no dot has no scoped parent.
+    #[test]
+    fn syn_add_group_leaves_an_unscoped_group_without_a_parent() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        let id = unsafe { syn_add_group(b"@plain") };
+        let table = unsafe { HL_TABLE.get_mut() };
+        assert_eq!(table.items[(id - 1) as usize].sg_parent, 0);
+    }
+
+    #[test]
+    fn syn_check_group_reuses_an_existing_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Existing"]);
+
+        assert_eq!(unsafe { syn_check_group(b"Existing") }, 1);
+        assert_eq!(unsafe { syn_check_group(b"EXISTING") }, 1, "case-insensitive");
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 1, "nothing appended");
+    }
+
+    #[test]
+    fn syn_check_group_creates_a_missing_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Existing"]);
+
+        assert_eq!(unsafe { syn_check_group(b"Fresh") }, 2);
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 2);
+    }
+
+    #[test]
+    fn syn_check_group_refuses_an_over_long_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+        let too_long = vec![b'a'; MAX_SYN_NAME + 1];
+        assert_eq!(unsafe { syn_check_group(&too_long) }, 0);
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 0);
+    }
+
+    /// `syn_name2id` is a pure lookup for an ordinary name, but an
+    /// `@` capture name goes through syn_check_group and so CREATES
+    /// the group. That asymmetry is the original's.
+    #[test]
+    fn syn_name2id_creates_only_for_an_at_capture_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        assert_eq!(unsafe { syn_name2id(b"Missing") }, 0, "ordinary name: no group");
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 0, "and none created");
+
+        let id = unsafe { syn_name2id(b"@capture") };
+        assert_ne!(id, 0, "@ name resolves");
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.ga_len(), 1, "because it was created");
+    }
+
+    #[test]
+    fn max_hl_id_and_color_idx_none_match_the_original() {
+        assert_eq!(MAX_HL_ID, 20000);
+        assert_eq!(COLOR_IDX_NONE, -1);
     }
 
     #[test]
