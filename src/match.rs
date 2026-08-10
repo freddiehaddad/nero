@@ -197,6 +197,68 @@ pub unsafe fn get_search_match_hl(
     result
 }
 
+/// Remove the match with ID `id` from window `wp`'s match list
+/// (`match_delete`), returning `0` on success and `-1` on failure.
+///
+/// Fails when `id` is below 1 (the original's `E802`) or no entry has
+/// that ID (`E803`). Both messages are omitted, matching this crate's
+/// established policy of skipping message display while keeping the
+/// same return value; `perr`, which exists only to gate those two
+/// messages, is therefore unused today but kept so real call sites
+/// stay faithful and need no change when messages land.
+///
+/// The original's `rtype` local likewise disappears: it only ever
+/// selects which redraw to schedule, and redraw scheduling is omitted
+/// here, so the `mit_toplnum != 0` branch has nothing left to do.
+///
+/// As in [`clear_matches`], `mit_match.regprog` is not freed - that
+/// needs `vim_regfree` - which is faithful while nothing can compile
+/// a regexp, and a debug assertion pins it.
+///
+/// # Safety
+/// `wp` must be a valid, non-null pointer to a live `WinT`, and every
+/// entry in its `w_match_head` chain must have been allocated with
+/// `Box::into_raw`.
+pub unsafe fn match_delete(wp: *mut WinT, id: i32, _perr: bool) -> i32 {
+    if id < 1 {
+        return -1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { &mut *wp };
+    let mut cur = win.w_match_head;
+    let mut prev = cur;
+    while !cur.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        let item = unsafe { &*cur };
+        if item.mit_id == id {
+            break;
+        }
+        prev = cur;
+        cur = item.mit_next;
+    }
+    if cur.is_null() {
+        return -1;
+    }
+
+    // SAFETY: forwarded from this function's own safety doc.
+    let item = unsafe { Box::from_raw(cur) };
+    debug_assert!(
+        item.mit_match.regprog.is_null(),
+        "match_delete: freeing a compiled regexp needs vim_regfree"
+    );
+    if std::ptr::eq(cur, prev) {
+        // The match was the list head.
+        win.w_match_head = item.mit_next;
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { &mut *prev }.mit_next = item.mit_next;
+    }
+    // Dropping `item` frees the entry, its pattern and its position
+    // array.
+    0
+}
+
 /// Clear all matches for window `wp` (`clear_matches`).
 ///
 /// A real teardown of the list now that
@@ -345,6 +407,75 @@ mod tests {
     use super::*;
     use crate::eval::typval_defs::TypvalValue;
 
+    // --- match_delete ---
+
+    /// Reads back the IDs still in the list, to check the chain was
+    /// relinked rather than merely having one entry freed.
+    fn match_ids(wp: &WinT) -> Vec<i32> {
+        let mut ids = Vec::new();
+        let mut cur = wp.w_match_head;
+        while !cur.is_null() {
+            let item = unsafe { &*cur };
+            ids.push(item.mit_id);
+            cur = item.mit_next;
+        }
+        ids
+    }
+
+    #[test]
+    fn match_delete_rejects_an_id_below_one() {
+        let mut wp = win_with_owned_matches(&[1]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 0, false) }, -1);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), -5, false) }, -1);
+        assert_eq!(match_ids(&wp), vec![1], "list untouched");
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    #[test]
+    fn match_delete_reports_an_unknown_id() {
+        let mut wp = win_with_owned_matches(&[1, 2]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 9, false) }, -1);
+        assert_eq!(match_ids(&wp), vec![1, 2], "list untouched");
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Removing the HEAD moves `w_match_head` on rather than
+    /// relinking a predecessor.
+    #[test]
+    fn match_delete_removes_the_head_entry() {
+        let mut wp = win_with_owned_matches(&[1, 2, 3]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 1, false) }, 0);
+        assert_eq!(match_ids(&wp), vec![2, 3]);
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Removing a MIDDLE entry relinks its predecessor, which is the
+    /// other half of the head-versus-rest branch.
+    #[test]
+    fn match_delete_removes_a_middle_entry() {
+        let mut wp = win_with_owned_matches(&[1, 2, 3]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 2, false) }, 0);
+        assert_eq!(match_ids(&wp), vec![1, 3], "the chain is rejoined");
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    #[test]
+    fn match_delete_removes_the_last_entry() {
+        let mut wp = win_with_owned_matches(&[1, 2, 3]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 3, false) }, 0);
+        assert_eq!(match_ids(&wp), vec![1, 2]);
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+    }
+
+    /// Deleting the only entry leaves a genuinely empty list.
+    #[test]
+    fn match_delete_can_empty_the_list() {
+        let mut wp = win_with_owned_matches(&[7]);
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 7, false) }, 0);
+        assert!(wp.w_match_head.is_null());
+        assert_eq!(unsafe { match_delete(std::ptr::from_mut(&mut *wp), 7, false) }, -1, "already gone");
+    }
+
     // --- clear_matches ---
 
     /// Builds a window owning a real match list, WITHOUT an RAII
@@ -396,9 +527,8 @@ mod tests {
     #[test]
     fn clear_matches_is_idempotent() {
         let mut wp = win_with_owned_matches(&[1, 2]);
-        let ptr = std::ptr::from_mut(&mut *wp);
-        unsafe { clear_matches(ptr) };
-        unsafe { clear_matches(ptr) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
+        unsafe { clear_matches(std::ptr::from_mut(&mut *wp)) };
         assert!(wp.w_match_head.is_null());
     }
 
