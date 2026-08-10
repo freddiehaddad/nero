@@ -220,6 +220,22 @@ pub unsafe fn linewhite(lnum: crate::pos_defs::LinenrT) -> bool {
     line.get(off).copied().unwrap_or(0) == 0
 }
 
+/// The number of the first sub-match that participated in a
+/// multi-line match, or `0` when none did (`first_submatch`).
+///
+/// Sub-match `0` is the whole match, so the scan starts at `1` and
+/// runs to the last sub-expression. A sub-match that did not
+/// participate is marked by a negative `lnum`.
+#[must_use]
+pub fn first_submatch(rp: &crate::regexp_defs::RegmmatchT) -> i32 {
+    for submatch in 1..crate::regexp_defs::NSUBEXP {
+        if rp.startpos[submatch].lnum >= 0 {
+            return submatch as i32;
+        }
+    }
+    0
+}
+
 /// Read line `lnum` into a fresh buffer, truncated to
 /// [`crate::tag::LSIZE`], and return the copy
 /// (`get_line_and_copy`).
@@ -803,6 +819,63 @@ pub unsafe fn set_last_search_pat(s: &[u8], is_substitute: bool, magic: bool, se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- first_submatch ---
+
+    /// A `RegmmatchT` whose listed sub-match indices participated
+    /// (non-negative `lnum`) and whose others did not (`lnum = -1`).
+    fn match_with_participating(indices: &[usize]) -> crate::regexp_defs::RegmmatchT {
+        let mut rm = crate::regexp_defs::RegmmatchT::default();
+        for pos in &mut rm.startpos {
+            pos.lnum = -1;
+        }
+        for &i in indices {
+            rm.startpos[i].lnum = 0;
+        }
+        rm
+    }
+
+    #[test]
+    fn first_submatch_returns_zero_when_none_participated() {
+        let rm = match_with_participating(&[]);
+        assert_eq!(first_submatch(&rm), 0);
+    }
+
+    /// Sub-match 0 is the whole match, so it is skipped: a match where
+    /// only index 0 participated still reports "none".
+    #[test]
+    fn first_submatch_skips_the_whole_match_at_index_zero() {
+        let rm = match_with_participating(&[0]);
+        assert_eq!(first_submatch(&rm), 0, "index 0 must not be reported");
+    }
+
+    #[test]
+    fn first_submatch_returns_the_first_participating_index() {
+        assert_eq!(first_submatch(&match_with_participating(&[1])), 1);
+        assert_eq!(first_submatch(&match_with_participating(&[3])), 3);
+        assert_eq!(
+            first_submatch(&match_with_participating(&[5, 2, 7])),
+            2,
+            "the lowest index wins, not the first listed"
+        );
+    }
+
+    /// The last sub-expression is index 9 and IS scanned - an
+    /// off-by-one that stopped at 8 would report 0 here.
+    #[test]
+    fn first_submatch_scans_the_last_subexpression() {
+        assert_eq!(first_submatch(&match_with_participating(&[9])), 9);
+    }
+
+    /// Only a NEGATIVE lnum means "did not participate"; zero is a
+    /// real relative line number, since positions are relative to the
+    /// match's own first line.
+    #[test]
+    fn first_submatch_treats_line_zero_as_participating() {
+        let mut rm = match_with_participating(&[]);
+        rm.startpos[4].lnum = 0;
+        assert_eq!(first_submatch(&rm), 4);
+    }
 
     #[test]
     fn save_re_pat_records_the_pattern_and_marks_it_last() {
