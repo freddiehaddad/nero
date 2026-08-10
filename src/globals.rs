@@ -1296,9 +1296,9 @@ pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Installs a value into one of [`GLOBALS`]' pointer fields and
-/// restores the previous one on drop - including when a test unwinds
-/// part-way through.
+/// Installs a value into one of [`GLOBALS`]' fields and restores the
+/// previous one on drop - including when a test unwinds part-way
+/// through.
 ///
 /// This is not merely tidiness. Tests routinely install a pointer to a
 /// STACK buffer, window or tab page into a global. Restoring only at
@@ -1307,7 +1307,12 @@ pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// read it corrupts the heap - turning one clean assertion failure
 /// into an unrelated crash elsewhere. Holding
 /// [`global_state_test_lock`] does not help, since the lock is
-/// deliberately poison-tolerant.
+/// deliberately poison-tolerant and keeps handing itself out after a
+/// panic.
+///
+/// Works for any `Copy` field, not just pointers, so a test that also
+/// has to save something like `Visual.active` can use one guard per
+/// field rather than a hand-rolled tuple.
 ///
 /// [`Self::restore_now`] exists because the restore POINT is
 /// load-bearing in some tests (for example `ml_close` must not run
@@ -1315,23 +1320,20 @@ pub(crate) fn global_state_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// eventual drop is a no-op and cannot clobber a value installed
 /// after it.
 #[cfg(test)]
-pub(crate) struct GlobalPtrGuard<T: 'static> {
-    slot: fn(&mut Globals) -> &mut *mut T,
-    prev: *mut T,
+pub(crate) struct GlobalFieldGuard<T: Copy + 'static> {
+    slot: fn(&mut Globals) -> &mut T,
+    prev: T,
     restored: bool,
 }
 
 #[cfg(test)]
-impl<T: 'static> GlobalPtrGuard<T> {
+impl<T: Copy + 'static> GlobalFieldGuard<T> {
     /// Install `value` into the field selected by `slot`.
     ///
     /// # Safety
     /// Touches [`GLOBALS`]; the caller must hold
     /// [`global_state_test_lock`].
-    pub(crate) unsafe fn install(
-        slot: fn(&mut Globals) -> &mut *mut T,
-        value: *mut T,
-    ) -> Self {
+    pub(crate) unsafe fn install(slot: fn(&mut Globals) -> &mut T, value: T) -> Self {
         // SAFETY: forwarded from this function's own safety doc.
         let g = unsafe { GLOBALS.get_mut() };
         let prev = *slot(g);
@@ -1351,7 +1353,7 @@ impl<T: 'static> GlobalPtrGuard<T> {
 }
 
 #[cfg(test)]
-impl<T: 'static> Drop for GlobalPtrGuard<T> {
+impl<T: Copy + 'static> Drop for GlobalFieldGuard<T> {
     fn drop(&mut self) {
         self.restore_now();
     }

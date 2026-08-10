@@ -5110,20 +5110,17 @@ mod tests {
     #[test]
     fn did_set_splitkeep_snapshots_curtab_window_heights_via_firstwin() {
         let _lock = crate::globals::global_state_test_lock();
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev_first_tabpage = globals.first_tabpage;
-        let prev_curtab = globals.curtab;
-        let prev_firstwin = globals.firstwin;
 
         let mut win = crate::buffer_defs::WinT { w_height: 12, w_prev_height: 0, w_next: std::ptr::null_mut(), ..Default::default() };
         let win_ptr = &mut win as *mut crate::buffer_defs::WinT;
         let mut tp = crate::buffer_defs::TabpageT::default();
         let tp_ptr = &mut tp as *mut crate::buffer_defs::TabpageT;
 
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        globals.first_tabpage = tp_ptr;
-        globals.curtab = tp_ptr;
-        globals.firstwin = win_ptr;
+        let mut _ft = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, tp_ptr) };
+
+        let mut _ct = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, tp_ptr) };
+
+        let mut _fw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr) };
 
         let mut val: Option<Vec<u8>> = Some(b"cursor".to_vec());
         let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
@@ -5131,18 +5128,16 @@ mod tests {
         assert_eq!(unsafe { did_set_splitkeep(&mut args) }, None);
         assert_eq!(unsafe { &*win_ptr }.w_prev_height, 12);
 
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        globals.first_tabpage = prev_first_tabpage;
-        globals.curtab = prev_curtab;
-        globals.firstwin = prev_firstwin;
+        _ft.restore_now();
+
+        _ct.restore_now();
+
+        _fw.restore_now();
     }
 
     #[test]
     fn did_set_splitkeep_snapshots_a_non_current_tabpage_via_its_own_tp_firstwin() {
         let _lock = crate::globals::global_state_test_lock();
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        let prev_first_tabpage = globals.first_tabpage;
-        let prev_curtab = globals.curtab;
 
         let mut other_win =
             crate::buffer_defs::WinT { w_height: 33, w_prev_height: 0, w_next: std::ptr::null_mut(), ..Default::default() };
@@ -5156,11 +5151,16 @@ mod tests {
         // `GLOBALS.firstwin` one).
         let mut curtab = crate::buffer_defs::TabpageT { tp_firstwin: std::ptr::null_mut(), tp_next: other_tp_ptr, ..Default::default() };
         let curtab_ptr = &mut curtab as *mut crate::buffer_defs::TabpageT;
-
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        globals.first_tabpage = curtab_ptr;
-        globals.curtab = curtab_ptr;
-        globals.firstwin = std::ptr::null_mut();
+        let mut _ft = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.first_tabpage, curtab_ptr)
+        };
+        let mut _ct =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curtab, curtab_ptr) };
+        // The original test set firstwin and never restored it, leaving
+        // it clobbered for every later test; the guard fixes that.
+        let mut _fw = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, std::ptr::null_mut())
+        };
 
         let mut val: Option<Vec<u8>> = Some(b"screen".to_vec());
         let varp = &mut val as *mut Option<Vec<u8>> as *mut c_void;
@@ -5168,9 +5168,9 @@ mod tests {
         assert_eq!(unsafe { did_set_splitkeep(&mut args) }, None);
         assert_eq!(unsafe { &*other_win_ptr }.w_prev_height, 33);
 
-        let globals = unsafe { crate::globals::GLOBALS.get_mut() };
-        globals.first_tabpage = prev_first_tabpage;
-        globals.curtab = prev_curtab;
+        _ft.restore_now();
+        _ct.restore_now();
+        _fw.restore_now();
     }
 
     // ---- did_set_spellsuggest ----

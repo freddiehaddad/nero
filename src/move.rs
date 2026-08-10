@@ -1665,10 +1665,9 @@ mod tests {
         // Everything below the VALID_VIRTCOL check is skipped, because
         // the virtual column has not actually moved.
         let _lock = crate::globals::global_state_test_lock();
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
-        g.Visual.active = false;
-        g.curwin = std::ptr::null_mut();
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut()) };
+        let mut _cb = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, std::ptr::null_mut()) };
+        let mut _cv = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.Visual.active, false) };
 
         let mut win = crate::buffer_defs::WinT {
             w_valid: i32::from(crate::buffer_defs::w_valid::VALID_VIRTCOL),
@@ -1681,10 +1680,11 @@ mod tests {
         unsafe { redraw_for_cursorcolumn(&mut win) };
         assert_eq!(win.w_redr_type, 0, "a valid virtcol short-circuits");
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = prev_win;
-        g.curbuf = prev_buf;
-        g.Visual.active = prev_vis;
+        _cw.restore_now();
+
+        _cb.restore_now();
+
+        _cv.restore_now();
     }
 
     #[test]
@@ -1693,10 +1693,9 @@ mod tests {
         // is off does 'cursorline' + "screenline" get the cheaper
         // UPD_VALID.
         let _lock = crate::globals::global_state_test_lock();
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
-        g.Visual.active = false;
-        g.curwin = std::ptr::null_mut();
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut()) };
+        let mut _cb = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, std::ptr::null_mut()) };
+        let mut _cv = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.Visual.active, false) };
 
         let mut win = crate::buffer_defs::WinT { w_redr_type: 0, ..Default::default() };
         win.w_onebuf_opt.wo_cuc = 1;
@@ -1717,10 +1716,11 @@ mod tests {
         unsafe { redraw_for_cursorcolumn(&mut win) };
         assert_eq!(win.w_redr_type, crate::drawscreen::UPD_VALID);
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = prev_win;
-        g.curbuf = prev_buf;
-        g.Visual.active = prev_vis;
+        _cw.restore_now();
+
+        _cb.restore_now();
+
+        _cv.restore_now();
     }
 
     #[test]
@@ -1728,10 +1728,9 @@ mod tests {
         // 'cursorline' alone is not enough - the "screenline" flag in
         // 'cursorlineopt' is what makes a horizontal move matter.
         let _lock = crate::globals::global_state_test_lock();
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
-        g.Visual.active = false;
-        g.curwin = std::ptr::null_mut();
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut()) };
+        let mut _cb = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, std::ptr::null_mut()) };
+        let mut _cv = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.Visual.active, false) };
 
         let mut win = crate::buffer_defs::WinT { w_redr_type: 0, ..Default::default() };
         win.w_onebuf_opt.wo_cul = 1;
@@ -1740,19 +1739,19 @@ mod tests {
         unsafe { redraw_for_cursorcolumn(&mut win) };
         assert_eq!(win.w_redr_type, 0);
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = prev_win;
-        g.curbuf = prev_buf;
-        g.Visual.active = prev_vis;
+        _cw.restore_now();
+
+        _cb.restore_now();
+
+        _cv.restore_now();
     }
 
     #[test]
     fn set_valid_virtcol_sets_the_column_and_the_valid_bit() {
         let _lock = crate::globals::global_state_test_lock();
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        let (prev_win, prev_buf, prev_vis) = (g.curwin, g.curbuf, g.Visual.active);
-        g.Visual.active = false;
-        g.curwin = std::ptr::null_mut();
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, std::ptr::null_mut()) };
+        let mut _cb = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curbuf, std::ptr::null_mut()) };
+        let mut _cv = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.Visual.active, false) };
 
         let mut win = crate::buffer_defs::WinT::default();
         unsafe { set_valid_virtcol(&mut win, 7) };
@@ -1763,10 +1762,11 @@ mod tests {
             0
         );
 
-        let g = unsafe { crate::globals::GLOBALS.get_mut() };
-        g.curwin = prev_win;
-        g.curbuf = prev_buf;
-        g.Visual.active = prev_vis;
+        _cw.restore_now();
+
+        _cb.restore_now();
+
+        _cv.restore_now();
     }
     use crate::buffer_defs::BufT;
 
@@ -2170,7 +2170,7 @@ mod tests {
         win.w_cursor.lnum = 5;
         win.w_valid_cursor.lnum = 1; // > 0 and different from w_cursor.lnum
 
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         // catch_unwind (rather than #[should_panic]) so curwin is
         // always restored before this test returns, even though the
@@ -2377,7 +2377,7 @@ mod tests {
         win.w_cursor = crate::pos_defs::PosT { lnum: 1, col: 4, coladd: 0 };
         win.w_set_curswant = true;
 
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { update_curswant_force() };
 
@@ -2400,7 +2400,7 @@ mod tests {
         win.w_set_curswant = false;
         win.w_curswant = 99;
 
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { update_curswant() };
 
@@ -2446,7 +2446,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_valid = i32::from(w_valid::VALID_WROW) | i32::from(w_valid::VALID_BOTLINE);
 
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         unsafe { changed_line_abv_curs() };
 
@@ -2872,7 +2872,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 0;
         win.w_onebuf_opt.wo_sop = 3;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { use_scrolloffpad(&win) });
 
@@ -2886,7 +2886,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 0;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { use_scrolloffpad(&win) });
 
@@ -2900,7 +2900,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(unsafe { use_scrolloffpad(&win) });
 
@@ -2915,7 +2915,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 0; // use_scrolloffpad() false
         win.w_onebuf_opt.wo_sop = 3;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
 
@@ -2930,7 +2930,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         assert!(!unsafe { scrolloffpad_eof_pressure(&win, 9, 0) });
 
@@ -2945,7 +2945,7 @@ mod tests {
         let mut win = win_with_buf(&mut buf as *mut BufT);
         win.w_onebuf_opt.wo_so = 5;
         win.w_onebuf_opt.wo_sop = 3;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, &mut win as *mut WinT) };
 
         // lnum(9) > line_count(10) - so(2) = 8 -> true.
         assert!(unsafe { scrolloffpad_eof_pressure(&win, 9, 2) });
@@ -3494,7 +3494,7 @@ mod tests {
         // subsequent read, matching this crate's established Tree
         // Borrows discipline.
         let win_ptr = &mut win as *mut WinT;
-        let mut _cw = unsafe { crate::globals::GlobalPtrGuard::install(|g| &mut g.curwin, win_ptr) };
+        let mut _cw = unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
 
         unsafe { cursor_correct_sms(win_ptr) };
 
