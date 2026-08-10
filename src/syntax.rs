@@ -439,6 +439,56 @@ pub fn limit_pos(pos: &mut LposT, limit: &LposT) {
     }
 }
 
+/// Prepare the syntax pattern table for its first use
+/// (`init_syn_patterns`).
+///
+/// The original also records `sizeof(synpat_T)` in `ga_itemsize`;
+/// that has no counterpart, since [`crate::garray_defs::TypedGarrayT`]
+/// carries the item type itself.
+///
+/// Note this sets the grow size WITHOUT clearing the table, so
+/// `ga_growsize` is assigned directly rather than going through
+/// `ga_init`, which would also empty it - the original calls
+/// `ga_set_growsize`, not `ga_init`.
+///
+/// # Safety
+/// `GLOBALS.curwin` must be valid and non-null, as must its `w_s`
+/// syntax block.
+pub unsafe fn init_syn_patterns() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let block = unsafe { &mut *(*crate::globals::GLOBALS.get_mut().curwin).w_s };
+    block.b_syn_patterns.ga_growsize = 10;
+}
+
+/// Comparator ordering two syntax group IDs ascending (`idl_id_cmp`).
+///
+/// Returns a negative/zero/positive `i32`, matching `qsort`'s own
+/// convention and this crate's established comparator shape. The
+/// subtraction is done in `i32`, as the original's casts make explicit,
+/// so two far-apart `i16` values cannot overflow the result.
+#[must_use]
+pub fn idl_id_cmp(a: i16, b: i16) -> i32 {
+    i32::from(a) - i32::from(b)
+}
+
+/// Reset the highlight-group completion counters
+/// (`reset_expand_highlight`).
+///
+/// Clears all three, so a following completion offers only the real
+/// groups until something opts the keywords back in - see
+/// [`crate::highlight_group::get_highlight_name_ext`], which reads
+/// them.
+///
+/// # Safety
+/// Touches `GLOBALS`' `include_*` counters.
+pub unsafe fn reset_expand_highlight() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.include_link = 0;
+    g.include_default = 0;
+    g.include_none = 0;
+}
+
 /// Walk `off` characters from byte index `col` in `line`, forwards for
 /// a positive `off` and backwards for a negative one, and return the
 /// resulting byte index.
@@ -843,6 +893,66 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- init_syn_patterns / idl_id_cmp / reset_expand_highlight ----
+
+    /// Sets the grow size WITHOUT emptying the table - a translation
+    /// via `ga_init` would have cleared it, since the original calls
+    /// `ga_set_growsize` rather than `ga_init`.
+    #[test]
+    fn init_syn_patterns_sets_growsize_without_clearing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let fx = ClusterFixture::new(&[]);
+
+        fx.block_mut().b_syn_patterns.items.push(SynpatT::default());
+        fx.block_mut().b_syn_patterns.ga_growsize = 1;
+
+        unsafe { init_syn_patterns() };
+
+        assert_eq!(fx.block().b_syn_patterns.ga_growsize, 10);
+        assert_eq!(
+            fx.block().b_syn_patterns.ga_len(),
+            1,
+            "the existing pattern must survive"
+        );
+    }
+
+    #[test]
+    fn idl_id_cmp_orders_ids_ascending() {
+        assert!(idl_id_cmp(1, 2) < 0);
+        assert!(idl_id_cmp(2, 1) > 0);
+        assert_eq!(idl_id_cmp(5, 5), 0);
+
+        let mut v = [30i16, -1, 10, 20];
+        v.sort_by(|a, b| idl_id_cmp(*a, *b).cmp(&0));
+        assert_eq!(v, [-1, 10, 20, 30]);
+    }
+
+    /// The subtraction happens in i32, so two far-apart i16 values
+    /// give the right sign instead of wrapping.
+    #[test]
+    fn idl_id_cmp_does_not_overflow_on_extreme_ids() {
+        assert!(idl_id_cmp(i16::MIN, i16::MAX) < 0);
+        assert!(idl_id_cmp(i16::MAX, i16::MIN) > 0);
+    }
+
+    #[test]
+    fn reset_expand_highlight_clears_all_three_counters() {
+        let _lock = crate::globals::global_state_test_lock();
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        let saved = (g.include_none, g.include_default, g.include_link);
+
+        g.include_none = 1;
+        g.include_default = 1;
+        g.include_link = 1;
+
+        unsafe { reset_expand_highlight() };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!((g.include_none, g.include_default, g.include_link), (0, 0, 0));
+
+        (g.include_none, g.include_default, g.include_link) = saved;
     }
 
     // ---- syn_add_start_off / syn_add_end_off ----
