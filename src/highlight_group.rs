@@ -420,6 +420,50 @@ pub unsafe fn highlight_exists(name: &[u8]) -> bool {
     id > 0
 }
 
+/// Whether highlight group `id` has attribute `flag` set, reported as
+/// the original's `"1"` string or nothing (`highlight_has_attr`).
+///
+/// `modec` selects which attribute set to inspect: `'g'` reads the
+/// GUI attributes, anything else the cterm ones.
+///
+/// **`id` is 1-BASED here**, unlike [`highlight_group_name`]'s 0-based
+/// table index - this one indexes `hl_table[id - 1]`, exactly like
+/// [`syn_id2name`]. The two conventions genuinely coexist in the
+/// original and are preserved rather than harmonised.
+///
+/// The underline attributes are a mutually-exclusive GROUP, not
+/// independent bits: when `flag` names one of them, the group's own
+/// underline bits must equal `flag` exactly rather than merely
+/// overlap it, so asking about `HL_UNDERLINE` on an undercurled group
+/// answers no. Every other flag is a plain bit test.
+///
+/// Returns `None` for an out-of-range `id`, matching the original's
+/// `NULL`.
+///
+/// # Safety
+/// Reads the [`HL_TABLE`] file-static.
+#[must_use]
+pub unsafe fn highlight_has_attr(id: i32, flag: u32, modec: u8) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let table = unsafe { HL_TABLE.get_mut() };
+    if id <= 0 || id > table.ga_len() {
+        return None;
+    }
+    let g = &table.items[(id - 1) as usize];
+
+    let attr = if modec == b'g' { g.sg_gui } else { g.sg_cterm };
+    #[allow(clippy::cast_sign_loss)]
+    let attr = attr as u32;
+
+    let matched = if flag & crate::highlight_defs::HL_UNDERLINE_MASK != 0 {
+        // Underline styles are exclusive: an exact match, not overlap.
+        (attr & crate::highlight_defs::HL_UNDERLINE_MASK) == flag
+    } else {
+        (attr & flag) != 0
+    };
+    matched.then_some(b"1".as_slice())
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -447,6 +491,7 @@ pub unsafe fn syn_id2name(id: i32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlight_defs::{HL_BOLD, HL_ITALIC};
 
     /// Installs a table of groups AND the matching uppercase name
     /// index, restoring both on drop even through a panic.
@@ -923,6 +968,77 @@ mod tests {
             0,
             "the query created the group"
         );
+    }
+
+    // --- highlight_has_attr ---
+
+    #[test]
+    fn highlight_has_attr_rejects_an_out_of_range_id() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        assert_eq!(unsafe { highlight_has_attr(0, HL_BOLD, b'g') }, None);
+        assert_eq!(unsafe { highlight_has_attr(2, HL_BOLD, b'g') }, None);
+        assert_eq!(unsafe { highlight_has_attr(-1, HL_BOLD, b'g') }, None);
+    }
+
+    /// `modec` picks which attribute set is read: `'g'` the GUI one,
+    /// anything else the cterm one. Setting only one shows through
+    /// only one.
+    #[test]
+    fn highlight_has_attr_selects_gui_or_cterm_by_modec() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            unsafe { HL_TABLE.get_mut() }.items[0].sg_gui = HL_BOLD as i32;
+        }
+
+        assert_eq!(unsafe { highlight_has_attr(1, HL_BOLD, b'g') }, Some(b"1".as_slice()));
+        assert_eq!(unsafe { highlight_has_attr(1, HL_BOLD, b'c') }, None, "cterm unset");
+    }
+
+    /// Underline styles are a mutually-exclusive GROUP: the bits must
+    /// match exactly, so an undercurled group does NOT report a plain
+    /// underline even though the two masks overlap.
+    #[test]
+    fn highlight_has_attr_matches_underline_styles_exactly() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            unsafe { HL_TABLE.get_mut() }.items[0].sg_gui =
+                crate::highlight_defs::HL_UNDERCURL as i32;
+        }
+
+        assert_eq!(
+            unsafe { highlight_has_attr(1, crate::highlight_defs::HL_UNDERCURL, b'g') },
+            Some(b"1".as_slice()),
+            "the exact style matches"
+        );
+        assert_eq!(
+            unsafe { highlight_has_attr(1, crate::highlight_defs::HL_UNDERLINE, b'g') },
+            None,
+            "a different underline style must NOT match, despite overlapping the mask"
+        );
+    }
+
+    /// A non-underline flag is a plain bit test, so it matches when
+    /// present alongside others.
+    #[test]
+    fn highlight_has_attr_bit_tests_other_flags() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            unsafe { HL_TABLE.get_mut() }.items[0].sg_cterm = (HL_BOLD | HL_ITALIC) as i32;
+        }
+
+        assert_eq!(unsafe { highlight_has_attr(1, HL_BOLD, b'c') }, Some(b"1".as_slice()));
+        assert_eq!(unsafe { highlight_has_attr(1, HL_ITALIC, b'c') }, Some(b"1".as_slice()));
     }
 
     #[test]
