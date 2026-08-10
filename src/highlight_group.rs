@@ -335,6 +335,91 @@ pub unsafe fn highlight_link_id(id: i32) -> i32 {
     unsafe { HL_TABLE.get_mut() }.items[id as usize].sg_link
 }
 
+/// Whether the group at table index `idx` has any settings of its own
+/// (`hl_has_settings`).
+///
+/// A cleared group never counts, whatever else it holds. Otherwise any
+/// one of the attribute, cterm colour or RGB colour-index settings is
+/// enough. A link only counts when `check_link` asks for it, which is
+/// how callers distinguish "styled in its own right" from "merely
+/// points at another group".
+///
+/// # Safety
+/// Same as [`highlight_group_name`]: reads [`HL_TABLE`], and `idx`
+/// must be a valid 0-based index.
+#[must_use]
+pub unsafe fn hl_has_settings(idx: i32, check_link: bool) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = &unsafe { HL_TABLE.get_mut() }.items[idx as usize];
+    !g.sg_cleared
+        && (g.sg_attr != 0
+            || g.sg_cterm_fg != 0
+            || g.sg_cterm_bg != 0
+            || g.sg_rgb_fg_idx != COLOR_IDX_NONE
+            || g.sg_rgb_bg_idx != COLOR_IDX_NONE
+            || g.sg_rgb_sp_idx != COLOR_IDX_NONE
+            || (check_link && (g.sg_set & sg_set::LINK) != 0))
+}
+
+/// Clear the highlighting for the group at table index `idx`
+/// (`highlight_clear`).
+///
+/// Resets every attribute, colour and font setting, and marks the
+/// group cleared.
+///
+/// Note the link is NOT simply dropped: it is restored to the group's
+/// DEFAULT link, and the script context follows it to wherever that
+/// default was set, so a `:highlight clear` returns the group to its
+/// built-in state rather than to nothing. Groups with no default link
+/// have `sg_deflink` of 0, so for them this does clear the link.
+///
+/// The original's `XFREE_CLEAR(sg_font)` becomes assigning `None`:
+/// dropping the owned value is what frees it.
+///
+/// # Safety
+/// Same as [`highlight_group_name`].
+pub unsafe fn highlight_clear(idx: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = &mut unsafe { HL_TABLE.get_mut() }.items[idx as usize];
+
+    g.sg_cleared = true;
+    g.sg_attr = 0;
+    g.sg_cterm = 0;
+    g.sg_cterm_bold = false;
+    g.sg_cterm_fg = 0;
+    g.sg_cterm_bg = 0;
+    g.sg_gui = 0;
+    g.sg_rgb_fg = -1;
+    g.sg_rgb_bg = -1;
+    g.sg_rgb_sp = -1;
+    g.sg_rgb_fg_idx = COLOR_IDX_NONE;
+    g.sg_rgb_bg_idx = COLOR_IDX_NONE;
+    g.sg_rgb_sp_idx = COLOR_IDX_NONE;
+    g.sg_blend = -1;
+    g.sg_font = None;
+
+    // Restore the default link and the context it was set from.
+    g.sg_link = g.sg_deflink;
+    g.sg_script_ctx = g.sg_deflink_sctx;
+}
+
+/// Whether a highlight group with this name exists
+/// (`highlight_exists`).
+///
+/// Note this is NOT a pure query for an `@` capture name: it goes
+/// through [`syn_name2id`], which CREATES such a group - so asking
+/// whether `@foo` exists makes it exist. That is the original's
+/// behaviour, inherited from the same call.
+///
+/// # Safety
+/// Same as [`syn_name2id`].
+#[must_use]
+pub unsafe fn highlight_exists(name: &[u8]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let id = unsafe { syn_name2id(name) };
+    id > 0
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -672,6 +757,172 @@ mod tests {
         unsafe { HL_TABLE.get_mut() }.items[0].sg_link = 2;
         assert_eq!(unsafe { highlight_link_id(0) }, 2);
         assert_eq!(unsafe { highlight_link_id(1) }, 0, "the other is untouched");
+    }
+
+    // --- hl_has_settings / highlight_clear / highlight_exists ---
+
+    /// A cleared group never counts as having settings, whatever else
+    /// it holds.
+    #[test]
+    fn hl_has_settings_ignores_a_cleared_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        let table = unsafe { HL_TABLE.get_mut() };
+        table.items[0].sg_cleared = true;
+        table.items[0].sg_attr = 5;
+        assert!(!unsafe { hl_has_settings(0, true) });
+    }
+
+    /// Each setting on its own is enough, so a check that missed one
+    /// would fail here.
+    #[test]
+    fn hl_has_settings_accepts_each_setting_on_its_own() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        // Every case starts from a not-cleared group with nothing set.
+        let reset = || {
+            let table = unsafe { HL_TABLE.get_mut() };
+            table.items[0] = HlGroup {
+                sg_cleared: false,
+                sg_rgb_fg_idx: COLOR_IDX_NONE,
+                sg_rgb_bg_idx: COLOR_IDX_NONE,
+                sg_rgb_sp_idx: COLOR_IDX_NONE,
+                ..Default::default()
+            };
+        };
+
+        reset();
+        assert!(!unsafe { hl_has_settings(0, true) }, "nothing set");
+
+        for setter in [
+            (|g: &mut HlGroup| g.sg_attr = 1) as fn(&mut HlGroup),
+            |g: &mut HlGroup| g.sg_cterm_fg = 1,
+            |g: &mut HlGroup| g.sg_cterm_bg = 1,
+            |g: &mut HlGroup| g.sg_rgb_fg_idx = 0,
+            |g: &mut HlGroup| g.sg_rgb_bg_idx = 0,
+            |g: &mut HlGroup| g.sg_rgb_sp_idx = 0,
+        ] {
+            reset();
+            setter(&mut unsafe { HL_TABLE.get_mut() }.items[0]);
+            assert!(unsafe { hl_has_settings(0, false) }, "one setting is enough");
+        }
+    }
+
+    /// A link only counts when `check_link` asks for it - the flag is
+    /// what separates "styled itself" from "points elsewhere".
+    #[test]
+    fn hl_has_settings_counts_a_link_only_when_asked() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        let table = unsafe { HL_TABLE.get_mut() };
+        table.items[0] = HlGroup {
+            sg_cleared: false,
+            sg_set: sg_set::LINK,
+            sg_rgb_fg_idx: COLOR_IDX_NONE,
+            sg_rgb_bg_idx: COLOR_IDX_NONE,
+            sg_rgb_sp_idx: COLOR_IDX_NONE,
+            ..Default::default()
+        };
+
+        assert!(unsafe { hl_has_settings(0, true) }, "counted when asked");
+        assert!(!unsafe { hl_has_settings(0, false) }, "not counted otherwise");
+    }
+
+    /// Clearing resets the styling and marks the group cleared.
+    #[test]
+    fn highlight_clear_resets_the_styling() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        {
+            let g = &mut unsafe { HL_TABLE.get_mut() }.items[0];
+            g.sg_cleared = false;
+            g.sg_attr = 9;
+            g.sg_cterm_fg = 3;
+            g.sg_rgb_fg = 0x00ff00;
+            g.sg_rgb_fg_idx = 4;
+            g.sg_blend = 50;
+            g.sg_font = Some(b"Mono".to_vec());
+        }
+
+        unsafe { highlight_clear(0) };
+
+        let g = &unsafe { HL_TABLE.get_mut() }.items[0];
+        assert!(g.sg_cleared);
+        assert_eq!((g.sg_attr, g.sg_cterm_fg, g.sg_gui), (0, 0, 0));
+        assert_eq!(g.sg_rgb_fg, -1);
+        assert_eq!(g.sg_rgb_fg_idx, COLOR_IDX_NONE);
+        assert_eq!(g.sg_blend, -1);
+        assert_eq!(g.sg_font, None, "the font is released");
+    }
+
+    /// Clearing RESTORES the default link rather than dropping the
+    /// link entirely, and the script context follows it to where that
+    /// default was set.
+    #[test]
+    fn highlight_clear_restores_the_default_link_not_nothing() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        let deflink_ctx = crate::eval::typval_defs::SctxT {
+            sc_sid: 42,
+            ..Default::default()
+        };
+        {
+            let g = &mut unsafe { HL_TABLE.get_mut() }.items[0];
+            g.sg_link = 7; // currently linked somewhere else
+            g.sg_deflink = 3; // but its default is group 3
+            g.sg_deflink_sctx = deflink_ctx;
+            g.sg_script_ctx = crate::eval::typval_defs::SctxT {
+                sc_sid: 99,
+                ..Default::default()
+            };
+        }
+
+        unsafe { highlight_clear(0) };
+
+        let g = &unsafe { HL_TABLE.get_mut() }.items[0];
+        assert_eq!(g.sg_link, 3, "restored to the default link, not 0");
+        assert_eq!(g.sg_script_ctx, deflink_ctx, "context follows the default");
+    }
+
+    /// With no default link, clearing does leave the group unlinked.
+    #[test]
+    fn highlight_clear_unlinks_a_group_with_no_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_link = 7;
+        unsafe { highlight_clear(0) };
+        assert_eq!(unsafe { HL_TABLE.get_mut() }.items[0].sg_link, 0);
+    }
+
+    #[test]
+    fn highlight_exists_reports_a_known_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"Normal"]);
+
+        assert!(unsafe { highlight_exists(b"Normal") });
+        assert!(unsafe { highlight_exists(b"NORMAL") }, "case-insensitive");
+        assert!(!unsafe { highlight_exists(b"Nope") });
+    }
+
+    /// Asking whether an `@` capture group exists CREATES it, so the
+    /// answer is always true - inherited from syn_name2id.
+    #[test]
+    fn highlight_exists_creates_an_at_capture_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[]);
+
+        assert!(unsafe { highlight_exists(b"@brand.new") });
+        assert_ne!(
+            unsafe { HL_TABLE.get_mut() }.ga_len(),
+            0,
+            "the query created the group"
+        );
     }
 
     #[test]
