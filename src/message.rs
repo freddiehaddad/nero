@@ -224,6 +224,31 @@ pub fn msg_use_grid() -> bool {
     has_chars && !crate::ui::ui_has(crate::ui::UiExtension::Messages)
 }
 
+/// Whether messages must be printed with `printf` rather than drawn
+/// on the screen (`msg_use_printf`).
+///
+/// True only when there is no usable screen: neither embedded mode
+/// (where messages go over the RPC channel) nor any attached UI, and
+/// no UI has taken over message display via `ext_messages`.
+///
+/// Note this is genuinely dynamic rather than always-false: this
+/// crate's [`crate::ui::ui_active`] is real, so a test that attaches
+/// no UI sees `true` here and one that attaches a UI sees `false`.
+/// Only the `ui_has` term is fixed, and it is fixed at `false`, which
+/// is the operand that leaves the other two deciding.
+///
+/// # Safety
+/// Reads `GLOBALS` (for `embedded_mode`) and the UI list via
+/// [`crate::ui::ui_active`].
+#[must_use]
+pub unsafe fn msg_use_printf() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let embedded = unsafe { crate::globals::GLOBALS.get_mut() }.embedded_mode;
+    // SAFETY: forwarded from this function's own safety doc.
+    let active = unsafe { crate::ui::ui_active() };
+    !embedded && active == 0 && !crate::ui::ui_has(crate::ui::UiExtension::Messages)
+}
+
 /// Whether message-scrolling should be throttled (`msg_do_throttle`).
 ///
 /// Always `false` today, following directly from [`msg_use_grid`]
@@ -793,6 +818,50 @@ pub unsafe fn sb_text_start_cmdline() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    // --- msg_use_printf ---
+
+    /// Restores `embedded_mode` on drop, even through a panic.
+    struct EmbeddedGuard {
+        prev: bool,
+    }
+
+    impl EmbeddedGuard {
+        fn set(value: bool) -> Self {
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let me = Self { prev: g.embedded_mode };
+            g.embedded_mode = value;
+            me
+        }
+    }
+
+    impl Drop for EmbeddedGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.embedded_mode = self.prev;
+        }
+    }
+
+    /// With no embedded channel and no attached UI there is no usable
+    /// screen, so messages must go through `printf`.
+    #[test]
+    fn msg_use_printf_is_true_without_an_embedded_channel_or_ui() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = EmbeddedGuard::set(false);
+        assert_eq!(unsafe { crate::ui::ui_active() }, 0, "no UI attached here");
+        assert!(unsafe { msg_use_printf() });
+    }
+
+    /// Embedded mode routes messages over the RPC channel instead, so
+    /// `printf` is not used. This is the term that genuinely toggles
+    /// the result under test: `ui_active` stays at its default of 0
+    /// (no UI can be attached from here, since the registry is private
+    /// to `ui.rs`) and `ui_has` is fixed false.
+    #[test]
+    fn msg_use_printf_is_false_in_embedded_mode() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = EmbeddedGuard::set(true);
+        assert!(!unsafe { msg_use_printf() });
+    }
 
     // --- msgchunk / msg_sb family ---
 
