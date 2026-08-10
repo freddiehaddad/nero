@@ -464,6 +464,29 @@ pub unsafe fn highlight_has_attr(id: i32, flag: u32, modec: u8) -> Option<&'stat
     matched.then_some(b"1".as_slice())
 }
 
+/// Reset the `Normal` highlight group's colours to "unset"
+/// (`restore_cterm_colors`).
+///
+/// The RGB values reset to `-1` (no colour) while the cterm ones reset
+/// to `0`. That asymmetry is the original's: `0` is a valid cterm
+/// colour number in general, but here it is the sentinel the rest of
+/// the code treats as "not set", whereas the RGB values use `-1`.
+///
+/// # Safety
+/// Touches the `NORMAL_FG`/`NORMAL_BG`/`NORMAL_SP` and
+/// `CTERM_NORMAL_FG_COLOR`/`CTERM_NORMAL_BG_COLOR` file-statics in
+/// [`crate::highlight`].
+pub unsafe fn restore_cterm_colors() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *crate::highlight::NORMAL_FG.get_mut() = -1;
+        *crate::highlight::NORMAL_BG.get_mut() = -1;
+        *crate::highlight::NORMAL_SP.get_mut() = -1;
+        *crate::highlight::CTERM_NORMAL_FG_COLOR.get_mut() = 0;
+        *crate::highlight::CTERM_NORMAL_BG_COLOR.get_mut() = 0;
+    }
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -1039,6 +1062,34 @@ mod tests {
 
         assert_eq!(unsafe { highlight_has_attr(1, HL_BOLD, b'c') }, Some(b"1".as_slice()));
         assert_eq!(unsafe { highlight_has_attr(1, HL_ITALIC, b'c') }, Some(b"1".as_slice()));
+    }
+
+    // --- restore_cterm_colors ---
+
+    /// The RGB colours reset to -1 while the cterm ones reset to 0 -
+    /// two different "unset" sentinels, which is the original's own
+    /// asymmetry rather than an oversight.
+    #[test]
+    fn restore_cterm_colors_uses_two_different_unset_sentinels() {
+        let _lock = crate::globals::global_state_test_lock();
+
+        unsafe {
+            *crate::highlight::NORMAL_FG.get_mut() = 0x11_22_33;
+            *crate::highlight::NORMAL_BG.get_mut() = 0x44_55_66;
+            *crate::highlight::NORMAL_SP.get_mut() = 0x77_88_99;
+            *crate::highlight::CTERM_NORMAL_FG_COLOR.get_mut() = 7;
+            *crate::highlight::CTERM_NORMAL_BG_COLOR.get_mut() = 8;
+        }
+
+        unsafe { restore_cterm_colors() };
+
+        unsafe {
+            assert_eq!(*crate::highlight::NORMAL_FG.get_mut(), -1);
+            assert_eq!(*crate::highlight::NORMAL_BG.get_mut(), -1);
+            assert_eq!(*crate::highlight::NORMAL_SP.get_mut(), -1);
+            assert_eq!(*crate::highlight::CTERM_NORMAL_FG_COLOR.get_mut(), 0);
+            assert_eq!(*crate::highlight::CTERM_NORMAL_BG_COLOR.get_mut(), 0);
+        }
     }
 
     #[test]
