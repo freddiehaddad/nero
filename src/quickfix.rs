@@ -233,6 +233,95 @@ pub unsafe fn win_set_loclist(wp: *mut WinT, qi: *mut crate::types_defs::QfInfoT
     }
 }
 
+/// Status returned by the quickfix line-parsing helpers (`QF_FAIL`,
+/// `QF_OK`, ... - an anonymous enum in the original).
+pub mod qf_status {
+    /// The field could not be parsed (`QF_FAIL`).
+    pub const QF_FAIL: i32 = 0;
+    /// The field was parsed successfully (`QF_OK`).
+    pub const QF_OK: i32 = 1;
+    /// There is no more input to read (`QF_END_OF_INPUT`).
+    pub const QF_END_OF_INPUT: i32 = 2;
+    /// Out of memory (`QF_NOMEM`).
+    pub const QF_NOMEM: i32 = 3;
+    /// This line should be skipped (`QF_IGNORE_LINE`).
+    pub const QF_IGNORE_LINE: i32 = 4;
+    /// Rescan the line with the next format (`QF_MULTISCAN`).
+    pub const QF_MULTISCAN: i32 = 5;
+}
+
+/// The fields parsed out of one error line, before they become a
+/// [`QflineT`] entry (`qffields_T`).
+///
+/// The original's four `char *` buffers become owned `Vec<u8>`s, which
+/// dissolves two of its functions entirely:
+///
+/// - `qf_alloc_fields` pre-allocates each buffer at `CMDBUFFSIZE + 1`
+///   and records that size in `errmsglen`. A `Vec` owns and grows its
+///   own storage, so [`QffieldsT::default`] replaces it.
+/// - `qf_free_fields` is four `xfree`s, which is exactly what
+///   dropping the owned values already does, so it has no body left to
+///   translate - the same reasoning that leaves `move.c`'s
+///   `redraw_for_cursorline` untranslated rather than empty.
+///
+/// `errmsglen` is likewise absent: every one of its uses in the
+/// original is buffer-capacity bookkeeping for those `xrealloc`s, never
+/// data anyone reads, so the `Vec`'s own storage replaces it - the same
+/// call already made for `TypedGarrayT`'s derived `ga_len`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QffieldsT {
+    /// File name for the error (`namebuf`).
+    pub namebuf: Vec<u8>,
+    /// Buffer number for the error (`bnr`).
+    pub bnr: i32,
+    /// Module name, shown instead of the file name (`module`).
+    pub module: Vec<u8>,
+    /// The error message itself (`errmsg`).
+    pub errmsg: Vec<u8>,
+    /// Line number where the error occurred (`lnum`).
+    pub lnum: crate::pos_defs::LinenrT,
+    /// Last line of a range, or zero (`end_lnum`).
+    pub end_lnum: crate::pos_defs::LinenrT,
+    /// Column where the error occurred (`col`).
+    pub col: i32,
+    /// Last column of a range, or zero (`end_col`).
+    pub end_col: i32,
+    /// Whether `col` is a visual column (`use_viscol`).
+    pub use_viscol: bool,
+    /// Search pattern for locating the error (`pattern`).
+    pub pattern: Vec<u8>,
+    /// Error number (`enr`).
+    pub enr: i32,
+    /// Error type: `'e'`, `'w'`, `'i'` and so on (`type`).
+    pub type_: u8,
+    /// Custom data attached by the caller (`user_data`), absent when
+    /// the original's pointer is `NULL`.
+    pub user_data: Option<crate::eval::typval_defs::TypvalT>,
+    /// Whether the entry is a recognised error (`valid`).
+    pub valid: bool,
+}
+
+/// Copy a line that matched no error format into the message field
+/// (`copy_nonerror_line`).
+///
+/// Always succeeds, returning `QF_OK`.
+///
+/// The original grows `errmsg` when the line does not fit and then
+/// `xstrlcpy`s into it; assigning the `Vec` does both. Note the copy
+/// is NUL-scanned, not a verbatim `linelen` bytes: `xstrlcpy` stops at
+/// the source's first NUL, so an embedded NUL truncates the message.
+/// That is preserved.
+pub fn copy_nonerror_line(linebuf: &[u8], linelen: usize, fields: &mut QffieldsT) -> i32 {
+    let n = linelen.min(linebuf.len());
+    let end = linebuf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+
+    fields.errmsg.clear();
+    fields.errmsg.extend_from_slice(&linebuf[..end]);
+    fields.errmsg.push(0);
+
+    qf_status::QF_OK
+}
+
 /// Propagate a location-list window's `'lhistory'` back to the window
 /// that owns the location list (`qf_sync_llw_to_win`).
 ///
@@ -1103,6 +1192,73 @@ mod tests {
         let first = fx.wins[0];
         unsafe { &mut *first }.w_buffer = std::ptr::null_mut();
         assert_eq!(unsafe { qf_find_win_with_normal_buf() }, fx.wins[1]);
+    }
+
+    // --- copy_nonerror_line ---
+
+    #[test]
+    fn copy_nonerror_line_copies_the_line_and_nul_terminates() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            copy_nonerror_line(b"some message", 12, &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.errmsg, b"some message\0".to_vec());
+    }
+
+    /// Only the first `linelen` bytes are taken, so trailing text in
+    /// the buffer is not part of the message.
+    #[test]
+    fn copy_nonerror_line_uses_only_the_first_linelen_bytes() {
+        let mut fields = QffieldsT::default();
+        copy_nonerror_line(b"head and tail", 4, &mut fields);
+        assert_eq!(fields.errmsg, b"head\0".to_vec());
+    }
+
+    /// The copy is NUL-scanned, not verbatim: `xstrlcpy` stops at the
+    /// source's first NUL, so an embedded NUL truncates the message
+    /// even when `linelen` reaches past it.
+    #[test]
+    fn copy_nonerror_line_truncates_at_an_embedded_nul() {
+        let mut fields = QffieldsT::default();
+        copy_nonerror_line(b"abc\0def", 7, &mut fields);
+        assert_eq!(fields.errmsg, b"abc\0".to_vec());
+    }
+
+    /// A previous, longer message is fully replaced rather than
+    /// partly overwritten.
+    #[test]
+    fn copy_nonerror_line_replaces_any_previous_message() {
+        let mut fields = QffieldsT::default();
+        copy_nonerror_line(b"a long previous message", 23, &mut fields);
+        copy_nonerror_line(b"short", 5, &mut fields);
+        assert_eq!(fields.errmsg, b"short\0".to_vec());
+    }
+
+    #[test]
+    fn copy_nonerror_line_handles_an_empty_line() {
+        let mut fields = QffieldsT::default();
+        copy_nonerror_line(b"", 0, &mut fields);
+        assert_eq!(fields.errmsg, b"\0".to_vec());
+    }
+
+    /// Only `errmsg` is touched; the other fields keep their values.
+    #[test]
+    fn copy_nonerror_line_leaves_the_other_fields_alone() {
+        let mut fields = QffieldsT { lnum: 12, col: 3, valid: true, ..Default::default() };
+        copy_nonerror_line(b"msg", 3, &mut fields);
+        assert_eq!((fields.lnum, fields.col, fields.valid), (12, 3, true));
+        assert!(fields.namebuf.is_empty());
+    }
+
+    #[test]
+    fn qf_status_values_match_the_original() {
+        assert_eq!(qf_status::QF_FAIL, 0);
+        assert_eq!(qf_status::QF_OK, 1);
+        assert_eq!(qf_status::QF_END_OF_INPUT, 2);
+        assert_eq!(qf_status::QF_NOMEM, 3);
+        assert_eq!(qf_status::QF_IGNORE_LINE, 4);
+        assert_eq!(qf_status::QF_MULTISCAN, 5);
     }
 
     // --- qf_sync_llw_to_win ---
