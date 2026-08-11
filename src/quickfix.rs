@@ -346,6 +346,28 @@ pub fn qf_parse_fmt_r<'a>(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%p` pointer-line match
+/// (`qf_parse_fmt_p`).
+pub fn qf_parse_fmt_p(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    fields.col = 0;
+    for &byte in matched {
+        fields.col += 1;
+        if byte == crate::ascii_defs::TAB {
+            fields.col += 7;
+            fields.col -= fields.col % 8;
+        }
+    }
+    fields.col += 1;
+    fields.use_viscol = true;
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -1915,6 +1937,46 @@ mod tests {
         let mut tail = Some(&original[..]);
         assert_eq!(qf_parse_fmt_r(None, &mut tail), qf_status::QF_FAIL);
         assert_eq!(tail, Some(&original[..]));
+    }
+
+    #[test]
+    fn qf_parse_fmt_p_counts_pointer_characters_and_uses_one_based_column() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_p(Some(b"   "), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.col, 4);
+        assert!(fields.use_viscol);
+    }
+
+    #[test]
+    fn qf_parse_fmt_p_expands_tabs_to_eight_column_boundaries() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_p(Some(b" \t"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.col, 9);
+    }
+
+    #[test]
+    fn qf_parse_fmt_p_rejects_a_missing_match_without_changing_fields() {
+        let mut fields = QffieldsT {
+            col: 7,
+            use_viscol: false,
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_p(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.col, 7);
+        assert!(!fields.use_viscol);
+    }
+
+    #[test]
+    fn qf_parse_fmt_p_maps_an_empty_pointer_line_to_column_one() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(qf_parse_fmt_p(Some(b""), &mut fields), qf_status::QF_OK);
+        assert_eq!(fields.col, 1);
     }
 
     #[test]
