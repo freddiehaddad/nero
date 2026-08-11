@@ -131,6 +131,7 @@ pub mod register_defs;
 pub mod runtime;
 pub mod runtime_defs;
 pub mod search;
+pub mod shada;
 pub mod search_defs;
 pub mod sha256;
 pub mod sign;
