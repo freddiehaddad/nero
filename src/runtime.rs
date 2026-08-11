@@ -241,6 +241,19 @@ pub fn script_item_count() -> ScidT {
     unsafe { SCRIPT_ITEMS.get_mut() }.len() as ScidT
 }
 
+/// Whether script id `sid` denotes a Lua script (`script_is_lua`).
+#[must_use]
+pub fn script_is_lua(sid: ScidT) -> bool {
+    if sid == crate::globals::SID_LUA {
+        return true;
+    }
+    if sid <= 0 || sid > script_item_count() {
+        return false;
+    }
+    let item = script_item(sid);
+    !item.is_null() && unsafe { (*item).sn_lua }
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -689,6 +702,33 @@ mod tests {
         new_script_item(None);
         new_script_item(None);
         assert_eq!(script_item_count(), 3);
+    }
+
+    #[test]
+    fn script_is_lua_accepts_the_builtin_lua_sid() {
+        assert!(script_is_lua(crate::globals::SID_LUA));
+    }
+
+    #[test]
+    fn script_is_lua_reads_the_registered_script_flag() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        let (lua_sid, lua) = new_script_item(Some(b"lua.lua".to_vec()));
+        let (vim_sid, _vim) = new_script_item(Some(b"vim.vim".to_vec()));
+        unsafe { (*lua).sn_lua = true };
+
+        assert!(script_is_lua(lua_sid));
+        assert!(!script_is_lua(vim_sid));
+    }
+
+    #[test]
+    fn script_is_lua_rejects_invalid_script_ids() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        new_script_item(None);
+        assert!(!script_is_lua(0));
+        assert!(!script_is_lua(-1));
+        assert!(!script_is_lua(2));
     }
 
     #[test]

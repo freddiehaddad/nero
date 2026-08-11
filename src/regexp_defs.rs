@@ -76,9 +76,32 @@ pub enum OptmagicT {
     MagicOff,
 }
 
+/// Effective regular-expression magic level (`magic_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum MagicT {
+    /// `\V`, very nomagic.
+    None = 1,
+    /// `\M`, nomagic.
+    Off = 2,
+    /// `\m` or the `'magic'` option.
+    On = 3,
+    /// `\v`, very magic.
+    All = 4,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magic_level_discriminants_match_regexp_defs_h() {
+        assert_eq!(MagicT::None as i32, 1);
+        assert_eq!(MagicT::Off as i32, 2);
+        assert_eq!(MagicT::On as i32, 3);
+        assert_eq!(MagicT::All as i32, 4);
+        assert!(MagicT::All as i32 > MagicT::On as i32);
+    }
 
     #[test]
     fn optmagic_default_is_not_set() {
