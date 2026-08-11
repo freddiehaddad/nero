@@ -432,6 +432,27 @@ pub unsafe fn can_get_old_char() -> bool {
     old_char != -1 && (stuffed || stuff_empty())
 }
 
+/// Defers or completes clearing `reg_executing` after a peek
+/// (`check_end_reg_executing`).
+///
+/// # Safety
+/// Mutates `GLOBALS.reg_executing`/
+/// `pending_end_reg_executing` and reads `TYPEBUF`.
+pub unsafe fn check_end_reg_executing(advance: bool) {
+    let maplen = unsafe { TYPEBUF.get_mut() }.tb_maplen;
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    if globals.reg_executing != 0
+        && (maplen == 0 || globals.pending_end_reg_executing)
+    {
+        if advance {
+            globals.reg_executing = 0;
+            globals.pending_end_reg_executing = false;
+        } else {
+            globals.pending_end_reg_executing = true;
+        }
+    }
+}
+
 /// Stop blocking the redo buffer after an Insert-mode redo
 /// (`stop_redo_ins`).
 ///
@@ -1233,6 +1254,96 @@ mod tests {
 
         assert_eq!(unsafe { *OLD_CHAR.get_mut() }, 2);
         assert!(!unsafe { *OLD_KEY_STUFFED.get_mut() });
+    }
+
+    struct TypebufStateGuard(crate::input_defs::TypebufT);
+
+    impl TypebufStateGuard {
+        fn install(maplen: i32) -> Self {
+            let replacement = crate::input_defs::TypebufT {
+                tb_maplen: maplen,
+                ..Default::default()
+            };
+            Self(unsafe { std::mem::replace(TYPEBUF.get_mut(), replacement) })
+        }
+    }
+
+    impl Drop for TypebufStateGuard {
+        fn drop(&mut self) {
+            *unsafe { TYPEBUF.get_mut() } = std::mem::take(&mut self.0);
+        }
+    }
+
+    #[test]
+    fn check_end_reg_executing_defers_clearing_while_peeking() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(0);
+        let _reg = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.reg_executing,
+                i32::from(b'a'),
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.pending_end_reg_executing,
+                false,
+            )
+        };
+
+        unsafe { check_end_reg_executing(false) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.reg_executing, i32::from(b'a'));
+        assert!(g.pending_end_reg_executing);
+    }
+
+    #[test]
+    fn check_end_reg_executing_clears_once_input_advances() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(4);
+        let _reg = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.reg_executing,
+                i32::from(b'a'),
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.pending_end_reg_executing,
+                true,
+            )
+        };
+
+        unsafe { check_end_reg_executing(true) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.reg_executing, 0);
+        assert!(!g.pending_end_reg_executing);
+    }
+
+    #[test]
+    fn check_end_reg_executing_waits_for_mapped_typeahead() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _typebuf = TypebufStateGuard::install(4);
+        let _reg = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.reg_executing,
+                i32::from(b'a'),
+            )
+        };
+        let _pending = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.pending_end_reg_executing,
+                false,
+            )
+        };
+
+        unsafe { check_end_reg_executing(true) };
+
+        let g = unsafe { crate::globals::GLOBALS.get_mut() };
+        assert_eq!(g.reg_executing, i32::from(b'a'));
+        assert!(!g.pending_end_reg_executing);
     }
 
     #[test]
