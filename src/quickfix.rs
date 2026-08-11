@@ -522,6 +522,20 @@ pub fn copy_nonerror_line(linebuf: &[u8], linelen: usize, fields: &mut QffieldsT
     qf_status::QF_OK
 }
 
+/// Parses a line that matched no `'errorformat'` entry
+/// (`qf_parse_line_nomatch`).
+pub fn qf_parse_line_nomatch(
+    linebuf: &[u8],
+    linelen: usize,
+    fields: &mut QffieldsT,
+) -> i32 {
+    fields.namebuf.clear();
+    fields.namebuf.push(0);
+    fields.lnum = 0;
+    fields.valid = false;
+    copy_nonerror_line(linebuf, linelen, fields)
+}
+
 /// Propagate a location-list window's `'lhistory'` back to the window
 /// that owns the location list (`qf_sync_llw_to_win`).
 ///
@@ -3235,6 +3249,32 @@ mod tests {
         copy_nonerror_line(b"msg", 3, &mut fields);
         assert_eq!((fields.lnum, fields.col, fields.valid), (12, 3, true));
         assert!(fields.namebuf.is_empty());
+    }
+
+    #[test]
+    fn qf_parse_line_nomatch_clears_location_and_copies_the_message() {
+        let mut fields = QffieldsT {
+            namebuf: b"old.c\0".to_vec(),
+            lnum: 12,
+            valid: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            qf_parse_line_nomatch(b"compiler chatter", 16, &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.namebuf, b"\0");
+        assert_eq!(fields.lnum, 0);
+        assert!(!fields.valid);
+        assert_eq!(fields.errmsg, b"compiler chatter\0");
+    }
+
+    #[test]
+    fn qf_parse_line_nomatch_obeys_the_explicit_line_length() {
+        let mut fields = QffieldsT::default();
+        qf_parse_line_nomatch(b"head tail", 4, &mut fields);
+        assert_eq!(fields.errmsg, b"head\0");
     }
 
     #[test]
