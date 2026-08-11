@@ -737,6 +737,18 @@ pub fn idl_id_cmp(a: i16, b: i16) -> i32 {
     i32::from(a) - i32::from(b)
 }
 
+/// Whether `id` is in the resolved set of cache entry `e`
+/// (`idl_contains`).
+///
+/// `idl_ids` is kept sorted ascending by [`idl_id_cmp`], so this is a
+/// binary search. The original hand-rolls one over a pointer/count
+/// pair; `idl_ids` is a `Vec` here, so the standard library's own
+/// binary search does the same job.
+#[must_use]
+pub fn idl_contains(e: &IdlEntryT, id: i16) -> bool {
+    e.idl_ids.binary_search(&id).is_ok()
+}
+
 /// Reset the highlight-group completion counters
 /// (`reset_expand_highlight`).
 ///
@@ -1701,6 +1713,60 @@ mod tests {
             1,
             "the existing pattern must survive"
         );
+    }
+
+    /// A binary search has to find an id wherever it sits, so this
+    /// checks every position of an odd- and an even-length set rather
+    /// than just the middle one.
+    #[test]
+    fn idl_contains_finds_an_id_at_any_position() {
+        for ids in [vec![3i16, 7, 11, 20, 42], vec![3i16, 7, 11, 20]] {
+            let e = IdlEntryT {
+                idl_ids: ids.clone(),
+                ..Default::default()
+            };
+            for &id in &ids {
+                assert!(idl_contains(&e, id), "{id} missing from {ids:?}");
+            }
+        }
+    }
+
+    /// Values below, above and between the stored ids must all miss -
+    /// an off-by-one in the search bounds would report one of these
+    /// as present.
+    #[test]
+    fn idl_contains_rejects_ids_outside_the_set() {
+        let e = IdlEntryT {
+            idl_ids: vec![3, 7, 11, 20, 42],
+            ..Default::default()
+        };
+        for id in [i16::MIN, 2, 4, 8, 10, 12, 19, 21, 41, 43, i16::MAX] {
+            assert!(!idl_contains(&e, id), "{id} should not be found");
+        }
+    }
+
+    #[test]
+    fn idl_contains_is_false_for_an_empty_set() {
+        let e = IdlEntryT::default();
+        assert!(!idl_contains(&e, 0));
+        assert!(!idl_contains(&e, 7));
+    }
+
+    /// The sort order the search relies on is the one `idl_id_cmp`
+    /// defines, so a set built through it stays searchable - including
+    /// the negative ids `idl_id_cmp` is careful about.
+    #[test]
+    fn idl_contains_agrees_with_idl_id_cmp_ordering() {
+        let mut ids = vec![42i16, -30, 7, -1, 11, 3];
+        ids.sort_by(|a, b| idl_id_cmp(*a, *b).cmp(&0));
+        let e = IdlEntryT {
+            idl_ids: ids.clone(),
+            ..Default::default()
+        };
+        for &id in &ids {
+            assert!(idl_contains(&e, id), "{id} missing after sorting");
+        }
+        assert!(!idl_contains(&e, -2));
     }
 
     #[test]
