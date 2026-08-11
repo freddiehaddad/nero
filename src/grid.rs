@@ -129,6 +129,39 @@ pub static LINEBUF_VCOL: crate::globals::GlobalCell<Vec<crate::pos_defs::ColnrT>
 pub static LINEBUF_SCRATCH: crate::globals::GlobalCell<Vec<u8>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+static GRID_LINE_FIRST: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(i32::MAX);
+static GRID_LINE_LAST: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static GRID_LINE_CLEAR_TO: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static GRID_LINE_BG_ATTR: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+static GRID_LINE_CLEAR_ATTR: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Marks the remainder of the buffered grid line for clearing
+/// (`grid_line_clear_end`).
+///
+/// `bg_attr` applies to both buffered cells and cleared columns;
+/// `clear_attr` only to the columns being cleared.
+pub fn grid_line_clear_end(
+    start_col: i32,
+    end_col: i32,
+    bg_attr: i32,
+    clear_attr: i32,
+) {
+    unsafe {
+        if *GRID_LINE_FIRST.get_mut() > start_col {
+            *GRID_LINE_FIRST.get_mut() = start_col;
+            *GRID_LINE_LAST.get_mut() = start_col;
+        }
+        *GRID_LINE_CLEAR_TO.get_mut() = end_col;
+        *GRID_LINE_BG_ATTR.get_mut() = bg_attr;
+        *GRID_LINE_CLEAR_ATTR.get_mut() = clear_attr;
+    }
+}
+
 /// Whether the cell at `col` differs from what the grid already shows
 /// (`grid_char_needs_redraw`).
 ///
@@ -639,6 +672,65 @@ pub unsafe fn grid_getchar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct GridLineStateGuard([i32; 5]);
+
+    impl GridLineStateGuard {
+        fn install(first: i32, last: i32) -> Self {
+            let saved = unsafe {
+                [
+                    *GRID_LINE_FIRST.get_mut(),
+                    *GRID_LINE_LAST.get_mut(),
+                    *GRID_LINE_CLEAR_TO.get_mut(),
+                    *GRID_LINE_BG_ATTR.get_mut(),
+                    *GRID_LINE_CLEAR_ATTR.get_mut(),
+                ]
+            };
+            unsafe {
+                *GRID_LINE_FIRST.get_mut() = first;
+                *GRID_LINE_LAST.get_mut() = last;
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for GridLineStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *GRID_LINE_FIRST.get_mut() = self.0[0];
+                *GRID_LINE_LAST.get_mut() = self.0[1];
+                *GRID_LINE_CLEAR_TO.get_mut() = self.0[2];
+                *GRID_LINE_BG_ATTR.get_mut() = self.0[3];
+                *GRID_LINE_CLEAR_ATTR.get_mut() = self.0[4];
+            }
+        }
+    }
+
+    #[test]
+    fn grid_line_clear_end_starts_a_new_range_before_existing_output() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GridLineStateGuard::install(20, 30);
+
+        grid_line_clear_end(10, 40, 7, 9);
+
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 10);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 10);
+        assert_eq!(unsafe { *GRID_LINE_CLEAR_TO.get_mut() }, 40);
+        assert_eq!(unsafe { *GRID_LINE_BG_ATTR.get_mut() }, 7);
+        assert_eq!(unsafe { *GRID_LINE_CLEAR_ATTR.get_mut() }, 9);
+    }
+
+    #[test]
+    fn grid_line_clear_end_keeps_an_earlier_buffered_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GridLineStateGuard::install(5, 12);
+
+        grid_line_clear_end(10, 40, 7, 9);
+
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 5);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 12);
+        assert_eq!(unsafe { *GRID_LINE_CLEAR_TO.get_mut() }, 40);
+    }
 
     // --- grid_char_needs_redraw ---
 
