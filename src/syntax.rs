@@ -43,6 +43,17 @@ static CURRENT_SEQNR: crate::globals::GlobalCell<i32> = crate::globals::GlobalCe
 /// the current position.
 static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
+/// `current_state` - the stack of syntax items in force at the current
+/// position, innermost last.
+///
+/// The original is a `garray_T` whose `ga_itemsize` doubles as a
+/// validity sentinel for `invalidate_current_state`. A `Vec` has no
+/// counterpart for that, so the flag will be added explicitly once the
+/// functions that read it are translated and its uses are visible; for
+/// now this is just the stack itself.
+static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
+    crate::globals::GlobalCell::new(Vec::new());
+
 /// The syntax flags and sequence number at the current position
 /// (`get_syntax_info`).
 ///
@@ -67,6 +78,24 @@ pub unsafe fn get_syntax_info() -> (i32, i32) {
 pub unsafe fn syn_get_sub_char() -> i32 {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *CURRENT_SUB_CHAR.get_mut() }
+}
+
+/// The fold level implied by the current syntax state
+/// (`syn_cur_foldlevel`).
+///
+/// One level is contributed by each item on the state stack that was
+/// defined with `fold`, so nested folded regions nest their levels.
+///
+/// # Safety
+/// Reads the `CURRENT_STATE` file-static.
+#[must_use]
+pub unsafe fn syn_cur_foldlevel() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { &*CURRENT_STATE.get_mut() };
+    state
+        .iter()
+        .filter(|si| si.si_flags & hl_flags::FOLD != 0)
+        .count() as i32
 }
 
 /// The text of the current line in the syntax buffer
@@ -838,6 +867,69 @@ pub struct SynpatT {
     pub sp_time: crate::buffer_defs::SynTimeT,
 }
 
+/// The value of [`StateItemT::si_idx`] for keywords (`KEYWORD_IDX`).
+///
+/// Every other value indexes the syntax-pattern array, so callers
+/// distinguish the two with a plain sign test rather than a
+/// comparison against this constant.
+pub const KEYWORD_IDX: i32 = -1;
+
+/// One entry of the current syntax state stack (`stateitem_T`).
+///
+/// For the current state more than just the pattern index has to be
+/// remembered. When `si_m_endpos.lnum` is 0 every field other than
+/// `si_idx` is unknown; the end positions hold the column of the
+/// character *after* the match.
+///
+/// As with [`SynpatT`], the two owned group-ID lists become `Vec<i16>`
+/// instead of the original's zero-terminated `int16_t *`, while
+/// `si_extmatch` stays a raw pointer because `reg_extmatch_T` is still
+/// opaque - the same split [`SynpatT::sp_prog`] makes.
+#[derive(Debug, Default)]
+pub struct StateItemT {
+    /// index of the syntax pattern, or [`KEYWORD_IDX`] (`si_idx`).
+    pub si_idx: i32,
+    /// highlight group ID for keywords (`si_id`).
+    pub si_id: i32,
+    /// same as `si_id`, with transparency removed (`si_trans_id`).
+    pub si_trans_id: i32,
+    /// line number of the match (`si_m_lnum`).
+    pub si_m_lnum: i32,
+    /// starting column of the match (`si_m_startcol`).
+    pub si_m_startcol: i32,
+    /// just after the end position of the match (`si_m_endpos`).
+    pub si_m_endpos: LposT,
+    /// start position of the highlighting (`si_h_startpos`).
+    pub si_h_startpos: LposT,
+    /// end position of the highlighting (`si_h_endpos`).
+    pub si_h_endpos: LposT,
+    /// end position of the end pattern (`si_eoe_pos`).
+    pub si_eoe_pos: LposT,
+    /// group ID for the end pattern, or zero (`si_end_idx`).
+    pub si_end_idx: i32,
+    /// whether the match ends before `si_m_endpos` (`si_ends`).
+    ///
+    /// An `int` in the original, but only ever assigned `true`/`false`
+    /// and tested as a condition, so it is a `bool` here - as
+    /// [`SynpatT::sp_syncing`] already is.
+    pub si_ends: bool,
+    /// attributes in this state (`si_attr`).
+    pub si_attr: i32,
+    /// `HL_HAS_EOL` for this state, plus `HL_SKIP*` for `si_next_list`
+    /// (`si_flags`). See [`hl_flags`].
+    pub si_flags: i32,
+    /// sequence number (`si_seqnr`).
+    pub si_seqnr: i32,
+    /// substitution character for conceal (`si_cchar`).
+    pub si_cchar: i32,
+    /// list of contained groups (`si_cont_list`).
+    pub si_cont_list: Vec<i16>,
+    /// `nextgroup` IDs to use after this item ends (`si_next_list`).
+    pub si_next_list: Vec<i16>,
+    /// `\z(...\)` matches from the start pattern (`si_extmatch`).
+    pub si_extmatch: *mut crate::types_defs::RegExtmatchT,
+}
+
 /// Whether any syntax items are defined for the syntax block `block`
 /// (`syntax_present`).
 ///
@@ -1037,6 +1129,44 @@ mod tests {
         }
     }
 
+    /// Restores the syntax state stack on drop.
+    ///
+    /// Separate from [`CurrentStateGuard`] because the stack is a
+    /// `Vec` rather than a `Copy` scalar, so it has to be moved out on
+    /// save and moved back on drop.
+    struct CurrentStackGuard {
+        saved: Vec<StateItemT>,
+    }
+
+    impl CurrentStackGuard {
+        fn install(stack: Vec<StateItemT>) -> Self {
+            // SAFETY: the global state test lock is held by the caller.
+            let slot = unsafe { &mut *CURRENT_STATE.get_mut() };
+            Self {
+                saved: std::mem::replace(slot, stack),
+            }
+        }
+    }
+
+    impl Drop for CurrentStackGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `install`.
+            let slot = unsafe { &mut *CURRENT_STATE.get_mut() };
+            *slot = std::mem::take(&mut self.saved);
+        }
+    }
+
+    /// Builds a state stack whose items carry exactly `flags`.
+    fn stack_with_flags(flags: &[i32]) -> Vec<StateItemT> {
+        flags
+            .iter()
+            .map(|&si_flags| StateItemT {
+                si_flags,
+                ..Default::default()
+            })
+            .collect()
+    }
+
     /// The flags come back as the return value and the sequence number
     /// as the second tuple element, matching the original's
     /// return-plus-out-parameter split.
@@ -1067,6 +1197,51 @@ mod tests {
 
         unsafe { *CURRENT_SUB_CHAR.get_mut() = i32::from(b'x') };
         assert_eq!(unsafe { syn_get_sub_char() }, i32::from(b'x'));
+    }
+
+    // ---- syn_cur_foldlevel ----
+
+    #[test]
+    fn syn_cur_foldlevel_is_zero_without_any_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        assert_eq!(unsafe { syn_cur_foldlevel() }, 0);
+    }
+
+    /// Only items carrying `HL_FOLD` count, so a deep stack of
+    /// non-folding items is still level zero.
+    #[test]
+    fn syn_cur_foldlevel_ignores_items_without_the_fold_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(stack_with_flags(&[
+            hl_flags::CONTAINED,
+            hl_flags::TRANSP,
+            hl_flags::CONCEAL,
+        ]));
+
+        assert_eq!(unsafe { syn_cur_foldlevel() }, 0, "no item folds");
+    }
+
+    /// Every folding item on the stack adds one level, so the result
+    /// is the number of folding items - not the stack depth, and not
+    /// merely whether one was found.
+    #[test]
+    fn syn_cur_foldlevel_counts_each_folding_item() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(stack_with_flags(&[
+            hl_flags::FOLD,
+            hl_flags::CONTAINED,
+            hl_flags::FOLD | hl_flags::TRANSP,
+            hl_flags::CONCEAL,
+            hl_flags::FOLD,
+        ]));
+
+        assert_eq!(
+            unsafe { syn_cur_foldlevel() },
+            3,
+            "3 of the 5 items fold, and FOLD combines with other flags"
+        );
     }
 
     // ---- idl cache ----

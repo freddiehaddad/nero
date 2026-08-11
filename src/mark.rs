@@ -3611,6 +3611,34 @@ mod tests {
         crate::globals::global_state_test_lock()
     }
 
+    /// An eval list that is freed on drop, including when a test
+    /// unwinds part-way through its assertions.
+    ///
+    /// Freeing at the end of the test body instead leaks the list into
+    /// the eval GC list whenever an assertion fails, and because that
+    /// list is a global the leak then breaks unrelated
+    /// `eval::typval` tests that assert it starts out empty - a
+    /// failure that shows up far away from its cause.
+    struct TestList(*mut crate::eval::typval_defs::ListT);
+
+    impl TestList {
+        fn alloc() -> Self {
+            Self(crate::eval::typval::tv_list_alloc(0))
+        }
+
+        fn get(&self) -> *mut crate::eval::typval_defs::ListT {
+            self.0
+        }
+    }
+
+    impl Drop for TestList {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `tv_list_alloc` and nothing
+            // else frees it - `get` only hands out a borrowed copy.
+            unsafe { crate::eval::typval::tv_list_free(self.0) };
+        }
+    }
+
     /// RAII guard restoring `GLOBALS.curbuf` on drop (including on test
     /// panic via unwinding), so a failed assertion never leaves a
     /// dangling pointer behind for a later test to observe. Holds
@@ -5229,7 +5257,7 @@ mod tests {
 
     #[test]
     fn get_buf_local_marks_includes_only_marks_with_positive_lnum() {
-        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval::tv_dict_find;
         use crate::eval::typval_defs::TypvalValue;
 
         let mut buf = BufT { handle: 5, ..Default::default() };
@@ -5243,7 +5271,8 @@ mod tests {
         let mut win = crate::buffer_defs::WinT::default();
         let _guard = MarkTestGuard::set(&mut win as *mut WinT, &mut buf as *mut BufT);
 
-        let l = tv_list_alloc(0);
+        let list = TestList::alloc();
+        let l = list.get();
         unsafe { get_buf_local_marks(&buf, l) };
 
         unsafe {
@@ -5264,8 +5293,6 @@ mod tests {
             };
             let mark2 = tv_dict_find(Some(&mut *d2), b"mark").unwrap();
             assert!(matches!(&(*mark2).di_tv.value, TypvalValue::String(Some(s)) if s == b"'["));
-
-            tv_list_free(l);
         }
     }
 
@@ -5282,7 +5309,7 @@ mod tests {
 
     #[test]
     fn get_global_marks_includes_resolved_fname_and_skips_nonzero_fnum() {
-        use crate::eval::typval::{tv_dict_find, tv_list_alloc, tv_list_free};
+        use crate::eval::typval::tv_dict_find;
         use crate::eval::typval_defs::TypvalValue;
 
         let _lock = globals_test_lock();
@@ -5299,7 +5326,8 @@ mod tests {
         namedfm[1].fmark.mark = PosT { lnum: 8, col: 0, coladd: 0 };
         namedfm[1].fmark.fnum = 3;
 
-        let l = tv_list_alloc(0);
+        let list = TestList::alloc();
+        let l = list.get();
         unsafe { get_global_marks(l) };
 
         unsafe {
@@ -5315,8 +5343,6 @@ mod tests {
             assert!(
                 matches!(&(*file_item).di_tv.value, TypvalValue::String(Some(s)) if s == b"/tmp/a")
             );
-
-            tv_list_free(l);
         }
     }
 
