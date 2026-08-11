@@ -225,6 +225,20 @@ pub unsafe fn ui_grid_cursor_goto(
     }
 }
 
+/// Moves the cursor on the default grid (`ui_cursor_goto`).
+///
+/// # Safety
+/// Same as [`ui_grid_cursor_goto`].
+pub unsafe fn ui_cursor_goto(new_row: i32, new_col: i32) {
+    unsafe {
+        ui_grid_cursor_goto(
+            crate::grid::DEFAULT_GRID_HANDLE,
+            new_row,
+            new_col,
+        );
+    }
+}
+
 /// Update the cursor shape if the mode changed
 /// (`ui_cursor_shape_no_check_conceal`).
 ///
@@ -486,6 +500,29 @@ mod tests {
         }
         assert_eq!((row, col), (4, 9));
         assert!(pending);
+    }
+
+    #[test]
+    fn ui_cursor_goto_targets_the_default_grid() {
+        let _lock = crate::globals::global_state_test_lock();
+        unsafe {
+            *CURSOR_GRID_HANDLE.get_mut() = 99;
+            *CURSOR_ROW.get_mut() = 0;
+            *CURSOR_COL.get_mut() = 0;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+            ui_cursor_goto(5, 7);
+        }
+
+        assert_eq!(unsafe { *CURSOR_GRID_HANDLE.get_mut() }, crate::grid::DEFAULT_GRID_HANDLE);
+        assert_eq!((unsafe { ui_current_row() }, unsafe { ui_current_col() }), (5, 7));
+        assert!(unsafe { *PENDING_CURSOR_UPDATE.get_mut() });
+
+        unsafe {
+            *CURSOR_GRID_HANDLE.get_mut() = crate::grid::DEFAULT_GRID_HANDLE;
+            *CURSOR_ROW.get_mut() = 0;
+            *CURSOR_COL.get_mut() = 0;
+            *PENDING_CURSOR_UPDATE.get_mut() = false;
+        }
     }
 
     #[test]
