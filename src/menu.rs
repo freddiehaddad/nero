@@ -48,8 +48,8 @@
 //! dependency at all, needing only already-real
 //! `crate::menu_defs::menu_mode` and `crate::input_defs::RemapValues`.
 //!
-//! Deferred: everything else - the whole menu tree (`root_menu`/
-//! `get_root_menu`), `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
+//! Deferred: everything else - the whole menu tree beyond its
+//! [`get_root_menu`] storage accessor, `ex_menu`/`execute_menu`/`show_menus*`/`menu_get`/
 //! `menu_find`/`menu_text`/`menuitem_getinfo`, all needing the menu
 //! tree/editor-command execution machinery and menu translation/remap
 //! state.
@@ -342,6 +342,21 @@ pub fn get_menu_mode_str(modes: i32) -> &'static str {
 /// by `window.rs`'s `FRAME_LOCKED`.
 static MENUS_LOCKED: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
+/// Head of the top-level menu list (`root_menu`).
+static ROOT_MENU: crate::globals::GlobalCell<*mut VimMenu> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+
+/// Address of the top-level menu-list pointer (`get_root_menu`).
+///
+/// The menu name is intentionally ignored in the original: all menu
+/// paths share the same root list. Returning a raw pointer to the
+/// pointer preserves callers' ability to replace the list head without
+/// handing out a long-lived mutable reference into global storage.
+#[must_use]
+pub fn get_root_menu(_name: &[u8]) -> *mut *mut VimMenu {
+    ROOT_MENU.as_ptr()
+}
+
 /// Whether menu changes are currently locked (`is_menus_locked`). The
 /// original's own `emsg` call when locked is omitted, matching this
 /// crate's established "skip the deferred message-display side
@@ -391,6 +406,44 @@ pub fn menu_unescape_name(name: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RootMenuGuard(*mut VimMenu);
+
+    impl RootMenuGuard {
+        fn save() -> Self {
+            Self(unsafe { *ROOT_MENU.get_mut() })
+        }
+    }
+
+    impl Drop for RootMenuGuard {
+        fn drop(&mut self) {
+            unsafe { *ROOT_MENU.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn get_root_menu_returns_the_same_storage_for_every_path() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RootMenuGuard::save();
+        unsafe { *ROOT_MENU.get_mut() = std::ptr::null_mut() };
+
+        let file = get_root_menu(b"File.New");
+        let edit = get_root_menu(b"Edit.Undo");
+        assert_eq!(file, edit);
+        assert!(unsafe { *file }.is_null());
+    }
+
+    #[test]
+    fn get_root_menu_allows_replacing_the_root_head() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut menu = Box::new(VimMenu::default());
+        let menu_ptr = std::ptr::addr_of_mut!(*menu);
+        let _g = RootMenuGuard::save();
+
+        unsafe { *get_root_menu(b"anything") = menu_ptr };
+
+        assert_eq!(unsafe { *get_root_menu(b"") }, menu_ptr);
+    }
 
     // --- menu_unescape_name ---
 
