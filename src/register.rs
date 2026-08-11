@@ -233,6 +233,16 @@ pub unsafe fn op_reg_set_previous(name: i32) -> bool {
     true
 }
 
+/// Releases the owned contents of yank register `reg`
+/// (`free_register`).
+///
+/// `YankregT`'s `Option<Vec<Vec<u8>>>` owns both the line array and
+/// every line, so the original's nested frees collapse into assigning
+/// `None`. Metadata is deliberately retained, as in the original.
+pub fn free_register(reg: &mut YankregT) {
+    reg.y_array = None;
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -768,6 +778,42 @@ mod tests {
 
         assert!(!unsafe { op_reg_set_previous(i32::from(b'!')) });
         assert_eq!(unsafe { get_y_previous() }, before);
+    }
+
+    #[test]
+    fn free_register_releases_all_owned_lines() {
+        let mut reg = YankregT {
+            y_array: Some(vec![b"one".to_vec(), b"two".to_vec()]),
+            ..Default::default()
+        };
+
+        free_register(&mut reg);
+
+        assert!(reg.y_array.is_none());
+    }
+
+    #[test]
+    fn free_register_preserves_register_metadata() {
+        let mut reg = YankregT {
+            y_array: Some(vec![b"text".to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            y_width: 7,
+            timestamp: 123,
+        };
+
+        free_register(&mut reg);
+
+        assert_eq!(reg.y_type, crate::normal_defs::MotionType::BlockWise);
+        assert_eq!(reg.y_width, 7);
+        assert_eq!(reg.timestamp, 123);
+    }
+
+    #[test]
+    fn free_register_is_idempotent_for_an_empty_register() {
+        let mut reg = YankregT::default();
+        free_register(&mut reg);
+        free_register(&mut reg);
+        assert!(reg.y_array.is_none());
     }
 
     #[test]
