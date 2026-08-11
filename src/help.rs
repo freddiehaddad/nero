@@ -90,9 +90,140 @@ pub fn help_heuristic(matched_string: &[u8], mut offset: i32, wrong_case: bool) 
     100 * num_letters + matched_string.len() as i32 + offset
 }
 
+/// Strips redundant `"@xx"` language suffixes from help tag matches
+/// (`cleanup_help_tags`).
+///
+/// Two suffixes are removed. A tag ending in `"@en"` loses it when no
+/// other match is the same tag in a different language, since English
+/// is then the only option. Separately, the language at the head of
+/// `'helplang'` is stripped, because that is the language the user
+/// already asked for - unless it is English, which the first rule
+/// covers.
+///
+/// The original truncates each name in place by writing a NUL over
+/// the `'@'`; the names are owned `Vec`s here, so they are truncated
+/// instead. `num_file` is dropped, since the slice carries its own
+/// length.
+pub fn cleanup_help_tags(file: &mut [Vec<u8>], helplang: Option<&[u8]>) {
+    // The preferred language's suffix, e.g. b"@de". English is left
+    // out: the "@en" pass below already handles it, and stripping it
+    // here would hide a tag that only exists in English.
+    let preferred: Option<[u8; 3]> = match helplang {
+        Some(hlg) if hlg.len() >= 2 && !(hlg[0] == b'e' && hlg[1] == b'n') => {
+            Some([b'@', hlg[0], hlg[1]])
+        }
+        _ => None,
+    };
+
+    for i in 0..file.len() {
+        let Some(len) = file[i].len().checked_sub(3).filter(|&l| l > 0) else {
+            continue;
+        };
+        if &file[i][len..] != b"@en" {
+            continue;
+        }
+        // Sorting is by priority, so the same tag in another language
+        // can be anywhere; every entry has to be checked.
+        let has_other_language = (0..file.len()).any(|j| {
+            j != i && file[j].len() == len + 3 && file[j][..=len] == file[i][..=len]
+        });
+        if !has_other_language {
+            file[i].truncate(len);
+        }
+    }
+
+    let Some(preferred) = preferred else {
+        return;
+    };
+    for name in file.iter_mut() {
+        let Some(len) = name.len().checked_sub(3).filter(|&l| l > 0) else {
+            continue;
+        };
+        if name[len..] == preferred {
+            name.truncate(len);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- cleanup_help_tags ----
+
+    fn tags(v: &[&[u8]]) -> Vec<Vec<u8>> {
+        v.iter().map(|s| s.to_vec()).collect()
+    }
+
+    /// A tag that only exists in English loses its "@en": there is no
+    /// other language to disambiguate it from.
+    #[test]
+    fn cleanup_help_tags_strips_a_lone_en_suffix() {
+        let mut file = tags(&[b"gets@en"]);
+        cleanup_help_tags(&mut file, None);
+        assert_eq!(file, tags(&[b"gets"]));
+    }
+
+    /// But when the same tag also exists in another language the
+    /// "@en" has to stay, otherwise the two become indistinguishable.
+    #[test]
+    fn cleanup_help_tags_keeps_en_when_another_language_has_the_tag() {
+        let mut file = tags(&[b"gets@en", b"gets@de"]);
+        cleanup_help_tags(&mut file, None);
+        assert_eq!(file, tags(&[b"gets@en", b"gets@de"]), "both must survive");
+    }
+
+    /// Matches are ordered by priority, not grouped by tag, so the
+    /// other-language entry may sit anywhere in the list.
+    #[test]
+    fn cleanup_help_tags_searches_the_whole_list_for_another_language() {
+        let mut file = tags(&[b"gets@en", b"other", b"unrelated@de", b"gets@de"]);
+        cleanup_help_tags(&mut file, None);
+        assert_eq!(file[0], b"gets@en".to_vec(), "the @de entry is last but still found");
+    }
+
+    /// A same-length entry that differs before the "@" is a different
+    /// tag, so it must not count as a translation.
+    #[test]
+    fn cleanup_help_tags_does_not_match_a_different_tag_of_the_same_length() {
+        let mut file = tags(&[b"gets@en", b"gots@de"]);
+        cleanup_help_tags(&mut file, None);
+        assert_eq!(file[0], b"gets".to_vec(), "gots is a different tag");
+    }
+
+    /// The language the user asked for is redundant on the tag name.
+    #[test]
+    fn cleanup_help_tags_strips_the_preferred_language() {
+        let mut file = tags(&[b"gets@de", b"other@fr"]);
+        cleanup_help_tags(&mut file, Some(b"de"));
+        assert_eq!(file, tags(&[b"gets", b"other@fr"]), "only the preferred one goes");
+    }
+
+    /// 'helplang' of "en" adds nothing: the "@en" rule already covers
+    /// English, and stripping it here would hide an English-only tag
+    /// that has a translation.
+    #[test]
+    fn cleanup_help_tags_treats_helplang_en_as_no_preference() {
+        let mut file = tags(&[b"gets@en", b"gets@de"]);
+        cleanup_help_tags(&mut file, Some(b"en"));
+        assert_eq!(file, tags(&[b"gets@en", b"gets@de"]));
+    }
+
+    /// Only the first entry of 'helplang' is used, and names too short
+    /// to carry a suffix are left alone.
+    #[test]
+    fn cleanup_help_tags_uses_only_the_first_helplang_entry() {
+        let mut file = tags(&[b"gets@de", b"gets2@fr", b"ab"]);
+        cleanup_help_tags(&mut file, Some(b"de,fr"));
+        assert_eq!(file, tags(&[b"gets", b"gets2@fr", b"ab"]));
+    }
+
+    #[test]
+    fn cleanup_help_tags_handles_an_empty_list() {
+        let mut file: Vec<Vec<u8>> = Vec::new();
+        cleanup_help_tags(&mut file, Some(b"de"));
+        assert!(file.is_empty());
+    }
 
     #[test]
     fn check_help_lang_finds_a_language_suffix() {
