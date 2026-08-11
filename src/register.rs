@@ -270,6 +270,42 @@ pub unsafe fn update_yankreg_width(reg: &mut YankregT) {
     reg.y_width = reg.y_width.max(measured);
 }
 
+/// Shifts numbered delete registers `"1` through `"9`
+/// (`shift_delete_registers`).
+///
+/// Register `"9` is discarded, `"8` becomes `"9`, and so on. The
+/// new `"1` is empty. The C implementation shallow-copies each owned
+/// pointer then nulls only `"1`'s array; moving each Rust value avoids
+/// duplicate ownership while explicitly preserving `"1`'s metadata.
+///
+/// When `y_append` is false, the unnamed register is redirected to
+/// the newly emptied `"1`.
+///
+/// # Safety
+/// Mutates the `Y_REGS` and `Y_PREVIOUS` file-statics.
+pub unsafe fn shift_delete_registers(y_append: bool) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let regs = unsafe { Y_REGS.get_mut() };
+    let retained_type = regs[1].y_type;
+    let retained_width = regs[1].y_width;
+    let retained_timestamp = regs[1].timestamp;
+
+    free_register(&mut regs[9]);
+    for n in (2..=9).rev() {
+        regs[n] = std::mem::take(&mut regs[n - 1]);
+    }
+    regs[1] = YankregT {
+        y_array: None,
+        y_type: retained_type,
+        y_width: retained_width,
+        timestamp: retained_timestamp,
+    };
+
+    if !y_append {
+        unsafe { *Y_PREVIOUS.get_mut() = Some(1) };
+    }
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -784,6 +820,32 @@ mod tests {
         }
     }
 
+    struct RegisterStateGuard {
+        regs: Option<[YankregT; NUM_REGISTERS]>,
+        previous: Option<usize>,
+    }
+
+    impl RegisterStateGuard {
+        fn save() -> Self {
+            // SAFETY: the caller holds the global-state test lock.
+            Self {
+                regs: Some(unsafe { Y_REGS.get_mut() }.clone()),
+                previous: unsafe { *Y_PREVIOUS.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for RegisterStateGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `save`; moving the saved array restores all
+            // owned register lines without cloning them again.
+            unsafe {
+                *Y_REGS.get_mut() = self.regs.take().expect("saved register state");
+                *Y_PREVIOUS.get_mut() = self.previous;
+            }
+        }
+    }
+
     #[test]
     fn op_reg_set_previous_selects_the_named_register() {
         let _lock = crate::globals::global_state_test_lock();
@@ -899,6 +961,43 @@ mod tests {
         unsafe { update_yankreg_width(&mut reg) };
 
         assert_eq!(reg.y_width, 2, "a double-width glyph plus ASCII occupies 3 cells");
+    }
+
+    #[test]
+    fn shift_delete_registers_moves_one_through_eight_up_and_clears_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        let regs = unsafe { Y_REGS.get_mut() };
+        for (n, reg) in regs.iter_mut().enumerate().take(10).skip(1) {
+            *reg = YankregT {
+                y_array: Some(vec![format!("r{n}").into_bytes()]),
+                y_type: crate::normal_defs::MotionType::LineWise,
+                y_width: n as i32,
+                timestamp: 100 + n as u64,
+            };
+        }
+
+        unsafe { shift_delete_registers(false) };
+
+        let regs = unsafe { Y_REGS.get_mut() };
+        assert!(regs[1].y_array.is_none());
+        assert_eq!(regs[1].y_type, crate::normal_defs::MotionType::LineWise);
+        assert_eq!(regs[1].y_width, 1, "the C code retains register 1 metadata");
+        assert_eq!(regs[1].timestamp, 101);
+        assert_eq!(regs[2].y_array.as_deref(), Some(&[b"r1".to_vec()][..]));
+        assert_eq!(regs[9].y_array.as_deref(), Some(&[b"r8".to_vec()][..]));
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(1));
+    }
+
+    #[test]
+    fn shift_delete_registers_keeps_previous_when_appending() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        assert!(unsafe { op_reg_set_previous(i32::from(b'5')) });
+
+        unsafe { shift_delete_registers(true) };
+
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(5));
     }
 
     #[test]
