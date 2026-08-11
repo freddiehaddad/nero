@@ -161,6 +161,19 @@ static TERMRESPONSE_CHANGED: GlobalCell<bool> = GlobalCell::new(false);
 /// response, paired with [`TERMRESPONSE_CHANGED`].
 static TERMRESPONSE_CHAN_ID: GlobalCell<u64> = GlobalCell::new(0);
 
+/// Returns the autocommand vector for `event`
+/// (`au_get_autocmds_for_event`).
+///
+/// A raw pointer mirrors the original and avoids manufacturing a
+/// long-lived mutable reference into the global array.
+#[must_use]
+pub fn au_get_autocmds_for_event(event: EventT) -> *mut AutoCmdVec {
+    let base = AUTOCMDS.as_ptr().cast::<AutoCmdVec>();
+    // SAFETY: EventT discriminants are the dense 0..NUM_EVENTS indices
+    // used to build this fixed-size array.
+    unsafe { base.add(event as usize) }
+}
+
 /// Return `true` if `event` autocommand is defined (`has_event`).
 #[must_use]
 pub fn has_event(event: EventT) -> bool {
@@ -694,6 +707,23 @@ mod tests {
         assert!(!has_event(EventT::BufEnter));
         assert!(!has_event(EventT::VimEnter));
         assert!(!has_event(EventT::WinScrolled));
+    }
+
+    #[test]
+    fn au_get_autocmds_for_event_returns_a_stable_event_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let first = au_get_autocmds_for_event(EventT::BufEnter);
+        let second = au_get_autocmds_for_event(EventT::BufEnter);
+        assert_eq!(first, second);
+        assert!(unsafe { &*first }.is_empty());
+    }
+
+    #[test]
+    fn au_get_autocmds_for_event_keeps_events_in_distinct_vectors() {
+        let _lock = crate::globals::global_state_test_lock();
+        let buf_enter = au_get_autocmds_for_event(EventT::BufEnter);
+        let vim_enter = au_get_autocmds_for_event(EventT::VimEnter);
+        assert_ne!(buf_enter, vim_enter);
     }
 
     #[test]
@@ -1464,6 +1494,4 @@ mod tests {
         reset_ft_recursive();
     }
 }
-
-
 
