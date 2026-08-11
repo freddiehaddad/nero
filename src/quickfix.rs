@@ -626,6 +626,25 @@ pub fn qf_list_empty(qfl: Option<&QfListT>) -> bool {
     qfl.is_none_or(|qfl| qfl.qf_count() <= 0)
 }
 
+/// Value used for the `"idx"` quickfix-list property
+/// (`qf_getprop_idx`).
+///
+/// The original immediately writes this number to a dictionary; the
+/// value selection is returned directly here. A nonzero requested
+/// index wins. Otherwise the current index is used, except an empty
+/// list always reports zero.
+#[must_use]
+pub fn qf_getprop_idx(qfl: &QfListT, eidx: i32) -> i32 {
+    if eidx != 0 {
+        return eidx;
+    }
+    if qf_list_empty(Some(qfl)) {
+        0
+    } else {
+        qfl.qf_index
+    }
+}
+
 /// Returns whether the list is non-empty AND has valid entries
 /// (`qf_list_has_valid_entries`).
 #[must_use]
@@ -3453,6 +3472,33 @@ mod tests {
     fn qf_list_empty_follows_the_entry_count() {
         assert!(qf_list_empty(Some(&QfListT::default())));
         assert!(!qf_list_empty(Some(&list_with(1))));
+    }
+
+    #[test]
+    fn qf_getprop_idx_uses_an_explicit_requested_index() {
+        let qfl = QfListT {
+            qf_index: 3,
+            ..list_with(5)
+        };
+        assert_eq!(qf_getprop_idx(&qfl, 4), 4);
+    }
+
+    #[test]
+    fn qf_getprop_idx_defaults_to_the_current_index() {
+        let qfl = QfListT {
+            qf_index: 3,
+            ..list_with(5)
+        };
+        assert_eq!(qf_getprop_idx(&qfl, 0), 3);
+    }
+
+    #[test]
+    fn qf_getprop_idx_reports_zero_for_an_empty_list() {
+        let qfl = QfListT {
+            qf_index: 9,
+            ..Default::default()
+        };
+        assert_eq!(qf_getprop_idx(&qfl, 0), 0);
     }
 
     #[test]
