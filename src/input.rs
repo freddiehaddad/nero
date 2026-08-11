@@ -231,6 +231,23 @@ pub fn read_readbuffers(advance: bool) -> u8 {
     }
 }
 
+/// Concatenates every block in a buffer (`get_buffcont`).
+///
+/// `dozero` distinguishes the original's allocated empty string from
+/// its null result: `Some(Vec::new())` versus `None`.
+#[must_use]
+pub fn get_buffcont(buf: &BuffheaderT, dozero: bool) -> Option<Vec<u8>> {
+    let count: usize = buf.blocks.iter().map(|block| block.b_str.len()).sum();
+    if count == 0 && !dozero {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for block in &buf.blocks {
+        out.extend_from_slice(&block.b_str);
+    }
+    Some(out)
+}
+
 /// Fold a pending CTRL modifier into the character itself where an
 /// equivalent control code exists (`merge_modifiers`).
 ///
@@ -943,6 +960,45 @@ mod tests {
         }
         assert_eq!(read_readbuffers(false), b'x');
         assert_eq!(read_readbuffers(false), b'x');
+    }
+
+    #[test]
+    fn get_buffcont_concatenates_blocks_without_consuming_them() {
+        let buf = BuffheaderT {
+            blocks: vec![
+                BuffblockT {
+                    b_str: b"ab".to_vec(),
+                },
+                BuffblockT {
+                    b_str: b"cd".to_vec(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(get_buffcont(&buf, false), Some(b"abcd".to_vec()));
+        assert_eq!(buf.blocks.len(), 2);
+    }
+
+    #[test]
+    fn get_buffcont_distinguishes_null_from_allocated_empty() {
+        let buf = BuffheaderT::default();
+        assert_eq!(get_buffcont(&buf, false), None);
+        assert_eq!(get_buffcont(&buf, true), Some(Vec::new()));
+    }
+
+    #[test]
+    fn get_buffcont_preserves_escaped_special_key_bytes() {
+        let buf = BuffheaderT {
+            blocks: vec![BuffblockT {
+                b_str: vec![crate::keycodes_defs::K_SPECIAL, 0x12, 0x34],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            get_buffcont(&buf, false),
+            Some(vec![crate::keycodes_defs::K_SPECIAL, 0x12, 0x34])
+        );
     }
 
     // --- merge_modifiers ---
