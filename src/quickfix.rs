@@ -404,6 +404,34 @@ pub fn qf_parse_fmt_s(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%o` module-name match
+/// (`qf_parse_fmt_o`) by appending it to the existing module string.
+pub fn qf_parse_fmt_o(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    let existing_end = fields
+        .module
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(fields.module.len());
+    fields.module.truncate(existing_end);
+    let match_end = matched
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(matched.len());
+    let max_content = crate::os::os_defs::CMDBUFFSIZE - 1;
+    let available = max_content.saturating_sub(fields.module.len());
+    fields
+        .module
+        .extend_from_slice(&matched[..match_end.min(available)]);
+    fields.module.push(0);
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -2084,6 +2112,47 @@ mod tests {
         };
         assert_eq!(qf_parse_fmt_s(None, &mut fields), qf_status::QF_FAIL);
         assert_eq!(fields.pattern, b"keep\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_o_appends_to_the_existing_module_name() {
+        let mut fields = QffieldsT {
+            module: b"core\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            qf_parse_fmt_o(Some(b"::sub"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.module, b"core::sub\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_o_initializes_an_empty_module_buffer() {
+        let mut fields = QffieldsT::default();
+        qf_parse_fmt_o(Some(b"module"), &mut fields);
+        assert_eq!(fields.module, b"module\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_o_caps_the_combined_module_to_cmdbuffsize() {
+        let mut fields = QffieldsT {
+            module: vec![b'a'; crate::os::os_defs::CMDBUFFSIZE - 5],
+            ..Default::default()
+        };
+        qf_parse_fmt_o(Some(b"0123456789"), &mut fields);
+        assert_eq!(fields.module.len(), crate::os::os_defs::CMDBUFFSIZE);
+        assert_eq!(fields.module.last(), Some(&0));
+    }
+
+    #[test]
+    fn qf_parse_fmt_o_rejects_a_missing_match_without_changing_module() {
+        let mut fields = QffieldsT {
+            module: b"keep\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_o(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.module, b"keep\0");
     }
 
     #[test]
