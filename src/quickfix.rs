@@ -903,12 +903,19 @@ pub fn qf_free_items(qfl: &mut QfListT) {
 /// leaves alone.
 pub fn qf_free(qfl: &mut QfListT) {
     qf_free_items(qfl);
-
     qfl.qf_title = None;
     qfl.qf_ctx = None;
     qfl.qf_qftf_cb = crate::eval::typval_defs::Callback::default();
     qfl.qf_id = 0;
     qfl.qf_changedtick = 0;
+}
+
+/// Marks a quickfix/location list as changed (`qf_list_changed`).
+///
+/// Consumers use this monotonically increasing tick to notice an
+/// in-place update even when the list's identity stays the same.
+pub fn qf_list_changed(qfl: &mut QfListT) {
+    qfl.qf_changedtick += 1;
 }
 
 /// Find the stack index of the list with the given unique id
@@ -2817,6 +2824,29 @@ mod tests {
         qf_free(&mut qfl);
         assert_eq!(qfl.qf_count(), 0);
         assert!(qfl.qf_nonevalid);
+    }
+
+    #[test]
+    fn qf_list_changed_increments_the_tick_once() {
+        let mut qfl = QfListT {
+            qf_changedtick: 41,
+            ..Default::default()
+        };
+
+        qf_list_changed(&mut qfl);
+
+        assert_eq!(qfl.qf_changedtick, 42);
+    }
+
+    #[test]
+    fn qf_list_changed_accumulates_multiple_updates() {
+        let mut qfl = QfListT::default();
+
+        qf_list_changed(&mut qfl);
+        qf_list_changed(&mut qfl);
+        qf_list_changed(&mut qfl);
+
+        assert_eq!(qfl.qf_changedtick, 3);
     }
 
     #[test]
