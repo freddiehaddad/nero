@@ -262,6 +262,28 @@ pub fn script_is_lua(sid: ScidT) -> bool {
     !item.is_null() && unsafe { (*item).sn_lua }
 }
 
+/// Finds the newest loaded script whose name matches `name`
+/// (`find_script_by_name`), or `-1`.
+///
+/// # Safety
+/// Reads filename-comparison option state through
+/// [`crate::path::path_fnamecmp`].
+#[must_use]
+pub unsafe fn find_script_by_name(name: &[u8]) -> ScidT {
+    for sid in (1..=script_item_count()).rev() {
+        let item = script_item(sid);
+        if !item.is_null()
+            && unsafe { (*item).sn_name.as_deref() }
+                .is_some_and(|saved| unsafe {
+                    crate::path::path_fnamecmp(saved, name) == 0
+                })
+        {
+            return sid;
+        }
+    }
+    -1
+}
+
 /// If `name` has a package name (contains `AUTOLOAD_CHAR` after its
 /// first byte), try autoloading the script for it (`script_autoload`).
 ///
@@ -745,6 +767,18 @@ mod tests {
         assert!(!script_is_lua(0));
         assert!(!script_is_lua(-1));
         assert!(!script_is_lua(2));
+    }
+
+    #[test]
+    fn find_script_by_name_returns_the_newest_matching_sid() {
+        let _lock = global_state_test_lock();
+        tests_reset_for_test();
+        let (first, _) = new_script_item(Some(b"same.vim".to_vec()));
+        new_script_item(Some(b"other.vim".to_vec()));
+        let (newest, _) = new_script_item(Some(b"same.vim".to_vec()));
+        assert_ne!(first, newest);
+        assert_eq!(unsafe { find_script_by_name(b"same.vim") }, newest);
+        assert_eq!(unsafe { find_script_by_name(b"missing.vim") }, -1);
     }
 
     #[test]
