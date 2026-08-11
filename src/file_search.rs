@@ -180,6 +180,34 @@ pub struct FfStackT {
     pub ffs_star_star_empty: i32,
 }
 
+/// Builds a stack entry from the two halves of a search path
+/// (`ff_create_stack_element`).
+///
+/// Both halves are optional: the original substitutes an empty string
+/// for a null one, noting this saves null checks in `vim_findfile`.
+/// `None` gets the same treatment here.
+///
+/// The returned node is owned by the caller and must eventually be
+/// released with [`ff_free_stack_element`].
+#[must_use]
+pub fn ff_create_stack_element(
+    fix_part: Option<&[u8]>,
+    wc_part: Option<&[u8]>,
+    level: i32,
+    star_star_empty: i32,
+) -> *mut FfStackT {
+    Box::into_raw(Box::new(FfStackT {
+        ffs_prev: std::ptr::null_mut(),
+        ffs_fix_path: fix_part.unwrap_or(b"").to_vec(),
+        ffs_wc_path: wc_part.unwrap_or(b"").to_vec(),
+        ffs_filearray: Vec::new(),
+        ffs_filearray_cur: 0,
+        ffs_stage: 0,
+        ffs_level: level,
+        ffs_star_star_empty: star_star_empty,
+    }))
+}
+
 /// Pushes a directory onto the search stack (`ff_push`).
 ///
 /// The original threads the whole `ff_search_ctx_T` through, but only
@@ -241,6 +269,55 @@ pub unsafe fn ff_free_stack_element(stack_ptr: *mut FfStackT) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ff_create_stack_element ----
+
+    /// Both halves are stored as given, and every other field starts
+    /// cleared.
+    #[test]
+    fn ff_create_stack_element_stores_both_path_halves() {
+        let node = ff_create_stack_element(Some(b"/usr/share"), Some(b"**/doc"), 4, 1);
+        unsafe {
+            assert_eq!((*node).ffs_fix_path, b"/usr/share".to_vec());
+            assert_eq!((*node).ffs_wc_path, b"**/doc".to_vec());
+            assert_eq!((*node).ffs_level, 4);
+            assert_eq!((*node).ffs_star_star_empty, 1);
+            assert!((*node).ffs_prev.is_null());
+            assert!((*node).ffs_filearray.is_empty());
+            assert_eq!((*node).ffs_filearray_cur, 0);
+            assert_eq!((*node).ffs_stage, 0);
+            ff_free_stack_element(node);
+        }
+    }
+
+    /// A missing half becomes an empty string rather than staying
+    /// absent, which is what lets the search loop skip null checks.
+    #[test]
+    fn ff_create_stack_element_substitutes_empty_paths() {
+        let node = ff_create_stack_element(None, None, 0, 0);
+        unsafe {
+            assert!((*node).ffs_fix_path.is_empty());
+            assert!((*node).ffs_wc_path.is_empty());
+            ff_free_stack_element(node);
+        }
+    }
+
+    /// A fresh entry is not linked to anything, so it can be pushed
+    /// straight onto a stack.
+    #[test]
+    fn ff_create_stack_element_produces_a_pushable_entry() {
+        let mut head: *mut FfStackT = std::ptr::null_mut();
+        unsafe {
+            ff_push(&mut head, ff_create_stack_element(Some(b"a"), None, 1, 0));
+            ff_push(&mut head, ff_create_stack_element(Some(b"b"), None, 2, 0));
+
+            assert_eq!((*head).ffs_fix_path, b"b".to_vec());
+            ff_free_stack_element(ff_pop(&mut head));
+            assert_eq!((*head).ffs_fix_path, b"a".to_vec());
+            ff_free_stack_element(ff_pop(&mut head));
+        }
+        assert!(head.is_null());
+    }
 
     // ---- ff_push / ff_pop / ff_free_stack_element ----
 
