@@ -663,6 +663,23 @@ pub fn option_get_type(opt_idx: OptIndex) -> OptValType {
     get_option(opt_idx).r#type
 }
 
+/// Initializes tab-local `'cmdheight'` from its declared default
+/// (`set_init_tablocal`).
+///
+/// The option describes itself as global in the generated table but
+/// is actually tab-local, so it needs this explicit initialization.
+///
+/// # Safety
+/// Mutates `OPTION_VARS.p_ch`.
+pub unsafe fn set_init_tablocal() {
+    let crate::option_defs::OptVal::Number(default) =
+        &get_option(OptIndex::Cmdheight).def_val
+    else {
+        unreachable!("'cmdheight' must be a numeric option");
+    };
+    unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = *default;
+}
+
 /// Check if option supports a specific type (`option_has_type`).
 #[must_use]
 pub fn option_has_type(opt_idx: OptIndex, typ: OptValType) -> bool {
@@ -4601,6 +4618,38 @@ mod varp_tests {
         assert_eq!(
             option_get_type(OptIndex::Allowrevins),
             OptValType::Boolean
+        );
+    }
+
+    struct CmdheightGuard(crate::types_defs::OptInt);
+
+    impl CmdheightGuard {
+        fn save() -> Self {
+            Self(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch)
+        }
+    }
+
+    impl Drop for CmdheightGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = self.0;
+        }
+    }
+
+    #[test]
+    fn set_init_tablocal_restores_cmdheight_to_its_default() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CmdheightGuard::save();
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch = 99;
+
+        unsafe { set_init_tablocal() };
+
+        assert_eq!(
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_ch,
+            1
+        );
+        assert_eq!(
+            get_option(OptIndex::Cmdheight).def_val,
+            crate::option_defs::OptVal::Number(1)
         );
     }
 
