@@ -218,6 +218,19 @@ pub fn read_readbuf(buf: &mut BuffheaderT, advance: bool) -> u8 {
     c
 }
 
+/// Reads one byte from the two stuff buffers (`read_readbuffers`),
+/// preferring `READBUF1` and falling back to `READBUF2`.
+///
+/// `K_SPECIAL` remains escaped; no translation is performed.
+pub fn read_readbuffers(advance: bool) -> u8 {
+    let c = read_readbuf(unsafe { READBUF1.get_mut() }, advance);
+    if c == crate::ascii_defs::NUL {
+        read_readbuf(unsafe { READBUF2.get_mut() }, advance)
+    } else {
+        c
+    }
+}
+
 /// Fold a pending CTRL modifier into the character itself where an
 /// equivalent control code exists (`merge_modifiers`).
 ///
@@ -885,6 +898,51 @@ mod tests {
             read_readbuf(&mut BuffheaderT::default(), true),
             crate::ascii_defs::NUL
         );
+    }
+
+    #[test]
+    fn read_readbuffers_prefers_the_first_buffer() {
+        let _lock = global_state_test_lock();
+        let _g = OldCharGuard::new();
+        unsafe {
+            READBUF1.get_mut().blocks.push(BuffblockT {
+                b_str: b"a".to_vec(),
+            });
+            READBUF2.get_mut().blocks.push(BuffblockT {
+                b_str: b"b".to_vec(),
+            });
+        }
+
+        assert_eq!(read_readbuffers(true), b'a');
+        assert_eq!(unsafe { READBUF2.get_mut().bh_index }, 0);
+    }
+
+    #[test]
+    fn read_readbuffers_falls_back_to_the_second_buffer() {
+        let _lock = global_state_test_lock();
+        let _g = OldCharGuard::new();
+        unsafe {
+            READBUF2.get_mut().blocks.push(BuffblockT {
+                b_str: b"b".to_vec(),
+            });
+        }
+
+        assert_eq!(read_readbuffers(true), b'b');
+        assert!(unsafe { READBUF2.get_mut().blocks.is_empty() });
+    }
+
+    #[test]
+    fn read_readbuffers_peeks_and_reports_nul_when_both_are_empty() {
+        let _lock = global_state_test_lock();
+        let _g = OldCharGuard::new();
+        assert_eq!(read_readbuffers(true), crate::ascii_defs::NUL);
+        unsafe {
+            READBUF1.get_mut().blocks.push(BuffblockT {
+                b_str: b"x".to_vec(),
+            });
+        }
+        assert_eq!(read_readbuffers(false), b'x');
+        assert_eq!(read_readbuffers(false), b'x');
     }
 
     // --- merge_modifiers ---
