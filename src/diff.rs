@@ -458,6 +458,60 @@ pub fn parse_diff_ed(line: &[u8], hunk: &mut DiffhunkT) -> i32 {
     crate::vim_defs::OK
 }
 
+/// Parses a zero-context unified diff hunk header
+/// (`parse_diff_unified`).
+///
+/// The accepted core is `@@ -old[,count] +new[,count]`; the original
+/// does not require a trailing `@@`, so neither does this parser.
+pub fn parse_diff_unified(line: &[u8], hunk: &mut DiffhunkT) -> i32 {
+    if !line.starts_with(b"@@ -") {
+        return crate::vim_defs::FAIL;
+    }
+    let mut p = 4;
+    let (mut oldline, used) = crate::charset::getdigits_int32(&line[p..], true, 0);
+    p += used;
+    let oldcount = if line.get(p) == Some(&b',') {
+        p += 1;
+        let (value, used) = crate::charset::getdigits_int(&line[p..], true, 0);
+        p += used;
+        value
+    } else {
+        1
+    };
+
+    if line.get(p) != Some(&b' ') || line.get(p + 1) != Some(&b'+') {
+        return crate::vim_defs::FAIL;
+    }
+    p += 2;
+    let (mut newline, used) = crate::charset::getdigits_int(&line[p..], true, 0);
+    p += used;
+    let newcount = if line.get(p) == Some(&b',') {
+        p += 1;
+        let (value, _used) = crate::charset::getdigits_int(&line[p..], true, 0);
+        value
+    } else {
+        1
+    };
+
+    if oldcount == 0 {
+        oldline += 1;
+    }
+    if newcount == 0 {
+        newline += 1;
+    }
+    if newline == 0 {
+        newline = 1;
+    }
+
+    *hunk = DiffhunkT {
+        lnum_orig: oldline,
+        count_orig: oldcount,
+        lnum_new: newline,
+        count_new: newcount,
+    };
+    crate::vim_defs::OK
+}
+
 /// Copy one diff entry's line range from one buffer slot to another
 /// (`diff_copy_entry`).
 ///
@@ -1189,6 +1243,77 @@ mod tests {
         );
         assert_eq!((hunk.lnum_orig, hunk.count_orig), (3, 1));
         assert_eq!((hunk.lnum_new, hunk.count_new), (7, 1));
+    }
+
+    #[test]
+    fn parse_diff_unified_parses_explicit_counts() {
+        let mut hunk = DiffhunkT::default();
+
+        assert_eq!(
+            parse_diff_unified(b"@@ -3,4 +8,2 @@", &mut hunk),
+            crate::vim_defs::OK
+        );
+        assert_eq!(
+            hunk,
+            DiffhunkT {
+                lnum_orig: 3,
+                count_orig: 4,
+                lnum_new: 8,
+                count_new: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_diff_unified_defaults_omitted_counts_to_one() {
+        let mut hunk = DiffhunkT::default();
+        assert_eq!(
+            parse_diff_unified(b"@@ -3 +8", &mut hunk),
+            crate::vim_defs::OK
+        );
+        assert_eq!((hunk.lnum_orig, hunk.count_orig), (3, 1));
+        assert_eq!((hunk.lnum_new, hunk.count_new), (8, 1));
+    }
+
+    #[test]
+    fn parse_diff_unified_advances_zero_length_ranges() {
+        let mut hunk = DiffhunkT::default();
+        assert_eq!(
+            parse_diff_unified(b"@@ -3,0 +8,0 @@", &mut hunk),
+            crate::vim_defs::OK
+        );
+        assert_eq!((hunk.lnum_orig, hunk.count_orig), (4, 0));
+        assert_eq!((hunk.lnum_new, hunk.count_new), (9, 0));
+    }
+
+    #[test]
+    fn parse_diff_unified_normalizes_a_zero_new_line_to_one() {
+        let mut hunk = DiffhunkT::default();
+        assert_eq!(
+            parse_diff_unified(b"@@ -3 +0 @@", &mut hunk),
+            crate::vim_defs::OK
+        );
+        assert_eq!((hunk.lnum_new, hunk.count_new), (1, 1));
+    }
+
+    #[test]
+    fn parse_diff_unified_rejects_bad_prefixes_without_writing() {
+        let original = DiffhunkT {
+            lnum_orig: 77,
+            ..Default::default()
+        };
+        let mut hunk = original;
+
+        assert_eq!(
+            parse_diff_unified(b"@ -3 +8", &mut hunk),
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(hunk, original);
+        assert_eq!(
+            parse_diff_unified(b"@@ -3 8", &mut hunk),
+            crate::vim_defs::FAIL
+        );
+        assert_eq!(hunk, original);
     }
 
     // --- clear_diffin / clear_diffout ---
