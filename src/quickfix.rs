@@ -716,6 +716,29 @@ pub unsafe fn is_qf_win(
         || (is_ll_stack(qi_ref) && std::ptr::eq(win.w_llist_ref, qi.cast_mut()))
 }
 
+/// Finds the window in the current tabpage displaying stack `qi`
+/// (`qf_find_win`), or null when none does.
+///
+/// # Safety
+/// The current tabpage's `firstwin` chain must be valid and acyclic,
+/// and `qi` plus every buffer referenced by the chain must remain
+/// live during the walk.
+#[must_use]
+pub unsafe fn qf_find_win(
+    qi: *const crate::types_defs::QfInfoT,
+) -> *mut crate::buffer_defs::WinT {
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut win = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !win.is_null() {
+        // SAFETY: the window and its successor are valid by contract.
+        if unsafe { is_qf_win(&*win, qi) } {
+            return win;
+        }
+        win = unsafe { (*win).w_next };
+    }
+    std::ptr::null_mut()
+}
+
 /// Free every list in the stack, but not the stack itself
 /// (`qf_free_list_stack_items`).
 ///
@@ -3486,6 +3509,96 @@ mod tests {
             ..Default::default()
         };
         assert!(!unsafe { is_qf_win(&normal_win, std::ptr::addr_of!(*qi)) });
+    }
+
+    #[test]
+    fn qf_find_win_returns_the_matching_window_not_merely_the_first() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let mut other = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+        let other_ptr = std::ptr::addr_of_mut!(*other);
+
+        let mut buf1 = Box::new(BufT::default());
+        let mut buf2 = Box::new(BufT::default());
+        buf1.b_p_bt = Some(b"quickfix".to_vec());
+        buf2.b_p_bt = Some(b"quickfix".to_vec());
+        let buf1_ptr = std::ptr::addr_of_mut!(*buf1);
+        let buf2_ptr = std::ptr::addr_of_mut!(*buf2);
+        buf2.b_prev = buf1_ptr;
+
+        let mut win1 = Box::new(WinT {
+            w_buffer: buf1_ptr,
+            w_llist_ref: other_ptr,
+            ..Default::default()
+        });
+        let mut win2 = Box::new(WinT {
+            w_buffer: buf2_ptr,
+            w_llist_ref: qi_ptr,
+            ..Default::default()
+        });
+        let win2_ptr = std::ptr::addr_of_mut!(*win2);
+        win1.w_next = win2_ptr;
+        let win1_ptr = std::ptr::addr_of_mut!(*win1);
+
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win1_ptr)
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf2_ptr)
+        };
+
+        assert_eq!(unsafe { qf_find_win(qi_ptr) }, win2_ptr);
+    }
+
+    #[test]
+    fn qf_find_win_returns_null_when_no_window_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut qi = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let mut other = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(WinT {
+            w_buffer: buf_ptr,
+            w_llist_ref: std::ptr::addr_of_mut!(*other),
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+
+        assert!(unsafe { qf_find_win(std::ptr::addr_of_mut!(*qi)) }.is_null());
+    }
+
+    #[test]
+    fn qf_find_win_handles_an_empty_window_chain() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = Box::new(crate::types_defs::QfInfoT::default());
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                std::ptr::null_mut(),
+            )
+        };
+
+        assert!(unsafe { qf_find_win(std::ptr::addr_of!(*qi)) }.is_null());
     }
 
     #[test]
