@@ -1072,6 +1072,29 @@ pub unsafe fn text_locked() -> bool {
         || unsafe { crate::globals::GLOBALS.get_mut() }.textlock != 0
 }
 
+/// Guesses whether a partially typed pattern currently matches
+/// everything (`empty_pattern_magic`).
+#[must_use]
+pub fn empty_pattern_magic(
+    pattern: &[u8],
+    magic: crate::regexp_defs::MagicT,
+) -> bool {
+    let mut len = pattern.len();
+    while len >= 2
+        && pattern[len - 2] == b'\\'
+        && b"mMvVcCZ".contains(&pattern[len - 1])
+    {
+        len -= 2;
+    }
+    len == 0
+        || (len > 1
+            && pattern[len - 1] == b'|'
+            && ((pattern[len - 2] == b'\\'
+                && magic == crate::regexp_defs::MagicT::On)
+                || (pattern[len - 2] != b'\\'
+                    && magic == crate::regexp_defs::MagicT::All)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1143,6 +1166,30 @@ mod tests {
             !unsafe { text_locked() },
             "dummy buffers are exempt from expr_map_lock"
         );
+    }
+
+    #[test]
+    fn empty_pattern_magic_accepts_empty_and_magic_only_patterns() {
+        use crate::regexp_defs::MagicT;
+        assert!(empty_pattern_magic(b"", MagicT::On));
+        assert!(empty_pattern_magic(b"\\v", MagicT::On));
+        assert!(empty_pattern_magic(b"\\m\\V", MagicT::All));
+    }
+
+    #[test]
+    fn empty_pattern_magic_detects_trailing_empty_alternatives() {
+        use crate::regexp_defs::MagicT;
+        assert!(empty_pattern_magic(b"abc\\|", MagicT::On));
+        assert!(!empty_pattern_magic(b"abc\\|", MagicT::Off));
+        assert!(empty_pattern_magic(b"abc|", MagicT::All));
+        assert!(!empty_pattern_magic(b"abc|", MagicT::On));
+    }
+
+    #[test]
+    fn empty_pattern_magic_rejects_nonempty_patterns() {
+        use crate::regexp_defs::MagicT;
+        assert!(!empty_pattern_magic(b"abc", MagicT::On));
+        assert!(!empty_pattern_magic(b"|", MagicT::All));
     }
 
     #[test]
