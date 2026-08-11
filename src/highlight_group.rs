@@ -543,6 +543,18 @@ pub unsafe fn get_highlight_name_ext(idx: i32, skip_cleared: bool) -> Option<Vec
     Some(table.items[idx as usize].sg_name.clone())
 }
 
+/// The `idx`-th highlight completion name (`get_highlight_name`).
+///
+/// This is the completion callback's ordinary form, which always
+/// hides cleared groups by returning their empty-name marker.
+///
+/// # Safety
+/// Same as [`get_highlight_name_ext`].
+#[must_use]
+pub unsafe fn get_highlight_name(idx: i32) -> Option<Vec<u8>> {
+    unsafe { get_highlight_name_ext(idx, true) }
+}
+
 /// The name of highlight group `id`, or an empty name when there is no
 /// such group (`syn_id2name`).
 ///
@@ -1263,6 +1275,28 @@ mod tests {
         );
         // Without skip_cleared the real name still comes through.
         assert_eq!(unsafe { get_highlight_name_ext(0, false) }, Some(b"A".to_vec()));
+    }
+
+    #[test]
+    fn get_highlight_name_delegates_with_cleared_groups_hidden() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A", b"B"]);
+        let _i = IncludeGuard::set(0, 0, 0);
+        unsafe { HL_TABLE.get_mut() }.items[0].sg_cleared = true;
+
+        assert_eq!(unsafe { get_highlight_name(0) }, Some(Vec::new()));
+        assert_eq!(unsafe { get_highlight_name(1) }, Some(b"B".to_vec()));
+        assert_eq!(unsafe { get_highlight_name(2) }, None);
+    }
+
+    #[test]
+    fn get_highlight_name_keeps_completion_keywords() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = HlTableGuard::with_names(&[b"A"]);
+        let _i = IncludeGuard::set(1, 1, 1);
+
+        assert_eq!(unsafe { get_highlight_name(1) }, Some(b"none".to_vec()));
+        assert_eq!(unsafe { get_highlight_name(2) }, Some(b"default".to_vec()));
     }
 
     #[test]
