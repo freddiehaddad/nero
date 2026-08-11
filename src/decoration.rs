@@ -591,11 +591,52 @@ pub fn buf_signcols_count_range(buf: &mut BufT, row1: i32, row2: i32, add: i32, 
     );
 }
 
+/// Represents highlight group `hl_id` as either its name or numeric
+/// identifier (`hl_group_name`).
+///
+/// # Safety
+/// The name branch reads the global highlight-group table through
+/// [`crate::highlight_group::syn_id2name`].
+#[must_use]
+pub unsafe fn hl_group_name(
+    hl_id: i32,
+    hl_name: bool,
+) -> crate::api::private::defs::Object {
+    if hl_name {
+        crate::api::private::defs::Object::String(unsafe {
+            crate::highlight_group::syn_id2name(hl_id)
+        })
+    } else {
+        crate::api::private::defs::Object::Integer(i64::from(hl_id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::{BufT, WinoptT};
     use crate::decoration_defs::{DecorSignHighlight, DecorVirtText, VirtTextPos};
+
+    #[test]
+    fn hl_group_name_returns_the_numeric_id_when_names_are_disabled() {
+        assert!(matches!(
+            unsafe { hl_group_name(42, false) },
+            crate::api::private::defs::Object::Integer(42)
+        ));
+        assert!(matches!(
+            unsafe { hl_group_name(-1, false) },
+            crate::api::private::defs::Object::Integer(-1)
+        ));
+    }
+
+    #[test]
+    fn hl_group_name_returns_a_string_object_when_names_are_enabled() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert!(matches!(
+            unsafe { hl_group_name(0, true) },
+            crate::api::private::defs::Object::String(name) if name.is_empty()
+        ));
+    }
 
     fn range_with(data: DecorRangeData) -> DecorRange {
         DecorRange {
