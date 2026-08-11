@@ -212,6 +212,17 @@ pub unsafe fn time_push() -> (ProftimeT, ProftimeT) {
     (relative, now)
 }
 
+/// Restores the previous-time baseline after nested work
+/// (`time_pop`) by subtracting `tp`.
+///
+/// # Safety
+/// Mutates the `G_PREV_TIME` file-static.
+pub unsafe fn time_pop(tp: ProftimeT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let previous = unsafe { *G_PREV_TIME.get_mut() };
+    unsafe { *G_PREV_TIME.get_mut() = previous.wrapping_sub(tp) };
+}
+
 /// Adds the `self` time from the total time and the `children` time
 /// (`profile_self`).
 ///
@@ -370,6 +381,26 @@ mod tests {
         let (relative, start) = unsafe { time_push() };
 
         assert_eq!(relative, start);
+    }
+
+    #[test]
+    fn time_pop_subtracts_from_the_previous_timestamp() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevTimeGuard::install(1_000);
+
+        unsafe { time_pop(400) };
+
+        assert_eq!(unsafe { *G_PREV_TIME.get_mut() }, 600);
+    }
+
+    #[test]
+    fn time_pop_uses_proftime_wrapping_arithmetic() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevTimeGuard::install(5);
+
+        unsafe { time_pop(10) };
+
+        assert_eq!(unsafe { *G_PREV_TIME.get_mut() }, ProftimeT::MAX - 4);
     }
 
     // --- prof_input_start / prof_input_end ---
