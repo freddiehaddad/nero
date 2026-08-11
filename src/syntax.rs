@@ -54,6 +54,10 @@ static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::Globa
 static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+/// `current_col` - the column the syntax engine is currently on.
+static CURRENT_COL: crate::globals::GlobalCell<crate::pos_defs::ColnrT> =
+    crate::globals::GlobalCell::new(0);
+
 /// `keepend_level` - the stack level of the first item with `keepend`,
 /// or -1 when there is none.
 ///
@@ -186,6 +190,38 @@ pub unsafe fn check_keepend() {
             }
         }
     }
+}
+
+/// Whether pattern `idx` was already matched at the current position
+/// (`did_match_already`).
+///
+/// `zero_width` holds the indices of zero-width matches that carried a
+/// `nextgroup` argument: those are never pushed onto the state stack,
+/// and can only match once anyway, so they are tracked separately.
+/// The original passes that list as a `garray_T` of `int`; it is a
+/// plain slice here, since nothing in this function grows it.
+///
+/// # Safety
+/// Reads the `CURRENT_STATE`/`CURRENT_COL`/`CURRENT_LNUM` file-statics.
+#[must_use]
+pub unsafe fn did_match_already(idx: i32, zero_width: &[i32]) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let (state, col, lnum) = unsafe {
+        (
+            &*CURRENT_STATE.get_mut(),
+            *CURRENT_COL.get_mut(),
+            *CURRENT_LNUM.get_mut(),
+        )
+    };
+
+    if state
+        .iter()
+        .any(|si| si.si_m_startcol == col && si.si_m_lnum == lnum && si.si_idx == idx)
+    {
+        return true;
+    }
+
+    zero_width.contains(&idx)
 }
 
 /// The text of the current line in the syntax buffer
@@ -1287,6 +1323,87 @@ mod tests {
 
         unsafe { *CURRENT_SUB_CHAR.get_mut() = i32::from(b'x') };
         assert_eq!(unsafe { syn_get_sub_char() }, i32::from(b'x'));
+    }
+
+    // ---- did_match_already ----
+
+    /// Installs a current column/line, restoring both on drop.
+    struct CurrentPosGuard(crate::pos_defs::ColnrT, crate::pos_defs::LinenrT);
+
+    impl CurrentPosGuard {
+        fn install(col: crate::pos_defs::ColnrT, lnum: crate::pos_defs::LinenrT) -> Self {
+            // SAFETY: the global state test lock is held by the caller.
+            unsafe {
+                let saved = Self(*CURRENT_COL.get_mut(), *CURRENT_LNUM.get_mut());
+                *CURRENT_COL.get_mut() = col;
+                *CURRENT_LNUM.get_mut() = lnum;
+                saved
+            }
+        }
+    }
+
+    impl Drop for CurrentPosGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `install`.
+            unsafe {
+                *CURRENT_COL.get_mut() = self.0;
+                *CURRENT_LNUM.get_mut() = self.1;
+            }
+        }
+    }
+
+    fn matched_at(idx: i32, lnum: i32, col: i32) -> StateItemT {
+        StateItemT {
+            si_idx: idx,
+            si_m_lnum: lnum,
+            si_m_startcol: col,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn did_match_already_is_false_with_nothing_matched() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _p = CurrentPosGuard::install(4, 2);
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        assert!(!unsafe { did_match_already(1, &[]) });
+    }
+
+    #[test]
+    fn did_match_already_finds_a_match_at_the_current_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _p = CurrentPosGuard::install(4, 2);
+        let _g = CurrentStackGuard::install(vec![matched_at(1, 2, 4)]);
+
+        assert!(unsafe { did_match_already(1, &[]) });
+    }
+
+    /// All three of pattern index, line and column must agree - a
+    /// match of the same pattern elsewhere does not count.
+    #[test]
+    fn did_match_already_requires_the_index_line_and_column_to_all_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _p = CurrentPosGuard::install(4, 2);
+        let _g = CurrentStackGuard::install(vec![
+            matched_at(1, 2, 5), // right pattern and line, wrong column
+            matched_at(1, 3, 4), // right pattern and column, wrong line
+            matched_at(9, 2, 4), // right position, wrong pattern
+        ]);
+
+        assert!(!unsafe { did_match_already(1, &[]) });
+    }
+
+    /// Zero-width matches carrying a nextgroup never reach the state
+    /// stack, so they are found only via the separate list.
+    #[test]
+    fn did_match_already_also_checks_the_zero_width_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _p = CurrentPosGuard::install(4, 2);
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        assert!(unsafe { did_match_already(7, &[3, 7]) });
+        assert!(!unsafe { did_match_already(5, &[3, 7]) });
     }
 
     // ---- check_keepend ----
