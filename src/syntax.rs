@@ -32,6 +32,43 @@ static SYN_BUF: crate::globals::GlobalCell<*mut crate::buffer_defs::BufT> =
 static CURRENT_LNUM: crate::globals::GlobalCell<crate::pos_defs::LinenrT> =
     crate::globals::GlobalCell::new(0);
 
+/// `current_flags` - the `HL_*` flags of the current character.
+static CURRENT_FLAGS: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// `current_seqnr` - the sequence number of the current syntax item,
+/// used to identify a concealed region.
+static CURRENT_SEQNR: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// `current_sub_char` - the conceal substitution character in force at
+/// the current position.
+static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
+
+/// The syntax flags and sequence number at the current position
+/// (`get_syntax_info`).
+///
+/// The original writes the sequence number through a `seqnrp`
+/// out-parameter and returns the flags; both come back as a tuple
+/// here, matching this crate's convention for out-parameters.
+///
+/// # Safety
+/// Reads the `CURRENT_FLAGS`/`CURRENT_SEQNR` file-statics.
+#[must_use]
+pub unsafe fn get_syntax_info() -> (i32, i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*CURRENT_FLAGS.get_mut(), *CURRENT_SEQNR.get_mut()) }
+}
+
+/// The conceal substitution character at the current position
+/// (`syn_get_sub_char`).
+///
+/// # Safety
+/// Reads the `CURRENT_SUB_CHAR` file-static.
+#[must_use]
+pub unsafe fn syn_get_sub_char() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_SUB_CHAR.get_mut() }
+}
+
 /// The text of the current line in the syntax buffer
 /// (`syn_getcurline`).
 ///
@@ -967,6 +1004,69 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    // ---- get_syntax_info / syn_get_sub_char ----
+
+    /// Restores the syntax engine's current-position statics on drop.
+    struct CurrentStateGuard {
+        flags: i32,
+        seqnr: i32,
+        sub_char: i32,
+    }
+
+    impl CurrentStateGuard {
+        fn save() -> Self {
+            unsafe {
+                Self {
+                    flags: *CURRENT_FLAGS.get_mut(),
+                    seqnr: *CURRENT_SEQNR.get_mut(),
+                    sub_char: *CURRENT_SUB_CHAR.get_mut(),
+                }
+            }
+        }
+    }
+
+    impl Drop for CurrentStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *CURRENT_FLAGS.get_mut() = self.flags;
+                *CURRENT_SEQNR.get_mut() = self.seqnr;
+                *CURRENT_SUB_CHAR.get_mut() = self.sub_char;
+            }
+        }
+    }
+
+    /// The flags come back as the return value and the sequence number
+    /// as the second tuple element, matching the original's
+    /// return-plus-out-parameter split.
+    #[test]
+    fn get_syntax_info_reports_flags_and_seqnr_separately() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStateGuard::save();
+
+        unsafe {
+            *CURRENT_FLAGS.get_mut() = hl_flags::CONCEAL;
+            *CURRENT_SEQNR.get_mut() = 42;
+        }
+        assert_eq!(unsafe { get_syntax_info() }, (hl_flags::CONCEAL, 42));
+
+        // The two are independent: changing one must not move the
+        // other.
+        unsafe { *CURRENT_SEQNR.get_mut() = 7 };
+        assert_eq!(unsafe { get_syntax_info() }, (hl_flags::CONCEAL, 7));
+    }
+
+    #[test]
+    fn syn_get_sub_char_reports_the_conceal_substitute() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStateGuard::save();
+
+        unsafe { *CURRENT_SUB_CHAR.get_mut() = 0 };
+        assert_eq!(unsafe { syn_get_sub_char() }, 0, "NUL means none");
+
+        unsafe { *CURRENT_SUB_CHAR.get_mut() = i32::from(b'x') };
+        assert_eq!(unsafe { syn_get_sub_char() }, i32::from(b'x'));
     }
 
     // ---- idl cache ----
