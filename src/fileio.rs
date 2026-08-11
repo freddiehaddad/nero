@@ -806,10 +806,160 @@ pub fn ucs2bytes(c: u32, out: &mut Vec<u8>, flags: i32) -> bool {
     error
 }
 
+/// Builds a file name from `fname` plus the extension `ext`
+/// (`modname`).
+///
+/// With no `fname`, the current directory is used instead. The result
+/// always ends in `ext`, has a basename of at most `BASENAMELEN`
+/// characters (truncated if needed), and differs from `fname`: if
+/// appending the extension alone would not change it, basename
+/// characters are replaced by `_`, and if the basename is already all
+/// underscores the first becomes `v`.
+///
+/// Returns `None` only when there is no `fname` and the current
+/// directory cannot be determined.
+#[must_use]
+pub fn modname(fname: Option<&[u8]>, ext: &[u8], prepend_dot: bool) -> Option<Vec<u8>> {
+    let mut prepend_dot = prepend_dot;
+    let mut retval = match fname {
+        Some(f) if !f.is_empty() => f.to_vec(),
+        _ => {
+            let mut dir = crate::os::fs::os_dirname()?;
+            if dir.is_empty() {
+                return None;
+            }
+            crate::path::add_pathsep(&mut dir);
+            // There is no file name to prepend a dot to.
+            prepend_dot = false;
+            dir
+        }
+    };
+
+    // The basename starts after the last path separator.
+    let base_start = match retval.iter().rposition(|&c| crate::path::vim_ispathsep(i32::from(c))) {
+        Some(i) => i + 1,
+        None => 0,
+    };
+
+    // Limit the basename to BASENAMELEN characters.
+    let max_base = base_start + crate::os::os_defs::BASENAMELEN as usize;
+    if retval.len() > max_base {
+        retval.truncate(max_base);
+    }
+
+    retval.extend_from_slice(ext);
+
+    if prepend_dot {
+        let tail = crate::path::path_tail(&retval);
+        if retval.get(tail) != Some(&b'.') {
+            retval.insert(tail, b'.');
+        }
+    }
+
+    // Appending the extension may not have changed anything, e.g.
+    // when it was already there.
+    if fname == Some(retval.as_slice()) {
+        // Find a character that can be replaced by '_', scanning back
+        // from the end of the basename.
+        let base_end = retval.len() - ext.len();
+        match retval[base_start..base_end].iter().rposition(|&c| c != b'_') {
+            Some(off) => retval[base_start + off] = b'_',
+            // The basename was all underscores already.
+            None => retval[base_start] = b'v',
+        }
+    }
+
+    Some(retval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::globals::global_state_test_lock;
+
+    // ---- modname ----
+
+    #[test]
+    fn modname_appends_the_extension() {
+        assert_eq!(modname(Some(b"/tmp/notes"), b".swp", false), Some(b"/tmp/notes.swp".to_vec()));
+    }
+
+    /// With prepend_dot the basename is hidden, but only when it is
+    /// not hidden already.
+    #[test]
+    fn modname_prepends_a_dot_only_when_needed() {
+        assert_eq!(modname(Some(b"/tmp/notes"), b".swp", true), Some(b"/tmp/.notes.swp".to_vec()));
+        assert_eq!(
+            modname(Some(b".notes"), b".swp", true),
+            Some(b".notes.swp".to_vec()),
+            "already hidden, so no second dot"
+        );
+    }
+
+    /// The result must differ from the input. When appending the
+    /// extension alone would not change it, the LAST non-underscore
+    /// character of the basename becomes an underscore.
+    #[test]
+    fn modname_forces_a_difference_when_the_name_is_unchanged() {
+        // "notes.swp" + ".swp" would normally be "notes.swp.swp", so
+        // pass an empty extension to hit the equality case directly.
+        assert_eq!(
+            modname(Some(b"/tmp/notes"), b"", false),
+            Some(b"/tmp/note_".to_vec()),
+            "the last basename character is replaced"
+        );
+    }
+
+    /// An all-underscore basename has nothing left to replace, so the
+    /// first character becomes 'v' instead.
+    #[test]
+    fn modname_uses_v_when_the_basename_is_all_underscores() {
+        assert_eq!(modname(Some(b"/tmp/____"), b"", false), Some(b"/tmp/v___".to_vec()));
+    }
+
+    /// The replacement scans only the basename, never the directory.
+    #[test]
+    fn modname_does_not_touch_the_directory_part() {
+        let got = modname(Some(b"/a_b/_"), b"", false).unwrap();
+        assert_eq!(got, b"/a_b/v".to_vec(), "the '_' in the directory is left alone");
+    }
+
+    /// A basename longer than BASENAMELEN is truncated before the
+    /// extension is appended.
+    #[test]
+    fn modname_truncates_an_overlong_basename() {
+        let long = vec![b'a'; crate::os::os_defs::BASENAMELEN as usize + 20];
+        let mut fname = b"/tmp/".to_vec();
+        fname.extend_from_slice(&long);
+
+        let got = modname(Some(&fname), b".swp", false).unwrap();
+
+        let base = &got[b"/tmp/".len()..];
+        assert_eq!(
+            base.len(),
+            crate::os::os_defs::BASENAMELEN as usize + b".swp".len(),
+            "basename truncated to BASENAMELEN, then the extension added"
+        );
+        assert!(got.ends_with(b".swp"));
+    }
+
+    /// Without a file name the current directory is used, and there
+    /// is then nothing to prepend a dot to.
+    #[test]
+    fn modname_without_a_name_uses_the_current_directory() {
+        let got = modname(None, b".swp", true).expect("cwd must be available");
+        assert!(got.ends_with(b".swp"));
+        let tail = crate::path::path_tail(&got);
+        assert_eq!(got[tail..], b".swp"[..], "no basename, so no leading dot was added");
+    }
+
+    #[test]
+    fn modname_treats_an_empty_name_like_none() {
+        let from_empty = modname(Some(b""), b".swp", false);
+        let from_none = modname(None, b".swp", false);
+        assert_eq!(from_empty, from_none);
+    }
+
 
     #[test]
     fn is_dev_fd_file_accepts_multi_digit_descriptors() {
