@@ -314,6 +314,25 @@ pub fn qf_parse_fmt_t(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%m` message match
+/// (`qf_parse_fmt_m`).
+pub fn qf_parse_fmt_m(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    let end = matched
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(matched.len());
+    fields.errmsg.clear();
+    fields.errmsg.extend_from_slice(&matched[..end]);
+    fields.errmsg.push(0);
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -1831,6 +1850,39 @@ mod tests {
         let mut fields = QffieldsT::default();
         assert_eq!(qf_parse_fmt_t(Some(b""), &mut fields), qf_status::QF_OK);
         assert_eq!(fields.type_, 0);
+    }
+
+    #[test]
+    fn qf_parse_fmt_m_replaces_the_message_and_nul_terminates_it() {
+        let mut fields = QffieldsT {
+            errmsg: b"old message\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            qf_parse_fmt_m(Some(b"new message"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.errmsg, b"new message\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_m_stops_at_an_embedded_nul() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_m(Some(b"head\0tail"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.errmsg, b"head\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_m_rejects_a_missing_match_without_changing_message() {
+        let mut fields = QffieldsT {
+            errmsg: b"keep\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_m(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.errmsg, b"keep\0");
     }
 
     #[test]
