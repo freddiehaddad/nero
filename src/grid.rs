@@ -208,6 +208,38 @@ pub unsafe fn grid_line_start(view: &crate::grid_defs::GridView, row: i32) {
     unsafe { screengrid_line_start(grid, row, col) };
 }
 
+/// Reads the cell currently displayed at `col` of the active grid
+/// line (`grid_line_getchar`).
+///
+/// The pending line buffer is not consulted. Out-of-range columns
+/// return a neutral space and no attribute, matching the original's
+/// untouched optional attribute out-parameter.
+///
+/// # Safety
+/// An active grid line must exist, and its backing arrays must cover
+/// the active row and adjusted column.
+#[must_use]
+pub unsafe fn grid_line_getchar(
+    col: i32,
+) -> (ScharT, Option<crate::types_defs::SattrT>) {
+    if col >= unsafe { *GRID_LINE_MAXCOL.get_mut() } {
+        return (schar_from_ascii(b' '), None);
+    }
+    let grid = unsafe { *GRID_LINE_GRID.get_mut() };
+    assert!(!grid.is_null());
+    let adjusted = col + unsafe { *GRID_LINE_COLOFF.get_mut() };
+    let row = unsafe { *GRID_LINE_ROW.get_mut() };
+    let off = unsafe {
+        *(*grid).line_offset.add(row as usize) + adjusted as usize
+    };
+    unsafe {
+        (
+            *(*grid).chars.add(off),
+            Some(*(*grid).attrs.add(off)),
+        )
+    }
+}
+
 /// Marks the remainder of the buffered grid line for clearing
 /// (`grid_line_clear_end`).
 ///
@@ -1070,6 +1102,60 @@ mod tests {
         assert_eq!(unsafe { *GRID_LINE_ROW.get_mut() }, 6);
         assert_eq!(unsafe { *GRID_LINE_COLOFF.get_mut() }, 3);
         assert_eq!(unsafe { *GRID_LINE_MAXCOL.get_mut() }, 7);
+    }
+
+    #[test]
+    fn grid_line_getchar_reads_the_active_grid_with_column_offset() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![0; 5],
+            vec![0; 5],
+            vec![0; 5],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let mut chars = vec![0; 10];
+        let mut attrs = vec![0; 10];
+        let mut offsets = [0_usize, 5];
+        chars[8] = 99;
+        attrs[8] = 7;
+        let mut grid = crate::grid_defs::ScreenGrid {
+            chars: chars.as_mut_ptr(),
+            attrs: attrs.as_mut_ptr(),
+            line_offset: offsets.as_mut_ptr(),
+            rows: 2,
+            cols: 5,
+            ..Default::default()
+        };
+        unsafe {
+            screengrid_line_start(std::ptr::addr_of_mut!(grid), 1, 2);
+        }
+
+        assert_eq!(unsafe { grid_line_getchar(1) }, (99, Some(7)));
+    }
+
+    #[test]
+    fn grid_line_getchar_returns_neutral_space_past_maxcol() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![0; 3],
+            vec![0; 3],
+            vec![0; 3],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let mut grid = crate::grid_defs::ScreenGrid {
+            cols: 3,
+            ..Default::default()
+        };
+        unsafe {
+            screengrid_line_start(std::ptr::addr_of_mut!(grid), 0, 0);
+        }
+
+        assert_eq!(
+            unsafe { grid_line_getchar(3) },
+            (schar_from_ascii(b' '), None)
+        );
     }
 
     impl Drop for GridLineGridGuard {
