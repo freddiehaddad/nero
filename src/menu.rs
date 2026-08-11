@@ -352,9 +352,91 @@ pub fn is_menus_locked() -> bool {
     unsafe { *MENUS_LOCKED.get_mut() > 0 }
 }
 
+/// Removes backslash escapes from the first part of a menu name
+/// (`menu_unescape_name`).
+///
+/// Only the leading part is unescaped: the scan stops at the first
+/// `.`, which separates menu-name parts. An escaped `.` does not
+/// terminate the scan, because the character after a backslash is
+/// stepped over whole - so `"a\\.b"` unescapes to `"a.b"` rather than
+/// stopping at the dot.
+///
+/// The original rewrites the name in place with `STRMOVE`; this
+/// rebuilds it, which is the same result without the overlapping
+/// copy.
+pub fn menu_unescape_name(name: &mut Vec<u8>) {
+    let mut out: Vec<u8> = Vec::with_capacity(name.len());
+    let mut i = 0;
+
+    while i < name.len() && name[i] != b'.' {
+        if name[i] == b'\\' {
+            // Drop the backslash and take what follows verbatim, so an
+            // escaped '.' is kept rather than ending the scan.
+            i += 1;
+            if i >= name.len() {
+                break;
+            }
+        }
+        let len = (crate::mbyte::utf_ptr2len(&name[i..]) as usize).max(1);
+        let end = (i + len).min(name.len());
+        out.extend_from_slice(&name[i..end]);
+        i = end;
+    }
+
+    // Everything from the separator on is left exactly as it was.
+    out.extend_from_slice(&name[i..]);
+    *name = out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- menu_unescape_name ---
+
+    fn unescaped(s: &[u8]) -> Vec<u8> {
+        let mut v = s.to_vec();
+        menu_unescape_name(&mut v);
+        v
+    }
+
+    #[test]
+    fn menu_unescape_name_removes_backslashes() {
+        assert_eq!(unescaped(br"a\ b"), b"a b".to_vec());
+        assert_eq!(unescaped(b"plain"), b"plain".to_vec());
+    }
+
+    /// An escaped dot is kept as a literal and does NOT end the scan,
+    /// because the character after a backslash is stepped over whole.
+    #[test]
+    fn menu_unescape_name_keeps_an_escaped_dot() {
+        assert_eq!(unescaped(br"a\.b"), b"a.b".to_vec());
+    }
+
+    /// An unescaped dot separates menu parts, so everything from it
+    /// on is left untouched - including later backslashes.
+    #[test]
+    fn menu_unescape_name_stops_at_an_unescaped_dot() {
+        assert_eq!(unescaped(br"a\ b.c\ d"), br"a b.c\ d".to_vec());
+    }
+
+    #[test]
+    fn menu_unescape_name_handles_a_trailing_backslash() {
+        assert_eq!(unescaped(br"ab\"), b"ab".to_vec());
+    }
+
+    #[test]
+    fn menu_unescape_name_handles_an_empty_name() {
+        assert_eq!(unescaped(b""), b"".to_vec());
+    }
+
+    /// Multi-byte characters are stepped over whole, so their
+    /// continuation bytes are never mistaken for a backslash or dot.
+    #[test]
+    fn menu_unescape_name_preserves_multibyte_characters() {
+        assert_eq!(unescaped("héllo".as_bytes()), "héllo".as_bytes().to_vec());
+        assert_eq!(unescaped(r"h\éllo".as_bytes()), "héllo".as_bytes().to_vec());
+    }
 
     #[test]
     fn menu_is_popup_matches_prefix() {
