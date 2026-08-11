@@ -203,6 +203,19 @@ pub unsafe fn get_y_register(reg: usize) -> Option<*mut YankregT> {
     Some(&mut regs[reg])
 }
 
+/// Returns the register named by `name` (`op_reg_get`), or `None`
+/// when the name has no direct register slot.
+///
+/// # Safety
+/// Touches the `Y_REGS` file-static; the returned pointer must not
+/// overlap another mutable access to that storage.
+#[must_use]
+pub unsafe fn op_reg_get(name: i32) -> Option<*const YankregT> {
+    let idx = op_reg_index(name)?;
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { get_y_register(idx) }.map(|ptr| ptr.cast_const())
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -678,6 +691,27 @@ mod tests {
         assert_eq!(op_reg_index(i32::from(b'"')), None);
         assert_eq!(op_reg_index(0), None);
         assert_eq!(op_reg_index(i32::from(b'!')), None);
+    }
+
+    #[test]
+    fn op_reg_get_returns_the_named_register_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let idx = op_reg_index(i32::from(b'c')).unwrap();
+        let expected = unsafe { get_y_register(idx) }.unwrap().cast_const();
+
+        assert_eq!(unsafe { op_reg_get(i32::from(b'c')) }, Some(expected));
+        assert_eq!(
+            unsafe { op_reg_get(i32::from(b'C')) },
+            Some(expected),
+            "upper- and lower-case names share the same register"
+        );
+    }
+
+    #[test]
+    fn op_reg_get_returns_none_for_a_name_without_a_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        assert_eq!(unsafe { op_reg_get(i32::from(b'!')) }, None);
+        assert_eq!(unsafe { op_reg_get(i32::from(b'"')) }, None);
     }
 
     #[test]
