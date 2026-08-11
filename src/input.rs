@@ -198,6 +198,26 @@ pub unsafe fn start_stuff() {
     }
 }
 
+/// Reads one byte from a stuff/redo buffer (`read_readbuf`).
+///
+/// With `advance == false` this peeks. Advancing past a block's last
+/// byte removes that block and resets the per-block index.
+pub fn read_readbuf(buf: &mut BuffheaderT, advance: bool) -> u8 {
+    let Some(first) = buf.blocks.first() else {
+        return crate::ascii_defs::NUL;
+    };
+    let c = first.b_str[buf.bh_index];
+    let block_len = first.b_str.len();
+    if advance {
+        buf.bh_index += 1;
+        if buf.bh_index >= block_len {
+            buf.blocks.remove(0);
+            buf.bh_index = 0;
+        }
+    }
+    c
+}
+
 /// Fold a pending CTRL modifier into the character itself where an
 /// equivalent control code exists (`merge_modifiers`).
 ///
@@ -820,6 +840,51 @@ mod tests {
             *READBUF1.get_mut() = save1;
             *READBUF2.get_mut() = save2;
         }
+    }
+
+    #[test]
+    fn read_readbuf_peeks_without_advancing() {
+        let mut buf = BuffheaderT {
+            blocks: vec![BuffblockT {
+                b_str: b"ab".to_vec(),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(read_readbuf(&mut buf, false), b'a');
+        assert_eq!(read_readbuf(&mut buf, false), b'a');
+        assert_eq!(buf.bh_index, 0);
+    }
+
+    #[test]
+    fn read_readbuf_advances_and_removes_a_finished_block() {
+        let mut buf = BuffheaderT {
+            blocks: vec![
+                BuffblockT {
+                    b_str: b"ab".to_vec(),
+                },
+                BuffblockT {
+                    b_str: b"c".to_vec(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(read_readbuf(&mut buf, true), b'a');
+        assert_eq!(buf.bh_index, 1);
+        assert_eq!(read_readbuf(&mut buf, true), b'b');
+        assert_eq!(buf.bh_index, 0);
+        assert_eq!(buf.blocks.len(), 1);
+        assert_eq!(read_readbuf(&mut buf, true), b'c');
+        assert!(buf.blocks.is_empty());
+    }
+
+    #[test]
+    fn read_readbuf_returns_nul_for_an_empty_buffer() {
+        assert_eq!(
+            read_readbuf(&mut BuffheaderT::default(), true),
+            crate::ascii_defs::NUL
+        );
     }
 
     // --- merge_modifiers ---
