@@ -22,21 +22,9 @@
 //! in full (via `langmap_adjust_mb_impl`, directly unit-tested
 //! against a manually-populated table), not stubbed.
 //!
-//! Note: `langmap_mapchar[]` (the original's OTHER, single-byte-only
-//! `'langmap'` lookup table, `c < 256`, already a real
-//! `crate::globals::Globals::langmap_mapchar` field) is deliberately
-//! NOT exposed via its own lookup function here: unlike
-//! `langmap_mapga`, `langmap_mapchar` currently defaults to all zeros
-//! (this crate's usual "mirrors raw C zero-init" convention), NOT the
-//! identity mapping the original's own `langmap_init()` would set up
-//! (`langmap_init`/`did_set_langmap` are both still deferred) - every
-//! real call site guards this table behind the original's own
-//! `LANGMAP_ADJUST` macro (which itself first checks `*p_langmap` is
-//! non-empty before ever indexing `langmap_mapchar[]`), so exposing a
-//! bare, ungated lookup now would give an actively wrong answer
-//! (mapping every character to NUL) rather than a faithful "nothing
-//! configured yet" result - the same trap already identified and
-//! avoided for `charclass()`/`mb_get_class`.
+//! `langmap_mapchar[]` (the original's other, single-byte-only lookup
+//! table) is initialized to its identity mapping by [`langmap_init`],
+//! matching startup before any `'langmap'` value is parsed.
 //!
 //! Also translated: [`map_mode_to_chars`] - encodes a mode bitmask
 //! (`MODE_INSERT`/`MODE_CMDLINE`/etc., already real via
@@ -72,6 +60,16 @@ use crate::state_defs::mode;
 /// `'langmap'` character remappings for multi-byte characters. Empty
 /// by default, matching the original's own `GA_EMPTY_INIT_VALUE`.
 static LANGMAP_MAPGA: GlobalCell<Vec<(i32, i32)>> = GlobalCell::new(Vec::new());
+
+/// Resets both language-map tables to the identity mapping
+/// (`langmap_init`).
+pub fn langmap_init() {
+    let mapchar = &mut unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar;
+    for (i, slot) in mapchar.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    unsafe { LANGMAP_MAPGA.get_mut() }.clear();
+}
 
 /// Search `entries` (sorted by `from`) for `from`; if found, update
 /// its `to`; otherwise insert a new `(from, to)` entry at the correct
@@ -281,7 +279,45 @@ mod tests {
         assert_eq!(langmap_adjust_mb_impl(&entries, 0x4e02), 0x4e02);
     }
 
-    // --- langmap_adjust_mb (touches the shared LANGMAP_MAPGA) ---
+    // --- langmap_init / langmap_adjust_mb (shared tables) ---
+
+    struct LangmapStateGuard {
+        mapchar: [u8; 256],
+        mapga: Vec<(i32, i32)>,
+    }
+
+    impl LangmapStateGuard {
+        fn save() -> Self {
+            Self {
+                mapchar: unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar,
+                mapga: unsafe { LANGMAP_MAPGA.get_mut() }.clone(),
+            }
+        }
+    }
+
+    impl Drop for LangmapStateGuard {
+        fn drop(&mut self) {
+            unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar = self.mapchar;
+            *(unsafe { LANGMAP_MAPGA.get_mut() }) = std::mem::take(&mut self.mapga);
+        }
+    }
+
+    #[test]
+    fn langmap_init_builds_the_single_byte_identity_map_and_clears_multibyte_entries() {
+        let _lock = global_state_test_lock();
+        let _g = LangmapStateGuard::save();
+        unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar = [0; 256];
+        unsafe { LANGMAP_MAPGA.get_mut() }.push((0x4e00, 0x61));
+
+        langmap_init();
+
+        let map = unsafe { crate::globals::GLOBALS.get_mut() }.langmap_mapchar;
+        assert_eq!(map[0], 0);
+        assert_eq!(map[1], 1);
+        assert_eq!(map[127], 127);
+        assert_eq!(map[255], 255);
+        assert!(unsafe { LANGMAP_MAPGA.get_mut() }.is_empty());
+    }
 
     #[test]
     fn langmap_adjust_mb_is_identity_by_default() {
@@ -495,4 +531,3 @@ mod tests {
         }
     }
 }
-
