@@ -333,6 +333,19 @@ pub fn qf_parse_fmt_m(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%r` tail match
+/// (`qf_parse_fmt_r`).
+pub fn qf_parse_fmt_r<'a>(
+    matched: Option<&'a [u8]>,
+    tail: &mut Option<&'a [u8]>,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    *tail = Some(matched);
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -1883,6 +1896,25 @@ mod tests {
         };
         assert_eq!(qf_parse_fmt_m(None, &mut fields), qf_status::QF_FAIL);
         assert_eq!(fields.errmsg, b"keep\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_r_returns_the_matched_tail_slice() {
+        let source = b"remaining text";
+        let mut tail = None;
+        assert_eq!(
+            qf_parse_fmt_r(Some(source), &mut tail),
+            qf_status::QF_OK
+        );
+        assert_eq!(tail, Some(&source[..]));
+    }
+
+    #[test]
+    fn qf_parse_fmt_r_rejects_a_missing_match_without_changing_tail() {
+        let original = b"keep";
+        let mut tail = Some(&original[..]);
+        assert_eq!(qf_parse_fmt_r(None, &mut tail), qf_status::QF_FAIL);
+        assert_eq!(tail, Some(&original[..]));
     }
 
     #[test]
