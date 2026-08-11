@@ -1120,6 +1120,13 @@ pub fn qf_free_list_stack_items(qi: &mut crate::types_defs::QfInfoT) {
     for qfl in &mut qi.qf_lists[..live] {
         qf_free(qfl);
     }
+
+    pub fn qf_free_lists(qi: &mut crate::types_defs::QfInfoT) {
+        qf_free_list_stack_items(qi);
+        qi.qf_lists.clear();
+        qi.qf_listcount = 0;
+        qi.qf_curlist = 0;
+    }
 }
 
 /// Build a new quickfix/location list stack holding up to `n` lists
