@@ -675,6 +675,18 @@ pub fn is_ll_list(qfl: &QfListT) -> bool {
     qfl.qfl_type == QfltypeT::Location
 }
 
+/// Whether `wp` is a location-list window (`IS_LL_WINDOW`).
+///
+/// Such a window displays a quickfix-type buffer and carries a
+/// non-null reference to the location-list stack it represents.
+#[must_use]
+pub fn is_ll_window(wp: &crate::buffer_defs::WinT) -> bool {
+    // SAFETY: a null buffer simply fails `bt_quickfix`; otherwise the
+    // caller's live window guarantees its buffer remains live.
+    crate::buffer::bt_quickfix(unsafe { wp.w_buffer.as_ref() })
+        && !wp.w_llist_ref.is_null()
+}
+
 /// Free every list in the stack, but not the stack itself
 /// (`qf_free_list_stack_items`).
 ///
@@ -3338,6 +3350,45 @@ mod tests {
         assert!(is_qf_list(&qfl) && !is_ll_list(&qfl));
         let lll = QfListT { qfl_type: QfltypeT::Location, ..Default::default() };
         assert!(is_ll_list(&lll) && !is_qf_list(&lll));
+    }
+
+    #[test]
+    fn is_ll_window_requires_a_quickfix_buffer_and_list_reference() {
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*buf),
+            w_llist_ref: std::ptr::addr_of_mut!(*qi),
+            ..Default::default()
+        };
+
+        assert!(is_ll_window(&win));
+    }
+
+    #[test]
+    fn is_ll_window_rejects_a_quickfix_window_without_a_list_reference() {
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*buf),
+            ..Default::default()
+        };
+
+        assert!(!is_ll_window(&win));
+    }
+
+    #[test]
+    fn is_ll_window_rejects_a_normal_buffer_with_a_list_reference() {
+        let mut buf = Box::new(BufT::default());
+        let mut qi = Box::new(crate::types_defs::QfInfoT::default());
+        let win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*buf),
+            w_llist_ref: std::ptr::addr_of_mut!(*qi),
+            ..Default::default()
+        };
+
+        assert!(!is_ll_window(&win));
     }
 
     #[test]
