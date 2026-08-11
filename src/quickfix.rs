@@ -1347,6 +1347,61 @@ pub unsafe fn qf_get_nth_above_entry(
     }
 }
 
+/// Finds the `n`th quickfix entry adjacent to `pos` in buffer `bnr`
+/// and direction `dir` (`qf_find_nth_adj_entry`).
+///
+/// Returns its one-based quickfix number, or zero when there is no
+/// qualifying entry. The closest entry is number one; only the
+/// remaining `n - 1` steps are delegated to the directional walker.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int` through the constituent helpers.
+#[must_use]
+pub unsafe fn qf_find_nth_adj_entry(
+    qfl: &QfListT,
+    bnr: i32,
+    pos: &crate::pos_defs::PosT,
+    n: crate::pos_defs::LinenrT,
+    dir: crate::vim_defs::Direction,
+    linewise: bool,
+) -> i32 {
+    let mut errornr = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let Some(idx) = (unsafe {
+        qf_find_closest_entry(qfl, bnr, pos, dir, linewise, &mut errornr)
+    }) else {
+        return 0;
+    };
+
+    let remaining = n - 1;
+    if remaining > 0 {
+        if dir == crate::vim_defs::Direction::Forward {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                qf_get_nth_below_entry(
+                    &qfl.qf_entries,
+                    idx,
+                    remaining,
+                    linewise,
+                    &mut errornr,
+                );
+            }
+        } else {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe {
+                qf_get_nth_above_entry(
+                    &qfl.qf_entries,
+                    idx,
+                    remaining,
+                    linewise,
+                    &mut errornr,
+                );
+            }
+        }
+    }
+    errornr
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1882,6 +1937,120 @@ mod tests {
         unsafe { qf_get_nth_above_entry(&entries, 1, 1, false, &mut errornr) };
 
         assert_eq!(errornr, 2);
+    }
+
+    #[test]
+    fn qf_find_nth_adj_entry_returns_the_closest_for_one() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![
+            entry_fl(7, 2),
+            entry_fl(7, 5),
+            entry_fl(7, 8),
+        ]);
+
+        assert_eq!(
+            unsafe {
+                qf_find_nth_adj_entry(
+                    &qfl,
+                    7,
+                    &pos_at(5, 0),
+                    1,
+                    crate::vim_defs::Direction::Forward,
+                    true,
+                )
+            },
+            3
+        );
+    }
+
+    #[test]
+    fn qf_find_nth_adj_entry_walks_the_remaining_distance() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![
+            entry_fl(7, 2),
+            entry_fl(7, 4),
+            entry_fl(7, 6),
+            entry_fl(7, 8),
+        ]);
+
+        assert_eq!(
+            unsafe {
+                qf_find_nth_adj_entry(
+                    &qfl,
+                    7,
+                    &pos_at(3, 0),
+                    3,
+                    crate::vim_defs::Direction::Forward,
+                    true,
+                )
+            },
+            4,
+            "closest is line 4, then two more steps reach line 8"
+        );
+        assert_eq!(
+            unsafe {
+                qf_find_nth_adj_entry(
+                    &qfl,
+                    7,
+                    &pos_at(9, 0),
+                    2,
+                    crate::vim_defs::Direction::Backward,
+                    true,
+                )
+            },
+            3,
+            "closest is line 8, then one step reaches line 6"
+        );
+    }
+
+    #[test]
+    fn qf_find_nth_adj_entry_returns_zero_when_no_entry_qualifies() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![entry_fl(1, 2)]);
+
+        assert_eq!(
+            unsafe {
+                qf_find_nth_adj_entry(
+                    &qfl,
+                    7,
+                    &pos_at(1, 0),
+                    1,
+                    crate::vim_defs::Direction::Forward,
+                    false,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn qf_find_nth_adj_entry_counts_a_repeated_line_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![
+            entry_fl(7, 2),
+            entry_fl(7, 2),
+            entry_fl(7, 3),
+            entry_fl(7, 4),
+        ]);
+
+        assert_eq!(
+            unsafe {
+                qf_find_nth_adj_entry(
+                    &qfl,
+                    7,
+                    &pos_at(1, 0),
+                    2,
+                    crate::vim_defs::Direction::Forward,
+                    true,
+                )
+            },
+            3,
+            "line 2 counts once, so the second result is line 3"
+        );
     }
 
     #[test]
