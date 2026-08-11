@@ -25,6 +25,7 @@ pub mod buffer;
 pub mod buffer_defs;
 pub mod buffer_updates;
 pub mod bufwrite;
+pub mod channel;
 pub mod change;
 pub mod charset;
 pub mod clipboard;
