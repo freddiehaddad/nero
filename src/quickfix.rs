@@ -657,6 +657,35 @@ pub fn qf_getprop_title(
     )
 }
 
+/// Adds the file-window id associated with a location-list window to
+/// `retdict` (`qf_getprop_filewinid`).
+///
+/// Non-location-list windows and stacks without an associated file
+/// window report zero.
+///
+/// # Safety
+/// The current window chain and all supplied pointers must remain
+/// valid while [`qf_find_win_with_loclist`] walks them.
+pub unsafe fn qf_getprop_filewinid(
+    wp: Option<&crate::buffer_defs::WinT>,
+    qi: *const crate::types_defs::QfInfoT,
+    retdict: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    let mut winid = 0;
+    if wp.is_some_and(is_ll_window) {
+        // SAFETY: forwarded from this function's own safety doc.
+        let ll_wp = unsafe { qf_find_win_with_loclist(qi) };
+        if !ll_wp.is_null() {
+            winid = unsafe { (*ll_wp).handle };
+        }
+    }
+    crate::eval::typval::tv_dict_add_nr(
+        retdict,
+        b"filewinid",
+        i64::from(winid),
+    )
+}
+
 /// Returns whether the list is non-empty AND has valid entries
 /// (`qf_list_has_valid_entries`).
 #[must_use]
@@ -3596,6 +3625,76 @@ mod tests {
         assert!(matches!(
             unsafe { &(*item).di_tv.value },
             crate::eval::typval_defs::TypvalValue::String(None)
+        ));
+    }
+
+    #[test]
+    fn qf_getprop_filewinid_reports_zero_without_a_location_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+
+        assert_eq!(
+            unsafe {
+                qf_getprop_filewinid(None, std::ptr::null(), dict.get())
+            },
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(dict.get()),
+            b"filewinid",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::Number(0)
+        ));
+    }
+
+    #[test]
+    fn qf_getprop_filewinid_finds_the_location_lists_file_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+        let mut qi = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let qi_ptr = std::ptr::addr_of_mut!(*qi);
+
+        let mut list_buf = Box::new(BufT::default());
+        list_buf.b_p_bt = Some(b"quickfix".to_vec());
+        let list_win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*list_buf),
+            w_llist_ref: qi_ptr,
+            ..Default::default()
+        };
+
+        let mut file_buf = Box::new(BufT::default());
+        let mut file_win = Box::new(WinT {
+            handle: 456,
+            w_buffer: std::ptr::addr_of_mut!(*file_buf),
+            w_llist: qi_ptr,
+            ..Default::default()
+        });
+        let file_win_ptr = std::ptr::addr_of_mut!(*file_win);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.firstwin,
+                file_win_ptr,
+            )
+        };
+
+        assert_eq!(
+            unsafe { qf_getprop_filewinid(Some(&list_win), qi_ptr, dict.get()) },
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(dict.get()),
+            b"filewinid",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::Number(456)
         ));
     }
 
