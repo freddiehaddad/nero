@@ -143,6 +143,8 @@ static GRID_LINE_FLAGS: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 static GRID_LINE_MAXCOL: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
+static GRID_LINE_GRID: crate::globals::GlobalCell<*mut crate::grid_defs::ScreenGrid> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
 
 /// `grid_put_linebuf` flag marking right-to-left text
 /// (`SLF_RIGHTLEFT`).
@@ -200,6 +202,28 @@ pub unsafe fn grid_line_fill(
         *GRID_LINE_LAST.get_mut() = (*GRID_LINE_LAST.get_mut()).max(end_col);
     }
     end_col
+}
+
+/// Writes one glyph and attribute into the current buffered grid line
+/// (`grid_line_put_schar`).
+///
+/// # Safety
+/// A grid line must have been started (`GRID_LINE_GRID` non-null), and
+/// all global line buffers must have at least `GRID_LINE_MAXCOL`
+/// entries.
+pub unsafe fn grid_line_put_schar(col: i32, schar: ScharT, attr: i32) {
+    assert!(!unsafe { *GRID_LINE_GRID.get_mut() }.is_null());
+    if col >= unsafe { *GRID_LINE_MAXCOL.get_mut() } {
+        return;
+    }
+    let col_idx = usize::try_from(col).expect("col must be nonnegative");
+    unsafe {
+        (&mut *LINEBUF_CHAR.get_mut())[col_idx] = schar;
+        (&mut *LINEBUF_ATTR.get_mut())[col_idx] = attr;
+        (&mut *LINEBUF_VCOL.get_mut())[col_idx] = -1;
+        *GRID_LINE_FIRST.get_mut() = (*GRID_LINE_FIRST.get_mut()).min(col);
+        *GRID_LINE_LAST.get_mut() = (*GRID_LINE_LAST.get_mut()).max(col + 1);
+    }
 }
 
 /// Mirrors a buffered line range for right-to-left drawing
@@ -868,6 +892,22 @@ mod tests {
         }
     }
 
+    struct GridLineGridGuard(*mut crate::grid_defs::ScreenGrid);
+
+    impl GridLineGridGuard {
+        fn install(grid: *mut crate::grid_defs::ScreenGrid) -> Self {
+            let saved = unsafe { *GRID_LINE_GRID.get_mut() };
+            unsafe { *GRID_LINE_GRID.get_mut() = grid };
+            Self(saved)
+        }
+    }
+
+    impl Drop for GridLineGridGuard {
+        fn drop(&mut self) {
+            unsafe { *GRID_LINE_GRID.get_mut() = self.0 };
+        }
+    }
+
     #[test]
     fn grid_line_clear_end_starts_a_new_range_before_existing_output() {
         let _lock = crate::globals::global_state_test_lock();
@@ -930,6 +970,48 @@ mod tests {
         assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[1; 4]);
         assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 1);
         assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 3);
+    }
+
+    #[test]
+    fn grid_line_put_schar_updates_one_cell_and_the_dirty_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(8, 1);
+        unsafe { *GRID_LINE_MAXCOL.get_mut() = 5 };
+        let _buf = LinebufStateGuard::install(
+            vec![0; 5],
+            vec![0; 5],
+            vec![7; 5],
+        );
+        let mut grid = crate::grid_defs::ScreenGrid::default();
+        let _grid = GridLineGridGuard::install(std::ptr::addr_of_mut!(grid));
+
+        unsafe { grid_line_put_schar(2, 42, 9) };
+
+        assert_eq!(unsafe { (&*LINEBUF_CHAR.get_mut())[2] }, 42);
+        assert_eq!(unsafe { (&*LINEBUF_ATTR.get_mut())[2] }, 9);
+        assert_eq!(unsafe { (&*LINEBUF_VCOL.get_mut())[2] }, -1);
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 2);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 3);
+    }
+
+    #[test]
+    fn grid_line_put_schar_ignores_columns_at_or_past_maxcol() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        unsafe { *GRID_LINE_MAXCOL.get_mut() = 3 };
+        let _buf = LinebufStateGuard::install(
+            vec![0; 3],
+            vec![0; 3],
+            vec![0; 3],
+        );
+        let mut grid = crate::grid_defs::ScreenGrid::default();
+        let _grid = GridLineGridGuard::install(std::ptr::addr_of_mut!(grid));
+
+        unsafe { grid_line_put_schar(3, 42, 9) };
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[0, 0, 0]);
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 1);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 2);
     }
 
     #[test]
