@@ -243,6 +243,33 @@ pub fn free_register(reg: &mut YankregT) {
     reg.y_array = None;
 }
 
+/// Updates a blockwise register's width from its contents
+/// (`update_yankreg_width`).
+///
+/// The stored width is the maximum screen-cell width minus one, and
+/// never shrinks. Non-blockwise registers are untouched.
+///
+/// # Safety
+/// Reads multibyte option state through
+/// [`crate::mbyte::mb_string2cells`].
+pub unsafe fn update_yankreg_width(reg: &mut YankregT) {
+    if reg.y_type != crate::normal_defs::MotionType::BlockWise {
+        return;
+    }
+
+    let maxlen = reg
+        .y_array
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        // SAFETY: forwarded from this function's own safety doc.
+        .map(|line| unsafe { crate::mbyte::mb_string2cells(line) })
+        .max()
+        .unwrap_or(0);
+    let measured = i32::try_from(maxlen).expect("register line width must fit in i32") - 1;
+    reg.y_width = reg.y_width.max(measured);
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -814,6 +841,64 @@ mod tests {
         free_register(&mut reg);
         free_register(&mut reg);
         assert!(reg.y_array.is_none());
+    }
+
+    #[test]
+    fn update_yankreg_width_uses_the_widest_blockwise_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut reg = YankregT {
+            y_array: Some(vec![b"ab".to_vec(), b"hello".to_vec(), b"xyz".to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            ..Default::default()
+        };
+
+        unsafe { update_yankreg_width(&mut reg) };
+
+        assert_eq!(reg.y_width, 4, "five cells are stored as width minus one");
+    }
+
+    #[test]
+    fn update_yankreg_width_never_shrinks_an_existing_width() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut reg = YankregT {
+            y_array: Some(vec![b"ab".to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            y_width: 9,
+            ..Default::default()
+        };
+
+        unsafe { update_yankreg_width(&mut reg) };
+
+        assert_eq!(reg.y_width, 9);
+    }
+
+    #[test]
+    fn update_yankreg_width_ignores_non_blockwise_registers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut reg = YankregT {
+            y_array: Some(vec![b"very long line".to_vec()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            y_width: 3,
+            ..Default::default()
+        };
+
+        unsafe { update_yankreg_width(&mut reg) };
+
+        assert_eq!(reg.y_width, 3);
+    }
+
+    #[test]
+    fn update_yankreg_width_counts_multibyte_screen_cells() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut reg = YankregT {
+            y_array: Some(vec!["一a".as_bytes().to_vec()]),
+            y_type: crate::normal_defs::MotionType::BlockWise,
+            ..Default::default()
+        };
+
+        unsafe { update_yankreg_width(&mut reg) };
+
+        assert_eq!(reg.y_width, 2, "a double-width glyph plus ASCII occupies 3 cells");
     }
 
     #[test]
