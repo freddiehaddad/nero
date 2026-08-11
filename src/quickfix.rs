@@ -1029,6 +1029,25 @@ pub fn qf_id2nr(qi: &crate::types_defs::QfInfoT, qfid: u32) -> i32 {
     INVALID_QFIDX
 }
 
+/// Restores list `save_qfid` as the current list
+/// (`qf_restore_list`).
+///
+/// This is used after autocommands, which may have selected another
+/// list. Returns `FAIL` without changing the selection when the saved
+/// list no longer exists.
+pub fn qf_restore_list(qi: &mut crate::types_defs::QfInfoT, save_qfid: u32) -> i32 {
+    if qf_get_curlist(qi).is_some_and(|qfl| qfl.qf_id == save_qfid) {
+        return crate::vim_defs::OK;
+    }
+
+    let curlist = qf_id2nr(qi, save_qfid);
+    if curlist < 0 {
+        return crate::vim_defs::FAIL;
+    }
+    qi.qf_curlist = curlist;
+    crate::vim_defs::OK
+}
+
 /// Set the title of the specified quickfix list (`qf_store_title`).
 ///
 /// `None` leaves the previous title cleared. The original's
@@ -4118,6 +4137,40 @@ mod tests {
         qi.qf_lists[2].qf_id = 33;
         qi.qf_listcount = 2;
         assert_eq!(qf_id2nr(&qi, 33), INVALID_QFIDX);
+    }
+
+    #[test]
+    fn qf_restore_list_is_a_noop_when_the_saved_list_is_current() {
+        let mut qi = stack_with(2);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_curlist = 1;
+
+        assert_eq!(qf_restore_list(&mut qi, 22), crate::vim_defs::OK);
+        assert_eq!(qi.qf_curlist, 1);
+    }
+
+    #[test]
+    fn qf_restore_list_selects_the_saved_list_by_id() {
+        let mut qi = stack_with(3);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_lists[2].qf_id = 33;
+        qi.qf_curlist = 0;
+
+        assert_eq!(qf_restore_list(&mut qi, 33), crate::vim_defs::OK);
+        assert_eq!(qi.qf_curlist, 2);
+    }
+
+    #[test]
+    fn qf_restore_list_fails_without_changing_selection_when_id_is_gone() {
+        let mut qi = stack_with(2);
+        qi.qf_lists[0].qf_id = 11;
+        qi.qf_lists[1].qf_id = 22;
+        qi.qf_curlist = 1;
+
+        assert_eq!(qf_restore_list(&mut qi, 99), crate::vim_defs::FAIL);
+        assert_eq!(qi.qf_curlist, 1);
     }
 
     #[test]
