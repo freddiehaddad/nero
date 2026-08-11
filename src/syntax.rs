@@ -98,6 +98,31 @@ pub unsafe fn syn_cur_foldlevel() -> i32 {
         .count() as i32
 }
 
+/// Pushes a cleared state onto the current state stack, with its
+/// pattern index set to `idx` (`push_current_state`).
+///
+/// # Safety
+/// Mutates the `CURRENT_STATE` file-static.
+pub unsafe fn push_current_state(idx: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { &mut *CURRENT_STATE.get_mut() };
+    state.push(StateItemT {
+        si_idx: idx,
+        ..Default::default()
+    });
+}
+
+/// The number of items on the current state stack
+/// (`current_state.ga_len`).
+///
+/// # Safety
+/// Reads the `CURRENT_STATE` file-static.
+#[must_use]
+pub unsafe fn current_state_len() -> usize {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*CURRENT_STATE.get_mut()).len() }
+}
+
 /// The text of the current line in the syntax buffer
 /// (`syn_getcurline`).
 ///
@@ -1197,6 +1222,60 @@ mod tests {
 
         unsafe { *CURRENT_SUB_CHAR.get_mut() = i32::from(b'x') };
         assert_eq!(unsafe { syn_get_sub_char() }, i32::from(b'x'));
+    }
+
+    // ---- push_current_state ----
+
+    /// A pushed state carries the given index and is otherwise
+    /// cleared, matching the original's own `CLEAR_POINTER` before it
+    /// assigns `si_idx`.
+    #[test]
+    fn push_current_state_appends_a_cleared_item_with_the_given_index() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        unsafe { push_current_state(7) };
+
+        assert_eq!(unsafe { current_state_len() }, 1);
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        assert_eq!(state[0].si_idx, 7);
+        assert_eq!(state[0].si_flags, 0, "the rest of the item is cleared");
+        assert_eq!(state[0].si_id, 0);
+        assert!(!state[0].si_ends);
+        assert!(state[0].si_cont_list.is_empty());
+        assert!(state[0].si_extmatch.is_null());
+    }
+
+    /// States stack rather than replace, innermost last, and the
+    /// keyword sentinel is stored as-is.
+    #[test]
+    fn push_current_state_stacks_items_in_order() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        unsafe {
+            push_current_state(2);
+            push_current_state(KEYWORD_IDX);
+            push_current_state(5);
+        }
+
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        let idxs: Vec<i32> = state.iter().map(|si| si.si_idx).collect();
+        assert_eq!(idxs, vec![2, KEYWORD_IDX, 5]);
+    }
+
+    /// A pushed state does not fold unless its flags say so, so
+    /// pushing alone must not change the fold level.
+    #[test]
+    fn push_current_state_does_not_change_the_fold_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = CurrentStackGuard::install(Vec::new());
+
+        unsafe {
+            push_current_state(1);
+            push_current_state(2);
+        }
+        assert_eq!(unsafe { syn_cur_foldlevel() }, 0);
     }
 
     // ---- syn_cur_foldlevel ----
