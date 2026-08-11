@@ -54,6 +54,14 @@ use crate::eval::typval_defs::ScidT;
 use crate::globals::GlobalCell;
 use crate::runtime_defs::ScriptitemT;
 
+static RUNTIME_SEARCH_PATH_VALID: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Invalidates the cached runtime search path after `'runtimepath'`
+/// changes (`did_set_runtimepackpath`).
+pub fn did_set_runtimepackpath() {
+    unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() = false };
+}
+
 /// `script_items` - the growable registry of all sourced scripts,
 /// indexed by script ID minus one (`SCRIPT_ITEM(id)` in the original).
 /// See this module's own doc comment for why this is a plain
@@ -471,6 +479,14 @@ pub(crate) fn tests_reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn did_set_runtimepackpath_invalidates_the_cached_search_path() {
+        let _lock = global_state_test_lock();
+        unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() = true };
+        did_set_runtimepackpath();
+        assert!(!unsafe { *RUNTIME_SEARCH_PATH_VALID.get_mut() });
+    }
     use crate::globals::global_state_test_lock;
 
     /// Saves and restores `EXESTACK` so a test cannot leak frames,
