@@ -141,6 +141,8 @@ static GRID_LINE_CLEAR_ATTR: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 static GRID_LINE_FLAGS: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
+static GRID_LINE_MAXCOL: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
 
 /// `grid_put_linebuf` flag marking right-to-left text
 /// (`SLF_RIGHTLEFT`).
@@ -166,6 +168,38 @@ pub fn grid_line_clear_end(
         *GRID_LINE_BG_ATTR.get_mut() = bg_attr;
         *GRID_LINE_CLEAR_ATTR.get_mut() = clear_attr;
     }
+}
+
+/// Fills a range in the currently buffered grid line
+/// (`grid_line_fill`) and returns the clamped end column.
+///
+/// # Safety
+/// The global line buffers must contain at least
+/// `GRID_LINE_MAXCOL` cells.
+pub unsafe fn grid_line_fill(
+    start_col: i32,
+    end_col: i32,
+    sc: ScharT,
+    attr: i32,
+) -> i32 {
+    let end_col = end_col.min(unsafe { *GRID_LINE_MAXCOL.get_mut() });
+    if start_col >= end_col {
+        return end_col;
+    }
+    let start = usize::try_from(start_col).expect("start_col must be nonnegative");
+    let end = usize::try_from(end_col).expect("end_col must be nonnegative");
+    for col in start..end {
+        unsafe {
+            (&mut *LINEBUF_CHAR.get_mut())[col] = sc;
+            (&mut *LINEBUF_ATTR.get_mut())[col] = attr;
+            (&mut *LINEBUF_VCOL.get_mut())[col] = -1;
+        }
+    }
+    unsafe {
+        *GRID_LINE_FIRST.get_mut() = (*GRID_LINE_FIRST.get_mut()).min(start_col);
+        *GRID_LINE_LAST.get_mut() = (*GRID_LINE_LAST.get_mut()).max(end_col);
+    }
+    end_col
 }
 
 /// Mirrors a buffered line range for right-to-left drawing
@@ -763,7 +797,7 @@ pub unsafe fn grid_getchar(
 mod tests {
     use super::*;
 
-    struct GridLineStateGuard([i32; 6]);
+    struct GridLineStateGuard([i32; 7]);
 
     impl GridLineStateGuard {
         fn install(first: i32, last: i32) -> Self {
@@ -775,12 +809,14 @@ mod tests {
                     *GRID_LINE_BG_ATTR.get_mut(),
                     *GRID_LINE_CLEAR_ATTR.get_mut(),
                     *GRID_LINE_FLAGS.get_mut(),
+                    *GRID_LINE_MAXCOL.get_mut(),
                 ]
             };
             unsafe {
                 *GRID_LINE_FIRST.get_mut() = first;
                 *GRID_LINE_LAST.get_mut() = last;
                 *GRID_LINE_FLAGS.get_mut() = 0;
+                *GRID_LINE_MAXCOL.get_mut() = 0;
             }
             Self(saved)
         }
@@ -795,6 +831,7 @@ mod tests {
                 *GRID_LINE_BG_ATTR.get_mut() = self.0[3];
                 *GRID_LINE_CLEAR_ATTR.get_mut() = self.0[4];
                 *GRID_LINE_FLAGS.get_mut() = self.0[5];
+                *GRID_LINE_MAXCOL.get_mut() = self.0[6];
             }
         }
     }
@@ -855,6 +892,44 @@ mod tests {
         assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 5);
         assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 12);
         assert_eq!(unsafe { *GRID_LINE_CLEAR_TO.get_mut() }, 40);
+    }
+
+    #[test]
+    fn grid_line_fill_clamps_fills_and_updates_the_dirty_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(8, 1);
+        unsafe { *GRID_LINE_MAXCOL.get_mut() = 5 };
+        let _buf = LinebufStateGuard::install(
+            vec![0; 6],
+            vec![0; 6],
+            vec![7; 6],
+        );
+
+        let end = unsafe { grid_line_fill(2, 99, 42, 11) };
+
+        assert_eq!(end, 5);
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[0, 0, 42, 42, 42, 0]);
+        assert_eq!(unsafe { &*LINEBUF_ATTR.get_mut() }, &[0, 0, 11, 11, 11, 0]);
+        assert_eq!(unsafe { &*LINEBUF_VCOL.get_mut() }, &[7, 7, -1, -1, -1, 7]);
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 2);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 5);
+    }
+
+    #[test]
+    fn grid_line_fill_is_a_noop_for_an_empty_clamped_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 3);
+        unsafe { *GRID_LINE_MAXCOL.get_mut() = 4 };
+        let _buf = LinebufStateGuard::install(
+            vec![1; 4],
+            vec![2; 4],
+            vec![3; 4],
+        );
+
+        assert_eq!(unsafe { grid_line_fill(4, 9, 8, 9) }, 4);
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[1; 4]);
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 1);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 3);
     }
 
     #[test]
