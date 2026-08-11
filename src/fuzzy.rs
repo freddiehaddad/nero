@@ -632,6 +632,58 @@ pub fn fuzzy_match_str_with_pos(
     Some(positions[..count].to_vec())
 }
 
+/// Fuzzy-matches each word in a line (`fuzzy_match_str_in_line`).
+///
+/// `ptr` is a byte offset into `line`; on success it becomes the
+/// matched word's start, and on failure the line end. `len`/`score`
+/// mirror the original out-parameters.
+///
+/// # Safety
+/// Word-boundary checks read the current buffer's character table.
+pub unsafe fn fuzzy_match_str_in_line(
+    line: &[u8],
+    ptr: &mut usize,
+    pat: &str,
+    len: &mut i32,
+    current_pos: Option<&mut crate::pos_defs::PosT>,
+    score: &mut i32,
+) -> bool {
+    let original = *ptr;
+    let line_end = original + crate::insexpand::find_line_end(&line[original..]);
+    let mut cursor = original;
+    let mut current_pos = current_pos;
+
+    while cursor < line_end {
+        let start = cursor
+            + unsafe {
+                crate::insexpand::find_word_start(&line[cursor..line_end])
+            };
+        if start >= line_end || line[start] == 0 {
+            break;
+        }
+        let end = start
+            + unsafe {
+                crate::insexpand::find_word_end(&line[start..line_end])
+            };
+        let word = std::str::from_utf8(&line[start..end])
+            .expect("editor text must be valid UTF-8");
+        *score = fuzzy_match_str(word, pat);
+        if *score != FUZZY_SCORE_NONE {
+            *len = i32::try_from(end - start).expect("word length must fit i32");
+            *ptr = start;
+            if let Some(pos) = current_pos.as_deref_mut() {
+                pos.col += i32::try_from(end - original)
+                    .expect("line offset must fit i32");
+            }
+            return true;
+        }
+        cursor = end;
+    }
+
+    *ptr = line_end;
+    false
+}
+
 /// `fuzzy_match_str`: fuzzy match `pat` against the whole of `str_` (no
 /// whitespace-splitting) and return just the score, or `0` if either is
 /// empty (matching the original's early-return for `NULL`).
@@ -709,6 +761,67 @@ mod tests {
             fuzzy_match_str_with_pos(Some("abc"), Some("xyz")),
             None
         );
+    }
+
+    #[test]
+    fn fuzzy_match_str_in_line_finds_a_later_word_and_updates_outputs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                std::ptr::addr_of_mut!(buf),
+            )
+        };
+        let line = b"  alpha beta\n";
+        let mut ptr = 0;
+        let mut len = 0;
+        let mut score = 0;
+        let mut pos = crate::pos_defs::PosT::default();
+
+        assert!(unsafe {
+            fuzzy_match_str_in_line(
+                line,
+                &mut ptr,
+                "bt",
+                &mut len,
+                Some(&mut pos),
+                &mut score,
+            )
+        });
+        assert_eq!(ptr, 8);
+        assert_eq!(len, 4);
+        assert!(score > 0);
+        assert_eq!(pos.col, 12, "the original advances by the matched word's end");
+    }
+
+    #[test]
+    fn fuzzy_match_str_in_line_moves_to_line_end_when_no_word_matches() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                std::ptr::addr_of_mut!(buf),
+            )
+        };
+        let mut ptr = 0;
+        let mut len = 99;
+        let mut score = 0;
+
+        assert!(!unsafe {
+            fuzzy_match_str_in_line(
+                b"alpha beta\n",
+                &mut ptr,
+                "zzz",
+                &mut len,
+                None,
+                &mut score,
+            )
+        });
+        assert_eq!(ptr, 10);
+        assert_eq!(len, 99, "no match leaves the length output untouched");
+        assert_eq!(score, FUZZY_SCORE_NONE);
     }
 
     #[test]
