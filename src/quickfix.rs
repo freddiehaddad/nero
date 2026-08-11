@@ -1093,9 +1093,155 @@ pub unsafe fn qf_find_win_with_normal_buf() -> *mut WinT {
     std::ptr::null_mut()
 }
 
+/// Whether the quickfix entry `qfp` is after `pos`
+/// (`qf_entry_after_pos`).
+///
+/// With `linewise` only the line number is considered; otherwise the
+/// column breaks a tie on the same line.
+#[must_use]
+pub fn qf_entry_after_pos(qfp: &QflineT, pos: &crate::pos_defs::PosT, linewise: bool) -> bool {
+    if linewise {
+        return qfp.qf_lnum > pos.lnum;
+    }
+    qfp.qf_lnum > pos.lnum || (qfp.qf_lnum == pos.lnum && qfp.qf_col > pos.col)
+}
+
+/// Whether the quickfix entry `qfp` is before `pos`
+/// (`qf_entry_before_pos`).
+///
+/// See [`qf_entry_after_pos`] for how `linewise` is treated.
+#[must_use]
+pub fn qf_entry_before_pos(qfp: &QflineT, pos: &crate::pos_defs::PosT, linewise: bool) -> bool {
+    if linewise {
+        return qfp.qf_lnum < pos.lnum;
+    }
+    qfp.qf_lnum < pos.lnum || (qfp.qf_lnum == pos.lnum && qfp.qf_col < pos.col)
+}
+
+/// Whether the quickfix entry `qfp` is on or after `pos`
+/// (`qf_entry_on_or_after_pos`).
+///
+/// Note the line comparison stays strict even here: only the column
+/// test is relaxed to `>=`, so an entry on the same line still has to
+/// reach `pos`'s column.
+#[must_use]
+pub fn qf_entry_on_or_after_pos(
+    qfp: &QflineT,
+    pos: &crate::pos_defs::PosT,
+    linewise: bool,
+) -> bool {
+    if linewise {
+        return qfp.qf_lnum >= pos.lnum;
+    }
+    qfp.qf_lnum > pos.lnum || (qfp.qf_lnum == pos.lnum && qfp.qf_col >= pos.col)
+}
+
+/// Whether the quickfix entry `qfp` is on or before `pos`
+/// (`qf_entry_on_or_before_pos`).
+///
+/// See [`qf_entry_on_or_after_pos`] for the asymmetry between the
+/// line and column comparisons.
+#[must_use]
+pub fn qf_entry_on_or_before_pos(
+    qfp: &QflineT,
+    pos: &crate::pos_defs::PosT,
+    linewise: bool,
+) -> bool {
+    if linewise {
+        return qfp.qf_lnum <= pos.lnum;
+    }
+    qfp.qf_lnum < pos.lnum || (qfp.qf_lnum == pos.lnum && qfp.qf_col <= pos.col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_entry_*_pos ---
+
+    fn entry_at(lnum: i32, col: i32) -> QflineT {
+        QflineT {
+            qf_lnum: lnum,
+            qf_col: col,
+            ..Default::default()
+        }
+    }
+
+    fn pos_at(lnum: i32, col: i32) -> crate::pos_defs::PosT {
+        crate::pos_defs::PosT {
+            lnum,
+            col,
+            coladd: 0,
+        }
+    }
+
+    /// At exactly the given position the four disagree, which is the
+    /// whole reason all four exist.
+    #[test]
+    fn qf_entry_pos_helpers_differ_at_the_exact_position() {
+        let e = entry_at(5, 3);
+        let p = pos_at(5, 3);
+
+        assert!(!qf_entry_after_pos(&e, &p, false), "not strictly after");
+        assert!(!qf_entry_before_pos(&e, &p, false), "not strictly before");
+        assert!(qf_entry_on_or_after_pos(&e, &p, false));
+        assert!(qf_entry_on_or_before_pos(&e, &p, false));
+    }
+
+    #[test]
+    fn qf_entry_pos_helpers_compare_columns_on_the_same_line() {
+        let p = pos_at(5, 3);
+
+        let later = entry_at(5, 4);
+        assert!(qf_entry_after_pos(&later, &p, false));
+        assert!(!qf_entry_before_pos(&later, &p, false));
+
+        let earlier = entry_at(5, 2);
+        assert!(!qf_entry_after_pos(&earlier, &p, false));
+        assert!(qf_entry_before_pos(&earlier, &p, false));
+    }
+
+    /// Linewise ignores the column entirely, so an entry on the same
+    /// line is neither after nor before regardless of its column.
+    #[test]
+    fn qf_entry_pos_helpers_ignore_the_column_when_linewise() {
+        let p = pos_at(5, 3);
+        for col in [0, 3, 99] {
+            let e = entry_at(5, col);
+            assert!(!qf_entry_after_pos(&e, &p, true), "col {col}");
+            assert!(!qf_entry_before_pos(&e, &p, true), "col {col}");
+            assert!(qf_entry_on_or_after_pos(&e, &p, true), "col {col}");
+            assert!(qf_entry_on_or_before_pos(&e, &p, true), "col {col}");
+        }
+    }
+
+    /// The line test stays strict in the "on or" variants: only the
+    /// column comparison is relaxed. An entry on an earlier line must
+    /// not count as "on or after" just because its column is large.
+    #[test]
+    fn qf_entry_on_or_after_keeps_the_line_test_strict() {
+        let p = pos_at(5, 3);
+
+        let earlier_line_big_col = entry_at(4, 99);
+        assert!(!qf_entry_on_or_after_pos(&earlier_line_big_col, &p, false));
+
+        let later_line_small_col = entry_at(6, 0);
+        assert!(!qf_entry_on_or_before_pos(&later_line_small_col, &p, false));
+        assert!(qf_entry_on_or_after_pos(&later_line_small_col, &p, false));
+    }
+
+    #[test]
+    fn qf_entry_pos_helpers_compare_lines_first() {
+        let p = pos_at(5, 3);
+
+        let below = entry_at(9, 0);
+        assert!(qf_entry_after_pos(&below, &p, false));
+        assert!(qf_entry_after_pos(&below, &p, true));
+
+        let above = entry_at(1, 99);
+        assert!(qf_entry_before_pos(&above, &p, false));
+        assert!(qf_entry_before_pos(&above, &p, true));
+    }
 
     // --- qf_find_win_with_normal_buf ---
 
