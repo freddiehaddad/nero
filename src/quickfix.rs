@@ -1217,6 +1217,52 @@ pub unsafe fn qf_find_entry_before_pos(
     Some(idx)
 }
 
+/// Finds the quickfix entry in buffer `bnr` closest to `pos` in
+/// `dir` (`qf_find_closest_entry`).
+///
+/// `errornr` receives the selected entry's one-based quickfix number.
+/// `None` means either the buffer has no entry or none lies in the
+/// requested direction.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int` through the constituent search helpers.
+#[must_use]
+pub unsafe fn qf_find_closest_entry(
+    qfl: &QfListT,
+    bnr: i32,
+    pos: &crate::pos_defs::PosT,
+    dir: crate::vim_defs::Direction,
+    linewise: bool,
+    errornr: &mut i32,
+) -> Option<usize> {
+    *errornr = 0;
+    // SAFETY: forwarded from this function's own safety doc.
+    let start = unsafe { qf_find_first_entry_in_buf(qfl, bnr, errornr) }?;
+
+    if dir == crate::vim_defs::Direction::Forward {
+        qf_find_entry_after_pos(
+            &qfl.qf_entries,
+            bnr,
+            pos,
+            linewise,
+            start,
+            errornr,
+        )
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            qf_find_entry_before_pos(
+                &qfl.qf_entries,
+                bnr,
+                pos,
+                linewise,
+                start,
+                errornr,
+            )
+        }
+    }
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1536,6 +1582,114 @@ mod tests {
             col,
             coladd: 0,
         }
+    }
+
+    fn qfl_with_entries(entries: Vec<QflineT>) -> QfListT {
+        QfListT {
+            qf_entries: entries,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qf_find_closest_entry_searches_forward() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![
+            entry_fl(7, 2),
+            entry_fl(7, 5),
+            entry_fl(7, 8),
+        ]);
+        let mut errornr = 99;
+
+        assert_eq!(
+            unsafe {
+                qf_find_closest_entry(
+                    &qfl,
+                    7,
+                    &pos_at(5, 0),
+                    crate::vim_defs::Direction::Forward,
+                    true,
+                    &mut errornr,
+                )
+            },
+            Some(2)
+        );
+        assert_eq!(errornr, 3);
+    }
+
+    #[test]
+    fn qf_find_closest_entry_searches_backward() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![
+            entry_fl(7, 2),
+            entry_fl(7, 5),
+            entry_fl(7, 8),
+        ]);
+        let mut errornr = 99;
+
+        assert_eq!(
+            unsafe {
+                qf_find_closest_entry(
+                    &qfl,
+                    7,
+                    &pos_at(5, 0),
+                    crate::vim_defs::Direction::Backward,
+                    true,
+                    &mut errornr,
+                )
+            },
+            Some(0)
+        );
+        assert_eq!(errornr, 1);
+    }
+
+    #[test]
+    fn qf_find_closest_entry_returns_none_without_that_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![entry_fl(1, 2), entry_fl(2, 5)]);
+        let mut errornr = 99;
+
+        assert_eq!(
+            unsafe {
+                qf_find_closest_entry(
+                    &qfl,
+                    7,
+                    &pos_at(5, 0),
+                    crate::vim_defs::Direction::Forward,
+                    false,
+                    &mut errornr,
+                )
+            },
+            None
+        );
+        assert_eq!(errornr, 3, "the initial scan ended one past the list");
+    }
+
+    #[test]
+    fn qf_find_closest_entry_returns_none_at_a_directional_boundary() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = qfl_with_entries(vec![entry_fl(7, 5)]);
+        let mut errornr = 99;
+
+        assert_eq!(
+            unsafe {
+                qf_find_closest_entry(
+                    &qfl,
+                    7,
+                    &pos_at(5, 0),
+                    crate::vim_defs::Direction::Backward,
+                    true,
+                    &mut errornr,
+                )
+            },
+            None,
+            "there is no entry on an earlier line"
+        );
+        assert_eq!(errornr, 1);
     }
 
     #[test]
