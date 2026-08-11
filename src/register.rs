@@ -216,6 +216,23 @@ pub unsafe fn op_reg_get(name: i32) -> Option<*const YankregT> {
     unsafe { get_y_register(idx) }.map(|ptr| ptr.cast_const())
 }
 
+/// Selects the register named by `name` as the previous yank register
+/// (`op_reg_set_previous`).
+///
+/// Returns `false` and leaves the previous selection untouched when
+/// the name has no direct register slot.
+///
+/// # Safety
+/// Mutates the `Y_PREVIOUS` file-static.
+pub unsafe fn op_reg_set_previous(name: i32) -> bool {
+    let Some(idx) = op_reg_index(name) else {
+        return false;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *Y_PREVIOUS.get_mut() = Some(idx) };
+    true
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -712,6 +729,45 @@ mod tests {
         let _lock = crate::globals::global_state_test_lock();
         assert_eq!(unsafe { op_reg_get(i32::from(b'!')) }, None);
         assert_eq!(unsafe { op_reg_get(i32::from(b'"')) }, None);
+    }
+
+    struct PreviousRegisterGuard(Option<usize>);
+
+    impl PreviousRegisterGuard {
+        fn save() -> Self {
+            // SAFETY: the caller holds the global-state test lock.
+            Self(unsafe { *Y_PREVIOUS.get_mut() })
+        }
+    }
+
+    impl Drop for PreviousRegisterGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `save`.
+            unsafe { *Y_PREVIOUS.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn op_reg_set_previous_selects_the_named_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PreviousRegisterGuard::save();
+
+        assert!(unsafe { op_reg_set_previous(i32::from(b'd')) });
+        assert_eq!(
+            unsafe { get_y_previous() }.cast_const(),
+            unsafe { op_reg_get(i32::from(b'd')) }.unwrap()
+        );
+    }
+
+    #[test]
+    fn op_reg_set_previous_rejects_invalid_names_without_changing_selection() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PreviousRegisterGuard::save();
+        assert!(unsafe { op_reg_set_previous(i32::from(b'a')) });
+        let before = unsafe { get_y_previous() };
+
+        assert!(!unsafe { op_reg_set_previous(i32::from(b'!')) });
+        assert_eq!(unsafe { get_y_previous() }, before);
     }
 
     #[test]
