@@ -357,6 +357,19 @@ pub fn qf_parse_fmt_c(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%k` end-column number
+/// (`qf_parse_fmt_k`).
+pub fn qf_parse_fmt_k(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(value) = qf_parse_atol_match(matched) else {
+        return qf_status::QF_FAIL;
+    };
+    fields.end_col = value;
+    qf_status::QF_OK
+}
+
 /// Parses an `'errorformat'` `%t` error-type match
 /// (`qf_parse_fmt_t`).
 pub fn qf_parse_fmt_t(
@@ -2072,6 +2085,26 @@ mod tests {
         };
         assert_eq!(qf_parse_fmt_c(None, &mut fields), qf_status::QF_FAIL);
         assert_eq!(fields.col, 6);
+    }
+
+    #[test]
+    fn qf_parse_fmt_k_parses_the_end_column_number() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_k(Some(b"29"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.end_col, 29);
+    }
+
+    #[test]
+    fn qf_parse_fmt_k_rejects_a_missing_match_without_changing_end_column() {
+        let mut fields = QffieldsT {
+            end_col: 6,
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_k(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.end_col, 6);
     }
 
     #[test]
