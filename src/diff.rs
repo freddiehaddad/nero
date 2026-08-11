@@ -366,6 +366,24 @@ pub fn clear_diffout(dout: &mut DiffoutT) {
     }
 }
 
+/// Copies the next in-memory diff hunk into `hunk`
+/// (`extract_hunk_internal`).
+///
+/// Returns `true` at end of input. On EOF both `hunk` and `line_idx`
+/// are left untouched.
+pub fn extract_hunk_internal(
+    dout: &DiffoutT,
+    hunk: &mut DiffhunkT,
+    line_idx: &mut usize,
+) -> bool {
+    if *line_idx >= dout.dout_ga.items.len() {
+        return true;
+    }
+    *hunk = dout.dout_ga.items[*line_idx];
+    *line_idx += 1;
+    false
+}
+
 /// Copy one diff entry's line range from one buffer slot to another
 /// (`diff_copy_entry`).
 ///
@@ -948,6 +966,62 @@ mod tests {
         let dout = DiffoutT::default();
         assert!(dout.dout_ga.is_empty());
         assert_eq!(dout.dout_ga.ga_growsize, 100);
+    }
+
+    #[test]
+    fn extract_hunk_internal_returns_hunks_in_order() {
+        let first = DiffhunkT {
+            lnum_orig: 1,
+            count_orig: 2,
+            lnum_new: 3,
+            count_new: 4,
+        };
+        let second = DiffhunkT {
+            lnum_orig: 8,
+            count_orig: 1,
+            lnum_new: 9,
+            count_new: 0,
+        };
+        let mut dout = DiffoutT::default();
+        dout.dout_ga.items.extend([first, second]);
+        let mut idx = 0;
+        let mut got = DiffhunkT::default();
+
+        assert!(!extract_hunk_internal(&dout, &mut got, &mut idx));
+        assert_eq!(got, first);
+        assert_eq!(idx, 1);
+        assert!(!extract_hunk_internal(&dout, &mut got, &mut idx));
+        assert_eq!(got, second);
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn extract_hunk_internal_reports_eof_without_changing_outputs() {
+        let dout = DiffoutT::default();
+        let original = DiffhunkT {
+            lnum_orig: 7,
+            count_orig: 6,
+            lnum_new: 5,
+            count_new: 4,
+        };
+        let mut got = original;
+        let mut idx = 0;
+
+        assert!(extract_hunk_internal(&dout, &mut got, &mut idx));
+        assert_eq!(got, original);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn extract_hunk_internal_remains_at_eof_after_consuming_the_last_hunk() {
+        let mut dout = DiffoutT::default();
+        dout.dout_ga.items.push(DiffhunkT::default());
+        let mut idx = 0;
+        let mut got = DiffhunkT::default();
+        assert!(!extract_hunk_internal(&dout, &mut got, &mut idx));
+
+        assert!(extract_hunk_internal(&dout, &mut got, &mut idx));
+        assert_eq!(idx, 1);
     }
 
     // --- clear_diffin / clear_diffout ---
