@@ -1129,6 +1129,49 @@ pub unsafe fn qf_find_first_entry_in_buf(
     None
 }
 
+/// Finds the first quickfix entry after `pos` in buffer `bnr`
+/// (`qf_find_entry_after_pos`).
+///
+/// `start_idx` names the first entry in that buffer and `errornr` is
+/// its one-based quickfix number. The returned value is the matching
+/// zero-based `Vec` index.
+///
+/// # Panics
+/// Panics when `start_idx` is outside `entries`, matching the
+/// original's requirement that its starting entry pointer is valid.
+#[must_use]
+pub fn qf_find_entry_after_pos(
+    entries: &[QflineT],
+    bnr: i32,
+    pos: &crate::pos_defs::PosT,
+    linewise: bool,
+    start_idx: usize,
+    errornr: &mut i32,
+) -> Option<usize> {
+    assert!(start_idx < entries.len(), "start_idx must name a quickfix entry");
+    let mut idx = start_idx;
+
+    if qf_entry_after_pos(&entries[idx], pos, linewise) {
+        return Some(idx);
+    }
+
+    while idx + 1 < entries.len()
+        && entries[idx + 1].qf_fnum == bnr
+        && qf_entry_on_or_before_pos(&entries[idx + 1], pos, linewise)
+    {
+        idx += 1;
+        *errornr += 1;
+    }
+
+    if idx + 1 >= entries.len() || entries[idx + 1].qf_fnum != bnr {
+        return None;
+    }
+
+    idx += 1;
+    *errornr += 1;
+    Some(idx)
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1448,6 +1491,93 @@ mod tests {
             col,
             coladd: 0,
         }
+    }
+
+    #[test]
+    fn qf_find_entry_after_pos_returns_the_start_when_it_is_already_after() {
+        let entries = vec![entry_fl(7, 6), entry_fl(7, 9)];
+        let mut errornr = 4;
+
+        assert_eq!(
+            qf_find_entry_after_pos(
+                &entries,
+                7,
+                &pos_at(5, 99),
+                false,
+                0,
+                &mut errornr,
+            ),
+            Some(0)
+        );
+        assert_eq!(errornr, 4, "the starting entry number is unchanged");
+    }
+
+    #[test]
+    fn qf_find_entry_after_pos_skips_entries_on_or_before_the_position() {
+        let mut entries = vec![
+            entry_fl(7, 3),
+            entry_fl(7, 5),
+            entry_fl(7, 5),
+            entry_fl(7, 6),
+        ];
+        entries[1].qf_col = 2;
+        entries[2].qf_col = 4;
+        let mut errornr = 10;
+
+        assert_eq!(
+            qf_find_entry_after_pos(
+                &entries,
+                7,
+                &pos_at(5, 3),
+                false,
+                0,
+                &mut errornr,
+            ),
+            Some(2),
+            "the column-4 entry is the first strictly after column 3"
+        );
+        assert_eq!(errornr, 12);
+    }
+
+    #[test]
+    fn qf_find_entry_after_pos_returns_none_at_the_end_of_the_buffer_run() {
+        let entries = vec![entry_fl(7, 3), entry_fl(7, 5), entry_fl(8, 9)];
+        let mut errornr = 2;
+
+        assert_eq!(
+            qf_find_entry_after_pos(
+                &entries,
+                7,
+                &pos_at(9, 0),
+                false,
+                0,
+                &mut errornr,
+            ),
+            None
+        );
+        assert_eq!(errornr, 3, "the scan advanced to the last entry in buffer 7");
+    }
+
+    #[test]
+    fn qf_find_entry_after_pos_treats_a_line_as_one_when_linewise() {
+        let mut entries = vec![entry_fl(7, 5), entry_fl(7, 5), entry_fl(7, 6)];
+        entries[0].qf_col = 1;
+        entries[1].qf_col = 99;
+        let mut errornr = 1;
+
+        assert_eq!(
+            qf_find_entry_after_pos(
+                &entries,
+                7,
+                &pos_at(5, 3),
+                true,
+                0,
+                &mut errornr,
+            ),
+            Some(2),
+            "both entries on line 5 are skipped regardless of column"
+        );
+        assert_eq!(errornr, 3);
     }
 
     /// At exactly the given position the four disagree, which is the
