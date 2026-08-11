@@ -190,9 +190,61 @@ pub unsafe fn win_float_find_altwin(
     }
 }
 
+/// Compares floating windows by descending z-index
+/// (`float_zindex_cmp`).
+///
+/// Returns zero for equal z-indices, a positive value when `a`
+/// belongs after `b`, and a negative value when it belongs before.
+#[must_use]
+pub fn float_zindex_cmp(a: &WinT, b: &WinT) -> i32 {
+    let za = a.w_config.zindex;
+    let zb = b.w_config.zindex;
+    if za == zb {
+        0
+    } else if za < zb {
+        1
+    } else {
+        -1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn float_with_zindex(zindex: i32) -> WinT {
+        let mut win = WinT::default();
+        win.w_config.zindex = zindex;
+        win
+    }
+
+    #[test]
+    fn float_zindex_cmp_orders_larger_zindex_first() {
+        let low = float_with_zindex(10);
+        let high = float_with_zindex(30);
+        assert!(float_zindex_cmp(&low, &high) > 0);
+        assert!(float_zindex_cmp(&high, &low) < 0);
+    }
+
+    #[test]
+    fn float_zindex_cmp_is_equal_for_equal_zindices() {
+        assert_eq!(
+            float_zindex_cmp(&float_with_zindex(20), &float_with_zindex(20)),
+            0
+        );
+    }
+
+    #[test]
+    fn float_zindex_cmp_drives_descending_sort_order() {
+        let mut wins = [
+            float_with_zindex(10),
+            float_with_zindex(30),
+            float_with_zindex(20),
+        ];
+        wins.sort_by(|a, b| float_zindex_cmp(a, b).cmp(&0));
+        let zindices = wins.map(|win| win.w_config.zindex);
+        assert_eq!(zindices, [30, 20, 10]);
+    }
 
     #[test]
     fn marks_a_window_anchored_float_as_position_changed() {
