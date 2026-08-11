@@ -645,6 +645,18 @@ pub fn qf_getprop_idx(qfl: &QfListT, eidx: i32) -> i32 {
     }
 }
 
+/// Adds the quickfix list title to `retdict` (`qf_getprop_title`).
+pub fn qf_getprop_title(
+    qfl: &QfListT,
+    retdict: &mut crate::eval::typval_defs::DictT,
+) -> i32 {
+    crate::eval::typval::tv_dict_add_str(
+        retdict,
+        b"title",
+        qfl.qf_title.as_deref(),
+    )
+}
+
 /// Returns whether the list is non-empty AND has valid entries
 /// (`qf_list_has_valid_entries`).
 #[must_use]
@@ -1702,6 +1714,24 @@ pub fn qf_entry_on_or_before_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDict(*mut crate::eval::typval_defs::DictT);
+
+    impl TestDict {
+        fn new() -> Self {
+            Self(crate::eval::typval::tv_dict_alloc())
+        }
+
+        fn get(&mut self) -> &mut crate::eval::typval_defs::DictT {
+            unsafe { &mut *self.0 }
+        }
+    }
+
+    impl Drop for TestDict {
+        fn drop(&mut self) {
+            unsafe { crate::eval::typval::tv_dict_free(self.0) };
+        }
+    }
 
     // --- qf_find_first_entry_in_buf / first/last_entry_on_line ---
 
@@ -3522,6 +3552,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qf_getprop_idx(&qfl, 0), 0);
+    }
+
+    #[test]
+    fn qf_getprop_title_adds_the_owned_title_string() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+        let qfl = QfListT {
+            qf_title: Some(b"build errors".to_vec()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            qf_getprop_title(&qfl, dict.get()),
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(dict.get()),
+            b"title",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(Some(title))
+                if title == b"build errors"
+        ));
+    }
+
+    #[test]
+    fn qf_getprop_title_preserves_a_null_title() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut dict = TestDict::new();
+
+        assert_eq!(
+            qf_getprop_title(&QfListT::default(), dict.get()),
+            crate::vim_defs::OK
+        );
+        let item = crate::eval::typval::tv_dict_find(
+            Some(dict.get()),
+            b"title",
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { &(*item).di_tv.value },
+            crate::eval::typval_defs::TypvalValue::String(None)
+        ));
     }
 
     #[test]
