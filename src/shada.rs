@@ -40,6 +40,28 @@ pub fn find_shada_parameter(shada: &[u8], kind: u8) -> Option<&[u8]> {
     None
 }
 
+/// Numeric value of parameter `kind` in a `'shada'` option
+/// (`get_shada_parameter`), or `-1` when it is absent or is not
+/// immediately followed by a decimal digit.
+#[must_use]
+pub fn get_shada_parameter(shada: &[u8], kind: u8) -> i32 {
+    let Some(rest) = find_shada_parameter(shada, kind) else {
+        return -1;
+    };
+    if !rest.first().is_some_and(u8::is_ascii_digit) {
+        return -1;
+    }
+
+    let mut value = 0_i32;
+    for &digit in rest.iter().take_while(|b| b.is_ascii_digit()) {
+        value = value
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(i32::from(digit - b'0')))
+            .expect("validated 'shada' numeric parameter must fit in i32");
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +124,28 @@ mod tests {
     fn find_shada_parameter_returns_none_for_missing_or_empty_values() {
         assert_eq!(find_shada_parameter(b"'100,<50", b's'), None);
         assert_eq!(find_shada_parameter(b"", b'\''), None);
+    }
+
+    #[test]
+    fn get_shada_parameter_parses_the_leading_decimal_number() {
+        assert_eq!(get_shada_parameter(b"'100,<50,s10", b'\''), 100);
+        assert_eq!(get_shada_parameter(b"'100,<50,s10", b'<'), 50);
+        assert_eq!(get_shada_parameter(b"'100,<50,s10", b's'), 10);
+    }
+
+    #[test]
+    fn get_shada_parameter_stops_at_the_next_option_part() {
+        assert_eq!(get_shada_parameter(b"'12,<345", b'\''), 12);
+    }
+
+    #[test]
+    fn get_shada_parameter_accepts_zero() {
+        assert_eq!(get_shada_parameter(b"'0", b'\''), 0);
+    }
+
+    #[test]
+    fn get_shada_parameter_returns_minus_one_without_a_number() {
+        assert_eq!(get_shada_parameter(b"!,<50", b'!'), -1);
+        assert_eq!(get_shada_parameter(b"'100", b's'), -1);
     }
 }
