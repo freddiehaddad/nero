@@ -687,6 +687,35 @@ pub fn is_ll_window(wp: &crate::buffer_defs::WinT) -> bool {
         && !wp.w_llist_ref.is_null()
 }
 
+/// Whether `win` displays the specified quickfix/location-list stack
+/// (`is_qf_win`).
+///
+/// A quickfix-stack window has a null `w_llist_ref`; a location-list
+/// window names its stack through that field.
+///
+/// # Safety
+/// `qi` must remain live for the duration of the call. The buffer
+/// pointer in `win`, when non-null, must point to a live `BufT`.
+#[must_use]
+pub unsafe fn is_qf_win(
+    win: &crate::buffer_defs::WinT,
+    qi: *const crate::types_defs::QfInfoT,
+) -> bool {
+    if qi.is_null() {
+        return false;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    if !unsafe { crate::buffer::buf_valid(win.w_buffer) }
+        || !crate::buffer::bt_quickfix(unsafe { win.w_buffer.as_ref() })
+    {
+        return false;
+    }
+    // SAFETY: `qi` is non-null and live by this function's contract.
+    let qi_ref = unsafe { &*qi };
+    (is_qf_stack(qi_ref) && win.w_llist_ref.is_null())
+        || (is_ll_stack(qi_ref) && std::ptr::eq(win.w_llist_ref, qi.cast_mut()))
+}
+
 /// Free every list in the stack, but not the stack itself
 /// (`qf_free_list_stack_items`).
 ///
@@ -3389,6 +3418,74 @@ mod tests {
         };
 
         assert!(!is_ll_window(&win));
+    }
+
+    #[test]
+    fn is_qf_win_accepts_the_global_quickfix_window_shape() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _buf_guard = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let qi = Box::new(crate::types_defs::QfInfoT::default());
+        let win = WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+
+        assert!(unsafe { is_qf_win(&win, std::ptr::addr_of!(*qi)) });
+    }
+
+    #[test]
+    fn is_qf_win_accepts_only_the_matching_location_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _buf_guard = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let mut qi = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let other = Box::new(crate::types_defs::QfInfoT {
+            qfl_type: QfltypeT::Location,
+            ..Default::default()
+        });
+        let win = WinT {
+            w_buffer: buf_ptr,
+            w_llist_ref: std::ptr::addr_of_mut!(*qi),
+            ..Default::default()
+        };
+
+        assert!(unsafe { is_qf_win(&win, std::ptr::addr_of!(*qi)) });
+        assert!(
+            !unsafe { is_qf_win(&win, std::ptr::addr_of!(*other)) },
+            "another location-list stack must not match"
+        );
+    }
+
+    #[test]
+    fn is_qf_win_rejects_an_invalid_or_non_quickfix_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = Box::new(crate::types_defs::QfInfoT::default());
+        let mut normal = Box::new(BufT::default());
+        let normal_ptr = std::ptr::addr_of_mut!(*normal);
+        let _buf_guard = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, normal_ptr)
+        };
+
+        let invalid = WinT::default();
+        assert!(!unsafe { is_qf_win(&invalid, std::ptr::addr_of!(*qi)) });
+
+        let normal_win = WinT {
+            w_buffer: normal_ptr,
+            ..Default::default()
+        };
+        assert!(!unsafe { is_qf_win(&normal_win, std::ptr::addr_of!(*qi)) });
     }
 
     #[test]
