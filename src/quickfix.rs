@@ -777,6 +777,29 @@ pub unsafe fn qf_winid(qi: *const crate::types_defs::QfInfoT) -> i32 {
     }
 }
 
+/// Buffer number used by a quickfix/location-list window
+/// (`qf_getprop_qfbufnr`), or zero when the stack has no live buffer.
+///
+/// The original immediately writes this value to a dictionary; the
+/// representation-independent value is returned directly here.
+///
+/// # Safety
+/// Reads the global buffer list through [`crate::buffer::buflist_findnr`].
+#[must_use]
+pub unsafe fn qf_getprop_qfbufnr(
+    qi: Option<&crate::types_defs::QfInfoT>,
+) -> i32 {
+    let Some(qi) = qi else {
+        return 0;
+    };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { crate::buffer::buflist_findnr(qi.qf_bufnr) }.is_null() {
+        0
+    } else {
+        qi.qf_bufnr
+    }
+}
+
 /// Free every list in the stack, but not the stack itself
 /// (`qf_free_list_stack_items`).
 ///
@@ -3795,6 +3818,47 @@ mod tests {
         };
 
         assert_eq!(unsafe { qf_winid(std::ptr::addr_of!(*qi)) }, 314);
+    }
+
+    #[test]
+    fn qf_getprop_qfbufnr_is_zero_without_a_stack() {
+        assert_eq!(unsafe { qf_getprop_qfbufnr(None) }, 0);
+    }
+
+    #[test]
+    fn qf_getprop_qfbufnr_returns_a_live_quickfix_buffer_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT {
+            handle: 12,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let qi = crate::types_defs::QfInfoT {
+            qf_bufnr: 12,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_getprop_qfbufnr(Some(&qi)) }, 12);
+    }
+
+    #[test]
+    fn qf_getprop_qfbufnr_is_zero_after_the_buffer_is_wiped() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let qi = crate::types_defs::QfInfoT {
+            qf_bufnr: 12,
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_getprop_qfbufnr(Some(&qi)) }, 0);
     }
 
     #[test]
