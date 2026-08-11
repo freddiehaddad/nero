@@ -45,6 +45,34 @@ pub struct DigrT {
 pub static USER_DIGRAPHS: GlobalCell<TypedGarrayT<DigrT>> =
     GlobalCell::new(TypedGarrayT::new(10));
 
+/// One `'keymap'` entry: the typed characters and what they map to
+/// (`kmap_T`).
+///
+/// Both fields are owned `char *` in the original; they are owned
+/// `Vec<u8>` here, which is what lets [`keymap_ga_clear`] collapse
+/// into a single call - see its own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KmapT {
+    /// the characters that are typed (`from`).
+    pub from: Vec<u8>,
+    /// what they are mapped to (`to`).
+    pub to: Vec<u8>,
+}
+
+/// Releases a buffer's `'keymap'` table (`keymap_ga_clear`).
+///
+/// The original frees each entry's `from`/`to` strings but leaves the
+/// array's length alone, so both of its callers follow it immediately
+/// with `ga_clear` to release the array itself. Here the strings are
+/// owned `Vec`s, so dropping the entries releases them too and the
+/// two steps become one.
+///
+/// Nothing reads the entries between those two calls in the original,
+/// so collapsing them changes no observable behaviour.
+pub fn keymap_ga_clear(kmap_ga: &mut TypedGarrayT<KmapT>) {
+    kmap_ga.ga_clear();
+}
+
 /// Add a digraph to the user table, or update the one already there
 /// (`registerdigraph`).
 ///
@@ -99,6 +127,54 @@ pub fn check_digraph_chars_valid(char1: i32, char2: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- keymap_ga_clear ----
+
+    fn kmap(from: &[u8], to: &[u8]) -> KmapT {
+        KmapT {
+            from: from.to_vec(),
+            to: to.to_vec(),
+        }
+    }
+
+    /// Clearing releases the entries themselves, not just their
+    /// strings: the original needs a following `ga_clear` for that,
+    /// which owned `Vec`s make unnecessary here.
+    #[test]
+    fn keymap_ga_clear_empties_the_table() {
+        let mut ga = crate::garray_defs::TypedGarrayT::<KmapT>::new(20);
+        ga.items.push(kmap(b"ab", b"\xc3\xa4"));
+        ga.items.push(kmap(b"cd", b"\xc3\xb6"));
+        assert_eq!(ga.ga_len(), 2);
+
+        keymap_ga_clear(&mut ga);
+
+        assert_eq!(ga.ga_len(), 0);
+        assert!(ga.is_empty());
+    }
+
+    #[test]
+    fn keymap_ga_clear_is_a_noop_on_an_empty_table() {
+        let mut ga = crate::garray_defs::TypedGarrayT::<KmapT>::new(20);
+
+        keymap_ga_clear(&mut ga);
+
+        assert_eq!(ga.ga_len(), 0);
+    }
+
+    /// The table is reusable afterwards, so unloading a keymap and
+    /// loading another one works.
+    #[test]
+    fn keymap_ga_clear_leaves_the_table_reusable() {
+        let mut ga = crate::garray_defs::TypedGarrayT::<KmapT>::new(20);
+        ga.items.push(kmap(b"ab", b"x"));
+
+        keymap_ga_clear(&mut ga);
+        ga.items.push(kmap(b"cd", b"y"));
+
+        assert_eq!(ga.ga_len(), 1);
+        assert_eq!(ga.items[0], kmap(b"cd", b"y"));
+    }
 
     // ---- registerdigraph ----
 

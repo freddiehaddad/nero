@@ -1241,7 +1241,7 @@ pub struct BufT {
     /// using "lmap" mappings (see [`KEYMAP_INIT`]/[`KEYMAP_LOADED`])
     pub b_kmap_state: i16,
     /// the keymap table
-    pub b_kmap_ga: GarrayT,
+    pub b_kmap_ga: crate::garray_defs::TypedGarrayT<crate::digraph::KmapT>,
 
     // Options local to a buffer. They are here because their value
     // depends on the type of file or contents of the file being edited.
@@ -1716,7 +1716,7 @@ impl Default for BufT {
             b_p_iminsert: 0,
             b_p_imsearch: 0,
             b_kmap_state: 0,
-            b_kmap_ga: GarrayT::default(),
+            b_kmap_ga: crate::garray_defs::TypedGarrayT::new(20),
             b_p_initialized: false,
             b_p_script_ctx: Vec::new(),
             b_p_ac: 0,
