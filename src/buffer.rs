@@ -806,10 +806,43 @@ pub unsafe fn set_buflisted(on: bool) {
     let _ = crate::autocmd::apply_autocmds(event, None, None, false, Some(&*curbuf));
 }
 
+/// Returns the buffer's short file name, or `"[No Name]"` when it has
+/// no name (`buf_get_fname`).
+///
+/// An explicitly present empty name remains empty; only the original
+/// null-pointer state selects the fallback.
+#[must_use]
+pub fn buf_get_fname(buf: &BufT) -> &[u8] {
+    buf.b_fname.as_deref().unwrap_or(b"[No Name]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
+
+    #[test]
+    fn buf_get_fname_returns_the_stored_short_name() {
+        let buf = BufT {
+            b_fname: Some(b"main.c".to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(buf_get_fname(&buf), b"main.c");
+    }
+
+    #[test]
+    fn buf_get_fname_uses_no_name_only_for_an_absent_name() {
+        assert_eq!(buf_get_fname(&BufT::default()), b"[No Name]");
+    }
+
+    #[test]
+    fn buf_get_fname_preserves_an_explicit_empty_name() {
+        let buf = BufT {
+            b_fname: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(buf_get_fname(&buf), b"");
+    }
 
     #[test]
     fn buf_time_compare_orders_most_recently_used_first() {
