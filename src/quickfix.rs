@@ -819,6 +819,37 @@ pub unsafe fn qf_stack_get_bufnr() -> i32 {
         .qf_bufnr
 }
 
+/// Returns the current quickfix entry number for window `wp`
+/// (`qf_current_entry`).
+///
+/// A location-list window uses the stack in `w_llist_ref`; every
+/// other window uses the global quickfix stack.
+///
+/// # Safety
+/// The global stack must be initialized. Any buffer/list pointers in
+/// `wp` must remain valid for the duration of the call.
+///
+/// # Panics
+/// Panics when the selected stack or its current list does not exist,
+/// matching the original's assertions/invariants.
+#[must_use]
+pub unsafe fn qf_current_entry(
+    wp: &crate::buffer_defs::WinT,
+) -> crate::pos_defs::LinenrT {
+    let qi = if is_ll_window(wp) {
+        // `is_ll_window` proved the reference non-null.
+        unsafe { &*wp.w_llist_ref }
+    } else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { QL_INFO.get_mut() }
+            .as_ref()
+            .expect("qf_current_entry: the global quickfix stack is not initialized")
+    };
+    qf_get_curlist(qi)
+        .expect("qf_current_entry: the selected stack has no current list")
+        .qf_index
+}
+
 /// Whether the quickfix/location list with id `qf_id` still exists
 /// (`qflist_valid`).
 ///
@@ -3052,6 +3083,59 @@ mod tests {
         assert_eq!(unsafe { qf_stack_get_bufnr() }, 12);
 
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_chi = prev_chi;
+    }
+
+    #[test]
+    fn qf_current_entry_uses_the_global_stack_for_an_ordinary_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        let mut global = stack_with(1);
+        global.qf_lists[0].qf_index = 4;
+        *unsafe { QL_INFO.get_mut() } = Some(global);
+
+        assert_eq!(unsafe { qf_current_entry(&WinT::default()) }, 4);
+    }
+
+    #[test]
+    fn qf_current_entry_uses_a_location_list_windows_reference() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        let mut global = stack_with(1);
+        global.qf_lists[0].qf_index = 4;
+        *unsafe { QL_INFO.get_mut() } = Some(global);
+
+        let mut location = Box::new(stack_with(1));
+        location.qfl_type = QfltypeT::Location;
+        location.qf_lists[0].qf_index = 7;
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*buf),
+            w_llist_ref: std::ptr::addr_of_mut!(*location),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_current_entry(&win) }, 7);
+    }
+
+    #[test]
+    fn qf_current_entry_ignores_a_reference_on_a_normal_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = QlInfoGuard::save();
+        let mut global = stack_with(1);
+        global.qf_lists[0].qf_index = 4;
+        *unsafe { QL_INFO.get_mut() } = Some(global);
+
+        let mut location = Box::new(stack_with(1));
+        location.qf_lists[0].qf_index = 7;
+        let mut buf = Box::new(BufT::default());
+        let win = WinT {
+            w_buffer: std::ptr::addr_of_mut!(*buf),
+            w_llist_ref: std::ptr::addr_of_mut!(*location),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { qf_current_entry(&win) }, 4);
     }
 
     // --- win_set_loclist / qf_find_win_with_loclist ---
