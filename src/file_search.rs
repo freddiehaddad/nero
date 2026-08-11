@@ -145,9 +145,179 @@ pub fn ff_path_in_stoplist(path: &[u8], stopdirs: &[&[u8]]) -> bool {
     false
 }
 
+/// One entry of the directory search stack (`ff_stack_T`).
+///
+/// The original's two `String` fields become owned `Vec<u8>`, and the
+/// `char **` file array becomes a `Vec<Vec<u8>>`, so
+/// `ffs_filearray_size` is dropped - the `Vec` carries its own length.
+/// `ffs_filearray_cur` stays, since it is a cursor rather than a
+/// length.
+///
+/// `ffs_prev` remains a raw pointer: the stack is threaded through the
+/// nodes themselves, and the search context owns them.
+#[derive(Debug, Default)]
+pub struct FfStackT {
+    /// the entry below this one on the stack (`ffs_prev`).
+    pub ffs_prev: *mut FfStackT,
+    /// the wildcard-free part of the search path (`ffs_fix_path`).
+    pub ffs_fix_path: Vec<u8>,
+    /// the part of the search path holding wildcards (`ffs_wc_path`).
+    pub ffs_wc_path: Vec<u8>,
+    /// entries found in `ffs_fix_path`, matched by the first wildcard
+    /// of the wildcard part (`ffs_filearray`).
+    pub ffs_filearray: Vec<Vec<u8>>,
+    /// how far through `ffs_filearray` a partly handled directory got
+    /// (`ffs_filearray_cur`).
+    pub ffs_filearray_cur: i32,
+    /// `0` the first time this directory is worked on, `1` when it was
+    /// already partly searched in an earlier step (`ffs_stage`).
+    pub ffs_stage: i32,
+    /// depth in the directory tree, counting back from the level given
+    /// to `vim_findfile_init` (`ffs_level`).
+    pub ffs_level: i32,
+    /// whether `"**"` was already expanded to an empty string
+    /// (`ffs_star_star_empty`).
+    pub ffs_star_star_empty: i32,
+}
+
+/// Pushes a directory onto the search stack (`ff_push`).
+///
+/// The original threads the whole `ff_search_ctx_T` through, but only
+/// ever touches its `ffsc_stack_ptr`, so this takes that head pointer
+/// directly - the same treatment the other helpers here already give
+/// their arguments.
+///
+/// A null `stack_ptr` is ignored, as in the original, which notes this
+/// guards against a crash rather than reporting an error.
+///
+/// # Safety
+/// `stack_ptr` must be null or point to a node that is not already on
+/// this stack, and `head` must be the live head of that stack.
+pub unsafe fn ff_push(head: &mut *mut FfStackT, stack_ptr: *mut FfStackT) {
+    if stack_ptr.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*stack_ptr).ffs_prev = *head };
+    *head = stack_ptr;
+}
+
+/// Pops a directory off the search stack, or returns null when it is
+/// empty (`ff_pop`).
+///
+/// Ownership of the returned node passes to the caller, which is
+/// expected to release it with [`ff_free_stack_element`].
+///
+/// # Safety
+/// `head` must be the live head of a stack whose nodes satisfy
+/// [`ff_push`]'s contract.
+pub unsafe fn ff_pop(head: &mut *mut FfStackT) -> *mut FfStackT {
+    let sptr = *head;
+    if !sptr.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        *head = unsafe { (*sptr).ffs_prev };
+    }
+    sptr
+}
+
+/// Releases one stack entry (`ff_free_stack_element`).
+///
+/// The original frees the two path strings and the file array by hand;
+/// all three are owned here, so reconstructing the `Box` releases
+/// them along with the node.
+///
+/// # Safety
+/// `stack_ptr` must be null or a node from [`Box::into_raw`] that is
+/// no longer on any stack, and no other pointer to it may be used
+/// afterwards.
+pub unsafe fn ff_free_stack_element(stack_ptr: *mut FfStackT) {
+    if stack_ptr.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    drop(unsafe { Box::from_raw(stack_ptr) });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ff_push / ff_pop / ff_free_stack_element ----
+
+    fn stack_node(level: i32) -> *mut FfStackT {
+        Box::into_raw(Box::new(FfStackT {
+            ffs_fix_path: b"/tmp".to_vec(),
+            ffs_wc_path: b"**".to_vec(),
+            ffs_filearray: vec![b"a".to_vec(), b"b".to_vec()],
+            ffs_level: level,
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn ff_pop_returns_null_for_an_empty_stack() {
+        let mut head: *mut FfStackT = std::ptr::null_mut();
+        assert!(unsafe { ff_pop(&mut head) }.is_null());
+        assert!(head.is_null(), "the head must stay empty");
+    }
+
+    /// Pushing null is ignored rather than corrupting the stack.
+    #[test]
+    fn ff_push_ignores_a_null_entry() {
+        let mut head = stack_node(1);
+        unsafe { ff_push(&mut head, std::ptr::null_mut()) };
+
+        assert_eq!(unsafe { (*head).ffs_level }, 1, "the head is unchanged");
+        unsafe { ff_free_stack_element(ff_pop(&mut head)) };
+    }
+
+    /// The stack is LIFO, so entries come back in reverse order and
+    /// the head empties out exactly once.
+    #[test]
+    fn ff_push_and_pop_are_last_in_first_out() {
+        let mut head: *mut FfStackT = std::ptr::null_mut();
+        unsafe {
+            ff_push(&mut head, stack_node(1));
+            ff_push(&mut head, stack_node(2));
+            ff_push(&mut head, stack_node(3));
+        }
+
+        let mut levels = Vec::new();
+        loop {
+            let node = unsafe { ff_pop(&mut head) };
+            if node.is_null() {
+                break;
+            }
+            levels.push(unsafe { (*node).ffs_level });
+            unsafe { ff_free_stack_element(node) };
+        }
+
+        assert_eq!(levels, vec![3, 2, 1]);
+        assert!(head.is_null());
+    }
+
+    /// Popping hands the entry over intact, so the caller can still
+    /// read it before releasing it.
+    #[test]
+    fn ff_pop_preserves_the_entrys_contents() {
+        let mut head: *mut FfStackT = std::ptr::null_mut();
+        unsafe { ff_push(&mut head, stack_node(7)) };
+
+        let node = unsafe { ff_pop(&mut head) };
+        assert!(!node.is_null());
+        unsafe {
+            assert_eq!((*node).ffs_fix_path, b"/tmp".to_vec());
+            assert_eq!((*node).ffs_wc_path, b"**".to_vec());
+            assert_eq!((*node).ffs_filearray.len(), 2);
+            assert_eq!((*node).ffs_level, 7);
+            ff_free_stack_element(node);
+        }
+    }
+
+    #[test]
+    fn ff_free_stack_element_accepts_null() {
+        unsafe { ff_free_stack_element(std::ptr::null_mut()) };
+    }
 
     #[test]
     fn vim_findfile_stopdir_splits_at_semicolon() {
