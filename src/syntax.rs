@@ -54,6 +54,13 @@ static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::Globa
 static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+/// `keepend_level` - the stack level of the first item with `keepend`,
+/// or -1 when there is none.
+///
+/// Checking for `keepend` is expensive, so [`check_keepend`] uses this
+/// to skip the work entirely below the level where one exists.
+static KEEPEND_LEVEL: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(-1);
+
 /// The syntax flags and sequence number at the current position
 /// (`get_syntax_info`).
 ///
@@ -121,6 +128,64 @@ pub unsafe fn push_current_state(idx: i32) {
 pub unsafe fn current_state_len() -> usize {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { (*CURRENT_STATE.get_mut()).len() }
+}
+
+/// Propagates a `keepend` match-end down to contained items, up to
+/// the first `skipend` item (`check_keepend`).
+///
+/// Walking the whole stack is expensive, so the scan starts at the
+/// level where a `keepend` actually exists. Within that range the last
+/// `extend` item wins: `keepend` items below it have no effect, since
+/// `extend` explicitly ignores a `keepend`.
+///
+/// # Safety
+/// Reads `KEEPEND_LEVEL` and mutates the `CURRENT_STATE` file-static.
+pub unsafe fn check_keepend() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let keepend_level = unsafe { *KEEPEND_LEVEL.get_mut() };
+    if keepend_level < 0 {
+        return;
+    }
+    // SAFETY: as above.
+    let state = unsafe { &mut *CURRENT_STATE.get_mut() };
+
+    // Find the last "extend" item; without one the scan covers every
+    // item from `keepend_level` upwards.
+    let mut i = state.len() as i32 - 1;
+    while i > keepend_level {
+        if state[i as usize].si_flags & hl_flags::EXTEND != 0 {
+            break;
+        }
+        i -= 1;
+    }
+
+    let mut maxpos = LposT::default();
+    let mut maxpos_h = LposT::default();
+    // `i` only stays below zero when the stack is empty, which cannot
+    // happen here: `pop_current_state` resets `keepend_level` to -1
+    // once it reaches the stack length, and that case returned above.
+    for sip in state[i.max(0) as usize..].iter_mut() {
+        if maxpos.lnum != 0 {
+            limit_pos_zero(&mut sip.si_m_endpos, &maxpos);
+            limit_pos_zero(&mut sip.si_h_endpos, &maxpos_h);
+            limit_pos_zero(&mut sip.si_eoe_pos, &maxpos);
+            sip.si_ends = true;
+        }
+        if sip.si_ends && (sip.si_flags & hl_flags::KEEPEND) != 0 {
+            if maxpos.lnum == 0
+                || maxpos.lnum > sip.si_m_endpos.lnum
+                || (maxpos.lnum == sip.si_m_endpos.lnum && maxpos.col > sip.si_m_endpos.col)
+            {
+                maxpos = sip.si_m_endpos;
+            }
+            if maxpos_h.lnum == 0
+                || maxpos_h.lnum > sip.si_h_endpos.lnum
+                || (maxpos_h.lnum == sip.si_h_endpos.lnum && maxpos_h.col > sip.si_h_endpos.col)
+            {
+                maxpos_h = sip.si_h_endpos;
+            }
+        }
+    }
 }
 
 /// The text of the current line in the syntax buffer
@@ -1222,6 +1287,129 @@ mod tests {
 
         unsafe { *CURRENT_SUB_CHAR.get_mut() = i32::from(b'x') };
         assert_eq!(unsafe { syn_get_sub_char() }, i32::from(b'x'));
+    }
+
+    // ---- check_keepend ----
+
+    /// Installs a `keepend_level`, restoring it on drop.
+    struct KeependLevelGuard(i32);
+
+    impl KeependLevelGuard {
+        fn install(level: i32) -> Self {
+            // SAFETY: the global state test lock is held by the caller.
+            unsafe {
+                let saved = *KEEPEND_LEVEL.get_mut();
+                *KEEPEND_LEVEL.get_mut() = level;
+                Self(saved)
+            }
+        }
+    }
+
+    impl Drop for KeependLevelGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `install`.
+            unsafe { *KEEPEND_LEVEL.get_mut() = self.0 };
+        }
+    }
+
+    fn ends_at(flags: i32, lnum: i32, col: i32) -> StateItemT {
+        let pos = LposT { lnum, col };
+        StateItemT {
+            si_flags: flags,
+            si_ends: true,
+            si_m_endpos: pos,
+            si_h_endpos: pos,
+            si_eoe_pos: pos,
+            ..Default::default()
+        }
+    }
+
+    /// A negative level means no item has `keepend`, so the whole
+    /// (expensive) scan is skipped and nothing is touched.
+    #[test]
+    fn check_keepend_does_nothing_without_a_keepend_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _k = KeependLevelGuard::install(-1);
+        let _g = CurrentStackGuard::install(vec![
+            ends_at(hl_flags::KEEPEND, 1, 5),
+            ends_at(0, 9, 9),
+        ]);
+
+        unsafe { check_keepend() };
+
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        assert_eq!(state[1].si_m_endpos, LposT { lnum: 9, col: 9 }, "untouched");
+    }
+
+    /// A `keepend` item pulls every later item's end positions back to
+    /// its own, and marks them as ending there.
+    #[test]
+    fn check_keepend_propagates_the_end_to_contained_items() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _k = KeependLevelGuard::install(0);
+        let mut inner = ends_at(0, 9, 9);
+        inner.si_ends = false;
+        let _g = CurrentStackGuard::install(vec![ends_at(hl_flags::KEEPEND, 1, 5), inner]);
+
+        unsafe { check_keepend() };
+
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        assert_eq!(
+            state[1].si_m_endpos,
+            LposT { lnum: 1, col: 5 },
+            "contained item is limited to the keepend item's end"
+        );
+        assert_eq!(state[1].si_eoe_pos, LposT { lnum: 1, col: 5 });
+        assert!(state[1].si_ends, "and is now marked as ending there");
+        assert_eq!(
+            state[0].si_m_endpos,
+            LposT { lnum: 1, col: 5 },
+            "the keepend item itself is unchanged"
+        );
+    }
+
+    /// `extend` explicitly ignores a `keepend`, so a `keepend` item
+    /// *below* the last `extend` item has no effect at all.
+    #[test]
+    fn check_keepend_ignores_a_keepend_below_the_last_extend() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _k = KeependLevelGuard::install(0);
+        let _g = CurrentStackGuard::install(vec![
+            ends_at(hl_flags::KEEPEND, 1, 5),
+            ends_at(hl_flags::EXTEND, 4, 2),
+            ends_at(0, 9, 9),
+        ]);
+
+        unsafe { check_keepend() };
+
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        assert_eq!(
+            state[2].si_m_endpos,
+            LposT { lnum: 9, col: 9 },
+            "the scan restarts at the extend item, so the keepend below it is skipped"
+        );
+    }
+
+    /// With several `keepend` items the earliest end wins, since each
+    /// one only narrows the limit.
+    #[test]
+    fn check_keepend_keeps_the_earliest_end_position() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _k = KeependLevelGuard::install(0);
+        let _g = CurrentStackGuard::install(vec![
+            ends_at(hl_flags::KEEPEND, 3, 0),
+            ends_at(hl_flags::KEEPEND, 2, 7),
+            ends_at(0, 9, 9),
+        ]);
+
+        unsafe { check_keepend() };
+
+        let state = unsafe { &*CURRENT_STATE.get_mut() };
+        assert_eq!(
+            state[2].si_m_endpos,
+            LposT { lnum: 2, col: 7 },
+            "line 2 beats line 3"
+        );
     }
 
     // ---- push_current_state ----
