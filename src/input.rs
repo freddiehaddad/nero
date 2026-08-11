@@ -360,10 +360,31 @@ static OLD_CHAR: GlobalCell<i32> = GlobalCell::new(-1);
 /// original. Starts at `0`, matching the original's own
 /// zero-initialized `static int old_mod_mask;`.
 static OLD_MOD_MASK: GlobalCell<i32> = GlobalCell::new(0);
+static OLD_MOUSE_GRID: GlobalCell<i32> = GlobalCell::new(0);
+static OLD_MOUSE_ROW: GlobalCell<i32> = GlobalCell::new(0);
+static OLD_MOUSE_COL: GlobalCell<i32> = GlobalCell::new(0);
 
 /// Whether [`OLD_CHAR`] was stuffed rather than typed
 /// (`old_KeyStuffed`), file-static in the original.
 static OLD_KEY_STUFFED: GlobalCell<bool> = GlobalCell::new(false);
+
+/// Puts one consumed character back for the next `vgetc()` call
+/// (`vungetc`), together with the input metadata that belonged to it.
+///
+/// # Safety
+/// Mutates the `OLD_*` file-statics and reads the current input fields
+/// from `GLOBALS`.
+pub unsafe fn vungetc(c: i32) {
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    unsafe {
+        *OLD_CHAR.get_mut() = c;
+        *OLD_MOD_MASK.get_mut() = globals.mod_mask;
+        *OLD_MOUSE_GRID.get_mut() = globals.mouse_grid;
+        *OLD_MOUSE_ROW.get_mut() = globals.mouse_row;
+        *OLD_MOUSE_COL.get_mut() = globals.mouse_col;
+        *OLD_KEY_STUFFED.get_mut() = globals.KeyStuffed != 0;
+    }
+}
 
 /// Sync undo before a blocking wait, unless it would break an
 /// in-progress edit (`may_sync_undo`).
@@ -1126,6 +1147,10 @@ mod tests {
     /// Saves and restores the `vungetc()` put-back state.
     struct OldCharGuard {
         chr: i32,
+        mod_mask: i32,
+        mouse_grid: i32,
+        mouse_row: i32,
+        mouse_col: i32,
         stuffed: bool,
         rb1: BuffheaderT,
         rb2: BuffheaderT,
@@ -1136,6 +1161,10 @@ mod tests {
             unsafe {
                 Self {
                     chr: *OLD_CHAR.get_mut(),
+                    mod_mask: *OLD_MOD_MASK.get_mut(),
+                    mouse_grid: *OLD_MOUSE_GRID.get_mut(),
+                    mouse_row: *OLD_MOUSE_ROW.get_mut(),
+                    mouse_col: *OLD_MOUSE_COL.get_mut(),
                     stuffed: *OLD_KEY_STUFFED.get_mut(),
                     rb1: std::mem::take(READBUF1.get_mut()),
                     rb2: std::mem::take(READBUF2.get_mut()),
@@ -1148,11 +1177,62 @@ mod tests {
         fn drop(&mut self) {
             unsafe {
                 *OLD_CHAR.get_mut() = self.chr;
+                *OLD_MOD_MASK.get_mut() = self.mod_mask;
+                *OLD_MOUSE_GRID.get_mut() = self.mouse_grid;
+                *OLD_MOUSE_ROW.get_mut() = self.mouse_row;
+                *OLD_MOUSE_COL.get_mut() = self.mouse_col;
                 *OLD_KEY_STUFFED.get_mut() = self.stuffed;
                 *READBUF1.get_mut() = std::mem::take(&mut self.rb1);
                 *READBUF2.get_mut() = std::mem::take(&mut self.rb2);
             }
         }
+    }
+
+    #[test]
+    fn vungetc_saves_the_character_and_all_current_input_metadata() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _old = OldCharGuard::new();
+        let _mod = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.mod_mask, 3)
+        };
+        let _grid = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.mouse_grid, 4)
+        };
+        let _row = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.mouse_row, 5)
+        };
+        let _col = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.mouse_col, 6)
+        };
+        let _stuffed = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.KeyStuffed, 1)
+        };
+
+        unsafe { vungetc(65) };
+
+        assert_eq!(unsafe { *OLD_CHAR.get_mut() }, 65);
+        assert_eq!(unsafe { *OLD_MOD_MASK.get_mut() }, 3);
+        assert_eq!(unsafe { *OLD_MOUSE_GRID.get_mut() }, 4);
+        assert_eq!(unsafe { *OLD_MOUSE_ROW.get_mut() }, 5);
+        assert_eq!(unsafe { *OLD_MOUSE_COL.get_mut() }, 6);
+        assert!(unsafe { *OLD_KEY_STUFFED.get_mut() });
+    }
+
+    #[test]
+    fn vungetc_overwrites_the_previous_put_back_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _old = OldCharGuard::new();
+        let _stuffed = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.KeyStuffed, 0)
+        };
+
+        unsafe {
+            vungetc(1);
+            vungetc(2);
+        }
+
+        assert_eq!(unsafe { *OLD_CHAR.get_mut() }, 2);
+        assert!(!unsafe { *OLD_KEY_STUFFED.get_mut() });
     }
 
     #[test]
