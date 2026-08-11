@@ -368,6 +368,20 @@ pub fn qf_parse_fmt_p(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%v` visual-column number
+/// (`qf_parse_fmt_v`).
+pub fn qf_parse_fmt_v(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    fields.col = crate::charset::getdigits_int(matched, false, 0).0;
+    fields.use_viscol = true;
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -1977,6 +1991,38 @@ mod tests {
         let mut fields = QffieldsT::default();
         assert_eq!(qf_parse_fmt_p(Some(b""), &mut fields), qf_status::QF_OK);
         assert_eq!(fields.col, 1);
+    }
+
+    #[test]
+    fn qf_parse_fmt_v_parses_a_leading_decimal_column() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_v(Some(b"123 trailing"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.col, 123);
+        assert!(fields.use_viscol);
+    }
+
+    #[test]
+    fn qf_parse_fmt_v_matches_atol_for_negative_and_nondigit_values() {
+        let mut fields = QffieldsT::default();
+        qf_parse_fmt_v(Some(b"-7"), &mut fields);
+        assert_eq!(fields.col, -7);
+        qf_parse_fmt_v(Some(b"none"), &mut fields);
+        assert_eq!(fields.col, 0);
+    }
+
+    #[test]
+    fn qf_parse_fmt_v_rejects_a_missing_match_without_changing_fields() {
+        let mut fields = QffieldsT {
+            col: 7,
+            use_viscol: false,
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_v(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.col, 7);
+        assert!(!fields.use_viscol);
     }
 
     #[test]
