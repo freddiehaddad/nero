@@ -139,6 +139,12 @@ static GRID_LINE_BG_ATTR: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 static GRID_LINE_CLEAR_ATTR: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
+static GRID_LINE_FLAGS: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// `grid_put_linebuf` flag marking right-to-left text
+/// (`SLF_RIGHTLEFT`).
+pub const SLF_RIGHTLEFT: i32 = 1;
 
 /// Marks the remainder of the buffered grid line for clearing
 /// (`grid_line_clear_end`).
@@ -220,6 +226,30 @@ pub unsafe fn linebuf_mirror(
     *firstp = width - old_clear;
     *clearp = width - old_first;
     *lastp = width - old_last;
+}
+
+/// Mirrors the current buffered grid line when it contains output
+/// (`grid_line_mirror`).
+///
+/// The clear range is first extended through the last buffered cell;
+/// an empty range returns without touching buffers or flags.
+///
+/// # Safety
+/// Same global line-buffer requirements as [`linebuf_mirror`].
+pub unsafe fn grid_line_mirror(width: i32) {
+    let clear_to = unsafe {
+        (*GRID_LINE_CLEAR_TO.get_mut()).max(*GRID_LINE_LAST.get_mut())
+    };
+    unsafe { *GRID_LINE_CLEAR_TO.get_mut() = clear_to };
+    if unsafe { *GRID_LINE_FIRST.get_mut() } >= clear_to {
+        return;
+    }
+
+    let first = unsafe { GRID_LINE_FIRST.get_mut() };
+    let last = unsafe { GRID_LINE_LAST.get_mut() };
+    let clear = unsafe { GRID_LINE_CLEAR_TO.get_mut() };
+    unsafe { linebuf_mirror(first, last, clear, width) };
+    unsafe { *GRID_LINE_FLAGS.get_mut() |= SLF_RIGHTLEFT };
 }
 
 /// Whether the cell at `col` differs from what the grid already shows
@@ -733,7 +763,7 @@ pub unsafe fn grid_getchar(
 mod tests {
     use super::*;
 
-    struct GridLineStateGuard([i32; 5]);
+    struct GridLineStateGuard([i32; 6]);
 
     impl GridLineStateGuard {
         fn install(first: i32, last: i32) -> Self {
@@ -744,11 +774,13 @@ mod tests {
                     *GRID_LINE_CLEAR_TO.get_mut(),
                     *GRID_LINE_BG_ATTR.get_mut(),
                     *GRID_LINE_CLEAR_ATTR.get_mut(),
+                    *GRID_LINE_FLAGS.get_mut(),
                 ]
             };
             unsafe {
                 *GRID_LINE_FIRST.get_mut() = first;
                 *GRID_LINE_LAST.get_mut() = last;
+                *GRID_LINE_FLAGS.get_mut() = 0;
             }
             Self(saved)
         }
@@ -762,6 +794,7 @@ mod tests {
                 *GRID_LINE_CLEAR_TO.get_mut() = self.0[2];
                 *GRID_LINE_BG_ATTR.get_mut() = self.0[3];
                 *GRID_LINE_CLEAR_ATTR.get_mut() = self.0[4];
+                *GRID_LINE_FLAGS.get_mut() = self.0[5];
             }
         }
     }
@@ -855,6 +888,41 @@ mod tests {
         unsafe { linebuf_mirror(&mut first, &mut last, &mut clear, 3) };
 
         assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[b'A' as u32, 0x4e00, 0]);
+    }
+
+    #[test]
+    fn grid_line_mirror_extends_the_clear_range_and_sets_rightleft() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(0, 4);
+        unsafe { *GRID_LINE_CLEAR_TO.get_mut() = 2 };
+        let _buf = LinebufStateGuard::install(
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4],
+        );
+
+        unsafe { grid_line_mirror(4) };
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[4, 3, 2, 1]);
+        assert_eq!(unsafe { *GRID_LINE_CLEAR_TO.get_mut() }, 4);
+        assert_ne!(unsafe { *GRID_LINE_FLAGS.get_mut() } & SLF_RIGHTLEFT, 0);
+    }
+
+    #[test]
+    fn grid_line_mirror_returns_without_touching_an_empty_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(4, 4);
+        unsafe { *GRID_LINE_CLEAR_TO.get_mut() = 4 };
+        let _buf = LinebufStateGuard::install(
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4],
+        );
+
+        unsafe { grid_line_mirror(4) };
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[1, 2, 3, 4]);
+        assert_eq!(unsafe { *GRID_LINE_FLAGS.get_mut() }, 0);
     }
 
     // --- grid_char_needs_redraw ---
