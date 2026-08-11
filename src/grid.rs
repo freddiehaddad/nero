@@ -162,6 +162,66 @@ pub fn grid_line_clear_end(
     }
 }
 
+/// Mirrors a buffered line range for right-to-left drawing
+/// (`linebuf_mirror`).
+///
+/// Character, attribute and virtual-column buffers are mirrored
+/// together. A two-cell character (`glyph, 0`) remains in that order
+/// after moving to its mirrored position.
+///
+/// # Safety
+/// Mutates the global `LINEBUF_*` arrays.
+///
+/// # Panics
+/// Panics when the supplied range/width do not describe valid indices
+/// in all three line buffers, matching the original's caller
+/// invariants.
+pub unsafe fn linebuf_mirror(
+    firstp: &mut i32,
+    lastp: &mut i32,
+    clearp: &mut i32,
+    width: i32,
+) {
+    let first = usize::try_from(*firstp).expect("first must be nonnegative");
+    let last = usize::try_from(*lastp).expect("last must be nonnegative");
+    let width_usize = usize::try_from(width).expect("width must be nonnegative");
+    assert!(first <= last && last <= width_usize);
+
+    let scratch_char = unsafe { &*LINEBUF_CHAR.get_mut() }[first..last].to_vec();
+    let scratch_attr = unsafe { &*LINEBUF_ATTR.get_mut() }[first..last].to_vec();
+    let scratch_vcol = unsafe { &*LINEBUF_VCOL.get_mut() }[first..last].to_vec();
+    let mirror = width_usize - 1;
+
+    let chars = unsafe { &mut *LINEBUF_CHAR.get_mut() };
+    let mut col = first;
+    while col < last {
+        let rev = mirror - col;
+        let source = scratch_char[col - first];
+        if col + 1 < last && scratch_char[col + 1 - first] == 0 {
+            chars[rev - 1] = source;
+            chars[rev] = 0;
+            col += 2;
+        } else {
+            chars[rev] = source;
+            col += 1;
+        }
+    }
+
+    let attrs = unsafe { &mut *LINEBUF_ATTR.get_mut() };
+    let vcols = unsafe { &mut *LINEBUF_VCOL.get_mut() };
+    for col in first..last {
+        attrs[mirror - col] = scratch_attr[col - first];
+        vcols[mirror - col] = scratch_vcol[col - first];
+    }
+
+    let old_first = *firstp;
+    let old_last = *lastp;
+    let old_clear = *clearp;
+    *firstp = width - old_clear;
+    *clearp = width - old_first;
+    *lastp = width - old_last;
+}
+
 /// Whether the cell at `col` differs from what the grid already shows
 /// (`grid_char_needs_redraw`).
 ///
@@ -706,6 +766,38 @@ mod tests {
         }
     }
 
+    struct LinebufStateGuard {
+        chars: Vec<ScharT>,
+        attrs: Vec<crate::types_defs::SattrT>,
+        vcols: Vec<crate::pos_defs::ColnrT>,
+    }
+
+    impl LinebufStateGuard {
+        fn install(
+            chars: Vec<ScharT>,
+            attrs: Vec<crate::types_defs::SattrT>,
+            vcols: Vec<crate::pos_defs::ColnrT>,
+        ) -> Self {
+            unsafe {
+                Self {
+                    chars: std::mem::replace(LINEBUF_CHAR.get_mut(), chars),
+                    attrs: std::mem::replace(LINEBUF_ATTR.get_mut(), attrs),
+                    vcols: std::mem::replace(LINEBUF_VCOL.get_mut(), vcols),
+                }
+            }
+        }
+    }
+
+    impl Drop for LinebufStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *LINEBUF_CHAR.get_mut() = std::mem::take(&mut self.chars);
+                *LINEBUF_ATTR.get_mut() = std::mem::take(&mut self.attrs);
+                *LINEBUF_VCOL.get_mut() = std::mem::take(&mut self.vcols);
+            }
+        }
+    }
+
     #[test]
     fn grid_line_clear_end_starts_a_new_range_before_existing_output() {
         let _lock = crate::globals::global_state_test_lock();
@@ -730,6 +822,39 @@ mod tests {
         assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 5);
         assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 12);
         assert_eq!(unsafe { *GRID_LINE_CLEAR_TO.get_mut() }, 40);
+    }
+
+    #[test]
+    fn linebuf_mirror_reverses_characters_attributes_and_virtual_columns() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = LinebufStateGuard::install(
+            vec![b'A' as u32, b'B' as u32, b'C' as u32, b'D' as u32],
+            vec![1, 2, 3, 4],
+            vec![10, 20, 30, 40],
+        );
+        let (mut first, mut last, mut clear) = (0, 4, 4);
+
+        unsafe { linebuf_mirror(&mut first, &mut last, &mut clear, 4) };
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[b'D' as u32, b'C' as u32, b'B' as u32, b'A' as u32]);
+        assert_eq!(unsafe { &*LINEBUF_ATTR.get_mut() }, &[4, 3, 2, 1]);
+        assert_eq!(unsafe { &*LINEBUF_VCOL.get_mut() }, &[40, 30, 20, 10]);
+        assert_eq!((first, last, clear), (0, 0, 4));
+    }
+
+    #[test]
+    fn linebuf_mirror_keeps_a_double_width_glyph_before_its_zero_cell() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = LinebufStateGuard::install(
+            vec![0x4e00, 0, b'A' as u32],
+            vec![7, 7, 8],
+            vec![1, 1, 2],
+        );
+        let (mut first, mut last, mut clear) = (0, 3, 3);
+
+        unsafe { linebuf_mirror(&mut first, &mut last, &mut clear, 3) };
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[b'A' as u32, 0x4e00, 0]);
     }
 
     // --- grid_char_needs_redraw ---
