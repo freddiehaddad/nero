@@ -384,6 +384,26 @@ pub fn extract_hunk_internal(
     false
 }
 
+/// Records one internal-xdiff result hunk (`xdiff_out`).
+///
+/// xdiff reports zero-based start lines; Neovim stores one-based line
+/// numbers in `DiffhunkT`. The callback always returns zero.
+pub fn xdiff_out(
+    start_a: i32,
+    count_a: i32,
+    start_b: i32,
+    count_b: i32,
+    dout: &mut DiffoutT,
+) -> i32 {
+    dout.dout_ga.items.push(DiffhunkT {
+        lnum_orig: start_a + 1,
+        count_orig: count_a,
+        lnum_new: start_b + 1,
+        count_new: count_b,
+    });
+    0
+}
+
 /// Copy one diff entry's line range from one buffer slot to another
 /// (`diff_copy_entry`).
 ///
@@ -1022,6 +1042,36 @@ mod tests {
 
         assert!(extract_hunk_internal(&dout, &mut got, &mut idx));
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn xdiff_out_converts_zero_based_starts_to_one_based_lines() {
+        let mut dout = DiffoutT::default();
+
+        assert_eq!(xdiff_out(0, 3, 7, 2, &mut dout), 0);
+
+        assert_eq!(
+            dout.dout_ga.items,
+            vec![DiffhunkT {
+                lnum_orig: 1,
+                count_orig: 3,
+                lnum_new: 8,
+                count_new: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn xdiff_out_appends_each_callback_result() {
+        let mut dout = DiffoutT::default();
+        xdiff_out(1, 2, 3, 4, &mut dout);
+        xdiff_out(10, 0, 20, 5, &mut dout);
+
+        assert_eq!(dout.dout_ga.ga_len(), 2);
+        assert_eq!(dout.dout_ga.items[0].lnum_orig, 2);
+        assert_eq!(dout.dout_ga.items[1].lnum_orig, 11);
+        assert_eq!(dout.dout_ga.items[1].count_orig, 0);
+        assert_eq!(dout.dout_ga.items[1].lnum_new, 21);
     }
 
     // --- clear_diffin / clear_diffout ---
