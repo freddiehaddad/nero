@@ -1172,6 +1172,51 @@ pub fn qf_find_entry_after_pos(
     Some(idx)
 }
 
+/// Finds the first quickfix entry before `pos` in buffer `bnr`
+/// (`qf_find_entry_before_pos`).
+///
+/// The search starts at that buffer's first entry. In linewise mode,
+/// when several entries share the selected line, the first one is
+/// returned.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int` while rewinding a linewise match through
+/// [`qf_find_first_entry_on_line`].
+///
+/// # Panics
+/// Panics when `start_idx` is outside `entries`, matching the
+/// original's valid-start-pointer precondition.
+#[must_use]
+pub unsafe fn qf_find_entry_before_pos(
+    entries: &[QflineT],
+    bnr: i32,
+    pos: &crate::pos_defs::PosT,
+    linewise: bool,
+    start_idx: usize,
+    errornr: &mut i32,
+) -> Option<usize> {
+    assert!(start_idx < entries.len(), "start_idx must name a quickfix entry");
+    let mut idx = start_idx;
+
+    while idx + 1 < entries.len()
+        && entries[idx + 1].qf_fnum == bnr
+        && qf_entry_before_pos(&entries[idx + 1], pos, linewise)
+    {
+        idx += 1;
+        *errornr += 1;
+    }
+
+    if qf_entry_on_or_after_pos(&entries[idx], pos, linewise) {
+        return None;
+    }
+
+    if linewise {
+        // SAFETY: forwarded from this function's own safety doc.
+        idx = unsafe { qf_find_first_entry_on_line(entries, idx, errornr) };
+    }
+    Some(idx)
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1491,6 +1536,112 @@ mod tests {
             col,
             coladd: 0,
         }
+    }
+
+    #[test]
+    fn qf_find_entry_before_pos_returns_none_when_the_first_is_not_before() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![entry_fl(7, 5), entry_fl(7, 6)];
+        let mut errornr = 4;
+
+        assert_eq!(
+            unsafe {
+                qf_find_entry_before_pos(
+                    &entries,
+                    7,
+                    &pos_at(5, 0),
+                    false,
+                    0,
+                    &mut errornr,
+                )
+            },
+            None
+        );
+        assert_eq!(errornr, 4);
+    }
+
+    #[test]
+    fn qf_find_entry_before_pos_returns_the_last_strictly_before_entry() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let mut entries = vec![
+            entry_fl(7, 3),
+            entry_fl(7, 5),
+            entry_fl(7, 5),
+            entry_fl(7, 6),
+        ];
+        entries[1].qf_col = 2;
+        entries[2].qf_col = 4;
+        let mut errornr = 10;
+
+        assert_eq!(
+            unsafe {
+                qf_find_entry_before_pos(
+                    &entries,
+                    7,
+                    &pos_at(5, 3),
+                    false,
+                    0,
+                    &mut errornr,
+                )
+            },
+            Some(1),
+            "column 2 is the last entry strictly before column 3"
+        );
+        assert_eq!(errornr, 11);
+    }
+
+    #[test]
+    fn qf_find_entry_before_pos_rewinds_to_the_first_entry_on_a_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![
+            entry_fl(7, 3),
+            entry_fl(7, 5),
+            entry_fl(7, 5),
+            entry_fl(7, 6),
+        ];
+        let mut errornr = 1;
+
+        assert_eq!(
+            unsafe {
+                qf_find_entry_before_pos(
+                    &entries,
+                    7,
+                    &pos_at(6, 0),
+                    true,
+                    0,
+                    &mut errornr,
+                )
+            },
+            Some(1),
+            "linewise returns the first entry on line 5"
+        );
+        assert_eq!(errornr, 2);
+    }
+
+    #[test]
+    fn qf_find_entry_before_pos_stops_at_the_end_of_the_buffer_run() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![entry_fl(7, 3), entry_fl(7, 4), entry_fl(8, 1)];
+        let mut errornr = 6;
+
+        assert_eq!(
+            unsafe {
+                qf_find_entry_before_pos(
+                    &entries,
+                    7,
+                    &pos_at(9, 0),
+                    false,
+                    0,
+                    &mut errornr,
+                )
+            },
+            Some(1)
+        );
+        assert_eq!(errornr, 7);
     }
 
     #[test]
