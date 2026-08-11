@@ -1061,6 +1061,24 @@ pub struct StateItemT {
     /// substitution character for conceal (`si_cchar`).
     pub si_cchar: i32,
     /// list of contained groups (`si_cont_list`).
+    ///
+    /// **Incomplete**: the original's `int16_t *` carries three
+    /// states: none (`NULL`); "everything not contained"
+    /// (`ID_LIST_ALL`, the sentinel `(int16_t *)-1` set by
+    /// `update_si_attr` for a transparent item that isn't inside
+    /// anything); and a real list. A `Vec` cannot express the middle
+    /// one, and it is also the wrong ownership: the original only ever
+    /// *borrows* here, either from a pattern's `sp_cont_list`, a
+    /// cluster's `scl_list`, or the parent state item, whose pointer
+    /// it copies directly. That is why `pop_current_state` frees
+    /// `si_extmatch` but never this.
+    ///
+    /// Picking the final shape is deliberately deferred, because it is
+    /// tied to the `in_id_list` cache: `IdlEntryT::idl_key` keys on
+    /// the list's *pointer identity*, so a representation that copies
+    /// the ids would silently break cache lookups. Decide it together
+    /// with `in_id_list`/`idl_get_entry`, where every consumer is
+    /// visible.
     pub si_cont_list: Vec<i16>,
     /// `nextgroup` IDs to use after this item ends (`si_next_list`).
     pub si_next_list: Vec<i16>,
