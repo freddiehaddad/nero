@@ -1059,6 +1059,19 @@ pub const fn get_text_locked_msg() -> &'static str {
     crate::errors::e_textlock
 }
 
+/// Whether text/window changes are currently forbidden
+/// (`text_locked`).
+///
+/// # Safety
+/// When `expr_map_lock` is positive, `GLOBALS.curbuf` must point to a
+/// live buffer, as required by [`crate::ex_docmd::expr_map_locked`].
+#[must_use]
+pub unsafe fn text_locked() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { crate::ex_docmd::expr_map_locked() })
+        || unsafe { crate::globals::GLOBALS.get_mut() }.textlock != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,7 +1084,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn text_locked_is_false_when_both_lock_sources_are_clear() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.textlock, 0)
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.expr_map_lock,
+                0,
+            )
+        };
 
+        assert!(!unsafe { text_locked() });
+    }
+
+    #[test]
+    fn text_locked_reflects_the_direct_textlock_counter() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.textlock, 2)
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.expr_map_lock,
+                0,
+            )
+        };
+
+        assert!(unsafe { text_locked() });
+    }
+
+    #[test]
+    fn text_locked_reflects_expression_mapping_except_for_dummy_buffers() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let _curbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.curbuf,
+                buf_ptr,
+            )
+        };
+        let _text = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.textlock, 0)
+        };
+        let _expr = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.expr_map_lock,
+                1,
+            )
+        };
+
+        assert!(unsafe { text_locked() });
+        buf.b_flags = crate::buffer_defs::b_flags::BF_DUMMY as i32;
+        assert!(
+            !unsafe { text_locked() },
+            "dummy buffers are exempt from expr_map_lock"
+        );
+    }
 
     #[test]
     fn save_and_restore_viewstate_round_trip_exactly() {
