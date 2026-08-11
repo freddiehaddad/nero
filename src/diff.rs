@@ -566,6 +566,25 @@ pub unsafe fn diff_check_sanity(
     crate::vim_defs::OK
 }
 
+/// Maximum line count contributed by diff block `dp` across the
+/// buffers registered in tabpage `tp` (`get_max_diff_length`).
+///
+/// Empty diff slots are ignored. The original reaches `tp` through
+/// global `curtab`; taking it directly keeps the same read explicit.
+#[must_use]
+pub fn get_max_diff_length(
+    tp: &crate::buffer_defs::TabpageT,
+    dp: &crate::buffer_defs::DiffT,
+) -> i32 {
+    let mut maxlength = 0;
+    for k in 0..crate::buffer_defs::DB_COUNT {
+        if !tp.tp_diffbuf[k].is_null() {
+            maxlength = maxlength.max(dp.df_count[k]);
+        }
+    }
+    maxlength
+}
+
 /// Free the whole list of diff blocks for tab page `tp`
 /// (`diff_clear`).
 ///
@@ -1655,7 +1674,43 @@ mod tests {
         unsafe { diff_clear(&mut tp) };
     }
 
-    // --- diff_check_sanity ---
+    // --- get_max_diff_length / diff_check_sanity ---
+
+    #[test]
+    fn get_max_diff_length_uses_only_registered_buffer_slots() {
+        let mut buf0 = BufT::default();
+        let mut buf2 = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[0] = &mut buf0;
+        tp.tp_diffbuf[2] = &mut buf2;
+        let mut dp = crate::buffer_defs::DiffT::default();
+        dp.df_count[0] = 4;
+        dp.df_count[1] = 99; // ignored: slot 1 has no buffer
+        dp.df_count[2] = 7;
+
+        assert_eq!(get_max_diff_length(&tp, &dp), 7);
+    }
+
+    #[test]
+    fn get_max_diff_length_is_zero_without_registered_buffers() {
+        let tp = crate::buffer_defs::TabpageT::default();
+        let dp = crate::buffer_defs::DiffT {
+            df_count: [9; crate::buffer_defs::DB_COUNT],
+            ..Default::default()
+        };
+
+        assert_eq!(get_max_diff_length(&tp, &dp), 0);
+    }
+
+    #[test]
+    fn get_max_diff_length_handles_zero_length_registered_ranges() {
+        let mut buf = BufT::default();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        tp.tp_diffbuf[1] = &mut buf;
+        let dp = crate::buffer_defs::DiffT::default();
+
+        assert_eq!(get_max_diff_length(&tp, &dp), 0);
+    }
 
     #[test]
     fn diff_check_sanity_accepts_a_range_inside_the_buffer() {
