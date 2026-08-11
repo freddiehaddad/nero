@@ -612,6 +612,26 @@ pub fn fuzzy_match(str_: &str, pat_arg: &str, matchseq: bool, matches: &mut [u32
     (num_matches != 0, out_score as i32)
 }
 
+/// Returns the character positions matched by `pat` in `str_`
+/// (`fuzzy_match_str_with_pos`), or `None` for null inputs/no match.
+///
+/// Whitespace separates pattern words but has no position of its own,
+/// matching the original's filtered copy from the fixed match array.
+#[must_use]
+pub fn fuzzy_match_str_with_pos(
+    str_: Option<&str>,
+    pat: Option<&str>,
+) -> Option<Vec<u32>> {
+    let (str_, pat) = (str_?, pat?);
+    let mut positions = [0_u32; FUZZY_MATCH_MAX_LEN];
+    let (matched, score) = fuzzy_match(str_, pat, false, &mut positions);
+    if !matched || score == FUZZY_SCORE_NONE {
+        return None;
+    }
+    let count = pat.chars().filter(|c| !c.is_whitespace()).count();
+    Some(positions[..count].to_vec())
+}
+
 /// `fuzzy_match_str`: fuzzy match `pat` against the whole of `str_` (no
 /// whitespace-splitting) and return just the score, or `0` if either is
 /// empty (matching the original's early-return for `NULL`).
@@ -663,6 +683,32 @@ mod tests {
     fn fuzzy_match_str_empty_inputs_return_zero() {
         assert_eq!(fuzzy_match_str("", "abc"), 0);
         assert_eq!(fuzzy_match_str("abc", ""), 0);
+    }
+
+    #[test]
+    fn fuzzy_match_str_with_pos_returns_the_matched_character_indices() {
+        assert_eq!(
+            fuzzy_match_str_with_pos(Some("abcdef"), Some("acf")),
+            Some(vec![0, 2, 5])
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_str_with_pos_omits_pattern_whitespace() {
+        assert_eq!(
+            fuzzy_match_str_with_pos(Some("abXXef"), Some("ab ef")),
+            Some(vec![0, 1, 4, 5])
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_str_with_pos_returns_none_for_null_or_unmatched_inputs() {
+        assert_eq!(fuzzy_match_str_with_pos(None, Some("a")), None);
+        assert_eq!(fuzzy_match_str_with_pos(Some("abc"), None), None);
+        assert_eq!(
+            fuzzy_match_str_with_pos(Some("abc"), Some("xyz")),
+            None
+        );
     }
 
     #[test]
