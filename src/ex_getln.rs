@@ -1052,9 +1052,26 @@ pub unsafe fn check_opt_wim() -> i32 {
     OK
 }
 
+/// Diagnostic used when command-line editing locks text changes
+/// (`get_text_locked_msg`).
+#[must_use]
+pub const fn get_text_locked_msg() -> &'static str {
+    crate::errors::e_textlock
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_text_locked_msg_returns_the_canonical_e565_diagnostic() {
+        assert_eq!(
+            get_text_locked_msg(),
+            "E565: Not allowed to change text or change window"
+        );
+    }
+
+
 
     #[test]
     fn save_and_restore_viewstate_round_trip_exactly() {
