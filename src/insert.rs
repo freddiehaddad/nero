@@ -359,6 +359,17 @@ pub unsafe fn get_last_insert_save() -> Option<Vec<u8>> {
     Some(s)
 }
 
+/// Releases the stored last-insert text (`free_last_insert`).
+///
+/// The skip count is deliberately retained: the original clears only
+/// the owned `String`, not its separate `last_insert_skip` static.
+///
+/// # Safety
+/// Mutates the `LAST_INSERT` file-static.
+pub unsafe fn free_last_insert() {
+    unsafe { *LAST_INSERT.get_mut() = None };
+}
+
 /// Clear the last-insert state, for tests only.
 ///
 /// The original has no such function - a real session simply never
@@ -1245,6 +1256,53 @@ mod tests {
     }
 
     // --- last_insert family ---
+
+    struct LastInsertStateGuard {
+        value: Option<Vec<u8>>,
+        skip: usize,
+    }
+
+    impl LastInsertStateGuard {
+        fn save() -> Self {
+            Self {
+                value: unsafe { LAST_INSERT.get_mut() }.clone(),
+                skip: unsafe { *LAST_INSERT_SKIP.get_mut() },
+            }
+        }
+    }
+
+    impl Drop for LastInsertStateGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *LAST_INSERT.get_mut() = self.value.take();
+                *LAST_INSERT_SKIP.get_mut() = self.skip;
+            }
+        }
+    }
+
+    #[test]
+    fn free_last_insert_releases_the_stored_text() {
+        let _lock = global_state_test_lock();
+        let _g = LastInsertStateGuard::save();
+        unsafe { set_last_insert(i32::from(b'a')) };
+
+        unsafe { free_last_insert() };
+
+        assert_eq!(unsafe { get_last_insert() }, None);
+    }
+
+    #[test]
+    fn free_last_insert_does_not_reset_the_separate_skip_count() {
+        let _lock = global_state_test_lock();
+        let _g = LastInsertStateGuard::save();
+        unsafe {
+            *LAST_INSERT.get_mut() = Some(b"prefix".to_vec());
+            *LAST_INSERT_SKIP.get_mut() = 4;
+            free_last_insert();
+        }
+
+        assert_eq!(unsafe { *LAST_INSERT_SKIP.get_mut() }, 4);
+    }
 
     #[test]
     fn last_insert_is_unset_until_something_records_one() {
