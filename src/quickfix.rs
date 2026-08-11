@@ -301,6 +301,19 @@ pub struct QffieldsT {
     pub valid: bool,
 }
 
+/// Parses an `'errorformat'` `%t` error-type match
+/// (`qf_parse_fmt_t`).
+pub fn qf_parse_fmt_t(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    fields.type_ = matched.first().copied().unwrap_or(0);
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -1791,6 +1804,33 @@ mod tests {
             // SAFETY: as in `set`.
             unsafe { crate::globals::GLOBALS.get_mut() }.got_int = self.0;
         }
+    }
+
+    #[test]
+    fn qf_parse_fmt_t_stores_the_first_matched_byte() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_t(Some(b"Error"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.type_, b'E');
+    }
+
+    #[test]
+    fn qf_parse_fmt_t_rejects_a_missing_match_without_changing_type() {
+        let mut fields = QffieldsT {
+            type_: b'W',
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_t(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.type_, b'W');
+    }
+
+    #[test]
+    fn qf_parse_fmt_t_treats_an_empty_match_as_nul() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(qf_parse_fmt_t(Some(b""), &mut fields), qf_status::QF_OK);
+        assert_eq!(fields.type_, 0);
     }
 
     #[test]
