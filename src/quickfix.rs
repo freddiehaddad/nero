@@ -739,6 +739,25 @@ pub unsafe fn qf_find_win(
     std::ptr::null_mut()
 }
 
+/// Returns the current tabpage's window id for quickfix/location stack
+/// `qi` (`qf_winid`), or zero when no such window is open.
+///
+/// # Safety
+/// Same pointer and window-chain requirements as [`qf_find_win`].
+#[must_use]
+pub unsafe fn qf_winid(qi: *const crate::types_defs::QfInfoT) -> i32 {
+    if qi.is_null() {
+        return 0;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let win = unsafe { qf_find_win(qi) };
+    if win.is_null() {
+        0
+    } else {
+        unsafe { (*win).handle }
+    }
+}
+
 /// Free every list in the stack, but not the stack itself
 /// (`qf_free_list_stack_items`).
 ///
@@ -3702,6 +3721,34 @@ mod tests {
         };
 
         assert!(unsafe { qf_find_win(std::ptr::addr_of!(*qi)) }.is_null());
+    }
+
+    #[test]
+    fn qf_winid_is_zero_for_a_null_stack() {
+        assert_eq!(unsafe { qf_winid(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn qf_winid_returns_the_matching_windows_handle() {
+        let _lock = crate::globals::global_state_test_lock();
+        let qi = Box::new(crate::types_defs::QfInfoT::default());
+        let mut buf = Box::new(BufT::default());
+        buf.b_p_bt = Some(b"quickfix".to_vec());
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let mut win = Box::new(WinT {
+            handle: 314,
+            w_buffer: buf_ptr,
+            ..Default::default()
+        });
+        let win_ptr = std::ptr::addr_of_mut!(*win);
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+
+        assert_eq!(unsafe { qf_winid(std::ptr::addr_of!(*qi)) }, 314);
     }
 
     #[test]
