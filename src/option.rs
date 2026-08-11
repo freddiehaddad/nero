@@ -808,10 +808,8 @@ static OPTION_SCRIPT_CTX: crate::globals::GlobalCell<[SctxT; crate::option_defs:
         [SctxT { sc_sid: 0, sc_seq: 0, sc_lnum: 0, sc_chan: 0 }; crate::option_defs::OPT_COUNT],
     );
 
-/// The script context recorded for GLOBAL option `opt_idx` (the
-/// original's own `options[opt_idx].script_ctx`, read directly - there
-/// is no separate named accessor function for this in the original,
-/// every real call site just reads the field). Buffer-/window-local
+/// The script context recorded for GLOBAL option `opt_idx`
+/// (`get_option_sctx`). Buffer-/window-local
 /// script contexts live on `BufT.b_p_script_ctx`/
 /// `WinoptT.wo_script_ctx` instead (see [`set_option_sctx`]'s own doc
 /// comment) and are read directly through those fields, matching the
@@ -822,12 +820,18 @@ static OPTION_SCRIPT_CTX: crate::globals::GlobalCell<[SctxT; crate::option_defs:
 /// [`option_was_set`]'s own established convention for this exact
 /// side-table shape.
 #[must_use]
-pub fn option_script_ctx(opt_idx: OptIndex) -> SctxT {
+pub fn get_option_sctx(opt_idx: OptIndex) -> SctxT {
     debug_assert!(opt_idx != OptIndex::Invalid);
     // SAFETY: a plain Copy-out read through one exclusive borrow, no
     // aliasing hazard.
     let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
     table[opt_idx as usize]
+}
+
+/// Backwards-compatible descriptive alias for [`get_option_sctx`].
+#[must_use]
+pub fn option_script_ctx(opt_idx: OptIndex) -> SctxT {
+    get_option_sctx(opt_idx)
 }
 
 /// Grow `v` in place (with `SctxT::default()` fill) so that
@@ -5787,6 +5791,26 @@ mod set_option_sctx_tests {
         table[opt_idx as usize] = SctxT::default();
     }
 
+    struct OptionScriptCtxGuard {
+        idx: OptIndex,
+        saved: SctxT,
+    }
+
+    impl OptionScriptCtxGuard {
+        fn install(idx: OptIndex, value: SctxT) -> Self {
+            let table = unsafe { OPTION_SCRIPT_CTX.get_mut() };
+            let saved = table[idx as usize];
+            table[idx as usize] = value;
+            Self { idx, saved }
+        }
+    }
+
+    impl Drop for OptionScriptCtxGuard {
+        fn drop(&mut self) {
+            (unsafe { OPTION_SCRIPT_CTX.get_mut() })[self.idx as usize] = self.saved;
+        }
+    }
+
     #[test]
     fn option_scope_idx_matches_the_known_buf_opt_index() {
         // 'tabstop' is BufOptIndex::Tabstop - verified against
@@ -5806,6 +5830,21 @@ mod set_option_sctx_tests {
         let _lock = crate::globals::global_state_test_lock();
         reset_script_ctx(OptIndex::Ignorecase);
         assert_eq!(option_script_ctx(OptIndex::Ignorecase), SctxT::default());
+    }
+
+    #[test]
+    fn get_option_sctx_reads_the_global_context_side_table() {
+        let _lock = crate::globals::global_state_test_lock();
+        let ctx = SctxT {
+            sc_sid: 17,
+            sc_seq: 3,
+            sc_lnum: 29,
+            sc_chan: 5,
+        };
+        let _g = OptionScriptCtxGuard::install(OptIndex::Ignorecase, ctx);
+
+        assert_eq!(get_option_sctx(OptIndex::Ignorecase), ctx);
+        assert_eq!(option_script_ctx(OptIndex::Ignorecase), ctx);
     }
 
     #[test]
