@@ -404,6 +404,60 @@ pub fn xdiff_out(
     0
 }
 
+/// Parses one ed-style diff command into `hunk` (`parse_diff_ed`).
+///
+/// Accepted forms are `{first}[,{last}]c...`, `...a...`, and
+/// `...d...`. Trailing text after the second range is ignored, as in
+/// the original parser.
+pub fn parse_diff_ed(line: &[u8], hunk: &mut DiffhunkT) -> i32 {
+    let mut p = 0;
+    let (f1, used) = crate::charset::getdigits_int32(&line[p..], true, 0);
+    p += used;
+    let l1 = if line.get(p) == Some(&b',') {
+        p += 1;
+        let (value, used) = crate::charset::getdigits_int(&line[p..], true, 0);
+        p += used;
+        value
+    } else {
+        f1
+    };
+
+    let Some(&difftype @ (b'a' | b'c' | b'd')) = line.get(p) else {
+        return crate::vim_defs::FAIL;
+    };
+    p += 1;
+
+    let (f2, used) = crate::charset::getdigits_int(&line[p..], true, 0);
+    p += used;
+    let l2 = if line.get(p) == Some(&b',') {
+        p += 1;
+        let (value, _used) = crate::charset::getdigits_int(&line[p..], true, 0);
+        value
+    } else {
+        f2
+    };
+
+    if l1 < f1 || l2 < f2 {
+        return crate::vim_defs::FAIL;
+    }
+
+    if difftype == b'a' {
+        hunk.lnum_orig = f1 + 1;
+        hunk.count_orig = 0;
+    } else {
+        hunk.lnum_orig = f1;
+        hunk.count_orig = l1 - f1 + 1;
+    }
+    if difftype == b'd' {
+        hunk.lnum_new = f2 + 1;
+        hunk.count_new = 0;
+    } else {
+        hunk.lnum_new = f2;
+        hunk.count_new = l2 - f2 + 1;
+    }
+    crate::vim_defs::OK
+}
+
 /// Copy one diff entry's line range from one buffer slot to another
 /// (`diff_copy_entry`).
 ///
@@ -1072,6 +1126,69 @@ mod tests {
         assert_eq!(dout.dout_ga.items[1].lnum_orig, 11);
         assert_eq!(dout.dout_ga.items[1].count_orig, 0);
         assert_eq!(dout.dout_ga.items[1].lnum_new, 21);
+    }
+
+    #[test]
+    fn parse_diff_ed_parses_change_ranges() {
+        let mut hunk = DiffhunkT::default();
+
+        assert_eq!(parse_diff_ed(b"3,5c7,9", &mut hunk), crate::vim_defs::OK);
+        assert_eq!(
+            hunk,
+            DiffhunkT {
+                lnum_orig: 3,
+                count_orig: 3,
+                lnum_new: 7,
+                count_new: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_diff_ed_parses_append_as_an_empty_original_range() {
+        let mut hunk = DiffhunkT::default();
+
+        assert_eq!(parse_diff_ed(b"4a8,10", &mut hunk), crate::vim_defs::OK);
+        assert_eq!(hunk.lnum_orig, 5);
+        assert_eq!(hunk.count_orig, 0);
+        assert_eq!(hunk.lnum_new, 8);
+        assert_eq!(hunk.count_new, 3);
+    }
+
+    #[test]
+    fn parse_diff_ed_parses_delete_as_an_empty_new_range() {
+        let mut hunk = DiffhunkT::default();
+
+        assert_eq!(parse_diff_ed(b"4,6d8", &mut hunk), crate::vim_defs::OK);
+        assert_eq!(hunk.lnum_orig, 4);
+        assert_eq!(hunk.count_orig, 3);
+        assert_eq!(hunk.lnum_new, 9);
+        assert_eq!(hunk.count_new, 0);
+    }
+
+    #[test]
+    fn parse_diff_ed_rejects_unknown_operators_and_reversed_ranges() {
+        let original = DiffhunkT {
+            lnum_orig: 99,
+            ..Default::default()
+        };
+        let mut hunk = original;
+        assert_eq!(parse_diff_ed(b"3x7", &mut hunk), crate::vim_defs::FAIL);
+        assert_eq!(hunk, original, "an invalid operator writes nothing");
+
+        assert_eq!(parse_diff_ed(b"5,3c7", &mut hunk), crate::vim_defs::FAIL);
+        assert_eq!(hunk, original, "a reversed range writes nothing");
+    }
+
+    #[test]
+    fn parse_diff_ed_accepts_single_line_ranges_and_trailing_text() {
+        let mut hunk = DiffhunkT::default();
+        assert_eq!(
+            parse_diff_ed(b"3c7 trailing", &mut hunk),
+            crate::vim_defs::OK
+        );
+        assert_eq!((hunk.lnum_orig, hunk.count_orig), (3, 1));
+        assert_eq!((hunk.lnum_new, hunk.count_new), (7, 1));
     }
 
     // --- clear_diffin / clear_diffout ---
