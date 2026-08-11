@@ -528,6 +528,28 @@ pub unsafe fn stop_redo_ins() {
 /// is currently its only real user in this crate.
 const MAXMAPLEN: i32 = 50;
 
+/// Initializes the static emergency typeahead buffer
+/// (`init_typebuf`) once.
+///
+/// In the C representation a null `tb_buf` marks "not initialized".
+/// In the Vec representation `tb_change_cnt == 0` is the equivalent
+/// sentinel: every real allocation sets it nonzero and preserves that
+/// invariant across wraparound.
+pub fn init_typebuf() {
+    let tb = unsafe { TYPEBUF.get_mut() };
+    if tb.tb_change_cnt != 0 {
+        return;
+    }
+    tb.tb_buf.clear();
+    tb.tb_noremap.clear();
+    tb.tb_off = MAXMAPLEN + 4;
+    tb.tb_len = 0;
+    tb.tb_maplen = 0;
+    tb.tb_silent = 0;
+    tb.tb_no_abbr_cnt = 0;
+    tb.tb_change_cnt = 1;
+}
+
 /// Whether the stuff buffer is empty (`stuff_empty`).
 #[must_use]
 pub fn stuff_empty() -> bool {
@@ -1894,6 +1916,37 @@ mod tests {
         free_buff(&mut buf);
         assert!(buf.blocks.is_empty());
         assert_eq!(buf.bh_index, 7, "free_buff never touches bh_index, matching the original");
+    }
+
+    #[test]
+    fn init_typebuf_initializes_the_static_buffer_once() {
+        let _lock = global_state_test_lock();
+        let _g = TypebufStateGuard::install(0);
+
+        init_typebuf();
+
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_off, MAXMAPLEN + 4);
+        assert_eq!(tb.tb_len, 0);
+        assert_eq!(tb.tb_change_cnt, 1);
+    }
+
+    #[test]
+    fn init_typebuf_leaves_an_initialized_buffer_untouched() {
+        let _lock = global_state_test_lock();
+        let _g = TypebufStateGuard::install(0);
+        unsafe {
+            TYPEBUF.get_mut().tb_buf = vec![1, 2, 3];
+            TYPEBUF.get_mut().tb_off = 9;
+            TYPEBUF.get_mut().tb_change_cnt = 7;
+        }
+
+        init_typebuf();
+
+        let tb = unsafe { TYPEBUF.get_mut() };
+        assert_eq!(tb.tb_buf, vec![1, 2, 3]);
+        assert_eq!(tb.tb_off, 9);
+        assert_eq!(tb.tb_change_cnt, 7);
     }
 
     #[test]
