@@ -216,6 +216,27 @@ pub unsafe fn op_reg_get(name: i32) -> Option<*const YankregT> {
     unsafe { get_y_register(idx) }.map(|ptr| ptr.cast_const())
 }
 
+/// Replaces the register named by `name` with `reg` (`op_reg_set`).
+///
+/// Returns `false` when the name has no direct slot. When
+/// `is_unnamed` is true, unnamed-register fallback is redirected to
+/// the replaced slot.
+///
+/// # Safety
+/// Mutates the `Y_REGS` and possibly `Y_PREVIOUS` file-statics.
+pub unsafe fn op_reg_set(name: i32, reg: YankregT, is_unnamed: bool) -> bool {
+    let Some(idx) = op_reg_index(name) else {
+        return false;
+    };
+    // Assigning the owned value drops the previous register contents,
+    // exactly replacing the original's free-then-shallow-copy pair.
+    unsafe { Y_REGS.get_mut()[idx] = reg };
+    if is_unnamed {
+        unsafe { *Y_PREVIOUS.get_mut() = Some(idx) };
+    }
+    true
+}
+
 /// Selects the register named by `name` as the previous yank register
 /// (`op_reg_set_previous`).
 ///
@@ -844,6 +865,63 @@ mod tests {
                 *Y_PREVIOUS.get_mut() = self.previous;
             }
         }
+    }
+
+    #[test]
+    fn op_reg_set_replaces_the_named_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        let value = YankregT {
+            y_array: Some(vec![b"new value".to_vec()]),
+            y_type: crate::normal_defs::MotionType::LineWise,
+            y_width: 4,
+            timestamp: 77,
+        };
+
+        assert!(unsafe { op_reg_set(i32::from(b'c'), value, false) });
+
+        let reg = unsafe { &*op_reg_get(i32::from(b'c')).unwrap() };
+        assert_eq!(reg.y_array.as_deref(), Some(&[b"new value".to_vec()][..]));
+        assert_eq!(reg.y_type, crate::normal_defs::MotionType::LineWise);
+        assert_eq!(reg.y_width, 4);
+        assert_eq!(reg.timestamp, 77);
+    }
+
+    #[test]
+    fn op_reg_set_updates_unnamed_fallback_only_when_requested() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        assert!(unsafe { op_reg_set_previous(i32::from(b'a')) });
+
+        assert!(unsafe { op_reg_set(i32::from(b'b'), YankregT::default(), false) });
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, op_reg_index(i32::from(b'a')));
+
+        assert!(unsafe { op_reg_set(i32::from(b'c'), YankregT::default(), true) });
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, op_reg_index(i32::from(b'c')));
+    }
+
+    #[test]
+    fn op_reg_set_rejects_a_name_without_a_direct_slot() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        let before = unsafe { Y_REGS.get_mut()[0].clone() };
+
+        assert!(!unsafe {
+            op_reg_set(
+                i32::from(b'!'),
+                YankregT {
+                    y_array: Some(vec![b"discarded".to_vec()]),
+                    ..Default::default()
+                },
+                true,
+            )
+        });
+
+        assert_eq!(
+            unsafe { Y_REGS.get_mut()[0].y_array.as_ref() },
+            before.y_array.as_ref()
+        );
+        assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, _g.previous);
     }
 
     #[test]
