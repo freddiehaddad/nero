@@ -656,10 +656,17 @@ pub fn is_option_hidden(opt_idx: OptIndex) -> bool {
     p.immutable && p.var.is_null()
 }
 
+/// Returns the declared value type of option `opt_idx`
+/// (`option_get_type`).
+#[must_use]
+pub fn option_get_type(opt_idx: OptIndex) -> OptValType {
+    get_option(opt_idx).r#type
+}
+
 /// Check if option supports a specific type (`option_has_type`).
 #[must_use]
 pub fn option_has_type(opt_idx: OptIndex, typ: OptValType) -> bool {
-    opt_idx != OptIndex::Invalid && get_option(opt_idx).r#type == typ
+    opt_idx != OptIndex::Invalid && option_get_type(opt_idx) == typ
 }
 
 /// Check if option supports a specific scope (`option_has_scope`).
@@ -4584,6 +4591,16 @@ mod varp_tests {
     }
 
     #[test]
+    fn option_get_type_returns_each_declared_value_kind() {
+        assert_eq!(option_get_type(OptIndex::Aleph), OptValType::Number);
+        assert_eq!(option_get_type(OptIndex::Ambiwidth), OptValType::String);
+        assert_eq!(
+            option_get_type(OptIndex::Allowrevins),
+            OptValType::Boolean
+        );
+    }
+
+    #[test]
     fn option_has_scope_reflects_scope_flags() {
         assert!(option_has_scope(OptIndex::Allowrevins, OptScope::Global));
         assert!(!option_has_scope(OptIndex::Allowrevins, OptScope::Win));
@@ -7988,5 +8005,3 @@ mod did_set_title_tests {
         assert!(msg.contains("maketitle"), "unexpected panic message: {msg}");
     }
 }
-
-
