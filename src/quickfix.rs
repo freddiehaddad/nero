@@ -382,6 +382,28 @@ pub fn qf_parse_fmt_v(
     qf_status::QF_OK
 }
 
+/// Parses an `'errorformat'` `%s` search-text match
+/// (`qf_parse_fmt_s`).
+///
+/// The result is a very-nomagic anchored pattern:
+/// `^\V{match}\$`, NUL-terminated and capped to `CMDBUFFSIZE`.
+pub fn qf_parse_fmt_s(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    let len = matched
+        .len()
+        .min(crate::os::os_defs::CMDBUFFSIZE - 5);
+    fields.pattern.clear();
+    fields.pattern.extend_from_slice(b"^\\V");
+    fields.pattern.extend_from_slice(&matched[..len]);
+    fields.pattern.extend_from_slice(b"\\$\0");
+    qf_status::QF_OK
+}
+
 /// Copy a line that matched no error format into the message field
 /// (`copy_nonerror_line`).
 ///
@@ -2023,6 +2045,45 @@ mod tests {
         assert_eq!(qf_parse_fmt_v(None, &mut fields), qf_status::QF_FAIL);
         assert_eq!(fields.col, 7);
         assert!(!fields.use_viscol);
+    }
+
+    #[test]
+    fn qf_parse_fmt_s_builds_an_anchored_very_nomagic_pattern() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_s(Some(b"a.b"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.pattern, b"^\\Va.b\\$\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_s_handles_an_empty_match() {
+        let mut fields = QffieldsT::default();
+        qf_parse_fmt_s(Some(b""), &mut fields);
+        assert_eq!(fields.pattern, b"^\\V\\$\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_s_caps_the_match_to_the_command_buffer_limit() {
+        let mut fields = QffieldsT::default();
+        let matched = vec![b'x'; crate::os::os_defs::CMDBUFFSIZE + 50];
+        qf_parse_fmt_s(Some(&matched), &mut fields);
+        assert_eq!(
+            fields.pattern.len(),
+            crate::os::os_defs::CMDBUFFSIZE + 1
+        );
+        assert!(fields.pattern.ends_with(b"\\$\0"));
+    }
+
+    #[test]
+    fn qf_parse_fmt_s_rejects_a_missing_match_without_changing_pattern() {
+        let mut fields = QffieldsT {
+            pattern: b"keep\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_s(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.pattern, b"keep\0");
     }
 
     #[test]
