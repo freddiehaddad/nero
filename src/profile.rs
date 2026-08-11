@@ -191,6 +191,27 @@ pub fn profile_sub(tm1: ProftimeT, tm2: ProftimeT) -> ProftimeT {
     tm1.wrapping_sub(tm2)
 }
 
+/// Previous timestamp used by startup-time nesting (`g_prev_time`).
+static G_PREV_TIME: crate::globals::GlobalCell<ProftimeT> =
+    crate::globals::GlobalCell::new(0);
+
+/// Saves timing state before an operation that may nest (`time_push`).
+///
+/// The original writes elapsed time and the new start through two
+/// out-parameters; both are returned as `(relative, start)` here.
+///
+/// # Safety
+/// Mutates the `G_PREV_TIME` file-static.
+#[must_use]
+pub unsafe fn time_push() -> (ProftimeT, ProftimeT) {
+    let now = profile_start();
+    // SAFETY: forwarded from this function's own safety doc.
+    let prev = unsafe { *G_PREV_TIME.get_mut() };
+    let relative = profile_sub(now, prev);
+    unsafe { *G_PREV_TIME.get_mut() = now };
+    (relative, now)
+}
+
 /// Adds the `self` time from the total time and the `children` time
 /// (`profile_self`).
 ///
@@ -311,6 +332,45 @@ pub fn profile_cmp(tm1: ProftimeT, tm2: ProftimeT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PrevTimeGuard(ProftimeT);
+
+    impl PrevTimeGuard {
+        fn install(value: ProftimeT) -> Self {
+            let slot = unsafe { G_PREV_TIME.get_mut() };
+            let saved = *slot;
+            *slot = value;
+            Self(saved)
+        }
+    }
+
+    impl Drop for PrevTimeGuard {
+        fn drop(&mut self) {
+            unsafe { *G_PREV_TIME.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn time_push_returns_elapsed_time_and_updates_the_previous_timestamp() {
+        let _lock = crate::globals::global_state_test_lock();
+        let previous = profile_start();
+        let _g = PrevTimeGuard::install(previous);
+
+        let (relative, start) = unsafe { time_push() };
+
+        assert_eq!(relative, profile_sub(start, previous));
+        assert_eq!(unsafe { *G_PREV_TIME.get_mut() }, start);
+    }
+
+    #[test]
+    fn time_push_from_zero_returns_the_absolute_monotonic_value() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = PrevTimeGuard::install(0);
+
+        let (relative, start) = unsafe { time_push() };
+
+        assert_eq!(relative, start);
+    }
 
     // --- prof_input_start / prof_input_end ---
 
