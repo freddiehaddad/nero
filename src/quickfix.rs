@@ -305,6 +305,26 @@ fn qf_parse_atol_match(matched: Option<&[u8]>) -> Option<i32> {
     matched.map(|text| crate::charset::getdigits_int(text, false, 0).0)
 }
 
+/// Parses an `'errorformat'` `%b` buffer number
+/// (`qf_parse_fmt_b`), accepting it only when that buffer still
+/// exists.
+///
+/// # Safety
+/// Reads the global buffer list through [`crate::buffer::buflist_findnr`].
+pub unsafe fn qf_parse_fmt_b(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(bnr) = qf_parse_atol_match(matched) else {
+        return qf_status::QF_FAIL;
+    };
+    if unsafe { crate::buffer::buflist_findnr(bnr) }.is_null() {
+        return qf_status::QF_FAIL;
+    }
+    fields.bnr = bnr;
+    qf_status::QF_OK
+}
+
 /// Parses an `'errorformat'` `%n` error number
 /// (`qf_parse_fmt_n`).
 pub fn qf_parse_fmt_n(
@@ -2029,6 +2049,48 @@ mod tests {
         assert_eq!(fields.enr, -7);
         qf_parse_fmt_n(Some(b"none"), &mut fields);
         assert_eq!(fields.enr, 0);
+    }
+
+    #[test]
+    fn qf_parse_fmt_b_accepts_a_live_buffer_number() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut buf = Box::new(BufT {
+            handle: 17,
+            ..Default::default()
+        });
+        let buf_ptr = std::ptr::addr_of_mut!(*buf);
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.lastbuf, buf_ptr)
+        };
+        let mut fields = QffieldsT::default();
+
+        assert_eq!(
+            unsafe { qf_parse_fmt_b(Some(b"17"), &mut fields) },
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.bnr, 17);
+    }
+
+    #[test]
+    fn qf_parse_fmt_b_rejects_missing_or_wiped_buffers_without_changing_bnr() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _lastbuf = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.lastbuf,
+                std::ptr::null_mut(),
+            )
+        };
+        let mut fields = QffieldsT {
+            bnr: 8,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { qf_parse_fmt_b(Some(b"17"), &mut fields) },
+            qf_status::QF_FAIL
+        );
+        assert_eq!(unsafe { qf_parse_fmt_b(None, &mut fields) }, qf_status::QF_FAIL);
+        assert_eq!(fields.bnr, 8);
     }
 
     #[test]
