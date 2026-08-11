@@ -1100,6 +1100,35 @@ pub unsafe fn qf_find_win_with_normal_buf() -> *mut WinT {
     std::ptr::null_mut()
 }
 
+/// Finds the first quickfix entry belonging to buffer `bnr`
+/// (`qf_find_first_entry_in_buf`).
+///
+/// The returned index is zero-based for the containing `Vec`, while
+/// `errornr` keeps the original's one-based quickfix numbering. When
+/// no entry matches, `errornr` is one past the list's last entry.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int`.
+#[must_use]
+pub unsafe fn qf_find_first_entry_in_buf(
+    qfl: &QfListT,
+    bnr: i32,
+    errornr: &mut i32,
+) -> Option<usize> {
+    for (idx, entry) in qfl.qf_entries.iter().enumerate() {
+        *errornr = i32::try_from(idx + 1).unwrap_or(i32::MAX);
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            return None;
+        }
+        if entry.qf_fnum == bnr {
+            return Some(idx);
+        }
+    }
+    *errornr = qfl.qf_count().saturating_add(1);
+    None
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1226,7 +1255,7 @@ pub fn qf_entry_on_or_before_pos(
 mod tests {
     use super::*;
 
-    // --- qf_find_first/last_entry_on_line ---
+    // --- qf_find_first_entry_in_buf / first/last_entry_on_line ---
 
     fn entry_fl(fnum: i32, lnum: i32) -> QflineT {
         QflineT {
@@ -1255,6 +1284,76 @@ mod tests {
             // SAFETY: as in `set`.
             unsafe { crate::globals::GLOBALS.get_mut() }.got_int = self.0;
         }
+    }
+
+    #[test]
+    fn qf_find_first_entry_in_buf_returns_the_first_match() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = QfListT {
+            qf_entries: vec![
+                entry_fl(1, 2),
+                entry_fl(7, 3),
+                entry_fl(7, 4),
+            ],
+            ..Default::default()
+        };
+        let mut errornr = 0;
+
+        assert_eq!(
+            unsafe { qf_find_first_entry_in_buf(&qfl, 7, &mut errornr) },
+            Some(1)
+        );
+        assert_eq!(errornr, 2, "quickfix entry numbers are one-based");
+    }
+
+    #[test]
+    fn qf_find_first_entry_in_buf_reports_one_past_end_on_a_miss() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let qfl = QfListT {
+            qf_entries: vec![entry_fl(1, 2), entry_fl(2, 3)],
+            ..Default::default()
+        };
+        let mut errornr = 0;
+
+        assert_eq!(
+            unsafe { qf_find_first_entry_in_buf(&qfl, 9, &mut errornr) },
+            None
+        );
+        assert_eq!(errornr, 3);
+    }
+
+    #[test]
+    fn qf_find_first_entry_in_buf_stops_when_interrupted() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(true);
+        let qfl = QfListT {
+            qf_entries: vec![entry_fl(7, 2)],
+            ..Default::default()
+        };
+        let mut errornr = 0;
+
+        assert_eq!(
+            unsafe { qf_find_first_entry_in_buf(&qfl, 7, &mut errornr) },
+            None
+        );
+        assert_eq!(errornr, 1, "the interrupted scan stopped at its first entry");
+    }
+
+    #[test]
+    fn qf_find_first_entry_in_buf_handles_an_empty_list() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let mut errornr = 99;
+
+        assert_eq!(
+            unsafe {
+                qf_find_first_entry_in_buf(&QfListT::default(), 7, &mut errornr)
+            },
+            None
+        );
+        assert_eq!(errornr, 1);
     }
 
     /// The scan spans only entries sharing BOTH file and line, and
