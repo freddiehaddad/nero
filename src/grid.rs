@@ -145,10 +145,57 @@ static GRID_LINE_MAXCOL: crate::globals::GlobalCell<i32> =
     crate::globals::GlobalCell::new(0);
 static GRID_LINE_GRID: crate::globals::GlobalCell<*mut crate::grid_defs::ScreenGrid> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+static GRID_LINE_ROW: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(-1);
+static GRID_LINE_COLOFF: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
 
 /// `grid_put_linebuf` flag marking right-to-left text
 /// (`SLF_RIGHTLEFT`).
 pub const SLF_RIGHTLEFT: i32 = 1;
+
+/// Starts buffering one row of `grid` (`screengrid_line_start`).
+///
+/// # Safety
+/// `grid` must remain live until the matching flush/end operation.
+/// No other grid line may already be active.
+pub unsafe fn screengrid_line_start(
+    grid: *mut crate::grid_defs::ScreenGrid,
+    row: i32,
+    col: i32,
+) {
+    assert!(!grid.is_null());
+    assert!(unsafe { *GRID_LINE_GRID.get_mut() }.is_null());
+    let linebuf_size = unsafe { (*LINEBUF_CHAR.get_mut()).len() };
+    let grid_cols = unsafe { (*grid).cols };
+    let maxcol = grid_cols.min(grid_cols - col);
+    assert!(usize::try_from(maxcol).is_ok_and(|n| n <= linebuf_size));
+
+    unsafe {
+        *GRID_LINE_ROW.get_mut() = row;
+        *GRID_LINE_GRID.get_mut() = grid;
+        *GRID_LINE_COLOFF.get_mut() = col;
+        *GRID_LINE_FIRST.get_mut() =
+            i32::try_from(linebuf_size).expect("line buffer length must fit i32");
+        *GRID_LINE_MAXCOL.get_mut() = maxcol;
+        *GRID_LINE_LAST.get_mut() = 0;
+        *GRID_LINE_CLEAR_TO.get_mut() = 0;
+        *GRID_LINE_BG_ATTR.get_mut() = 0;
+        *GRID_LINE_CLEAR_ATTR.get_mut() = 0;
+        *GRID_LINE_FLAGS.get_mut() = 0;
+    }
+
+    let globals = unsafe { crate::globals::GLOBALS.get_mut() };
+    let rdb_flags = unsafe { crate::option_vars::OPTION_VARS.get_mut() }.rdb_flags;
+    if globals.full_screen
+        && rdb_flags & crate::option_vars::opt_rdb_flag::INVALID != 0
+    {
+        unsafe {
+            LINEBUF_CHAR.get_mut().fill(ScharT::MAX);
+            LINEBUF_ATTR.get_mut().fill(-1);
+        }
+    }
+}
 
 /// Marks the remainder of the buffered grid line for clearing
 /// (`grid_line_clear_end`).
@@ -821,7 +868,7 @@ pub unsafe fn grid_getchar(
 mod tests {
     use super::*;
 
-    struct GridLineStateGuard([i32; 7]);
+    struct GridLineStateGuard([i32; 9]);
 
     impl GridLineStateGuard {
         fn install(first: i32, last: i32) -> Self {
@@ -834,6 +881,8 @@ mod tests {
                     *GRID_LINE_CLEAR_ATTR.get_mut(),
                     *GRID_LINE_FLAGS.get_mut(),
                     *GRID_LINE_MAXCOL.get_mut(),
+                    *GRID_LINE_ROW.get_mut(),
+                    *GRID_LINE_COLOFF.get_mut(),
                 ]
             };
             unsafe {
@@ -841,6 +890,8 @@ mod tests {
                 *GRID_LINE_LAST.get_mut() = last;
                 *GRID_LINE_FLAGS.get_mut() = 0;
                 *GRID_LINE_MAXCOL.get_mut() = 0;
+                *GRID_LINE_ROW.get_mut() = -1;
+                *GRID_LINE_COLOFF.get_mut() = 0;
             }
             Self(saved)
         }
@@ -856,6 +907,8 @@ mod tests {
                 *GRID_LINE_CLEAR_ATTR.get_mut() = self.0[4];
                 *GRID_LINE_FLAGS.get_mut() = self.0[5];
                 *GRID_LINE_MAXCOL.get_mut() = self.0[6];
+                *GRID_LINE_ROW.get_mut() = self.0[7];
+                *GRID_LINE_COLOFF.get_mut() = self.0[8];
             }
         }
     }
@@ -900,6 +953,83 @@ mod tests {
             unsafe { *GRID_LINE_GRID.get_mut() = grid };
             Self(saved)
         }
+    }
+
+    struct RdbFlagsGuard(u32);
+
+    impl RdbFlagsGuard {
+        fn install(value: u32) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.rdb_flags;
+            opts.rdb_flags = value;
+            Self(saved)
+        }
+    }
+
+    impl Drop for RdbFlagsGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.rdb_flags = self.0;
+        }
+    }
+
+    #[test]
+    fn screengrid_line_start_initializes_all_buffering_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![0; 6],
+            vec![0; 6],
+            vec![0; 6],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let mut grid = crate::grid_defs::ScreenGrid {
+            cols: 6,
+            ..Default::default()
+        };
+        let grid_ptr = std::ptr::addr_of_mut!(grid);
+
+        unsafe { screengrid_line_start(grid_ptr, 3, 2) };
+
+        assert_eq!(unsafe { *GRID_LINE_GRID.get_mut() }, grid_ptr);
+        assert_eq!(unsafe { *GRID_LINE_ROW.get_mut() }, 3);
+        assert_eq!(unsafe { *GRID_LINE_COLOFF.get_mut() }, 2);
+        assert_eq!(unsafe { *GRID_LINE_MAXCOL.get_mut() }, 4);
+        assert_eq!(unsafe { *GRID_LINE_FIRST.get_mut() }, 6);
+        assert_eq!(unsafe { *GRID_LINE_LAST.get_mut() }, 0);
+        assert_eq!(unsafe { *GRID_LINE_FLAGS.get_mut() }, 0);
+    }
+
+    #[test]
+    fn screengrid_line_start_invalidates_scratch_cells_when_requested() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![1; 4],
+            vec![2; 4],
+            vec![3; 4],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let _full = unsafe {
+            crate::globals::GlobalFieldGuard::install(
+                |g| &mut g.full_screen,
+                true,
+            )
+        };
+        let _rdb = RdbFlagsGuard::install(
+            crate::option_vars::opt_rdb_flag::INVALID,
+        );
+        let mut grid = crate::grid_defs::ScreenGrid {
+            cols: 4,
+            ..Default::default()
+        };
+
+        unsafe {
+            screengrid_line_start(std::ptr::addr_of_mut!(grid), 0, 0);
+        }
+
+        assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[ScharT::MAX; 4]);
+        assert_eq!(unsafe { &*LINEBUF_ATTR.get_mut() }, &[-1; 4]);
+        assert_eq!(unsafe { &*LINEBUF_VCOL.get_mut() }, &[3; 4]);
     }
 
     impl Drop for GridLineGridGuard {
