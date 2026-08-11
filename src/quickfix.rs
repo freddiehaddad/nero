@@ -1093,6 +1093,68 @@ pub unsafe fn qf_find_win_with_normal_buf() -> *mut WinT {
     std::ptr::null_mut()
 }
 
+/// Finds the first quickfix entry on the same line as the one at
+/// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
+///
+/// Assumes the entries are sorted by line number, as the original
+/// does. Since [`QflineT`] entries live in a `Vec` here rather than on
+/// the original's `qf_prev`/`qf_next` links, this walks indices; the
+/// returned index replaces the original's returned pointer.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int`.
+#[must_use]
+pub unsafe fn qf_find_first_entry_on_line(
+    entries: &[QflineT],
+    mut idx: usize,
+    errornr: &mut i32,
+) -> usize {
+    while idx > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        let cur = &entries[idx];
+        let prev = &entries[idx - 1];
+        if cur.qf_fnum != prev.qf_fnum || cur.qf_lnum != prev.qf_lnum {
+            break;
+        }
+        idx -= 1;
+        *errornr -= 1;
+    }
+    idx
+}
+
+/// Finds the last quickfix entry on the same line as the one at
+/// `idx`, updating `errornr` to match (`qf_find_last_entry_on_line`).
+///
+/// The mirror of [`qf_find_first_entry_on_line`]; see it for how the
+/// original's list links map onto indices.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int`.
+#[must_use]
+pub unsafe fn qf_find_last_entry_on_line(
+    entries: &[QflineT],
+    mut idx: usize,
+    errornr: &mut i32,
+) -> usize {
+    while idx + 1 < entries.len() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        let cur = &entries[idx];
+        let next = &entries[idx + 1];
+        if cur.qf_fnum != next.qf_fnum || cur.qf_lnum != next.qf_lnum {
+            break;
+        }
+        idx += 1;
+        *errornr += 1;
+    }
+    idx
+}
+
 /// Whether the quickfix entry `qfp` is after `pos`
 /// (`qf_entry_after_pos`).
 ///
@@ -1156,6 +1218,113 @@ pub fn qf_entry_on_or_before_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- qf_find_first/last_entry_on_line ---
+
+    fn entry_fl(fnum: i32, lnum: i32) -> QflineT {
+        QflineT {
+            qf_fnum: fnum,
+            qf_lnum: lnum,
+            ..Default::default()
+        }
+    }
+
+    /// Restores `got_int` on drop, so a failing assertion cannot leave
+    /// the interrupt flag set for later tests.
+    struct GotIntGuard(bool);
+
+    impl GotIntGuard {
+        fn set(v: bool) -> Self {
+            // SAFETY: the global state test lock is held by the caller.
+            let g = unsafe { crate::globals::GLOBALS.get_mut() };
+            let saved = g.got_int;
+            g.got_int = v;
+            Self(saved)
+        }
+    }
+
+    impl Drop for GotIntGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe { crate::globals::GLOBALS.get_mut() }.got_int = self.0;
+        }
+    }
+
+    /// The scan spans only entries sharing BOTH file and line, and
+    /// errornr moves in lockstep with the index.
+    #[test]
+    fn qf_find_entry_on_line_walks_the_run_of_matching_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+
+        let entries = vec![
+            entry_fl(1, 5),
+            entry_fl(1, 7),
+            entry_fl(1, 7),
+            entry_fl(1, 7),
+            entry_fl(1, 9),
+        ];
+
+        let mut errornr = 3;
+        assert_eq!(unsafe { qf_find_first_entry_on_line(&entries, 2, &mut errornr) }, 1);
+        assert_eq!(errornr, 2, "errornr follows the one step taken back");
+
+        let mut errornr = 3;
+        assert_eq!(unsafe { qf_find_last_entry_on_line(&entries, 2, &mut errornr) }, 3);
+        assert_eq!(errornr, 4);
+    }
+
+    /// A different file breaks the run even when the line matches -
+    /// comparing only the line would wrongly join two files.
+    #[test]
+    fn qf_find_entry_on_line_stops_at_a_different_file() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+
+        let entries = vec![entry_fl(1, 7), entry_fl(2, 7), entry_fl(3, 7)];
+
+        let mut errornr = 2;
+        assert_eq!(unsafe { qf_find_first_entry_on_line(&entries, 1, &mut errornr) }, 1);
+        assert_eq!(errornr, 2, "no step taken, so errornr is unchanged");
+
+        let mut errornr = 2;
+        assert_eq!(unsafe { qf_find_last_entry_on_line(&entries, 1, &mut errornr) }, 1);
+    }
+
+    /// The ends of the list are honoured without running off either
+    /// side.
+    #[test]
+    fn qf_find_entry_on_line_handles_the_list_ends() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+
+        let entries = vec![entry_fl(1, 7), entry_fl(1, 7)];
+
+        let mut errornr = 1;
+        assert_eq!(unsafe { qf_find_first_entry_on_line(&entries, 0, &mut errornr) }, 0);
+        assert_eq!(errornr, 1);
+
+        let mut errornr = 2;
+        assert_eq!(unsafe { qf_find_last_entry_on_line(&entries, 1, &mut errornr) }, 1);
+        assert_eq!(errornr, 2);
+    }
+
+    /// An interrupt stops the scan where it stands, so a very long run
+    /// of entries stays cancellable.
+    #[test]
+    fn qf_find_entry_on_line_stops_when_interrupted() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(true);
+
+        let entries = vec![entry_fl(1, 7), entry_fl(1, 7), entry_fl(1, 7)];
+
+        let mut errornr = 2;
+        assert_eq!(unsafe { qf_find_first_entry_on_line(&entries, 1, &mut errornr) }, 1);
+        assert_eq!(errornr, 2, "interrupted before taking a step");
+
+        let mut errornr = 2;
+        assert_eq!(unsafe { qf_find_last_entry_on_line(&entries, 1, &mut errornr) }, 1);
+    }
 
     // --- qf_entry_*_pos ---
 
