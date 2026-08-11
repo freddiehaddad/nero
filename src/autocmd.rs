@@ -161,6 +161,19 @@ static TERMRESPONSE_CHANGED: GlobalCell<bool> = GlobalCell::new(false);
 /// response, paired with [`TERMRESPONSE_CHANGED`].
 static TERMRESPONSE_CHAN_ID: GlobalCell<u64> = GlobalCell::new(0);
 
+/// Whether a `VimResume` event is pending (`pending_vimresume`).
+static PENDING_VIMRESUME: GlobalCell<crate::types_defs::TriState> =
+    GlobalCell::new(crate::types_defs::TriState::False);
+
+/// Runs the queued `VimResume` event and clears its pending state
+/// (`vimresume_event`).
+pub fn vimresume_event() {
+    let _ = apply_autocmds(EventT::VimResume, None, None, false, None);
+    unsafe {
+        *PENDING_VIMRESUME.get_mut() = crate::types_defs::TriState::False;
+    }
+}
+
 /// Returns the autocommand vector for `event`
 /// (`au_get_autocmds_for_event`).
 ///
@@ -724,6 +737,51 @@ mod tests {
         let buf_enter = au_get_autocmds_for_event(EventT::BufEnter);
         let vim_enter = au_get_autocmds_for_event(EventT::VimEnter);
         assert_ne!(buf_enter, vim_enter);
+    }
+
+    struct PendingVimresumeGuard(crate::types_defs::TriState);
+
+    impl PendingVimresumeGuard {
+        fn install(value: crate::types_defs::TriState) -> Self {
+            let slot = unsafe { PENDING_VIMRESUME.get_mut() };
+            let saved = *slot;
+            *slot = value;
+            Self(saved)
+        }
+    }
+
+    impl Drop for PendingVimresumeGuard {
+        fn drop(&mut self) {
+            unsafe { *PENDING_VIMRESUME.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn vimresume_event_clears_the_pending_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g =
+            PendingVimresumeGuard::install(crate::types_defs::TriState::True);
+
+        vimresume_event();
+
+        assert_eq!(
+            unsafe { *PENDING_VIMRESUME.get_mut() },
+            crate::types_defs::TriState::False
+        );
+    }
+
+    #[test]
+    fn vimresume_event_also_finishes_the_currently_triggering_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g =
+            PendingVimresumeGuard::install(crate::types_defs::TriState::None);
+
+        vimresume_event();
+
+        assert_eq!(
+            unsafe { *PENDING_VIMRESUME.get_mut() },
+            crate::types_defs::TriState::False
+        );
     }
 
     #[test]
@@ -1494,4 +1552,3 @@ mod tests {
         reset_ft_recursive();
     }
 }
-
