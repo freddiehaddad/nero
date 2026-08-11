@@ -305,6 +305,41 @@ fn qf_parse_atol_match(matched: Option<&[u8]>) -> Option<i32> {
     matched.map(|text| crate::charset::getdigits_int(text, false, 0).0)
 }
 
+/// Parses an `'errorformat'` `%f` file-name match
+/// (`qf_parse_fmt_f`).
+///
+/// Environment/home expansion is applied first. Separate-file
+/// prefixes `O`, `P` and `Q` additionally require the expanded path
+/// to exist.
+///
+/// # Safety
+/// Reads environment-expansion state through
+/// [`crate::os::env::expand_env`].
+pub unsafe fn qf_parse_fmt_f(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+    prefix: u8,
+) -> i32 {
+    let Some(matched) = matched else {
+        return qf_status::QF_FAIL;
+    };
+    let expanded = unsafe { crate::os::env::expand_env(matched) };
+    let capped_len = expanded.len().min(crate::os::os_defs::CMDBUFFSIZE - 1);
+    let mut name = expanded[..capped_len].to_vec();
+
+    if matches!(prefix, b'O' | b'P' | b'Q') {
+        let Ok(path) = std::str::from_utf8(&name) else {
+            return qf_status::QF_FAIL;
+        };
+        if !crate::os::fs::os_path_exists(std::path::Path::new(path)) {
+            return qf_status::QF_FAIL;
+        }
+    }
+    name.push(0);
+    fields.namebuf = name;
+    qf_status::QF_OK
+}
+
 /// Parses an `'errorformat'` `%b` buffer number
 /// (`qf_parse_fmt_b`), accepting it only when that buffer still
 /// exists.
@@ -2069,6 +2104,49 @@ mod tests {
             qf_status::QF_OK
         );
         assert_eq!(fields.bnr, 17);
+    }
+
+    #[test]
+    fn qf_parse_fmt_f_copies_and_nul_terminates_an_ordinary_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut fields = QffieldsT::default();
+
+        let status =
+            unsafe { qf_parse_fmt_f(Some(b"src/file.c"), &mut fields, b'E') };
+
+        assert_eq!(status, qf_status::QF_OK);
+        assert_eq!(fields.namebuf, b"src/file.c\0");
+    }
+
+    #[test]
+    fn qf_parse_fmt_f_requires_existing_paths_for_separate_file_prefixes() {
+        let path = std::env::temp_dir().join("nero_qf_parse_fmt_f.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let text = path.to_string_lossy().into_owned().into_bytes();
+        let mut fields = QffieldsT::default();
+
+        assert_eq!(
+            unsafe { qf_parse_fmt_f(Some(&text), &mut fields, b'P') },
+            qf_status::QF_OK
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            unsafe { qf_parse_fmt_f(Some(&text), &mut fields, b'P') },
+            qf_status::QF_FAIL
+        );
+    }
+
+    #[test]
+    fn qf_parse_fmt_f_rejects_a_missing_match_without_changing_name() {
+        let mut fields = QffieldsT {
+            namebuf: b"keep\0".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { qf_parse_fmt_f(None, &mut fields, b'E') },
+            qf_status::QF_FAIL
+        );
+        assert_eq!(fields.namebuf, b"keep\0");
     }
 
     #[test]
