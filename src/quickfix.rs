@@ -1150,6 +1150,13 @@ pub fn qf_alloc_stack(qfltype: QfltypeT, n: i32) -> crate::types_defs::QfInfoT {
     }
 }
 
+#[must_use]
+pub fn qf_alloc_list_stack(n: i32) -> Vec<QfListT> {
+    (0..usize::try_from(n).unwrap_or(0))
+        .map(|_| QfListT::default())
+        .collect()
+}
+
 /// `ql_info_actual` - the global quickfix list stack.
 ///
 /// The original keeps a file-static struct plus a `ql_info` pointer
@@ -4884,6 +4891,14 @@ mod tests {
         // Below the first clamps to 1, since entries are 1-based.
         assert_eq!(get_nth_entry(&qfl, -5), 1);
         assert_eq!(get_nth_entry(&qfl, 0), 1);
+    }
+
+    #[test]
+    fn qf_alloc_list_stack_returns_the_requested_zeroed_slots() {
+        let lists = qf_alloc_list_stack(3);
+        assert_eq!(lists.len(), 3);
+        assert!(lists.iter().all(|list| list.qf_count() == 0));
+        assert!(qf_alloc_list_stack(-1).is_empty());
     }
 
     #[test]
