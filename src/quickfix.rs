@@ -301,6 +301,23 @@ pub struct QffieldsT {
     pub valid: bool,
 }
 
+fn qf_parse_atol_match(matched: Option<&[u8]>) -> Option<i32> {
+    matched.map(|text| crate::charset::getdigits_int(text, false, 0).0)
+}
+
+/// Parses an `'errorformat'` `%n` error number
+/// (`qf_parse_fmt_n`).
+pub fn qf_parse_fmt_n(
+    matched: Option<&[u8]>,
+    fields: &mut QffieldsT,
+) -> i32 {
+    let Some(value) = qf_parse_atol_match(matched) else {
+        return qf_status::QF_FAIL;
+    };
+    fields.enr = value;
+    qf_status::QF_OK
+}
+
 /// Parses an `'errorformat'` `%t` error-type match
 /// (`qf_parse_fmt_t`).
 pub fn qf_parse_fmt_t(
@@ -1932,6 +1949,30 @@ mod tests {
             qf_status::QF_OK
         );
         assert_eq!(fields.type_, b'E');
+    }
+
+    #[test]
+    fn qf_parse_fmt_n_parses_an_atol_compatible_error_number() {
+        let mut fields = QffieldsT::default();
+        assert_eq!(
+            qf_parse_fmt_n(Some(b"42 trailing"), &mut fields),
+            qf_status::QF_OK
+        );
+        assert_eq!(fields.enr, 42);
+        qf_parse_fmt_n(Some(b"-7"), &mut fields);
+        assert_eq!(fields.enr, -7);
+        qf_parse_fmt_n(Some(b"none"), &mut fields);
+        assert_eq!(fields.enr, 0);
+    }
+
+    #[test]
+    fn qf_parse_fmt_n_rejects_a_missing_match_without_changing_error_number() {
+        let mut fields = QffieldsT {
+            enr: 9,
+            ..Default::default()
+        };
+        assert_eq!(qf_parse_fmt_n(None, &mut fields), qf_status::QF_FAIL);
+        assert_eq!(fields.enr, 9);
     }
 
     #[test]
