@@ -212,6 +212,53 @@ mod fuzmatch_tests {
         fuzzy_match_str_sort(&mut one);
         assert_eq!(one[0].idx, 9);
     }
+
+    #[test]
+    fn fuzzymatches_to_strmatches_sorts_by_score_and_moves_strings() {
+        let matches = vec![
+            FuzmatchStrT {
+                idx: 0,
+                str: b"low".to_vec(),
+                score: 1,
+            },
+            FuzmatchStrT {
+                idx: 1,
+                str: b"high".to_vec(),
+                score: 9,
+            },
+        ];
+
+        assert_eq!(
+            fuzzymatches_to_strmatches(matches, false),
+            vec![b"high".to_vec(), b"low".to_vec()]
+        );
+    }
+
+    #[test]
+    fn fuzzymatches_to_strmatches_uses_function_name_order_when_requested() {
+        let matches = vec![
+            FuzmatchStrT {
+                idx: 0,
+                str: b"<SNR>1_func".to_vec(),
+                score: 100,
+            },
+            FuzmatchStrT {
+                idx: 1,
+                str: b"plain".to_vec(),
+                score: 1,
+            },
+        ];
+
+        assert_eq!(
+            fuzzymatches_to_strmatches(matches, true),
+            vec![b"plain".to_vec(), b"<SNR>1_func".to_vec()]
+        );
+    }
+
+    #[test]
+    fn fuzzymatches_to_strmatches_handles_an_empty_input() {
+        assert!(fuzzymatches_to_strmatches(Vec::new(), false).is_empty());
+    }
 }
 
 /// Order two fuzzy function-name matches
@@ -242,6 +289,25 @@ pub fn fuzzy_match_func_compare(s1: &FuzmatchStrT, s2: &FuzmatchStrT) -> std::cm
 /// functions sorted to the end (`fuzzy_match_func_sort`).
 pub fn fuzzy_match_func_sort(fm: &mut [FuzmatchStrT]) {
     fm.sort_by(fuzzy_match_func_compare);
+}
+
+/// Sorts fuzzy matches and transfers their strings into the returned
+/// list (`fuzzymatches_to_strmatches`).
+///
+/// Consuming the input Vec frees the match records automatically while
+/// each owned string is moved, matching the original's pointer
+/// transfer followed by freeing only the outer array.
+#[must_use]
+pub fn fuzzymatches_to_strmatches(
+    mut fuzmatch: Vec<FuzmatchStrT>,
+    funcsort: bool,
+) -> Vec<Vec<u8>> {
+    if funcsort {
+        fuzzy_match_func_sort(&mut fuzmatch);
+    } else {
+        fuzzy_match_str_sort(&mut fuzmatch);
+    }
+    fuzmatch.into_iter().map(|item| item.str).collect()
 }
 
 const SCORE_MAX: f64 = f64::INFINITY;
