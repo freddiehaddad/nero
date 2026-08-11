@@ -3352,9 +3352,91 @@ pub unsafe fn ml_firstmarked() -> LinenrT {
     0
 }
 
+/// Builds the name of a file to place in a directory, following the
+/// `'directory'`/`'backupdir'` conventions (`get_file_in_dir`).
+///
+/// Three shapes of `dname` are handled: `"."` keeps the file beside
+/// the original, `"./sub"` inserts `sub` between the original's
+/// directory and its name, and anything else prepends `dname` to the
+/// original's tail.
+///
+/// The original swaps a NUL into `fname` to isolate its directory
+/// part and puts the byte back afterwards; slicing gives the same two
+/// halves here without mutating the input, so `fname` is borrowed.
+#[must_use]
+pub fn get_file_in_dir(fname: &[u8], dname: &[u8]) -> Vec<u8> {
+    let tail_idx = crate::path::path_tail(fname);
+    let tail = &fname[tail_idx..];
+
+    if dname == b"." {
+        return fname.to_vec();
+    }
+
+    let is_dot_sep = dname.len() >= 2
+        && dname[0] == b'.'
+        && crate::path::vim_ispathsep(i32::from(dname[1]));
+    if !is_dot_sep {
+        return crate::path::concat_fnames(dname, tail, true);
+    }
+
+    // "./sub": the part after "./" goes between the file's own
+    // directory and its name.
+    let sub = &dname[2..];
+    if tail_idx == 0 {
+        // No directory part before the file name.
+        return crate::path::concat_fnames(sub, tail, true);
+    }
+    let dir = &fname[..tail_idx];
+    let tmp = crate::path::concat_fnames(dir, sub, true);
+    crate::path::concat_fnames(&tmp, tail, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- get_file_in_dir ----
+
+    /// "." keeps the file exactly where it is.
+    #[test]
+    fn get_file_in_dir_with_dot_returns_the_name_unchanged() {
+        assert_eq!(get_file_in_dir(b"/home/u/notes.txt", b"."), b"/home/u/notes.txt".to_vec());
+        assert_eq!(get_file_in_dir(b"notes.txt", b"."), b"notes.txt".to_vec());
+    }
+
+    /// A plain directory replaces the file's own directory entirely,
+    /// keeping only the tail.
+    #[test]
+    fn get_file_in_dir_with_a_plain_dir_uses_only_the_tail() {
+        assert_eq!(get_file_in_dir(b"/home/u/notes.txt", b"/tmp"), b"/tmp/notes.txt".to_vec());
+        assert_eq!(get_file_in_dir(b"notes.txt", b"/tmp"), b"/tmp/notes.txt".to_vec());
+    }
+
+    /// "./sub" is relative to the file's OWN directory, so the result
+    /// keeps that directory and inserts "sub" before the name - this
+    /// is what distinguishes it from the plain-directory case above.
+    #[test]
+    fn get_file_in_dir_with_dot_slash_inserts_below_the_files_directory() {
+        assert_eq!(
+            get_file_in_dir(b"/home/u/notes.txt", b"./bak"),
+            b"/home/u/bak/notes.txt".to_vec(),
+            "bak goes between the file's directory and its name"
+        );
+    }
+
+    /// With no directory part there is nothing to insert below, so
+    /// the sub-directory is simply prepended.
+    #[test]
+    fn get_file_in_dir_with_dot_slash_and_a_bare_name() {
+        assert_eq!(get_file_in_dir(b"notes.txt", b"./bak"), b"bak/notes.txt".to_vec());
+    }
+
+    /// An existing separator is not doubled.
+    #[test]
+    fn get_file_in_dir_does_not_double_a_separator() {
+        assert_eq!(get_file_in_dir(b"/home/u/notes.txt", b"/tmp/"), b"/tmp/notes.txt".to_vec());
+    }
+
 
     #[test]
     fn ml_line_alloced_follows_ml_line_dirty() {
