@@ -373,6 +373,15 @@ pub unsafe fn append_number_to_redobuff(n: i32) {
     add_num_buff(unsafe { REDOBUFF.get_mut() }, n);
 }
 
+/// Returns the redo buffer as one owned byte string (`get_inserted`).
+///
+/// `None` preserves the original null `String.data` for an empty
+/// buffer; escaped `K_SPECIAL` bytes are returned unchanged.
+#[must_use]
+pub fn get_inserted() -> Option<Vec<u8>> {
+    get_buffcont(unsafe { REDOBUFF.get_mut() }, false)
+}
+
 /// Index in `scriptin` (`curscript`). File-static in the original;
 /// `-1` means no script is being read.
 static CURSCRIPT: GlobalCell<i32> = GlobalCell::new(-1);
@@ -1585,6 +1594,29 @@ mod tests {
         unsafe { append_number_to_redobuff(42) };
         unsafe { append_char_to_redobuff(i32::from(b'z')) };
         assert_eq!(buff_bytes(unsafe { REDOBUFF.get_mut() }), b"42z".to_vec());
+    }
+
+    #[test]
+    fn get_inserted_returns_none_for_an_empty_redo_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe { REDOBUFF.get_mut() }.blocks.clear();
+
+        assert_eq!(get_inserted(), None);
+    }
+
+    #[test]
+    fn get_inserted_returns_all_redo_blocks_without_consuming_them() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = RedobuffGuard::new();
+        unsafe {
+            add_buff(REDOBUFF.get_mut(), b"ab");
+            add_buff(REDOBUFF.get_mut(), b"cd");
+        }
+
+        assert_eq!(get_inserted(), Some(b"abcd".to_vec()));
+        assert_eq!(get_inserted(), Some(b"abcd".to_vec()));
+        assert_eq!(unsafe { REDOBUFF.get_mut().blocks.len() }, 2);
     }
 
     #[test]
