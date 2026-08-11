@@ -85,6 +85,44 @@ pub fn aborting() -> bool {
     (g.did_emsg != 0 && g.force_abort) || g.got_int || g.did_throw
 }
 
+/// Frees a message list and every message it holds (`free_msglist`).
+///
+/// Each node's `msg`/`sfile` are owned `Vec`s, so reconstructing the
+/// `Box` releases them along with the node itself; the original frees
+/// all three by hand.
+///
+/// # Safety
+/// `l` must be either null or the head of a chain of nodes that each
+/// came from [`Box::into_raw`], and no other pointer to any of them
+/// may be used afterwards.
+pub unsafe fn free_msglist(l: *mut crate::ex_eval_defs::MsglistT) {
+    let mut messages = l;
+    while !messages.is_null() {
+        // SAFETY: forwarded from this function's own safety doc; the
+        // next link is read before the node is released.
+        let next = unsafe { (*messages).next };
+        drop(unsafe { Box::from_raw(messages) });
+        messages = next;
+    }
+}
+
+/// Frees the current message list and clears it
+/// (`free_global_msglist`).
+///
+/// # Safety
+/// `GLOBALS.msg_list` must be non-null: it points at a variable in
+/// `do_cmdline`'s own frame, and the original dereferences it without
+/// checking, so this may only be called while such a frame is live.
+/// The chain it points at must satisfy [`free_msglist`]'s contract.
+pub unsafe fn free_global_msglist() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let msg_list = unsafe { crate::globals::GLOBALS.get_mut() }.msg_list;
+    unsafe {
+        free_msglist(*msg_list);
+        *msg_list = std::ptr::null_mut();
+    }
+}
+
 /// Saves the current exception state in `estate`
 /// (`exception_state_save`).
 ///
@@ -167,6 +205,64 @@ mod tests {
     use super::*;
     use crate::globals::{global_state_test_lock, GLOBALS};
     use crate::vim_defs::OK;
+
+    // --- free_msglist / free_global_msglist ---
+
+    /// Builds a chain of `n` nodes, each carrying owned strings, and
+    /// returns the head. Run under Miri/ASan a leaked or
+    /// double-freed node shows up directly.
+    fn msglist_chain(n: usize) -> *mut crate::ex_eval_defs::MsglistT {
+        let mut head = std::ptr::null_mut();
+        for i in 0..n {
+            let node = Box::new(crate::ex_eval_defs::MsglistT {
+                next: head,
+                msg: Some(format!("msg{i}").into_bytes()),
+                throw_msg: None,
+                sfile: Some(format!("file{i}").into_bytes()),
+                slnum: 0,
+                multiline: false,
+            });
+            head = Box::into_raw(node);
+        }
+        head
+    }
+
+    #[test]
+    fn free_msglist_accepts_a_null_list() {
+        unsafe { free_msglist(std::ptr::null_mut()) };
+    }
+
+    /// Every node in the chain is released, not just the head - the
+    /// walk has to read `next` before freeing each node.
+    #[test]
+    fn free_msglist_walks_the_whole_chain() {
+        unsafe { free_msglist(msglist_chain(4)) };
+    }
+
+    #[test]
+    fn free_msglist_frees_a_single_node() {
+        unsafe { free_msglist(msglist_chain(1)) };
+    }
+
+    /// The global variant clears the list pointer as well, so a
+    /// second call cannot free the same chain twice.
+    #[test]
+    fn free_global_msglist_clears_the_list() {
+        let _lock = global_state_test_lock();
+
+        let mut list = msglist_chain(3);
+        // Restored on drop, so a failing assertion below cannot leave
+        // the global pointing at this stack slot.
+        let mut _guard = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.msg_list, &mut list as *mut _)
+        };
+
+        unsafe { free_global_msglist() };
+
+        assert!(list.is_null(), "the list pointer must be cleared");
+        // Safe precisely because the pointer was cleared above.
+        unsafe { free_global_msglist() };
+    }
 
     // --- exception_state_save / clear ---
 
