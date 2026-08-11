@@ -327,6 +327,21 @@ pub unsafe fn shift_delete_registers(y_append: bool) {
     }
 }
 
+/// Releases the contents of every register (`clear_registers`).
+///
+/// This is compiled only for exit-time cleanup in the original. It is
+/// always available here, where dropping each owned line array is
+/// safe and useful in tests as well.
+///
+/// # Safety
+/// Mutates the `Y_REGS` file-static.
+pub unsafe fn clear_registers() {
+    // SAFETY: forwarded from this function's own safety doc.
+    for reg in unsafe { Y_REGS.get_mut() } {
+        free_register(reg);
+    }
+}
+
 /// Whether the register `regname` holds linewise content, also
 /// handing back the register itself (`yank_register_mline`).
 ///
@@ -1076,6 +1091,40 @@ mod tests {
         unsafe { shift_delete_registers(true) };
 
         assert_eq!(unsafe { *Y_PREVIOUS.get_mut() }, Some(5));
+    }
+
+    #[test]
+    fn clear_registers_releases_every_registers_contents() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        let regs = unsafe { Y_REGS.get_mut() };
+        for (idx, reg) in regs.iter_mut().enumerate() {
+            reg.y_array = Some(vec![format!("slot {idx}").into_bytes()]);
+        }
+
+        unsafe { clear_registers() };
+
+        assert!(unsafe { Y_REGS.get_mut() }.iter().all(|reg| reg.y_array.is_none()));
+    }
+
+    #[test]
+    fn clear_registers_preserves_metadata_like_free_register() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = RegisterStateGuard::save();
+        unsafe {
+            Y_REGS.get_mut()[4] = YankregT {
+                y_array: Some(vec![b"text".to_vec()]),
+                y_type: crate::normal_defs::MotionType::BlockWise,
+                y_width: 6,
+                timestamp: 88,
+            };
+            clear_registers();
+        }
+
+        let reg = &unsafe { Y_REGS.get_mut() }[4];
+        assert_eq!(reg.y_type, crate::normal_defs::MotionType::BlockWise);
+        assert_eq!(reg.y_width, 6);
+        assert_eq!(reg.timestamp, 88);
     }
 
     #[test]
