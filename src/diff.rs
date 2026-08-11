@@ -300,17 +300,39 @@ pub struct DiffinT {
     pub din_mmfile: Vec<u8>,
 }
 
+/// One hunk produced by the diff engine (`diffhunk_T`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffhunkT {
+    /// First original-file line in the hunk (`lnum_orig`).
+    pub lnum_orig: crate::pos_defs::LinenrT,
+    /// Number of original-file lines (`count_orig`).
+    pub count_orig: i32,
+    /// First new-file line in the hunk (`lnum_new`).
+    pub lnum_new: crate::pos_defs::LinenrT,
+    /// Number of new-file lines (`count_new`).
+    pub count_new: i32,
+}
+
 /// Result of a diff operation (`diffout_T`).
 ///
 /// Mirrors [`DiffinT`]: an external diff leaves its output in a
 /// temporary file, an internal one in a growable array.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiffoutT {
     /// Temporary file holding the result, for an external diff
     /// (`dout_fname`).
     pub dout_fname: Option<Vec<u8>>,
     /// The result itself, for an internal diff (`dout_ga`).
-    pub dout_ga: crate::garray_defs::GarrayT,
+    pub dout_ga: crate::garray_defs::TypedGarrayT<DiffhunkT>,
+}
+
+impl Default for DiffoutT {
+    fn default() -> Self {
+        Self {
+            dout_fname: None,
+            dout_ga: crate::garray_defs::TypedGarrayT::new(100),
+        }
+    }
 }
 
 /// Release whichever half of `din` is actually in use
@@ -909,6 +931,25 @@ mod tests {
     use super::*;
     use crate::buffer_defs::BufT;
 
+    #[test]
+    fn diffhunk_holds_both_original_and_new_ranges_independently() {
+        let hunk = DiffhunkT {
+            lnum_orig: 3,
+            count_orig: 4,
+            lnum_new: 8,
+            count_new: 2,
+        };
+        assert_eq!((hunk.lnum_orig, hunk.count_orig), (3, 4));
+        assert_eq!((hunk.lnum_new, hunk.count_new), (8, 2));
+    }
+
+    #[test]
+    fn diffout_default_uses_the_internal_diff_grow_size() {
+        let dout = DiffoutT::default();
+        assert!(dout.dout_ga.is_empty());
+        assert_eq!(dout.dout_ga.ga_growsize, 100);
+    }
+
     // --- clear_diffin / clear_diffout ---
 
     #[test]
@@ -944,10 +985,13 @@ mod tests {
     fn clear_diffout_releases_the_growable_array_when_there_is_no_temp_file() {
         let mut dout = DiffoutT {
             dout_fname: None,
-            dout_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+            dout_ga: crate::garray_defs::TypedGarrayT {
+                ga_growsize: 100,
+                items: vec![DiffhunkT::default(); 3],
+            },
         };
         clear_diffout(&mut dout);
-        assert_eq!(dout.dout_ga.ga_len, 0);
+        assert_eq!(dout.dout_ga.ga_len(), 0);
     }
 
     #[test]
@@ -957,12 +1001,15 @@ mod tests {
 
         let mut dout = DiffoutT {
             dout_fname: Some(path.to_str().unwrap().as_bytes().to_vec()),
-            dout_ga: crate::garray_defs::GarrayT { ga_len: 3, ..Default::default() },
+            dout_ga: crate::garray_defs::TypedGarrayT {
+                ga_growsize: 100,
+                items: vec![DiffhunkT::default(); 3],
+            },
         };
         clear_diffout(&mut dout);
 
         let gone = !path.exists();
-        let ga_len = dout.dout_ga.ga_len;
+        let ga_len = dout.dout_ga.ga_len();
         let _ = std::fs::remove_file(&path);
 
         assert!(gone, "the temporary file must be deleted");
