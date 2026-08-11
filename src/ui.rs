@@ -286,6 +286,11 @@ pub unsafe fn ui_current_col() -> i32 {
     unsafe { *CURSOR_COL.get_mut() }
 }
 
+#[cfg(test)]
+pub(crate) unsafe fn ui_current_grid_handle_for_test() -> crate::types_defs::HandleT {
+    unsafe { *CURSOR_GRID_HANDLE.get_mut() }
+}
+
 /// Note that a mode-info update is owed to the UIs
 /// (`ui_mode_info_set`).
 ///

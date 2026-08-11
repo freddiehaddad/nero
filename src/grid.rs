@@ -240,6 +240,23 @@ pub unsafe fn grid_line_getchar(
     }
 }
 
+/// Moves the UI cursor within the currently rendered grid line
+/// (`grid_line_cursor_goto`).
+///
+/// # Safety
+/// An active grid line must exist.
+pub unsafe fn grid_line_cursor_goto(col: i32) {
+    let grid = unsafe { *GRID_LINE_GRID.get_mut() };
+    assert!(!grid.is_null());
+    unsafe {
+        crate::ui::ui_grid_cursor_goto(
+            (*grid).handle,
+            *GRID_LINE_ROW.get_mut(),
+            col,
+        );
+    }
+}
+
 /// Marks the remainder of the buffered grid line for clearing
 /// (`grid_line_clear_end`).
 ///
@@ -1158,9 +1175,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grid_line_cursor_goto_uses_the_active_grid_and_row() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _cursor = UiCursorGuard::save();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![0; 4],
+            vec![0; 4],
+            vec![0; 4],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let mut grid = crate::grid_defs::ScreenGrid {
+            handle: 77,
+            cols: 4,
+            ..Default::default()
+        };
+        unsafe {
+            screengrid_line_start(std::ptr::addr_of_mut!(grid), 3, 0);
+            grid_line_cursor_goto(2);
+        }
+
+        assert_eq!(unsafe { crate::ui::ui_current_row() }, 3);
+        assert_eq!(unsafe { crate::ui::ui_current_col() }, 2);
+    }
+
     impl Drop for GridLineGridGuard {
         fn drop(&mut self) {
             unsafe { *GRID_LINE_GRID.get_mut() = self.0 };
+        }
+    }
+
+    struct UiCursorGuard {
+        grid: crate::types_defs::HandleT,
+        row: i32,
+        col: i32,
+    }
+
+    impl UiCursorGuard {
+        fn save() -> Self {
+            unsafe {
+                Self {
+                    grid: crate::ui::ui_current_grid_handle_for_test(),
+                    row: crate::ui::ui_current_row(),
+                    col: crate::ui::ui_current_col(),
+                }
+            }
+        }
+    }
+
+    impl Drop for UiCursorGuard {
+        fn drop(&mut self) {
+            unsafe { crate::ui::ui_grid_cursor_goto(self.grid, self.row, self.col) };
         }
     }
 
