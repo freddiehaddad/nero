@@ -197,6 +197,17 @@ pub unsafe fn screengrid_line_start(
     }
 }
 
+/// Starts buffering one row through a possibly offset `GridView`
+/// (`grid_line_start`).
+///
+/// # Safety
+/// The view's target grid must satisfy
+/// [`screengrid_line_start`]'s lifetime requirements.
+pub unsafe fn grid_line_start(view: &crate::grid_defs::GridView, row: i32) {
+    let (grid, row, col) = grid_adjust(view, row, 0);
+    unsafe { screengrid_line_start(grid, row, col) };
+}
+
 /// Marks the remainder of the buffered grid line for clearing
 /// (`grid_line_clear_end`).
 ///
@@ -1030,6 +1041,35 @@ mod tests {
         assert_eq!(unsafe { &*LINEBUF_CHAR.get_mut() }, &[ScharT::MAX; 4]);
         assert_eq!(unsafe { &*LINEBUF_ATTR.get_mut() }, &[-1; 4]);
         assert_eq!(unsafe { &*LINEBUF_VCOL.get_mut() }, &[3; 4]);
+    }
+
+    #[test]
+    fn grid_line_start_applies_the_grid_views_offsets() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _state = GridLineStateGuard::install(1, 2);
+        let _buf = LinebufStateGuard::install(
+            vec![0; 10],
+            vec![0; 10],
+            vec![0; 10],
+        );
+        let _active = GridLineGridGuard::install(std::ptr::null_mut());
+        let mut grid = crate::grid_defs::ScreenGrid {
+            cols: 10,
+            ..Default::default()
+        };
+        let grid_ptr = std::ptr::addr_of_mut!(grid);
+        let view = crate::grid_defs::GridView {
+            target: grid_ptr,
+            row_offset: 2,
+            col_offset: 3,
+        };
+
+        unsafe { grid_line_start(&view, 4) };
+
+        assert_eq!(unsafe { *GRID_LINE_GRID.get_mut() }, grid_ptr);
+        assert_eq!(unsafe { *GRID_LINE_ROW.get_mut() }, 6);
+        assert_eq!(unsafe { *GRID_LINE_COLOFF.get_mut() }, 3);
+        assert_eq!(unsafe { *GRID_LINE_MAXCOL.get_mut() }, 7);
     }
 
     impl Drop for GridLineGridGuard {
