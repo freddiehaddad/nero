@@ -1310,6 +1310,43 @@ pub unsafe fn qf_get_nth_below_entry(
     }
 }
 
+/// Moves `errornr` by up to `n` quickfix entries above `start_idx`
+/// in the same buffer (`qf_get_nth_above_entry`).
+///
+/// In linewise mode every run sharing a line counts as one step and
+/// the error number is left at that line's first entry.
+///
+/// # Safety
+/// Reads `GLOBALS.got_int` and calls
+/// [`qf_find_first_entry_on_line`].
+pub unsafe fn qf_get_nth_above_entry(
+    entries: &[QflineT],
+    start_idx: usize,
+    mut n: crate::pos_defs::LinenrT,
+    linewise: bool,
+    errornr: &mut i32,
+) {
+    assert!(start_idx < entries.len(), "start_idx must name a quickfix entry");
+    let mut idx = start_idx;
+
+    while n > 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { crate::globals::GLOBALS.get_mut() }.got_int {
+            break;
+        }
+        n -= 1;
+        if idx == 0 || entries[idx - 1].qf_fnum != entries[idx].qf_fnum {
+            break;
+        }
+        idx -= 1;
+        *errornr -= 1;
+        if linewise {
+            // SAFETY: forwarded from this function's own safety doc.
+            idx = unsafe { qf_find_first_entry_on_line(entries, idx, errornr) };
+        }
+    }
+}
+
 /// Finds the first quickfix entry on the same line as the one at
 /// `idx`, updating `errornr` to match (`qf_find_first_entry_on_line`).
 ///
@@ -1791,6 +1828,60 @@ mod tests {
         unsafe { qf_get_nth_below_entry(&entries, 0, 1, false, &mut errornr) };
 
         assert_eq!(errornr, 4);
+    }
+
+    #[test]
+    fn qf_get_nth_above_entry_counts_individual_entries() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![entry_fl(7, 2), entry_fl(7, 2), entry_fl(7, 3)];
+        let mut errornr = 3;
+
+        unsafe { qf_get_nth_above_entry(&entries, 2, 2, false, &mut errornr) };
+
+        assert_eq!(errornr, 1);
+    }
+
+    #[test]
+    fn qf_get_nth_above_entry_counts_each_line_once() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![
+            entry_fl(7, 2),
+            entry_fl(7, 2),
+            entry_fl(7, 3),
+            entry_fl(7, 3),
+            entry_fl(7, 4),
+        ];
+        let mut errornr = 5;
+
+        unsafe { qf_get_nth_above_entry(&entries, 4, 2, true, &mut errornr) };
+
+        assert_eq!(errornr, 1, "two linewise steps land on line 2's first entry");
+    }
+
+    #[test]
+    fn qf_get_nth_above_entry_stops_at_another_buffer() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(false);
+        let entries = vec![entry_fl(8, 2), entry_fl(7, 3)];
+        let mut errornr = 9;
+
+        unsafe { qf_get_nth_above_entry(&entries, 1, 1, false, &mut errornr) };
+
+        assert_eq!(errornr, 9);
+    }
+
+    #[test]
+    fn qf_get_nth_above_entry_stops_when_interrupted() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = GotIntGuard::set(true);
+        let entries = vec![entry_fl(7, 2), entry_fl(7, 3)];
+        let mut errornr = 2;
+
+        unsafe { qf_get_nth_above_entry(&entries, 1, 1, false, &mut errornr) };
+
+        assert_eq!(errornr, 2);
     }
 
     #[test]
