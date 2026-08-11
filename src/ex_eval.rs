@@ -85,6 +85,43 @@ pub fn aborting() -> bool {
     (g.did_emsg != 0 && g.force_abort) || g.got_int || g.did_throw
 }
 
+/// Saves the current exception state in `estate`
+/// (`exception_state_save`).
+///
+/// Used around calls that run unrelated script code - timer callbacks
+/// and deferred functions - so an exception in flight there cannot be
+/// confused with one belonging to the interrupted code.
+///
+/// # Safety
+/// Reads `crate::globals::GLOBALS`.
+pub unsafe fn exception_state_save(estate: &mut crate::ex_eval_defs::ExceptionStateT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    estate.estate_current_exception = g.current_exception;
+    estate.estate_did_throw = g.did_throw;
+    estate.estate_need_rethrow = g.need_rethrow;
+    estate.estate_trylevel = g.trylevel;
+    estate.estate_did_emsg = g.did_emsg;
+}
+
+/// Clears the current exception state (`exception_state_clear`).
+///
+/// Note this only drops the state; it does not discard the exception
+/// `current_exception` still points at. The original's callers pair it
+/// with a save/restore, which is what preserves that exception.
+///
+/// # Safety
+/// Mutates `crate::globals::GLOBALS`.
+pub unsafe fn exception_state_clear() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let g = unsafe { crate::globals::GLOBALS.get_mut() };
+    g.current_exception = std::ptr::null_mut();
+    g.did_throw = false;
+    g.need_rethrow = false;
+    g.trylevel = 0;
+    g.did_emsg = 0;
+}
+
 /// Returns `true` if a command with a subcommand resulting in
 /// `retcode` should abort the script processing (`should_abort`).
 #[must_use]
@@ -130,6 +167,130 @@ mod tests {
     use super::*;
     use crate::globals::{global_state_test_lock, GLOBALS};
     use crate::vim_defs::OK;
+
+    // --- exception_state_save / clear ---
+
+    /// Restores all five exception-state globals on drop, including
+    /// when a test unwinds part-way through its assertions.
+    struct ExceptionStateGuard(crate::ex_eval_defs::ExceptionStateT);
+
+    impl ExceptionStateGuard {
+        fn save() -> Self {
+            let mut saved = crate::ex_eval_defs::ExceptionStateT::default();
+            // SAFETY: the global state test lock is held by the caller.
+            unsafe { exception_state_save(&mut saved) };
+            Self(saved)
+        }
+    }
+
+    impl Drop for ExceptionStateGuard {
+        fn drop(&mut self) {
+            // SAFETY: as in `save`.
+            let g = unsafe { GLOBALS.get_mut() };
+            g.current_exception = self.0.estate_current_exception;
+            g.did_throw = self.0.estate_did_throw;
+            g.need_rethrow = self.0.estate_need_rethrow;
+            g.trylevel = self.0.estate_trylevel;
+            g.did_emsg = self.0.estate_did_emsg;
+        }
+    }
+
+    /// Each field is given a distinct value so a save that copied the
+    /// wrong global into a slot would be caught.
+    #[test]
+    fn exception_state_save_captures_every_field() {
+        let _lock = global_state_test_lock();
+        let _g = ExceptionStateGuard::save();
+
+        let marker = 0x1234_usize as *mut crate::ex_eval_defs::ExceptT;
+        unsafe {
+            let g = GLOBALS.get_mut();
+            g.current_exception = marker;
+            g.did_throw = true;
+            g.need_rethrow = false;
+            g.trylevel = 7;
+            g.did_emsg = 3;
+        }
+
+        let mut estate = crate::ex_eval_defs::ExceptionStateT::default();
+        unsafe { exception_state_save(&mut estate) };
+
+        assert_eq!(estate.estate_current_exception, marker);
+        assert!(estate.estate_did_throw);
+        assert!(!estate.estate_need_rethrow, "must not be confused with did_throw");
+        assert_eq!(estate.estate_trylevel, 7);
+        assert_eq!(estate.estate_did_emsg, 3, "must not be confused with trylevel");
+    }
+
+    /// Saving must not disturb the state it reads.
+    #[test]
+    fn exception_state_save_leaves_the_globals_alone() {
+        let _lock = global_state_test_lock();
+        let _g = ExceptionStateGuard::save();
+
+        unsafe {
+            let g = GLOBALS.get_mut();
+            g.did_throw = true;
+            g.trylevel = 2;
+        }
+
+        let mut estate = crate::ex_eval_defs::ExceptionStateT::default();
+        unsafe { exception_state_save(&mut estate) };
+
+        unsafe {
+            let g = GLOBALS.get_mut();
+            assert!(g.did_throw);
+            assert_eq!(g.trylevel, 2);
+        }
+    }
+
+    #[test]
+    fn exception_state_clear_resets_every_field() {
+        let _lock = global_state_test_lock();
+        let _g = ExceptionStateGuard::save();
+
+        unsafe {
+            let g = GLOBALS.get_mut();
+            g.current_exception = 0x1234_usize as *mut crate::ex_eval_defs::ExceptT;
+            g.did_throw = true;
+            g.need_rethrow = true;
+            g.trylevel = 7;
+            g.did_emsg = 3;
+
+            exception_state_clear();
+
+            let g = GLOBALS.get_mut();
+            assert!(g.current_exception.is_null());
+            assert!(!g.did_throw);
+            assert!(!g.need_rethrow);
+            assert_eq!(g.trylevel, 0);
+            assert_eq!(g.did_emsg, 0);
+        }
+    }
+
+    /// A cleared state can be restored from a state saved beforehand,
+    /// which is the whole point of the pair.
+    #[test]
+    fn a_saved_state_survives_a_clear() {
+        let _lock = global_state_test_lock();
+        let _g = ExceptionStateGuard::save();
+
+        let marker = 0x4321_usize as *mut crate::ex_eval_defs::ExceptT;
+        let mut estate = crate::ex_eval_defs::ExceptionStateT::default();
+        unsafe {
+            let g = GLOBALS.get_mut();
+            g.current_exception = marker;
+            g.trylevel = 5;
+
+            exception_state_save(&mut estate);
+            exception_state_clear();
+
+            assert!(GLOBALS.get_mut().current_exception.is_null());
+        }
+
+        assert_eq!(estate.estate_current_exception, marker);
+        assert_eq!(estate.estate_trylevel, 5);
+    }
 
     // --- cause_abort / update_force_abort ---
 
