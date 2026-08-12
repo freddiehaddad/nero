@@ -39,6 +39,9 @@
 //! display skipped, keeping the exact same `FAIL`/`OK` return value
 //! and every other state change - matching this crate's established
 //! policy.
+//!
+//! Also translated: [`tag_freematch`] - clears the cached tag-match
+//! name.
 
 use crate::buffer_defs::{TaggyT, WinT};
 
@@ -48,6 +51,19 @@ use crate::buffer_defs::{TaggyT, WinT};
 /// `optionstr.rs`'s own `did_set_complete`, matching the original's
 /// own cross-file use of this same constant.
 pub const LSIZE: usize = 512;
+
+/// Cached tag match name (`tagmatchname`).
+static TAGMATCHNAME: crate::globals::GlobalCell<Option<Vec<u8>>> =
+    crate::globals::GlobalCell::new(None);
+
+/// Free the cached tag match (`tag_freematch`).
+///
+/// # Safety
+/// Must not run concurrently with another access to `TAGMATCHNAME`.
+pub unsafe fn tag_freematch() {
+    // SAFETY: forwarded from this function's own safety doc.
+    *unsafe { TAGMATCHNAME.get_mut() } = None;
+}
 
 /// Add the details of a single tag-stack entry to `retdict`
 /// (`get_tag_details`).
@@ -396,6 +412,29 @@ pub unsafe fn set_tagstack(wp: &mut WinT, d: *mut crate::eval::typval_defs::Dict
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TagmatchGuard(Option<Vec<u8>>);
+
+    impl TagmatchGuard {
+        fn install(value: Option<Vec<u8>>) -> Self {
+            let saved = std::mem::replace(unsafe { TAGMATCHNAME.get_mut() }, value);
+            Self(saved)
+        }
+    }
+
+    impl Drop for TagmatchGuard {
+        fn drop(&mut self) {
+            *unsafe { TAGMATCHNAME.get_mut() } = self.0.take();
+        }
+    }
+
+    #[test]
+    fn tag_freematch_clears_the_cached_match_name() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TagmatchGuard::install(Some(b"cached-tag".to_vec()));
+        unsafe { tag_freematch() };
+        assert!(unsafe { TAGMATCHNAME.get_mut() }.is_none());
+    }
     use crate::eval::typval_defs::{DictitemT, TypvalT, TypvalValue};
 
     #[test]
