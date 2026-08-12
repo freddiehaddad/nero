@@ -772,6 +772,24 @@ pub unsafe fn diff_check_fill(wp: &WinT, lnum: crate::pos_defs::LinenrT) -> i32 
     n.max(0)
 }
 
+/// `diff_filler({lnum})` (`f_diff_filler`).
+///
+/// # Safety
+/// Forwarded from [`crate::eval::typval::tv_get_lnum`] and
+/// [`diff_check_fill`]. `GLOBALS.curwin` must point to a live window.
+pub unsafe fn f_diff_filler(
+    argvars: &[crate::eval::typval_defs::TypvalT],
+    rettv: &mut crate::eval::typval_defs::TypvalT,
+) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let lnum = unsafe { crate::eval::typval::tv_get_lnum(&argvars[0]) };
+    // SAFETY: forwarded from this function's own safety doc.
+    let curwin = unsafe { crate::globals::GLOBALS.get_mut() }.curwin;
+    // SAFETY: forwarded from this function's own safety doc.
+    let filler = unsafe { diff_check_fill(&*curwin, lnum) }.max(0);
+    rettv.value = crate::eval::typval_defs::TypvalValue::Number(i64::from(filler));
+}
+
 /// Return the index of `buf` in `tp`'s `tp_diffbuf[]` array, or
 /// [`crate::buffer_defs::DB_COUNT`] if `buf` isn't currently
 /// registered there (`diff_buf_idx`).
@@ -2094,6 +2112,33 @@ mod tests {
         // diff_check_with_linestatus's own "no diffs at all" path.
         assert!(diffopt_filler());
         assert_eq!(unsafe { diff_check_fill(&wp, 1) }, 0);
+    }
+
+    #[test]
+    fn diff_filler_builtin_returns_zero_when_the_current_tab_has_no_diffs() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut tp = crate::buffer_defs::TabpageT::default();
+        let tp_ptr = std::ptr::addr_of_mut!(tp);
+        let _tab = CurtabGuard::set(tp_ptr);
+        let mut win = WinT::default();
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let _win =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.curwin, win_ptr) };
+        let mut rettv = crate::eval::typval_defs::TypvalT::default();
+
+        unsafe {
+            f_diff_filler(
+                &[crate::eval::typval_defs::TypvalT {
+                    value: crate::eval::typval_defs::TypvalValue::Number(1),
+                    ..Default::default()
+                }],
+                &mut rettv,
+            )
+        };
+        assert_eq!(
+            rettv.value,
+            crate::eval::typval_defs::TypvalValue::Number(0)
+        );
     }
 
     #[test]

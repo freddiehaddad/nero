@@ -470,6 +470,7 @@ static FUNCTIONS: std::sync::LazyLock<crate::globals::GlobalCell<std::collection
         m.insert(&b"pumvisible"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pumvisible });
         m.insert(&b"pum_getpos"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_pum_getpos });
         m.insert(&b"did_filetype"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_did_filetype });
+        m.insert(&b"diff_filler"[..], EvalFuncDefT { min_argc: 1, max_argc: 1, base_arg: 1, func: crate::diff::f_diff_filler });
         m.insert(&b"garbagecollect"[..], EvalFuncDefT { min_argc: 0, max_argc: 1, base_arg: BASE_NONE, func: f_garbagecollect });
         m.insert(&b"getcharsearch"[..], EvalFuncDefT { min_argc: 0, max_argc: 0, base_arg: BASE_NONE, func: f_getcharsearch });
         m.insert(&b"getjumplist"[..], EvalFuncDefT { min_argc: 0, max_argc: 2, base_arg: 1, func: f_getjumplist });
@@ -8550,6 +8551,7 @@ mod tests {
             "pumvisible",
             "pum_getpos",
             "did_filetype",
+            "diff_filler",
             "garbagecollect",
             "getcharsearch",
             "getjumplist",
