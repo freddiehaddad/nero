@@ -5,7 +5,8 @@
 //! (`:` command execution, `do_cmdline`, the `ex_*` handler table) - a
 //! whole separate, substantial phase-6 undertaking, not attempted here.
 //! `ex_wrongmodifier` is translated in full: it installs the exact
-//! invalid-command error on its `ExargT`.
+//! invalid-command error on its `ExargT`; `ex_nogui` likewise reports
+//! the exact built-in-GUI error for `:gui`/`:gvim`.
 //!
 //! Translated: `expr_map_locked` - needed as a dependency by
 //! `undo.c`'s `undo_allowed`, `insert.c`, `ex_getln.c`, and
@@ -105,6 +106,11 @@ use crate::buffer_defs::b_flags;
 /// (`ex_wrongmodifier`).
 pub fn ex_wrongmodifier(eap: &mut crate::ex_cmds_defs::ExargT) {
     eap.errmsg = Some(crate::errors::e_invcmd.as_bytes().to_vec());
+}
+
+/// Handle `:gui`/`:gvim` in a build with no built-in GUI (`ex_nogui`).
+pub fn ex_nogui(eap: &mut crate::ex_cmds_defs::ExargT) {
+    eap.errmsg = Some(b"E25: Nvim does not have a built-in GUI".to_vec());
 }
 
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
@@ -1085,6 +1091,16 @@ mod tests {
         };
         ex_wrongmodifier(&mut eap);
         assert_eq!(eap.errmsg.as_deref(), Some(crate::errors::e_invcmd.as_bytes()));
+    }
+
+    #[test]
+    fn ex_nogui_sets_the_built_in_gui_error() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        ex_nogui(&mut eap);
+        assert_eq!(
+            eap.errmsg.as_deref(),
+            Some(b"E25: Nvim does not have a built-in GUI".as_slice())
+        );
     }
 
     struct FfuGuard {
