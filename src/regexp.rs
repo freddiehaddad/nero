@@ -80,6 +80,28 @@ pub unsafe fn ref_extmatch(
     em
 }
 
+/// Remove a reference and free the external-submatch block at zero
+/// (`unref_extmatch`).
+///
+/// Rust drops every owned capture string when the block is freed,
+/// replacing the original's explicit ten-element `xfree` loop.
+///
+/// # Safety
+/// A non-null `em` must point to a live `RegExtmatchT` allocated with
+/// `Box::into_raw`, and each logical reference may be released once.
+pub unsafe fn unref_extmatch(em: *mut crate::types_defs::RegExtmatchT) {
+    if em.is_null() {
+        return;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { (*em).refcnt = (*em).refcnt.wrapping_sub(1) };
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*em).refcnt } <= 0 {
+        // SAFETY: forwarded from this function's own safety doc.
+        drop(unsafe { Box::from_raw(em) });
+    }
+}
+
 /// Whether NFA matching exceeded its configured deadline
 /// (`nfa_did_time_out`).
 ///
@@ -351,5 +373,21 @@ mod tests {
         // The final unref helper lands separately; this test still owns
         // the allocation directly.
         drop(unsafe { Box::from_raw(ext) });
+    }
+
+    #[test]
+    fn unref_extmatch_decrements_then_frees_at_zero() {
+        unsafe { unref_extmatch(std::ptr::null_mut()) };
+
+        let ext = make_extmatch();
+        unsafe { (*ext).matches[2] = Some(b"capture".to_vec()) };
+        unsafe { ref_extmatch(ext) };
+        unsafe { unref_extmatch(ext) };
+        assert_eq!(unsafe { (*ext).refcnt }, 1);
+        assert_eq!(unsafe { (*ext).matches[2].as_deref() }, Some(b"capture".as_slice()));
+
+        // Drops the block and all owned captures. Miri exercises this
+        // path to catch double-free/use-after-free mistakes.
+        unsafe { unref_extmatch(ext) };
     }
 }
