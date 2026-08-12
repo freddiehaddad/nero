@@ -6,7 +6,8 @@
 //! whole separate, substantial phase-6 undertaking, not attempted here.
 //! `ex_wrongmodifier` is translated in full: it installs the exact
 //! invalid-command error on its `ExargT`; `ex_nogui` likewise reports
-//! the exact built-in-GUI error for `:gui`/`:gvim`.
+//! the exact built-in-GUI error for `:gui`/`:gvim`; `ex_ni` reports an
+//! unavailable command unless execution is being skipped.
 //!
 //! Translated: `expr_map_locked` - needed as a dependency by
 //! `undo.c`'s `undo_allowed`, `insert.c`, `ex_getln.c`, and
@@ -111,6 +112,13 @@ pub fn ex_wrongmodifier(eap: &mut crate::ex_cmds_defs::ExargT) {
 /// Handle `:gui`/`:gvim` in a build with no built-in GUI (`ex_nogui`).
 pub fn ex_nogui(eap: &mut crate::ex_cmds_defs::ExargT) {
     eap.errmsg = Some(b"E25: Nvim does not have a built-in GUI".to_vec());
+}
+
+/// Stub handler for an unavailable command (`ex_ni`).
+pub fn ex_ni(eap: &mut crate::ex_cmds_defs::ExargT) {
+    if !eap.skip {
+        eap.errmsg = Some(b"E319: The command is not available in this version".to_vec());
+    }
 }
 
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
@@ -1101,6 +1109,21 @@ mod tests {
             eap.errmsg.as_deref(),
             Some(b"E25: Nvim does not have a built-in GUI".as_slice())
         );
+    }
+
+    #[test]
+    fn ex_ni_reports_unavailable_unless_the_command_is_skipped() {
+        let mut eap = crate::ex_cmds_defs::ExargT::default();
+        ex_ni(&mut eap);
+        assert_eq!(
+            eap.errmsg.as_deref(),
+            Some(b"E319: The command is not available in this version".as_slice())
+        );
+
+        eap.skip = true;
+        eap.errmsg = Some(b"preserved".to_vec());
+        ex_ni(&mut eap);
+        assert_eq!(eap.errmsg.as_deref(), Some(b"preserved".as_slice()));
     }
 
     struct FfuGuard {
