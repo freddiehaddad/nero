@@ -42,6 +42,8 @@
 //!
 //! Also translated: [`tag_freematch`] - clears the cached tag-match
 //! name.
+//! `findtags_matchargs_init` initializes the six-field match state
+//! used by the deferred tags-file search engine.
 
 use crate::buffer_defs::{TaggyT, WinT};
 
@@ -51,6 +53,31 @@ use crate::buffer_defs::{TaggyT, WinT};
 /// `optionstr.rs`'s own `did_set_complete`, matching the original's
 /// own cross-file use of this same constant.
 pub const LSIZE: usize = 512;
+/// Treat the tag pattern as a regular expression (`TAG_REGEXP`).
+const TAG_REGEXP: i32 = 4;
+
+/// Arguments used for matching one tags-file line
+/// (`findtags_match_args_T`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FindtagsMatchArgsT {
+    matchoff: i32,
+    match_re: bool,
+    match_no_ic: bool,
+    has_re: bool,
+    sortic: bool,
+    sort_error: bool,
+}
+
+/// Initialize tags-file matching state (`findtags_matchargs_init`).
+#[allow(dead_code)]
+fn findtags_matchargs_init(margs: &mut FindtagsMatchArgsT, flags: i32) {
+    margs.matchoff = 0;
+    margs.match_re = false;
+    margs.match_no_ic = false;
+    margs.has_re = flags & TAG_REGEXP != 0;
+    margs.sortic = false;
+    margs.sort_error = false;
+}
 
 /// Cached tag match name (`tagmatchname`).
 static TAGMATCHNAME: crate::globals::GlobalCell<Option<Vec<u8>>> =
@@ -434,6 +461,32 @@ mod tests {
         let _guard = TagmatchGuard::install(Some(b"cached-tag".to_vec()));
         unsafe { tag_freematch() };
         assert!(unsafe { TAGMATCHNAME.get_mut() }.is_none());
+    }
+
+    #[test]
+    fn findtags_matchargs_init_resets_state_and_tracks_regexp_flag() {
+        let mut args = FindtagsMatchArgsT {
+            matchoff: 9,
+            match_re: true,
+            match_no_ic: true,
+            has_re: false,
+            sortic: true,
+            sort_error: true,
+        };
+        findtags_matchargs_init(&mut args, 0);
+        assert_eq!(args, FindtagsMatchArgsT::default());
+
+        findtags_matchargs_init(&mut args, TAG_REGEXP);
+        assert_eq!(
+            args,
+            FindtagsMatchArgsT {
+                has_re: true,
+                ..Default::default()
+            }
+        );
+
+        findtags_matchargs_init(&mut args, TAG_REGEXP | 0x4000);
+        assert!(args.has_re);
     }
     use crate::eval::typval_defs::{DictitemT, TypvalT, TypvalValue};
 
