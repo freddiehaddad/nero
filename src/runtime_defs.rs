@@ -26,6 +26,14 @@ use crate::ex_eval_defs::ExceptT;
 use crate::pos_defs::LinenrT;
 use crate::types_defs::{AutoPatCmdT, ProftimeT};
 
+/// Per-line script profiling counters (`sn_prl_T`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnPrlT {
+    pub snp_count: i32,
+    pub sn_prl_total: ProftimeT,
+    pub sn_prl_self: ProftimeT,
+}
+
 /// Source-file state shared with command execution (`source_cookie_T`).
 ///
 /// This initial representation carries the fields exposed by
@@ -173,7 +181,7 @@ pub struct ScriptitemT {
     pub sn_pr_children: ProftimeT,
     // profiling the script per line.
     /// things stored for every line (`sn_prl_ga`).
-    pub sn_prl_ga: crate::garray_defs::GarrayT,
+    pub sn_prl_ga: Vec<SnPrlT>,
     /// start time for current line (`sn_prl_start`).
     pub sn_prl_start: ProftimeT,
     /// time spent in children for this line (`sn_prl_children`).
@@ -236,8 +244,20 @@ mod tests {
         assert!(!si.sn_lua);
         assert!(!si.sn_prof_on);
         assert_eq!(si.sn_pr_count, 0);
-        assert_eq!(si.sn_prl_ga.ga_len, 0);
+        assert!(si.sn_prl_ga.is_empty());
         assert_eq!(si.sn_prl_idx, 0);
+    }
+
+    #[test]
+    fn script_profile_line_counters_default_to_zero() {
+        assert_eq!(
+            SnPrlT::default(),
+            SnPrlT {
+                snp_count: 0,
+                sn_prl_total: 0,
+                sn_prl_self: 0,
+            }
+        );
     }
 
     #[test]
