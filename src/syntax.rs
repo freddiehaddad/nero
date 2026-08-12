@@ -192,6 +192,34 @@ pub unsafe fn syn_cur_foldlevel() -> i32 {
         .count() as i32
 }
 
+/// Return a syntax-stack item's highlight ID (`syn_get_stack_item`).
+///
+/// An out-of-range request invalidates unfinished state and moves the
+/// current column to `MAXCOL`.
+///
+/// # Safety
+/// Same requirements as the internal `invalidate_current_state`.
+#[must_use]
+pub unsafe fn syn_get_stack_item(index: i32) -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { CURRENT_STATE.get_mut() }.len();
+    let Ok(index) = usize::try_from(index) else {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { invalidate_current_state() };
+        unsafe { *CURRENT_COL.get_mut() = crate::pos_defs::MAXCOL };
+        return -1;
+    };
+    if index >= len {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { invalidate_current_state() };
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *CURRENT_COL.get_mut() = crate::pos_defs::MAXCOL };
+        return -1;
+    }
+    // SAFETY: bounds checked above.
+    unsafe { CURRENT_STATE.get_mut()[index].si_id }
+}
+
 /// Pushes a cleared state onto the current state stack, with its
 /// pattern index set to `idx` (`push_current_state`).
 ///
@@ -1438,6 +1466,30 @@ mod tests {
         assert!(!unsafe { *CURRENT_STATE_VALID.get_mut() });
         assert!(unsafe { *CURRENT_NEXT_LIST.get_mut() }.is_null());
         assert_eq!(unsafe { *KEEPEND_LEVEL.get_mut() }, -1);
+    }
+
+    #[test]
+    fn syn_get_stack_item_returns_ids_and_invalidates_out_of_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stack = CurrentStackGuard::install(vec![
+            StateItemT {
+                si_id: 11,
+                ..Default::default()
+            },
+            StateItemT {
+                si_id: 22,
+                ..Default::default()
+            },
+        ]);
+        let _valid = CurrentValidityGuard::set(true);
+        let _column = CurrentPosGuard::install(4, 1);
+        assert_eq!(unsafe { syn_get_stack_item(1) }, 22);
+        assert!(unsafe { *CURRENT_STATE_VALID.get_mut() });
+
+        assert_eq!(unsafe { syn_get_stack_item(2) }, -1);
+        assert!(unsafe { CURRENT_STATE.get_mut() }.is_empty());
+        assert!(!unsafe { *CURRENT_STATE_VALID.get_mut() });
+        assert_eq!(unsafe { *CURRENT_COL.get_mut() }, crate::pos_defs::MAXCOL);
     }
 
     // ---- get_syntax_info / syn_get_sub_char ----
