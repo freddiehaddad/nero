@@ -10,7 +10,8 @@
 //! Per-function/per-script profiling remains mostly deferred, but
 //! [`func_line_exec`]/[`script_line_exec`] are now translated because
 //! their function/script records have real fields.
-//! [`script_prof_save`] also records nested-child timing state.
+//! [`script_prof_save`]/[`script_prof_restore`] record nested-child
+//! timing state.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -164,6 +165,37 @@ pub unsafe fn script_prof_save(tm: &mut ProftimeT) {
         }
     }
     *tm = profile_get_wait();
+}
+
+/// Accumulate time spent in a nested script or function
+/// (`script_prof_restore`).
+///
+/// # Safety
+/// Reads `GLOBALS.current_sctx` and mutates its live script item.
+pub unsafe fn script_prof_restore(tm: &ProftimeT) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if sid <= 0 || sid > crate::runtime::script_item_count() {
+        return;
+    }
+    let item = crate::runtime::script_item(sid);
+    // SAFETY: the script registry owns this live item.
+    if unsafe { (*item).sn_prof_on } {
+        // SAFETY: the script registry owns this live item.
+        unsafe { (*item).sn_pr_nest -= 1 };
+        // SAFETY: the script registry owns this live item.
+        if unsafe { (*item).sn_pr_nest } == 0 {
+            // SAFETY: the script registry owns this live item.
+            let child = unsafe { profile_end((*item).sn_pr_child) };
+            let child = profile_sub_wait(*tm, child);
+            // SAFETY: the script registry owns this live item.
+            unsafe {
+                (*item).sn_pr_child = child;
+                (*item).sn_pr_children = profile_add((*item).sn_pr_children, child);
+                (*item).sn_prl_children = profile_add((*item).sn_prl_children, child);
+            }
+        }
+    }
 }
 
 /// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
@@ -499,6 +531,43 @@ mod tests {
         unsafe { script_prof_save(&mut wait) };
         assert_eq!(unsafe { (*item).sn_pr_nest }, 2);
         assert_eq!(unsafe { (*item).sn_pr_child }, child_start);
+    }
+
+    #[test]
+    fn script_prof_restore_accumulates_only_when_leaving_the_outermost_child() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (sid, item) = crate::runtime::new_script_item(Some(b"restore.vim".to_vec()));
+        let sctx = crate::eval::typval_defs::SctxT {
+            sc_sid: sid,
+            ..Default::default()
+        };
+        let _sctx = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.current_sctx, sctx)
+        };
+        let wait = profile_get_wait();
+        unsafe {
+            (*item).sn_prof_on = true;
+            (*item).sn_pr_nest = 2;
+            (*item).sn_pr_child = profile_start().wrapping_sub(1_000_000);
+            (*item).sn_pr_children = 0;
+            (*item).sn_prl_children = 0;
+        }
+
+        unsafe { script_prof_restore(&wait) };
+        assert_eq!(unsafe { (*item).sn_pr_nest }, 1);
+        assert_eq!(unsafe { (*item).sn_pr_children }, 0);
+
+        unsafe { script_prof_restore(&wait) };
+        assert_eq!(unsafe { (*item).sn_pr_nest }, 0);
+        assert!(unsafe { (*item).sn_pr_child } > 0);
+        assert_eq!(
+            unsafe { (*item).sn_pr_children },
+            unsafe { (*item).sn_pr_child }
+        );
+        assert_eq!(
+            unsafe { (*item).sn_prl_children },
+            unsafe { (*item).sn_pr_child }
+        );
     }
 
     struct PrevTimeGuard(ProftimeT);
