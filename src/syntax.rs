@@ -121,6 +121,9 @@ static CURRENT_STATE_VALID: crate::globals::GlobalCell<bool> =
 /// Current `nextgroup` ID list (`current_next_list`).
 static CURRENT_NEXT_LIST: crate::globals::GlobalCell<*mut i16> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Index of the next syntax match (`next_match_idx`).
+static NEXT_MATCH_IDX: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
 
 /// Deep-clear the current syntax stack (`clear_current_state`).
 ///
@@ -232,6 +235,29 @@ pub unsafe fn push_current_state(idx: i32) {
         si_idx: idx,
         ..Default::default()
     });
+}
+
+/// Pop the innermost current syntax state (`pop_current_state`).
+///
+/// # Safety
+/// Every non-null `si_extmatch` must hold one live reference; no other
+/// syntax-state operation may run concurrently.
+#[allow(dead_code)]
+unsafe fn pop_current_state() {
+    // SAFETY: forwarded from this function's own safety doc.
+    if let Some(item) = unsafe { CURRENT_STATE.get_mut() }.pop() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::regexp::unref_extmatch(item.si_extmatch) };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *NEXT_MATCH_IDX.get_mut() = -1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    let len = unsafe { CURRENT_STATE.get_mut() }.len() as i32;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { *KEEPEND_LEVEL.get_mut() } >= len {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { *KEEPEND_LEVEL.get_mut() = -1 };
+    }
 }
 
 /// The number of items on the current state stack
@@ -1492,6 +1518,23 @@ mod tests {
         assert_eq!(unsafe { *CURRENT_COL.get_mut() }, crate::pos_defs::MAXCOL);
     }
 
+    #[test]
+    fn pop_current_state_resets_next_match_and_expired_keepend_level() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stack = CurrentStackGuard::install(vec![
+            StateItemT::default(),
+            StateItemT::default(),
+        ]);
+        let _next = NextMatchGuard::set(8);
+        let _keepend = KeependLevelGuard::install(1);
+
+        unsafe { pop_current_state() };
+
+        assert_eq!(unsafe { CURRENT_STATE.get_mut() }.len(), 1);
+        assert_eq!(unsafe { *NEXT_MATCH_IDX.get_mut() }, -1);
+        assert_eq!(unsafe { *KEEPEND_LEVEL.get_mut() }, -1);
+    }
+
     // ---- get_syntax_info / syn_get_sub_char ----
 
     /// Restores the syntax engine's current-position statics on drop.
@@ -1535,6 +1578,22 @@ mod tests {
     struct CurrentValidityGuard(bool);
 
     struct CurrentNextListGuard(*mut i16);
+
+    struct NextMatchGuard(i32);
+
+    impl NextMatchGuard {
+        fn set(value: i32) -> Self {
+            let saved = unsafe { *NEXT_MATCH_IDX.get_mut() };
+            unsafe { *NEXT_MATCH_IDX.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for NextMatchGuard {
+        fn drop(&mut self) {
+            unsafe { *NEXT_MATCH_IDX.get_mut() = self.0 };
+        }
+    }
 
     impl CurrentNextListGuard {
         fn set(value: *mut i16) -> Self {
