@@ -18,11 +18,10 @@
 //! consumer (`mark_forget_file`) rather than waiting for the rest of
 //! this file - see that module's own doc comment.
 //!
-//! Also translated: [`set_ref_in_tagfunc`] - marks the global
-//! `'tagfunc'` callback (`TFU_CB`) with a GC `copy_id` so it survives
-//! garbage collection. `TFU_CB` stays `Callback::None` forever today
-//! (see its own doc comment) - matches every real, unconfigured
-//! session.
+//! Also translated: [`set_ref_in_tagfunc`]/[`free_tagfunc_option`] -
+//! mark or release the global `'tagfunc'` callback (`TFU_CB`).
+//! `TFU_CB` stays `Callback::None` forever today (see its own doc
+//! comment) - matches every real, unconfigured session.
 //!
 //! Also translated: the tag-stack WRITE side - [`set_tagstack`] (the
 //! `settagstack()` builtin's real dispatcher) plus its own private
@@ -214,6 +213,15 @@ pub fn tag_strnicmp(s1: &[u8], s2: &[u8], len: usize) -> i32 {
 /// `option_set_callback_func`, not translated).
 static TFU_CB: crate::globals::GlobalCell<crate::eval::typval_defs::Callback> =
     crate::globals::GlobalCell::new(crate::eval::typval_defs::Callback::None);
+
+/// Release the global `'tagfunc'` callback (`free_tagfunc_option`).
+///
+/// # Safety
+/// Must not run concurrently with another access to `TFU_CB`.
+pub unsafe fn free_tagfunc_option() {
+    // SAFETY: forwarded from this function's own safety doc.
+    crate::eval::typval::callback_free(unsafe { &mut *TFU_CB.as_ptr() });
+}
 
 /// Mark the global `'tagfunc'` callback with `copy_id` so that it is
 /// not garbage collected (`set_ref_in_tagfunc`).
@@ -439,6 +447,25 @@ pub unsafe fn set_tagstack(wp: &mut WinT, d: *mut crate::eval::typval_defs::Dict
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TfuGuard {
+        saved: Option<crate::eval::typval_defs::Callback>,
+    }
+
+    impl TfuGuard {
+        fn install(value: crate::eval::typval_defs::Callback) -> Self {
+            let slot = unsafe { &mut *TFU_CB.as_ptr() };
+            Self { saved: Some(std::mem::replace(slot, value)) }
+        }
+    }
+
+    impl Drop for TfuGuard {
+        fn drop(&mut self) {
+            let slot = unsafe { &mut *TFU_CB.as_ptr() };
+            crate::eval::typval::callback_free(slot);
+            *slot = self.saved.take().expect("saved callback");
+        }
+    }
 
     struct TagmatchGuard(Option<Vec<u8>>);
 
@@ -741,10 +768,24 @@ mod tests {
 
     #[test]
     fn set_ref_in_tagfunc_is_always_false_since_tfu_cb_stays_none() {
+        let _lock = crate::globals::global_state_test_lock();
         // Nothing in this crate can populate TFU_CB with a real
         // callback yet (needs option_set_callback_func) - it always
         // stays Callback::None, matching a real, unconfigured session.
         assert!(!unsafe { set_ref_in_tagfunc(1) });
+    }
+
+    #[test]
+    fn free_tagfunc_option_releases_and_clears_the_callback() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = TfuGuard::install(crate::eval::typval_defs::Callback::Funcref(
+            b"TagResolver".to_vec(),
+        ));
+        unsafe { free_tagfunc_option() };
+        assert_eq!(
+            unsafe { &*TFU_CB.as_ptr() },
+            &crate::eval::typval_defs::Callback::None
+        );
     }
 
     // --- tagstack_clear / tagstack_shift / tagstack_push_item / tagstack_set_curidx ---
