@@ -299,6 +299,22 @@ use crate::eval::typval_defs::{Callback, TypvalT, TypvalValue, VarLockStatus, Va
 use crate::option_defs::OptIndex;
 use crate::vim_defs::{FAIL, OK};
 
+/// Highlight group selected by `:echohl` (`echo_hl_id`).
+static ECHO_HL_ID: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Handle `:echohl {name}` (`ex_echohl`).
+///
+/// # Safety
+/// Forwarded from [`crate::highlight_group::syn_name2id`].
+pub unsafe fn ex_echohl(eap: &crate::ex_cmds_defs::ExargT) {
+    let name = eap.arg.as_deref().unwrap_or(&[]);
+    // SAFETY: forwarded from this function's own safety doc.
+    let id = unsafe { crate::highlight_group::syn_name2id(name) };
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *ECHO_HL_ID.get_mut() = id };
+}
+
 /// "n1" divided by "n2", taking care of dividing by zero
 /// (`num_divide`).
 #[must_use]
@@ -5832,6 +5848,37 @@ unsafe fn get_lval_list(lp: &mut LvalT, var1: &TypvalT, var2: &TypvalT, empty1: 
 mod tests {
     use super::*;
     use crate::eval::typval_defs::VarLockStatus;
+
+    struct EchoHighlightGuard(i32);
+
+    impl EchoHighlightGuard {
+        fn capture() -> Self {
+            Self(unsafe { *ECHO_HL_ID.get_mut() })
+        }
+    }
+
+    impl Drop for EchoHighlightGuard {
+        fn drop(&mut self) {
+            unsafe { *ECHO_HL_ID.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn ex_echohl_resolves_and_stores_the_highlight_group() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = EchoHighlightGuard::capture();
+        let eap = crate::ex_cmds_defs::ExargT {
+            arg: Some(b"@echo.capture".to_vec()),
+            ..Default::default()
+        };
+
+        unsafe { ex_echohl(&eap) };
+        assert!(unsafe { *ECHO_HL_ID.get_mut() } > 0);
+
+        let empty = crate::ex_cmds_defs::ExargT::default();
+        unsafe { ex_echohl(&empty) };
+        assert_eq!(unsafe { *ECHO_HL_ID.get_mut() }, 0);
+    }
 
     // --- get_callback_depth ---
 
@@ -11399,4 +11446,3 @@ mod tests {
         reset_globals_for_test();
     }
 }
-
