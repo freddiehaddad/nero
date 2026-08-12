@@ -90,6 +90,21 @@ static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::Globa
 static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
     crate::globals::GlobalCell::new(Vec::new());
 
+/// Deep-clear the current syntax stack (`clear_current_state`).
+///
+/// # Safety
+/// Every non-null `si_extmatch` must hold one live reference, and no
+/// other syntax-state operation may run concurrently.
+#[allow(dead_code)]
+unsafe fn clear_current_state() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let state = unsafe { CURRENT_STATE.get_mut() };
+    for item in state.drain(..) {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { crate::regexp::unref_extmatch(item.si_extmatch) };
+    }
+}
+
 /// `current_col` - the column the syntax engine is currently on.
 static CURRENT_COL: crate::globals::GlobalCell<crate::pos_defs::ColnrT> =
     crate::globals::GlobalCell::new(0);
@@ -1348,6 +1363,24 @@ mod tests {
         assert_eq!(unsafe { syn_getcurline_len() }, 0);
 
         close_syntax_test_buf(syn);
+    }
+
+    #[test]
+    fn clear_current_state_releases_extmatches_and_empties_the_stack() {
+        let _lock = crate::globals::global_state_test_lock();
+        let ext = Box::into_raw(Box::new(crate::types_defs::RegExtmatchT {
+            refcnt: 1,
+            matches: std::array::from_fn(|index| {
+                (index == 1).then(|| b"capture".to_vec())
+            }),
+        }));
+        let _stack = CurrentStackGuard::install(vec![StateItemT {
+            si_extmatch: ext,
+            ..Default::default()
+        }]);
+
+        unsafe { clear_current_state() };
+        assert!(unsafe { CURRENT_STATE.get_mut() }.is_empty());
     }
 
     // ---- get_syntax_info / syn_get_sub_char ----
