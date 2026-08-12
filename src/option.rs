@@ -6641,6 +6641,25 @@ pub fn optval_equal(o1: &crate::option_defs::OptVal, o2: &crate::option_defs::Op
     o1 == o2
 }
 
+/// Whether an option currently has its default value
+/// (`optval_default`).
+///
+/// # Safety
+/// For a visible option, `varp` must point to storage of the option's
+/// declared type.
+#[allow(dead_code)]
+unsafe fn optval_default(
+    opt_idx: OptIndex,
+    varp: *mut std::ffi::c_void,
+) -> bool {
+    if is_option_hidden(opt_idx) {
+        return true;
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    let current = unsafe { optval_from_varp(opt_idx, varp) };
+    optval_equal(&current, &get_option(opt_idx).def_val)
+}
+
 /// This option's own flags, or `0` for an invalid index
 /// (`get_option_flags`).
 #[must_use]
@@ -7538,6 +7557,17 @@ mod did_set_title_tests {
     #[test]
     fn get_option_flags_reports_zero_for_an_invalid_index() {
         assert_eq!(get_option_flags(OptIndex::Invalid), 0);
+    }
+
+    #[test]
+    fn optval_default_short_circuits_hidden_and_compares_visible_values() {
+        assert!(unsafe { optval_default(OptIndex::Aleph, std::ptr::null_mut()) });
+
+        let mut value = 0i32;
+        let varp = std::ptr::addr_of_mut!(value).cast();
+        assert!(unsafe { optval_default(OptIndex::Allowrevins, varp) });
+        unsafe { *varp.cast::<i32>() = 1 };
+        assert!(!unsafe { optval_default(OptIndex::Allowrevins, varp) });
     }
 
     #[test]
