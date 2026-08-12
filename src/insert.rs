@@ -53,6 +53,16 @@ pub unsafe fn replace_push(bytes: &[u8]) {
     stack.splice(position..position, bytes.iter().copied());
 }
 
+/// Push a NUL separator onto the replacement stack
+/// (`replace_push_nul`).
+///
+/// # Safety
+/// Forwarded from [`replace_push`].
+pub unsafe fn replace_push_nul() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { replace_push(&[crate::ascii_defs::NUL]) };
+}
+
 /// Peek at the replacement stack and pop its top byte only when it is
 /// NUL (`replace_pop_if_nul`).
 ///
@@ -786,6 +796,18 @@ mod tests {
         unsafe { crate::globals::GLOBALS.get_mut() }.replace_offset = 99;
         unsafe { replace_push(b"ignored") };
         assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"abcd!XY");
+    }
+
+    #[test]
+    fn replace_push_nul_uses_the_same_offset_insertion_rule() {
+        let _lock = global_state_test_lock();
+        let _guard = ReplaceStackGuard::install(b"ab".to_vec());
+        let _offset = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.replace_offset, 1)
+        };
+
+        unsafe { replace_push_nul() };
+        assert_eq!(unsafe { REPLACE_STACK.get_mut() }.as_slice(), b"a\0b");
     }
 
     struct CurwinGuard {
