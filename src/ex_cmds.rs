@@ -286,9 +286,36 @@ pub unsafe fn sub_set_replacement(sub: crate::ex_cmds_defs::SubReplacementString
     unsafe { *OLD_SUB.get_mut() = sub };
 }
 
+/// Release the previous substitution replacement (`free_old_sub`).
+///
+/// # Safety
+/// Forwarded from [`sub_set_replacement`].
+pub unsafe fn free_old_sub() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        sub_set_replacement(crate::ex_cmds_defs::SubReplacementString::default())
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct OldSubGuard(Option<crate::ex_cmds_defs::SubReplacementString>);
+
+    impl OldSubGuard {
+        fn capture() -> Self {
+            Self(Some(unsafe { sub_get_replacement() }))
+        }
+    }
+
+    impl Drop for OldSubGuard {
+        fn drop(&mut self) {
+            unsafe {
+                sub_set_replacement(self.0.take().expect("saved replacement"))
+            };
+        }
+    }
 
     fn globals_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::globals::global_state_test_lock()
@@ -603,6 +630,29 @@ mod tests {
         assert_eq!(got.timestamp, 0);
 
         unsafe { sub_set_replacement(previous) };
+    }
+
+    #[test]
+    fn free_old_sub_clears_every_owned_replacement_field() {
+        let _lock = globals_test_lock();
+        let _guard = OldSubGuard::capture();
+        unsafe {
+            sub_set_replacement(crate::ex_cmds_defs::SubReplacementString {
+                sub: Some(b"replacement".to_vec()),
+                timestamp: 42,
+                additional_data: Some(Box::new(
+                    crate::types_defs::AdditionalData {
+                        nitems: 2,
+                        nbytes: 8,
+                    },
+                )),
+            });
+            free_old_sub();
+        }
+        let cleared = unsafe { sub_get_replacement() };
+        assert!(cleared.sub.is_none());
+        assert_eq!(cleared.timestamp, 0);
+        assert!(cleared.additional_data.is_none());
     }
 
     #[cfg(not(unix))]
