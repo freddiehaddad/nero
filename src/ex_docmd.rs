@@ -121,6 +121,18 @@ pub fn ex_ni(eap: &mut crate::ex_cmds_defs::ExargT) {
     }
 }
 
+/// Error reported when an Ex address is invalid for its command
+/// (`addr_error`).
+#[allow(dead_code)]
+#[must_use]
+fn addr_error(addr_type: crate::ex_cmds_defs::CmdAddrT) -> &'static [u8] {
+    if addr_type == crate::ex_cmds_defs::CmdAddrT::None {
+        crate::errors::e_norange.as_bytes()
+    } else {
+        crate::errors::e_invrange.as_bytes()
+    }
+}
+
 /// `prev_dir` - the directory `:cd -` returns to, at global scope.
 ///
 /// Only ever set by `post_chdir` (not yet translated), so this stays
@@ -1124,6 +1136,21 @@ mod tests {
         eap.errmsg = Some(b"preserved".to_vec());
         ex_ni(&mut eap);
         assert_eq!(eap.errmsg.as_deref(), Some(b"preserved".as_slice()));
+    }
+
+    #[test]
+    fn addr_error_distinguishes_no_range_from_an_invalid_range() {
+        assert_eq!(
+            addr_error(crate::ex_cmds_defs::CmdAddrT::None),
+            crate::errors::e_norange.as_bytes()
+        );
+        for addr in [
+            crate::ex_cmds_defs::CmdAddrT::Lines,
+            crate::ex_cmds_defs::CmdAddrT::Unsigned,
+            crate::ex_cmds_defs::CmdAddrT::TabsRelative,
+        ] {
+            assert_eq!(addr_error(addr), crate::errors::e_invrange.as_bytes());
+        }
     }
 
     struct FfuGuard {
