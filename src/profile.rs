@@ -11,7 +11,8 @@
 //! [`func_line_exec`]/[`script_line_exec`] are now translated because
 //! their function/script records have real fields.
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
-//! timing state.
+//! timing state, and [`prof_child_enter`] starts the paired
+//! function/script child measurement.
 //!
 //! `os_hrtime()` (`os/time.c`, phase 10, not yet translated) is stood in
 //! for by [`std::time::Instant`], Rust's standard monotonic high-resolution
@@ -196,6 +197,23 @@ pub unsafe fn script_prof_restore(tm: &ProftimeT) {
             }
         }
     }
+}
+
+/// Prepare profiling before entering a nested operation
+/// (`prof_child_enter`).
+///
+/// # Safety
+/// The current funccall, when non-null, and its `fc_func` must be live.
+/// Forwarded from [`script_prof_save`].
+pub unsafe fn prof_child_enter(tm: &mut ProftimeT) {
+    let fc = crate::eval::userfunc::get_current_funccal();
+    // SAFETY: forwarded from this function's own safety doc.
+    if !fc.is_null() && unsafe { (*(*fc).fc_func).uf_profiling != 0 } {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*fc).fc_prof_child = profile_start() };
+    }
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { script_prof_save(tm) };
 }
 
 /// Stands in for `os_hrtime()` until `os/time.c` is translated - see module
@@ -438,6 +456,22 @@ pub fn profile_cmp(tm1: ProftimeT, tm2: ProftimeT) -> i32 {
 mod tests {
     use super::*;
 
+    struct CurrentFunccallGuard(*mut crate::eval::typval_defs::FunccallT);
+
+    impl CurrentFunccallGuard {
+        fn install(value: *mut crate::eval::typval_defs::FunccallT) -> Self {
+            let saved = crate::eval::userfunc::get_current_funccal();
+            crate::eval::userfunc::set_current_funccal(value);
+            Self(saved)
+        }
+    }
+
+    impl Drop for CurrentFunccallGuard {
+        fn drop(&mut self) {
+            crate::eval::userfunc::set_current_funccal(self.0);
+        }
+    }
+
     #[test]
     fn func_line_exec_marks_only_an_active_profiled_line() {
         let mut func = crate::eval::typval_defs::UfuncT {
@@ -568,6 +602,29 @@ mod tests {
             unsafe { (*item).sn_prl_children },
             unsafe { (*item).sn_pr_child }
         );
+    }
+
+    #[test]
+    fn prof_child_enter_starts_a_profiled_current_function() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut func = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 1,
+            ..Default::default()
+        };
+        let func_ptr = std::ptr::addr_of_mut!(func);
+        let mut call = crate::eval::typval_defs::FunccallT {
+            fc_func: func_ptr,
+            ..Default::default()
+        };
+        let call_ptr = std::ptr::addr_of_mut!(call);
+        let _call = CurrentFunccallGuard::install(call_ptr);
+        let before = profile_start();
+        let mut wait = u64::MAX;
+
+        unsafe { prof_child_enter(&mut wait) };
+
+        assert!(unsafe { (*call_ptr).fc_prof_child } >= before);
+        assert_eq!(wait, profile_get_wait());
     }
 
     struct PrevTimeGuard(ProftimeT);
