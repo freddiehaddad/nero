@@ -110,7 +110,8 @@
 //! [`CPT_ABBR`]/[`CPT_KIND`]/[`CPT_MENU`]/[`CPT_INFO`]/[`CPT_COUNT`].
 //!
 //! Also translated: [`ins_compl_arm_autocomplete_delay`]/
-//! [`ins_compl_clear_autocomplete_delay`] and their pending/start-time
+//! [`ins_compl_clear_autocomplete_delay`]/
+//! [`ins_compl_autocomplete_pending`] and their pending/start-time
 //! state.
 //!
 //! Deferred: everything else in the file.
@@ -900,6 +901,17 @@ pub unsafe fn ins_compl_clear_autocomplete_delay() {
     unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() = false };
 }
 
+/// Whether the `'autocompletedelay'` timer is currently pending
+/// (`ins_compl_autocomplete_pending`).
+///
+/// # Safety
+/// Must not run concurrently with another completion-delay operation.
+#[must_use]
+pub unsafe fn ins_compl_autocomplete_pending() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() }
+}
+
 /// Get the local or global value of `'completeopt'` flags
 /// (`get_cot_flags`).
 ///
@@ -1665,6 +1677,16 @@ mod tests {
 
         assert!(!unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
         assert_eq!(unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() }, start);
+    }
+
+    #[test]
+    fn autocomplete_delay_pending_accessor_tracks_arm_and_clear() {
+        let _guard = AutocompleteDelayGuard::set(25);
+        assert!(!unsafe { ins_compl_autocomplete_pending() });
+        assert!(unsafe { ins_compl_arm_autocomplete_delay() });
+        assert!(unsafe { ins_compl_autocomplete_pending() });
+        unsafe { ins_compl_clear_autocomplete_delay() };
+        assert!(!unsafe { ins_compl_autocomplete_pending() });
     }
 
     /// Installs a buffer as `curbuf` for the test's duration and
