@@ -6,6 +6,9 @@
 
 /// Compiled program can match a newline (`RF_HASNL`).
 const RF_HASNL: u32 = 4;
+/// Whether the previous `vim_regcomp()` saw an end-of-line item
+/// (`had_eol`).
+static HAD_EOL: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::new(false);
 
 /// Whether the compiled program can match a line break
 /// (`re_multiline`).
@@ -15,6 +18,17 @@ const RF_HASNL: u32 = 4;
 #[must_use]
 pub fn re_multiline(prog: &crate::types_defs::RegprogT) -> i32 {
     (prog.regflags & RF_HASNL) as i32
+}
+
+/// Whether the previous regexp compilation saw `$`
+/// (`vim_regcomp_had_eol`).
+///
+/// # Safety
+/// Must not run concurrently with regexp compilation.
+#[must_use]
+pub unsafe fn vim_regcomp_had_eol() -> i32 {
+    // SAFETY: forwarded from this function's own safety doc.
+    i32::from(unsafe { *HAD_EOL.get_mut() })
 }
 
 /// Uppercase one replacement character (`do_upper`).
@@ -42,6 +56,22 @@ mod tests {
     use super::*;
 
     struct CasemapGuard(u32);
+
+    struct HadEolGuard(bool);
+
+    impl HadEolGuard {
+        fn set(value: bool) -> Self {
+            let saved = unsafe { *HAD_EOL.get_mut() };
+            unsafe { *HAD_EOL.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for HadEolGuard {
+        fn drop(&mut self) {
+            unsafe { *HAD_EOL.get_mut() = self.0 };
+        }
+    }
 
     impl CasemapGuard {
         fn keep_ascii() -> Self {
@@ -92,5 +122,14 @@ mod tests {
 
         prog.regflags = RF_HASNL | 0x80;
         assert_eq!(re_multiline(&prog), RF_HASNL as i32);
+    }
+
+    #[test]
+    fn vim_regcomp_had_eol_reflects_the_last_compile_flag() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = HadEolGuard::set(false);
+        assert_eq!(unsafe { vim_regcomp_had_eol() }, 0);
+        unsafe { *HAD_EOL.get_mut() = true };
+        assert_eq!(unsafe { vim_regcomp_had_eol() }, 1);
     }
 }
