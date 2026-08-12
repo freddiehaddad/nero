@@ -127,6 +127,20 @@ unsafe fn do_cmdline_start() -> i32 {
     crate::vim_defs::OK
 }
 
+/// End executing an Ex command line (`do_cmdline_end`).
+///
+/// # Safety
+/// Must pair with one successful [`do_cmdline_start`] call and run on
+/// the editor thread.
+#[allow(dead_code)]
+unsafe fn do_cmdline_end() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CMDLINE_CALL_DEPTH.get_mut() -= 1 };
+    // SAFETY: forwarded from this function's own safety doc.
+    assert!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() } >= 0);
+    crate::clipboard::end_batch_changes();
+}
+
 /// Report a command modifier used in an invalid position
 /// (`ex_wrongmodifier`).
 pub fn ex_wrongmodifier(eap: &mut crate::ex_cmds_defs::ExargT) {
@@ -1167,6 +1181,19 @@ mod tests {
         assert_eq!(unsafe { do_cmdline_start() }, crate::vim_defs::OK);
         guard.started = true;
         assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 200);
+    }
+
+    #[test]
+    fn do_cmdline_end_balances_depth_and_batch_state() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut guard = CmdlineStartGuard::install(0, 100);
+        assert_eq!(unsafe { do_cmdline_start() }, crate::vim_defs::OK);
+        guard.started = true;
+        assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 1);
+
+        unsafe { do_cmdline_end() };
+        guard.started = false;
+        assert_eq!(unsafe { *CMDLINE_CALL_DEPTH.get_mut() }, 0);
     }
 
     #[test]
