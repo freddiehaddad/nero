@@ -12,6 +12,12 @@ static HAD_EOL: crate::globals::GlobalCell<bool> = crate::globals::GlobalCell::n
 /// Whether `'cpoptions'` contains the literal flag (`reg_cpo_lit`).
 static REG_CPO_LIT: crate::globals::GlobalCell<bool> =
     crate::globals::GlobalCell::new(false);
+/// NFA matching deadline (`nfa_time_limit`); null disables it.
+static NFA_TIME_LIMIT: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Optional caller-owned timeout result (`nfa_timed_out`).
+static NFA_TIMED_OUT: crate::globals::GlobalCell<*mut bool> =
+    crate::globals::GlobalCell::new(std::ptr::null_mut());
 
 /// Refresh regexp-specific `'cpoptions'` flags (`get_cpo_flags`).
 ///
@@ -48,6 +54,31 @@ fn nfa_re_num_cmp(value: u64, op: i32, position: u64) -> bool {
     } else {
         value == position
     }
+}
+
+/// Whether NFA matching exceeded its configured deadline
+/// (`nfa_did_time_out`).
+///
+/// # Safety
+/// Non-null timeout pointers must remain live for the call.
+#[allow(dead_code)]
+#[must_use]
+unsafe fn nfa_did_time_out() -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    let limit = unsafe { *NFA_TIME_LIMIT.get_mut() };
+    if !limit.is_null()
+        // SAFETY: forwarded from this function's own safety doc.
+        && crate::profile::profile_passed_limit(unsafe { *limit })
+    {
+        // SAFETY: forwarded from this function's own safety doc.
+        let timed_out = unsafe { *NFA_TIMED_OUT.get_mut() };
+        if !timed_out.is_null() {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { *timed_out = true };
+        }
+        return true;
+    }
+    false
 }
 
 /// Whether the compiled program can match a line break
@@ -102,6 +133,37 @@ mod tests {
     struct CpoGuard {
         saved_option: Option<Vec<u8>>,
         saved_literal: bool,
+    }
+
+    struct NfaTimeoutGuard {
+        limit: *mut crate::types_defs::ProftimeT,
+        timed_out: *mut bool,
+    }
+
+    impl NfaTimeoutGuard {
+        fn install(
+            limit: *mut crate::types_defs::ProftimeT,
+            timed_out: *mut bool,
+        ) -> Self {
+            let saved = Self {
+                limit: unsafe { *NFA_TIME_LIMIT.get_mut() },
+                timed_out: unsafe { *NFA_TIMED_OUT.get_mut() },
+            };
+            unsafe {
+                *NFA_TIME_LIMIT.get_mut() = limit;
+                *NFA_TIMED_OUT.get_mut() = timed_out;
+            }
+            saved
+        }
+    }
+
+    impl Drop for NfaTimeoutGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *NFA_TIME_LIMIT.get_mut() = self.limit;
+                *NFA_TIMED_OUT.get_mut() = self.timed_out;
+            }
+        }
     }
 
     impl CpoGuard {
@@ -221,5 +283,28 @@ mod tests {
         assert!(nfa_re_num_cmp(7, 0, 7));
         assert!(nfa_re_num_cmp(u64::MAX, 99, u64::MAX));
         assert!(!nfa_re_num_cmp(7, 0, 8));
+    }
+
+    #[test]
+    fn nfa_did_time_out_sets_the_optional_result_only_after_deadline() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut timed_out = false;
+        let timed_out_ptr = std::ptr::addr_of_mut!(timed_out);
+        let mut future = crate::profile::profile_setlimit(10_000);
+        let future_ptr = std::ptr::addr_of_mut!(future);
+        let _guard = NfaTimeoutGuard::install(future_ptr, timed_out_ptr);
+        assert!(!unsafe { nfa_did_time_out() });
+        assert!(!unsafe { *timed_out_ptr });
+
+        let mut past = 1;
+        let past_ptr = std::ptr::addr_of_mut!(past);
+        unsafe { *NFA_TIME_LIMIT.get_mut() = past_ptr };
+        assert!(unsafe { nfa_did_time_out() });
+        assert!(unsafe { *timed_out_ptr });
+
+        unsafe { *NFA_TIME_LIMIT.get_mut() = std::ptr::null_mut() };
+        unsafe { *timed_out_ptr = false };
+        assert!(!unsafe { nfa_did_time_out() });
+        assert!(!unsafe { *timed_out_ptr });
     }
 }
