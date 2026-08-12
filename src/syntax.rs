@@ -41,6 +41,18 @@ pub unsafe fn syn_set_timeout(tm: *mut crate::types_defs::ProftimeT) {
     unsafe { *SYN_TM.get_mut() = tm };
 }
 
+/// Mark the current syntax stack valid (`validate_current_state`).
+///
+/// The original also sets grow size 3; `Vec` grows automatically.
+///
+/// # Safety
+/// Must not run concurrently with another syntax-state operation.
+#[allow(dead_code)]
+unsafe fn validate_current_state() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *CURRENT_STATE_VALID.get_mut() = true };
+}
+
 /// Configure completion for `:match`/`:echohl`
 /// (`set_context_in_echohl_cmd`).
 ///
@@ -82,13 +94,13 @@ static CURRENT_SUB_CHAR: crate::globals::GlobalCell<i32> = crate::globals::Globa
 /// `current_state` - the stack of syntax items in force at the current
 /// position, innermost last.
 ///
-/// The original is a `garray_T` whose `ga_itemsize` doubles as a
-/// validity sentinel for `invalidate_current_state`. A `Vec` has no
-/// counterpart for that, so the flag will be added explicitly once the
-/// functions that read it are translated and its uses are visible; for
-/// now this is just the stack itself.
+/// The original is a `garray_T`; [`CURRENT_STATE_VALID`] separately
+/// models its `ga_itemsize` validity sentinel.
 static CURRENT_STATE: crate::globals::GlobalCell<Vec<StateItemT>> =
     crate::globals::GlobalCell::new(Vec::new());
+/// Whether `CURRENT_STATE` is valid (`current_state.ga_itemsize != 0`).
+static CURRENT_STATE_VALID: crate::globals::GlobalCell<bool> =
+    crate::globals::GlobalCell::new(false);
 
 /// Deep-clear the current syntax stack (`clear_current_state`).
 ///
@@ -1383,6 +1395,14 @@ mod tests {
         assert!(unsafe { CURRENT_STATE.get_mut() }.is_empty());
     }
 
+    #[test]
+    fn validate_current_state_sets_the_explicit_validity_sentinel() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CurrentValidityGuard::set(false);
+        unsafe { validate_current_state() };
+        assert!(unsafe { *CURRENT_STATE_VALID.get_mut() });
+    }
+
     // ---- get_syntax_info / syn_get_sub_char ----
 
     /// Restores the syntax engine's current-position statics on drop.
@@ -1421,6 +1441,22 @@ mod tests {
     /// save and moved back on drop.
     struct CurrentStackGuard {
         saved: Vec<StateItemT>,
+    }
+
+    struct CurrentValidityGuard(bool);
+
+    impl CurrentValidityGuard {
+        fn set(value: bool) -> Self {
+            let saved = unsafe { *CURRENT_STATE_VALID.get_mut() };
+            unsafe { *CURRENT_STATE_VALID.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for CurrentValidityGuard {
+        fn drop(&mut self) {
+            unsafe { *CURRENT_STATE_VALID.get_mut() = self.0 };
+        }
     }
 
     impl CurrentStackGuard {
