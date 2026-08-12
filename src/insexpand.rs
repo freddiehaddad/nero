@@ -115,6 +115,8 @@
 //! [`ins_compl_autocomplete_pending`]/
 //! [`ins_compl_autocomplete_elapsed`] and their pending/start-time
 //! state.
+//! [`ins_compl_enable_autocomplete`] performs the corresponding
+//! autocomplete-mode transition.
 //!
 //! Deferred: everything else in the file.
 
@@ -905,6 +907,18 @@ static COMPL_AUTOCOMPLETE: GlobalCell<bool> = GlobalCell::new(false);
 static COMPL_AUTOCOMPLETE_PENDING: GlobalCell<bool> = GlobalCell::new(false);
 /// Nanosecond timestamp at which the delay was armed.
 static COMPL_AUTOCOMPLETE_START_TV: GlobalCell<u64> = GlobalCell::new(0);
+
+/// Enable autocompletion (`ins_compl_enable_autocomplete`).
+///
+/// # Safety
+/// Must not run concurrently with other completion-state operations.
+pub unsafe fn ins_compl_enable_autocomplete() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe {
+        *COMPL_AUTOCOMPLETE.get_mut() = true;
+        *COMPL_GET_LONGEST.get_mut() = false;
+    }
+}
 
 /// Arm the `'autocompletedelay'` timer when a delay is configured
 /// (`ins_compl_arm_autocomplete_delay`).
@@ -1718,6 +1732,34 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    struct AutocompleteModeGuard {
+        prev_autocomplete: bool,
+        prev_longest: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AutocompleteModeGuard {
+        fn set(autocomplete: bool, longest: bool) -> Self {
+            let _lock = global_state_test_lock();
+            let prev_autocomplete = unsafe { *COMPL_AUTOCOMPLETE.get_mut() };
+            let prev_longest = unsafe { *COMPL_GET_LONGEST.get_mut() };
+            unsafe {
+                *COMPL_AUTOCOMPLETE.get_mut() = autocomplete;
+                *COMPL_GET_LONGEST.get_mut() = longest;
+            }
+            Self { prev_autocomplete, prev_longest, _lock }
+        }
+    }
+
+    impl Drop for AutocompleteModeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *COMPL_AUTOCOMPLETE.get_mut() = self.prev_autocomplete;
+                *COMPL_GET_LONGEST.get_mut() = self.prev_longest;
+            }
+        }
+    }
+
     impl ComplWindowGuard {
         fn set(win: *mut crate::buffer_defs::WinT, buf: *mut crate::buffer_defs::BufT) -> Self {
             let _lock = global_state_test_lock();
@@ -1806,6 +1848,14 @@ mod tests {
         let start = unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() };
         assert!(unsafe { *COMPL_AUTOCOMPLETE_PENDING.get_mut() });
         assert!((before..=after).contains(&start));
+    }
+
+    #[test]
+    fn enable_autocomplete_sets_mode_and_clears_get_longest() {
+        let _guard = AutocompleteModeGuard::set(false, true);
+        unsafe { ins_compl_enable_autocomplete() };
+        assert!(unsafe { *COMPL_AUTOCOMPLETE.get_mut() });
+        assert!(!unsafe { *COMPL_GET_LONGEST.get_mut() });
     }
 
     #[test]
