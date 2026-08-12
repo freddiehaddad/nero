@@ -6648,6 +6648,26 @@ pub fn get_option_flags(opt_idx: OptIndex) -> u32 {
     if opt_idx == OptIndex::Invalid { 0 } else { get_option(opt_idx).flags }
 }
 
+/// Process the new `'window'` option value (`did_set_window`).
+///
+/// Values outside the usable screen range are reset to one less than
+/// the current row count, exactly as the original does.
+///
+/// # Safety
+/// Reads `GLOBALS.Rows` and mutates `OPTION_VARS.p_window`.
+pub unsafe fn did_set_window(
+    _args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from this function's own safety doc.
+    let rows = unsafe { crate::globals::GLOBALS.get_mut() }.Rows;
+    // SAFETY: forwarded from this function's own safety doc.
+    let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+    if opts.p_window < 1 || opts.p_window >= i64::from(rows) {
+        opts.p_window = i64::from(rows - 1);
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7252,6 +7272,25 @@ pub fn did_set_title() {
 #[cfg(test)]
 mod did_set_title_tests {
     use super::*;
+
+    struct PWindowGuard(crate::types_defs::OptInt);
+
+    impl PWindowGuard {
+        unsafe fn set(value: crate::types_defs::OptInt) -> Self {
+            // SAFETY: forwarded from this helper's own contract.
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.p_window;
+            opts.p_window = value;
+            Self(saved)
+        }
+    }
+
+    impl Drop for PWindowGuard {
+        fn drop(&mut self) {
+            // SAFETY: every caller holds `global_state_test_lock`.
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = self.0;
+        }
+    }
     use std::ffi::c_void;
 
     /// Builds an `OptsetT` pointing at `win`, matching the fixture
@@ -7317,6 +7356,26 @@ mod did_set_title_tests {
             get_option_flags(OptIndex::Path) & crate::option_defs::opt_flags::COMMA,
             0
         );
+    }
+
+    #[test]
+    fn did_set_window_clamps_values_outside_the_screen_range() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _rows =
+            unsafe { crate::globals::GlobalFieldGuard::install(|g| &mut g.Rows, 24) };
+        let _window = unsafe { PWindowGuard::set(0) };
+        let mut args = crate::option_defs::OptsetT::default();
+
+        assert_eq!(unsafe { did_set_window(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window, 23);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = 12;
+        assert_eq!(unsafe { did_set_window(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window, 12);
+
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = 24;
+        assert_eq!(unsafe { did_set_window(&mut args) }, None);
+        assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window, 23);
     }
 
     #[test]
