@@ -71,7 +71,8 @@
 //! Also translated: the completion-state accessors
 //! [`ins_compl_used_match`]/[`ins_compl_init_get_longest`]/
 //! [`ins_compl_interrupted`]/[`ins_compl_enter_selects`]/
-//! [`ins_compl_col`]/[`ins_compl_len`] and their backing statics.
+//! [`ins_compl_col`]/[`ins_compl_len`]/[`ins_compl_win_active`] and
+//! their backing statics.
 //! Note `ins_compl_interrupted` is an OR of two separate conditions -
 //! an explicit interruption AND the current source running out of its
 //! time budget - so it is not a plain accessor.
@@ -425,6 +426,12 @@ static CTRL_X_MODE: GlobalCell<i32> = GlobalCell::new(CTRL_X_NORMAL);
 /// completion-source dispatch machinery, isn't translated), matching
 /// [`CTRL_X_MODE`]'s own established treatment exactly.
 static COMPL_STARTED: GlobalCell<bool> = GlobalCell::new(false);
+/// Window in which completion is currently running (`compl_curr_win`).
+static COMPL_CURR_WIN: GlobalCell<*mut crate::buffer_defs::WinT> =
+    GlobalCell::new(std::ptr::null_mut());
+/// Buffer in which completion is currently running (`compl_curr_buf`).
+static COMPL_CURR_BUF: GlobalCell<*mut crate::buffer_defs::BufT> =
+    GlobalCell::new(std::ptr::null_mut());
 
 /// Whether one of the matches was selected, rather than the text
 /// being edited or the longest common string used (`compl_used_match`).
@@ -1129,6 +1136,21 @@ pub unsafe fn ins_compl_active() -> bool {
     unsafe { *COMPL_STARTED.get_mut() }
 }
 
+/// Whether `wp` is the actual active completion window
+/// (`ins_compl_win_active`).
+///
+/// # Safety
+/// When completion is active, `wp` must point to a live window.
+#[must_use]
+pub unsafe fn ins_compl_win_active(wp: *mut crate::buffer_defs::WinT) -> bool {
+    // SAFETY: forwarded from this function's own safety doc.
+    (unsafe { ins_compl_active() })
+        // SAFETY: completion is active, so the pointers are live by
+        // this function's contract.
+        && wp == unsafe { *COMPL_CURR_WIN.get_mut() }
+        && unsafe { (*wp).w_buffer == *COMPL_CURR_BUF.get_mut() }
+}
+
 /// # Safety
 /// Single-threaded test/editor state, matching every other
 /// `GlobalCell`-backed file-static in this crate.
@@ -1615,6 +1637,38 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
+    struct ComplWindowGuard {
+        prev_started: bool,
+        prev_win: *mut crate::buffer_defs::WinT,
+        prev_buf: *mut crate::buffer_defs::BufT,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ComplWindowGuard {
+        fn set(win: *mut crate::buffer_defs::WinT, buf: *mut crate::buffer_defs::BufT) -> Self {
+            let _lock = global_state_test_lock();
+            let prev_started = unsafe { *COMPL_STARTED.get_mut() };
+            let prev_win = unsafe { *COMPL_CURR_WIN.get_mut() };
+            let prev_buf = unsafe { *COMPL_CURR_BUF.get_mut() };
+            unsafe {
+                *COMPL_STARTED.get_mut() = true;
+                *COMPL_CURR_WIN.get_mut() = win;
+                *COMPL_CURR_BUF.get_mut() = buf;
+            }
+            Self { prev_started, prev_win, prev_buf, _lock }
+        }
+    }
+
+    impl Drop for ComplWindowGuard {
+        fn drop(&mut self) {
+            unsafe {
+                *COMPL_STARTED.get_mut() = self.prev_started;
+                *COMPL_CURR_WIN.get_mut() = self.prev_win;
+                *COMPL_CURR_BUF.get_mut() = self.prev_buf;
+            }
+        }
+    }
+
     impl AutocompleteDelayGuard {
         fn set(delay: crate::types_defs::OptInt) -> Self {
             let _lock = global_state_test_lock();
@@ -1708,6 +1762,35 @@ mod tests {
         let now = crate::os::time::os_hrtime();
         unsafe { *COMPL_AUTOCOMPLETE_START_TV.get_mut() = now.wrapping_sub(7_000_000) };
         assert!(unsafe { ins_compl_autocomplete_elapsed() } >= 7);
+    }
+
+    #[test]
+    fn ins_compl_win_active_requires_the_active_window_and_buffer() {
+        let mut buf = crate::buffer_defs::BufT::default();
+        let buf_ptr = std::ptr::addr_of_mut!(buf);
+        let mut win = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut other = crate::buffer_defs::WinT {
+            w_buffer: buf_ptr,
+            ..Default::default()
+        };
+        let other_ptr = std::ptr::addr_of_mut!(other);
+        let _guard = ComplWindowGuard::set(win_ptr, buf_ptr);
+
+        assert!(unsafe { ins_compl_win_active(win_ptr) });
+        assert!(!unsafe { ins_compl_win_active(other_ptr) });
+
+        let mut other_buf = crate::buffer_defs::BufT::default();
+        let other_buf_ptr = std::ptr::addr_of_mut!(other_buf);
+        unsafe { (*win_ptr).w_buffer = other_buf_ptr };
+        assert!(!unsafe { ins_compl_win_active(win_ptr) });
+        unsafe { (*win_ptr).w_buffer = buf_ptr };
+
+        unsafe { *COMPL_STARTED.get_mut() = false };
+        assert!(!unsafe { ins_compl_win_active(win_ptr) });
     }
 
     /// Installs a buffer as `curbuf` for the test's duration and
