@@ -8,8 +8,8 @@
 //! `profile_sub_wait`/`profile_equal`/`profile_signed`/`profile_cmp`.
 //!
 //! Per-function/per-script profiling remains mostly deferred, but
-//! [`func_line_exec`]/[`script_line_exec`] are now translated because
-//! their function/script records have real fields.
+//! [`func_line_exec`]/[`func_line_end`]/[`script_line_exec`] are now
+//! translated because their function/script records have real fields.
 //! [`script_prof_save`]/[`script_prof_restore`] record nested-child
 //! timing state, and [`prof_child_enter`]/[`prof_child_exit`] perform
 //! the paired function/script child measurement.
@@ -120,6 +120,30 @@ pub unsafe fn func_line_exec(cookie: *mut std::ffi::c_void) {
     if unsafe { (*fp).uf_profiling != 0 && (*fp).uf_tml_idx >= 0 } {
         // SAFETY: forwarded from this function's own safety doc.
         unsafe { (*fp).uf_tml_execed = 1 };
+    }
+}
+
+/// Finish profiling the current function line (`func_line_end`).
+///
+/// # Safety
+/// `cookie` must point to a live `FunccallT` whose `fc_func` and
+/// timing vectors are valid for `uf_tml_idx`.
+pub unsafe fn func_line_end(cookie: *mut std::ffi::c_void) {
+    let fcp = cookie.cast::<crate::eval::typval_defs::FunccallT>();
+    // SAFETY: forwarded from this function's own safety doc.
+    let fp = unsafe { &mut *(*fcp).fc_func };
+    if fp.uf_profiling != 0 && fp.uf_tml_idx >= 0 {
+        let idx = fp.uf_tml_idx as usize;
+        if fp.uf_tml_execed != 0 {
+            fp.uf_tml_count[idx] += 1;
+            let elapsed = profile_end(fp.uf_tml_start);
+            let elapsed = profile_sub_wait(fp.uf_tml_wait, elapsed);
+            fp.uf_tml_start = elapsed;
+            fp.uf_tml_total[idx] = profile_add(fp.uf_tml_total[idx], elapsed);
+            fp.uf_tml_self[idx] =
+                profile_self(fp.uf_tml_self[idx], elapsed, fp.uf_tml_children);
+        }
+        fp.uf_tml_idx = -1;
     }
 }
 
@@ -526,6 +550,40 @@ mod tests {
         }
         unsafe { func_line_exec(call_ptr.cast()) };
         assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+    }
+
+    #[test]
+    fn func_line_end_accumulates_an_executed_line_and_clears_the_index() {
+        let mut func = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 1,
+            uf_tml_count: vec![0],
+            uf_tml_total: vec![0],
+            uf_tml_self: vec![0],
+            uf_tml_start: profile_start().wrapping_sub(1_000_000),
+            uf_tml_children: 100,
+            uf_tml_wait: profile_get_wait(),
+            uf_tml_idx: 0,
+            uf_tml_execed: 1,
+            ..Default::default()
+        };
+        let func_ptr = std::ptr::addr_of_mut!(func);
+        let mut call = crate::eval::typval_defs::FunccallT {
+            fc_func: func_ptr,
+            ..Default::default()
+        };
+        let call_ptr = std::ptr::addr_of_mut!(call);
+
+        unsafe { func_line_end(call_ptr.cast()) };
+
+        assert_eq!(unsafe { (*func_ptr).uf_tml_idx }, -1);
+        assert_eq!(unsafe { &(*func_ptr).uf_tml_count }, &[1]);
+        let elapsed = unsafe { (*func_ptr).uf_tml_start };
+        assert!(elapsed > 0);
+        assert_eq!(unsafe { (&(*func_ptr).uf_tml_total)[0] }, elapsed);
+        assert_eq!(
+            unsafe { (&(*func_ptr).uf_tml_self)[0] },
+            profile_self(0, elapsed, 100)
+        );
     }
 
     #[test]
