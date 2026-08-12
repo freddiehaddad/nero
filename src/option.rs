@@ -930,6 +930,24 @@ pub unsafe fn set_option_sctx(opt_idx: OptIndex, opt_flags: u32, mut script_ctx:
     }
 }
 
+/// Record the current script context for a sentinel-terminated option
+/// list (`didset_options_sctx`).
+///
+/// # Safety
+/// Mutates option script-context state and reads `GLOBALS.current_sctx`.
+#[allow(dead_code)]
+unsafe fn didset_options_sctx(opt_flags: u32, options: &[OptIndex]) {
+    // SAFETY: forwarded from this function's own safety doc.
+    let current = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx;
+    for &option in options {
+        if option == OptIndex::Invalid {
+            break;
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { set_option_sctx(option, opt_flags, current) };
+    }
+}
+
 /// Get a raw pointer to `OPTIONS`'s element at `opt_idx`. Built on
 /// `GlobalCell::as_ptr()` (never `.get_mut()`), matching
 /// `eval/vars.rs`'s `vimvar_ptr`/`vimvar_ptr_at` precedent exactly:
@@ -5919,6 +5937,56 @@ mod set_option_sctx_tests {
         let _lock = crate::globals::global_state_test_lock();
         reset_script_ctx(OptIndex::Ignorecase);
         assert_eq!(option_script_ctx(OptIndex::Ignorecase), SctxT::default());
+    }
+
+    #[test]
+    fn didset_options_sctx_stops_at_invalid_and_uses_current_context() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _ignore = OptionScriptCtxGuard::install(
+            OptIndex::Ignorecase,
+            crate::eval::typval_defs::SctxT {
+                sc_sid: 11,
+                ..Default::default()
+            },
+        );
+        let _magic = OptionScriptCtxGuard::install(
+            OptIndex::Magic,
+            crate::eval::typval_defs::SctxT {
+                sc_sid: 22,
+                ..Default::default()
+            },
+        );
+        let _history = OptionScriptCtxGuard::install(
+            OptIndex::History,
+            crate::eval::typval_defs::SctxT {
+                sc_sid: 33,
+                ..Default::default()
+            },
+        );
+        let current = crate::eval::typval_defs::SctxT {
+            sc_sid: 77,
+            sc_lnum: 5,
+            ..Default::default()
+        };
+        let _current = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.current_sctx, current)
+        };
+
+        unsafe {
+            didset_options_sctx(
+                crate::option_defs::opt_set_flags::OPT_GLOBAL,
+                &[
+                    OptIndex::Ignorecase,
+                    OptIndex::Magic,
+                    OptIndex::Invalid,
+                    OptIndex::History,
+                ],
+            )
+        };
+
+        assert_eq!(option_script_ctx(OptIndex::Ignorecase).sc_sid, 77);
+        assert_eq!(option_script_ctx(OptIndex::Magic).sc_sid, 77);
+        assert_eq!(option_script_ctx(OptIndex::History).sc_sid, 33);
     }
 
     #[test]
