@@ -6724,6 +6724,40 @@ pub unsafe fn did_set_number_relativenumber(
     None
 }
 
+const E_PREVIEW_WINDOW_ALREADY_EXISTS: &[u8] = b"E590: A preview window already exists";
+
+/// Process the updated `'previewwindow'` option value
+/// (`did_set_previewwindow`).
+///
+/// # Safety
+/// `args.os_win` must point to a live window, and
+/// `GLOBALS.firstwin`'s `w_next` chain must contain live windows.
+pub unsafe fn did_set_previewwindow(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let win = args.os_win as *mut crate::buffer_defs::WinT;
+    // SAFETY: forwarded from this function's own safety doc.
+    if unsafe { (*win).w_onebuf_opt.wo_pvw } == 0 {
+        return None;
+    }
+
+    // `FOR_ALL_WINDOWS_IN_TAB(wp, curtab)` starts at `firstwin` for
+    // this exact call, as established elsewhere in this crate.
+    // SAFETY: forwarded from this function's own safety doc.
+    let mut wp = unsafe { crate::globals::GLOBALS.get_mut() }.firstwin;
+    while !wp.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        if unsafe { (*wp).w_onebuf_opt.wo_pvw } != 0 && wp != win {
+            // SAFETY: forwarded from this function's own safety doc.
+            unsafe { (*win).w_onebuf_opt.wo_pvw = 0 };
+            return Some(E_PREVIEW_WINDOW_ALREADY_EXISTS);
+        }
+        // SAFETY: forwarded from this function's own safety doc.
+        wp = unsafe { (*wp).w_next };
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7505,6 +7539,73 @@ mod did_set_title_tests {
             unsafe { (*win_ptr).w_maxscwidth },
             crate::option_vars::SCL_NO
         );
+    }
+
+    #[test]
+    fn did_set_previewwindow_rejects_a_second_preview_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut first = crate::buffer_defs::WinT::default();
+        let first_ptr = std::ptr::addr_of_mut!(first);
+        let mut target = crate::buffer_defs::WinT::default();
+        let target_ptr = std::ptr::addr_of_mut!(target);
+        unsafe {
+            (*first_ptr).w_onebuf_opt.wo_pvw = 1;
+            (*first_ptr).w_next = target_ptr;
+            (*target_ptr).w_onebuf_opt.wo_pvw = 1;
+        }
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, first_ptr)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_win: target_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            unsafe { did_set_previewwindow(&mut args) },
+            Some(E_PREVIEW_WINDOW_ALREADY_EXISTS)
+        );
+        assert_eq!(unsafe { (*target_ptr).w_onebuf_opt.wo_pvw }, 0);
+        assert_eq!(unsafe { (*first_ptr).w_onebuf_opt.wo_pvw }, 1);
+    }
+
+    #[test]
+    fn did_set_previewwindow_accepts_the_only_preview_window() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut win = crate::buffer_defs::WinT::default();
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        unsafe { (*win_ptr).w_onebuf_opt.wo_pvw = 1 };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, win_ptr)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_previewwindow(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_pvw }, 1);
+    }
+
+    #[test]
+    fn did_set_previewwindow_is_a_noop_when_disabling_the_option() {
+        let _lock = crate::globals::global_state_test_lock();
+        let mut existing = crate::buffer_defs::WinT::default();
+        let existing_ptr = std::ptr::addr_of_mut!(existing);
+        unsafe { (*existing_ptr).w_onebuf_opt.wo_pvw = 1 };
+        let mut target = crate::buffer_defs::WinT::default();
+        let target_ptr = std::ptr::addr_of_mut!(target);
+        unsafe { (*existing_ptr).w_next = target_ptr };
+        let _firstwin = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.firstwin, existing_ptr)
+        };
+        let mut args = crate::option_defs::OptsetT {
+            os_win: target_ptr.cast(),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_previewwindow(&mut args) }, None);
+        assert_eq!(unsafe { (*existing_ptr).w_onebuf_opt.wo_pvw }, 1);
     }
 
     #[test]
