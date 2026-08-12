@@ -12,7 +12,7 @@
 //!   `has_non_ascii_len`, `concat_str`; and now that `mbyte.c`'s
 //!   `mb_toupper`/`mb_tolower`/`utf_ptr2char_info`/`utf_char2bytes` all
 //!   exist: `vim_strup`, `vim_strsave_up`, `vim_strcpy_up`,
-//!   `vim_strncpy_up`, `vim_memcpy_up`,
+//!   `vim_strnsave_up`, `vim_strncpy_up`, `vim_memcpy_up`,
 //!   `mb_strup_buf`, `strcase_save`; `vim_strchr` (re-examined:
 //!   an earlier note claimed this needed `charset.c`'s real `g_chartab`/
 //!   `option.c`, but re-reading the actual body shows it only needs
@@ -436,6 +436,21 @@ pub fn vim_memcpy_up(
 pub fn vim_strsave_up(string: &[u8]) -> Vec<u8> {
     let end = string.iter().position(|&b| b == NUL).unwrap_or(string.len());
     let mut result = string[..end].to_vec();
+    vim_strup(&mut result);
+    result.push(NUL);
+    result
+}
+
+/// Allocate an uppercase copy of at most `count` source bytes and
+/// NUL-terminate it (`vim_strnsave_up`).
+#[must_use]
+pub fn vim_strnsave_up(source: &[u8], count: usize) -> Vec<u8> {
+    let length = source
+        .iter()
+        .take(count)
+        .position(|&byte| byte == NUL)
+        .unwrap_or(source.len().min(count));
+    let mut result = source[..length].to_vec();
     vim_strup(&mut result);
     result.push(NUL);
     result
@@ -963,6 +978,14 @@ mod tests {
         // past the first NUL isn't part of the "real" string at all,
         // so the result is truncated there (not just left unmodified).
         assert_eq!(vim_strsave_up(b"ab\0cd"), b"AB\0");
+    }
+
+    #[test]
+    fn vim_strnsave_up_stops_at_count_or_nul_and_terminates() {
+        assert_eq!(vim_strnsave_up(b"abcdef", 3), b"ABC\0");
+        assert_eq!(vim_strnsave_up(b"ab\0cd", 5), b"AB\0");
+        assert_eq!(vim_strnsave_up(b"abc", 99), b"ABC\0");
+        assert_eq!(vim_strnsave_up(b"abc", 0), b"\0");
     }
 
     #[test]
