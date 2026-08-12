@@ -1120,13 +1120,13 @@ pub fn qf_free_list_stack_items(qi: &mut crate::types_defs::QfInfoT) {
     for qfl in &mut qi.qf_lists[..live] {
         qf_free(qfl);
     }
+}
 
-    pub fn qf_free_lists(qi: &mut crate::types_defs::QfInfoT) {
-        qf_free_list_stack_items(qi);
-        qi.qf_lists.clear();
-        qi.qf_listcount = 0;
-        qi.qf_curlist = 0;
-    }
+pub fn qf_free_lists(qi: &mut crate::types_defs::QfInfoT) {
+    qf_free_list_stack_items(qi);
+    qi.qf_lists.clear();
+    qi.qf_listcount = 0;
+    qi.qf_curlist = 0;
 }
 
 /// Build a new quickfix/location list stack holding up to `n` lists
@@ -4906,6 +4906,16 @@ mod tests {
         assert_eq!(lists.len(), 3);
         assert!(lists.iter().all(|list| list.qf_count() == 0));
         assert!(qf_alloc_list_stack(-1).is_empty());
+    }
+
+    #[test]
+    fn qf_free_lists_clears_the_stack_storage_and_counts() {
+        let mut qi = stack_with(2);
+        qi.qf_listcount = 2;
+        qf_free_lists(&mut qi);
+        assert!(qi.qf_lists.is_empty());
+        assert_eq!(qi.qf_listcount, 0);
+        assert_eq!(qi.qf_curlist, 0);
     }
 
     #[test]
