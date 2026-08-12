@@ -17,6 +17,8 @@
 //! precedent (e.g. `drawline.rs`'s `get_lcs_ext`).
 //! [`syn_set_timeout`] also translates the syntax engine's timeout
 //! pointer setter independently of the recognition engine.
+//! [`set_context_in_echohl_cmd`] configures command-line completion
+//! for `:echohl`/`:match`.
 //!
 //! Deferred: everything else in the file.
 
@@ -25,6 +27,8 @@ use crate::pos_defs::LposT;
 /// Syntax-recognition timeout (`syn_tm`); null means no timeout.
 static SYN_TM: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
     crate::globals::GlobalCell::new(std::ptr::null_mut());
+/// Include `"None"` in highlight-name completion (`include_none`).
+static INCLUDE_NONE: crate::globals::GlobalCell<i32> = crate::globals::GlobalCell::new(0);
 
 /// Set or clear the syntax-recognition timeout (`syn_set_timeout`).
 ///
@@ -34,6 +38,21 @@ static SYN_TM: crate::globals::GlobalCell<*mut crate::types_defs::ProftimeT> =
 pub unsafe fn syn_set_timeout(tm: *mut crate::types_defs::ProftimeT) {
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { *SYN_TM.get_mut() = tm };
+}
+
+/// Configure completion for `:match`/`:echohl`
+/// (`set_context_in_echohl_cmd`).
+///
+/// # Safety
+/// Must not run concurrently with another syntax-completion update.
+pub unsafe fn set_context_in_echohl_cmd(
+    xp: &mut crate::cmdexpand_defs::ExpandT,
+    arg: &[u8],
+) {
+    xp.xp_context = crate::cmdexpand_defs::ExpandContext::Highlight;
+    xp.xp_pattern = Some(arg.to_vec());
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *INCLUDE_NONE.get_mut() = 1 };
 }
 
 /// `syn_buf` - the buffer the syntax engine is currently highlighting.
@@ -1186,6 +1205,20 @@ mod tests {
         }
     }
 
+    struct IncludeNoneGuard(i32);
+
+    impl IncludeNoneGuard {
+        fn capture() -> Self {
+            Self(unsafe { *INCLUDE_NONE.get_mut() })
+        }
+    }
+
+    impl Drop for IncludeNoneGuard {
+        fn drop(&mut self) {
+            unsafe { *INCLUDE_NONE.get_mut() = self.0 };
+        }
+    }
+
     impl Drop for SynTimeoutGuard {
         fn drop(&mut self) {
             unsafe { *SYN_TM.get_mut() = self.0 };
@@ -1205,6 +1238,24 @@ mod tests {
         unsafe { syn_set_timeout(std::ptr::null_mut()) };
         assert!(unsafe { *SYN_TM.get_mut() }.is_null());
     }
+
+    #[test]
+    fn set_context_in_echohl_cmd_selects_highlight_completion_and_none() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = IncludeNoneGuard::capture();
+        unsafe { *INCLUDE_NONE.get_mut() = 0 };
+        let mut xp = crate::cmdexpand_defs::ExpandT::default();
+
+        unsafe { set_context_in_echohl_cmd(&mut xp, b"Err") };
+
+        assert_eq!(
+            xp.xp_context,
+            crate::cmdexpand_defs::ExpandContext::Highlight
+        );
+        assert_eq!(xp.xp_pattern.as_deref(), Some(b"Err".as_slice()));
+        assert_eq!(unsafe { *INCLUDE_NONE.get_mut() }, 1);
+    }
+
 
     // ---- syn_getcurline / syn_getcurline_len ----
 
