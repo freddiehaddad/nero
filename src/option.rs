@@ -6668,6 +6668,35 @@ pub unsafe fn did_set_window(
     None
 }
 
+/// Process the new `'winblend'` option value (`did_set_winblend`).
+///
+/// A real value change clamps the window-local setting into `0..=100`,
+/// invalidates its highlights, and recomputes grid blending.
+///
+/// # Safety
+/// `args.os_win` must be a valid, non-null pointer to a live `WinT`.
+pub unsafe fn did_set_winblend(
+    args: &mut crate::option_defs::OptsetT,
+) -> Option<&'static [u8]> {
+    let (old_value, value) = match (&args.os_oldval, &args.os_newval) {
+        (
+            crate::option_defs::OptVal::Number(old_value),
+            crate::option_defs::OptVal::Number(value),
+        ) => (*old_value, *value),
+        _ => return None,
+    };
+    if value != old_value {
+        let win = args.os_win as *mut crate::buffer_defs::WinT;
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe {
+            (*win).w_onebuf_opt.wo_winbl = (*win).w_onebuf_opt.wo_winbl.clamp(0, 100);
+            (*win).w_hl_needs_update = 1;
+            check_blending(&mut *win);
+        }
+    }
+    None
+}
+
 /// Process the new global `'undolevels'` option value
 /// (`did_set_global_undolevels`).
 ///
@@ -7376,6 +7405,37 @@ mod did_set_title_tests {
         unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window = 24;
         assert_eq!(unsafe { did_set_window(&mut args) }, None);
         assert_eq!(unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_window, 23);
+    }
+
+    #[test]
+    fn did_set_winblend_clamps_and_invalidates_only_when_the_value_changes() {
+        let mut win = crate::buffer_defs::WinT::default();
+        win.w_onebuf_opt.wo_winbl = 150;
+        let win_ptr = std::ptr::addr_of_mut!(win);
+        let mut args = crate::option_defs::OptsetT {
+            os_win: win_ptr.cast(),
+            os_oldval: crate::option_defs::OptVal::Number(20),
+            os_newval: crate::option_defs::OptVal::Number(20),
+            ..Default::default()
+        };
+
+        assert_eq!(unsafe { did_set_winblend(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_winbl }, 150);
+        assert_eq!(unsafe { (*win_ptr).w_hl_needs_update }, 0);
+        assert!(!unsafe { (*win_ptr).w_grid_alloc.blending });
+
+        args.os_newval = crate::option_defs::OptVal::Number(150);
+        assert_eq!(unsafe { did_set_winblend(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_winbl }, 100);
+        assert_eq!(unsafe { (*win_ptr).w_hl_needs_update }, 1);
+        assert!(unsafe { (*win_ptr).w_grid_alloc.blending });
+
+        unsafe { (*win_ptr).w_onebuf_opt.wo_winbl = -7 };
+        args.os_oldval = crate::option_defs::OptVal::Number(150);
+        args.os_newval = crate::option_defs::OptVal::Number(-7);
+        assert_eq!(unsafe { did_set_winblend(&mut args) }, None);
+        assert_eq!(unsafe { (*win_ptr).w_onebuf_opt.wo_winbl }, 0);
+        assert!(!unsafe { (*win_ptr).w_grid_alloc.blending });
     }
 
     #[test]
