@@ -66,6 +66,20 @@ fn make_extmatch() -> *mut crate::types_defs::RegExtmatchT {
     }))
 }
 
+/// Add a reference to an external-submatch block (`ref_extmatch`).
+///
+/// # Safety
+/// A non-null `em` must point to a live `RegExtmatchT`.
+pub unsafe fn ref_extmatch(
+    em: *mut crate::types_defs::RegExtmatchT,
+) -> *mut crate::types_defs::RegExtmatchT {
+    if !em.is_null() {
+        // SAFETY: forwarded from this function's own safety doc.
+        unsafe { (*em).refcnt = (*em).refcnt.wrapping_add(1) };
+    }
+    em
+}
+
 /// Whether NFA matching exceeded its configured deadline
 /// (`nfa_did_time_out`).
 ///
@@ -324,6 +338,18 @@ mod tests {
         assert_eq!(unsafe { (*ext).refcnt }, 1);
         assert!(unsafe { &(*ext).matches }.iter().all(Option::is_none));
         // Constructor ownership is still held only by this test.
+        drop(unsafe { Box::from_raw(ext) });
+    }
+
+    #[test]
+    fn ref_extmatch_is_null_safe_and_increments_a_live_block() {
+        assert!(unsafe { ref_extmatch(std::ptr::null_mut()) }.is_null());
+
+        let ext = make_extmatch();
+        assert_eq!(unsafe { ref_extmatch(ext) }, ext);
+        assert_eq!(unsafe { (*ext).refcnt }, 2);
+        // The final unref helper lands separately; this test still owns
+        // the allocation directly.
         drop(unsafe { Box::from_raw(ext) });
     }
 }
