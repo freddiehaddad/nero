@@ -117,6 +117,33 @@ pub fn profile_init(script: &mut crate::runtime_defs::ScriptitemT) {
     script.sn_pr_nest = 0;
 }
 
+/// Start timing the current user-function line (`func_line_start`).
+///
+/// # Safety
+/// `cookie` must point to a live `FunccallT` whose `fc_func` points to
+/// a live `UfuncT`.
+pub unsafe fn func_line_start(cookie: *mut std::ffi::c_void) {
+    let call = cookie.cast::<crate::eval::typval_defs::FunccallT>();
+    // SAFETY: forwarded from this function's own safety doc.
+    let function = unsafe { &mut *(*call).fc_func };
+    let line = crate::runtime::sourcing_lnum();
+    if function.uf_profiling == 0
+        || line < 1
+        || line as usize > function.uf_lines.len()
+    {
+        return;
+    }
+    let mut index = (line - 1) as usize;
+    while index > 0 && function.uf_lines[index].is_none() {
+        index -= 1;
+    }
+    function.uf_tml_idx = index as i32;
+    function.uf_tml_execed = 0;
+    function.uf_tml_start = profile_start();
+    function.uf_tml_children = profile_zero();
+    function.uf_tml_wait = profile_get_wait();
+}
+
 /// Start timing the current source line (`script_line_start`).
 ///
 /// # Safety
@@ -640,6 +667,29 @@ mod tests {
         }
         unsafe { func_line_exec(call_ptr.cast()) };
         assert_eq!(unsafe { (*func_ptr).uf_tml_execed }, 0);
+    }
+
+    #[test]
+    fn func_line_start_skips_back_over_continuation_lines() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _stack = ProfileExestackGuard::line(2);
+        let mut function = crate::eval::typval_defs::UfuncT {
+            uf_profiling: 1,
+            uf_lines: vec![Some(b"first".to_vec()), None, Some(b"third".to_vec())],
+            ..Default::default()
+        };
+        let function_ptr = std::ptr::addr_of_mut!(function);
+        let mut call = crate::eval::typval_defs::FunccallT {
+            fc_func: function_ptr,
+            ..Default::default()
+        };
+
+        unsafe { func_line_start(std::ptr::addr_of_mut!(call).cast()) };
+
+        assert_eq!(function.uf_tml_idx, 0);
+        assert_eq!(function.uf_tml_execed, 0);
+        assert_eq!(function.uf_tml_children, 0);
+        assert_eq!(function.uf_tml_wait, profile_get_wait());
     }
 
     #[test]
