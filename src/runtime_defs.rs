@@ -30,11 +30,15 @@ use crate::types_defs::{AutoPatCmdT, ProftimeT};
 ///
 /// This initial representation carries the fields exposed by
 /// `source_breakpoint`/`source_dbg_tick`/`source_level` plus the
-/// current source line. File I/O, read-ahead and conversion fields
-/// remain with the deferred source-reader implementation.
+/// current source line and in-memory string/buffer source state. File
+/// I/O, read-ahead and conversion fields remain with the deferred
+/// source-reader implementation.
 #[derive(Debug, Default)]
 pub struct SourceCookieT {
     pub sourcing_lnum: LinenrT,
+    pub source_from_buf_or_str: bool,
+    pub buf_lnum: i32,
+    pub buflines: Vec<Vec<u8>>,
     pub breakpoint: LinenrT,
     pub dbg_tick: i32,
     pub level: i32,
@@ -190,6 +194,9 @@ mod tests {
     fn source_cookie_defaults_all_exposed_source_state_to_zero() {
         let cookie = SourceCookieT::default();
         assert_eq!(cookie.sourcing_lnum, 0);
+        assert!(!cookie.source_from_buf_or_str);
+        assert_eq!(cookie.buf_lnum, 0);
+        assert!(cookie.buflines.is_empty());
         assert_eq!(cookie.breakpoint, 0);
         assert_eq!(cookie.dbg_tick, 0);
         assert_eq!(cookie.level, 0);
