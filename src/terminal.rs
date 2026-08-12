@@ -12,7 +12,7 @@
 //! only [`crate::option_vars`]'s already-real `tpf_flags` and
 //! `opt_tpf_flag` constants, with no dependency on any terminal
 //! state at all; [`terminal_buf`] - the terminal's owning buffer
-//! handle.
+//! handle; [`terminal_running`] - whether the terminal is still open.
 //!
 //! Deferred: everything else - the terminal lifecycle
 //! (`terminal_open`/`terminal_close`/`terminal_destroy`), input and
@@ -26,6 +26,13 @@ use crate::types_defs::{HandleT, TerminalT};
 #[must_use]
 pub fn terminal_buf(term: &TerminalT) -> HandleT {
     term.buf_handle
+}
+
+/// Whether the terminal's child process is still running
+/// (`terminal_running`).
+#[must_use]
+pub fn terminal_running(term: &TerminalT) -> bool {
+    !term.closed
 }
 
 /// Whether character `c` should be filtered out of a terminal paste,
@@ -89,6 +96,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(terminal_buf(&term), 42);
+    }
+
+    #[test]
+    fn terminal_running_is_the_inverse_of_closed() {
+        let mut term = TerminalT::default();
+        assert!(terminal_running(&term));
+        term.closed = true;
+        assert!(!terminal_running(&term));
     }
 
     struct BackgroundGuard(Option<Vec<u8>>);
