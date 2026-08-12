@@ -14,6 +14,16 @@ unsafe fn do_upper(dst: &mut i32, c: i32) {
     *dst = unsafe { crate::mbyte::mb_toupper(c) };
 }
 
+/// Lowercase one replacement character (`do_lower`).
+///
+/// # Safety
+/// Forwarded from [`crate::mbyte::mb_tolower`].
+#[allow(dead_code)]
+unsafe fn do_lower(dst: &mut i32, c: i32) {
+    // SAFETY: forwarded from this function's own safety doc.
+    *dst = unsafe { crate::mbyte::mb_tolower(c) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +55,17 @@ mod tests {
 
         unsafe { do_upper(&mut dst, i32::from(b'!')) };
         assert_eq!(dst, i32::from(b'!'));
+    }
+
+    #[test]
+    fn do_lower_writes_the_ascii_lowercase_character() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = CasemapGuard::keep_ascii();
+        let mut dst = 0;
+        unsafe { do_lower(&mut dst, i32::from(b'Z')) };
+        assert_eq!(dst, i32::from(b'z'));
+
+        unsafe { do_lower(&mut dst, i32::from(b'?')) };
+        assert_eq!(dst, i32::from(b'?'));
     }
 }
