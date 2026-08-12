@@ -55,9 +55,51 @@ pub unsafe fn is_filter_char(c: i32) -> bool {
     (unsafe { crate::option_vars::OPTION_VARS.get_mut() }.tpf_flags & flag) != 0
 }
 
+/// Reports whether the current background theme is dark
+/// (`term_theme`) and returns the libvterm callback success value.
+///
+/// # Safety
+/// Reads `OPTION_VARS.p_bg`.
+#[must_use]
+pub unsafe fn term_theme() -> (bool, i32) {
+    let dark = unsafe { crate::option_vars::OPTION_VARS.get_mut() }
+        .p_bg
+        .as_deref()
+        .and_then(|value| value.first())
+        == Some(&b'd');
+    (dark, 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BackgroundGuard(Option<Vec<u8>>);
+
+    impl BackgroundGuard {
+        fn install(value: &[u8]) -> Self {
+            let opts = unsafe { crate::option_vars::OPTION_VARS.get_mut() };
+            let saved = opts.p_bg.replace(value.to_vec());
+            Self(saved)
+        }
+    }
+
+    impl Drop for BackgroundGuard {
+        fn drop(&mut self) {
+            unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bg =
+                self.0.take();
+        }
+    }
+
+    #[test]
+    fn term_theme_tracks_the_background_options_first_byte() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _g = BackgroundGuard::install(b"dark");
+        assert_eq!(unsafe { term_theme() }, (true, 1));
+        unsafe { crate::option_vars::OPTION_VARS.get_mut() }.p_bg =
+            Some(b"light".to_vec());
+        assert_eq!(unsafe { term_theme() }, (false, 1));
+    }
 
     /// Sets `'termpastefilter'`'s parsed flags, restoring the previous
     /// value on drop.
