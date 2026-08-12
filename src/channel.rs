@@ -16,6 +16,11 @@ pub struct ChannelT {
     pub did_close_event: bool,
 }
 
+/// Add one reference to a channel (`channel_incref`).
+pub fn channel_incref(channel: &mut ChannelT) {
+    channel.refcount = channel.refcount.wrapping_add(1);
+}
+
 /// Three-way comparison of channel IDs (`int64_t_cmp`).
 ///
 /// Written with comparisons rather than subtraction, so the full
@@ -65,5 +70,23 @@ mod tests {
         assert_eq!(channel.id, 42);
         assert_eq!(channel.refcount, 1);
         assert!(!channel.did_close_event);
+    }
+
+    #[test]
+    fn channel_incref_increments_only_the_reference_count() {
+        let mut channel = ChannelT {
+            id: 42,
+            refcount: 1,
+            did_close_event: false,
+        };
+        channel_incref(&mut channel);
+        assert_eq!(
+            channel,
+            ChannelT {
+                id: 42,
+                refcount: 2,
+                did_close_event: false,
+            }
+        );
     }
 }
