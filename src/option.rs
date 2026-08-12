@@ -1968,6 +1968,7 @@ pub unsafe fn get_varp_scope_from(opt_idx: OptIndex, opt_flags: u32, buf: *mut B
                         );
                         std::ptr::addr_of_mut!((*win).w_allbuf_opt.wo_wrap) as *mut c_void
                     }
+
                 }
             };
         }
@@ -2032,6 +2033,20 @@ pub unsafe fn get_varp_scope_from(opt_idx: OptIndex, opt_flags: u32, buf: *mut B
 
     // SAFETY: forwarded from this function's own safety doc.
     unsafe { get_varp_from(opt_idx, buf, win) }
+}
+
+/// Resolves an option variable by index and requested scope
+/// (`get_option_varp_scope_from`).
+///
+/// # Safety
+/// Same as [`get_varp_scope_from`].
+pub unsafe fn get_option_varp_scope_from(
+    opt_idx: OptIndex,
+    opt_flags: u32,
+    buf: *mut BufT,
+    win: *mut WinT,
+) -> *mut c_void {
+    unsafe { get_varp_scope_from(opt_idx, opt_flags, buf, win) }
 }
 
 /// Get pointer to option variable, depending on local or global scope,
@@ -5201,6 +5216,31 @@ mod optval_tests {
         let globals = unsafe { crate::globals::GLOBALS.get_mut() };
         globals.curbuf = prev_buf;
         globals.curwin = prev_win;
+    }
+
+    #[test]
+    fn get_option_varp_scope_from_matches_the_existing_resolver() {
+        let mut buf = BufT::default();
+        let mut win = WinT::default();
+        let flags = crate::option_defs::opt_set_flags::OPT_LOCAL;
+        assert_eq!(
+            unsafe {
+                get_option_varp_scope_from(
+                    OptIndex::Tabstop,
+                    flags,
+                    &mut buf,
+                    &mut win,
+                )
+            },
+            unsafe {
+                get_varp_scope_from(
+                    OptIndex::Tabstop,
+                    flags,
+                    &mut buf,
+                    &mut win,
+                )
+            }
+        );
     }
 
     #[test]
