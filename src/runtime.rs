@@ -582,6 +582,15 @@ pub(crate) fn tests_reset_for_test() {
     }
 }
 
+/// Test-only replacement for the execution stack, returning the prior
+/// contents so an RAII guard can restore them.
+#[cfg(test)]
+pub(crate) fn replace_exestack_for_test(
+    stack: Vec<crate::runtime_defs::EstackT>,
+) -> Vec<crate::runtime_defs::EstackT> {
+    std::mem::replace(unsafe { EXESTACK.get_mut() }, stack)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

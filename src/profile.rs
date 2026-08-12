@@ -117,6 +117,33 @@ pub fn profile_init(script: &mut crate::runtime_defs::ScriptitemT) {
     script.sn_pr_nest = 0;
 }
 
+/// Start timing the current source line (`script_line_start`).
+///
+/// # Safety
+/// Reads `GLOBALS.current_sctx` and mutates its live script item.
+pub unsafe fn script_line_start() {
+    // SAFETY: forwarded from this function's own safety doc.
+    let sid = unsafe { crate::globals::GLOBALS.get_mut() }.current_sctx.sc_sid;
+    if sid <= 0 || sid > crate::runtime::script_item_count() {
+        return;
+    }
+    let item = crate::runtime::script_item(sid);
+    let line = crate::runtime::sourcing_lnum();
+    // SAFETY: the script registry owns this live item.
+    if unsafe { (*item).sn_prof_on } && line >= 1 {
+        let index = (line - 1) as usize;
+        // SAFETY: the script registry owns this live item.
+        let item = unsafe { &mut *item };
+        item.sn_prl_ga
+            .resize(index + 1, crate::runtime_defs::SnPrlT::default());
+        item.sn_prl_idx = line - 1;
+        item.sn_prl_execed = 0;
+        item.sn_prl_start = profile_start();
+        item.sn_prl_children = profile_zero();
+        item.sn_prl_wait = profile_get_wait();
+    }
+}
+
 /// Mark the current profiled function line as executed
 /// (`func_line_exec`).
 ///
@@ -517,6 +544,25 @@ mod tests {
 
     struct CurrentFunccallGuard(*mut crate::eval::typval_defs::FunccallT);
 
+    struct ProfileExestackGuard(Vec<crate::runtime_defs::EstackT>);
+
+    impl ProfileExestackGuard {
+        fn line(line: crate::pos_defs::LinenrT) -> Self {
+            let stack = vec![crate::runtime_defs::EstackT {
+                es_lnum: line,
+                ..Default::default()
+            }];
+            Self(crate::runtime::replace_exestack_for_test(stack))
+        }
+    }
+
+    impl Drop for ProfileExestackGuard {
+        fn drop(&mut self) {
+            let saved = std::mem::take(&mut self.0);
+            let _ = crate::runtime::replace_exestack_for_test(saved);
+        }
+    }
+
     impl CurrentFunccallGuard {
         fn install(value: *mut crate::eval::typval_defs::FunccallT) -> Self {
             let saved = crate::eval::userfunc::get_current_funccal();
@@ -590,6 +636,31 @@ mod tests {
         assert_eq!(script.sn_pr_self, 0);
         assert!(script.sn_prl_ga.is_empty());
         assert_eq!(script.sn_prl_idx, -1);
+    }
+
+    #[test]
+    fn script_line_start_grows_counters_and_starts_the_requested_line() {
+        let _lock = crate::globals::global_state_test_lock();
+        let (sid, item) =
+            crate::runtime::new_script_item(Some(b"profile-lines.vim".to_vec()));
+        unsafe { profile_init(&mut *item) };
+        let sctx = crate::eval::typval_defs::SctxT {
+            sc_sid: sid,
+            ..Default::default()
+        };
+        let _sctx = unsafe {
+            crate::globals::GlobalFieldGuard::install(|g| &mut g.current_sctx, sctx)
+        };
+        let _stack = ProfileExestackGuard::line(3);
+
+        unsafe { script_line_start() };
+
+        let item = unsafe { &*item };
+        assert_eq!(item.sn_prl_ga.len(), 3);
+        assert_eq!(item.sn_prl_idx, 2);
+        assert_eq!(item.sn_prl_execed, 0);
+        assert_eq!(item.sn_prl_children, 0);
+        assert_eq!(item.sn_prl_wait, profile_get_wait());
     }
 
     #[test]
