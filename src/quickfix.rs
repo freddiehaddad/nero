@@ -108,6 +108,22 @@
 use crate::buffer_defs::{BufT, WinT, BUF_HAS_LL_ENTRY, BUF_HAS_QF_ENTRY};
 use crate::garray_defs::GarrayT;
 
+/// Nesting depth of quickfix operations (`quickfix_busy`).
+static QUICKFIX_BUSY: crate::globals::GlobalCell<i32> =
+    crate::globals::GlobalCell::new(0);
+
+/// Delay location-list destruction while quickfix code holds references
+/// (`incr_quickfix_busy`).
+///
+/// # Safety
+/// Must be paired with a future `decr_quickfix_busy` operation and run
+/// on the editor thread.
+#[allow(dead_code)]
+unsafe fn incr_quickfix_busy() {
+    // SAFETY: forwarded from this function's own safety doc.
+    unsafe { *QUICKFIX_BUSY.get_mut() += 1 };
+}
+
 /// One entry of the directory stack used while parsing `'errorformat'`
 /// output (`dir_stack_T`).
 ///
@@ -2026,6 +2042,33 @@ pub fn qf_entry_on_or_before_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QuickfixBusyGuard(i32);
+
+    impl QuickfixBusyGuard {
+        fn set(value: i32) -> Self {
+            let saved = unsafe { *QUICKFIX_BUSY.get_mut() };
+            unsafe { *QUICKFIX_BUSY.get_mut() = value };
+            Self(saved)
+        }
+    }
+
+    impl Drop for QuickfixBusyGuard {
+        fn drop(&mut self) {
+            unsafe { *QUICKFIX_BUSY.get_mut() = self.0 };
+        }
+    }
+
+    #[test]
+    fn incr_quickfix_busy_supports_nested_critical_sections() {
+        let _lock = crate::globals::global_state_test_lock();
+        let _guard = QuickfixBusyGuard::set(0);
+        unsafe {
+            incr_quickfix_busy();
+            incr_quickfix_busy();
+        }
+        assert_eq!(unsafe { *QUICKFIX_BUSY.get_mut() }, 2);
+    }
 
     struct TestDict(*mut crate::eval::typval_defs::DictT);
 
